@@ -6,3 +6,5 @@ All my openwebui plugins. So we can have a shared library for further optimizati
 - Write a readme for the search engine.
 - Write a readme for the context manager.
 - Write a readme for the router.
+- Update deployment script.
+- Let's backup the models. We defs don't wanna lose them.
