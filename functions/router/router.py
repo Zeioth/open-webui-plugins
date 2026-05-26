@@ -104,13 +104,57 @@ class Filter:
         "examples": ["how to install yay", "hyprland config", "pacman update error"],
         "knowledge_base": "the official Arch Linux wiki",
         "collection_name": "archwiki"
+    },
+    {
+        "id": "progrmador",
+        "name": "Programador",
+        "keywords": [
+            "code", "function", "class", "algorithm", "debug", "bug",
+            "implement", "python", "javascript", "api", "script",
+            "optimize", "refactor", "snippet", "error", "exception",
+            "library", "framework", "endpoint", "test", "unit test"
+        ],
+        "description": "Precise model for code implementation tasks",
+        "examples": [
+            "write a function to calculate factorial",
+            "how to fix CORS error in express",
+            "optimize this slow SQL query",
+            "refactor this class using the strategy pattern",
+            "code to read a CSV file and transform the data"
+        ],
+        "knowledge_base": "",
+        "collection_name": ""
+    },
+    {
+        "id": "arquitecto-de-codigo",
+        "name": "Arquitecto de código",
+        "keywords": [
+            "architecture", "design pattern", "microservices", "system design",
+            "scalability", "ddd", "domain driven design", "event sourcing",
+            "c4 model", "monolith", "orchestration", "saga", "cqrs",
+            "trade-off", "clean architecture", "hexagonal", "onion architecture",
+            "architectural decision record", "adr", "component diagram"
+        ],
+        "description": "Maximum precision model for software architecture tasks",
+        "examples": [
+            "compare microservices vs modular monolith",
+            "design the architecture of a booking system",
+            "when to use event sourcing?",
+            "draw a C4 diagram for an ecommerce app",
+            "explain the components of a clean architecture"
+        ],
+        "knowledge_base": "",
+        "collection_name": ""
     }
 ]""",
             description="JSON with expert definitions. Each must have 'id', 'name', 'keywords' (list). Optional: 'description', 'examples', 'knowledge_base', 'collection_name'.",
         )
         default_model: str = Field(default="generalista")
         change_threshold: int = Field(default=2)
-        notify_change: bool = Field(default=True)
+        notify_change: bool = Field(
+            default=True,
+            description="Show a notification when the expert model changes. Default is True to ensure visibility.",
+        )
         notification_template: str = Field(default="🎯 Using expert: {expert}")
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434/")
         LLM_API_TOKEN: str = Field(default="")
@@ -513,7 +557,7 @@ class Filter:
         if not expert_id:
             expert_id = self._keyword_fallback(user_query) or ""
 
-        # Default
+        # Default fallback to 'generalista' if still nothing matched
         if not expert_id:
             expert_id = self.valves.default_model
 
@@ -687,6 +731,7 @@ class Filter:
 
         body["model"] = model_to_use
 
+        # Emit notification if a change happened and notifications are enabled
         if __event_emitter__ and self.valves.notify_change and change:
             notif = self.valves.notification_template.format(expert=expert_name)
             await __event_emitter__(
