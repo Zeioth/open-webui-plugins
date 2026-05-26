@@ -13,6 +13,7 @@ requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb
 import os
 import time
 import re
+import anyio
 import hashlib
 import sqlite3
 import ast
