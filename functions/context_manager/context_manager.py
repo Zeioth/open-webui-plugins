@@ -1044,13 +1044,35 @@ class Filter:
             return None
 
     def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
-        if not messages:
-            return messages
-        while messages and messages[-1].get("role") != "user":
-            messages.pop()
+        """Trim trailing assistant messages so the list ends with a user.
+        Insert a dummy user only if there is no real user message at all."""
         if not messages:
             messages.append({"role": "user", "content": "continue"})
-            self._log_debug("Inserted dummy user message to satisfy API")
+            self._log_debug("Inserted dummy user message to satisfy API (empty list)")
+            return messages
+
+        # Find the index of the last user message
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx == -1:
+            # No user message at all: add a dummy and remove any trailing non‑user messages
+            while messages and messages[-1].get("role") != "user":
+                messages.pop()
+            messages.append({"role": "user", "content": "continue"})
+            self._log_debug(
+                "Inserted dummy user message to satisfy API (no user in list)"
+            )
+        else:
+            # Remove all messages after the last user
+            if last_user_idx + 1 < len(messages):
+                removed = len(messages) - (last_user_idx + 1)
+                messages = messages[: last_user_idx + 1]
+                self._log_debug(f"Trimmed {removed} trailing assistant messages")
+
         return messages
 
     def _estimate_tokens(self, messages: List[dict]) -> int:
