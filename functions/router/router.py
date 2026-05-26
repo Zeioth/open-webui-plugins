@@ -1,10 +1,10 @@
 """
 title: Router
-description: Smart router that selects the best expert model for each query based on keywords, LLM classification, and semantic similarity. Rewrites queries for better RAG retrieval and injects RAG guidance.
+description: Smart router that selects the best expert model for each query based on LLM classification (primary), semantic similarity, and keywords.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 1.0.0
+version: 2.1.0
 license: MIT
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -20,15 +20,13 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Path to shared library
 import sys
 
 if "/app/backend/data/custom_lib" not in sys.path:
     sys.path.append("/app/backend/data/custom_lib")
 
-# Shared resources (persistent cache & shared LLM caller)
 try:
-    from shared_resources import SQLiteCache, AsyncLRUCache  # type: ignore
+    from shared_resources import SQLiteCache, AsyncLRUCache
 
     _SHARED_RESOURCES_AVAILABLE = True
 except ImportError:
@@ -36,14 +34,9 @@ except ImportError:
 
 
 def _build_cache(table: str, max_size: int, ttl: int, db_path: str):
-    """
-    Build cache: L1 RAM (LRU) + L2 SQLite (persistent) when shared_resources is available.
-    Falls back to L1-only cache otherwise.
-    """
     if _SHARED_RESOURCES_AVAILABLE:
         return SQLiteCache(db_path=db_path, table=table, max_size=max_size, ttl=ttl)
 
-    # Minimal fallback with same async interface
     import asyncio as _asyncio, time as _time
 
     class _FallbackCache:
@@ -90,7 +83,7 @@ class Filter:
     {
         "id": "experto-en-neovim",
         "name": "Neovim",
-        "keywords": ["neovim", "nvim", "vim", "lsp", "treesitter", "buffer", "init.lua", "keymap"],
+        "keywords": ["neovim", "nvim", "vimrc", "init.lua", "lazy.nvim", "vim-plug", "treesitter", "keymap", "which-key"],
         "description": "Configuration, plugins, and usage of Neovim editor",
         "examples": ["how to configure LSP in nvim", "best neovim plugins 2025", "treesitter setup init.lua"],
         "knowledge_base": "the official Neovim documentation and community plugins",
@@ -99,68 +92,75 @@ class Filter:
     {
         "id": "experto-en-arch-linux",
         "name": "Arch Linux",
-        "keywords": ["arch", "archlinux", "pacman", "yay", "aur", "systemd", "grub", "hyprland", "wayland"],
+        "keywords": ["archlinux", "pacman", "yay", "aur", "systemd", "grub", "hyprland", "wayland"],
         "description": "Installation, maintenance, and troubleshooting of Arch Linux",
         "examples": ["how to install yay", "hyprland config", "pacman update error"],
         "knowledge_base": "the official Arch Linux wiki",
         "collection_name": "archwiki"
     },
     {
-        "id": "progrmador",
-        "name": "Programador",
-        "keywords": [
-            "code", "function", "class", "algorithm", "debug", "bug",
-            "implement", "python", "javascript", "api", "script",
-            "optimize", "refactor", "snippet", "error", "exception",
-            "library", "framework", "endpoint", "test", "unit test"
-        ],
-        "description": "Precise model for code implementation tasks",
-        "examples": [
-            "write a function to calculate factorial",
-            "how to fix CORS error in express",
-            "optimize this slow SQL query",
-            "refactor this class using the strategy pattern",
-            "code to read a CSV file and transform the data"
-        ],
-        "knowledge_base": "",
-        "collection_name": ""
-    },
-    {
         "id": "arquitecto-de-codigo",
         "name": "Arquitecto de código",
         "keywords": [
-            "architecture", "design pattern", "microservices", "system design",
-            "scalability", "ddd", "domain driven design", "event sourcing",
-            "c4 model", "monolith", "orchestration", "saga", "cqrs",
-            "trade-off", "clean architecture", "hexagonal", "onion architecture",
-            "architectural decision record", "adr", "component diagram"
+            "architecture", "arquitectura", "design pattern", "patrón de diseño",
+            "microservices", "microservicios", "system design", "diseño de sistemas",
+            "scalability", "escalabilidad", "ddd", "domain driven design",
+            "event sourcing", "c4 model", "modelo c4", "monolith", "monolito",
+            "orchestration", "orquestación", "saga", "cqrs",
+            "trade-off", "clean architecture", "arquitectura limpia",
+            "hexagonal", "onion architecture", "architectural decision record", "adr",
+            "component diagram", "diagrama de componentes"
         ],
         "description": "Maximum precision model for software architecture tasks",
         "examples": [
+            "compara microservicios con monolito modular",
             "compare microservices vs modular monolith",
+            "diseña la arquitectura de un sistema de reservas",
             "design the architecture of a booking system",
             "when to use event sourcing?",
             "draw a C4 diagram for an ecommerce app",
-            "explain the components of a clean architecture"
+            "explica los componentes de una clean architecture"
+        ]
+    },
+    {
+        "id": "progrmador",
+        "name": "Programador",
+        "keywords": [
+            "function", "función", "class", "clase",
+            "algorithm", "algoritmo", "debug", "depurar", "bug",
+            "implement", "implementar", "python", "javascript", "api", "script",
+            "optimize", "optimizar", "refactor", "refactorizar",
+            "snippet", "fragmento", "error", "excepción",
+            "library", "librería", "framework", "endpoint", "test", "prueba unitaria"
         ],
-        "knowledge_base": "",
-        "collection_name": ""
+        "description": "Precise model for code implementation tasks",
+        "examples": [
+            "escribe una función que calcule el factorial",
+            "write a function to calculate factorial",
+            "how to fix CORS error in express",
+            "optimize this slow SQL query",
+            "refactor this class using the strategy pattern"
+        ]
     }
 ]""",
-            description="JSON with expert definitions. Each must have 'id', 'name', 'keywords' (list). Optional: 'description', 'examples', 'knowledge_base', 'collection_name'.",
+            description="JSON with expert definitions. 'model' field is no longer needed – the router respects the model already selected by the user.",
         )
         default_model: str = Field(default="generalista")
-        change_threshold: int = Field(default=2)
-        notify_change: bool = Field(
-            default=True,
-            description="Show a notification when the expert model changes. Default is True to ensure visibility.",
+        default_model_name: str = Field(
+            default="llama3.2:3B",
+            description="Real Ollama model name for 'generalista'",
         )
+        change_threshold: int = Field(default=2)
+        notify_change: bool = Field(default=True)
         notification_template: str = Field(default="🎯 Using expert: {expert}")
+
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434/")
         LLM_API_TOKEN: str = Field(default="")
-        classifier_model: str = Field(default="ollama/llama3.2:3b")
+        classifier_model: str = Field(
+            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+        )
         classifier_temperature: float = Field(default=0.0)
-        classifier_timeout: int = Field(default=10)
+        classifier_timeout: int = Field(default=15)
         default_llm_temperature: float = Field(default=0.3)
         default_llm_max_tokens: int = Field(default=256)
         default_llm_timeout: int = Field(default=30)
@@ -170,18 +170,9 @@ class Filter:
         string_cache_max_size: int = Field(default=1000)
         string_cache_ttl: int = Field(default=1800)
         rewrite_cache_ttl: int = Field(default=3600)
-        USE_SEMANTIC_CLASSIFY: bool = Field(
-            default=True,
-            description="Use embedding similarity before LLM for classification (faster)",
-        )
-        SEMANTIC_THRESHOLD: float = Field(
-            default=0.55,
-            description="Minimum cosine similarity to classify without LLM (0–1)",
-        )
-        CACHE_DB_PATH: str = Field(
-            default="/app/backend/data/router_cache.db",
-            description="SQLite path for persistent classification and rewrite cache",
-        )
+        USE_SEMANTIC_CLASSIFY: bool = Field(default=True)
+        SEMANTIC_THRESHOLD: float = Field(default=0.55)
+        CACHE_DB_PATH: str = Field(default="/app/backend/data/router_cache.db")
         DEBUG: bool = Field(default=True)
 
     def __init__(self):
@@ -189,7 +180,6 @@ class Filter:
         self._experts: List[dict] = []
         self._experts_json_hash: Optional[str] = None
         self._load_experts()
-
         db_path = self.valves.CACHE_DB_PATH
         self._string_cache = _build_cache(
             "classifications",
@@ -203,7 +193,6 @@ class Filter:
             self.valves.rewrite_cache_ttl,
             db_path,
         )
-        # Serialise embedding rebuilds to avoid duplicate work on concurrent requests
         self._embeddings_lock = asyncio.Lock()
 
     def _load_experts(self):
@@ -233,7 +222,6 @@ class Filter:
             )
 
     async def _sync_cache_config(self):
-        """Update cache parameters in-place to preserve already cached entries."""
         if (
             self._string_cache.max_size != self.valves.string_cache_max_size
             or self._string_cache.ttl != self.valves.string_cache_ttl
@@ -253,7 +241,6 @@ class Filter:
                 self._rewrite_cache._ram.max_size = self.valves.rewrite_cache_max_size
                 self._rewrite_cache._ram.ttl = self.valves.rewrite_cache_ttl
 
-    # --- LLM call using shared caller or aiohttp fallback ---
     async def _call_llm(
         self,
         prompt: str,
@@ -269,7 +256,6 @@ class Filter:
             max_tokens = self.valves.default_llm_max_tokens
         if timeout is None:
             timeout = self.valves.default_llm_timeout
-
         model_str = provider or self.valves.classifier_model
 
         if _SHARED_RESOURCES_AVAILABLE:
@@ -289,9 +275,7 @@ class Filter:
             except Exception as e:
                 logger.warning(f"[Router] shared call_llm failed: {e}, using fallback")
 
-        # Fallback: reuse the shared HTTP session instead of creating a new one each time
         import aiohttp
-
         from shared_resources import get_http_session
 
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
@@ -300,11 +284,9 @@ class Filter:
         )
         model_name = model_str.split("/", 1)[1] if "/" in model_str else model_str
         is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-
         headers = {"Content-Type": "application/json"}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-
         if is_ollama:
             url = f"{base_url}/api/generate"
             payload = {
@@ -325,7 +307,6 @@ class Filter:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
-
         session = await get_http_session(timeout=timeout)
         try:
             async with session.post(
@@ -340,7 +321,6 @@ class Filter:
                 data = await resp.json()
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"Router LLM connection error: {exc}") from exc
-
         if is_ollama:
             content = data.get("response", "")
             if "error" in data:
@@ -348,7 +328,6 @@ class Filter:
                 return ""
         else:
             content = data["choices"][0]["message"]["content"]
-
         content = content.strip()
         if not content:
             logger.warning(f"[Router] LLM returned empty content for '{model_name}'.")
@@ -356,7 +335,6 @@ class Filter:
             logger.debug(f"[Router] LLM raw response: {content[:300]}")
         return content
 
-    # --- Original classification methods (unchanged) ---
     async def _classify_with_llm(self, user_query: str) -> Optional[str]:
         lines = []
         for exp in self._experts:
@@ -365,13 +343,11 @@ class Filter:
                 line += f" ({exp['description']})"
             lines.append(line)
         expert_list = "\n".join(lines)
-
         examples_section = ""
         for exp in self._experts:
             if exp.get("examples"):
                 for ex in exp["examples"]:
                     examples_section += f"User: {ex}\nExpert: {exp['id']}\n"
-
         system_prompt = (
             "You are a smart router. Choose the expert that best matches the user query.\n"
             "Reply with ONLY the expert ID (one word) or 'generalista'.\n\n"
@@ -380,7 +356,6 @@ class Filter:
         if examples_section:
             system_prompt += f"\nExamples:\n{examples_section}\n"
         system_prompt += "\nExpert ID:"
-
         try:
             response = await self._call_llm(
                 prompt=user_query,
@@ -413,7 +388,6 @@ class Filter:
                 return exp["id"]
         return None
 
-    # --- Contextual cache key ---
     def _get_cache_key(
         self, user_query: str, messages: list = None, context_window: int = 2
     ) -> str:
@@ -432,7 +406,6 @@ class Filter:
                 return f"{base}::{ctx_hash}"
         return base
 
-    # --- Semantic classification ---
     def _build_expert_example_embeddings(self, experts_config: list) -> dict:
         try:
             if _SHARED_RESOURCES_AVAILABLE:
@@ -445,7 +418,6 @@ class Filter:
                 embedder = SentenceTransformer("all-MiniLM-L6-v2")
         except Exception:
             return {}
-
         import numpy as np
 
         result = {}
@@ -469,12 +441,9 @@ class Filter:
 
         if threshold is None:
             threshold = self.valves.SEMANTIC_THRESHOLD
-
         if not experts_config:
             return ""
-
         current_hash = self._experts_json_hash
-        # Serialise embedding rebuild to avoid duplicate work on concurrent requests
         async with self._embeddings_lock:
             if (
                 not hasattr(self, "_expert_embeddings")
@@ -487,10 +456,8 @@ class Filter:
                     lambda: self._build_expert_example_embeddings(experts_config)
                 )
                 self._expert_embeddings_hash = current_hash
-
         if not self._expert_embeddings:
             return ""
-
         try:
             if _SHARED_RESOURCES_AVAILABLE:
                 from shared_resources import get_embedder
@@ -502,24 +469,19 @@ class Filter:
                 embedder = SentenceTransformer("all-MiniLM-L6-v2")
         except Exception:
             return ""
-
         import anyio
 
         query_vec = await anyio.to_thread.run_sync(
             lambda: embedder.encode([user_query], convert_to_numpy=True)[0]
         )
         q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
-
-        best_id = ""
-        best_score = -1.0
+        best_id, best_score = "", -1.0
         for expert_id, example_vecs in self._expert_embeddings.items():
             norms = np.linalg.norm(example_vecs, axis=1, keepdims=True) + 1e-10
             scores = (example_vecs / norms) @ q_norm
             score = float(scores.max())
             if score > best_score:
-                best_score = score
-                best_id = expert_id
-
+                best_score, best_id = score, expert_id
         if best_score >= threshold:
             if self.valves.DEBUG:
                 logger.info(
@@ -528,10 +490,8 @@ class Filter:
             return best_id
         return ""
 
-    # --- Main classification pipeline ---
     async def _classify_query(self, user_query: str, messages: list = None) -> str:
         cache_key = self._get_cache_key(user_query, messages)
-
         cached = await self._string_cache.get(cache_key)
         if cached is not None:
             if self.valves.DEBUG:
@@ -540,31 +500,39 @@ class Filter:
 
         expert_id = ""
 
-        # Semantic classification
-        if self.valves.USE_SEMANTIC_CLASSIFY:
+        # 1) LLM classifier (most accurate, covers edge cases)
+        try:
+            expert_id = await self._classify_with_llm(user_query) or ""
+            if self.valves.DEBUG and expert_id:
+                logger.info(f"[Router] LLM classifier → {expert_id}")
+        except Exception as e:
+            logger.warning(f"[Router] LLM classifier failed: {e}")
+            expert_id = ""
+
+        # 2) Semantic classification (fallback)
+        if not expert_id and self.valves.USE_SEMANTIC_CLASSIFY:
             try:
                 expert_id = await self._semantic_classify(user_query, self._experts)
+                if self.valves.DEBUG and expert_id:
+                    logger.info(f"[Router] Semantic classify → {expert_id}")
             except Exception as e:
                 if self.valves.DEBUG:
                     logger.info(f"[Router] Semantic classify error: {e}")
                 expert_id = ""
 
-        # LLM classifier
-        if not expert_id:
-            expert_id = await self._classify_with_llm(user_query) or ""
-
-        # Keyword fallback
+        # 3) Keyword fallback (last resort, only very specific terms)
         if not expert_id:
             expert_id = self._keyword_fallback(user_query) or ""
+            if self.valves.DEBUG and expert_id:
+                logger.info(f"[Router] Keyword fallback → {expert_id}")
 
-        # Default fallback to 'generalista' if still nothing matched
+        # 4) Default
         if not expert_id:
             expert_id = self.valves.default_model
 
         await self._string_cache.set(cache_key, expert_id)
         return expert_id
 
-    # --- Query rewriting (unchanged) ---
     async def _rewrite_query(self, original: str, expert_id: str) -> str:
         cache_key = f"{original.lower()}|{expert_id}"
         cached = await self._rewrite_cache.get(cache_key)
@@ -572,20 +540,17 @@ class Filter:
             if self.valves.DEBUG:
                 logger.info(f"[Router] Rewrite cache hit: '{cached}'")
             return cached
-
         kb_desc = None
         for exp in self._experts:
             if exp["id"] == expert_id:
                 kb_desc = exp.get("knowledge_base")
                 break
-
         rewritten = original
-        if kb_desc:
-            prompt = (
-                f"KB:{kb_desc}\nQ:{original}\nShort technical phrase (same language):"
-            )
-        else:
-            prompt = f"Q:{original}\nShort technical phrase (same language):"
+        prompt = (
+            f"KB:{kb_desc}\nQ:{original}\nShort technical phrase (same language):"
+            if kb_desc
+            else f"Q:{original}\nShort technical phrase (same language):"
+        )
         try:
             rewritten = await self._call_llm(
                 prompt=prompt,
@@ -600,7 +565,6 @@ class Filter:
         except Exception as e:
             logger.error(f"[Router] Query rewriting failed: {e}")
             rewritten = original
-
         await self._rewrite_cache.set(cache_key, rewritten)
         if self.valves.DEBUG:
             logger.info(
@@ -608,23 +572,19 @@ class Filter:
             )
         return rewritten
 
-    # --- RAG injection (unchanged) ---
     def _inject_rag_guidance(self, expert_id: str, messages: list) -> bool:
-        collection = None
-        kb_desc = None
+        collection = kb_desc = None
         for exp in self._experts:
             if exp["id"] == expert_id:
                 collection = exp.get("collection_name")
                 kb_desc = exp.get("knowledge_base")
                 break
-
         if not collection:
             if self.valves.DEBUG:
                 logger.info(
                     f"[Router] No collection for expert '{expert_id}', skipping RAG guidance."
                 )
             return False
-
         guidance = (
             f"You have access to the knowledge base '{collection}' ({kb_desc or 'specialized documents'}). "
             "Use this knowledge base when relevant, but you may also use other available tools. "
@@ -635,16 +595,13 @@ class Filter:
             sys_msg["content"] = sys_msg["content"] + "\n\n" + guidance
         else:
             messages.insert(0, {"role": "system", "content": guidance})
-
         if self.valves.DEBUG:
             logger.info(
                 f"[Router] Injected RAG guidance for collection '{collection}'."
             )
         return True
 
-    # --- Helper to detect tool requests ---
     def _is_tool_request(self, text: str) -> bool:
-        """Return True if the user message explicitly asks to use a tool."""
         tool_keywords = [
             "utiliza la herramienta",
             "usa la herramienta",
@@ -663,10 +620,20 @@ class Filter:
         text_lower = text.lower()
         return any(kw in text_lower for kw in tool_keywords)
 
-    # --- Inlet (now passes messages to classification) ---
-    async def inlet(self, body: dict, **kwargs) -> dict:
-        user = kwargs.get("user", {})
-        __event_emitter__ = kwargs.get("__event_emitter__")
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+        **kwargs,
+    ) -> dict:
+        __event_call__ = kwargs.get("__event_call__")
+        event_sender = __event_emitter__ or __event_call__
+
+        if self.valves.DEBUG:
+            logger.info(
+                f"[Router] emitter={__event_emitter__ is not None}, event_call={__event_call__ is not None}"
+            )
 
         await self._sync_cache_config()
         self._load_experts()
@@ -679,11 +646,9 @@ class Filter:
         current_expert = metadata.get("router_expert")
         current_query = messages[-1].get("content", "")
 
-        # Pass the full message history for contextual cache key
         new_expert = await self._classify_query(current_query, messages)
         new_name = self._get_expert_name(new_expert)
 
-        # Decide whether to switch expert (with change threshold)
         if not current_expert:
             model_to_use = new_expert
             expert_name = new_name
@@ -709,14 +674,12 @@ class Filter:
                 expert_name = self._get_expert_name(current_expert)
                 change = False
 
-        # Optional query rewriting (skip if user is asking to use a tool)
         if self.valves.enable_query_rewriting and messages:
             original_query = messages[-1].get("content", "")
             if original_query and not self._is_tool_request(original_query):
                 rewritten = await self._rewrite_query(original_query, model_to_use)
                 messages[-1]["content"] = rewritten
 
-        # Optional RAG injection
         if (
             self.valves.enable_rag_injection
             and model_to_use != self.valves.default_model
@@ -729,14 +692,28 @@ class Filter:
             if self.valves.DEBUG:
                 logger.info(f"[Router] Switched to expert: {expert_name}")
 
-        body["model"] = model_to_use
+        # Model is kept as originally selected by the user
 
-        # Emit notification if a change happened and notifications are enabled
-        if __event_emitter__ and self.valves.notify_change and change:
+        if self.valves.notify_change and change:
             notif = self.valves.notification_template.format(expert=expert_name)
-            await __event_emitter__(
-                {"type": "notification", "data": {"type": "info", "content": notif}}
-            )
+            if event_sender is not None:
+                try:
+                    await event_sender(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"🧠 Router: {notif}",
+                                "done": True,
+                            },
+                        }
+                    )
+                    if self.valves.DEBUG:
+                        logger.info(f"[Router] Notification emitted: {notif}")
+                except Exception as e:
+                    logger.error(f"[Router] Failed to emit notification: {e}")
+            else:
+                logger.warning("[Router] No event sender available for notification.")
+
         return body
 
     def _get_expert_name(self, expert_id: str) -> str:
@@ -744,3 +721,4 @@ class Filter:
             if exp["id"] == expert_id:
                 return exp["name"]
         return "General"
+
