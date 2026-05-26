@@ -1,11 +1,11 @@
 """
 title: Web Search and Crawl
-description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, and Crawl4AI. Extracts content from URLs using a self-hosted Crawl4AI instance, optionally researching using Crawl4AI Deep Research.
+description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, and Crawl4AI.
+version: 4.0.0
+license: MIT
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.5.0
-license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
 
@@ -13,8 +13,6 @@ import sys
 
 if "/app/backend/data/custom_lib" not in sys.path:
     sys.path.append("/app/backend/data/custom_lib")
-
-# region ── Imports ────────────────────────────────────────────────────────────
 
 import os
 import re
@@ -26,7 +24,6 @@ import tiktoken
 import aiohttp
 import time
 import asyncio
-import uuid
 import hashlib
 import numpy as np
 import threading
@@ -35,10 +32,8 @@ from pydantic import BaseModel, Field
 from typing import Any, List, Optional, Union, Callable, Literal, Tuple
 from loguru import logger
 from crawl4ai import (
-    BestFirstCrawlingStrategy,
     CrawlerRunConfig,
     DefaultTableExtraction,
-    KeywordRelevanceScorer,
     LLMConfig,
     BrowserConfig,
     CacheMode,
@@ -54,9 +49,9 @@ import chromadb
 
 # OpenWebUI imports for native search
 try:
-    from open_webui.main import Request, app  # type: ignore
-    from open_webui.models.users import UserModel, Users  # type: ignore
-    from open_webui.routers.retrieval import SearchForm, process_web_search  # type: ignore
+    from open_webui.main import Request, app
+    from open_webui.models.users import Users
+    from open_webui.routers.retrieval import SearchForm, process_web_search
 
     NATIVE_SEARCH_AVAILABLE = True
 except ImportError:
@@ -64,8 +59,6 @@ except ImportError:
     logger.warning(
         "OpenWebUI native search not available - install requirements or check OpenWebUI version"
     )
-
-# endregion
 
 # Shared resources import
 try:
@@ -116,8 +109,6 @@ def _get_enc(model: str = "gpt-4"):
 _EMBEDDER_INSTANCE = None
 _EMBEDDER_LOCK = threading.Lock()
 
-# region ── Models ─────────────────────────────────────────────────────────────
-
 
 class ArticleData(BaseModel):
     topic: str
@@ -131,19 +122,13 @@ class ResearchCrawlMode:
     RESEARCH_FILTER = "research_filter"
 
 
-# endregion
-
-
 class Tools:
 
-    # region ── Valves ─────────────────────────────────────────────────────────
     class Valves(BaseModel):
-        # ── Initial Response ─────────────────────────────────────────────────
         INITIAL_RESPONSE: str = Field(
             title="Initial delta response",
             default="I'm going to search it on the internet using SearXNG....",
         )
-        # ── Search Engines ───────────────────────────────────────────────────
         USE_NATIVE_SEARCH: bool = Field(default=False)
         SEARCH_WITH_SEARXNG: bool = Field(default=True)
         SEARXNG_BASE_URL: str = Field(
@@ -177,23 +162,7 @@ class Tools:
         CRAWL4AI_WORD_COUNT_THRESHOLD: int = Field(default=50)
         CRAWL4AI_TEXT_ONLY: bool = Field(default=True)
         LLM_INSTRUCTION: str = Field(
-            default="""Focus on extracting the core content. Summarize lengthy sections into concise points
-            Include:
-            - Key concepts and explanations
-            - Important examples
-            - Critical details that enhance understanding
-            - Data from tables that support the main content
-            - Any relevant data snippets
-            Exclude:
-            - Navigation elements
-            - Sidebars
-            - Footer content
-            - Marketing or promotional material
-            - Advertisements
-            - User comments
-            - Any other non-essential information
-            Format the output as clean markdown with proper code blocks and headers.
-            """
+            default="""Focus on extracting the core content..."""
         )
         CRAWL4AI_MIN_IMAGE_SCORE: int = Field(default=6, ge=0, le=10)
         CRAWL4AI_VALIDATE_IMAGES: bool = Field(default=True)
@@ -239,9 +208,6 @@ class Tools:
         LLM_FREQUENCY_PENALTY: float = Field(default=None)
         LLM_PRESENCE_PENALTY: float = Field(default=None)
 
-    # endregion
-
-    # region ── User Valves ────────────────────────────────────────────────────
     class UserValves(BaseModel):
         SEARXNG_MAX_RESULTS: Optional[int] = Field(default=None)
         CRAWL4AI_MAX_URLS: Optional[int] = Field(default=None)
@@ -259,14 +225,9 @@ class Tools:
         RESEARCH_LLM_LINK_SELECTION: bool = Field(default=True)
         RESEARCH_INCLUDE_EXTERNAL: bool = Field(default=False)
 
-    # endregion
-
-    # region ── Init & Configuration ───────────────────────────────────────────
-
     def __init__(self):
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
-
         self.crawl_counter = 0
         self.content_counter = 0
         self.pages_crawled = 0
@@ -275,7 +236,6 @@ class Tools:
         self.stats_lock = asyncio.Lock()
         self.status_lock = asyncio.Lock()
         self._cache_locks: dict[str, asyncio.Lock] = {}
-
         self._chroma_client = None
         self._cache_collection = None
         self._excluded_collection = None
