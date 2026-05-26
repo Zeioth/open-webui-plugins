@@ -85,7 +85,15 @@ def get_tiktoken_encoding(model: str = "gpt-4"):
 # ---------------------------------------------------------------------------
 _HTTP_SESSION: Optional[Any] = None
 _HTTP_TIMEOUT_SECONDS: int = 120
-_HTTP_SESSION_LOCK = asyncio.Lock()  # Protects session creation/recreation against concurrent calls
+_HTTP_SESSION_LOCK: Optional[asyncio.Lock] = None  # Lazy init to avoid errors before event loop
+
+
+def _get_http_lock() -> asyncio.Lock:
+    """Return the HTTP session lock, creating it lazily inside the event loop."""
+    global _HTTP_SESSION_LOCK
+    if _HTTP_SESSION_LOCK is None:
+        _HTTP_SESSION_LOCK = asyncio.Lock()
+    return _HTTP_SESSION_LOCK
 
 
 async def get_http_session(timeout_seconds: int = 120):
@@ -98,7 +106,7 @@ async def get_http_session(timeout_seconds: int = 120):
     global _HTTP_SESSION, _HTTP_TIMEOUT_SECONDS
     import aiohttp  # type: ignore
 
-    async with _HTTP_SESSION_LOCK:
+    async with _get_http_lock():
         needs_recreate = (
             _HTTP_SESSION is None
             or _HTTP_SESSION.closed
@@ -125,7 +133,7 @@ async def get_http_session(timeout_seconds: int = 120):
 async def close_http_session():
     """Close the shared session. Call on process shutdown if needed."""
     global _HTTP_SESSION
-    async with _HTTP_SESSION_LOCK:
+    async with _get_http_lock():
         if _HTTP_SESSION and not _HTTP_SESSION.closed:
             await _HTTP_SESSION.close()
             _HTTP_SESSION = None
@@ -272,22 +280,37 @@ class SQLiteCache:
         self.max_size = max_size
         self._ram = AsyncLRUCache(max_size=max_size, ttl=ttl)
         self._db_path = db_path
+        self._conn: Optional[Any] = None
+        self._conn_lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
+        """Initialize the database. Creates the persistent connection via _get_conn()."""
+        self._get_conn()
+
+    def _get_conn(self):
+        """Return the persistent SQLite connection, creating it if needed. Thread‑safe."""
         import sqlite3, os
-        parent = os.path.dirname(os.path.abspath(self._db_path))
-        os.makedirs(parent, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS {self.table} (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    ts REAL NOT NULL
+        with self._conn_lock:
+            if self._conn is None:
+                parent = os.path.dirname(os.path.abspath(self._db_path))
+                os.makedirs(parent, exist_ok=True)
+                self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                self._conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {self.table} (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        ts REAL NOT NULL
+                    )
+                """)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA cache_size=-8000")
+                self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{self.table}_ts ON {self.table}(ts)"
                 )
-            """)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.commit()
+                self._conn.commit()
+            return self._conn
 
     async def get(self, key: str) -> Optional[str]:
         # L1 RAM
@@ -295,13 +318,12 @@ class SQLiteCache:
         if hit is not None:
             return hit
         # L2 SQLite
-        import sqlite3
         def _read():
-            with sqlite3.connect(self._db_path) as conn:
-                row = conn.execute(
-                    f"SELECT value, ts FROM {self.table} WHERE key = ?", (key,)
-                ).fetchone()
-            return row
+            conn = self._get_conn()
+            return conn.execute(
+                f"SELECT value, ts FROM {self.table} WHERE key = ?", (key,)
+            ).fetchone()
+
         import anyio
         row = await anyio.to_thread.run_sync(_read)
         if row is None:
@@ -315,29 +337,29 @@ class SQLiteCache:
 
     async def set(self, key: str, value: str) -> None:
         await self._ram.set(key, value)
-        import anyio
         def _write():
-            with sqlite3.connect(self._db_path) as conn:
-                conn.execute(
-                    f"REPLACE INTO {self.table} (key, value, ts) VALUES (?, ?, ?)",
-                    (key, value, time.time()),
-                )
-                conn.commit()
+            conn = self._get_conn()
+            conn.execute(
+                f"REPLACE INTO {self.table} (key, value, ts) VALUES (?, ?, ?)",
+                (key, value, time.time()),
+            )
+            conn.commit()
+        import anyio
         await anyio.to_thread.run_sync(_write)
 
     async def _delete_from_db(self, key: str) -> None:
-        import anyio, sqlite3
         def _del():
-            with sqlite3.connect(self._db_path) as conn:
-                conn.execute(f"DELETE FROM {self.table} WHERE key = ?", (key,))
-                conn.commit()
+            conn = self._get_conn()
+            conn.execute(f"DELETE FROM {self.table} WHERE key = ?", (key,))
+            conn.commit()
+        import anyio
         await anyio.to_thread.run_sync(_del)
 
     async def clear(self) -> None:
         await self._ram.clear()
-        import anyio, sqlite3
         def _clr():
-            with sqlite3.connect(self._db_path) as conn:
-                conn.execute(f"DELETE FROM {self.table}")
-                conn.commit()
+            conn = self._get_conn()
+            conn.execute(f"DELETE FROM {self.table}")
+            conn.commit()
+        import anyio
         await anyio.to_thread.run_sync(_clr)

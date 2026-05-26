@@ -1,4 +1,3 @@
-
 """
 title: Router
 description: Smart router that selects the best expert model for each query based on keywords, LLM classification, and semantic similarity. Rewrites queries for better RAG retrieval and injects RAG guidance.
@@ -190,27 +189,25 @@ class Filter:
             )
 
     async def _sync_cache_config(self):
-        db_path = self.valves.CACHE_DB_PATH
+        """Update cache parameters in-place to preserve already cached entries."""
         if (
             self._string_cache.max_size != self.valves.string_cache_max_size
             or self._string_cache.ttl != self.valves.string_cache_ttl
         ):
-            self._string_cache = _build_cache(
-                "classifications",
-                self.valves.string_cache_max_size,
-                self.valves.string_cache_ttl,
-                db_path,
-            )
+            self._string_cache.max_size = self.valves.string_cache_max_size
+            self._string_cache.ttl = self.valves.string_cache_ttl
+            if hasattr(self._string_cache, "_ram"):
+                self._string_cache._ram.max_size = self.valves.string_cache_max_size
+                self._string_cache._ram.ttl = self.valves.string_cache_ttl
         if (
             self._rewrite_cache.max_size != self.valves.rewrite_cache_max_size
             or self._rewrite_cache.ttl != self.valves.rewrite_cache_ttl
         ):
-            self._rewrite_cache = _build_cache(
-                "rewrites",
-                self.valves.rewrite_cache_max_size,
-                self.valves.rewrite_cache_ttl,
-                db_path,
-            )
+            self._rewrite_cache.max_size = self.valves.rewrite_cache_max_size
+            self._rewrite_cache.ttl = self.valves.rewrite_cache_ttl
+            if hasattr(self._rewrite_cache, "_ram"):
+                self._rewrite_cache._ram.max_size = self.valves.rewrite_cache_max_size
+                self._rewrite_cache._ram.ttl = self.valves.rewrite_cache_ttl
 
     # --- LLM call using shared caller or aiohttp fallback ---
     async def _call_llm(
@@ -702,4 +699,3 @@ class Filter:
             if exp["id"] == expert_id:
                 return exp["name"]
         return "General"
-

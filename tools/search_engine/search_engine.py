@@ -1,4 +1,3 @@
-
 """
 title: Web Search and Crawl
 description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, and Crawl4AI. Extracts content from URLs using a self-hosted Crawl4AI instance, optionally researching using Crawl4AI Deep Research.
@@ -28,6 +27,7 @@ import asyncio
 import hashlib
 import numpy as np
 import threading
+from collections import OrderedDict
 from urllib.parse import parse_qs, urlparse, quote, unquote
 from pydantic import BaseModel, Field
 from typing import Any, List, Optional, Union, Callable, Literal, Tuple
@@ -66,6 +66,8 @@ try:
     from shared_resources import (
         get_chroma_client as _shared_get_chroma_client,
         get_tiktoken_encoding as _shared_get_tiktoken_encoding,
+        get_embedder as _shared_get_embedder,
+        get_http_session,
     )
 
     _SHARED_RESOURCES_AVAILABLE = True
@@ -75,25 +77,28 @@ except ImportError:
 import hashlib as _hashlib
 import time as _time
 
-# Cache for query expansion
-_EXPANSION_CACHE: dict = {}
+# Cache for query expansion (OrderedDict for predictable eviction)
+_EXPANSION_CACHE: OrderedDict = OrderedDict()
 _EXPANSION_CACHE_TTL: int = 3600
+_EXPANSION_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Cache for homonym detection
-_HOMONYM_CACHE: dict = {}
+_HOMONYM_CACHE: OrderedDict = OrderedDict()
 _HOMONYM_CACHE_TTL: int = 3600
+_HOMONYM_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Cache for search results
-_SEARCH_RESULT_CACHE: dict = {}
+_SEARCH_RESULT_CACHE: OrderedDict = OrderedDict()
 _SEARCH_RESULT_CACHE_TTL: int = 600
+_SEARCH_RESULT_CACHE_LOCK = asyncio.Lock()
 
 # Local tiktoken cache (fallback)
 _TIKTOKEN_CACHE_LOCAL: dict = {}
-_TIKTOKEN_LOCK = threading.Lock()  # Thread safety for the local tokenizer cache
+_TIKTOKEN_LOCK = threading.Lock()  # Thread safety for local tokenizer cache
 
 
 def _get_tiktoken_enc_local(model: str = "gpt-4"):
-    with _TIKTOKEN_LOCK:  # Protect dict access
+    with _TIKTOKEN_LOCK:
         if model not in _TIKTOKEN_CACHE_LOCAL:
             try:
                 _TIKTOKEN_CACHE_LOCAL[model] = tiktoken.encoding_for_model(model)
@@ -108,7 +113,7 @@ def _get_enc(model: str = "gpt-4"):
     return _get_tiktoken_enc_local(model)
 
 
-# ── Global singleton for SentenceTransformer ─────────────────────────────────
+# ── Global singleton for SentenceTransformer (used only when shared_resources is absent) ──
 _EMBEDDER_INSTANCE = None
 _EMBEDDER_LOCK = threading.Lock()
 
@@ -265,12 +270,8 @@ class Tools:
         self._previous_queries: List[str] = []
 
         # Semaphores to prevent resource exhaustion
-        self._cache_filter_llm_sem = asyncio.Semaphore(
-            2
-        )  # Max 2 concurrent cache filter LLM calls
-        self._image_validation_sem = asyncio.Semaphore(
-            10
-        )  # Max 10 concurrent image validations
+        self._cache_filter_llm_sem = asyncio.Semaphore(2)   # Max 2 concurrent cache filter LLM calls
+        self._image_validation_sem = asyncio.Semaphore(10)  # Max 10 concurrent image validations
 
         # Limit the number of pending cache filter tasks to avoid memory pressure
         self._pending_filter_tasks = 0
@@ -279,7 +280,6 @@ class Tools:
 
         self._configure()
 
-        # URL normalization and tool definition (unchanged, keep as is)
         if self.valves.SEARCH_WITH_SEARXNG and self.valves.SEARXNG_BASE_URL:
             searxng_parsed_url = urlparse(self.valves.SEARXNG_BASE_URL)
             searxng_parsed_url_query = parse_qs(searxng_parsed_url.query)
@@ -353,6 +353,9 @@ class Tools:
     # region ── Init helpers ──────────────────────────────────────────────────
 
     def _get_embedder(self):
+        """Return the shared embedder singleton. Prefer shared_resources if available."""
+        if _SHARED_RESOURCES_AVAILABLE:
+            return _shared_get_embedder()
         global _EMBEDDER_INSTANCE
         if _EMBEDDER_INSTANCE is None:
             with _EMBEDDER_LOCK:
@@ -819,9 +822,7 @@ class Tools:
                     async with s.get(url, allow_redirects=True) as resp:
                         if resp.status >= 400:
                             return False
-                        content = await resp.content.read(
-                            30 * 1024
-                        )  # Reduced from 200 KB
+                        content = await resp.content.read(30 * 1024)  # Reduced from 200 KB
                         html = content.decode("utf-8", errors="ignore").lower()
             else:
                 async with session.get(url, allow_redirects=True) as resp:
@@ -1109,16 +1110,13 @@ class Tools:
             chunks = self._chunk_text(markdown)
             if not chunks:
                 return None
-
             if self.valves.CACHE_FILTER_ENABLED:
                 # Throttle cache filter LLM calls to avoid overwhelming the model
                 async with self._cache_filter_llm_sem:
                     # Check if we have too many pending filter tasks
                     async with self._pending_filter_lock:
                         if self._pending_filter_tasks >= self._max_pending_filter_tasks:
-                            logger.debug(
-                                f"Too many pending cache filter tasks, skipping filter for {url}"
-                            )
+                            logger.debug(f"Too many pending cache filter tasks, skipping filter for {url}")
                             should_filter = False
                         else:
                             self._pending_filter_tasks += 1
@@ -1126,18 +1124,11 @@ class Tools:
                     if should_filter:
                         logger.info(f"Started background cache filter for {url}")
                         filter_task = asyncio.create_task(
-                            self._filter_and_update_cache(
-                                url, chunks.copy(), __event_emitter__
-                            )
+                            self._filter_and_update_cache(url, chunks.copy(), __event_emitter__)
                         )
-                        filter_task.add_done_callback(
-                            lambda _: self._decrement_filter_tasks()
-                        )
+                        filter_task.add_done_callback(lambda _: self._decrement_filter_tasks())
                     else:
                         filter_task = None
-                # Optionally emit a status update
-                # if __event_emitter__ and self.valves.MORE_STATUS:
-                #     await __event_emitter__(...)
             else:
                 filter_task = None
 
@@ -1172,6 +1163,11 @@ class Tools:
             if url in self._cache_locks and not self._cache_locks[url].locked():
                 del self._cache_locks[url]
         return filter_task
+
+    async def _decrement_filter_tasks(self):
+        """Decrement the pending filter task counter. Called when a filter task completes."""
+        async with self._pending_filter_lock:
+            self._pending_filter_tasks = max(0, self._pending_filter_tasks - 1)
 
     async def _filter_and_update_cache(
         self,
@@ -1254,15 +1250,6 @@ class Tools:
                         },
                     }
                 )
-        finally:
-            # Clean up the lock from the cache_locks dict after processing
-            if url in self._cache_locks and not self._cache_locks[url].locked():
-                del self._cache_locks[url]
-
-    async def _decrement_filter_tasks(self):
-        """Decrement the pending filter task counter. Called when a filter task completes."""
-        async with self._pending_filter_lock:
-            self._pending_filter_tasks = max(0, self._pending_filter_tasks - 1)
 
     async def _filter_chunks_with_llm(self, chunks: List[str]) -> Optional[List[bool]]:
         if not chunks:
@@ -1274,9 +1261,7 @@ class Tools:
             "Return ONLY a JSON array of booleans, one per fragment.\n\nFragments:\n"
         )
         for i, chunk in enumerate(chunks):
-            prompt += (
-                f"{i}: {chunk[:500]}\n"  # 500 chars kept for quality classification
-            )
+            prompt += f"{i}: {chunk[:500]}\n"
         prompt += "\nJSON array (no other text):"
         try:
             provider = self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
@@ -1326,11 +1311,9 @@ class Tools:
             logger.warning(f"Chunk filter LLM error: {e}. Using all True as fallback.")
         return [True] * len(chunks)
 
-    async def _get_cached_chunks(
-        self, url: str, query: str, max_chunks: int = 3
-    ) -> list:
+    async def _get_cached_chunks(self, url: str, query: str, max_chunks: int = 3) -> list:
         """Retrieve cached chunks without blocking the async event loop.
-        All ChromaDB access and embedding computations run in a thread via anyio."""
+           All ChromaDB access and embedding computations run in a thread via anyio."""
         if not self._get_embedder() or not self._get_cache_collection():
             return []
 
@@ -1374,21 +1357,15 @@ class Tools:
 
             filtered_docs, filtered_embs = zip(*filtered)
             if all(e is not None for e in filtered_embs):
-                query_vec = self._get_embedder().encode([query], convert_to_numpy=True)[
-                    0
-                ]
+                query_vec = self._get_embedder().encode([query], convert_to_numpy=True)[0]
                 chunk_matrix = np.array(filtered_embs)
                 q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
                 norms = np.linalg.norm(chunk_matrix, axis=1, keepdims=True) + 1e-10
                 c_norm = chunk_matrix / norms
                 similarities = c_norm @ q_norm
             else:
-                query_embedding = self._get_embedder().encode(
-                    [query], convert_to_numpy=True
-                )
-                chunk_embeddings = self._get_embedder().encode(
-                    list(filtered_docs), convert_to_numpy=True
-                )
+                query_embedding = self._get_embedder().encode([query], convert_to_numpy=True)
+                chunk_embeddings = self._get_embedder().encode(list(filtered_docs), convert_to_numpy=True)
                 query_vec = np.array(query_embedding[0])
                 query_norm = query_vec / np.linalg.norm(query_vec)
                 chunk_norms = chunk_embeddings / np.linalg.norm(
@@ -1922,6 +1899,24 @@ class Tools:
         max_tokens: int = 700,
         timeout: int = 120,
     ) -> str:
+        # Fast path: delegate to shared_resources (pure aiohttp, no threads)
+        if _SHARED_RESOURCES_AVAILABLE:
+            from shared_resources import call_llm as _shared_call_llm
+            try:
+                return await _shared_call_llm(
+                    prompt=prompt,
+                    system=system,
+                    base_url=self.valves.LLM_BASE_URL,
+                    model=provider or self.valves.LLM_PROVIDER,
+                    api_token=self.valves.LLM_API_TOKEN,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.warning(f"shared call_llm failed: {e}, using requests fallback")
+
+        # Fallback: original implementation using requests
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
         api_token = (
             self.valves.LLM_API_TOKEN.strip()
@@ -2026,139 +2021,145 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> List[str]:
         cache_key = _hashlib.sha256(query.lower().encode()).hexdigest()[:16]
-        cached = _HOMONYM_CACHE.get(cache_key)
-        if cached:
-            homonyms, cached_ts = cached
-            if _time.time() - cached_ts < _HOMONYM_CACHE_TTL:
-                if self.valves.DEBUG:
-                    logger.debug(f"Homonym cache HIT for: {query[:60]}")
-                homonyms_str = ", ".join(homonyms) if homonyms else "None"
+        # Per-key lock: prevents two coroutines from calling LLM with the same query
+        if cache_key not in _HOMONYM_CACHE_LOCKS:
+            _HOMONYM_CACHE_LOCKS[cache_key] = asyncio.Lock()
+        async with _HOMONYM_CACHE_LOCKS[cache_key]:
+            # Double-check inside the lock
+            cached = _HOMONYM_CACHE.get(cache_key)
+            if cached:
+                homonyms, cached_ts = cached
+                if _time.time() - cached_ts < _HOMONYM_CACHE_TTL:
+                    if self.valves.DEBUG:
+                        logger.debug(f"Homonym cache HIT for: {query[:60]}")
+                    homonyms_str = ", ".join(homonyms) if homonyms else "None"
+                    if __event_emitter__ and self.valves.MORE_STATUS:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"📦 Homonyms (cached): {homonyms_str}",
+                                    "done": False,
+                                },
+                            }
+                        )
+                    return homonyms
+
+            if __event_emitter__ and self.valves.MORE_STATUS:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "🔍 Detecting homonyms to avoid...",
+                            "done": False,
+                        },
+                    }
+                )
+
+            prompt = f"""List homonyms (alternative meanings) that must be avoided when searching for: "{query}"
+Do NOT include the original query or its words. Only list terms whose meanings could be confused with the query.
+If none, return an empty array.
+Output ONLY a JSON array of strings. Example for query "fresa": ["fresadora", "fresa dental"]
+"""
+            system_msg = "Return only a JSON array of homonyms. No other text."
+
+            try:
+                provider = self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
+                content = await self._call_llm(
+                    prompt=prompt,
+                    system=system_msg,
+                    provider=provider,
+                    temperature=0.2,
+                    max_tokens=4000,
+                    timeout=300,
+                )
+            except Exception as e:
+                logger.error(f"Homonym detection error: {e}")
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "⚠️ Homonym detection failed, skipping pre-filter.",
+                                "done": False,
+                            },
+                        }
+                    )
+                return []
+
+            if content:
+                content = re.sub(r"```(?:json)?\s*", "", content)
+                content = re.sub(r"```", "", content)
+                brace_idx = content.find("[")
+                if brace_idx != -1:
+                    content = content[brace_idx:]
+                last_brace = content.rfind("]")
+                if last_brace != -1:
+                    content = content[: last_brace + 1]
+                content = content.strip()
+
+            if not content:
                 if __event_emitter__ and self.valves.MORE_STATUS:
                     await __event_emitter__(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"📦 Homonyms (cached): {homonyms_str}",
+                                "description": "🔍 Homonyms detected: None",
                                 "done": False,
                             },
                         }
                     )
-                return homonyms
+                _HOMONYM_CACHE[cache_key] = ([], _time.time())
+                return []
 
-        if __event_emitter__ and self.valves.MORE_STATUS:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "🔍 Detecting homonyms to avoid...",
-                        "done": False,
-                    },
-                }
-            )
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    homonyms = [
+                        h.strip().lower()
+                        for h in parsed
+                        if h.strip().lower() not in ("none", "ninguno", "n/a", "-")
+                    ]
+                else:
+                    homonyms = parsed.get("homonyms", [])
+            except json.JSONDecodeError:
+                homonyms = self._extract_homonyms_from_llm_response(content)
 
-        prompt = f"""List homonyms (alternative meanings) that must be avoided when searching for: "{query}"
-Do NOT include the original query or its words. Only list terms whose meanings could be confused with the query.
-If none, return an empty array.
-Output ONLY a JSON array of strings. Example for query "fresa": ["fresadora", "fresa dental"]
-"""
-        system_msg = "Return only a JSON array of homonyms. No other text."
+            _HOMONYM_CACHE[cache_key] = (homonyms, _time.time())
+            if len(_HOMONYM_CACHE) > 200:
+                _HOMONYM_CACHE.popitem(last=False)  # remove oldest (FIFO)
+            _HOMONYM_CACHE_LOCKS.pop(cache_key, None)
 
-        try:
-            provider = self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
-            content = await self._call_llm(
-                prompt=prompt,
-                system=system_msg,
-                provider=provider,
-                temperature=0.2,
-                max_tokens=4000,
-                timeout=300,
-            )
-        except Exception as e:
-            logger.error(f"Homonym detection error: {e}")
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "⚠️ Homonym detection failed, skipping pre-filter.",
-                            "done": False,
-                        },
-                    }
-                )
-            return []
-
-        if content:
-            content = re.sub(r"```(?:json)?\s*", "", content)
-            content = re.sub(r"```", "", content)
-            brace_idx = content.find("[")
-            if brace_idx != -1:
-                content = content[brace_idx:]
-            last_brace = content.rfind("]")
-            if last_brace != -1:
-                content = content[: last_brace + 1]
-            content = content.strip()
-
-        if not content:
+            homonyms_str = ", ".join(homonyms) if homonyms else "None"
+            if self.valves.DEBUG:
+                logger.info(f"Homonyms detected (stored in cache): {homonyms}")
             if __event_emitter__ and self.valves.MORE_STATUS:
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": "🔍 Homonyms detected: None",
+                            "description": f"🔍 Homonyms detected: {homonyms_str}",
                             "done": False,
                         },
                     }
                 )
-            _HOMONYM_CACHE[cache_key] = ([], _time.time())
-            return []
 
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                homonyms = [
-                    h.strip().lower()
-                    for h in parsed
-                    if h.strip().lower() not in ("none", "ninguno", "n/a", "-")
-                ]
-            else:
-                homonyms = parsed.get("homonyms", [])
-        except json.JSONDecodeError:
-            homonyms = self._extract_homonyms_from_llm_response(content)
+            try:
+                tokens_used = await self._estimate_llm_call_tokens(prompt, content)
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"🔍 Homonym detection used {tokens_used} tokens.",
+                                "done": False,
+                            },
+                        }
+                    )
+            except Exception:
+                pass
 
-        _HOMONYM_CACHE[cache_key] = (homonyms, _time.time())
-        if len(_HOMONYM_CACHE) > 200:
-            del _HOMONYM_CACHE[next(iter(_HOMONYM_CACHE))]
-
-        homonyms_str = ", ".join(homonyms) if homonyms else "None"
-        if self.valves.DEBUG:
-            logger.info(f"Homonyms detected (stored in cache): {homonyms}")
-        if __event_emitter__ and self.valves.MORE_STATUS:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"🔍 Homonyms detected: {homonyms_str}",
-                        "done": False,
-                    },
-                }
-            )
-
-        try:
-            tokens_used = await self._estimate_llm_call_tokens(prompt, content)
-            if __event_emitter__ and self.valves.MORE_STATUS:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"🔍 Homonym detection used {tokens_used} tokens.",
-                            "done": False,
-                        },
-                    }
-                )
-        except Exception:
-            pass
-
-        return homonyms
+            return homonyms
 
     async def _expand_query_with_llm(
         self,
@@ -2169,36 +2170,41 @@ Output ONLY a JSON array of strings. Example for query "fresa": ["fresadora", "f
             return [query]
 
         cache_key = _hashlib.sha256(query.lower().encode()).hexdigest()[:16]
-        cached = _EXPANSION_CACHE.get(cache_key)
-        if cached:
-            cached_queries, cached_ts = cached
-            if _time.time() - cached_ts < _EXPANSION_CACHE_TTL:
-                if self.valves.DEBUG:
-                    logger.debug(f"Expansion cache HIT for: {query[:60]}")
-                if __event_emitter__ and self.valves.MORE_STATUS:
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"📦 Using cached expansion ({len(cached_queries)} terms).",
-                                "done": False,
-                            },
-                        }
-                    )
-                return cached_queries
+        # Per-key lock: prevents two coroutines from calling LLM with the same query
+        if cache_key not in _EXPANSION_CACHE_LOCKS:
+            _EXPANSION_CACHE_LOCKS[cache_key] = asyncio.Lock()
+        async with _EXPANSION_CACHE_LOCKS[cache_key]:
+            # Double-check inside the lock
+            cached = _EXPANSION_CACHE.get(cache_key)
+            if cached:
+                cached_queries, cached_ts = cached
+                if _time.time() - cached_ts < _EXPANSION_CACHE_TTL:
+                    if self.valves.DEBUG:
+                        logger.debug(f"Expansion cache HIT for: {query[:60]}")
+                    if __event_emitter__ and self.valves.MORE_STATUS:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"📦 Using cached expansion ({len(cached_queries)} terms).",
+                                    "done": False,
+                                },
+                            }
+                        )
+                    return cached_queries
 
-        if __event_emitter__ and self.valves.MORE_STATUS:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "🧠 Generating related search terms...",
-                        "done": False,
-                    },
-                }
-            )
+            if __event_emitter__ and self.valves.MORE_STATUS:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "🧠 Generating related search terms...",
+                            "done": False,
+                        },
+                    }
+                )
 
-        prompt = f"""You are a search query expander. Given the original query, generate {self.valves.MAX_EXPANDED_QUERIES} related search terms. Each term must stay under 10 words and include disambiguating context if the subject is ambiguous.
+            prompt = f"""You are a search query expander. Given the original query, generate {self.valves.MAX_EXPANDED_QUERIES} related search terms. Each term must stay under 10 words and include disambiguating context if the subject is ambiguous.
 
 Original query: "{query}"
 
@@ -2206,151 +2212,152 @@ Output ONLY a JSON array of strings. Example: ["fresa fruta clasificación", "Fr
 
 Now output your JSON array:
 """
-        system_msg = "You only output a JSON array of strings. No other text."
-
-        try:
-            provider = self.valves.EXPANSION_LLM_PROVIDER or self.valves.LLM_PROVIDER
-            content = await self._call_llm(
-                prompt=prompt,
-                system=system_msg,
-                provider=provider,
-                temperature=0.2,
-                max_tokens=4000,
-                timeout=300,
-            )
-        except Exception as e:
-            logger.error(f"Query expansion error: {e}")
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "⚠️ Query expansion failed. Using original query.",
-                            "done": False,
-                        },
-                    }
-                )
-            return [query]
-
-        if content:
-            content = re.sub(r"```(?:json)?\s*", "", content)
-            content = re.sub(r"```", "", content)
-            brace_idx = content.find("[")
-            if brace_idx != -1:
-                content = content[brace_idx:]
-            last_brace = content.rfind("]")
-            if last_brace != -1:
-                content = content[: last_brace + 1]
-            content = content.strip()
-
-        if not content:
-            logger.warning(
-                "Query expansion: LLM returned empty content after cleaning."
-            )
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "⚠️ Could not parse expanded queries. Using original query.",
-                            "done": False,
-                        },
-                    }
-                )
-            return [query]
-
-        related_queries = None
-
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                related_queries = parsed
-            elif isinstance(parsed, dict) and "queries" in parsed:
-                related_queries = parsed["queries"]
-        except json.JSONDecodeError:
-            arr_match = re.search(r"\[.*\]", content, re.DOTALL)
-            if arr_match:
-                try:
-                    related_queries = json.loads(arr_match.group())
-                except json.JSONDecodeError:
-                    pass
-
-        if related_queries is None:
-            logger.warning(
-                f"Query expansion: could not parse JSON. Raw (cleaned) first 500 chars: {content[:500]}"
-            )
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "⚠️ Could not parse expanded queries. Using original query.",
-                            "done": False,
-                        },
-                    }
-                )
-            return [query]
-
-        if isinstance(related_queries, list):
-            related_queries = [
-                str(q).strip() for q in related_queries if q and str(q).strip()
-            ]
-            all_queries = [query]
-            for q in related_queries[: self.valves.MAX_EXPANDED_QUERIES]:
-                if q and q.lower() != query.lower() and q not in all_queries:
-                    all_queries.append(q)
-
-            _EXPANSION_CACHE[cache_key] = (all_queries, _time.time())
-            if len(_EXPANSION_CACHE) > 200:
-                del _EXPANSION_CACHE[next(iter(_EXPANSION_CACHE))]
-
-            if self.valves.DEBUG:
-                logger.info(
-                    f"Query expansion (stored in cache): {query} -> {all_queries}"
-                )
+            system_msg = "You only output a JSON array of strings. No other text."
 
             try:
-                tokens_used = await self._estimate_llm_call_tokens(prompt, content)
-                if __event_emitter__ and self.valves.MORE_STATUS:
+                provider = self.valves.EXPANSION_LLM_PROVIDER or self.valves.LLM_PROVIDER
+                content = await self._call_llm(
+                    prompt=prompt,
+                    system=system_msg,
+                    provider=provider,
+                    temperature=0.2,
+                    max_tokens=4000,
+                    timeout=300,
+                )
+            except Exception as e:
+                logger.error(f"Query expansion error: {e}")
+                if __event_emitter__:
                     await __event_emitter__(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"🧠 Query expansion used {tokens_used} tokens.",
+                                "description": "⚠️ Query expansion failed. Using original query.",
                                 "done": False,
                             },
                         }
                     )
-            except Exception:
-                pass
+                return [query]
 
-            if __event_emitter__ and self.valves.MORE_STATUS:
-                lines = [f"  • {q}" for q in all_queries]
-                expanded_list = "\n".join(lines)
+            if content:
+                content = re.sub(r"```(?:json)?\s*", "", content)
+                content = re.sub(r"```", "", content)
+                brace_idx = content.find("[")
+                if brace_idx != -1:
+                    content = content[brace_idx:]
+                last_brace = content.rfind("]")
+                if last_brace != -1:
+                    content = content[: last_brace + 1]
+                content = content.strip()
+
+            if not content:
+                logger.warning(
+                    "Query expansion: LLM returned empty content after cleaning."
+                )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "⚠️ Could not parse expanded queries. Using original query.",
+                                "done": False,
+                            },
+                        }
+                    )
+                return [query]
+
+            related_queries = None
+
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    related_queries = parsed
+                elif isinstance(parsed, dict) and "queries" in parsed:
+                    related_queries = parsed["queries"]
+            except json.JSONDecodeError:
+                arr_match = re.search(r"\[.*\]", content, re.DOTALL)
+                if arr_match:
+                    try:
+                        related_queries = json.loads(arr_match.group())
+                    except json.JSONDecodeError:
+                        pass
+
+            if related_queries is None:
+                logger.warning(
+                    f"Query expansion: could not parse JSON. Raw (cleaned) first 500 chars: {content[:500]}"
+                )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "⚠️ Could not parse expanded queries. Using original query.",
+                                "done": False,
+                            },
+                        }
+                    )
+                return [query]
+
+            if isinstance(related_queries, list):
+                related_queries = [
+                    str(q).strip() for q in related_queries if q and str(q).strip()
+                ]
+                all_queries = [query]
+                for q in related_queries[: self.valves.MAX_EXPANDED_QUERIES]:
+                    if q and q.lower() != query.lower() and q not in all_queries:
+                        all_queries.append(q)
+
+                _EXPANSION_CACHE[cache_key] = (all_queries, _time.time())
+                if len(_EXPANSION_CACHE) > 200:
+                    _EXPANSION_CACHE.popitem(last=False)  # remove oldest (FIFO)
+                _EXPANSION_CACHE_LOCKS.pop(cache_key, None)
+
+                if self.valves.DEBUG:
+                    logger.info(
+                        f"Query expansion (stored in cache): {query} -> {all_queries}"
+                    )
+
+                try:
+                    tokens_used = await self._estimate_llm_call_tokens(prompt, content)
+                    if __event_emitter__ and self.valves.MORE_STATUS:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"🧠 Query expansion used {tokens_used} tokens.",
+                                    "done": False,
+                                },
+                            }
+                        )
+                except Exception:
+                    pass
+
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    lines = [f"  • {q}" for q in all_queries]
+                    expanded_list = "\n".join(lines)
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"🔍 Will search using {len(all_queries)} terms (including original):\n{expanded_list}",
+                                "done": False,
+                            },
+                        }
+                    )
+
+                return all_queries
+
+            logger.warning("Query expansion: extracted queries not a list")
+            if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"🔍 Will search using {len(all_queries)} terms (including original):\n{expanded_list}",
+                            "description": "⚠️ Could not parse expanded queries. Using original query.",
                             "done": False,
                         },
                     }
                 )
-
-            return all_queries
-
-        logger.warning("Query expansion: extracted queries not a list")
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "⚠️ Could not parse expanded queries. Using original query.",
-                        "done": False,
-                    },
-                }
-            )
-        return [query]
+            return [query]
 
     async def _search_all_queries(
         self,
@@ -2383,13 +2390,14 @@ Now output your JSON array:
                 f"|searxng={int(self.valves.SEARCH_WITH_SEARXNG)}"
             )
             ck = _hashlib.sha256(_cache_flags.encode()).hexdigest()[:16]
-            cached = _SEARCH_RESULT_CACHE.get(ck)
-            if cached:
-                results, ts = cached
-                if _time.time() - ts < _SEARCH_RESULT_CACHE_TTL:
-                    if self.valves.DEBUG:
-                        logger.debug(f"Search result cache HIT for: {q[:50]}")
-                    return q, results
+            async with _SEARCH_RESULT_CACHE_LOCK:
+                cached = _SEARCH_RESULT_CACHE.get(ck)
+                if cached:
+                    results, ts = cached
+                    if _time.time() - ts < _SEARCH_RESULT_CACHE_TTL:
+                        if self.valves.DEBUG:
+                            logger.debug(f"Search result cache HIT for: {q[:50]}")
+                        return q, results
 
             rich_results = []
             tasks = []
@@ -2407,9 +2415,10 @@ Now output your JSON array:
                             seen.add(url)
                             rich_results.append(item)
 
-            _SEARCH_RESULT_CACHE[ck] = (rich_results, _time.time())
-            if len(_SEARCH_RESULT_CACHE) > 100:
-                del _SEARCH_RESULT_CACHE[next(iter(_SEARCH_RESULT_CACHE))]
+            async with _SEARCH_RESULT_CACHE_LOCK:
+                _SEARCH_RESULT_CACHE[ck] = (rich_results, _time.time())
+                if len(_SEARCH_RESULT_CACHE) > 100:
+                    _SEARCH_RESULT_CACHE.popitem(last=False)
 
             return q, rich_results
 
@@ -2474,9 +2483,7 @@ Now output your JSON array:
             return urls
 
         if self._detected_homonyms is None:
-            self._detected_homonyms = await self._detect_homonyms_llm(
-                query, __event_emitter__
-            )
+            self._detected_homonyms = await self._detect_homonyms_llm(query, __event_emitter__)
 
         detected = self._detected_homonyms or []
         if detected:
@@ -2484,18 +2491,14 @@ Now output your JSON array:
             for url in urls:
                 slug = urlparse(url).path.lower().replace("_", " ").replace("-", " ")
                 if not any(
-                    re.search(
-                        rf"\b{re.escape(h.replace('_',' ').replace('-',' '))}\b", slug
-                    )
+                    re.search(rf"\b{re.escape(h.replace('_',' ').replace('-',' '))}\b", slug)
                     for h in detected
                 ):
                     pre_filtered.append(url)
             removed = len(urls) - len(pre_filtered)
             if removed > 0:
                 if self.valves.DEBUG:
-                    logger.info(
-                        f"Pre-filter removed {removed} URLs by homonym slug match"
-                    )
+                    logger.info(f"Pre-filter removed {removed} URLs by homonym slug match")
                 if __event_emitter__ and self.valves.MORE_STATUS:
                     await __event_emitter__(
                         {
@@ -2514,19 +2517,13 @@ Now output your JSON array:
         BATCH_SIZE = 10  # Process URLs in batches to keep prompt within context window
         all_decisions = []
 
-        async def _fetch_title(
-            url: str, session: aiohttp.ClientSession
-        ) -> tuple[str, str]:
+        async def _fetch_title(url: str, session: aiohttp.ClientSession) -> tuple[str, str]:
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
-                        content = await resp.content.read(
-                            8 * 1024
-                        )  # 8 KB is enough for title
+                        content = await resp.content.read(8 * 1024)  # 8 KB is enough for title
                         html = content.decode("utf-8", errors="ignore").lower()
-                        title_match = re.search(
-                            r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE
-                        )
+                        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE)
                         if title_match:
                             return url, title_match.group(1).strip()[:200]
             except Exception as e:
@@ -2534,22 +2531,18 @@ Now output your JSON array:
                     logger.debug(f"Could not fetch title for {url}: {e}")
             return url, ""
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5),
-            headers={"User-Agent": self.valves.CRAWL4AI_USER_AGENT},
-        ) as session:
-            for i in range(0, len(urls), BATCH_SIZE):
-                batch = urls[i : i + BATCH_SIZE]
-                titles = dict(
-                    await asyncio.gather(*[_fetch_title(u, session) for u in batch])
-                )
+        # Reuse the shared HTTP session for fetching titles
+        title_session = await get_http_session(5)
+        for i in range(0, len(urls), BATCH_SIZE):
+            batch = urls[i : i + BATCH_SIZE]
+            titles = dict(await asyncio.gather(*[_fetch_title(u, title_session) for u in batch]))
 
-                homonym_context = ""
-                if detected:
-                    homonym_list = ", ".join(detected)
-                    homonym_context = f"\nPre-detected homonyms (MUST REJECT pages about these): {homonym_list}\n"
+            homonym_context = ""
+            if detected:
+                homonym_list = ", ".join(detected)
+                homonym_context = f"\nPre-detected homonyms (MUST REJECT pages about these): {homonym_list}\n"
 
-                prompt = f"""You are a URL relevance filter. For each URL, decide KEEP or REJECT based on whether it is about the exact concept of the query.
+            prompt = f"""You are a URL relevance filter. For each URL, decide KEEP or REJECT based on whether it is about the exact concept of the query.
 
 Query: "{query}"
 {homonym_context}
@@ -2562,75 +2555,60 @@ Output ONLY a JSON array of decision objects. Example:
 
 Now evaluate these URLs:
 """
-                for idx, url in enumerate(batch, 1):
-                    prompt += f"{idx}. {url} — Title: {titles.get(url, 'N/A')}\n"
+            for idx, url in enumerate(batch, 1):
+                prompt += f"{idx}. {url} — Title: {titles.get(url, 'N/A')}\n"
 
-                content = ""
-                try:
-                    provider = (
-                        self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
-                    )
-                    content = await self._call_llm(
-                        prompt=prompt,
-                        system="Return only a JSON array of decisions. No other text.",
-                        provider=provider,
-                        temperature=0.2,
-                        max_tokens=8000,
-                        timeout=300,
-                    )
-                except Exception as e:
-                    logger.error(f"LLM URL filter error: {e}\n{traceback.format_exc()}")
-                    all_decisions.extend(
-                        [
-                            {"index": i + j + 1, "decision": "KEEP"}
-                            for j in range(len(batch))
-                        ]
-                    )
-                    continue
+            content = ""
+            try:
+                provider = self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
+                content = await self._call_llm(
+                    prompt=prompt,
+                    system="Return only a JSON array of decisions. No other text.",
+                    provider=provider,
+                    temperature=0.2,
+                    max_tokens=8000,
+                    timeout=300,
+                )
+            except Exception as e:
+                logger.error(f"LLM URL filter error: {e}\n{traceback.format_exc()}")
+                all_decisions.extend(
+                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                )
+                continue
 
-                if not content or not content.strip():
-                    logger.warning(
-                        "LLM URL filter: empty response for batch, keeping all"
-                    )
-                    all_decisions.extend(
-                        [
-                            {"index": i + j + 1, "decision": "KEEP"}
-                            for j in range(len(batch))
-                        ]
-                    )
-                    continue
+            if not content or not content.strip():
+                logger.warning("LLM URL filter: empty response for batch, keeping all")
+                all_decisions.extend(
+                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                )
+                continue
 
-                content = re.sub(r"```(?:json)?\s*", "", content)
-                content = re.sub(r"```", "", content)
-                brace_idx = content.find("[")
-                if brace_idx != -1:
-                    content = content[brace_idx:]
-                last_brace = content.rfind("]")
-                if last_brace != -1:
-                    content = content[: last_brace + 1]
+            content = re.sub(r"```(?:json)?\s*", "", content)
+            content = re.sub(r"```", "", content)
+            brace_idx = content.find("[")
+            if brace_idx != -1:
+                content = content[brace_idx:]
+            last_brace = content.rfind("]")
+            if last_brace != -1:
+                content = content[: last_brace + 1]
 
-                try:
-                    batch_decisions = json.loads(content)
-                    if isinstance(batch_decisions, list):
-                        for d in batch_decisions:
-                            if isinstance(d, dict) and "decision" in d:
-                                original_index = d.get("index", 0)
-                                all_decisions.append(
-                                    {
-                                        "index": original_index + i,
-                                        "decision": d["decision"],
-                                    }
-                                )
-                    else:
-                        raise ValueError("Not a list")
-                except (json.JSONDecodeError, ValueError):
-                    logger.warning("Could not parse LLM decision JSON, keeping all")
-                    all_decisions.extend(
-                        [
-                            {"index": i + j + 1, "decision": "KEEP"}
-                            for j in range(len(batch))
-                        ]
-                    )
+            try:
+                batch_decisions = json.loads(content)
+                if isinstance(batch_decisions, list):
+                    for d in batch_decisions:
+                        if isinstance(d, dict) and "decision" in d:
+                            original_index = d.get("index", 0)
+                            all_decisions.append({
+                                "index": original_index + i,
+                                "decision": d["decision"],
+                            })
+                else:
+                    raise ValueError("Not a list")
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Could not parse LLM decision JSON, keeping all")
+                all_decisions.extend(
+                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                )
 
         keep_indices = {
             d["index"] - 1
@@ -2671,29 +2649,22 @@ Now evaluate these URLs:
     # region ── Image Validation ───────────────────────────────────────────────
 
     async def _validate_image_url(self, url: str) -> bool:
-        # Limit concurrent image HEAD requests
         async with self._image_validation_sem:
             try:
                 if not self.valves.CRAWL4AI_VALIDATE_IMAGES:
                     return True
 
-                timeout = aiohttp.ClientTimeout(total=4)
                 url = url.strip()
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
-                async with aiohttp.ClientSession(
-                    timeout=timeout,
-                    headers=headers,
-                    skip_auto_headers={"Accept-Encoding", "Content-Type"},
-                ) as session:
-                    async with session.head(url, allow_redirects=True) as response:
-                        if response.status != 200:
-                            return False
-                        content_type = response.headers.get("Content-Type", "").lower()
-                        if not content_type.startswith("image/"):
-                            return False
-                        return True
+                # Reuse the validation session to avoid creating a new session per image
+                session = await self._get_validation_session()
+                per_req_timeout = aiohttp.ClientTimeout(total=4)
+                async with session.head(
+                    url, allow_redirects=True, timeout=per_req_timeout
+                ) as response:
+                    if response.status != 200:
+                        return False
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    return content_type.startswith("image/")
             except Exception:
                 return False
 
@@ -2763,17 +2734,16 @@ Now evaluate these URLs:
         timeout = aiohttp.ClientTimeout(total=self.valves.SEARXNG_TIMEOUT)
 
         try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                if self.valves.SEARXNG_METHOD == "POST":
-                    async with session.post(
-                        url, json={"q": query, "format": "json"}, timeout=timeout
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                else:
-                    async with session.get(url, timeout=timeout) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
+            # Reuse the shared HTTP session instead of creating a new one each time
+            session = await get_http_session(self.valves.SEARXNG_TIMEOUT)
+            if self.valves.SEARXNG_METHOD == "POST":
+                async with session.post(url, json={"q": query, "format": "json"}, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            else:
+                async with session.get(url, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Error searching SearXNG: {str(e)}")
             return []
@@ -3885,9 +3855,7 @@ Now evaluate these URLs:
         current_query = query
         gathered_for_round = gathered_urls
         user_provided_for_round = user_provided_urls
-        round_start_pages = (
-            self.pages_crawled
-        )  # Track pages at start of round for correct budget decay
+        round_start_pages = self.pages_crawled  # Track pages at start of round for correct budget decay
 
         while round_num <= max_rounds:
             if round_num == 1:
@@ -4318,7 +4286,8 @@ Generate ONLY the new query string, nothing else."""
 
         # Cap total timeout to avoid blocking the batch for too long
         timeout = min(
-            self.valves.CRAWL4AI_TIMEOUT * len(urls) + 60, 300  # 5 minutes max
+            self.valves.CRAWL4AI_TIMEOUT * len(urls) + 60,
+            300  # 5 minutes max
         )
         try:
             async with aiohttp.ClientSession() as session:
@@ -5216,4 +5185,3 @@ Generate ONLY the new query string, nothing else."""
         return results
 
     # endregion
-

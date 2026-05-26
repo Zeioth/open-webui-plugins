@@ -380,6 +380,10 @@ class Filter:
         ltm_include_timestamps: bool = Field(default=True)
 
         LLM_CACHE_TTL: int = Field(default=300)
+        LLM_CACHE_MAX_SIZE: int = Field(
+            default=100,
+            description="Maximum number of cached LLM responses in RAM.",
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -451,13 +455,31 @@ class Filter:
         # Counter for periodic WAL checkpoints (every 100 writes)
         self._write_counter = 0
 
-        # Schedule periodic response cache cleanup
-        if self.valves.enable_response_cache and HAS_CHROMA:
-            self._response_cache_cleanup_task = asyncio.create_task(
-                self._periodic_response_cache_cleanup()
-            )
+        # Lazy start of response cache cleanup task (will be done in first inlet())
+        self._response_cache_cleanup_task: Optional[asyncio.Task] = None
 
-        print("[CodeAware] Filter loaded")
+        # Cache for session classification to avoid repeated LLM calls
+        self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
+        self._session_classify_ttl: float = 300.0  # 5 minutes
+
+        print("[CodeAware] Filter loaded (v5.25.0)")
+
+    def _ensure_cleanup_task(self) -> None:
+        """Start the periodic cleanup task if it hasn't been created yet."""
+        if (
+            not self.valves.enable_response_cache
+            or not HAS_CHROMA
+            or self._response_cache_cleanup_task is not None
+        ):
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                self._response_cache_cleanup_task = asyncio.create_task(
+                    self._periodic_response_cache_cleanup()
+                )
+        except RuntimeError:
+            pass
 
     async def _get_project_lock(self, project_id: str) -> asyncio.Lock:
         async with self._lock_lock:
@@ -636,7 +658,13 @@ class Filter:
             name=f"response_cache_{self.valves.project_id or 'default'}",
             metadata={"hnsw:space": "cosine"},
         )
-        self._purge_expired_memories()
+        # purge expired memories (will be scheduled as async task if loop running)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self._purge_expired_memories())
+        except RuntimeError:
+            pass
         self._log_debug("LTM ready")
 
     async def _purge_expired_memories(self):
@@ -658,7 +686,7 @@ class Filter:
 
     def _init_llm_cache(self):
         ttl = self.valves.LLM_CACHE_TTL
-        max_size = 100
+        max_size = self.valves.LLM_CACHE_MAX_SIZE
         if _SHARED_RESOURCES_AVAILABLE:
             return _AsyncLRUCache(max_size=max_size, ttl=ttl)
         import asyncio as _asyncio, time as _t
@@ -724,39 +752,74 @@ class Filter:
                 models_to_try.append(m)
                 seen.add(m)
 
-        if _SHARED_RESOURCES_AVAILABLE:
+        max_retries = 2
+        base_delay = 1.0
+
+        for model in models_to_try:
+            cache_key = hashlib.md5(
+                f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
+            ).hexdigest()
+            cached = await self._llm_cache.get(cache_key)
+            if cached is not None:
+                self._log_debug(f"LLM cache hit for model {model}")
+                return cached
+
+            # Fast path: delegate to shared_resources (pure aiohttp, no threads)
+            if _SHARED_RESOURCES_AVAILABLE:
+                from shared_resources import call_llm as _shared_call_llm
+
+                for attempt in range(max_retries + 1):
+                    try:
+                        async with self._llm_semaphore:
+                            content = await _shared_call_llm(
+                                prompt=prompt,
+                                system=system_prompt,
+                                base_url=self.valves.LLM_BASE_URL,
+                                model=model,
+                                api_token=self.valves.LLM_API_TOKEN,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                timeout=self.valves.llm_request_timeout,
+                            )
+                        if content:
+                            await self._llm_cache.set(cache_key, content)
+                            return content
+                    except RuntimeError as exc:
+                        status_hint = str(exc)
+                        if any(
+                            c in status_hint
+                            for c in ("429", "500", "502", "503", "504")
+                        ):
+                            if attempt < max_retries:
+                                await asyncio.sleep(base_delay * (2**attempt))
+                                continue
+                        break
+                    except Exception as exc:
+                        if attempt < max_retries:
+                            await asyncio.sleep(base_delay * (2**attempt))
+                            continue
+                        logger.warning(f"shared call_llm failed after retries: {exc}")
+                        break
+                continue  # try next model if this one failed
+
+            # Fallback: original implementation using the shared HTTP session
             try:
                 http_session = await _shared_get_http_session(
                     self.valves.llm_request_timeout
                 )
             except Exception:
                 http_session = self._http_session
-        else:
-            http_session = self._http_session
-
-        if http_session is None:
-            return None
-
-        max_retries = 2
-        base_delay = 1.0
-
-        for model in models_to_try:
-            model_name = (
-                model.split("/", 1)[1]
-                if is_ollama and model.startswith("ollama/")
-                else model
-            )
-            cache_key = hashlib.md5(
-                f"{model_name}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
-            ).hexdigest()
-            cached = await self._llm_cache.get(cache_key)
-            if cached is not None:
-                self._log_debug(f"LLM cache hit for model {model_name}")
-                return cached
+            if http_session is None:
+                continue
 
             for attempt in range(max_retries + 1):
                 try:
                     async with self._llm_semaphore:
+                        model_name = (
+                            model.split("/", 1)[1]
+                            if is_ollama and model.startswith("ollama/")
+                            else model
+                        )
                         if is_ollama:
                             url = f"{base_url}/api/generate"
                             payload = {
@@ -1159,20 +1222,42 @@ class Filter:
         return ContentType.GENERAL
 
     async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
+        # Use cache to avoid repeated LLM calls for the same project + last user message
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        cache_key = None
+        if last_user:
+            content_key = last_user.get("content", "")[:200]
+            cache_key = (
+                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
+            )
+            cached = self._session_classify_cache.get(cache_key)
+            if cached is not None:
+                result, ts = cached
+                if time.time() - ts < self._session_classify_ttl:
+                    self._log_debug(
+                        f"Session classify cache hit → {'code' if result else 'non-code'}"
+                    )
+                    return result
+
         state = self._get_state(project_id)
         if state and state.get("active_blocks"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
             self._log_debug("Session classified as code (existing blocks)")
             return True
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
             if self._has_code_indicators(msg.get("content", "")):
+                if cache_key:
+                    self._session_classify_cache[cache_key] = (True, time.time())
                 self._log_debug("Session classified as code (heuristic)")
                 return True
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if not last_user_msg:
+        if not last_user:
+            if cache_key:
+                self._session_classify_cache[cache_key] = (False, time.time())
             self._log_debug("Session classified as non-code (no user message)")
             return False
         model = (
@@ -1180,7 +1265,7 @@ class Filter:
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"Is the following user message about programming/code? Answer only 'yes' or 'no'.\n\nMessage: {last_user_msg.get('content','')[:500]}"
+        prompt = f"Is the following user message about programming/code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:500]}"
         self._log_debug("Classifying session with LLM...")
         response = await self._call_llm(
             prompt=prompt,
@@ -1190,6 +1275,15 @@ class Filter:
             temperature=0.0,
         )
         result = response and response.strip().lower().startswith("yes")
+        if cache_key:
+            self._session_classify_cache[cache_key] = (result, time.time())
+            # Simple FIFO eviction when cache grows too large
+            if len(self._session_classify_cache) > 500:
+                oldest = min(
+                    self._session_classify_cache,
+                    key=lambda k: self._session_classify_cache[k][1],
+                )
+                del self._session_classify_cache[oldest]
         self._log_debug(
             f"LLM classification result: {'code' if result else 'non-code'}"
         )
@@ -1281,8 +1375,6 @@ class Filter:
             state = self._get_state(project_id)
             if self.valves.auto_remove_duplicate_blocks:
                 self._remove_duplicate_blocks(state)
-
-            # Launch summarization of inactive blocks and track the task
             task = asyncio.create_task(
                 self._summarize_inactive_blocks_safely(project_id)
             )
@@ -1648,20 +1740,12 @@ class Filter:
                 return True
         return False
 
-    def _cleanup_completed_tasks(self):
-        """Remove references to completed tasks to free memory."""
-        self._hierarchical_compress_tasks = [
-            t for t in self._hierarchical_compress_tasks if not t.done()
-        ]
-        self._summarize_tasks = [t for t in self._summarize_tasks if not t.done()]
-        self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
-
     def shutdown(self):
         """Cancel all pending background tasks when the plugin is unloaded."""
         # Cancel the periodic response cache cleanup task
         if (
             hasattr(self, "_response_cache_cleanup_task")
-            and self._response_cache_cleanup_task
+            and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
             self._log_debug("Response cache cleanup task cancelled")
@@ -1688,10 +1772,19 @@ class Filter:
                 task.cancel()
             self._log_debug(f"Cancelled {len(self._dependency_tasks)} dependency tasks")
 
+    def _cleanup_completed_tasks(self):
+        """Remove references to completed tasks to free memory."""
+        self._hierarchical_compress_tasks = [
+            t for t in self._hierarchical_compress_tasks if not t.done()
+        ]
+        self._summarize_tasks = [t for t in self._summarize_tasks if not t.done()]
+        self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
+
     # region ── Inlet ─────────────────────────────────────────────────────────
 
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
+        self._ensure_cleanup_task()
         messages = body.get("messages", [])
         project_id = self._get_project_id()
         if not messages:
@@ -2243,13 +2336,14 @@ class Filter:
                     context_hash,
                     state,
                 )
-        self._purge_expired_memories()
+        asyncio.create_task(self._purge_expired_memories())
         self._clean_llm_cache()
 
         # Periodic WAL checkpoints to reclaim disk space
         self._write_counter += 1
         if self._write_counter % 100 == 0:
             asyncio.create_task(self._run_db_checkpoints())
+            self._cleanup_completed_tasks()  # Clean task references periodically
 
         return body
 
@@ -2542,37 +2636,39 @@ class Filter:
 
     async def _expire_blocks_by_time(self, project_id: str):
         """Remove blocks that haven't been mentioned for a long time."""
-        state = self._get_state(project_id)
-        if not state:
-            return
-        now = time.time()
-        expiration_seconds = self.valves.block_expiration_hours * 3600
-        to_remove = []
-        for h, block in state["active_blocks"].items():
-            if block.pinned or block.obsolete:
-                continue
-            age = now - block.last_mentioned
-            if (
-                block.content_type == ContentType.ERROR
-                and self.valves.error_retention_turns > 0
-            ):
-                if age > max(
-                    self.valves.error_retention_turns * 300, expiration_seconds
+        lock = await self._get_project_lock(project_id)
+        async with lock:
+            state = self._get_state(project_id)
+            if not state:
+                return
+            now = time.time()
+            expiration_seconds = self.valves.block_expiration_hours * 3600
+            to_remove = []
+            for h, block in state["active_blocks"].items():
+                if block.pinned or block.obsolete:
+                    continue
+                age = now - block.last_mentioned
+                if (
+                    block.content_type == ContentType.ERROR
+                    and self.valves.error_retention_turns > 0
                 ):
-                    to_remove.append(h)
-            elif (
-                block.content_type == ContentType.PROPOSED_CHANGE
-                and self.valves.proposed_change_retention_turns > 0
-            ):
-                if age > max(
-                    self.valves.proposed_change_retention_turns * 300,
-                    expiration_seconds,
+                    if age > max(
+                        self.valves.error_retention_turns * 300, expiration_seconds
+                    ):
+                        to_remove.append(h)
+                elif (
+                    block.content_type == ContentType.PROPOSED_CHANGE
+                    and self.valves.proposed_change_retention_turns > 0
                 ):
-                    to_remove.append(h)
-        for h in to_remove:
-            del state["active_blocks"][h]
-        if to_remove:
-            self._set_state(project_id, state)
+                    if age > max(
+                        self.valves.proposed_change_retention_turns * 300,
+                        expiration_seconds,
+                    ):
+                        to_remove.append(h)
+            for h in to_remove:
+                del state["active_blocks"][h]
+            if to_remove:
+                self._set_state(project_id, state)
 
     async def _summarize_inactive_blocks_safely(self, project_id: str):
         """Summarise code blocks that haven't been active for a while, avoiding overlapping runs."""
@@ -3533,10 +3629,11 @@ Generate a unified diff that applies this change. Use the format:
 @@ -line,old +line,new @@
  -old line
  +new line
-```
+ ```
 If the file does not exist in the provided context, assume it is a new file and create a diff from empty (e.g., use /dev/null as original).
 Output only the diff, enclosed in diff ... .
 """
+
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a code assistant that generates correct unified diffs. Output only the diff with proper formatting.",
@@ -3700,11 +3797,6 @@ Output only the diff, enclosed in diff ... .
         if self.valves.selective_summarization and self.valves.summary_include_metadata:
             summary = f"[Summary of {len(messages)} messages, type: {dominant_type.value}]\n{summary}"
         return summary
-
-    # --------------------------------------------------------------------------
-    # Consecutive message deduplication (kept for reference but not used)
-    # --------------------------------------------------------------------------
-    # async def _deduplicate_consecutive_messages(...): ...
 
     # --------------------------------------------------------------------------
     # Contradiction detection
