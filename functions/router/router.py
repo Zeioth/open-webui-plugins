@@ -1,3 +1,4 @@
+
 """
 title: Router
 description: Smart router that selects the best expert model for each query based on keywords, LLM classification, and semantic similarity. Rewrites queries for better RAG retrieval and injects RAG guidance.
@@ -16,19 +17,20 @@ import hashlib
 import asyncio
 from typing import Dict, List, Optional, Tuple
 import anyio
-import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 # Path to shared library
 import sys
+
 if "/app/backend/data/custom_lib" not in sys.path:
     sys.path.append("/app/backend/data/custom_lib")
 
 # Shared resources (persistent cache & shared LLM caller)
 try:
     from shared_resources import SQLiteCache, AsyncLRUCache  # type: ignore
+
     _SHARED_RESOURCES_AVAILABLE = True
 except ImportError:
     _SHARED_RESOURCES_AVAILABLE = False
@@ -158,6 +160,8 @@ class Filter:
             self.valves.rewrite_cache_ttl,
             db_path,
         )
+        # Serialise embedding rebuilds to avoid duplicate work on concurrent requests
+        self._embeddings_lock = asyncio.Lock()
 
     def _load_experts(self):
         try:
@@ -244,8 +248,10 @@ class Filter:
             except Exception as e:
                 logger.warning(f"[Router] shared call_llm failed: {e}, using fallback")
 
-        # Fallback: aiohttp without shared pool
+        # Fallback: reuse the shared HTTP session instead of creating a new one each time
         import aiohttp
+
+        from shared_resources import get_http_session
 
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
         api_token = (
@@ -279,7 +285,8 @@ class Filter:
                 "max_tokens": max_tokens,
             }
 
-        async with aiohttp.ClientSession() as session:
+        session = await get_http_session(timeout=timeout)
+        try:
             async with session.post(
                 url,
                 json=payload,
@@ -290,6 +297,8 @@ class Filter:
                     text = await resp.text()
                     raise RuntimeError(f"LLM HTTP {resp.status}: {text[:200]}")
                 data = await resp.json()
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"Router LLM connection error: {exc}") from exc
 
         if is_ollama:
             content = data.get("response", "")
@@ -424,17 +433,19 @@ class Filter:
             return ""
 
         current_hash = self._experts_json_hash
-        if (
-            not hasattr(self, "_expert_embeddings")
-            or not hasattr(self, "_expert_embeddings_hash")
-            or self._expert_embeddings_hash != current_hash
-        ):
-            import anyio
+        # Serialise embedding rebuild to avoid duplicate work on concurrent requests
+        async with self._embeddings_lock:
+            if (
+                not hasattr(self, "_expert_embeddings")
+                or not hasattr(self, "_expert_embeddings_hash")
+                or self._expert_embeddings_hash != current_hash
+            ):
+                import anyio
 
-            self._expert_embeddings = await anyio.to_thread.run_sync(
-                lambda: self._build_expert_example_embeddings(experts_config)
-            )
-            self._expert_embeddings_hash = current_hash
+                self._expert_embeddings = await anyio.to_thread.run_sync(
+                    lambda: self._build_expert_example_embeddings(experts_config)
+                )
+                self._expert_embeddings_hash = current_hash
 
         if not self._expert_embeddings:
             return ""
@@ -594,10 +605,19 @@ class Filter:
     def _is_tool_request(self, text: str) -> bool:
         """Return True if the user message explicitly asks to use a tool."""
         tool_keywords = [
-            "utiliza la herramienta", "usa la herramienta", "use the tool",
-            "search_and_crawl", "ejecuta la herramienta", "llama a la herramienta",
-            "run the tool", "call the tool", "utiliza la tool", "usa la tool",
-            "utiliza la función", "usa la función", "ejecuta la función",
+            "utiliza la herramienta",
+            "usa la herramienta",
+            "use the tool",
+            "search_and_crawl",
+            "ejecuta la herramienta",
+            "llama a la herramienta",
+            "run the tool",
+            "call the tool",
+            "utiliza la tool",
+            "usa la tool",
+            "utiliza la función",
+            "usa la función",
+            "ejecuta la función",
         ]
         text_lower = text.lower()
         return any(kw in text_lower for kw in tool_keywords)
@@ -682,3 +702,4 @@ class Filter:
             if exp["id"] == expert_id:
                 return exp["name"]
         return "General"
+

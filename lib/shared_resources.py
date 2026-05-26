@@ -85,6 +85,7 @@ def get_tiktoken_encoding(model: str = "gpt-4"):
 # ---------------------------------------------------------------------------
 _HTTP_SESSION: Optional[Any] = None
 _HTTP_TIMEOUT_SECONDS: int = 120
+_HTTP_SESSION_LOCK = asyncio.Lock()  # Protects session creation/recreation against concurrent calls
 
 
 async def get_http_session(timeout_seconds: int = 120):
@@ -92,39 +93,42 @@ async def get_http_session(timeout_seconds: int = 120):
     Return (or create) the shared aiohttp ClientSession.
     If the requested timeout is larger than the current session's,
     the session is recreated to avoid cutting off long calls.
+    Thread‑safe: guarded by an asyncio lock.
     """
     global _HTTP_SESSION, _HTTP_TIMEOUT_SECONDS
     import aiohttp  # type: ignore
 
-    needs_recreate = (
-        _HTTP_SESSION is None
-        or _HTTP_SESSION.closed
-        or timeout_seconds > _HTTP_TIMEOUT_SECONDS
-    )
-    if needs_recreate:
-        if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
-            await _HTTP_SESSION.close()
-        connector = aiohttp.TCPConnector(
-            limit=30,
-            limit_per_host=10,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True,
+    async with _HTTP_SESSION_LOCK:
+        needs_recreate = (
+            _HTTP_SESSION is None
+            or _HTTP_SESSION.closed
+            or timeout_seconds > _HTTP_TIMEOUT_SECONDS
         )
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        _HTTP_SESSION = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-        )
-        _HTTP_TIMEOUT_SECONDS = timeout_seconds
+        if needs_recreate:
+            if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+                await _HTTP_SESSION.close()
+            connector = aiohttp.TCPConnector(
+                limit=30,
+                limit_per_host=10,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            )
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            _HTTP_SESSION = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
+            _HTTP_TIMEOUT_SECONDS = timeout_seconds
     return _HTTP_SESSION
 
 
 async def close_http_session():
     """Close the shared session. Call on process shutdown if needed."""
     global _HTTP_SESSION
-    if _HTTP_SESSION and not _HTTP_SESSION.closed:
-        await _HTTP_SESSION.close()
-        _HTTP_SESSION = None
+    async with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION and not _HTTP_SESSION.closed:
+            await _HTTP_SESSION.close()
+            _HTTP_SESSION = None
 
 
 # ---------------------------------------------------------------------------
