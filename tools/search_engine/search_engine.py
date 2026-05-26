@@ -1,11 +1,10 @@
-
 """
 title: Web Search and Crawl
 description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, and Crawl4AI. Extracts content from URLs using a self-hosted Crawl4AI instance, optionally researching using Crawl4AI Deep Research.
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.4.0
+version: 3.5.0
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -244,12 +243,12 @@ class Tools:
 
     # region ── User Valves ────────────────────────────────────────────────────
     class UserValves(BaseModel):
-        SEARXNG_MAX_RESULTS: int = Field(default=None)
-        CRAWL4AI_MAX_URLS: int = Field(default=None)
-        CRAWL4AI_DISPLAY_MEDIA: bool = Field(default=None)
-        CRAWL4AI_MAX_MEDIA_ITEMS: int = Field(default=None)
-        CRAWL4AI_DISPLAY_THUMBNAILS: bool = Field(default=None)
-        CRAWL4AI_THUMBNAIL_SIZE: int = Field(default=None)
+        SEARXNG_MAX_RESULTS: Optional[int] = Field(default=None)
+        CRAWL4AI_MAX_URLS: Optional[int] = Field(default=None)
+        CRAWL4AI_DISPLAY_MEDIA: Optional[bool] = Field(default=None)
+        CRAWL4AI_MAX_MEDIA_ITEMS: Optional[int] = Field(default=None)
+        CRAWL4AI_DISPLAY_THUMBNAILS: Optional[bool] = Field(default=None)
+        CRAWL4AI_THUMBNAIL_SIZE: Optional[int] = Field(default=None)
         RESEARCH_MODE: bool = Field(default=False)
         RESEARCH_CRAWL_MODE: Literal[
             "pseudo_adaptive", "llm_guided", "bfs_deep", "research_filter"
@@ -823,13 +822,17 @@ class Tools:
                     async with s.get(url, allow_redirects=True) as resp:
                         if resp.status >= 400:
                             return False
-                        content = await resp.content.read(200 * 1024)
+                        content = await resp.content.read(
+                            30 * 1024
+                        )  # FIX: 30 KB → CHANGE BACK TO 200 IF NEEDED
                         html = content.decode("utf-8", errors="ignore").lower()
             else:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status >= 400:
                         return False
-                    content = await resp.content.read(200 * 1024)
+                    content = await resp.content.read(
+                        30 * 1024
+                    )  # FIX: 30 KB → CHANGE BACK TO 200 IF NEEDED
                     html = content.decode("utf-8", errors="ignore").lower()
             title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE)
             title_text = title_match.group(1) if title_match else ""
@@ -1248,7 +1251,7 @@ class Tools:
             "Return ONLY a JSON array of booleans, one per fragment.\n\nFragments:\n"
         )
         for i, chunk in enumerate(chunks):
-            prompt += f"{i}: {chunk[:500]}\n"
+            prompt += f"{i}: {chunk[:500]}\n"  # kept at 500 chars
         prompt += "\nJSON array (no other text):"
         try:
             provider = self.valves.FILTER_LLM_PROVIDER or self.valves.LLM_PROVIDER
@@ -2220,7 +2223,7 @@ Now output your JSON array:
             elif isinstance(parsed, dict) and "queries" in parsed:
                 related_queries = parsed["queries"]
         except json.JSONDecodeError:
-            arr_match = _re.search(r"\[.*\]", content, re.DOTALL)
+            arr_match = _re.search(r"\[.*\]", content, _re.DOTALL)
             if arr_match:
                 try:
                     related_queries = json.loads(arr_match.group())
@@ -2488,29 +2491,32 @@ Now output your JSON array:
 
         url_titles = {}
 
-        async def fetch_title(url: str) -> tuple[str, str]:
+        async def fetch_title(
+            url: str, session: aiohttp.ClientSession
+        ) -> tuple[str, str]:
             try:
-                timeout = aiohttp.ClientTimeout(total=5)
-                headers = {"User-Agent": self.valves.CRAWL4AI_USER_AGENT}
-                async with aiohttp.ClientSession(
-                    timeout=timeout, headers=headers
-                ) as session:
-                    async with session.get(url, allow_redirects=True) as resp:
-                        if resp.status == 200:
-                            content = await resp.content.read(50 * 1024)
-                            html = content.decode("utf-8", errors="ignore").lower()
-                            title_match = re.search(
-                                r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE
-                            )
-                            if title_match:
-                                return url, title_match.group(1).strip()[:200]
+                async with session.get(url, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        content = await resp.content.read(
+                            8 * 1024
+                        )  # FIX: read 8 KB → INCREASE IF NEEDED
+                        html = content.decode("utf-8", errors="ignore").lower()
+                        title_match = re.search(
+                            r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE
+                        )
+                        if title_match:
+                            return url, title_match.group(1).strip()[:200]
             except Exception as e:
                 if self.valves.DEBUG:
                     logger.debug(f"Could not fetch title for {url}: {e}")
             return url, ""
 
-        tasks = [fetch_title(url) for url in urls]
-        results = await asyncio.gather(*tasks)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5),
+            headers={"User-Agent": self.valves.CRAWL4AI_USER_AGENT},
+        ) as session:
+            tasks = [fetch_title(url, session) for url in urls]
+            results = await asyncio.gather(*tasks)
         for url, title in results:
             url_titles[url] = title
 
@@ -2766,10 +2772,7 @@ Now evaluate these URLs:
         query: str,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> List[dict]:
-        if not self.valves.SEARCH_WITH_SEARXNG:
-            return []
-        if not self.valves.SEARXNG_BASE_URL:
-            logger.error("SearXNG base URL is not configured.")
+        if not self.valves.SEARCH_WITH_SEARXNG or not self.valves.SEARXNG_BASE_URL:
             return []
 
         url = self.valves.SEARXNG_BASE_URL.replace("<query>", query)
@@ -2780,42 +2783,42 @@ Now evaluate these URLs:
         if self.valves.SEARXNG_API_TOKEN:
             headers["Authorization"] = f"Bearer {self.valves.SEARXNG_API_TOKEN}"
 
-        try:
-            if self.valves.SEARXNG_METHOD == "POST":
-                response = requests.post(
-                    url,
-                    data={"q": query, "format": "json"},
-                    headers=headers,
-                    timeout=self.valves.SEARXNG_TIMEOUT,
-                )
-            else:
-                response = requests.get(
-                    url, headers=headers, timeout=self.valves.SEARXNG_TIMEOUT
-                )
-            response.raise_for_status()
-            data = response.json()
+        timeout = aiohttp.ClientTimeout(total=self.valves.SEARXNG_TIMEOUT)
 
-            max_results = (
-                self.user_valves.SEARXNG_MAX_RESULTS or self.valves.SEARXNG_MAX_RESULTS
-            )
-            results = []
-            for r in data.get("results", [])[:max_results]:
-                url = r.get("url")
-                if url:
-                    results.append(
-                        {
-                            "url": url,
-                            "title": r.get("title", ""),
-                            "snippet": r.get("content", "") or r.get("snippet", ""),
-                        }
-                    )
-            return results
-        except requests.exceptions.RequestException as e:
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                if self.valves.SEARXNG_METHOD == "POST":
+                    async with session.post(
+                        url, json={"q": query, "format": "json"}, timeout=timeout
+                    ) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                else:
+                    async with session.get(url, timeout=timeout) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Error searching SearXNG: {str(e)}")
             return []
         except Exception as e:
             logger.error(f"Unexpected error in SearXNG search: {str(e)}")
             return []
+
+        max_results = (
+            self.user_valves.SEARXNG_MAX_RESULTS or self.valves.SEARXNG_MAX_RESULTS
+        )
+        results = []
+        for r in data.get("results", [])[:max_results]:
+            url = r.get("url")
+            if url:
+                results.append(
+                    {
+                        "url": url,
+                        "title": r.get("title", ""),
+                        "snippet": r.get("content", "") or r.get("snippet", ""),
+                    }
+                )
+        return results
 
     # endregion
 
@@ -3016,6 +3019,7 @@ Now evaluate these URLs:
         extract_links: bool = False,
         url_depths: Optional[List[int]] = None,
         total_remaining: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         crawl_results = []
@@ -3063,7 +3067,8 @@ Now evaluate these URLs:
                 batches.append((batch, batch_index))
 
                 budget = self._compute_token_budget(
-                    self.pages_crawled + batch_index + 1, max_tokens
+                    base_offset + self.pages_crawled + batch_index + 1,
+                    max_tokens,
                 )
                 if budget is None:
                     if __event_emitter__ and self.valves.MORE_STATUS:
@@ -3288,7 +3293,8 @@ Now evaluate these URLs:
         gathered_urls: List[str],
         query: str,
         max_images: int,
-        __event_emitter__: Callable[[dict], Any],
+        base_offset: int = 0,
+        __event_emitter__: Callable[[dict], Any] = None,
     ) -> Tuple[List[dict], List[str], List[str], int]:
         if __event_emitter__ and self.valves.MORE_STATUS:
             await __event_emitter__(
@@ -3306,6 +3312,7 @@ Now evaluate these URLs:
                 query=query,
                 max_tokens=self.valves.CRAWL4AI_MAX_TOKENS,
                 extract_links=False,
+                base_offset=base_offset,
                 __event_emitter__=__event_emitter__,
             )
             return (
@@ -3360,9 +3367,12 @@ Now evaluate these URLs:
                     continue
                 seen_images.add(base_image_url)
                 thumbnail_url = f"https://images.weserv.nl/?url={quote(img_url)}&w={thumbnail_size}&h={thumbnail_size}&fit=inside"
-                if await self._validate_image_url(
-                    img_url
-                ) and await self._validate_image_url(thumbnail_url):
+                # validate in parallel
+                ok_orig, ok_thumb = await asyncio.gather(
+                    self._validate_image_url(img_url),
+                    self._validate_image_url(thumbnail_url),
+                )
+                if ok_orig and ok_thumb:
                     image_list.append(img_url)
 
             for vid_url in crawled_batch.get("videos", []):
@@ -3476,7 +3486,8 @@ Now evaluate these URLs:
         query: str,
         effective_crawl_mode: str,
         max_urls: int,
-        __event_emitter__: Callable[[dict], Any],
+        base_offset: int = 0,
+        __event_emitter__: Callable[[dict], Any] = None,
     ) -> Tuple[List[dict], List[str], List[str], int]:
         crawl_results = []
         image_list = []
@@ -3488,6 +3499,7 @@ Now evaluate these URLs:
             mode=effective_crawl_mode,
             max_tokens=self.valves.CRAWL4AI_MAX_TOKENS,
             max_urls=max_urls,
+            base_offset=base_offset,
             __event_emitter__=__event_emitter__,
         )
 
@@ -3504,6 +3516,8 @@ Now evaluate these URLs:
 
         total_tokens = research_result.get("tokens_used", 0)
         return crawl_results, image_list, video_list, total_tokens
+
+    # (El resto del código se mantiene sin cambios, excepto por el método search_and_crawl que se actualiza a continuación)
 
     async def _display_media(
         self,
@@ -3897,6 +3911,7 @@ Now evaluate these URLs:
         current_query = query
         gathered_for_round = gathered_urls
         user_provided_for_round = user_provided_urls
+        round_start_pages = self.pages_crawled  # track pages at start of round
 
         while round_num <= max_rounds:
             if round_num == 1:
@@ -4000,13 +4015,18 @@ Now evaluate these URLs:
                         current_query,
                         effective_crawl_mode,
                         max_urls,
-                        __event_emitter__,
+                        base_offset=round_start_pages,
+                        __event_emitter__=__event_emitter__,
                     )
                 )
             else:
                 round_crawl_results, round_images, round_videos, round_tokens = (
                     await self._run_normal_crawl(
-                        gathered_for_round, current_query, max_images, __event_emitter__
+                        gathered_for_round,
+                        current_query,
+                        max_images,
+                        base_offset=round_start_pages,
+                        __event_emitter__=__event_emitter__,
                     )
                 )
 
@@ -4061,6 +4081,7 @@ Now evaluate these URLs:
                     gathered_for_round = [
                         u for u in gathered_for_round if u not in self._visited_urls
                     ]
+                    round_start_pages = self.pages_crawled  # reset offset for new round
                     if not gathered_for_round:
                         logger.info("No new URLs found after refinement; stopping.")
                         all_crawl_results = filtered_content
@@ -4105,7 +4126,7 @@ Now evaluate these URLs:
         if not summaries:
             return True, content_items
 
-        chunk_size = 4
+        chunk_size = 10  # changed from 4 → Revert if needed
         all_classifications = []
         for i in range(0, len(summaries), chunk_size):
             batch = summaries[i : i + chunk_size]
@@ -4419,9 +4440,11 @@ Generate ONLY the new query string, nothing else."""
                         if match.startswith("http") and self._is_html_url(match):
                             all_links.append(match)
 
-                await __event_emitter__(
-                    {"type": "files", "data": {"files": image_list + video_list}}
-                )
+                # FIX: add guard for __event_emitter__
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {"type": "files", "data": {"files": image_list + video_list}}
+                    )
 
                 try:
                     extracted_content = item.get("extracted_content", "[]")
@@ -4612,6 +4635,7 @@ Generate ONLY the new query string, nothing else."""
         mode: str = "pseudo_adaptive",
         max_tokens: int = 0,
         max_urls: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         if max_urls is None:
@@ -4621,26 +4645,26 @@ Generate ONLY the new query string, nothing else."""
 
         if mode == ResearchCrawlMode.PSEUDO_ADAPTIVE:
             return await self._pseudo_adaptive_crawl(
-                urls, query, max_tokens, max_urls, __event_emitter__
+                urls, query, max_tokens, max_urls, base_offset, __event_emitter__
             )
         elif mode == ResearchCrawlMode.LLM_GUIDED:
             return await self._llm_guided_crawl(
-                urls, query, max_tokens, max_urls, __event_emitter__
+                urls, query, max_tokens, max_urls, base_offset, __event_emitter__
             )
         elif mode == ResearchCrawlMode.BFS_DEEP:
             return await self._bfs_deep_crawl(
-                urls, query, max_tokens, max_urls, __event_emitter__
+                urls, query, max_tokens, max_urls, base_offset, __event_emitter__
             )
         elif mode == ResearchCrawlMode.RESEARCH_FILTER:
             return await self._research_filter_crawl(
-                urls, query, max_tokens, max_urls, __event_emitter__
+                urls, query, max_tokens, max_urls, base_offset, __event_emitter__
             )
         else:
             logger.warning(
                 f"Unknown research crawl mode: {mode}, defaulting to pseudo_adaptive"
             )
             return await self._pseudo_adaptive_crawl(
-                urls, query, max_tokens, max_urls, __event_emitter__
+                urls, query, max_tokens, max_urls, base_offset, __event_emitter__
             )
 
     # endregion
@@ -4653,6 +4677,7 @@ Generate ONLY the new query string, nothing else."""
         query: str,
         max_tokens: int = 0,
         max_urls: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         from collections import deque
@@ -4742,6 +4767,7 @@ Generate ONLY the new query string, nothing else."""
                 extract_links=True,
                 url_depths=url_depths,
                 total_remaining=remaining,
+                base_offset=base_offset,
                 __event_emitter__=__event_emitter__,
             )
             total_tokens += result["tokens_used"]
@@ -4792,6 +4818,7 @@ Generate ONLY the new query string, nothing else."""
         query: str,
         max_tokens: int = 0,
         max_urls: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         if max_urls is None:
@@ -4852,6 +4879,7 @@ Generate ONLY the new query string, nothing else."""
                 extract_links=True,
                 url_depths=[0],
                 total_remaining=remaining,
+                base_offset=base_offset,
                 __event_emitter__=__event_emitter__,
             )
             total_tokens += result["tokens_used"]
@@ -4927,6 +4955,7 @@ Generate ONLY the new query string, nothing else."""
         query: str,
         max_tokens: int = 0,
         max_urls: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         from collections import deque
@@ -5008,6 +5037,7 @@ Generate ONLY the new query string, nothing else."""
                 extract_links=True,
                 url_depths=url_depths,
                 total_remaining=remaining,
+                base_offset=base_offset,
                 __event_emitter__=__event_emitter__,
             )
             total_tokens += result["tokens_used"]
@@ -5063,6 +5093,7 @@ Generate ONLY the new query string, nothing else."""
         query: str,
         max_tokens: int = 0,
         max_urls: Optional[int] = None,
+        base_offset: int = 0,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> dict:
         if max_urls is None:
@@ -5078,7 +5109,7 @@ Generate ONLY the new query string, nothing else."""
             "content": [],
             "images": [],
             "videos": [],
-            "sources": {},
+            "sources": {},  # kept for compatibility but now unused (dead code removed elsewhere)
             "total_pages": 0,
             "tokens_used": 0,
         }
@@ -5121,6 +5152,7 @@ Generate ONLY the new query string, nothing else."""
                 extract_links=True,
                 url_depths=[0],
                 total_remaining=remaining,
+                base_offset=base_offset,
                 __event_emitter__=__event_emitter__,
             )
             total_tokens += crawl_result["tokens_used"]
@@ -5141,14 +5173,9 @@ Generate ONLY the new query string, nothing else."""
                     )
                 break
 
-            relevance_score = sum(
-                1 for kw in keywords if kw in str(crawl_result["content"]).lower()
-            )
-            results["sources"][source_url] = {
-                "content": crawl_result["content"],
-                "relevance_score": relevance_score,
-                "links": crawl_result.get("links", [])[:10],
-            }
+            # Dead code removed: no longer storing sources
+            # relevance_score = sum(...)
+            # results["sources"][source_url] = { ... }
 
             scored_links = []
             for link in crawl_result.get("links", [])[:15]:
@@ -5196,6 +5223,7 @@ Generate ONLY the new query string, nothing else."""
                     max_tokens=max_tokens,
                     extract_links=False,
                     total_remaining=remaining,
+                    base_offset=base_offset,
                     __event_emitter__=__event_emitter__,
                 )
                 total_tokens += link_result["tokens_used"]
