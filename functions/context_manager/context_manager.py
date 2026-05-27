@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.28.0
+version: 5.29.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -2087,9 +2087,7 @@ class Filter:
             return ContentType.PROPOSED_CHANGE
         if (
             "traceback" in cl
-            or (
-                "error" in cl and ("traceback" in cl or 'file "' in cl or "line " in cl)
-            )
+            or ('file "' in cl and "line " in cl)
             or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
         ):
             return ContentType.ERROR
@@ -2758,6 +2756,17 @@ class Filter:
                 )
 
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    # Resolve any previous proposed changes on the same file
+                    if new_block.file_path:
+                        state["recent_changes"] = [
+                            c
+                            for c in state["recent_changes"]
+                            if not (
+                                c.file_path
+                                and c.file_path == new_block.file_path
+                                and c.hash != new_block.hash
+                            )
+                        ]
                     state["recent_changes"].append(new_block)
                     if self.valves.enable_diff_application and not is_conflicting:
                         for base in list(state["active_blocks"].values()):
@@ -2843,7 +2852,7 @@ class Filter:
                                 if sim > best_sim and sim > 0.6:
                                     best_sim = sim
                                     best_base = base
-                    if best_base and best_sim > 0.6 and best_sim < 0.95:
+                    if best_base and best_sim > 0.5 and best_sim < 0.98:
                         self._symbol_index.remove_all_for_block(
                             best_base.hash, best_base.symbols, project_id
                         )
@@ -3358,7 +3367,12 @@ class Filter:
     def _is_duplicate_code(
         self, new_block: CodeBlock, existing_blocks: List[CodeBlock]
     ) -> Tuple[bool, Optional[CodeBlock]]:
+        new_len = len(new_block.content)
         for ex in existing_blocks:
+            # Quick length reject: if lengths differ by >20%, skip expensive comparison
+            ex_len = len(ex.content)
+            if ex_len > 0 and abs(new_len - ex_len) > 0.2 * max(new_len, ex_len):
+                continue
             if (
                 self._calculate_code_similarity(new_block.content, ex.content)
                 >= self.valves.code_similarity_threshold
@@ -3634,11 +3648,13 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             messages.insert(0, {"role": "system", "content": contradiction_warning})
             body["messages"] = messages
 
-    # 9. Update active code (process recent messages)
+    # 9. Update active code (process only new messages since last inlet)
     if self.valves.enable_code_awareness and is_code_session:
-        for idx, msg in enumerate(messages[-5:], start=max(0, len(messages) - 5)):
-            await self._update_active_code(msg, project_id)
-        self._last_processed_message_idx[project_id] = len(messages) - 1
+        last_idx = len(messages) - 1
+        start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
+        for idx in range(start_idx, last_idx + 1):
+            await self._update_active_code(messages[idx], project_id)
+        self._last_processed_message_idx[project_id] = last_idx
 
     # 10. LTM retrieval
     unique_meta = []
@@ -5741,39 +5757,34 @@ Output only JSON.
             return None
         if not self.memory_collection:
             return None
-        where_filter = {
-            "$and": [
-                {"project_id": {"$eq": project_id}},
-                {"role": {"$eq": "user"}},
-            ]
-        }
-        results = await anyio.to_thread.run_sync(
-            lambda: self.memory_collection.get(
-                where=where_filter,
-                limit=self.valves.duplicate_question_lookback,
-                include=["documents", "metadatas"],
+        try:
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self.embedder.encode([query]).tolist()
             )
-        )
-        if not results or not results["documents"]:
-            return None
-        query_embedding = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(query).tolist()
-        )
-        best_sim = 0.0
-        best_entry = None
-        for i, doc in enumerate(results["documents"]):
-            doc_embedding = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode(doc).tolist()
+            results = await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.query(
+                    query_embeddings=q_emb,
+                    n_results=1,
+                    where={
+                        "$and": [
+                            {"project_id": {"$eq": project_id}},
+                            {"role": {"$eq": "user"}},
+                        ]
+                    },
+                    include=["documents", "metadatas", "distances"],
+                )
             )
-            sim = self._cosine_similarity(query_embedding, doc_embedding)
-            if sim > best_sim and sim >= self.valves.duplicate_question_threshold:
-                best_sim = sim
-                best_entry = {
-                    "content": doc,
-                    "sim": sim,
-                    "timestamp": results["metadatas"][i].get("timestamp"),
-                }
-        return best_entry
+            if results and results["ids"] and results["ids"][0]:
+                sim = 1 - results["distances"][0][0]  # cosine distance to similarity
+                if sim >= self.valves.duplicate_question_threshold:
+                    return {
+                        "content": results["documents"][0][0],
+                        "sim": sim,
+                        "timestamp": results["metadatas"][0][0].get("timestamp"),
+                    }
+        except Exception as e:
+            self._log_debug(f"Duplicate question search failed: {e}")
+        return None
 
     # --------------------------------------------------------------------------
     #  Diff application (with fixes for stale symbols and cache)
@@ -6078,7 +6089,9 @@ Output only JSON.
         return len(code) // 4
 
     async def _handle_oversized_code_block(self, code: str, language: str) -> str:
-        """Truncate, summarise or warn when a code block exceeds the token limit."""
+        """Truncate, summarise or warn when a code block exceeds the token limit.
+        When summarizing, extracts function/class signatures to give the LLM a global view.
+        """
         max_tokens = self.valves.max_code_block_tokens
         if max_tokens <= 0:
             return code
@@ -6103,8 +6116,23 @@ Output only JSON.
                 or self.valves.llm_model
                 or self.valves.summarization_model
             )
+            # Extract function/class signatures to give the LLM an overview
+            signatures = []
+            for match in re.finditer(
+                r"^\s*(def|class|function|fn|func|async def)\s+(\w+)[^(]*\([^)]*\)",
+                code,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                signatures.append(match.group(0).strip())
+            header = ""
+            if signatures:
+                header = (
+                    f"Signatures found ({len(signatures)}):\n"
+                    + "\n".join(signatures[:50])
+                    + "\n\n"
+                )
             summary = await self._call_llm(
-                prompt=f"Summarize the following {language} code block.\n```{language}\n{code[:8000]}\n```",
+                prompt=f"Summarize the following {language} code block.\n{header}First part of code:\n```{language}\n{code[:8000]}\n```",
                 system_prompt="You are a code summarization assistant.",
                 model_override=model,
                 max_tokens=self.valves.oversized_summary_max_tokens,
@@ -6123,7 +6151,8 @@ Output only JSON.
     #  MODIFIED: _remove_duplicate_blocks – cleans up symbol index and invalidates cache
     # --------------------------------------------------------------------------
     def _remove_duplicate_blocks(self, state: Dict, project_id: str):
-        """Remove code blocks that are very similar to a more important block."""
+        """Remove code blocks that are very similar to a more important block.
+        When importance scores are close, keep the more recent block."""
         if not self.valves.auto_remove_duplicate_blocks:
             return
         blocks = list(state["active_blocks"].values())
@@ -6149,7 +6178,15 @@ Output only JSON.
                         ):
                             to_remove.add(other.hash)
                         continue
-                    if block.importance_score >= other.importance_score:
+                    # Prefer newer block when scores are close
+                    score_diff = abs(block.importance_score - other.importance_score)
+                    if score_diff < 1.0:
+                        # Keep the more recent one
+                        if block.timestamp >= other.timestamp:
+                            to_remove.add(other.hash)
+                        else:
+                            to_remove.add(block.hash)
+                    elif block.importance_score >= other.importance_score:
                         to_remove.add(other.hash)
                     else:
                         to_remove.add(block.hash)
