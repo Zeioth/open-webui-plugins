@@ -1095,6 +1095,7 @@ class Filter:
         self._last_project_id: str = ""
         self._has_any_calls: bool = False
 
+        self._process_config = ProcessConfig() if HAS_TREE_SITTER else None
         print("[CodeAware] Filter loaded")
 
     # --------------------------------------------------------------------------
@@ -1131,6 +1132,102 @@ class Filter:
         """Return True if the given (start, end) span lies entirely inside a code block."""
         s, e = span
         return any(cs <= s and e <= ce for cs, ce in code_spans)
+
+    # --------------------------------------------------------------------------
+    # Tree-sitter based code span detection (optimized)
+    # --------------------------------------------------------------------------
+    def _likely_contains_code(self, content: str) -> bool:
+        """Quick heuristic to avoid calling tree-sitter on plain natural language.
+        Returns True if the text contains patterns typical of source code."""
+        if "```" in content:
+            return True
+        if re.search(r"^( {4,}|\t)", content, re.MULTILINE):
+            return True
+
+        # Combined pattern: keywords that almost always appear in code,
+        # plus common constructs like fat arrows, type hints, etc.
+        # The search stops at the first match.
+        code_indicators = re.compile(
+            r"\b(?:"
+            r"def\s+\w+\s*\(|"  # Python function
+            r"class\s+\w+|"  # class definition
+            r"function\s+\w+\s*\(|"  # JS/TS function
+            r"import\s+|"  # import statement
+            r"from\s+\w+\s+import\s+|"  # Python from..import
+            r"const\s+\w+\s*[:=]|"  # const with type/assignment
+            r"let\s+\w+\s*[:=]|"  # let ...
+            r"var\s+\w+\s*[:=]|"  # var ...
+            r'#include\s*[<"]|'  # C/C++ include
+            r"public\s+(class|void|int|string|static)|"  # Java/C# modifier
+            r"private\s+(class|void|int|string|static)|"
+            r"protected\s+(class|void|int|string|static)|"
+            r"return\s+\S|"  # return something
+            r"if\s*\(.+\)\s*\{?|"  # if (...) {
+            r"else\s*\{|"  # else {
+            r"for\s*\(.+\)|"  # for (...)
+            r"while\s*\(.+\)|"  # while (...)
+            r"switch\s*\(|"  # switch (
+            r"case\s+\S+\s*:|"  # case value:
+            r"break\s*;|"  # break;
+            r"continue\s*;|"  # continue;
+            r"try\s*\{|"  # try {
+            r"except\s+\w+\s*:|"  # Python except
+            r"catch\s*\(|"  # catch (
+            r"finally\s*:|"  # finally:
+            r"throw\s+new\s|"  # throw new
+            r"yield\s+|"  # yield
+            r"async\s+(function|def|fn)|"  # async function/def/fn
+            r"await\s+\w+|"  # await expression
+            r"\b(int|float|double|bool|void|char)\s+\w+\s*[;=]|"
+            r"namespace\s+\w+|"  # C++/C# namespace
+            r"using\s+namespace\s+|"  # C++ using
+            r"package\s+\w+|"  # Java/Go package
+            r"module\s+\w+|"  # JS module
+            r"export\s+(default\s+)?(class|function|const|let|var)|"
+            r"console\.log\s*\(|"
+            r"System\.out\.print|"
+            r"print\s*\(|"
+            r"fmt\.Print|"
+            r"println!\s*\(|"
+            r"=>\s*\{|"
+            r"->\s*\w+|"  # C++/Java lambda, Rust return type
+            r"===|!==|&&|\|\||\b instanceof\b|"
+            r"\b new \w+\s*\(|"  # new Class()
+            r";\s*$|"  # line ending with semicolon
+            r"^\s*//|"  # line comment
+            r"^\s*/\*|"  # block comment start
+            r"^\s*\*|"  # Javadoc / block comment continuation
+            r"^\s*#\w"  # shell / Python comment
+            r")",
+            re.MULTILINE,
+        )
+        return bool(code_indicators.search(content))
+
+    async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
+        """
+        Return character spans of code blocks detected by tree-sitter's process().
+        Uses a quick heuristic first; avoids parsing when no code is present.
+        """
+        if not HAS_TREE_SITTER or not self._process_config:
+            return []
+        if not self._likely_contains_code(content):
+            return []
+        try:
+            blocks = process(content, self._process_config)
+            spans = [(b.start_byte, b.end_byte) for b in blocks]
+            self._log_debug(f"Tree‑sitter found {len(spans)} code spans")
+            return spans
+        except Exception as e:
+            self._log_debug(f"Tree‑sitter process failed: {e}")
+            return []
+
+    def _remove_code_spans(self, content: str, spans: List[Tuple[int, int]]) -> str:
+        """Return the content with all code spans replaced by whitespace, preserving string length."""
+        chars = list(content)
+        for start, end in spans:
+            for i in range(start, min(end, len(chars))):
+                chars[i] = " "
+        return "".join(chars)
 
     def _ensure_cleanup_task(self) -> None:
         """Start the periodic cleanup task if it hasn't been created yet."""
@@ -2849,342 +2946,412 @@ class Filter:
     #  MODIFIED: inlet – inject lightweight context when threshold exceeded
     # --------------------------------------------------------------------------
 
+    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        self._log_debug("inlet called")
+        self._ensure_cleanup_task()
+        messages = body.get("messages", [])
+        project_id = self._get_project_id()
 
-async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-    self._log_debug("inlet called")
-    self._ensure_cleanup_task()
-    messages = body.get("messages", [])
-    project_id = self._get_project_id()
-
-    # Detect project change and clean up old project index
-    if self._last_project_id and self._last_project_id != project_id:
-        self._log_debug(f"Project changed from {self._last_project_id} to {project_id}")
-        old_state = self._conversation_state.get(self._last_project_id)
-        if old_state:
-            self._remove_project_from_index_by_id(self._last_project_id, old_state)
-        self._cached_lightweight_context.pop(self._last_project_id, None)
-    self._last_project_id = project_id
-
-    if not messages:
-        return body
-    state = self._get_state(project_id)
-    is_code_session = await self._classify_session(messages, project_id)
-    self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
-
-    # 1. Forget
-    if (
-        self.valves.enable_forget_command or self.valves.enable_natural_language_forget
-    ) and (
-        is_code_session
-        or (messages and messages[-1].get("content", "").startswith("/"))
-    ):
-        new_messages, handled = await self._handle_forget_command(
-            messages, project_id, __user__
-        )
-        if handled:
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-    # 2. Remember
-    if self.valves.enable_natural_language_forget:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            remember_intent = await self._parse_remember_intent(
-                last_user_msg.get("content", "")
+        if self._last_project_id and self._last_project_id != project_id:
+            self._log_debug(
+                f"Project changed from {self._last_project_id} to {project_id}"
             )
-            if (
-                remember_intent
-                and remember_intent.get("action")
-                and remember_intent["action"] != "none"
-            ):
-                confirmation = await self._execute_remember_intent(
-                    project_id, remember_intent
-                )
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
+            old_state = self._conversation_state.get(self._last_project_id)
+            if old_state:
+                self._remove_project_from_index_by_id(self._last_project_id, old_state)
+            self._cached_lightweight_context.pop(self._last_project_id, None)
+        self._last_project_id = project_id
 
-    # 3. Obsolete
-    if self.valves.enable_obsolete_marking:
+        if not messages:
+            return body
+        state = self._get_state(project_id)
+        is_code_session = await self._classify_session(messages, project_id)
+        self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
+
+        # Pre-calc code spans for natural language commands (avoids multiple parses)
         last_user_msg = (
             messages[-1] if messages and messages[-1].get("role") == "user" else None
         )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            intent = await self._parse_obsolete_intent(last_user_msg["content"])
-            if intent and intent.get("action") != "none":
-                confirmation = await self._execute_obsolete_intent(project_id, intent)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # 4. /think (explicit) or auto Chain-of-Thought
-    if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
+        code_spans = None
         if last_user_msg:
-            user_content = last_user_msg.get("content", "")
-            if self.valves.enable_cot_on_demand and user_content.strip().startswith(
-                "/think"
+            code_spans = await self._get_code_spans(last_user_msg.get("content", ""))
+
+        # 1. Forget
+        if (
+            self.valves.enable_forget_command
+            or self.valves.enable_natural_language_forget
+        ) and (
+            is_code_session
+            or (messages and messages[-1].get("content", "").startswith("/"))
+        ):
+            new_messages, handled = await self._handle_forget_command(
+                messages, project_id, __user__, code_spans=code_spans
+            )
+            if handled:
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
+
+        # 2. Remember
+        if self.valves.enable_natural_language_forget:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
             ):
-                cot_question = await self._parse_cot_intent(user_content)
-                if cot_question:
-                    active_ctx = self._get_active_code_context(project_id)
-                    facts_ctx = self._get_facts_context(project_id)
-                    context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                    reasoning = await self._generate_cot(cot_question, context)
+                remember_intent = await self._parse_remember_intent(
+                    last_user_msg.get("content", ""), code_spans=code_spans
+                )
+                if (
+                    remember_intent
+                    and remember_intent.get("action")
+                    and remember_intent["action"] != "none"
+                ):
+                    confirmation = await self._execute_remember_intent(
+                        project_id, remember_intent
+                    )
+                    status_msg = f"[CodeAware] {confirmation}"
+                    messages.insert(0, {"role": "system", "content": status_msg})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
+
+        # 3. Obsolete
+        if self.valves.enable_obsolete_marking:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
+            ):
+                intent = await self._parse_obsolete_intent(
+                    last_user_msg["content"], code_spans=code_spans
+                )
+                if intent and intent.get("action") != "none":
+                    confirmation = await self._execute_obsolete_intent(
+                        project_id, intent
+                    )
+                    status_msg = f"[CodeAware] {confirmation}"
+                    messages.insert(0, {"role": "system", "content": status_msg})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
+
+        # 4. /think (explicit) or auto Chain-of-Thought
+        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg:
+                user_content = last_user_msg.get("content", "")
+                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
+                    "/think"
+                ):
+                    cot_question = await self._parse_cot_intent(user_content)
+                    if cot_question:
+                        active_ctx = self._get_active_code_context(project_id)
+                        facts_ctx = self._get_facts_context(project_id)
+                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        reasoning = await self._generate_cot(cot_question, context)
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                            }
+                        )
+                        messages = self._ensure_last_message_is_user(messages)
+                        body["messages"] = messages
+                        return body
+                elif (
+                    self.valves.auto_cot_enabled
+                    and self._should_auto_cot(user_content)
+                    and not user_content.strip().startswith("/")
+                ):
+                    self._log_debug("Auto-injecting Chain-of-Thought prompt")
+                    sys_msgs = [m for m in messages if m.get("role") == "system"]
+                    cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                    if sys_msgs:
+                        sys_msgs[0]["content"] = (
+                            cot_prompt + "\n" + sys_msgs[0]["content"]
+                        )
+                    else:
+                        messages.insert(0, {"role": "system", "content": cot_prompt})
+                    body["messages"] = messages
+
+        # 5. /assume
+        if self.valves.enable_assumption_extraction:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
+            ):
+                assumption_target = await self._parse_assumption_intent(
+                    last_user_msg.get("content", "")
+                )
+                if assumption_target:
+                    analysis = await self._extract_assumptions(assumption_target)
                     messages.pop()
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                            "content": f"**Assumption Analysis**\n{analysis}",
                         }
                     )
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
                     return body
-            elif (
-                self.valves.auto_cot_enabled
-                and self._should_auto_cot(user_content)
-                and not user_content.strip().startswith("/")
+
+        # 6. /iterate
+        if self.valves.enable_iterative_mode:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
             ):
-                self._log_debug("Auto-injecting Chain-of-Thought prompt")
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                if sys_msgs:
-                    sys_msgs[0]["content"] = cot_prompt + "\n" + sys_msgs[0]["content"]
-                else:
-                    messages.insert(0, {"role": "system", "content": cot_prompt})
-                body["messages"] = messages
-
-    # 5. /assume
-    if self.valves.enable_assumption_extraction:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            assumption_target = await self._parse_assumption_intent(
-                last_user_msg.get("content", "")
-            )
-            if assumption_target:
-                analysis = await self._extract_assumptions(assumption_target)
-                messages.pop()
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"**Assumption Analysis**\n{analysis}",
-                    }
-                )
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # 6. /iterate
-    if self.valves.enable_iterative_mode:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            result, consumed = await self._run_iteration(
-                project_id, last_user_msg.get("content", "")
-            )
-            if consumed:
-                messages.pop()
-                messages.append({"role": "assistant", "content": result})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # 7. Smart context selection
-    if self.valves.smart_context_selection and len(messages) > 0 and is_code_session:
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            query = messages[last_user_idx].get("content", "")
-            if query:
-                historical = await self._retrieve_historical_messages(
-                    query, project_id, self.valves.smart_context_top_k
-                )
-                new_history = []
-                for msg in historical:
-                    if msg["content"] != query:
-                        new_history.append(msg)
-                new_history.append(messages[last_user_idx])
-                if (
-                    self.valves.smart_context_include_last_user
-                    and last_user_idx + 1 < len(messages)
-                    and messages[last_user_idx + 1].get("role") == "assistant"
-                ):
-                    new_history.append(messages[last_user_idx + 1])
-                system_msgs = [m for m in messages if m.get("role") == "system"]
-                messages = system_msgs + new_history
-                body["messages"] = messages
-
-    # 8. Contradiction detection
-    if (
-        self.valves.enable_contradiction_detection
-        and self.valves.contradiction_inject_warning
-        and is_code_session
-    ):
-        contradiction_warning = await self._detect_contradictions(messages)
-        if contradiction_warning:
-            messages.insert(0, {"role": "system", "content": contradiction_warning})
-            body["messages"] = messages
-
-    # 9. Update active code (process recent messages)
-    if self.valves.enable_code_awareness and is_code_session:
-        for idx, msg in enumerate(messages[-5:], start=max(0, len(messages) - 5)):
-            await self._update_active_code(msg, project_id)
-        self._last_processed_message_idx[project_id] = len(messages) - 1
-
-    # 10. LTM retrieval
-    unique_meta = []
-    if not self.valves.smart_context_selection and is_code_session:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if (
-            last_user_msg
-            and HAS_SENTENCE
-            and HAS_CHROMA
-            and self.valves.enable_code_awareness
-        ):
-            query = last_user_msg.get("content", "")
-            base_mem = await self._retrieve_relevant_memories(
-                query, project_id, ContentType.BASE_CODE, include_meta=True
-            )
-            error_mem = (
-                await self._retrieve_relevant_memories(
-                    query, project_id, ContentType.ERROR, include_meta=True
-                )
-                if self.valves.preserve_error_context
-                else []
-            )
-            general_mem = await self._retrieve_relevant_memories(
-                query, project_id, None, include_meta=True
-            )
-            all_meta = base_mem + error_mem + general_mem
-            all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-            seen = set()
-            unique_meta = []
-            for m in all_meta:
-                if m["doc"] not in seen:
-                    seen.add(m["doc"])
-                    unique_meta.append(m)
-
-    max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
-    parts = []
-    current_tokens = 0
-    header = "## Relevant Past Context (with timestamps)\n\n"
-    if max_ltm_tokens > 0:
-        current_tokens += (
-            len(self.tokenizer.encode(header)) if self.tokenizer else (len(header) // 4)
-        )
-    for mem in unique_meta:
-        ts = mem.get("timestamp")
-        if ts and ts > 1000000000:
-            time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%SZ"
-            )
-            text = f"[{time_str}] {mem['doc']}"
-        else:
-            text = f"[unknown date] {mem['doc']}"
-        frag_tokens = (
-            len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
-        )
-        if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
-            continue
-        parts.append(text)
-        current_tokens += frag_tokens
-    if parts:
-        ctx = header + "\n---\n".join(parts)
-        if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
-            ctx += "\n[Some older fragments omitted to fit token budget]"
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        if sys_msgs:
-            sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-        else:
-            messages.insert(0, {"role": "system", "content": ctx})
-        body["messages"] = messages
-
-    # 11. Response cache
-    if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if last_user_msg:
-            context_hash = self._compute_context_hash(messages)
-            cached = await self._find_cached_response(
-                last_user_msg.get("content", ""), context_hash, state
-            )
-            if cached:
-                messages.append({"role": "assistant", "content": cached["response"]})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # 12. Inject active code context (MODIFIED: lightweight context if threshold exceeded)
-    if is_code_session and self.valves.enable_code_awareness:
-        # Detect structural tasks to avoid expansion
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        is_structural = last_user_msg and await self._is_structural_task(
-            last_user_msg.get("content", "")
-        )
-
-        code_blocks = [
-            b
-            for b in state["active_blocks"].values()
-            if b.content_type
-            in (
-                ContentType.BASE_CODE,
-                ContentType.PROPOSED_CHANGE,
-                ContentType.COMMITTED_CHANGE,
-            )
-            and not b.obsolete
-        ]
-        total_code_tokens = sum(b._cached_token_count for b in code_blocks)
-
-        if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
-            self._log_debug(
-                f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
-            )
-            active_ctx = await self._build_lightweight_context(project_id)
-
-            if last_user_msg and not is_structural:
-                expanded = self._expand_referenced_symbols(
+                result, consumed = await self._run_iteration(
                     project_id, last_user_msg.get("content", "")
                 )
-                if expanded:
-                    active_ctx += "\n" + expanded
-            elif is_structural:
-                self._log_debug("Structural task detected, not expanding code bodies.")
-                active_ctx += "\n\n[Note: Structural analysis requested. Use the symbol index with call graphs and summaries to generate the diagram. Do not request code bodies.]"
-        else:
-            active_ctx = self._get_active_code_context(project_id)
+                if consumed:
+                    messages.pop()
+                    messages.append({"role": "assistant", "content": result})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
 
-        if active_ctx:
-            checklist = (
-                "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+        # 7. Smart context selection
+        if (
+            self.valves.smart_context_selection
+            and len(messages) > 0
+            and is_code_session
+        ):
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                query = messages[last_user_idx].get("content", "")
+                if query:
+                    historical = await self._retrieve_historical_messages(
+                        query, project_id, self.valves.smart_context_top_k
+                    )
+                    new_history = []
+                    for msg in historical:
+                        if msg["content"] != query:
+                            new_history.append(msg)
+                    new_history.append(messages[last_user_idx])
+                    if (
+                        self.valves.smart_context_include_last_user
+                        and last_user_idx + 1 < len(messages)
+                        and messages[last_user_idx + 1].get("role") == "assistant"
+                    ):
+                        new_history.append(messages[last_user_idx + 1])
+                    system_msgs = [m for m in messages if m.get("role") == "system"]
+                    messages = system_msgs + new_history
+                    body["messages"] = messages
+
+        # 8. Contradiction detection
+        if (
+            self.valves.enable_contradiction_detection
+            and self.valves.contradiction_inject_warning
+            and is_code_session
+        ):
+            contradiction_warning = await self._detect_contradictions(messages)
+            if contradiction_warning:
+                messages.insert(0, {"role": "system", "content": contradiction_warning})
+                body["messages"] = messages
+
+        # 9. Update active code (process recent messages)
+        if self.valves.enable_code_awareness and is_code_session:
+            for idx, msg in enumerate(messages[-5:], start=max(0, len(messages) - 5)):
+                await self._update_active_code(msg, project_id)
+            self._last_processed_message_idx[project_id] = len(messages) - 1
+
+        # 10. LTM retrieval
+        unique_meta = []
+        if not self.valves.smart_context_selection and is_code_session:
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if (
+                last_user_msg
+                and HAS_SENTENCE
+                and HAS_CHROMA
+                and self.valves.enable_code_awareness
+            ):
+                query = last_user_msg.get("content", "")
+                base_mem = await self._retrieve_relevant_memories(
+                    query, project_id, ContentType.BASE_CODE, include_meta=True
+                )
+                error_mem = (
+                    await self._retrieve_relevant_memories(
+                        query, project_id, ContentType.ERROR, include_meta=True
+                    )
+                    if self.valves.preserve_error_context
+                    else []
+                )
+                general_mem = await self._retrieve_relevant_memories(
+                    query, project_id, None, include_meta=True
+                )
+                all_meta = base_mem + error_mem + general_mem
+                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+                seen = set()
+                unique_meta = []
+                for m in all_meta:
+                    if m["doc"] not in seen:
+                        seen.add(m["doc"])
+                        unique_meta.append(m)
+
+        max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
+        parts = []
+        current_tokens = 0
+        header = "## Relevant Past Context (with timestamps)\n\n"
+        if max_ltm_tokens > 0:
+            current_tokens += (
+                len(self.tokenizer.encode(header))
+                if self.tokenizer
+                else (len(header) // 4)
+            )
+        for mem in unique_meta:
+            ts = mem.get("timestamp")
+            if ts and ts > 1000000000:
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
+                )
+                text = f"[{time_str}] {mem['doc']}"
+            else:
+                text = f"[unknown date] {mem['doc']}"
+            frag_tokens = (
+                len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
+            )
+            if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
+                continue
+            parts.append(text)
+            current_tokens += frag_tokens
+        if parts:
+            ctx = header + "\n---\n".join(parts)
+            if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
+                ctx += "\n[Some older fragments omitted to fit token budget]"
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": ctx})
+            body["messages"] = messages
+
+        # 11. Response cache
+        if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user_msg:
+                context_hash = self._compute_context_hash(messages)
+                cached = await self._find_cached_response(
+                    last_user_msg.get("content", ""), context_hash, state
+                )
+                if cached:
+                    messages.append(
+                        {"role": "assistant", "content": cached["response"]}
+                    )
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
+
+        # 12. Inject active code context (MODIFIED: lightweight context if threshold exceeded)
+        if is_code_session and self.valves.enable_code_awareness:
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            is_structural = last_user_msg and await self._is_structural_task(
+                last_user_msg.get("content", "")
+            )
+
+            code_blocks = [
+                b
+                for b in state["active_blocks"].values()
+                if b.content_type
+                in (
+                    ContentType.BASE_CODE,
+                    ContentType.PROPOSED_CHANGE,
+                    ContentType.COMMITTED_CHANGE,
+                )
+                and not b.obsolete
+            ]
+            total_code_tokens = sum(b._cached_token_count for b in code_blocks)
+
+            if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
+                self._log_debug(
+                    f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
+                )
+                active_ctx = await self._build_lightweight_context(project_id)
+
+                if last_user_msg and not is_structural:
+                    expanded = self._expand_referenced_symbols(
+                        project_id, last_user_msg.get("content", "")
+                    )
+                    if expanded:
+                        active_ctx += "\n" + expanded
+                elif is_structural:
+                    self._log_debug(
+                        "Structural task detected, not expanding code bodies."
+                    )
+                    active_ctx += "\n\n[Note: Structural analysis requested. Use the symbol index with call graphs and summaries to generate the diagram. Do not request code bodies.]"
+            else:
+                active_ctx = self._get_active_code_context(project_id)
+
+            if active_ctx:
+                checklist = (
+                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                    "2. Identify every assumption the code makes and verify each one.\n"
+                    "3. For every regex or string match, test it against 5 counter-examples.\n"
+                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                    "6. Output your reasoning step by step, then provide the corrected code.\n"
+                )
+                active_ctx = checklist + "\n\n" + active_ctx
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = (
+                        active_ctx + "\n\n" + sys_msgs[0]["content"]
+                    )
+                else:
+                    messages.insert(0, {"role": "system", "content": active_ctx})
+                body["messages"] = messages
+
+        # 12b. Code review checklist injection
+        if (
+            is_code_session
+            and self.valves.enable_code_review_mode
+            and self._is_code_review_request(
+                next(
+                    (
+                        m.get("content", "")
+                        for m in reversed(messages)
+                        if m.get("role") == "user"
+                    ),
+                    "",
+                )
+            )
+        ):
+            self._log_debug("Injecting code review checklist")
+            review_prompt = (
+                "## Code Review Checklist\n"
+                "You are reviewing code. Follow these steps:\n"
                 "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
                 "2. Identify every assumption the code makes and verify each one.\n"
                 "3. For every regex or string match, test it against 5 counter-examples.\n"
@@ -3192,202 +3359,172 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 "5. Ask yourself: what is the worst-case scenario for this code?\n"
                 "6. Output your reasoning step by step, then provide the corrected code.\n"
             )
-            active_ctx = checklist + "\n\n" + active_ctx
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
-                sys_msgs[0]["content"] = active_ctx + "\n\n" + sys_msgs[0]["content"]
+                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
             else:
-                messages.insert(0, {"role": "system", "content": active_ctx})
+                messages.insert(0, {"role": "system", "content": review_prompt})
             body["messages"] = messages
 
-    # 12b. Code review checklist injection
-    if (
-        is_code_session
-        and self.valves.enable_code_review_mode
-        and self._is_code_review_request(
-            next(
-                (
-                    m.get("content", "")
-                    for m in reversed(messages)
-                    if m.get("role") == "user"
-                ),
-                "",
-            )
-        )
-    ):
-        self._log_debug("Injecting code review checklist")
-        review_prompt = (
-            "## Code Review Checklist\n"
-            "You are reviewing code. Follow these steps:\n"
-            "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-            "2. Identify every assumption the code makes and verify each one.\n"
-            "3. For every regex or string match, test it against 5 counter-examples.\n"
-            "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-            "5. Ask yourself: what is the worst-case scenario for this code?\n"
-            "6. Output your reasoning step by step, then provide the corrected code.\n"
-        )
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        if sys_msgs:
-            sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
-        else:
-            messages.insert(0, {"role": "system", "content": review_prompt})
-        body["messages"] = messages
-
-    # 13. Inject facts
-    if (
-        is_code_session
-        and self.valves.enable_facts
-        and self.valves.inject_facts_in_context
-    ):
-        facts_ctx = self._get_facts_context(project_id)
-        if facts_ctx:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": facts_ctx})
-            body["messages"] = messages
-
-    # 14. Confidence scoring instruction
-    if self.valves.enable_confidence_scoring and is_code_session:
-        total_tokens = self._estimate_tokens(messages)
-        if total_tokens > self.valves.context_window_tokens * 0.8:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] += self.valves.confidence_prompt
-            else:
-                messages.insert(
-                    0, {"role": "system", "content": self.valves.confidence_prompt}
-                )
-            body["messages"] = messages
-
-    # 15. Inject feedback context
-    if (
-        is_code_session
-        and self.valves.enable_feedback_tracking
-        and self.valves.inject_feedback_context
-    ):
-        feedback_ctx = self._get_feedback_context(project_id)
-        if feedback_ctx:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = feedback_ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": feedback_ctx})
-            body["messages"] = messages
-
-    # 16. Proactive suggestions (summarisation and commands)
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    history_msgs = [m for m in messages if m.get("role") != "system"]
-    total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-    if self.valves.context_window_tokens > 0:
-        suggestion = await self._check_and_suggest_summarization(
-            project_id, total_tokens, self.valves.context_window_tokens
-        )
-        if suggestion:
-            messages.insert(0, {"role": "system", "content": suggestion})
-            body["messages"] = messages
-    cmd_suggestion = await self._suggest_commands(project_id, state)
-    if cmd_suggestion:
-        messages.insert(0, {"role": "system", "content": cmd_suggestion})
-        body["messages"] = messages
-
-    # 17. Duplicate question detection
-    if self.valves.duplicate_question_threshold and HAS_SENTENCE:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if last_user_msg:
-            duplicate = await self._find_duplicate_question(
-                last_user_msg.get("content", ""), project_id
-            )
-            if duplicate:
-                warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f})."
-                messages.insert(0, {"role": "system", "content": warn_msg})
+        # 13. Inject facts
+        if (
+            is_code_session
+            and self.valves.enable_facts
+            and self.valves.inject_facts_in_context
+        ):
+            facts_ctx = self._get_facts_context(project_id)
+            if facts_ctx:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
+                else:
+                    messages.insert(0, {"role": "system", "content": facts_ctx})
                 body["messages"] = messages
 
-    # 18. Adaptive context trim
-    trim_needed = False
-    if self.valves.adaptive_trim:
-        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        if total_tokens > self.valves.context_window_tokens:
-            trim_needed = True
-    else:
-        user_max = (
-            __user__["valves"].max_turns
-            if __user__ and hasattr(__user__, "valves")
-            else None
-        )
-        eff_max = user_max if user_max is not None else self.valves.max_turns
-        if len(history_msgs) > eff_max:
-            trim_needed = True
+        # 14. Confidence scoring instruction
+        if self.valves.enable_confidence_scoring and is_code_session:
+            total_tokens = self._estimate_tokens(messages)
+            if total_tokens > self.valves.context_window_tokens * 0.8:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] += self.valves.confidence_prompt
+                else:
+                    messages.insert(
+                        0, {"role": "system", "content": self.valves.confidence_prompt}
+                    )
+                body["messages"] = messages
 
-    if trim_needed and len(history_msgs) > self.valves.max_turns:
-        self._log_debug("Trimming old messages")
-        keep = self.valves.max_turns
-        last_user_idx = -1
-        for i in range(len(history_msgs) - 1, -1, -1):
-            if history_msgs[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            start_idx = max(0, last_user_idx - keep + 1)
-            old_block = history_msgs[:start_idx] if start_idx > 0 else []
-            kept_block = history_msgs[start_idx:]
-        else:
-            old_block = history_msgs[:-keep] if keep > 0 else []
-            kept_block = history_msgs[-keep:] if keep > 0 else []
-        if self.valves.summarize_old_messages and old_block:
-            has_code = any("```" in m.get("content", "") for m in old_block)
-            summary = await self._summarize_messages(
-                old_block, is_code_context=has_code
+        # 15. Inject feedback context
+        if (
+            is_code_session
+            and self.valves.enable_feedback_tracking
+            and self.valves.inject_feedback_context
+        ):
+            feedback_ctx = self._get_feedback_context(project_id)
+            if feedback_ctx:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = (
+                        feedback_ctx + "\n\n" + sys_msgs[0]["content"]
+                    )
+                else:
+                    messages.insert(0, {"role": "system", "content": feedback_ctx})
+                body["messages"] = messages
+
+        # 16. Proactive suggestions (summarisation and commands)
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        history_msgs = [m for m in messages if m.get("role") != "system"]
+        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+        if self.valves.context_window_tokens > 0:
+            suggestion = await self._check_and_suggest_summarization(
+                project_id, total_tokens, self.valves.context_window_tokens
             )
-            if summary:
-                history_msgs = [
-                    {
-                        "role": "assistant",
-                        "content": f"[Summary of earlier conversation]\n{summary}",
-                    }
-                ] + kept_block
+            if suggestion:
+                messages.insert(0, {"role": "system", "content": suggestion})
+                body["messages"] = messages
+        cmd_suggestion = await self._suggest_commands(project_id, state)
+        if cmd_suggestion:
+            messages.insert(0, {"role": "system", "content": cmd_suggestion})
+            body["messages"] = messages
+
+        # 17. Duplicate question detection
+        if self.valves.duplicate_question_threshold and HAS_SENTENCE:
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user_msg:
+                duplicate = await self._find_duplicate_question(
+                    last_user_msg.get("content", ""), project_id
+                )
+                if duplicate:
+                    warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f})."
+                    messages.insert(0, {"role": "system", "content": warn_msg})
+                    body["messages"] = messages
+
+        # 18. Adaptive context trim
+        trim_needed = False
+        if self.valves.adaptive_trim:
+            total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+            if total_tokens > self.valves.context_window_tokens:
+                trim_needed = True
+        else:
+            user_max = (
+                __user__["valves"].max_turns
+                if __user__ and hasattr(__user__, "valves")
+                else None
+            )
+            eff_max = user_max if user_max is not None else self.valves.max_turns
+            if len(history_msgs) > eff_max:
+                trim_needed = True
+
+        if trim_needed and len(history_msgs) > self.valves.max_turns:
+            self._log_debug("Trimming old messages")
+            keep = self.valves.max_turns
+            last_user_idx = -1
+            for i in range(len(history_msgs) - 1, -1, -1):
+                if history_msgs[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                start_idx = max(0, last_user_idx - keep + 1)
+                old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                kept_block = history_msgs[start_idx:]
+            else:
+                old_block = history_msgs[:-keep] if keep > 0 else []
+                kept_block = history_msgs[-keep:] if keep > 0 else []
+            if self.valves.summarize_old_messages and old_block:
+                has_code = any("```" in m.get("content", "") for m in old_block)
+                summary = await self._summarize_messages(
+                    old_block, is_code_context=has_code
+                )
+                if summary:
+                    history_msgs = [
+                        {
+                            "role": "assistant",
+                            "content": f"[Summary of earlier conversation]\n{summary}",
+                        }
+                    ] + kept_block
+                else:
+                    history_msgs = kept_block
             else:
                 history_msgs = kept_block
-        else:
-            history_msgs = kept_block
-        if self.valves.preserve_tool_calls:
-            while history_msgs and history_msgs[0].get("role") == "tool":
-                history_msgs.pop(0)
-            if (
-                history_msgs
-                and history_msgs[0].get("role") == "assistant"
-                and history_msgs[0].get("tool_calls")
-            ):
-                tool_call_ids = {tc.get("id") for tc in history_msgs[0]["tool_calls"]}
-                tool_response_ids = {
-                    m.get("tool_call_id")
-                    for m in history_msgs[1:]
-                    if m.get("role") == "tool"
-                }
-                if not tool_call_ids.issubset(tool_response_ids):
+            if self.valves.preserve_tool_calls:
+                while history_msgs and history_msgs[0].get("role") == "tool":
                     history_msgs.pop(0)
+                if (
+                    history_msgs
+                    and history_msgs[0].get("role") == "assistant"
+                    and history_msgs[0].get("tool_calls")
+                ):
+                    tool_call_ids = {
+                        tc.get("id") for tc in history_msgs[0]["tool_calls"]
+                    }
+                    tool_response_ids = {
+                        m.get("tool_call_id")
+                        for m in history_msgs[1:]
+                        if m.get("role") == "tool"
+                    }
+                    if not tool_call_ids.issubset(tool_response_ids):
+                        history_msgs.pop(0)
 
-    messages = system_msgs + history_msgs
+        messages = system_msgs + history_msgs
 
-    # 19. Final safety: ensure the last message is from the user
-    if messages and messages[-1].get("role") != "user":
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            messages = messages[: last_user_idx + 1]
-            self._log_debug("Trimmed trailing assistant messages")
-        else:
-            messages.append({"role": "user", "content": "continue"})
-            self._log_debug("Inserted dummy user message to satisfy API")
+        # 19. Final safety: ensure the last message is from the user
+        if messages and messages[-1].get("role") != "user":
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                messages = messages[: last_user_idx + 1]
+                self._log_debug("Trimmed trailing assistant messages")
+            else:
+                messages.append({"role": "user", "content": "continue"})
+                self._log_debug("Inserted dummy user message to satisfy API")
 
-    body["messages"] = messages
-    return body
+        body["messages"] = messages
+        return body
 
     # --------------------------------------------------------------------------
     #  MODIFIED: outlet – skip if already processed in inlet
@@ -3861,7 +3998,11 @@ Code:
     #  MODIFIED: _handle_forget_command – clean index on block removal
     # --------------------------------------------------------------------------
     async def _handle_forget_command(
-        self, messages: List[dict], project_id: str, __user__: Optional[dict]
+        self,
+        messages: List[dict],
+        project_id: str,
+        __user__: Optional[dict],
+        code_spans: Optional[List[Tuple[int, int]]] = None,
     ) -> Tuple[List[dict], bool]:
         if not (
             self.valves.enable_forget_command
@@ -3876,14 +4017,12 @@ Code:
         content = last_msg.get("content", "").strip()
 
         if self.valves.enable_natural_language_forget:
-            intent = await self._parse_forget_intent(content)
+            intent = await self._parse_forget_intent(content, code_spans=code_spans)
             if intent and intent.get("action") != "none":
                 confirmation = await self._execute_forget_intent(project_id, intent)
                 status_msg = f"[CodeAware] {confirmation}"
                 messages.insert(0, {"role": "system", "content": status_msg})
                 self._set_state(project_id, self._get_state(project_id))
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
                 messages.pop()
                 messages.append({"role": "assistant", "content": confirmation})
                 return messages, True
@@ -3939,6 +4078,8 @@ Code:
                     f"Forgotten {len(to_remove)} block(s) matching '{target}'."
                 )
             self._set_state(project_id, state)
+            status_msg = f"[CodeAware] {confirmation}"
+            messages.insert(0, {"role": "system", "content": status_msg})
             messages.pop()
             messages.append({"role": "assistant", "content": confirmation})
             return messages, True
@@ -4044,13 +4185,15 @@ Code:
     # --------------------------------------------------------------------------
     #  Forget / Remember / Obsolete intent parsers
     # --------------------------------------------------------------------------
-    async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
+    async def _parse_forget_intent(
+        self, user_message: str, code_spans: Optional[List[Tuple[int, int]]] = None
+    ) -> Optional[Dict]:
         """Interpret natural language forget command using LLM, after stripping code."""
         if not self.valves.enable_natural_language_forget:
             return None
 
-        # Remove code blocks before LLM interpretation
-        code_spans = await self._get_code_spans(user_message)
+        if code_spans is None:
+            code_spans = await self._get_code_spans(user_message)
         cleaned = self._remove_code_spans(user_message, code_spans).strip()
         if not cleaned or len(cleaned) < 5:
             return None
@@ -4090,12 +4233,15 @@ Code:
             pass
         return None
 
-    async def _parse_remember_intent(self, user_message: str) -> Optional[Dict]:
+    async def _parse_remember_intent(
+        self, user_message: str, code_spans: Optional[List[Tuple[int, int]]] = None
+    ) -> Optional[Dict]:
         """Interpret natural language remember/pin command using LLM, after stripping code."""
         if not self.valves.enable_natural_language_forget:
             return None
 
-        code_spans = await self._get_code_spans(user_message)
+        if code_spans is None:
+            code_spans = await self._get_code_spans(user_message)
         cleaned = self._remove_code_spans(user_message, code_spans).strip()
         if not cleaned or len(cleaned) < 5:
             return None
@@ -4216,12 +4362,15 @@ Code:
             else:
                 return "Unrecognized pin action."
 
-    async def _parse_obsolete_intent(self, user_message: str) -> Optional[Dict]:
+    async def _parse_obsolete_intent(
+        self, user_message: str, code_spans: Optional[List[Tuple[int, int]]] = None
+    ) -> Optional[Dict]:
         """Interpret natural language obsolete/revive command using LLM, after stripping code."""
         if not self.valves.enable_obsolete_marking:
             return None
 
-        code_spans = await self._get_code_spans(user_message)
+        if code_spans is None:
+            code_spans = await self._get_code_spans(user_message)
         cleaned = self._remove_code_spans(user_message, code_spans).strip()
         if not cleaned or len(cleaned) < 5:
             return None
