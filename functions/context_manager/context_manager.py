@@ -2327,14 +2327,12 @@ class Filter:
                 )
             new_blocks_pending.append(new_block)
 
-        # Extract signatures and call graphs concurrently (outside lock)
-        symbols_list = await asyncio.gather(
-            *[
-                SignatureExtractor.extract_async(blk.content, blk.file_path)
-                for blk in new_blocks_pending
-            ],
-            return_exceptions=True,
-        )
+        # Extract signatures and call graphs sequentially in the same thread
+        # to avoid moving the tree-sitter Parser across threads (Parser is !Send).
+        symbols_list = []
+        for blk in new_blocks_pending:
+            syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
+            symbols_list.append(syms)
 
         async with lock:
             state = self._get_state(project_id)
@@ -3135,7 +3133,7 @@ class Filter:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
             )
-            is_structural = last_user_msg and self._is_structural_task(
+            is_structural = last_user_msg and await self._is_structural_task(
                 last_user_msg.get("content", "")
             )
 
