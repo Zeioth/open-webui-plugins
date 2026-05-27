@@ -3330,7 +3330,8 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 and remember_intent.get("action")
                 and remember_intent["action"] != "none"
             ):
-                desc = f"Action: {remember_intent.get('action')}, details: { {k:v for k,v in remember_intent.items() if k!='action'} }"
+                details = {k: v for k, v in remember_intent.items() if k != "action"}
+                desc = f"Action: {remember_intent.get('action')}, details: {details}"
                 if await self._verify_command_intent(
                     last_user_msg.get("content", ""), desc
                 ):
