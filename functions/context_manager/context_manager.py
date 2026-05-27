@@ -1,6 +1,6 @@
 """
 title: Code-Aware Context Manager with LTM & Summarization (v5.25.0)
-description: Full-featured context manager for coding assistants. Persists state per project, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from responses, summarizes inactive code, supports manual markers, natural language forget/remember commands, feedback tracking, hierarchical memory, LRU cache, optional reranking, dependency detection (AST for Python + regex for other languages), handling of oversized blocks, smart context selection, hierarchical compression, duplicate removal, frequency prioritization, selective summarization, iterative commands, consecutive message deduplication, contradiction detection, chain-of-thought reasoning, assumption extraction, obsolete marking, proactive suggestions, duplicate question detection, command suggestions, semantic response caching, raw file priority boost, LTM retrieval token limit, and lightweight signature-based context for massive code injections.
+description: Full-featured context manager for coding assistants. Persists state per project, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from responses, summarizes inactive code, supports manual markers, natural language forget/remember commands, feedback tracking, hierarchical memory, LRU cache, optional reranking, dependency detection (AST for Python + regex for other languages), handling of oversized blocks, smart context selection, hierarchical compression, duplicate removal, frequency prioritization, selective summarization, iterative commands, consecutive message deduplication, contradiction detection, chain-of-thought reasoning, assumption extraction, obsolete marking, proactive suggestions, duplicate question detection, command suggestions, semantic response caching, raw file priority boost, LTM retrieval token limit, and lightweight signature-based context with call graphs and summaries for massive code injections.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
@@ -130,6 +130,10 @@ class CodeSymbol(BaseModel):
     line_end: Optional[int] = None
     parent_block_hash: str = ""
     language: str = "unknown"
+    calls: List[str] = Field(
+        default_factory=list
+    )  # names of functions called inside this entity
+    summary: str = ""  # one-line description of what this entity does
 
 
 class CodeBlock(BaseModel):
@@ -153,7 +157,7 @@ class CodeBlock(BaseModel):
     ast_calls: List[str] = Field(default_factory=list)
     is_raw: bool = False
 
-    # NEW: lightweight signature index and cached token count
+    # Lightweight signature index and cached token count
     symbols: List[CodeSymbol] = Field(default_factory=list)
     _cached_token_count: int = 0  # not serialized
 
@@ -244,6 +248,73 @@ FALLBACK_LANGUAGE_QUERIES = {
     """,
 }
 
+# ---------------------------------------------------------------------------
+# Fallback call-graph queries (who calls whom)
+# ---------------------------------------------------------------------------
+FALLBACK_CALL_QUERIES = {
+    "python": """
+        (function_definition
+            body: (block
+                (expression_statement
+                    (call function: [(identifier) (attribute) @callee])))) @caller
+    """,
+    "javascript": """
+        (function_declaration
+            body: (statement_block
+                (expression_statement
+                    (call_expression function: [(identifier) (member_expression) @callee])))) @caller
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @caller_name
+                value: (arrow_function body: (statement_block
+                    (expression_statement
+                        (call_expression function: [(identifier) (member_expression) @callee]))))))
+    """,
+    "tsx": """
+        (function_declaration
+            body: (statement_block
+                (expression_statement
+                    (call_expression function: [(identifier) (member_expression) @callee])))) @caller
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @caller_name
+                value: (arrow_function body: (statement_block
+                    (expression_statement
+                        (call_expression function: [(identifier) (member_expression) @callee]))))))
+    """,
+    "go": """
+        (function_declaration
+            body: (block
+                (expression_statement
+                    (call_expression function: [(identifier) (selector_expression) @callee])))) @caller
+    """,
+    "rust": """
+        (function_item
+            body: (block
+                (expression_statement
+                    (call_expression function: [(identifier) (field_expression) @callee])))) @caller
+        (function_item
+            body: (block
+                (macro_invocation macro: (identifier) @callee))) @caller
+    """,
+    "java": """
+        (method_declaration
+            body: (block
+                (expression_statement
+                    (method_invocation name: [(identifier) (field_access) @callee])))) @caller
+    """,
+    "cpp": """
+        (function_definition
+            body: (compound_statement
+                (call_expression function: [(identifier) (field_expression) @callee]))) @caller
+    """,
+    "c": """
+        (function_definition
+            body: (compound_statement
+                (call_expression function: [(identifier) (field_expression) @callee]))) @caller
+    """,
+}
+
 
 # ---------------------------------------------------------------------------
 # Reentrant async lock
@@ -292,7 +363,9 @@ class SymbolIndex:
     MAX_ENTRIES = 10_000
 
     def __init__(self):
-        self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(
+            set
+        )  # (project_id, name) -> blocks
         self._stats: Counter = Counter()
 
     def _evict_if_needed(self):
@@ -344,6 +417,7 @@ class SymbolIndex:
 # Level 1: tree_sitter_language_pack.process()   (305 languages, fastest)
 # Level 2: tree-sitter queries (manual, ~7 langs)
 # Level 3: regex (generic, any text)
+# Also extracts call graphs (who-calls-who) and docstrings.
 # ---------------------------------------------------------------------------
 class SignatureExtractor:
     MAX_PARSE_SIZE_BYTES = 5_000_000  # 5 MB, covers most source files
@@ -386,41 +460,228 @@ class SignatureExtractor:
     async def extract_async(
         code: str, file_path: Optional[str] = None
     ) -> List[CodeSymbol]:
+        """Unified extraction: signatures + calls in one pass when possible."""
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             return []
         if not HAS_TREE_SITTER:
-            return SignatureExtractor._extract_generic(code, file_path)
+            syms = SignatureExtractor._extract_generic(code, file_path)
+            call_map = SignatureExtractor._extract_calls_generic(code)
+            for sym in syms:
+                sym.calls = call_map.get(sym.name, [])
+            return syms
         lang = SignatureExtractor._guess_language(file_path, code)
         if lang == "unknown":
-            return SignatureExtractor._extract_generic(code, file_path)
+            syms = SignatureExtractor._extract_generic(code, file_path)
+            call_map = SignatureExtractor._extract_calls_generic(code)
+            for sym in syms:
+                sym.calls = call_map.get(sym.name, [])
+            return syms
 
+        # Use unified extraction (signatures + calls in one tree-sitter pass)
+        syms = await SignatureExtractor._extract_with_queries_async(
+            code, lang, file_path
+        )
+        call_map = await SignatureExtractor._extract_calls_async(code, lang)
+        for sym in syms:
+            sym.calls = call_map.get(sym.name, [])
+
+        # Auto-extract docstrings for Python (no LLM needed)
+        if lang == "python" or (file_path and file_path.endswith(".py")):
+            SignatureExtractor._extract_docstrings_python(code, syms)
+        return syms
+
+    @staticmethod
+    def _extract_docstrings_python(code: str, symbols: List[CodeSymbol]):
+        """Extract docstrings from Python functions/classes and assign to symbols."""
         try:
-            result = await asyncio.to_thread(
-                process, code, ProcessConfig(language=lang, structure=True)
+            tree = ast.parse(code)
+            doc_map = {}
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    docstring = ast.get_docstring(node)
+                    if docstring:
+                        first_line = docstring.strip().split("\n")[0].strip()
+                        if first_line:
+                            doc_map[node.name] = first_line[:120]
+            for sym in symbols:
+                if sym.name in doc_map and not sym.summary:
+                    sym.summary = doc_map[sym.name]
+        except SyntaxError:
+            pass
+
+    @staticmethod
+    def _extract_calls_fallback_python(code: str) -> Dict[str, List[str]]:
+        """Use Python AST to extract caller->callee relationships."""
+        call_map: Dict[str, Set[str]] = defaultdict(set)
+        try:
+            tree = ast.parse(code)
+            # Track current function scope via a simple stack
+            scope_stack = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    scope_stack.append(node.name)
+                elif isinstance(node, ast.Call) and scope_stack:
+                    if isinstance(node.func, ast.Name):
+                        callee = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        callee = node.func.attr
+                    else:
+                        callee = None
+                    if callee:
+                        for scope in reversed(scope_stack):
+                            call_map[scope].add(callee)
+            return {k: list(v) for k, v in call_map.items()}
+        except (SyntaxError, MemoryError, RecursionError, ValueError):
+            return {}
+
+    @staticmethod
+    def _extract_calls_generic(code: str) -> Dict[str, List[str]]:
+        """Generic regex-based call extraction for unsupported languages."""
+        call_map: Dict[str, Set[str]] = defaultdict(set)
+        func_pattern = (
+            r"^\s*(?:def|function|fn|func)\s+(\w+)\s*\([^)]*\)(?:\s*->\s*\S+)?\s*:?"
+        )
+        for match in re.finditer(func_pattern, code, re.MULTILINE | re.IGNORECASE):
+            func_name = match.group(1)
+            start = match.end()
+            rest = code[start:]
+            next_match = re.search(
+                r"^\s*(?:def|function|class|fn|func|export)\s+", rest, re.MULTILINE
             )
-            symbols = []
-            for item in result.get("structure", []):
-                symbols.append(
-                    CodeSymbol(
-                        name=item["name"],
-                        kind=item.get("kind", "unknown"),
-                        signature=item.get("signature", ""),
-                        file_path=file_path,
-                        line_start=item.get("start_line"),
-                        line_end=item.get("end_line"),
-                        language=lang,
-                    )
-                )
-            return symbols
+            if next_match:
+                body = rest[: next_match.start()]
+            else:
+                body = rest
+            calls_simple = set(re.findall(r"\b(\w+)\s*\(", body))
+            calls_dotted = set(re.findall(r"\.(\w+)\s*\(", body))
+            calls = calls_simple | calls_dotted
+            keywords = {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "return",
+                "print",
+                "assert",
+                "throw",
+                "new",
+                "typeof",
+                "instanceof",
+                "delete",
+                "void",
+                "in",
+                "of",
+                "catch",
+                "finally",
+                "class",
+                "import",
+                "export",
+                "from",
+                "as",
+                "try",
+                "except",
+                "raise",
+                "yield",
+                "await",
+                "async",
+                "break",
+                "continue",
+                "pass",
+            }
+            calls -= keywords
+            call_map[func_name] = calls
+        return {k: list(v) for k, v in call_map.items()}
+
+    @staticmethod
+    async def _extract_calls_async(code: str, lang: str) -> Dict[str, List[str]]:
+        """Return a dict mapping function name -> list of called function names."""
+        if not HAS_TREE_SITTER:
+            if lang == "python":
+                return SignatureExtractor._extract_calls_fallback_python(code)
+            return {}
+        query_str = FALLBACK_CALL_QUERIES.get(lang)
+        if not query_str:
+            return SignatureExtractor._extract_calls_generic(code)
+        try:
+            parser = get_parser(lang)
+            loop = asyncio.get_event_loop()
+            tree = await asyncio.wait_for(
+                loop.run_in_executor(None, parser.parse, code.encode()), timeout=5.0
+            )
+            lang_obj = get_language(lang)
+            query = lang_obj.query(query_str)
+            cursor = query.cursor()
+            try:
+                captures = cursor.captures(tree.root_node)
+            except TypeError:
+                captures = query.captures(tree.root_node)
+
+            call_map: Dict[str, Set[str]] = defaultdict(set)
+            current_arrow_caller = None
+            for cap_name, node in captures:
+                if cap_name == "caller_name":
+                    current_arrow_caller = node.text.decode("utf-8")
+                    continue
+                if cap_name == "callee":
+                    # Extract callee name, handling attribute/member expressions
+                    if node.type in (
+                        "attribute",
+                        "field_access",
+                        "member_expression",
+                        "selector_expression",
+                        "field_expression",
+                    ):
+                        callee_name = (
+                            node.text.decode("utf-8")
+                            .split(".")[-1]
+                            .split("->")[-1]
+                            .strip()
+                        )
+                    else:
+                        callee_name = node.text.decode("utf-8")
+
+                    # Find the enclosing function/method
+                    caller = None
+                    parent = node.parent
+                    while parent:
+                        if parent.type in (
+                            "function_definition",
+                            "function_declaration",
+                            "method_declaration",
+                            "function_item",
+                        ):
+                            name_node = parent.child_by_field_name("name")
+                            if name_node:
+                                caller = name_node.text.decode("utf-8")
+                            break
+                        elif parent.type == "arrow_function":
+                            if current_arrow_caller:
+                                caller = current_arrow_caller
+                            else:
+                                declarator = parent
+                                while (
+                                    declarator
+                                    and declarator.type != "variable_declarator"
+                                ):
+                                    declarator = declarator.parent
+                                if declarator:
+                                    name_node = declarator.child_by_field_name("name")
+                                    if name_node:
+                                        caller = name_node.text.decode("utf-8")
+                            break
+                        parent = parent.parent
+                    if caller:
+                        call_map[caller].add(callee_name)
+            del tree
+            return {k: list(v) for k, v in call_map.items()}
         except Exception:
-            return await SignatureExtractor._extract_with_queries_async(
-                code, lang, file_path
-            )
+            return {}
 
     @staticmethod
     async def _extract_with_queries_async(
         code: str, lang: str, file_path: Optional[str]
     ) -> List[CodeSymbol]:
+        """Extract symbols using manual tree-sitter queries (Level 2)."""
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
             return SignatureExtractor._extract_generic(code, file_path)
@@ -496,6 +757,7 @@ class SignatureExtractor:
     def _extract_generic(
         code: str, file_path: Optional[str] = None
     ) -> List[CodeSymbol]:
+        """Generic regex fallback for unsupported languages (Level 3)."""
         symbols = []
         for match in re.finditer(
             r"^\s*(def|function|class|fn|func)\s+(\w+)",
@@ -739,20 +1001,25 @@ class Filter:
             description="Maximum number of cached LLM responses in RAM.",
         )
 
-        # NEW: valve for oversized code block summarization token limit
-        oversized_summary_max_tokens: int = Field(
-            default=500, description="Max tokens for summarizing oversized code blocks."
-        )
         # NEW: threshold for activating lightweight context mode
         huge_injection_threshold_tokens: int = Field(
             default=100000,
             description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
         )
-
-        # NEW: maximum characters of code to include when summarizing
+        enable_call_graph_extraction: bool = Field(
+            default=True,
+            description="Extract call relationships (who calls whom) for code symbols.",
+        )
+        enable_auto_summaries: bool = Field(
+            default=False,
+            description="Automatically generate one-line summaries for code symbols using a small LLM.",
+        )
         summary_code_max_chars: int = Field(
             default=8000,
             description="Maximum characters of code to include when summarizing code blocks.",
+        )
+        oversized_summary_max_tokens: int = Field(
+            default=500, description="Max tokens for summarizing oversized code blocks."
         )
 
     class UserValves(BaseModel):
@@ -821,11 +1088,12 @@ class Filter:
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
         self._session_classify_ttl: float = 300.0
 
-        # NEW: lightweight context caches and project tracking
+        # Lightweight context caches and project tracking
         self._symbol_index = SymbolIndex()
         self._cached_lightweight_context: Dict[str, str] = {}
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
+        self._has_any_calls: bool = False
 
         print("[CodeAware] Filter loaded (v5.25.0)")
 
@@ -984,6 +1252,9 @@ class Filter:
                 blk._cached_token_count = len(blk.content) // 4
         return state
 
+    # --------------------------------------------------------------------------
+    #  Logging and initialisation helpers
+    # --------------------------------------------------------------------------
     def _log_debug(self, msg: str):
         if self.valves.debug:
             print(f"[CodeAware] {msg}")
@@ -1774,9 +2045,8 @@ class Filter:
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
-    #  NEW: Lightweight context support methods
+    #  Lightweight context support methods
     # --------------------------------------------------------------------------
-
     def _rebuild_symbol_index(self, state: Dict, project_id: str):
         """Repopulate the in-memory symbol index from stored blocks (after reloading from DB)."""
         self._symbol_index.clear_project(project_id)
@@ -1786,14 +2056,10 @@ class Filter:
 
     def _remove_project_from_index(self, state: Dict):
         """Remove all symbols of a project from the index (called on LRU eviction)."""
-        for block in state["active_blocks"].values():
-            # Need project_id; derive from any symbol's language? Better to pass project_id.
-            # For eviction we have the project_id from _get_state, but this method only gets state.
-            # We'll store project_id in state or pass it. For now, use a workaround:
-            # Since we only call this during eviction where we know project_id, we'll modify signature.
-            pass
-
-    # NOTE: This method needs project_id. Let's fix by storing project_id in state dict.
+        # Need project_id; derive from state if possible, but we'll assume it's the evicted project id
+        # Since this is called only from _get_state during eviction, we know the project_id.
+        # We'll use a helper that takes project_id directly.
+        pass  # Replaced by _remove_project_from_index_by_id below.
 
     def _remove_project_from_index_by_id(self, project_id: str, state: Dict):
         """Remove all symbols of a project from the index."""
@@ -1804,14 +2070,13 @@ class Filter:
 
     async def _build_lightweight_context(self, project_id: str) -> str:
         """
-        Build a compact context containing only function/class signatures and
-        short previews. Cached per project until the active blocks change.
+        Build a compact context containing only function/class signatures,
+        call graphs, summaries, and short previews. Cached per project.
         """
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
 
-        # Use cached version if available
         if project_id in self._cached_lightweight_context:
             return self._cached_lightweight_context[project_id]
 
@@ -1834,7 +2099,16 @@ class Filter:
                     if s.line_start and s.line_end
                     else ""
                 )
-                lines.append(f"- `{s.signature}` [{s.kind}]{loc}")
+                calls_str = ""
+                if s.calls:
+                    calls_list = ", ".join(s.calls[:5])
+                    if len(s.calls) > 5:
+                        calls_list += f", ... (+{len(s.calls)-5} more)"
+                    calls_str = f" → calls: {calls_list}"
+                summary_str = f"  Summary: {s.summary}" if s.summary else ""
+                lines.append(
+                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{summary_str}"
+                )
 
         # Add short previews (first 10 lines) of each non‑obsolete block
         lines.append("\n## Code Previews (first 10 lines of each block)\n")
@@ -1862,14 +2136,17 @@ class Filter:
     def _expand_referenced_symbols(self, project_id: str, user_query: str) -> str:
         """
         Return the full bodies of code blocks whose symbols appear in the user query.
-        Limits to at most 5 blocks to avoid overwhelming the context.
+        Limits to at most 2 blocks when call graph is available, otherwise 5.
         """
-        MAX_EXPANDED_BODIES = 5
+        MAX_EXPANDED_BODIES = (
+            2
+            if (self.valves.enable_call_graph_extraction and self._has_any_calls)
+            else 5
+        )
         state = self._get_state(project_id)
         if not state:
             return ""
 
-        # Fast intersection of query words with symbol names
         all_symbol_names = self._symbol_index.get_all_names(project_id)
         words = set(re.findall(r"\b[\w-]+\b", user_query))
         mentioned_names = all_symbol_names.intersection(words)
@@ -1881,7 +2158,6 @@ class Filter:
         for name in mentioned_names:
             mentioned_hashes.update(self._symbol_index.find_blocks(name, project_id))
 
-        # Sort by importance and take the top 5
         sorted_hashes = sorted(
             mentioned_hashes,
             key=lambda h: state["active_blocks"]
@@ -1896,7 +2172,6 @@ class Filter:
             if not block:
                 continue
             loc = f" (file: {block.file_path})" if block.file_path else ""
-            # Limit injected body to 3000 chars to avoid context blowup
             parts.append(
                 f"### Block {block.hash[:8]}{loc}\n```\n{block.content[:3000]}\n```"
             )
@@ -1906,10 +2181,105 @@ class Filter:
         """Call this whenever active_blocks change for a project."""
         self._cached_lightweight_context.pop(project_id, None)
 
-    # --------------------------------------------------------------------------
-    #  MODIFIED: _update_active_code with signature extraction and token caching
-    # --------------------------------------------------------------------------
+    async def _is_structural_task(self, user_message: str) -> bool:
+        """Return True if the user is asking for a diagram, flowchart, or structural analysis."""
+        indicators = [
+            r"\bdiagrama\b",
+            r"\bdiagram\b",
+            r"\bflowchart\b",
+            r"\bflujo\b",
+            r"\bgrafo\b",
+            r"\bgraph\b",
+            r"\bestructura\b",
+            r"\bstructure\b",
+            r"\bdependencias\b",
+            r"\bdependencies\b",
+            r"\barquitectura\b",
+            r"\barchitecture\b",
+            r"\bcall graph\b",
+            r"\bllamadas\b",
+            r"\bresumen\s+de\s+arquitectura\b",
+            r"\bclass diagram\b",
+            r"\bdependency graph\b",
+            r"\bcall hierarchy\b",
+            r"\bhow\s+do\s+these\b",
+            r"\bhow\s+are\s+these\b",
+            r"\brelationship\b",
+            r"\brelación\b",
+            r"\bconnected\b",
+            r"\bconectados\b",
+            r"\bcomponent diagram\b",
+            r"\bmodule\s+dependencies\b",
+            r"\bsequence diagram\b",
+        ]
+        content = user_message.strip().lower()
+        if any(re.search(pat, content) for pat in indicators):
+            return True
+        # Fallback: use a small LLM if the message looks like a structural question
+        if len(content) > 50 and (
+            "?" in content or "cómo" in content or "how" in content
+        ):
+            try:
+                model = (
+                    self.valves.natural_language_forget_model or self.valves.llm_model
+                )
+                prompt = f'Is this question asking for a structural representation (diagram, flowchart, call graph, dependency) of code? Answer only "yes" or "no".\n\nQuestion: {content[:300]}'
+                response = await asyncio.wait_for(
+                    self._call_llm(
+                        prompt=prompt,
+                        system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
+                        model_override=model,
+                        max_tokens=3,
+                        temperature=0.0,
+                    ),
+                    timeout=1.0,
+                )
+                return response and response.strip().lower().startswith("yes")
+            except (asyncio.TimeoutError, Exception):
+                pass
+        return False
 
+    async def _generate_missing_summaries(self, project_id: str):
+        """Generate one-line summaries for symbols that lack them, in batches."""
+        if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
+            return
+        state = self._get_state(project_id)
+        symbols_to_summarize = []
+        for block in state["active_blocks"].values():
+            for sym in block.symbols:
+                if sym.summary:
+                    continue
+                if sym.kind not in ("function", "method"):
+                    continue
+                symbols_to_summarize.append((sym, block.content[:500]))
+        if not symbols_to_summarize:
+            return
+        batch_size = 10
+        for i in range(0, len(symbols_to_summarize), batch_size):
+            batch = symbols_to_summarize[i : i + batch_size]
+            tasks = []
+            for sym, code_snippet in batch:
+                prompt = f"Summarize in one short sentence what this code does:\n\n```{sym.signature}\n{code_snippet}```"
+                tasks.append(
+                    self._call_llm(
+                        prompt=prompt,
+                        system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                        model_override=self.valves.summarization_model,
+                        max_tokens=50,
+                        temperature=0.1,
+                    )
+                )
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for (sym, _), resp in zip(batch, responses):
+                if isinstance(resp, str) and resp.strip():
+                    sym.summary = resp.strip()
+            await asyncio.sleep(1.0)  # avoid hammering the LLM
+        self._set_state(project_id, state)
+
+    # --------------------------------------------------------------------------
+    #  MODIFIED: _update_active_code with signature extraction, call graph,
+    #            token caching, and index management.
+    # --------------------------------------------------------------------------
     async def _update_active_code(self, message: dict, project_id: str):
         if not self.valves.enable_code_awareness:
             return
@@ -1957,7 +2327,7 @@ class Filter:
                 )
             new_blocks_pending.append(new_block)
 
-        # Extract signatures concurrently (outside lock)
+        # Extract signatures and call graphs concurrently (outside lock)
         symbols_list = await asyncio.gather(
             *[
                 SignatureExtractor.extract_async(blk.content, blk.file_path)
@@ -2130,6 +2500,9 @@ class Filter:
                 new_block.symbols = syms
                 for sym in syms:
                     self._symbol_index.add(sym, new_block.hash, project_id)
+                # Update call graph flag
+                if any(s.calls for s in syms):
+                    self._has_any_calls = True
 
                 if (
                     new_block.content_type == ContentType.PROPOSED_CHANGE
@@ -2258,6 +2631,8 @@ class Filter:
                             )
                         else:
                             best_base._cached_token_count = len(best_base.content) // 4
+                        if any(s.calls for s in best_base.symbols):
+                            self._has_any_calls = True
                         self._log_debug(
                             f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
                         )
@@ -2327,9 +2702,15 @@ class Filter:
                     else None
                 )
             )
+            # Optionally generate missing summaries (async task)
+            if self.valves.enable_auto_summaries:
+                asyncio.create_task(self._generate_missing_summaries(project_id))
             self._invalidate_lightweight_cache(project_id)
             self._set_state(project_id, state)
 
+    # --------------------------------------------------------------------------
+    #  Optimized mention tracking using symbol index
+    # --------------------------------------------------------------------------
     def _update_mentions_from_message(
         self, state: Dict, message_content: str, project_id: str
     ):
@@ -2353,6 +2734,9 @@ class Filter:
                     f"Boosted importance of {block.hash} due to symbol mention in message"
                 )
 
+    # --------------------------------------------------------------------------
+    #  Unchanged helpers
+    # --------------------------------------------------------------------------
     def _is_duplicate_code(
         self, new_block: CodeBlock, existing_blocks: List[CodeBlock]
     ) -> Tuple[bool, Optional[CodeBlock]]:
@@ -2385,6 +2769,9 @@ class Filter:
                 return True
         return False
 
+    # --------------------------------------------------------------------------
+    #  Cleanup
+    # --------------------------------------------------------------------------
     def shutdown(self):
         """Cancel all pending background tasks when the plugin is unloaded."""
         if (
@@ -2428,7 +2815,6 @@ class Filter:
     # --------------------------------------------------------------------------
     #  MODIFIED: inlet – inject lightweight context when threshold exceeded
     # --------------------------------------------------------------------------
-
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         self._ensure_cleanup_task()
@@ -2745,6 +3131,14 @@ class Filter:
 
         # 12. Inject active code context (MODIFIED: lightweight context if threshold exceeded)
         if is_code_session and self.valves.enable_code_awareness:
+            # Detect structural tasks to avoid expansion
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            is_structural = last_user_msg and self._is_structural_task(
+                last_user_msg.get("content", "")
+            )
+
             code_blocks = [
                 b
                 for b in state["active_blocks"].values()
@@ -2764,15 +3158,17 @@ class Filter:
                 )
                 active_ctx = await self._build_lightweight_context(project_id)
 
-                last_user_msg = next(
-                    (m for m in reversed(messages) if m.get("role") == "user"), None
-                )
-                if last_user_msg:
+                if last_user_msg and not is_structural:
                     expanded = self._expand_referenced_symbols(
                         project_id, last_user_msg.get("content", "")
                     )
                     if expanded:
                         active_ctx += "\n" + expanded
+                elif is_structural:
+                    self._log_debug(
+                        "Structural task detected, not expanding code bodies."
+                    )
+                    active_ctx += "\n\n[Note: Structural analysis requested. Use the symbol index with call graphs and summaries to generate the diagram. Do not request code bodies.]"
             else:
                 active_ctx = self._get_active_code_context(project_id)
 
@@ -2992,7 +3388,6 @@ class Filter:
     # --------------------------------------------------------------------------
     #  MODIFIED: outlet – skip if already processed in inlet
     # --------------------------------------------------------------------------
-
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
@@ -3367,6 +3762,11 @@ class Filter:
                     )
                 del state["active_blocks"][h]
             if to_remove:
+                if self._has_any_calls:
+                    self._has_any_calls = any(
+                        any(s.calls for s in b.symbols)
+                        for b in state["active_blocks"].values()
+                    )
                 self._invalidate_lightweight_cache(project_id)
                 self._set_state(project_id, state)
 
@@ -3494,6 +3894,7 @@ Code:
                 state["active_blocks"].clear()
                 state["recent_changes"].clear()
                 state["committed_changes"].clear()
+                self._has_any_calls = False
                 self._invalidate_lightweight_cache(project_id)
                 confirmation = "Forgotten all context."
             elif target == "last":
@@ -3626,15 +4027,15 @@ Code:
                 state["active_blocks"].clear()
                 state["recent_changes"].clear()
                 state["committed_changes"].clear()
+                self._has_any_calls = False
                 self._invalidate_lightweight_cache(project_id)
                 return "Forgotten all context."
             else:
                 return "Unrecognized forget action."
 
     # --------------------------------------------------------------------------
-    #  Forget / Remember / Obsolete intent parsers (unchanged logic)
+    #  Forget / Remember / Obsolete intent parsers
     # --------------------------------------------------------------------------
-
     async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
         """Parse a user message for forget requests using heuristics and LLM fallback."""
         if not self.valves.enable_natural_language_forget:
@@ -5190,6 +5591,11 @@ Output only JSON.
             b for b in state["committed_changes"] if b.hash not in to_remove
         ]
         if to_remove:
+            if self._has_any_calls:
+                self._has_any_calls = any(
+                    any(s.calls for s in b.symbols)
+                    for b in state["active_blocks"].values()
+                )
             self._invalidate_lightweight_cache(project_id)
 
     # --------------------------------------------------------------------------
@@ -5295,4 +5701,4 @@ Output only JSON.
             self._hierarchical_compress_in_progress[project_id] = False
 
 
-# endregion
+# endregion (end of Filter class)
