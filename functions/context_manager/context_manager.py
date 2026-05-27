@@ -739,10 +739,20 @@ class Filter:
             description="Maximum number of cached LLM responses in RAM.",
         )
 
+        # NEW: valve for oversized code block summarization token limit
+        oversized_summary_max_tokens: int = Field(
+            default=500, description="Max tokens for summarizing oversized code blocks."
+        )
         # NEW: threshold for activating lightweight context mode
         huge_injection_threshold_tokens: int = Field(
             default=100000,
             description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
+        )
+
+        # NEW: maximum characters of code to include when summarizing
+        summary_code_max_chars: int = Field(
+            default=8000,
+            description="Maximum characters of code to include when summarizing code blocks.",
         )
 
     class UserValves(BaseModel):
