@@ -1846,6 +1846,28 @@ class Filter:
             self._log_debug(f"LLM call timed out after {timeout}s: {prompt[:80]}...")
             return None
 
+    async def _verify_command_intent(
+        self, user_message_cleaned: str, action_description: str
+    ) -> bool:
+        """Quick LLM verification that the user actually intends to execute this command."""
+        prompt = (
+            f"A command parser interpreted the following user message (code already removed) as:\n"
+            f"{action_description}\n\n"
+            f"Original message: {user_message_cleaned[:500]}\n\n"
+            f"Is this interpretation correct? Answer only 'yes' or 'no'."
+        )
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt="You are a strict yes/no verifier. Answer only 'yes' or 'no'.",
+            model_override=None,  # use default summarization model
+            max_tokens=3,
+            temperature=0.0,
+            timeout=4.0,  # short timeout to avoid delays
+        )
+        if response and response.strip().lower().startswith("yes"):
+            return True
+        return False
+
     async def _periodic_response_cache_cleanup(self):
         """Clean up expired response cache entries every hour."""
         while True:
@@ -3251,6 +3273,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         is_code_session
         or (messages and messages[-1].get("content", "").startswith("/"))
     ):
+        # Always try the dedicated /forget handler first (covers explicit commands and fallback)
         new_messages, handled = await self._handle_forget_command(
             messages, project_id, __user__
         )
@@ -3258,6 +3281,37 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             return body
+
+        # If natural language parsing produced an intent (but not handled as explicit command),
+        # verify it before executing to prevent accidental triggers.
+        if self.valves.enable_natural_language_forget:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and not last_user_msg.get("content", "").startswith("/"):
+                intent = await self._parse_forget_intent(
+                    last_user_msg.get("content", "")
+                )
+                if intent and intent.get("action") != "none":
+                    # Build a human-readable description of the action
+                    desc = f"Action: {intent.get('action')}, details: { {k:v for k,v in intent.items() if k!='action'} }"
+                    if await self._verify_command_intent(
+                        last_user_msg.get("content", ""), desc
+                    ):
+                        confirmation = await self._execute_forget_intent(
+                            project_id, intent
+                        )
+                        status_msg = f"[CodeAware] {confirmation}"
+                        messages.insert(0, {"role": "system", "content": status_msg})
+                        messages.pop()
+                        messages.append({"role": "assistant", "content": confirmation})
+                        messages = self._ensure_last_message_is_user(messages)
+                        body["messages"] = messages
+                        return body
+                    else:
+                        self._log_debug("Forget intent rejected by verification LLM")
 
     # 2. Remember
     if self.valves.enable_natural_language_forget:
@@ -3275,31 +3329,51 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 and remember_intent.get("action")
                 and remember_intent["action"] != "none"
             ):
-                confirmation = await self._execute_remember_intent(
-                    project_id, remember_intent
-                )
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
+                desc = f"Action: {remember_intent.get('action')}, details: { {k:v for k,v in remember_intent.items() if k!='action'} }"
+                if await self._verify_command_intent(
+                    last_user_msg.get("content", ""), desc
+                ):
+                    confirmation = await self._execute_remember_intent(
+                        project_id, remember_intent
+                    )
+                    status_msg = f"[CodeAware] {confirmation}"
+                    messages.insert(0, {"role": "system", "content": status_msg})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
+                else:
+                    self._log_debug("Remember intent rejected by verification LLM")
 
-    # 3. Obsolete
-    if self.valves.enable_obsolete_marking:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            intent = await self._parse_obsolete_intent(last_user_msg["content"])
-            if intent and intent.get("action") != "none":
-                confirmation = await self._execute_obsolete_intent(project_id, intent)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
+            # 3. Obsolete
+            if self.valves.enable_obsolete_marking:
+                last_user_msg = (
+                    messages[-1]
+                    if messages and messages[-1].get("role") == "user"
+                    else None
+                )
+                if last_user_msg and (
+                    is_code_session or last_user_msg.get("content", "").startswith("/")
+                ):
+                    intent = await self._parse_obsolete_intent(last_user_msg["content"])
+                    if intent and intent.get("action") != "none":
+                        desc = f"Action: {intent.get('action')}, details: { {k:v for k,v in intent.items() if k!='action'} }"
+                        if await self._verify_command_intent(
+                            last_user_msg.get("content", ""), desc
+                        ):
+                            confirmation = await self._execute_obsolete_intent(
+                                project_id, intent
+                            )
+                            status_msg = f"[CodeAware] {confirmation}"
+                            messages.insert(
+                                0, {"role": "system", "content": status_msg}
+                            )
+                            messages = self._ensure_last_message_is_user(messages)
+                            body["messages"] = messages
+                            return body
+                        else:
+                            self._log_debug(
+                                "Obsolete intent rejected by verification LLM"
+                            )
 
             # 3.5 Facts extraction and command handling
             if self.valves.enable_facts:
@@ -3386,17 +3460,29 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 last_user_msg.get("content", "")
             )
             if assumption_target:
-                analysis = await self._extract_assumptions(assumption_target)
-                messages.pop()
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"**Assumption Analysis**\n{analysis}",
-                    }
-                )
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
+                # Only verify if it was triggered by natural language, not explicit /assume
+                if not last_user_msg.get("content", "").strip().startswith("/assume"):
+                    desc = f"Extract underlying assumptions from: {assumption_target[:200]}"
+                    if not await self._verify_command_intent(
+                        last_user_msg.get("content", ""), desc
+                    ):
+                        self._log_debug(
+                            "Assumption intent rejected by verification LLM"
+                        )
+                        assumption_target = None  # prevent execution
+
+                if assumption_target:
+                    analysis = await self._extract_assumptions(assumption_target)
+                    messages.pop()
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"**Assumption Analysis**\n{analysis}",
+                        }
+                    )
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
 
     # 6. /iterate
     if self.valves.enable_iterative_mode:
@@ -4376,19 +4462,6 @@ Code:
             return messages, False
         content = last_msg.get("content", "").strip()
 
-        if self.valves.enable_natural_language_forget:
-            intent = await self._parse_forget_intent(content)
-            if intent and intent.get("action") != "none":
-                confirmation = await self._execute_forget_intent(project_id, intent)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                self._set_state(project_id, self._get_state(project_id))
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages.pop()
-                messages.append({"role": "assistant", "content": confirmation})
-                return messages, True
-
         if self.valves.enable_forget_command and content.startswith("/forget"):
             parts = content.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else ""
@@ -4403,7 +4476,7 @@ Code:
                 state["active_blocks"].clear()
                 state["recent_changes"].clear()
                 state["committed_changes"].clear()
-                self._has_any_calls = False
+                state["has_any_calls"] = False
                 self._invalidate_lightweight_cache(project_id)
                 confirmation = "Forgotten all context."
             elif target == "last":
@@ -4536,7 +4609,7 @@ Code:
                 state["active_blocks"].clear()
                 state["recent_changes"].clear()
                 state["committed_changes"].clear()
-                self._has_any_calls = False
+                state["has_any_calls"] = False
                 self._invalidate_lightweight_cache(project_id)
                 return "Forgotten all context."
             else:
@@ -5221,8 +5294,14 @@ Output a structured list of assumptions and a brief comment on their validity or
             re.IGNORECASE,
         ):
             goal = command
-            if await self._start_new_iteration(project_id, goal, auto_continue=False):
-                return await self._execute_next_step(project_id), True
+            desc = f"Start a new iterative task with goal: {goal[:200]}"
+            if await self._verify_command_intent(command, desc):
+                if await self._start_new_iteration(
+                    project_id, goal, auto_continue=False
+                ):
+                    return await self._execute_next_step(project_id), True
+            else:
+                self._log_debug("Iterative start rejected by verification LLM")
         return "", False
 
     async def _generate_plan(self, goal: str, context: str) -> List[Dict]:
