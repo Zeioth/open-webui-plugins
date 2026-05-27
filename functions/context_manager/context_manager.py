@@ -1353,7 +1353,7 @@ class Filter:
         while len(self._conversation_state) > self.valves.max_cached_projects:
             oldest_pid = next(iter(self._conversation_state))
             oldest_state = self._conversation_state[oldest_pid]
-            self._remove_project_from_index(oldest_state)
+            self._remove_project_from_index_by_id(oldest_pid, oldest_state)
             del self._conversation_state[oldest_pid]
             self._cached_lightweight_context.pop(oldest_pid, None)
             self._project_locks.pop(oldest_pid, None)  # ← new line
@@ -3296,7 +3296,8 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 )
                 if intent and intent.get("action") != "none":
                     # Build a human-readable description of the action
-                    desc = f"Action: {intent.get('action')}, details: { {k:v for k,v in intent.items() if k!='action'} }"
+                    details = {k: v for k, v in intent.items() if k != "action"}
+                    desc = f"Action: {intent.get('action')}, details: {details}"
                     if await self._verify_command_intent(
                         last_user_msg.get("content", ""), desc
                     ):
@@ -3356,7 +3357,8 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 ):
                     intent = await self._parse_obsolete_intent(last_user_msg["content"])
                     if intent and intent.get("action") != "none":
-                        desc = f"Action: {intent.get('action')}, details: { {k:v for k,v in intent.items() if k!='action'} }"
+                        details = {k: v for k, v in intent.items() if k != "action"}
+                        desc = f"Action: {intent.get('action')}, details: {details}"
                         if await self._verify_command_intent(
                             last_user_msg.get("content", ""), desc
                         ):
