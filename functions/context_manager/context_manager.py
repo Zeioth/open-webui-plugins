@@ -1213,6 +1213,7 @@ class Filter:
             "last_compression_timestamp": 0,
             "last_suggestion_timestamp": 0,
             "response_cache": [],
+            "has_any_calls": False,
         }
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
         self.diff_pattern = re.compile(self.valves.diff_pattern)
@@ -1260,7 +1261,6 @@ class Filter:
         self._cached_lightweight_context: Dict[str, str] = {}
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
-        self._has_any_calls: bool = False
         self._response_cache_size: int = (
             0  # contador en memoria para evitar full scan en ChromaDB
         )
@@ -1431,6 +1431,9 @@ class Filter:
             data["last_suggestion_timestamp"] = 0
         if "response_cache" not in data:
             data["response_cache"] = []
+        if "has_any_calls" not in data:
+            data["has_any_calls"] = False
+
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             try:
@@ -1453,6 +1456,7 @@ class Filter:
             "last_compression_timestamp": data.get("last_compression_timestamp", 0),
             "response_cache": data.get("response_cache", []),
             "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
+            "has_any_calls": data.get("has_any_calls", False),
         }
         # Recalculate token counts for loaded blocks (not persisted)
         for blk in (
@@ -2391,9 +2395,13 @@ class Filter:
     def _rebuild_symbol_index(self, state: Dict, project_id: str):
         """Repopulate the in-memory symbol index from stored blocks (after reloading from DB)."""
         self._symbol_index.clear_project(project_id)
+        has_any = False
         for block in state["active_blocks"].values():
             for sym in block.symbols:
                 self._symbol_index.add(sym, block.hash, project_id)
+                if sym.calls:
+                    has_any = True
+        state["has_any_calls"] = has_any
 
     def _remove_project_from_index(self, state: Dict):
         """Remove all symbols of a project from the index (called on LRU eviction)."""
@@ -2479,10 +2487,10 @@ class Filter:
         Return the full bodies of code blocks whose symbols appear in the user query.
         Limits to at most 2 blocks when call graph is available, otherwise 5.
         """
+        state = self._get_state(project_id)
+        has_calls = state.get("has_any_calls", False) if state else False
         MAX_EXPANDED_BODIES = (
-            2
-            if (self.valves.enable_call_graph_extraction and self._has_any_calls)
-            else 5
+            2 if (self.valves.enable_call_graph_extraction and has_calls) else 5
         )
         state = self._get_state(project_id)
         if not state:
@@ -2867,7 +2875,7 @@ class Filter:
                 for sym in syms:
                     self._symbol_index.add(sym, new_block.hash, project_id)
                 if any(s.calls for s in syms):
-                    self._has_any_calls = True
+                    state["has_any_calls"] = True
 
                 is_conflicting = False
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
@@ -3018,7 +3026,7 @@ class Filter:
                         else:
                             best_base._cached_token_count = len(best_base.content) // 4
                         if any(s.calls for s in best_base.symbols):
-                            self._has_any_calls = True
+                            state["has_any_calls"] = True
                         self._log_debug(
                             f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
                         )
@@ -4253,11 +4261,10 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                     )
                 del state["active_blocks"][h]
             if to_remove:
-                if self._has_any_calls:
-                    self._has_any_calls = any(
-                        any(s.calls for s in b.symbols)
-                        for b in state["active_blocks"].values()
-                    )
+                state["has_any_calls"] = any(
+                    any(s.calls for s in b.symbols)
+                    for b in state["active_blocks"].values()
+                )
                 self._invalidate_lightweight_cache(project_id)
                 self._set_state(project_id, state)
 
@@ -6099,11 +6106,9 @@ Output only the diff, enclosed in diff ... .
             b for b in state["committed_changes"] if b.hash not in to_remove
         ]
         if to_remove:
-            if self._has_any_calls:
-                self._has_any_calls = any(
-                    any(s.calls for s in b.symbols)
-                    for b in state["active_blocks"].values()
-                )
+            state["has_any_calls"] = any(
+                any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
+            )
             self._invalidate_lightweight_cache(project_id)
 
     # --------------------------------------------------------------------------
