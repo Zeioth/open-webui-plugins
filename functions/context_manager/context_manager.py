@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.29.0
+version: 5.3.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1289,9 +1289,16 @@ class Filter:
         except Exception as e:
             self._log_debug(f"Tree‑sitter process failed: {e}")
             spans = []
-        # Simple eviction when cache grow too much
+
+        # Evict the oldest 50 entries when the cache grows too large (keeps recent results)
         if len(self._code_spans_cache) >= 200:
-            self._code_spans_cache.clear()
+            keys_to_evict = list(self._code_spans_cache.keys())[:50]
+            for key in keys_to_evict:
+                del self._code_spans_cache[key]
+            self._log_debug(
+                f"Evicted {len(keys_to_evict)} oldest code span cache entries"
+            )
+
         self._code_spans_cache[cache_key] = spans
         return spans
 
