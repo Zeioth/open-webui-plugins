@@ -500,6 +500,27 @@ class Filter:
 
         expert_id = ""
 
+        # ── Sticky routing: if the active expert matches the semantic prediction,
+        #    skip the LLM classifier entirely to avoid loading another model. ────
+        if _SHARED_RESOURCES_AVAILABLE and self.valves.USE_SEMANTIC_CLASSIFY:
+            try:
+                from shared_resources import get_active_expert
+                active_expert = get_active_expert()
+                if active_expert and active_expert != "generalista":
+                    sem_id = await self._semantic_classify(user_query, self._experts)
+                    if sem_id == active_expert:
+                        await self._string_cache.set(cache_key, sem_id)
+                        if self.valves.DEBUG:
+                            logger.info(
+                                f"[Router] Sticky routing: keeping '{sem_id}' "
+                                f"(already loaded, semantic confirms)"
+                            )
+                        return sem_id
+            except Exception as e:
+                if self.valves.DEBUG:
+                    logger.info(f"[Router] Sticky routing check error: {e}")
+        # ──────────────────────────────────────────────────────────────────────────
+
         # 1) LLM classifier (most accurate, covers edge cases)
         try:
             expert_id = await self._classify_with_llm(user_query) or ""
@@ -692,6 +713,15 @@ class Filter:
             if self.valves.DEBUG:
                 logger.info(f"[Router] Switched to expert: {expert_name}")
 
+        # ── Register the active expert in shared_resources for sticky routing ──
+        if _SHARED_RESOURCES_AVAILABLE:
+            try:
+                from shared_resources import set_active_expert
+                set_active_expert(model_to_use)
+            except Exception:
+                pass
+        # ────────────────────────────────────────────────────────────────────────
+
         # Model is kept as originally selected by the user
 
         if self.valves.notify_change and change:
@@ -721,4 +751,3 @@ class Filter:
             if exp["id"] == expert_id:
                 return exp["name"]
         return "General"
-

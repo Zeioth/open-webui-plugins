@@ -363,3 +363,29 @@ class SQLiteCache:
             conn.commit()
         import anyio
         await anyio.to_thread.run_sync(_clr)
+
+
+# ---------------------------------------------------------------------------
+# 8. Active expert tracker (used for sticky routing)
+# ---------------------------------------------------------------------------
+_ACTIVE_EXPERT: Optional[str] = None
+_ACTIVE_EXPERT_LOCK = threading.Lock()
+
+
+def get_active_expert() -> Optional[str]:
+    """
+    Return the expert_id currently selected and loaded in the main conversation.
+    This is set by the Router after choosing an expert.
+    """
+    return _ACTIVE_EXPERT
+
+
+def set_active_expert(expert_id: str) -> None:
+    """
+    Update the active expert_id.
+    Called by the Router after a routing decision, so that other plugins
+    or subsequent requests can skip re-classification when the expert hasn't changed.
+    """
+    global _ACTIVE_EXPERT
+    with _ACTIVE_EXPERT_LOCK:
+        _ACTIVE_EXPERT = expert_id
