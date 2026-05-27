@@ -1240,6 +1240,8 @@ class Filter:
         self._project_locks: dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
+        self._pending_llm: Dict[str, asyncio.Future] = {}
+        self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
         self._llm_cache_ttl = self.valves.LLM_CACHE_TTL
 
@@ -1603,172 +1605,210 @@ class Filter:
         if not HAS_AIOHTTP:
             return None
 
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
-        api_token = self.valves.LLM_API_TOKEN.strip() or None
-        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+        # Deduplication key – identical requests share the same LLM call
+        dedup_key = hashlib.md5(
+            f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
+        ).hexdigest()
 
-        models_to_try = []
-        seen = set()
-        for m in [
-            model_override,
-            self.valves.llm_model,
-            self.valves.summarization_model,
-        ]:
-            if m and m not in seen:
-                models_to_try.append(m)
-                seen.add(m)
+        # Check if another task is already running this exact call
+        async with self._pending_llm_lock:
+            if dedup_key in self._pending_llm:
+                future = self._pending_llm[dedup_key]
+                is_producer = False
+            else:
+                future = asyncio.Future()
+                self._pending_llm[dedup_key] = future
+                is_producer = True
 
-        max_retries = 2
-        base_delay = 1.0
+        if not is_producer:
+            # Wait for the in‑flight call and return its result (or re‑raise its exception)
+            self._log_debug(f"Awaiting existing LLM call for dedup key {dedup_key[:8]}")
+            return await future
 
-        for model in models_to_try:
-            cache_key = hashlib.md5(
-                f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
-            ).hexdigest()
-            cached = await self._llm_cache.get(cache_key)
-            if cached is not None:
-                self._log_debug(f"LLM cache hit for model {model}")
-                return cached
+        # ── Producer: execute the actual LLM call ────────────────────────────────
+        try:
+            base_url = self.valves.LLM_BASE_URL.rstrip("/")
+            api_token = self.valves.LLM_API_TOKEN.strip() or None
+            is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
-            if _SHARED_RESOURCES_AVAILABLE:
-                from shared_resources import call_llm as _shared_call_llm
+            models_to_try = []
+            seen = set()
+            for m in [
+                model_override,
+                self.valves.llm_model,
+                self.valves.summarization_model,
+            ]:
+                if m and m not in seen:
+                    models_to_try.append(m)
+                    seen.add(m)
+
+            max_retries = 2
+            base_delay = 1.0
+
+            for model in models_to_try:
+                cache_key = hashlib.md5(
+                    f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
+                ).hexdigest()
+                cached = await self._llm_cache.get(cache_key)
+                if cached is not None:
+                    self._log_debug(f"LLM cache hit for model {model}")
+                    future.set_result(cached)
+                    return cached
+
+                if _SHARED_RESOURCES_AVAILABLE:
+                    from shared_resources import call_llm as _shared_call_llm
+
+                    for attempt in range(max_retries + 1):
+                        try:
+                            async with self._llm_semaphore:
+                                content = await _shared_call_llm(
+                                    prompt=prompt,
+                                    system=system_prompt,
+                                    base_url=self.valves.LLM_BASE_URL,
+                                    model=model,
+                                    api_token=self.valves.LLM_API_TOKEN,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    timeout=self.valves.llm_request_timeout,
+                                )
+                            if content:
+                                await self._llm_cache.set(cache_key, content)
+                                future.set_result(content)
+                                return content
+                        except RuntimeError as exc:
+                            status_hint = str(exc)
+                            if any(
+                                c in status_hint
+                                for c in ("429", "500", "502", "503", "504")
+                            ):
+                                if attempt < max_retries:
+                                    await asyncio.sleep(base_delay * (2**attempt))
+                                    continue
+                            break
+                        except Exception as exc:
+                            if attempt < max_retries:
+                                await asyncio.sleep(base_delay * (2**attempt))
+                                continue
+                            logger.warning(
+                                f"shared call_llm failed after retries: {exc}"
+                            )
+                            break
+                    continue
+
+                try:
+                    http_session = await _shared_get_http_session(
+                        self.valves.llm_request_timeout
+                    )
+                except Exception:
+                    http_session = self._http_session
+                if http_session is None:
+                    continue
 
                 for attempt in range(max_retries + 1):
                     try:
                         async with self._llm_semaphore:
-                            content = await _shared_call_llm(
-                                prompt=prompt,
-                                system=system_prompt,
-                                base_url=self.valves.LLM_BASE_URL,
-                                model=model,
-                                api_token=self.valves.LLM_API_TOKEN,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                timeout=self.valves.llm_request_timeout,
+                            model_name = (
+                                model.split("/", 1)[1]
+                                if is_ollama and model.startswith("ollama/")
+                                else model
                             )
-                        if content:
-                            await self._llm_cache.set(cache_key, content)
-                            return content
-                    except RuntimeError as exc:
-                        status_hint = str(exc)
-                        if any(
-                            c in status_hint
-                            for c in ("429", "500", "502", "503", "504")
-                        ):
-                            if attempt < max_retries:
-                                await asyncio.sleep(base_delay * (2**attempt))
-                                continue
-                        break
-                    except Exception as exc:
-                        if attempt < max_retries:
-                            await asyncio.sleep(base_delay * (2**attempt))
-                            continue
-                        logger.warning(f"shared call_llm failed after retries: {exc}")
-                        break
-                continue
-
-            try:
-                http_session = await _shared_get_http_session(
-                    self.valves.llm_request_timeout
-                )
-            except Exception:
-                http_session = self._http_session
-            if http_session is None:
-                continue
-
-            for attempt in range(max_retries + 1):
-                try:
-                    async with self._llm_semaphore:
-                        model_name = (
-                            model.split("/", 1)[1]
-                            if is_ollama and model.startswith("ollama/")
-                            else model
-                        )
-                        if is_ollama:
-                            url = f"{base_url}/api/generate"
-                            payload = {
-                                "model": model_name,
-                                "prompt": prompt,
-                                "system": system_prompt,
-                                "stream": False,
-                                "options": {
-                                    "temperature": temperature,
-                                    "num_predict": max_tokens,
-                                },
-                            }
-                            headers = {"Content-Type": "application/json"}
-                        else:
-                            url = f"{base_url}/v1/chat/completions"
-                            headers = {"Content-Type": "application/json"}
-                            if api_token:
-                                headers["Authorization"] = f"Bearer {api_token}"
-                            elif self.valves.openai_api_key:
-                                headers["Authorization"] = (
-                                    f"Bearer {self.valves.openai_api_key}"
-                                )
-                            payload = {
-                                "model": model_name,
-                                "messages": [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": prompt},
-                                ],
-                                "temperature": temperature,
-                                "max_tokens": max_tokens,
-                            }
-
-                        async with http_session.post(
-                            url, json=payload, headers=headers
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if is_ollama:
-                                    content = data.get("response", "")
-                                    if not content.strip():
-                                        continue
-                                    content = content.strip()
-                                else:
-                                    choices = data.get("choices", [])
-                                    if not choices:
-                                        continue
-                                    content = (
-                                        choices[0].get("message", {}).get("content", "")
-                                    )
-                                    if not content:
-                                        continue
-                                    content = content.strip()
-                                await self._llm_cache.set(cache_key, content)
-                                return content
-                            elif resp.status in (429, 500, 502, 503, 504):
-                                if attempt < max_retries:
-                                    delay = base_delay * (2**attempt)
-                                    self._log_debug(
-                                        f"LLM call failed with {resp.status}, retrying in {delay}s..."
-                                    )
-                                    await asyncio.sleep(delay)
-                                    continue
-                                else:
-                                    self._log_debug(
-                                        f"LLM call failed after {max_retries} retries"
-                                    )
-                                    break
+                            if is_ollama:
+                                url = f"{base_url}/api/generate"
+                                payload = {
+                                    "model": model_name,
+                                    "prompt": prompt,
+                                    "system": system_prompt,
+                                    "stream": False,
+                                    "options": {
+                                        "temperature": temperature,
+                                        "num_predict": max_tokens,
+                                    },
+                                }
+                                headers = {"Content-Type": "application/json"}
                             else:
-                                break
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    if attempt < max_retries:
-                        delay = base_delay * (2**attempt)
-                        self._log_debug(
-                            f"LLM connection error: {e}, retrying in {delay}s..."
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        logger.warning(
-                            f"LLM call failed after {max_retries} retries: {e}"
-                        )
-                        break
+                                url = f"{base_url}/v1/chat/completions"
+                                headers = {"Content-Type": "application/json"}
+                                if api_token:
+                                    headers["Authorization"] = f"Bearer {api_token}"
+                                elif self.valves.openai_api_key:
+                                    headers["Authorization"] = (
+                                        f"Bearer {self.valves.openai_api_key}"
+                                    )
+                                payload = {
+                                    "model": model_name,
+                                    "messages": [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": prompt},
+                                    ],
+                                    "temperature": temperature,
+                                    "max_tokens": max_tokens,
+                                }
 
-        logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
-        return None
+                            async with http_session.post(
+                                url, json=payload, headers=headers
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if is_ollama:
+                                        content = data.get("response", "")
+                                        if not content.strip():
+                                            continue
+                                        content = content.strip()
+                                    else:
+                                        choices = data.get("choices", [])
+                                        if not choices:
+                                            continue
+                                        content = (
+                                            choices[0]
+                                            .get("message", {})
+                                            .get("content", "")
+                                        )
+                                        if not content:
+                                            continue
+                                        content = content.strip()
+                                    await self._llm_cache.set(cache_key, content)
+                                    future.set_result(content)
+                                    return content
+                                elif resp.status in (429, 500, 502, 503, 504):
+                                    if attempt < max_retries:
+                                        delay = base_delay * (2**attempt)
+                                        self._log_debug(
+                                            f"LLM call failed with {resp.status}, retrying in {delay}s..."
+                                        )
+                                        await asyncio.sleep(delay)
+                                        continue
+                                    else:
+                                        self._log_debug(
+                                            f"LLM call failed after {max_retries} retries"
+                                        )
+                                        break
+                                else:
+                                    break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        if attempt < max_retries:
+                            delay = base_delay * (2**attempt)
+                            self._log_debug(
+                                f"LLM connection error: {e}, retrying in {delay}s..."
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(
+                                f"LLM call failed after {max_retries} retries: {e}"
+                            )
+                            break
+
+            # All models failed
+            logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
+            future.set_result(None)
+            return None
+
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            async with self._pending_llm_lock:
+                self._pending_llm.pop(dedup_key, None)
 
     async def _try_llm_quick(
         self,
@@ -1980,36 +2020,6 @@ class Filter:
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
         total_chars += sum(30 for _ in messages)
         return total_chars // 4
-
-    def _extract_function_names(self, code: str) -> List[str]:
-        names = []
-        names.extend(
-            re.findall(r"^\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code, re.MULTILINE)
-        )
-        names.extend(
-            re.findall(r"^\s*class\s+([a-zA-Z_][a-zA-Z0-9_]*)", code, re.MULTILINE)
-        )
-        names.extend(
-            re.findall(
-                r"^\s*(?:function|async function)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
-                code,
-                re.MULTILINE,
-            )
-        )
-        names.extend(
-            re.findall(
-                r"^\s*(?:const|let|var)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:async\s*)?\(?",
-                code,
-                re.MULTILINE,
-            )
-        )
-        names.extend(
-            re.findall(r"^\s*fn\s+([a-zA-Z_][a-zA-Z0-9_]*)", code, re.MULTILINE)
-        )
-        names.extend(
-            re.findall(r"^\s*func\s+([a-zA-Z_][a-zA-Z0-9_]*)", code, re.MULTILINE)
-        )
-        return list(set(names))
 
     def _extract_signature(self, code: str) -> str:
         func_match = re.search(
@@ -5459,52 +5469,35 @@ Output only the diff, enclosed in diff ... .
     async def _detect_contradictions(
         self, conversation_messages: List[dict]
     ) -> Optional[str]:
+        """Check the last two user messages for contradictions using the LLM."""
         if (
             not self.valves.enable_contradiction_detection
-            or len(conversation_messages) < 4
+            or len(conversation_messages) < 2
         ):
             return None
 
-        recent = conversation_messages[-10:]
-        contradictory_pairs = []
-        for i, msg1 in enumerate(recent):
-            for msg2 in recent[i + 1 :]:
-                if msg1.get("role") != "user" or msg2.get("role") != "user":
-                    continue
-                sim = self._calculate_code_similarity(
-                    msg1.get("content", ""), msg2.get("content", "")
-                )
-                if sim > 0.6:
-                    c1 = msg1.get("content", "").lower()
-                    c2 = msg2.get("content", "").lower()
-                    if " no " in c1 or "error" in c1 or " no " in c2 or "error" in c2:
-                        contradictory_pairs.append((msg1, msg2))
-        contradictory_pairs = contradictory_pairs[:3]
-        if not contradictory_pairs:
+        # Collect the last two user messages
+        user_msgs = [m for m in conversation_messages if m.get("role") == "user"]
+        if len(user_msgs) < 2:
             return None
 
-        pair_texts = []
-        for idx, (msg1, msg2) in enumerate(contradictory_pairs, 1):
-            pair_texts.append(f"Pair {idx}:")
-            pair_texts.append(f"Message A: {msg1.get('content','')[:500]}")
-            pair_texts.append(f"Message B: {msg2.get('content','')[:500]}")
-            pair_texts.append("---")
-        conv_text = "\n".join(pair_texts)
+        msg_a = user_msgs[-2].get("content", "")[:500]
+        msg_b = user_msgs[-1].get("content", "")[:500]
+        if not msg_a.strip() or not msg_b.strip():
+            return None
 
         model = (
             self.valves.contradiction_detection_model
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Analyze the following pairs of user messages for contradictions. A contradiction occurs when the user says something in one message and later says the opposite, or makes statements that conflict with each other.
-
-If you find a contradiction, output JSON: {{"contradiction": true, "explanation": "Brief explanation of the conflict", "suggestion": "What the user might really need"}}
-If no contradiction, output {{"contradiction": false}}.
-
-{conv_text}
-
-Output only JSON.
-"""
+        prompt = (
+            "Compare the following two user messages. Do they contradict each other? "
+            'If yes, output JSON: {"contradiction": true, "explanation": "...", "suggestion": "..."}.\n'
+            'If no, output: {"contradiction": false}.\n'
+            "Output only JSON.\n\n"
+            f"Message 1: {msg_a}\n\nMessage 2: {msg_b}"
+        )
         response = await self._try_llm_quick(
             prompt=prompt,
             system_prompt="You are a contradiction detection assistant. Output only JSON.",
@@ -5523,8 +5516,11 @@ Output only JSON.
                 response = response[:-3]
             data = json.loads(response)
             if data.get("contradiction"):
-                return f"⚠️ **Contradiction detected**: {data.get('explanation','')}\n\nSuggestion: {data.get('suggestion','')}"
-        except:
+                return (
+                    f"⚠️ **Contradiction detected**: {data.get('explanation', '')}\n\n"
+                    f"Suggestion: {data.get('suggestion', '')}"
+                )
+        except Exception:
             pass
         return None
 
