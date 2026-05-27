@@ -1347,6 +1347,7 @@ class Filter:
             self._remove_project_from_index(oldest_state)
             del self._conversation_state[oldest_pid]
             self._cached_lightweight_context.pop(oldest_pid, None)
+            self._project_locks.pop(oldest_pid, None)  # ← new line
             self._log_debug(f"Evicting project {oldest_pid} from cache")
         # Rebuild index for newly loaded state (only if not already in index)
         if state["active_blocks"]:
@@ -2059,25 +2060,63 @@ class Filter:
     async def _extract_code_blocks(
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        """Extract code blocks from message content.
-        Returns a list of block dicts and a parallel list of (start, end) offsets in content.
+        """Extract code blocks from message content using tree‑sitter (or regex fallback).
+        Returns a list of block dicts and a parallel list of (start, end) byte offsets.
         """
         blocks = []
         spans = []
         if not self.valves.auto_detect_code_blocks:
             return blocks, spans
+
+        # ── Primary: tree‑sitter native code detection (handles backticks in strings correctly) ──
+        if HAS_TREE_SITTER:
+            try:
+                config = ProcessConfig()
+                # process() returns a list of objects with start_byte, end_byte, and language
+                ts_blocks = process(content, config)
+                for tsb in ts_blocks:
+                    start, end = tsb.start_byte, tsb.end_byte
+                    raw = content[start:end].strip()
+                    lang = tsb.language or "text"
+
+                    # Remove the surrounding backtick fence if present
+                    lines = raw.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        code = "\n".join(lines).strip()
+                        block_type = "fenced"
+                    else:
+                        code = raw
+                        block_type = "indented"  # tree‑sitter detected indented code without fences
+
+                    code = await self._handle_oversized_code_block(code, lang)
+                    blocks.append({"language": lang, "code": code, "type": block_type})
+                    spans.append((start, end))
+
+                self._log_debug(f"Tree‑sitter extracted {len(blocks)} code blocks")
+                return blocks, spans
+
+            except Exception as e:
+                self._log_debug(
+                    f"Tree‑sitter extraction failed, falling back to regex: {e}"
+                )
+
+        # ── Fallback: original regex method (legacy, may break on backticks inside strings) ──
         for match in self.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
             code = await self._handle_oversized_code_block(code, lang)
             blocks.append({"language": lang, "code": code, "type": "fenced"})
             spans.append((match.start(), match.end()))
+
+        # Indented blocks as fallback as well
         lines = content.split("\n")
-        indented = []
-        # We need to track the start line of indented blocks to compute offsets.
         line_offsets = [0]
         for line in lines:
-            line_offsets.append(line_offsets[-1] + len(line) + 1)  # +1 for newline
+            line_offsets.append(line_offsets[-1] + len(line) + 1)
+        indented = []
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -2088,12 +2127,8 @@ class Filter:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
                     code = await self._handle_oversized_code_block(code, "text")
-                    start_offset = line_offsets[
-                        i - len(indented)
-                    ]  # start of first indented line
-                    end_offset = (
-                        line_offsets[i] - 1
-                    )  # end of last indented line (before newline of next line)
+                    start_offset = line_offsets[i - len(indented)]
+                    end_offset = line_offsets[i] - 1
                     blocks.append(
                         {"language": "text", "code": code, "type": "indented"}
                     )
@@ -2107,6 +2142,7 @@ class Filter:
             end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
             blocks.append({"language": "text", "code": code, "type": "indented"})
             spans.append((start_offset, end_offset))
+
         return blocks, spans
 
     def _extract_file_path_for_block(
@@ -2248,12 +2284,14 @@ class Filter:
         result = response and response.strip().lower().startswith("yes")
         if cache_key:
             self._session_classify_cache[cache_key] = (result, time.time())
-            if len(self._session_classify_cache) > 500:
-                oldest = min(
-                    self._session_classify_cache,
-                    key=lambda k: self._session_classify_cache[k][1],
+            if len(self._session_classify_cache) >= 500:
+                # Keep only the 400 most recent entries (batch eviction)
+                items = sorted(
+                    self._session_classify_cache.items(),
+                    key=lambda item: item[1][1],  # sort by timestamp
                 )
-                del self._session_classify_cache[oldest]
+                self._session_classify_cache = dict(items[-400:])
+                self._log_debug("Session classify cache pruned to 400 entries")
         self._log_debug(
             f"LLM classification result: {'code' if result else 'non-code'}"
         )
@@ -3145,6 +3183,7 @@ class Filter:
         # Clean up signature index and cache
         self._symbol_index.clear()
         self._cached_lightweight_context.clear()
+        self._project_locks.clear()
 
     def _cleanup_completed_tasks(self):
         """Remove references to completed tasks to free memory."""
