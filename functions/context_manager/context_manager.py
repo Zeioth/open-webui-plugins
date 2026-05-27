@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.27.0
+version: 5.28.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1255,6 +1255,9 @@ class Filter:
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
         self._has_any_calls: bool = False
+        self._response_cache_size: int = (
+            0  # contador en memoria para evitar full scan en ChromaDB
+        )
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
 
         print("[CodeAware] Filter loaded")
@@ -1819,19 +1822,26 @@ class Filter:
             entry_id = hashlib.md5(
                 f"{self.valves.project_id}|{query}".encode()
             ).hexdigest()[:32]
+
             max_entries = self.valves.response_cache_max_entries
-            existing = await anyio.to_thread.run_sync(
-                lambda: col.get(
-                    where={"project_id": self.valves.project_id}, include=["metadatas"]
+            if self._response_cache_size >= max_entries:
+                existing = await anyio.to_thread.run_sync(
+                    lambda: col.get(
+                        where={"project_id": self.valves.project_id},
+                        include=["metadatas"],
+                    )
                 )
-            )
-            if existing and len(existing["ids"]) >= max_entries:
-                items = sorted(
-                    zip(existing["ids"], existing["metadatas"]),
-                    key=lambda x: x[1].get("timestamp", 0),
-                )
-                to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
-                await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
+                if existing and len(existing["ids"]) >= max_entries:
+                    items = sorted(
+                        zip(existing["ids"], existing["metadatas"]),
+                        key=lambda x: x[1].get("timestamp", 0),
+                    )
+                    to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
+                    await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
+                    self._response_cache_size = len(existing["ids"]) - len(to_delete)
+                else:
+                    self._response_cache_size = len(existing["ids"]) if existing else 0
+
             await anyio.to_thread.run_sync(
                 lambda: col.upsert(
                     ids=[entry_id],
@@ -1847,6 +1857,7 @@ class Filter:
                     ],
                 )
             )
+            self._response_cache_size += 1
             self._log_debug(f"Stored response in ChromaDB cache for: {query[:50]}")
         except Exception as e:
             self._log_debug(f"Error storing response in cache: {e}")
@@ -2538,7 +2549,7 @@ class Filter:
             syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
             symbols_list.append(syms)
 
-        # ── Cache de símbolos para reutilizar en duplicados ─────────────────
+        # Cache symbols to reuse for duplicate blocks (avoids re-parsing)
         _content_to_syms: Dict[str, List[CodeSymbol]] = {
             blk.content: syms
             for blk, syms in zip(new_blocks_pending, symbols_list)
@@ -2547,8 +2558,8 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
-            if self.valves.auto_remove_duplicate_blocks:
-                self._remove_duplicate_blocks(state, project_id)
+            # NOTE: _remove_duplicate_blocks will be called at the end, only if blocks were added.
+            # Calling it here was redundant (#4).
             task = asyncio.create_task(
                 self._summarize_inactive_blocks_safely(project_id)
             )
@@ -2613,7 +2624,7 @@ class Filter:
                         existing.pinned = True
                         existing.is_raw = existing.is_raw or new_block.is_raw
                         existing.importance_score = 10.0
-                        # ── Reusar símbolos pre‑extraídos para el nuevo contenido ──
+                        # Reuse pre-extracted symbols for the updated content
                         reused = _content_to_syms.get(new_block.content)
                         if reused is not None:
                             existing.symbols = [
@@ -2621,7 +2632,7 @@ class Filter:
                                 for s in reused
                             ]
                         else:
-                            # Fallback si por alguna razón no estaban cacheados
+                            # Fallback if symbols weren't cached
                             existing.symbols = await SignatureExtractor.extract_async(
                                 existing.content, existing.file_path
                             )
@@ -2673,7 +2684,7 @@ class Filter:
                         existing.timestamp = time.time()
                         existing.mention_count += 1
                         existing.last_mentioned = time.time()
-                        # ── Reusar símbolos pre‑extraídos para el nuevo contenido ──
+                        # Reuse pre-extracted symbols for the updated content
                         reused = _content_to_syms.get(new_block.content)
                         if reused is not None:
                             existing.symbols = [
@@ -2729,10 +2740,13 @@ class Filter:
                 if any(s.calls for s in syms):
                     self._has_any_calls = True
 
-                if (
-                    new_block.content_type == ContentType.PROPOSED_CHANGE
-                    and self._has_conflicting_proposed_changes(state, new_block)
-                ):
+                # Cache _has_conflicting_proposed_changes result to avoid calling it twice (#5)
+                is_conflicting = (
+                    self._has_conflicting_proposed_changes(state, new_block)
+                    if new_block.content_type == ContentType.PROPOSED_CHANGE
+                    else False
+                )
+                if is_conflicting:
                     new_block.importance_score = max(new_block.importance_score, 7.0)
                     self._log_debug(
                         f"Proposed change {new_block.hash} marked as conflicting"
@@ -2745,8 +2759,7 @@ class Filter:
 
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
                     state["recent_changes"].append(new_block)
-                    conflict = self._has_conflicting_proposed_changes(state, new_block)
-                    if self.valves.enable_diff_application and not conflict:
+                    if self.valves.enable_diff_application and not is_conflicting:
                         for base in list(state["active_blocks"].values()):
                             if (
                                 base.content_type == ContentType.BASE_CODE
@@ -2844,7 +2857,7 @@ class Filter:
                         best_base.importance_score = min(
                             best_base.importance_score + 1.0, 10.0
                         )
-                        # ── Reusar símbolos si están en el caché de pre‑parseo ──
+                        # Reuse pre-extracted symbols if available
                         reused = _content_to_syms.get(block_info["code"])
                         if reused is not None:
                             best_base.symbols = [
@@ -3640,20 +3653,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             and self.valves.enable_code_awareness
         ):
             query = last_user_msg.get("content", "")
-            base_mem = await self._retrieve_relevant_memories(
-                query, project_id, ContentType.BASE_CODE, include_meta=True
-            )
-            error_mem = (
-                await self._retrieve_relevant_memories(
-                    query, project_id, ContentType.ERROR, include_meta=True
-                )
-                if self.valves.preserve_error_context
-                else []
-            )
-            general_mem = await self._retrieve_relevant_memories(
-                query, project_id, None, include_meta=True
-            )
-            all_meta = base_mem + error_mem + general_mem
+            all_meta = await self._retrieve_all_memories_unified(query, project_id)
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             seen = set()
             unique_meta = []
@@ -4138,6 +4138,77 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         except Exception as e:
             logger.warning(f"LTM compression failed: {e}")
 
+    async def _retrieve_all_memories_unified(
+        self, query: str, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Unified version that computes the embedding only once and performs
+        a single query to ChromaDB, returning all content types together.
+        Replaces the 3 separate calls from step 10 of the inlet.
+        """
+        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
+            return []
+        try:
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self.embedder.encode(query[:1000]).tolist()
+            )
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+            if self.valves.long_term_memory_expiration_days > 0:
+                where_filter["$and"].append({"expires_at": {"$gt": now}})
+
+            results = await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=self.valves.long_term_memory_top_k
+                    * 3,  # max results to compensate filtering
+                    where=where_filter,
+                )
+            )
+            docs_with_meta = []
+            if results and results["documents"]:
+                for i, doc in enumerate(results["documents"][0]):
+                    meta = results["metadatas"][0][i]
+                    sim = 1 - results["distances"][0][i]
+                    ts = meta.get("timestamp")
+                    if ts is not None and ts < 1000000000:
+                        ts = None
+                    if self.valves.ltm_time_decay_hours > 0 and ts is not None:
+                        age_hours = (now - ts) / 3600
+                        sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
+                    if sim >= self.valves.long_term_memory_similarity_threshold:
+                        docs_with_meta.append((doc, sim, ts, meta))
+
+            if self.valves.preserve_error_context:
+                for i, (doc, sim, ts, meta) in enumerate(docs_with_meta):
+                    if meta.get("content_type") == ContentType.ERROR.value:
+                        # boost ligero para errores
+                        docs_with_meta[i] = (doc, sim * 1.1, ts, meta)
+
+            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+
+            if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
+                rerank_k = min(
+                    (
+                        self.valves.reranker_top_k
+                        if self.valves.reranker_top_k > 0
+                        else self.valves.long_term_memory_top_k
+                    ),
+                    50,
+                )
+                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
+                reranked = await self._rerank_results(query, docs_only, rerank_k)
+                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
+                docs_with_meta = [
+                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
+                ]
+
+            docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
+            return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
+        except Exception as e:
+            logger.warning(f"Unified memory retrieval failed: {e}")
+            return []
+
     async def _retrieve_relevant_memories(
         self,
         query: str,
@@ -4210,7 +4281,11 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
     async def _retrieve_historical_messages(
         self, query: str, project_id: str, limit: int
     ) -> List[Dict]:
-        """Retrieve full historical messages for smart context selection."""
+        """
+        Retrieve full historical messages for smart context selection.
+        Fusiona en una sola query mensajes regulares y summaries jerárquicos,
+        post-filtrando por metadata en Python.
+        """
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
         try:
@@ -4221,44 +4296,35 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             where_filter = {
                 "$and": [
                     {"project_id": {"$eq": project_id}},
-                    {"is_hierarchical_summary": {"$ne": True}},
                 ]
             }
             if self.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append({"expires_at": {"$gt": now}})
+
             results = await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.query(
                     query_embeddings=[q_emb],
-                    n_results=limit,
+                    n_results=limit * 3,
                     where=where_filter,
                     include=["documents", "metadatas", "distances"],
                 )
             )
-            messages = []
+
+            regular_messages = []
+            summary_messages = []
             if results and results["documents"]:
                 for i, doc in enumerate(results["documents"][0]):
                     meta = results["metadatas"][0][i]
+                    is_summary = meta.get("is_hierarchical_summary", False)
                     role = meta.get("role", "user")
-                    messages.append({"role": role, "content": doc})
-            summary_filter = {
-                "$and": [
-                    {"project_id": {"$eq": project_id}},
-                    {"is_hierarchical_summary": {"$eq": True}},
-                ]
-            }
-            summary_results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.query(
-                    query_embeddings=[q_emb],
-                    n_results=limit // 2,
-                    where=summary_filter,
-                    include=["documents", "metadatas"],
-                )
-            )
-            if summary_results and summary_results["documents"]:
-                for i, doc in enumerate(summary_results["documents"][0]):
-                    meta = summary_results["metadatas"][0][i]
-                    role = meta.get("role", "assistant")
-                    messages.append({"role": role, "content": doc})
+                    if is_summary:
+                        summary_messages.append({"role": "assistant", "content": doc})
+                    else:
+                        regular_messages.append({"role": role, "content": doc})
+
+            # Combine: first summaries, then regular messages
+            messages = summary_messages + regular_messages
+
             if (
                 self.valves.enable_reranking
                 and self._cross_encoder
@@ -4268,6 +4334,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 reranked = await self._rerank_results(query, docs, limit)
                 doc_to_msg = {m["content"]: m for m in messages}
                 messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
+
             return messages[:limit]
         except Exception as e:
             logger.warning(f"Historical message retrieval failed: {e}")
