@@ -3806,7 +3806,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         if len(history_msgs) > eff_max:
             trim_needed = True
 
-    if trim_needed and len(history_msgs) > self.valves.max_turns:
+    if trim_needed or len(history_msgs) > self.valves.max_turns:
         self._log_debug("Trimming old messages")
         keep = self.valves.max_turns
         last_user_idx = -1
