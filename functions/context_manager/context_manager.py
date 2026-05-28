@@ -2439,6 +2439,10 @@ class Filter:
             )
 
     async def _build_lightweight_context(self, project_id: str) -> str:
+        """
+        Build a compact context containing only function/class signatures,
+        call graphs, summaries, and short previews. Cached per project.
+        """
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
@@ -2448,6 +2452,7 @@ class Filter:
 
         lines = ["## Code Symbol Index (full bodies available on request)\n"]
 
+        # Group symbols by file path
         grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
         for block in state["active_blocks"].values():
             if block.obsolete:
@@ -2471,10 +2476,17 @@ class Filter:
                         calls_list += f", ... (+{len(s.calls)-5} more)"
                     calls_str = f" → calls: {calls_list}"
                 summary_str = f"  Summary: {s.summary}" if s.summary else ""
+                # ── Contador de versiones ──────────────────────────────
+                num_versions = len(self._symbol_index.find_blocks(s.name, project_id))
+                version_info = (
+                    f" ({num_versions} versions available)" if num_versions > 1 else ""
+                )
+                # ───────────────────────────────────────────────────────
                 lines.append(
-                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{summary_str}"
+                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{summary_str}{version_info}"
                 )
 
+        # Add short previews (first 10 lines) of each non‑obsolete block
         lines.append("\n## Code Previews (first 10 lines of each block)\n")
         max_preview_chars = 4000
         chars_added = 0
@@ -2498,6 +2510,11 @@ class Filter:
         return result
 
     def _expand_referenced_symbols(self, project_id: str, user_query: str) -> str:
+        """
+        Return the full bodies of code blocks whose symbols appear in the user query.
+        Limits to at most 2 blocks when call graph is available, otherwise 5.
+        Also shows a short diff between the latest and previous version for the same file.
+        """
         state = self._get_state(project_id)
         has_calls = state.get("has_any_calls", False) if state else False
         MAX_EXPANDED_BODIES = (
@@ -2517,8 +2534,18 @@ class Filter:
         for name in mentioned_names:
             mentioned_hashes.update(self._symbol_index.find_blocks(name, project_id))
 
+        # Filter out obsolete blocks
+        non_obsolete_hashes = {
+            h
+            for h in mentioned_hashes
+            if h in state["active_blocks"] and not state["active_blocks"][h].obsolete
+        }
+
+        if not non_obsolete_hashes:
+            return ""
+
         sorted_hashes = sorted(
-            mentioned_hashes,
+            non_obsolete_hashes,
             key=lambda h: state["active_blocks"]
             .get(h, CodeBlock(content=""))
             .importance_score,
@@ -2526,74 +2553,49 @@ class Filter:
         )
 
         parts = ["\n## Expanded Code Bodies (referenced symbols)\n"]
+        expanded_hashes = set()
+
         for block_hash in sorted_hashes[:MAX_EXPANDED_BODIES]:
             block = state["active_blocks"].get(block_hash)
             if not block:
                 continue
+            expanded_hashes.add(block_hash)
             loc = f" (file: {block.file_path})" if block.file_path else ""
             parts.append(
                 f"### Block {block.hash[:8]}{loc}\n```\n{block.content[:3000]}\n```"
             )
+
+            # ── Minidiff between latest and previous version (same file) ──
+            if block.file_path:
+                # Find the most recent non‑obsolete block with the same file path
+                same_file_blocks = [
+                    (h, b)
+                    for h, b in state["active_blocks"].items()
+                    if b.file_path == block.file_path
+                    and not b.obsolete
+                    and h != block_hash
+                ]
+                if same_file_blocks:
+                    # Pick the previous one = the most recent among them
+                    prev_hash, prev_block = max(
+                        same_file_blocks, key=lambda x: x[1].timestamp
+                    )
+                    diff_lines = list(
+                        difflib.unified_diff(
+                            prev_block.content.splitlines(),
+                            block.content.splitlines(),
+                            fromfile=f"{block.file_path}:prev",
+                            tofile=f"{block.file_path}:latest",
+                            lineterm="",
+                        )
+                    )
+                    if diff_lines:
+                        parts.append(
+                            f"\n**Changes from previous version (block {prev_hash[:8]}):**\n"
+                            f"```diff\n" + "\n".join(diff_lines[:20]) + "\n```"
+                        )
+
         return "\n".join(parts)
-
-    def _invalidate_lightweight_cache(self, project_id: str):
-        self._cached_lightweight_context.pop(project_id, None)
-
-    async def _is_structural_task(self, user_message: str) -> bool:
-        indicators = [
-            r"\bdiagrama\b",
-            r"\bdiagram\b",
-            r"\bflowchart\b",
-            r"\bflujo\b",
-            r"\bgrafo\b",
-            r"\bgraph\b",
-            r"\bestructura\b",
-            r"\bstructure\b",
-            r"\bdependencias\b",
-            r"\bdependencies\b",
-            r"\barquitectura\b",
-            r"\barchitecture\b",
-            r"\bcall graph\b",
-            r"\bllamadas\b",
-            r"\bresumen\s+de\s+arquitectura\b",
-            r"\bclass diagram\b",
-            r"\bdependency graph\b",
-            r"\bcall hierarchy\b",
-            r"\bhow\s+do\s+these\b",
-            r"\bhow\s+are\s+these\b",
-            r"\brelationship\b",
-            r"\brelación\b",
-            r"\bconnected\b",
-            r"\bconectados\b",
-            r"\bcomponent diagram\b",
-            r"\bmodule\s+dependencies\b",
-            r"\bsequence diagram\b",
-        ]
-        content = user_message.strip().lower()
-        if any(re.search(pat, content) for pat in indicators):
-            return True
-        if len(content) > 50 and (
-            "?" in content or "cómo" in content or "how" in content
-        ):
-            try:
-                model = (
-                    self.valves.natural_language_forget_model or self.valves.llm_model
-                )
-                prompt = f'Is this question asking for a structural representation (diagram, flowchart, call graph, dependency) of code? Answer only "yes" or "no".\n\nQuestion: {content[:300]}'
-                response = await asyncio.wait_for(
-                    self._call_llm(
-                        prompt=prompt,
-                        system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
-                        model_override=model,
-                        max_tokens=3,
-                        temperature=0.0,
-                    ),
-                    timeout=1.0,
-                )
-                return response and response.strip().lower().startswith("yes")
-            except (asyncio.TimeoutError, Exception):
-                pass
-        return False
 
     async def _generate_missing_summaries(self, project_id: str):
         if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
