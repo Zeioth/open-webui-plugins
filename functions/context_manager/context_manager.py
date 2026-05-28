@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.7
+version: 5.4.8
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1249,6 +1249,13 @@ class Filter:
         if self.valves.debug:
             print(f"[CodeAware] {msg}")
             logger.info(msg)
+
+    def _log_timing(self, step_name: str, elapsed_since_start: float, duration: float):
+        """Log timing information for a step when debug is enabled."""
+        if self.valves.debug:
+            self._log_debug(
+                f"[Timing] {step_name}: +{elapsed_since_start:.3f}s (dur={duration:.3f}s)"
+            )
 
     # --------------------------------------------------------------------------
     #  Code span utilities
@@ -5793,6 +5800,14 @@ class Filter:
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
+        inlet_start = time.monotonic()  # ⏱️
+
+        # Helper for timing relative to inlet_start
+        def _inlet_timing(step_name: str, start: float, end: float = None):
+            if end is None:
+                end = time.monotonic()
+            self._log_timing(step_name, start - inlet_start, end - start)
+
         self._ensure_cleanup_task()
         messages = body.get("messages", [])
         project_id = self._get_project_id()
@@ -5805,7 +5820,6 @@ class Filter:
             if old_state:
                 self._remove_project_from_index_by_id(self._last_project_id, old_state)
             self._cached_lightweight_context.pop(self._last_project_id, None)
-            # Clean change summaries from previous project
             self._block_change_summaries.clear()
         self._last_project_id = project_id
 
@@ -5827,6 +5841,7 @@ class Filter:
             if handled:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
+                _inlet_timing("total_inlet", inlet_start)  # ⏱️
                 return body
 
         # --- Command routing: natural language forget/remember/obsolete ---
@@ -5835,7 +5850,9 @@ class Filter:
             and last_user_msg
             and not is_explicit_command
         ):
+            t0 = time.monotonic()  # ⏱️
             intents = await self._parse_all_intents(last_user_msg.get("content", ""))
+            _inlet_timing("parse_nl_intents", t0)  # ⏱️
             for intent_type in ("forget", "remember", "obsolete"):
                 fi = intents.get(intent_type, {})
                 if fi.get("action") not in (None, "none"):
@@ -5860,6 +5877,7 @@ class Filter:
                     messages.append({"role": "assistant", "content": confirmation})
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
+                    _inlet_timing("total_inlet", inlet_start)  # ⏱️
                     return body
 
         # --- Command routing: /status ---
@@ -5888,6 +5906,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)  # ⏱️
             return body
 
         # --- Command routing: /speculative_stats ---
@@ -5925,6 +5944,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)  # ⏱️
             return body
 
         # --- Command routing: /clean ---
@@ -5941,6 +5961,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)  # ⏱️
             return body
 
         # --- Command routing: /fact ---
@@ -5959,6 +5980,7 @@ class Filter:
                 messages.append({"role": "assistant", "content": response})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
+                _inlet_timing("total_inlet", inlet_start)  # ⏱️
                 return body
 
         # --- Command routing: /expand ---
@@ -5972,16 +5994,19 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)  # ⏱️
             return body
 
         # ----- NO MORE EARLY RETURNS BEYOND THIS POINT -----
 
         state = self._get_state(project_id)
+
+        t0 = time.monotonic()  # ⏱️
         is_code_session = await self._classify_session(messages, project_id)
+        _inlet_timing("classify_session", t0)  # ⏱️
+
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
-        # Collect all system injections with priorities (priority, text)
-        # Order of insertion within the same priority is preserved.
         system_injections = []  # list of (priority, text)
 
         # ------------------------------------------------------------
@@ -6012,9 +6037,11 @@ class Filter:
         ):
             query = last_user_msg.get("content", "")
             if query:
+                t0 = time.monotonic()  # ⏱️
                 ltm_future = asyncio.create_task(
                     self._retrieve_all_memories_unified(query, project_id)
                 )
+                _inlet_timing("ltm_task_creation", t0)  # ⏱️
 
         # ---------- Chain-of-Thought multi-level auto-detection ----------
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
@@ -6039,6 +6066,7 @@ class Filter:
                         )
                         messages = self._ensure_last_message_is_user(messages)
                         body["messages"] = messages
+                        _inlet_timing("total_inlet", inlet_start)  # ⏱️
                         return body
                 else:
                     # New multi-level CoT detection
@@ -6051,7 +6079,7 @@ class Filter:
                         cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                         system_injections.append(("high", cot_prompt))
                     elif cot_level == 2:
-                        # Auto-CoT in background: generate reasoning and inject as system message
+                        t0 = time.monotonic()  # ⏱️
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
@@ -6062,8 +6090,9 @@ class Filter:
                             system_injections.append(
                                 ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
                             )
+                        _inlet_timing("cot_level2_reasoning", t0)  # ⏱️
                     elif cot_level == 3:
-                        # Auto-CoT with self-reflection
+                        t0 = time.monotonic()  # ⏱️
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
@@ -6077,6 +6106,7 @@ class Filter:
                                     f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
                                 )
                             )
+                        _inlet_timing("cot_level3_reflection", t0)  # ⏱️
 
         # /assume command
         if self.valves.enable_assumption_extraction and last_user_msg:
@@ -6094,6 +6124,7 @@ class Filter:
                 )
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
+                _inlet_timing("total_inlet", inlet_start)  # ⏱️
                 return body
 
         # Iterative mode
@@ -6106,6 +6137,7 @@ class Filter:
                 messages.append({"role": "assistant", "content": result})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
+                _inlet_timing("total_inlet", inlet_start)  # ⏱️
                 return body
 
         # Smart context selection (if enabled)
@@ -6114,6 +6146,7 @@ class Filter:
             and len(messages) > 0
             and is_code_session
         ):
+            t0 = time.monotonic()  # ⏱️
             last_user_idx = -1
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i].get("role") == "user":
@@ -6125,26 +6158,24 @@ class Filter:
                     historical = await self._retrieve_historical_messages(
                         query, project_id, self.valves.smart_context_top_k
                     )
-                    # Preserve the last user message and the assistant answer if exists
                     preserved = [messages[last_user_idx]]
                     if (
                         last_user_idx + 1 < len(messages)
                         and messages[last_user_idx + 1].get("role") == "assistant"
                     ):
                         preserved.append(messages[last_user_idx + 1])
-                    # Remove the current query from historical to avoid duplication
                     new_history = [msg for msg in historical if msg["content"] != query]
-                    # Add preserved at the end so they stay in context
                     new_history.extend(preserved)
                     system_msgs = [m for m in messages if m.get("role") == "system"]
-                    # The note about context optimization is collected as low priority
                     system_injections.append(
                         ("low", "[Context optimized: only relevant history is shown]")
                     )
                     messages = system_msgs + new_history
                     body["messages"] = messages
+            _inlet_timing("smart_context_selection", t0)  # ⏱️
 
         # Parallel checks (contradiction, response cache, duplicate question)
+        t0 = time.monotonic()  # ⏱️
         last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
         context_hash = self._compute_context_hash(messages)
         contradiction_warning, cached_response, duplicate_match = (
@@ -6152,6 +6183,8 @@ class Filter:
                 messages, last_user_query, context_hash, project_id, state
             )
         )
+        _inlet_timing("parallel_context_checks", t0)  # ⏱️
+
         if contradiction_warning and self.valves.contradiction_inject_warning:
             system_injections.append(("high", contradiction_warning))
         if cached_response:
@@ -6160,6 +6193,7 @@ class Filter:
             )
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)  # ⏱️
             return body
         if duplicate_match:
             warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
@@ -6185,7 +6219,11 @@ class Filter:
                         else None
                     )
                 )
+
+            t0 = time.monotonic()  # ⏱️
             await self._update_active_code(messages[last_idx], project_id)
+            _inlet_timing("update_active_code_last", t0)  # ⏱️
+
             self._last_processed_message_idx[project_id] = last_idx
 
         # ------------------------------------------------------------
@@ -6193,6 +6231,7 @@ class Filter:
         # ------------------------------------------------------------
         unique_meta = []
         if ltm_future is not None:
+            t0 = time.monotonic()  # ⏱️
             all_meta = await ltm_future
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             seen = set()
@@ -6200,6 +6239,7 @@ class Filter:
                 if m["doc"] not in seen:
                     seen.add(m["doc"])
                     unique_meta.append(m)
+            _inlet_timing("ltm_retrieval", t0)  # ⏱️
 
         # Format and inject LTM (high priority)
         max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
@@ -6294,7 +6334,6 @@ class Filter:
                 active_ctx = self._get_active_code_context(
                     project_id, user_query=user_query
                 )
-                # Also expand referenced symbols if not structural
                 if last_user_msg and not is_structural and user_query:
                     expanded = self._expand_referenced_symbols(project_id, user_query)
                     if expanded:
@@ -6365,14 +6404,18 @@ class Filter:
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
         if self.valves.context_window_tokens > 0:
+            t0 = time.monotonic()  # ⏱️
             suggestion = await self._check_and_suggest_summarization(
                 project_id, total_tokens, self.valves.context_window_tokens
             )
+            _inlet_timing("check_summarization_suggestion", t0)  # ⏱️
             if suggestion:
                 system_injections.append(("medium", suggestion))
 
         # Command suggestion (after a certain number of messages without commands)
+        t0 = time.monotonic()  # ⏱️
         cmd_suggestion = await self._suggest_commands(project_id, state)
+        _inlet_timing("suggest_commands", t0)  # ⏱️
         if cmd_suggestion:
             system_injections.append(("medium", cmd_suggestion))
 
@@ -6381,7 +6424,6 @@ class Filter:
             total_tokens = self._estimate_tokens(system_msgs + history_msgs)
             if total_tokens > self.valves.context_window_tokens:
                 self._log_debug("Trimming old messages due to token budget")
-                # Simple truncation: keep last max_turns user-assistant pairs
                 keep = self.valves.max_turns
                 last_user_idx = -1
                 for i in range(len(history_msgs) - 1, -1, -1):
@@ -6397,10 +6439,12 @@ class Filter:
                     kept_block = history_msgs[-keep:] if keep > 0 else []
 
                 if self.valves.summarize_old_messages and old_block:
+                    t0 = time.monotonic()  # ⏱️
                     has_code = any("```" in m.get("content", "") for m in old_block)
                     summary = await self._summarize_messages(
                         old_block, is_code_context=has_code
                     )
+                    _inlet_timing("summarize_old_messages", t0)  # ⏱️
                     if summary:
                         system_injections.append(
                             ("high", f"[Summary of earlier conversation]\n{summary}")
@@ -6453,10 +6497,12 @@ class Filter:
                     kept_block = history_msgs[-keep:] if keep > 0 else []
 
                 if self.valves.summarize_old_messages and old_block:
+                    t0 = time.monotonic()  # ⏱️
                     has_code = any("```" in m.get("content", "") for m in old_block)
                     summary = await self._summarize_messages(
                         old_block, is_code_context=has_code
                     )
+                    _inlet_timing("summarize_old_messages", t0)  # ⏱️
                     if summary:
                         system_injections.append(
                             ("high", f"[Summary of earlier conversation]\n{summary}")
@@ -6486,12 +6532,11 @@ class Filter:
         base_content = ""
         if sys_msgs:
             base_content = sys_msgs[0].get("content", "")
-            # Remove all existing system messages; we will build a single one
             messages = [m for m in messages if m.get("role") != "system"]
 
+        t0 = time.monotonic()  # ⏱️
         budget = self.valves.global_injection_token_budget
         if budget > 0 and self.tokenizer:
-            # Sort by priority: critical=0, high=1, medium=2, low=3
             priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
             system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
             selected_texts = []
@@ -6504,25 +6549,21 @@ class Filter:
                     selected_texts.append(text)
                     total_tokens += tokens
                 else:
-                    # If it's critical or high, try truncating to fit
                     if prio in ("critical", "high"):
                         available = budget - total_tokens
-                        if available > 20:  # at least some useful content
+                        if available > 20:
                             truncated = text[: available * 4] + "\n[truncated]"
                             selected_texts.append(truncated)
                             total_tokens += len(self.tokenizer.encode(truncated))
-                            break  # stop adding more after a forced truncation
-                    # For medium or low, just skip
+                            break
             final_system = "\n\n".join(selected_texts)
         else:
-            # No budget: use all injections
             final_system = "\n\n".join(text for _, text in system_injections if text)
+        _inlet_timing("assemble_system_message", t0)  # ⏱️
 
-        # Combine with any original system content
         if base_content.strip():
             final_system = final_system + "\n\n" + base_content
 
-        # Insert as the only system message at the beginning
         if final_system.strip():
             messages.insert(0, {"role": "system", "content": final_system})
 
@@ -6542,6 +6583,7 @@ class Filter:
             self._log_debug(f"Injected system tokens: {total_system_tokens}")
 
         body["messages"] = messages
+        _inlet_timing("total_inlet", inlet_start)  # ⏱️
         return body
 
     # --------------------------------------------------------------------------
