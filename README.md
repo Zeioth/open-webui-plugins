@@ -13,7 +13,8 @@ My current system prompt:
 ## Código
 - Python: sigue PEP 8.
 
-## Diagramas e infografías
+## Al general diagramas e infografías
+- No muestres el código fuente de la infografía en el chat.
 - Usa siempre la herramienta adecuada para renderizarlos. No pegues el código en el chat.
 - Al generar Mermaid, evita errores de sintaxis:
   - Labels: no empieces con `/`, no uses flechas Unicode (→ ⟶ =>), escapa caracteres especiales con comillas: `["label (con paréntesis)"]`, máximo 40 caracteres.
