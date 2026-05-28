@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.4
+version: 5.4.5
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -5829,7 +5829,7 @@ class Filter:
                 body["messages"] = messages
                 return body
 
-        # --- Command routing: /expand (new) ---
+        # --- Command routing: /expand ---
         if last_user_msg and last_user_msg.get("content", "").strip().startswith(
             "/expand"
         ):
@@ -5845,6 +5845,24 @@ class Filter:
         state = self._get_state(project_id)
         is_code_session = await self._classify_session(messages, project_id)
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
+
+        # ------------------------------------------------------------
+        # PARALLEL: Start LTM recovery in background while
+        # updating active code.
+        # ------------------------------------------------------------
+        ltm_future = None
+        if (
+            self.valves.enable_code_awareness
+            and is_code_session
+            and not self.valves.smart_context_selection
+            and HAS_SENTENCE
+            and HAS_CHROMA
+        ):
+            query = last_user_msg.get("content", "")
+            if query:
+                ltm_future = asyncio.create_task(
+                    self._retrieve_all_memories_unified(query, project_id)
+                )
 
         # Code interpretation note (now also informs about the /expand command)
         if is_code_session:
@@ -6015,25 +6033,21 @@ class Filter:
             await self._update_active_code(messages[last_idx], project_id)
             self._last_processed_message_idx[project_id] = last_idx
 
-        # LTM retrieval (when smart context not used)
+        # ------------------------------------------------------------
+        # Get the result of LTM recovery that started in parallel
+        # at the top. If it didn't launc, ltm_future is None.
+        # ------------------------------------------------------------
         unique_meta = []
-        if not self.valves.smart_context_selection and is_code_session:
-            if (
-                last_user_msg
-                and HAS_SENTENCE
-                and HAS_CHROMA
-                and self.valves.enable_code_awareness
-            ):
-                query = last_user_msg.get("content", "")
-                all_meta = await self._retrieve_all_memories_unified(query, project_id)
-                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-                seen = set()
-                unique_meta = []
-                for m in all_meta:
-                    if m["doc"] not in seen:
-                        seen.add(m["doc"])
-                        unique_meta.append(m)
+        if ltm_future is not None:
+            all_meta = await ltm_future
+            all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+            seen = set()
+            for m in all_meta:
+                if m["doc"] not in seen:
+                    seen.add(m["doc"])
+                    unique_meta.append(m)
 
+        # Format and inject LTM
         max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
         parts = []
         current_tokens = 0
