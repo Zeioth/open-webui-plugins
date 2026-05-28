@@ -203,7 +203,6 @@ class CodeBlock(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Fallback tree-sitter queries for signature extraction
-# Used only when tree_sitter_language_pack.process() is unavailable (older versions)
 # ---------------------------------------------------------------------------
 FALLBACK_LANGUAGE_QUERIES = {
     "python": """
@@ -248,9 +247,6 @@ FALLBACK_LANGUAGE_QUERIES = {
     """,
 }
 
-# ---------------------------------------------------------------------------
-# Fallback call-graph queries (who calls whom)
-# ---------------------------------------------------------------------------
 FALLBACK_CALL_QUERIES = {
     "python": """
         (function_definition
@@ -414,10 +410,6 @@ class SymbolIndex:
 
 # ---------------------------------------------------------------------------
 # Signature Extractor: multi-level fallback for extracting code symbols
-# Level 1: tree_sitter_language_pack.process()   (305 languages, fastest)
-# Level 2: tree-sitter queries (manual, ~7 langs)
-# Level 3: regex (generic, any text)
-# Also extracts call graphs (who-calls-who) and docstrings.
 # ---------------------------------------------------------------------------
 class SignatureExtractor:
     MAX_PARSE_SIZE_BYTES = 5_000_000  # 5 MB, covers most source files
@@ -478,7 +470,6 @@ class SignatureExtractor:
                 sym.calls = call_map.get(sym.name, [])
             return syms
 
-        # ── Parse ONCE ──────────────────────────────────────────────────────
         try:
             parser = get_parser(lang)
             loop = asyncio.get_event_loop()
@@ -492,17 +483,15 @@ class SignatureExtractor:
                 sym.calls = call_map.get(sym.name, [])
             return syms
 
-        # ── Ambas consultas sobre el mismo árbol ────────────────────────────
         syms = SignatureExtractor._extract_symbols_from_tree(
             tree, lang, code, file_path
         )
         call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
-        del tree  # liberar RAM inmediatamente
+        del tree
 
         for sym in syms:
             sym.calls = call_map.get(sym.name, [])
 
-        # Auto-extract docstrings for Python
         if lang == "python" or (file_path and file_path.endswith(".py")):
             SignatureExtractor._extract_docstrings_python(code, syms)
 
@@ -512,7 +501,6 @@ class SignatureExtractor:
     def _extract_symbols_from_tree(
         tree, lang: str, code: str, file_path: Optional[str]
     ) -> List[CodeSymbol]:
-        """Level-2 extraction: uses an already built tree (no re-parse)."""
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
             return SignatureExtractor._extract_generic(code, file_path)
@@ -578,7 +566,6 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
-        """Extract calls (caller->callee) from an already built tree."""
         query_str = FALLBACK_CALL_QUERIES.get(lang)
         if not query_str:
             if lang == "python":
@@ -653,7 +640,6 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_docstrings_python(code: str, symbols: List[CodeSymbol]):
-        """Extract docstrings from Python functions/classes and assign to symbols."""
         try:
             tree = ast.parse(code)
             doc_map = {}
@@ -672,11 +658,9 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_calls_fallback_python(code: str) -> Dict[str, List[str]]:
-        """Use Python AST to extract caller->callee relationships."""
         call_map: Dict[str, Set[str]] = defaultdict(set)
         try:
             tree = ast.parse(code)
-            # Track current function scope via a simple stack
             scope_stack = []
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -697,7 +681,6 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_calls_generic(code: str) -> Dict[str, List[str]]:
-        """Generic regex-based call extraction for unsupported languages."""
         call_map: Dict[str, Set[str]] = defaultdict(set)
         func_pattern = (
             r"^\s*(?:def|function|fn|func)\s+(\w+)\s*\([^)]*\)(?:\s*->\s*\S+)?\s*:?"
@@ -755,7 +738,6 @@ class SignatureExtractor:
 
     @staticmethod
     async def _extract_calls_async(code: str, lang: str) -> Dict[str, List[str]]:
-        """Return a dict mapping function name -> list of called function names."""
         if not HAS_TREE_SITTER:
             if lang == "python":
                 return SignatureExtractor._extract_calls_fallback_python(code)
@@ -784,7 +766,6 @@ class SignatureExtractor:
                     current_arrow_caller = node.text.decode("utf-8")
                     continue
                 if cap_name == "callee":
-                    # Extract callee name, handling attribute/member expressions
                     if node.type in (
                         "attribute",
                         "field_access",
@@ -801,7 +782,6 @@ class SignatureExtractor:
                     else:
                         callee_name = node.text.decode("utf-8")
 
-                    # Find the enclosing function/method
                     caller = None
                     parent = node.parent
                     while parent:
@@ -842,7 +822,6 @@ class SignatureExtractor:
     async def _extract_with_queries_async(
         code: str, lang: str, file_path: Optional[str]
     ) -> List[CodeSymbol]:
-        """Extract symbols using manual tree-sitter queries (Level 2)."""
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
             return SignatureExtractor._extract_generic(code, file_path)
@@ -918,7 +897,6 @@ class SignatureExtractor:
     def _extract_generic(
         code: str, file_path: Optional[str] = None
     ) -> List[CodeSymbol]:
-        """Generic regex fallback for unsupported languages (Level 3)."""
         symbols = []
         for match in re.finditer(
             r"^\s*(def|function|class|fn|func)\s+(\w+)",
@@ -1190,9 +1168,91 @@ class Filter:
             default=500, description="Max tokens for summarizing oversized code blocks."
         )
 
+        # --- Nuevas válvulas para Feature 1 ---
+        ltm_index_symbols_enabled: bool = Field(default=False)
+        ltm_symbol_index_max_per_message: int = Field(default=20)
+        ltm_symbol_boost_enabled: bool = Field(default=False)
+        ltm_symbol_boost_factor: float = Field(default=1.5)
+        ltm_symbol_boost_min_similarity: float = Field(default=0.5)
+        ltm_symbol_force_mode_enabled: bool = Field(default=False)
+        ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
+
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
         enable_code_awareness: Optional[bool] = Field(default=None)
+
+    # Lista negra de símbolos genéricos que no se indexan
+    _SYMBOL_BLACKLIST = {
+        "self",
+        "cls",
+        "args",
+        "kwargs",
+        "init",
+        "main",
+        "len",
+        "print",
+        "range",
+        "int",
+        "str",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "object",
+        "type",
+        "super",
+        "i",
+        "j",
+        "k",
+        "x",
+        "y",
+        "z",
+        "e",
+        "ex",
+        "err",
+        "error",
+        "data",
+        "result",
+        "value",
+        "key",
+        "item",
+        "items",
+        "func",
+        "method",
+        "function",
+        "class",
+        "return",
+        "pass",
+        "break",
+        "continue",
+        "if",
+        "else",
+        "elif",
+        "for",
+        "while",
+        "try",
+        "except",
+        "finally",
+        "with",
+        "as",
+        "import",
+        "from",
+        "def",
+        "lambda",
+        "yield",
+        "raise",
+        "assert",
+        "and",
+        "or",
+        "not",
+        "in",
+        "is",
+        "None",
+        "True",
+        "False",
+    }
 
     def __init__(self):
         self.valves = self.Valves()
@@ -3393,671 +3453,88 @@ class Filter:
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
-    #  MODIFIED: inlet
+    #  Feature 1 – Symbolic retrieval
     # --------------------------------------------------------------------------
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet called")
-        self._ensure_cleanup_task()
-        messages = body.get("messages", [])
-        project_id = self._get_project_id()
+    def _is_symbol_indexable(self, symbol: CodeSymbol) -> bool:
+        """Decide whether a code symbol should be indexed in LTM metadata."""
+        if symbol.kind not in ("function", "class", "method"):
+            return False
+        if len(symbol.name) < 3:
+            return False
+        if symbol.name in self._SYMBOL_BLACKLIST:
+            return False
+        return True
 
-        if self._last_project_id and self._last_project_id != project_id:
-            self._log_debug(
-                f"Project changed from {self._last_project_id} to {project_id}"
-            )
-            old_state = self._conversation_state.get(self._last_project_id)
-            if old_state:
-                self._remove_project_from_index_by_id(self._last_project_id, old_state)
-            self._cached_lightweight_context.pop(self._last_project_id, None)
-        self._last_project_id = project_id
+    def _extract_query_symbols(self, query: str, project_id: str) -> Set[str]:
+        """Return project symbols that appear as whole words in the query."""
+        if not query or not project_id:
+            return set()
+        words = set(re.findall(r"\b\w+\b", query))
+        project_symbols = self._symbol_index.get_all_names(project_id)
+        return words.intersection(project_symbols)
 
-        if not messages:
-            return body
+    def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
+        """Detect ?symbol: prefix and return (symbol, cleaned_query)."""
+        if not self.valves.ltm_symbol_force_mode_enabled:
+            return None, query
+        match = re.match(r"\?symbol:(\S+)", query)
+        if match:
+            symbol = match.group(1)
+            cleaned = query[match.end() :].strip()
+            return symbol, cleaned if cleaned else symbol
+        return None, query
 
-        state = self._get_state(project_id)
-        is_code_session = await self._classify_session(messages, project_id)
-        self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
-
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        is_explicit_command = last_user_msg and last_user_msg.get(
-            "content", ""
-        ).startswith("/")
-
-        # ── Unified Intent Handling ──────────────────────────────────
-        if self.valves.enable_forget_command and is_explicit_command:
-            new_messages, handled = await self._handle_forget_command(
-                messages, project_id, __user__
-            )
-            if handled:
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-        if (
-            self.valves.enable_natural_language_forget
-            and last_user_msg
-            and not is_explicit_command
-            and (is_code_session or is_explicit_command)
-        ):
-            intents = await self._parse_all_intents(last_user_msg.get("content", ""))
-
-            # Forget
-            fi = intents.get("forget", {})
-            if fi.get("action") not in (None, "none"):
-                confirmation = await self._execute_forget_intent(project_id, fi)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages.pop()
-                messages.append({"role": "assistant", "content": confirmation})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-            # Remember
-            ri = intents.get("remember", {})
-            if ri.get("action") not in (None, "none"):
-                confirmation = await self._execute_remember_intent(project_id, ri)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-            # Obsolete
-            oi = intents.get("obsolete", {})
-            if (
-                oi.get("action") not in (None, "none")
-                and self.valves.enable_obsolete_marking
-            ):
-                confirmation = await self._execute_obsolete_intent(project_id, oi)
-                status_msg = f"[CodeAware] {confirmation}"
-                messages.insert(0, {"role": "system", "content": status_msg})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-        # Facts – no LLM, kept as before
-        if self.valves.enable_facts and last_user_msg:
-            facts = await self._extract_facts_from_message(
-                last_user_msg.get("content", "")
-            )
-            for fact_text in facts:
-                await self._add_fact(project_id, fact_text)
-            if (
-                last_user_msg.get("content", "")
-                .strip()
-                .startswith(self.valves.fact_command_prefix)
-            ):
-                response_msg = await self._handle_fact_command(
-                    last_user_msg.get("content", ""), project_id
-                )
-                if response_msg:
-                    messages.pop()
-                    messages.append({"role": "assistant", "content": response_msg})
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    return body
-
-        # ── Code interpretation note ──────────────────────────────────
-        if is_code_session:
-            note = (
-                "When reading user messages, treat code inside triple backticks "
-                "as literal source code without interpreting Markdown. "
-                "You may still use Markdown in your own responses."
-            )
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                if note not in sys_msgs[0].get("content", ""):
-                    sys_msgs[0]["content"] = note + "\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": note})
-
-        # ── /think or auto Chain-of-Thought ───────────────────────────
-        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-            if last_user_msg:
-                user_content = last_user_msg.get("content", "")
-                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
-                    "/think"
-                ):
-                    cot_question = await self._parse_cot_intent(user_content)
-                    if cot_question:
-                        active_ctx = self._get_active_code_context(project_id)
-                        facts_ctx = self._get_facts_context(project_id)
-                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                        reasoning = await self._generate_cot(cot_question, context)
-                        messages.pop()
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
-                            }
-                        )
-                        messages = self._ensure_last_message_is_user(messages)
-                        body["messages"] = messages
-                        return body
-                elif (
-                    self.valves.auto_cot_enabled
-                    and self._should_auto_cot(user_content)
-                    and not user_content.strip().startswith("/")
-                ):
-                    self._log_debug("Auto-injecting Chain-of-Thought prompt")
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
-                    cot_prompt = (
-                        "Please think step by step before answering. "
-                        "Show your reasoning, then provide the final answer."
-                    )
-                    if sys_msgs:
-                        sys_msgs[0]["content"] = (
-                            cot_prompt + "\n" + sys_msgs[0]["content"]
-                        )
-                    else:
-                        messages.insert(0, {"role": "system", "content": cot_prompt})
-                    body["messages"] = messages
-
-        # ── /assume ────────────────────────────────────────────────────
-        if self.valves.enable_assumption_extraction:
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
-            ):
-                assumption_target = await self._parse_assumption_intent(
-                    last_user_msg.get("content", "")
-                )
-                if assumption_target:
-                    analysis = await self._extract_assumptions(assumption_target)
-                    messages.pop()
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": f"**Assumption Analysis**\n{analysis}",
-                        }
-                    )
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    return body
-
-        # ── /iterate ───────────────────────────────────────────────────
-        if self.valves.enable_iterative_mode:
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
-            ):
-                result, consumed = await self._run_iteration(
-                    project_id, last_user_msg.get("content", "")
-                )
-                if consumed:
-                    messages.pop()
-                    messages.append({"role": "assistant", "content": result})
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    return body
-
-        # ── Smart context selection ────────────────────────────────────
-        if (
-            self.valves.smart_context_selection
-            and len(messages) > 0
-            and is_code_session
-        ):
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                query = messages[last_user_idx].get("content", "")
-                if query:
-                    historical = await self._retrieve_historical_messages(
-                        query, project_id, self.valves.smart_context_top_k
-                    )
-                    new_history = []
-                    for msg in historical:
-                        if msg["content"] != query:
-                            new_history.append(msg)
-                    new_history.append(messages[last_user_idx])
-                    if (
-                        self.valves.smart_context_include_last_user
-                        and last_user_idx + 1 < len(messages)
-                        and messages[last_user_idx + 1].get("role") == "assistant"
-                    ):
-                        new_history.append(messages[last_user_idx + 1])
-                    system_msgs = [m for m in messages if m.get("role") == "system"]
-                    messages = system_msgs + new_history
-                    body["messages"] = messages
-
-        # ── Parallel Checks (contradiction, cache, duplicate) ──────────
-        last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
-        context_hash = self._compute_context_hash(messages)
-
-        contradiction_warning, cached_response, duplicate_match = (
-            await self._parallel_context_checks(
-                messages, last_user_query, context_hash, project_id, state
-            )
-        )
-
-        if contradiction_warning and self.valves.contradiction_inject_warning:
-            messages.insert(0, {"role": "system", "content": contradiction_warning})
-            body["messages"] = messages
-
-        if cached_response:
-            messages.append(
-                {"role": "assistant", "content": cached_response["response"]}
-            )
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-        if duplicate_match:
-            warn_msg = (
-                f"⚠️ **Note**: This question is very similar to one you asked before "
-                f"(similarity {duplicate_match['sim']:.2f})."
-            )
-            messages.insert(0, {"role": "system", "content": warn_msg})
-            body["messages"] = messages
-
-        # ── Update active code (historical in background, last message sync) ─
-        if self.valves.enable_code_awareness and is_code_session:
-            last_idx = len(messages) - 1
-            start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
-
-            if start_idx < last_idx:
-
-                async def _process_historical(msgs, start, end, pid):
-                    for i in range(start, end):
-                        await self._update_active_code(msgs[i], pid)
-
-                task = asyncio.create_task(
-                    _process_historical(messages, start_idx, last_idx, project_id)
-                )
-                task.add_done_callback(
-                    lambda t: (
-                        self._log_debug(f"Historical update error: {t.exception()}")
-                        if t.exception()
-                        else None
-                    )
-                )
-
-            await self._update_active_code(messages[last_idx], project_id)
-            self._last_processed_message_idx[project_id] = last_idx
-
-        # ── LTM retrieval ──────────────────────────────────────────────
-        unique_meta = []
-        if not self.valves.smart_context_selection and is_code_session:
-            if (
-                last_user_msg
-                and HAS_SENTENCE
-                and HAS_CHROMA
-                and self.valves.enable_code_awareness
-            ):
-                query = last_user_msg.get("content", "")
-                all_meta = await self._retrieve_all_memories_unified(query, project_id)
-                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-                seen = set()
-                unique_meta = []
-                for m in all_meta:
-                    if m["doc"] not in seen:
-                        seen.add(m["doc"])
-                        unique_meta.append(m)
-
-        max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
-        parts = []
-        current_tokens = 0
-        header = "## Relevant Past Context (with timestamps)\n\n"
-        if max_ltm_tokens > 0:
-            current_tokens += (
-                len(self.tokenizer.encode(header))
-                if self.tokenizer
-                else (len(header) // 4)
-            )
-        for mem in unique_meta:
-            ts = mem.get("timestamp")
-            if ts and ts > 1000000000:
-                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%SZ"
-                )
-                text = f"[{time_str}] {mem['doc']}"
-            else:
-                text = f"[unknown date] {mem['doc']}"
-            frag_tokens = (
-                len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
-            )
-            if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
-                continue
-            parts.append(text)
-            current_tokens += frag_tokens
-        if parts:
-            ctx = header + "\n---\n".join(parts)
-            if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
-                ctx += "\n[Some older fragments omitted to fit token budget]"
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": ctx})
-            body["messages"] = messages
-
-        # ── Inject active code context (lightweight or full) ───────────
-        if is_code_session and self.valves.enable_code_awareness:
-            is_structural = last_user_msg and await self._is_structural_task(
-                last_user_msg.get("content", "")
-            )
-
-            code_blocks = [
-                b
-                for b in state["active_blocks"].values()
-                if b.content_type
-                in (
-                    ContentType.BASE_CODE,
-                    ContentType.PROPOSED_CHANGE,
-                    ContentType.COMMITTED_CHANGE,
-                )
-                and not b.obsolete
+    async def _retrieve_by_symbol(
+        self, symbol: str, cleaned_query: str, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """Retrieve memories containing a specific symbol."""
+        now = time.time()
+        where = {
+            "$and": [
+                {"project_id": {"$eq": project_id}},
+                {"code_symbols": {"$contains": f",{symbol},"}},
             ]
-            total_code_tokens = sum(b._cached_token_count for b in code_blocks)
+        }
+        if self.valves.long_term_memory_expiration_days > 0:
+            where["$and"].append({"expires_at": {"$gt": now}})
 
-            # User query for dynamic relevancy boost and lightweight expansion
-            user_query = last_user_msg.get("content", "") if last_user_msg else ""
-
-            if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
-                self._log_debug(
-                    f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
-                )
-                active_ctx = await self._build_lightweight_context(project_id)
-
-                if last_user_msg and not is_structural:
-                    expanded = self._expand_referenced_symbols(project_id, user_query)
-                    if expanded:
-                        active_ctx += "\n" + expanded
-                elif is_structural:
-                    self._log_debug(
-                        "Structural task detected, not expanding code bodies."
-                    )
-                    active_ctx += (
-                        "\n\n[Note: Structural analysis requested. Use the symbol index "
-                        "with call graphs and summaries to generate the diagram. Do not "
-                        "request code bodies.]"
-                    )
-            else:
-                active_ctx = self._get_active_code_context(
-                    project_id, user_query=user_query
-                )
-
-            if active_ctx:
-                checklist = (
-                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                    "2. Identify every assumption the code makes and verify each one.\n"
-                    "3. For every regex or string match, test it against 5 counter-examples.\n"
-                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                    "6. Output your reasoning step by step, then provide the corrected code.\n"
-                )
-                active_ctx = checklist + "\n\n" + active_ctx
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        active_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
-                else:
-                    messages.insert(0, {"role": "system", "content": active_ctx})
-                body["messages"] = messages
-
-        # ── Code review checklist injection ────────────────────────────
-        if (
-            is_code_session
-            and self.valves.enable_code_review_mode
-            and self._is_code_review_request(
-                last_user_msg.get("content", "") if last_user_msg else ""
-            )
-        ):
-            self._log_debug("Injecting code review checklist")
-            review_prompt = (
-                "## Code Review Checklist\n"
-                "You are reviewing code. Follow these steps:\n"
-                "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                "2. Identify every assumption the code makes and verify each one.\n"
-                "3. For every regex or string match, test it against 5 counter-examples.\n"
-                "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                "6. Output your reasoning step by step, then provide the corrected code.\n"
-            )
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": review_prompt})
-            body["messages"] = messages
-
-        # ── Inject facts ───────────────────────────────────────────────
-        if (
-            is_code_session
-            and self.valves.enable_facts
-            and self.valves.inject_facts_in_context
-        ):
-            facts_ctx = self._get_facts_context(project_id)
-            if facts_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
-                else:
-                    messages.insert(0, {"role": "system", "content": facts_ctx})
-                body["messages"] = messages
-
-        # ── Confidence scoring ─────────────────────────────────────────
-        if self.valves.enable_confidence_scoring and is_code_session:
-            total_tokens = self._estimate_tokens(messages)
-            if total_tokens > self.valves.context_window_tokens * 0.8:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] += self.valves.confidence_prompt
-                else:
-                    messages.insert(
-                        0, {"role": "system", "content": self.valves.confidence_prompt}
-                    )
-                body["messages"] = messages
-
-        # ── Inject feedback context ────────────────────────────────────
-        if (
-            is_code_session
-            and self.valves.enable_feedback_tracking
-            and self.valves.inject_feedback_context
-        ):
-            feedback_ctx = self._get_feedback_context(project_id)
-            if feedback_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        feedback_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
-                else:
-                    messages.insert(0, {"role": "system", "content": feedback_ctx})
-                body["messages"] = messages
-
-        # ── Proactive suggestions ─────────────────────────────────────
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        history_msgs = [m for m in messages if m.get("role") != "system"]
-        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        if self.valves.context_window_tokens > 0:
-            suggestion = await self._check_and_suggest_summarization(
-                project_id, total_tokens, self.valves.context_window_tokens
-            )
-            if suggestion:
-                messages.insert(0, {"role": "system", "content": suggestion})
-                body["messages"] = messages
-
-        cmd_suggestion = await self._suggest_commands(project_id, state)
-        if cmd_suggestion:
-            messages.insert(0, {"role": "system", "content": cmd_suggestion})
-            body["messages"] = messages
-
-        # ── Adaptive context trim ─────────────────────────────────────
-        trim_needed = False
-        if self.valves.adaptive_trim:
-            total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-            if total_tokens > self.valves.context_window_tokens:
-                trim_needed = True
-        else:
-            user_max = (
-                __user__["valves"].max_turns
-                if __user__ and hasattr(__user__, "valves")
-                else None
-            )
-            eff_max = user_max if user_max is not None else self.valves.max_turns
-            if len(history_msgs) > eff_max:
-                trim_needed = True
-
-        if trim_needed or len(history_msgs) > self.valves.max_turns:
-            self._log_debug("Trimming old messages")
-            keep = self.valves.max_turns
-            last_user_idx = -1
-            for i in range(len(history_msgs) - 1, -1, -1):
-                if history_msgs[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                start_idx = max(0, last_user_idx - keep + 1)
-                old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                kept_block = history_msgs[start_idx:]
-            else:
-                old_block = history_msgs[:-keep] if keep > 0 else []
-                kept_block = history_msgs[-keep:] if keep > 0 else []
-
-            if self.valves.summarize_old_messages and old_block:
-                has_code = any("```" in m.get("content", "") for m in old_block)
-                summary = await self._summarize_messages(
-                    old_block, is_code_context=has_code
-                )
-                if summary:
-                    history_msgs = [
-                        {
-                            "role": "assistant",
-                            "content": f"[Summary of earlier conversation]\n{summary}",
-                        }
-                    ] + kept_block
-                else:
-                    history_msgs = kept_block
-            else:
-                history_msgs = kept_block
-
-            if self.valves.preserve_tool_calls:
-                while history_msgs and history_msgs[0].get("role") == "tool":
-                    history_msgs.pop(0)
-                if (
-                    history_msgs
-                    and history_msgs[0].get("role") == "assistant"
-                    and history_msgs[0].get("tool_calls")
-                ):
-                    tool_call_ids = {
-                        tc.get("id") for tc in history_msgs[0]["tool_calls"]
-                    }
-                    tool_response_ids = {
-                        m.get("tool_call_id")
-                        for m in history_msgs[1:]
-                        if m.get("role") == "tool"
-                    }
-                    if not tool_call_ids.issubset(tool_response_ids):
-                        history_msgs.pop(0)
-
-        messages = system_msgs + history_msgs
-
-        if messages and messages[-1].get("role") != "user":
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                messages = messages[: last_user_idx + 1]
-                self._log_debug("Trimmed trailing assistant messages")
-            else:
-                messages.append({"role": "user", "content": "continue"})
-                self._log_debug("Inserted dummy user message to satisfy API")
-
-        body["messages"] = messages
-        return body
-
-    # --------------------------------------------------------------------------
-    #  MODIFIED: outlet
-    # --------------------------------------------------------------------------
-    async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("outlet called")
-        if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
-            return body
-        messages = body.get("messages", [])
-        project_id = self._get_project_id()
-        state = self._get_state(project_id)
-        is_code_session = await self._classify_session(messages, project_id)
-        last_msg = messages[-1] if messages else None
-        if last_msg:
-            last_idx = len(messages) - 1
-            if last_idx <= self._last_processed_message_idx.get(project_id, -1):
-                self._log_debug(
-                    "outlet: last message already processed in inlet, skipping"
-                )
-            else:
-                if last_msg.get("role") in ("user", "assistant"):
-                    if is_code_session:
-                        await self._update_active_code(last_msg, project_id)
-                        await self._store_message_in_memory(last_msg, project_id)
-                    else:
-                        if not self.valves.ltm_store_only_code_sessions:
-                            await self._store_message_in_memory(last_msg, project_id)
-        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
-            last_user = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
-            )
-            last_assistant = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"), None
-            )
-            if last_user and last_assistant:
-                context_hash = self._compute_context_hash(messages[:-1])
-                await self._store_response_in_cache(
-                    last_user.get("content", ""),
-                    last_assistant.get("content", ""),
-                    context_hash,
-                    state,
-                )
-        asyncio.create_task(self._purge_expired_memories())
-        self._clean_llm_cache()
-
-        self._write_counter += 1
-        if self._write_counter % 100 == 0:
-            asyncio.create_task(self._run_db_checkpoints())
-            self._cleanup_completed_tasks()
-
-        return body
-
-    async def _run_db_checkpoints(self):
-        try:
-            await anyio.to_thread.run_sync(
-                lambda: self._db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            )
-            self._log_debug("SQLite WAL checkpoint completed")
-        except Exception as e:
-            self._log_debug(f"SQLite checkpoint error: {e}")
-        try:
-            if self.chroma_client:
-                await anyio.to_thread.run_sync(lambda: self.chroma_client.persist())
-            self._log_debug("ChromaDB persist/checkpoint completed")
-        except Exception as e:
-            self._log_debug(f"ChromaDB checkpoint error: {e}")
-
-    def _compute_context_hash(self, messages: List[dict]) -> str:
-        if not self.valves.response_cache_include_context_hash:
-            return ""
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        context_str = "\n".join([m.get("content", "") for m in sys_msgs])
-        return hashlib.md5(context_str.encode()).hexdigest()[:16]
-
-    def _compute_code_state_hash(self, project_id: str) -> str:
-        """Compute a hash representing the current state of all active code blocks."""
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return ""
-        # Use sorted hashes of all non‑obsolete blocks
-        sorted_hashes = sorted(
-            h for h, b in state["active_blocks"].items() if not b.obsolete
+        q_emb = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(cleaned_query[:1000]).tolist()
         )
-        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
+        results = await anyio.to_thread.run_sync(
+            lambda: self.memory_collection.query(
+                query_embeddings=[q_emb],
+                n_results=self.valves.long_term_memory_top_k * 2,
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+
+        docs_with_meta = []
+        if results and results["documents"]:
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i]
+                sim = 1.0 - (results["distances"][0][i] / 2.0)
+                ts = meta.get("timestamp")
+                if ts is not None and ts < 1000000000:
+                    ts = None
+                if self.valves.ltm_time_decay_hours > 0 and ts is not None:
+                    age_hours = (now - ts) / 3600
+                    sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
+                if sim >= self.valves.long_term_memory_similarity_threshold:
+                    docs_with_meta.append((doc, sim, ts, meta))
+
+        docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+        docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
+
+        if not docs_with_meta and self.valves.ltm_symbol_force_fallback_to_semantic:
+            self._log_debug(
+                f"No memories found for symbol {symbol}, falling back to semantic search."
+            )
+            # Recursively call _retrieve_all_memories_unified with cleaned_query (won't re-enter forced mode)
+            return await self._retrieve_all_memories_unified(cleaned_query, project_id)
+
+        return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
 
     async def _store_message_in_memory(self, message: dict, project_id: str):
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
@@ -4065,7 +3542,7 @@ class Filter:
         content = message.get("content", "")
         if not content or len(content.strip()) < 15:
             return
-        extracted = await self._extract_code_blocks(content)
+        extracted, _ = await self._extract_code_blocks(content)
         content_type = self._classify_content(content, extracted)
         msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
         expires_at = None
@@ -4073,6 +3550,34 @@ class Filter:
             expires_at = time.time() + (
                 self.valves.long_term_memory_expiration_days * 86400
             )
+
+        # Feature 1: symbol indexing
+        code_symbols_str = ""
+        if self.valves.ltm_index_symbols_enabled:
+            blocks_for_symbols = extracted if extracted else []
+            if not blocks_for_symbols:
+                blocks_for_symbols, _ = await self._extract_code_blocks(content)
+            if blocks_for_symbols:
+                all_symbols = set()
+                for blk in blocks_for_symbols:
+                    try:
+                        syms = await SignatureExtractor.extract_async(
+                            blk["code"], blk.get("language")
+                        )
+                        for sym in syms:
+                            if self._is_symbol_indexable(sym):
+                                all_symbols.add(sym.name)
+                                if (
+                                    len(all_symbols)
+                                    >= self.valves.ltm_symbol_index_max_per_message
+                                ):
+                                    break
+                    except Exception:
+                        pass
+                if all_symbols:
+                    code_symbols_str = "," + ",".join(sorted(all_symbols)) + ","
+                    self._log_debug(f"Indexed symbols for LTM: {code_symbols_str}")
+
         embedding = await anyio.to_thread.run_sync(
             lambda: self.embedder.encode(content).tolist()
         )
@@ -4088,6 +3593,8 @@ class Filter:
                         "expires_at": expires_at,
                         "content_type": content_type.value,
                         "has_code": len(extracted) > 0,
+                        "code_symbols": code_symbols_str,
+                        "memory_id": msg_id,
                     }
                 ],
                 documents=[content],
@@ -4199,6 +3706,14 @@ class Filter:
     ) -> List[Dict[str, Any]]:
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
+
+        # Feature 1c: forced symbol mode
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
+        if forced_symbol:
+            return await self._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
+            )
+
         try:
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self.embedder.encode(query[:1000]).tolist()
@@ -4236,6 +3751,28 @@ class Filter:
 
             docs_with_meta.sort(key=lambda x: x[1], reverse=True)
 
+            # Feature 1b: symbol boost
+            if self.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._extract_query_symbols(query, project_id)
+                if query_symbols:
+                    new_docs = []
+                    for doc, sim, ts, meta in docs_with_meta:
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if (
+                            meta_symbols_str
+                            and sim >= self.valves.ltm_symbol_boost_min_similarity
+                        ):
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                sim *= self.valves.ltm_symbol_boost_factor
+                                self._log_debug(
+                                    f"Boosted memory {meta.get('memory_id','?')} with symbols {common}, new sim={sim:.3f}"
+                                )
+                        new_docs.append((doc, sim, ts, meta))
+                    new_docs.sort(key=lambda x: x[1], reverse=True)
+                    docs_with_meta = new_docs
+
             if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
                 rerank_k = min(
                     (
@@ -4263,6 +3800,15 @@ class Filter:
     ) -> List[Dict]:
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
+
+        # Feature 1c: forced symbol mode
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
+        if forced_symbol:
+            memories = await self._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
+            )
+            return [{"role": "user", "content": m["doc"]} for m in memories]
+
         try:
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self.embedder.encode(query[:1000]).tolist()
@@ -4281,19 +3827,47 @@ class Filter:
                 )
             )
 
-            regular_messages = []
-            summary_messages = []
+            query_symbols = set()
+            if self.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._extract_query_symbols(query, project_id)
+
+            scored_regular = []
+            scored_summaries = []
             if results and results["documents"]:
                 for i, doc in enumerate(results["documents"][0]):
                     meta = results["metadatas"][0][i]
-                    is_summary = meta.get("is_hierarchical_summary", False)
-                    role = meta.get("role", "user")
-                    if is_summary:
-                        summary_messages.append({"role": "assistant", "content": doc})
-                    else:
-                        regular_messages.append({"role": role, "content": doc})
+                    dist = results["distances"][0][i]
+                    sim = 1.0 - (dist / 2.0)
 
-            messages = summary_messages + regular_messages
+                    # Feature 1b: symbol boost
+                    if (
+                        query_symbols
+                        and sim >= self.valves.ltm_symbol_boost_min_similarity
+                    ):
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if meta_symbols_str:
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                sim *= self.valves.ltm_symbol_boost_factor
+                                self._log_debug(
+                                    f"Boosted history memory {meta.get('memory_id','?')} with symbols {common}, sim={sim:.3f}"
+                                )
+
+                    role = meta.get("role", "user")
+                    is_summary = meta.get("is_hierarchical_summary", False)
+                    entry = (sim, {"role": role, "content": doc})
+                    if is_summary:
+                        scored_summaries.append(entry)
+                    else:
+                        scored_regular.append(entry)
+
+            scored_summaries.sort(key=lambda x: x[0], reverse=True)
+            scored_regular.sort(key=lambda x: x[0], reverse=True)
+
+            messages = [msg for _, msg in scored_summaries] + [
+                msg for _, msg in scored_regular
+            ]
 
             if (
                 self.valves.enable_reranking
@@ -5605,6 +5179,3 @@ Code:
             self._log_debug(f"Error in hierarchical_compress: {e}")
         finally:
             self._hierarchical_compress_in_progress[project_id] = False
-
-
-# endregion (end of Filter class)
