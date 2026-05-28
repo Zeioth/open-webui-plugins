@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.1
+version: 5.4.2
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1063,6 +1063,13 @@ class Filter:
         speculative_boost_on_miss: float = Field(default=1.0)
         speculative_decay_after_ignored_turns: int = Field(default=3)
         speculative_stats_command_enabled: bool = Field(default=True)
+        active_context_max_tokens: int = Field(
+            default=0,
+            description="Maximum tokens for the injected active code context. 0 = unlimited.",
+        )
+        duplicate_question_lookback_hours: float = Field(
+            default=24.0
+        )  # <-- Only last 24h
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -1910,7 +1917,7 @@ class Filter:
                         {
                             "query": query[:500],
                             "project_id": self.valves.project_id,
-                            "context_hash": context_hash,
+                            "context_hash": "",  # Not used anymore: we keep compatibility.
                             "code_state_hash": self._compute_code_state_hash(
                                 self.valves.project_id
                             ),
@@ -2030,7 +2037,9 @@ class Filter:
         if HAS_TREE_SITTER:
             try:
                 config = ProcessConfig()
-                ts_blocks = process(content, config)
+                ts_blocks = await anyio.to_thread.run_sync(
+                    lambda: process(content, config)
+                )
                 for tsb in ts_blocks:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
@@ -2262,6 +2271,16 @@ class Filter:
             if cache_key:
                 self._session_classify_cache[cache_key] = (True, time.time())
             return True
+
+        # ------------------------------------------------------------------
+        # NUEVO: si el mensaje contiene bloques de código delimitados,
+        # es claramente una sesión de código, sin necesidad de LLM.
+        # ------------------------------------------------------------------
+        if last_user and "```" in last_user.get("content", ""):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+
         if not last_user or len(last_user.get("content", "")) < 20:
             result = False
         else:
@@ -2334,6 +2353,7 @@ class Filter:
         if not active:
             return ""
 
+        # ---- Calculate recent files ---
         recent_window = self.valves.recent_activity_window_minutes * 60
         recent_files = {}
         for b in active:
@@ -2350,7 +2370,6 @@ class Filter:
                 minutes_ago = int(age_seconds / 60)
                 time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
                 recent_lines.append(f"- `{file_path}` ({time_str})")
-
         recent_section = ""
         if recent_lines:
             recent_section = (
@@ -2359,6 +2378,7 @@ class Filter:
                 + "\n\n"
             )
 
+        # ---- Relevance by mention of files/symbols ----
         mentioned_files = set()
         mentioned_symbols = set()
         if user_query:
@@ -2393,6 +2413,7 @@ class Filter:
             reverse=True,
         )
 
+        # ---- File's last version ----
         latest_per_file = {}
         for b in active:
             if b.file_path:
@@ -2403,6 +2424,7 @@ class Filter:
                     latest_per_file[b.file_path] = b
         latest_hashes = {b.hash for b in latest_per_file.values()}
 
+        # ---- Construction of sections (ordered importance) ----
         base_codes = [
             b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
         ][: self.valves.max_base_code_blocks]
@@ -2454,6 +2476,25 @@ class Filter:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(self._format_block_context(b, is_latest) + tag)
+
+        # Token limit
+        max_tokens = self.valves.active_context_max_tokens
+        if max_tokens > 0 and self.tokenizer:
+            # Removal priority: errors (lowest), proposed changes, committed changes, base code (highest).
+            # Build the final text from parts; if it exceeds the limit, trim from the end (least important parts added last).
+            # We've added sections in order: base, proposed, committed, errors (errors last), so we can truncate from the back.
+            full_text = "\n".join(parts)
+            while len(self.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3:
+                # Remove the last section (the least important in order of addition).
+                # Strategy: remove errors first, then committed, etc.
+                # Simply pop the last element of `parts`, which corresponds to the most recently added section.
+                parts.pop()
+                full_text = "\n".join(parts)
+            if len(self.tokenizer.encode(full_text)) > max_tokens:
+                # If it still exceeds the limit, truncate the remaining block (likely base code).
+                # Leave a warning message.
+                parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
+                full_text = "\n".join(parts)
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
@@ -3471,7 +3512,7 @@ class Filter:
         if not self.valves.enable_reranking or not self._cross_encoder or not documents:
             return documents[:top_k]
         pairs = [(query, doc) for doc in documents]
-        scores = self._cross_encoder.predict(pairs)
+        scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
         scored = list(zip(documents, scores))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
@@ -5098,6 +5139,12 @@ class Filter:
                 "$and": [
                     {"project_id": {"$eq": project_id}},
                     {"role": {"$eq": "user"}},
+                    {
+                        "timestamp": {
+                            "$gt": time.time()
+                            - self.valves.duplicate_question_lookback_hours
+                        }
+                    },
                 ]
             }
             results = await anyio.to_thread.run_sync(
@@ -5838,19 +5885,24 @@ class Filter:
                     historical = await self._retrieve_historical_messages(
                         query, project_id, self.valves.smart_context_top_k
                     )
-                    new_history = []
-                    for msg in historical:
-                        if msg["content"] != query:
-                            new_history.append(msg)
-                    new_history.append(messages[last_user_idx])
+                    # Preserve the last user message and the assistant answer if exists
+                    preserved = [messages[last_user_idx]]
                     if (
-                        self.valves.smart_context_include_last_user
-                        and last_user_idx + 1 < len(messages)
+                        last_user_idx + 1 < len(messages)
                         and messages[last_user_idx + 1].get("role") == "assistant"
                     ):
-                        new_history.append(messages[last_user_idx + 1])
+                        preserved.append(messages[last_user_idx + 1])
+                    # Remove the current query from historical to avoid duplication
+                    new_history = [msg for msg in historical if msg["content"] != query]
+                    # Add preserved at the end so they stay in context
+                    new_history.extend(preserved)
                     system_msgs = [m for m in messages if m.get("role") == "system"]
-                    messages = system_msgs + new_history
+                    # Add a note explaining the context has been replaced
+                    note = {
+                        "role": "system",
+                        "content": "[Context optimized: only relevant history is shown]",
+                    }
+                    messages = system_msgs + [note] + new_history
                     body["messages"] = messages
 
         # Parallel checks (contradiction, response cache, duplicate question)
@@ -6240,6 +6292,46 @@ class Filter:
                 messages = messages[: last_user_idx + 1]
             else:
                 messages.append({"role": "user", "content": "continue"})
+
+        # --------------------------------------------------------------------------
+        # Ensure active context is ALWAYS at the begining of system message
+        # --------------------------------------------------------------------------
+        if is_code_session and self.valves.enable_code_awareness:
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                content = sys_msgs[0].get("content", "")
+                # Search active context's marker.
+                active_marker = "## Currently Active Code Context"
+                idx = content.find(active_marker)
+                if idx > 0:  # no está al principio.
+                    before = content[:idx].strip()
+                    active_block = content[idx:]
+                    # Search next marker "## " (next section).
+                    next_marker_match = re.search(
+                        r"\n## (?!Currently Active Code Context)", active_block
+                    )
+                    if next_marker_match:
+                        active_section = active_block[: next_marker_match.start()]
+                        after = active_block[next_marker_match.start() :]
+                        sys_msgs[0]["content"] = (
+                            active_section + "\n\n" + before + "\n\n" + after
+                        )
+                    else:
+                        # The rest of the message is just active context.
+                        sys_msgs[0]["content"] = active_block + "\n\n" + before
+                # If idx == 0, it's already the the beginning, we do nothing.
+
+        if self.valves.debug:
+            total_system_tokens = 0
+            for m in messages:
+                if m.get("role") == "system":
+                    content = m.get("content", "")
+                    total_system_tokens += (
+                        len(self.tokenizer.encode(content))
+                        if self.tokenizer
+                        else len(content) // 4
+                    )
+            self._log_debug(f"Injected system tokens: {total_system_tokens}")
 
         body["messages"] = messages
         return body
