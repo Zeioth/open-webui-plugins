@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.0
+version: 5.3.4
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -88,6 +88,13 @@ try:
     HAS_TREE_SITTER = True
 except ImportError:
     HAS_TREE_SITTER = False
+
+try:
+    import tree_sitter
+
+    HAS_TREE_SITTER_CORE = True
+except ImportError:
+    HAS_TREE_SITTER_CORE = False
 
 # ---------------------------------------------------------------------------
 # Path for shared resources
@@ -446,6 +453,21 @@ class SignatureExtractor:
         return "unknown"
 
     @staticmethod
+    def _parse_sync(code_bytes: bytes, lang: str):
+        """Creates a new parser in the current thread and parses the code."""
+        from tree_sitter import (
+            Parser as TSParser,
+        )  # local import to avoid global dependencies.
+
+        try:
+            lang_obj = get_language(lang)
+            parser = TSParser()
+            parser.set_language(lang_obj)
+            return parser.parse(code_bytes)
+        except Exception as e:
+            raise RuntimeError(f"Tree‑sitter parse error: {e}")
+
+    @staticmethod
     async def extract_async(
         code: str, file_path: Optional[str] = None
     ) -> List[CodeSymbol]:
@@ -467,10 +489,14 @@ class SignatureExtractor:
             return syms
 
         try:
-            parser = get_parser(lang)
             loop = asyncio.get_event_loop()
+            # Llama a _parse_sync, que crea un parser NUEVO dentro del hilo,
+            # evitando el error de "unsendable".
             tree = await asyncio.wait_for(
-                loop.run_in_executor(None, parser.parse, code.encode()), timeout=5.0
+                loop.run_in_executor(
+                    None, SignatureExtractor._parse_sync, code.encode(), lang
+                ),
+                timeout=5.0,
             )
         except (asyncio.TimeoutError, Exception):
             syms = SignatureExtractor._extract_generic(code, file_path)
