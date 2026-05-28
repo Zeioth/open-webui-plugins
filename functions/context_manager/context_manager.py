@@ -5448,9 +5448,25 @@ class Filter:
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
         t0 = time.monotonic()
-        prompt = ...
+        prompt = (
+            f"The user is working on a {'code' if is_code_session else 'general'} task.\n"
+            f"User message:\n{user_content[:500]}\n\n"
+            "Decide the depth of Chain-of-Thought reasoning needed:\n"
+            "0 = none (simple fact, greeting, trivial)\n"
+            "1 = basic (ask to think step by step internally)\n"
+            "2 = moderate (generate reasoning automatically)\n"
+            "3 = deep (generate reasoning + self-critique)\n\n"
+            "Respond with only the digit 0, 1, 2, or 3."
+        )
         try:
-            response = await self._try_llm_quick(...)
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt="You are a classifier. Output only a single digit.",
+                model_override=self.valves.cot_detection_model,
+                max_tokens=2,
+                temperature=0.0,
+                timeout=5.0,
+            )
             if response and response.strip().isdigit():
                 level = int(response.strip())
                 if 0 <= level <= 3:
