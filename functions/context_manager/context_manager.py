@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.5
+version: 5.4.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -2015,10 +2015,18 @@ class Filter:
 
                     # Si Tree‑sitter no pudo determinar el lenguaje, intentamos adivinarlo
                     if lang == "text" or lang == "":
-                        # Buscamos patrones comunes de código
+                        # check for common code patterns
                         guessed = SignatureExtractor._guess_language(None, raw)
                         if guessed != "unknown":
                             lang = guessed
+
+                    # If language is still "text" or "", use the LLM fallback
+                    # Si el lenguaje sigue siendo "text" o "", usar el fallback LLM si está activo
+                    if lang == "text" or lang == "":
+                        llm_lang = await self._detect_language_via_llm(raw)
+                        if llm_lang != "unknown":
+                            lang = llm_lang
+                            self._log_debug(f"LLM detected language: {lang}")
 
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
@@ -2078,6 +2086,50 @@ class Filter:
             blocks.append({"language": "text", "code": code, "type": "indented"})
             spans.append((start_offset, end_offset))
         return blocks, spans
+
+    async def _detect_language_via_llm(self, code_snippet: str) -> str:
+        """Use a small, quick LLM call to identify the programming language."""
+        if not HAS_AIOHTTP:
+            return "unknown"
+        prompt = (
+            "Identify the programming language of this code. "
+            "Answer with a single word (e.g., 'python', 'javascript', 'go', 'rust') or 'unknown':\n\n"
+            f"```\n{code_snippet[:500]}\n```"
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._call_llm(
+                    prompt=prompt,
+                    system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
+                    model_override=self.valves.natural_language_forget_model
+                    or self.valves.llm_model,
+                    max_tokens=10,
+                    temperature=0.0,
+                ),
+                timeout=3.0,
+            )
+            if response:
+                lang = response.strip().lower()
+                # Normalize common responses
+                lang_map = {
+                    "py": "python",
+                    "js": "javascript",
+                    "ts": "typescript",
+                    "tsx": "tsx",
+                    "jsx": "jsx",
+                    "c++": "cpp",
+                    "c#": "csharp",
+                    "bash": "bash",
+                    "sh": "bash",
+                    "zsh": "bash",
+                    "rb": "ruby",
+                    "rs": "rust",
+                    "golang": "go",
+                }
+                return lang_map.get(lang, lang)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        return "unknown"
 
     def _extract_file_path_for_block(
         self, content: str, block_start: int
