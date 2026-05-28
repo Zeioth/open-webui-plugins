@@ -6186,6 +6186,7 @@ class Filter:
         # ------------------------------------------------------------
         parallel_checks_task = None
         cot_task = None  # will hold the CoT generation task if needed
+        cot_task_start = None  # timestamp when CoT task was created
         last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
         context_hash = self._compute_context_hash(messages)
         if last_user_msg:
@@ -6222,6 +6223,7 @@ class Filter:
                             cot_task = asyncio.create_task(
                                 self._generate_cot_reasoning(cot_question, context)
                             )
+                            cot_task_start = time.monotonic()
                             _inlet_timing("cot_manual_level2", t0)
                         elif level == 3:
                             t0 = time.monotonic()
@@ -6235,6 +6237,7 @@ class Filter:
                                     cot_question, context
                                 )
                             )
+                            cot_task_start = time.monotonic()
                             _inlet_timing("cot_manual_level3", t0)
 
                 # Automatic detection (only if no manual /think was used)
@@ -6256,6 +6259,7 @@ class Filter:
                         cot_task = asyncio.create_task(
                             self._generate_cot_reasoning(user_content, context)
                         )
+                        cot_task_start = time.monotonic()
                         _inlet_timing("cot_level2_reasoning", t0)
                     elif cot_level == 3:
                         t0 = time.monotonic()
@@ -6267,6 +6271,7 @@ class Filter:
                                 user_content, context
                             )
                         )
+                        cot_task_start = time.monotonic()
                         _inlet_timing("cot_level3_reflection", t0)
 
         # If any CoT reasoning was used, add a global note for the final model
@@ -6391,6 +6396,10 @@ class Filter:
                         reasoning = cot_task.result()
                     else:
                         reasoning = await cot_task
+                    # Log total CoT generation time
+                    if cot_task_start is not None:
+                        cot_dur = time.monotonic() - cot_task_start
+                        self._log_timing("cot_reasoning_total", cot_dur, cot_dur)
 
                 # Ensure parallel checks are fully completed
                 if parallel_checks_task is not None and not parallel_checks_task.done():
