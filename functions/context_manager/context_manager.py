@@ -6143,9 +6143,6 @@ class Filter:
         body["messages"] = messages
         return body
 
-        body["messages"] = messages
-        return body  # <-- fin del método inlet
-
     # --------------------------------------------------------------------------
     #  Change summary generation
     # --------------------------------------------------------------------------
