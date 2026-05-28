@@ -2269,76 +2269,73 @@ class Filter:
                     return ContentType.BASE_CODE
         return ContentType.GENERAL
 
-    async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
-        last_user = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        cache_key = None
-        if last_user:
-            content_key = last_user.get("content", "")[:200]
-            cache_key = (
-                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
-            )
-            cached = self._session_classify_cache.get(cache_key)
-            if cached is not None:
-                result, ts = cached
-                if time.time() - ts < self._session_classify_ttl:
-                    self._log_debug(
-                        f"Session classify cache hit → {'code' if result else 'non-code'}"
-                    )
-                    return result
-                else:
-                    del self._session_classify_cache[cache_key]
 
-        state = self._get_state(project_id)
-        if state and state.get("active_blocks"):
+async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
+    """Determine if this is a coding session.
+    Uses a 1800s TTL cache, state heuristics, code indicators in the last
+    10 user messages, and falls back to a fast LLM call only when uncertain.
+    """
+    # 1. Cache check (TTL 1800s set in __init__)
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    cache_key = None
+    if last_user:
+        content_key = last_user.get("content", "")[:200]
+        cache_key = f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
+        cached = self._session_classify_cache.get(cache_key)
+        if cached is not None:
+            result, ts = cached
+            if time.time() - ts < self._session_classify_ttl:
+                return result
+            del self._session_classify_cache[cache_key]
+
+    # 2. Existing state → definitely a coding session
+    state = self._get_state(project_id)
+    if state and state.get("active_blocks"):
+        if cache_key:
+            self._session_classify_cache[cache_key] = (True, time.time())
+        return True
+
+    # 3. Heuristics on the last 10 user messages (no LLM)
+    for msg in reversed(messages[-10:]):
+        if msg.get("role") != "user":
+            continue
+        if self._has_code_indicators(msg.get("content", "")):
             if cache_key:
                 self._session_classify_cache[cache_key] = (True, time.time())
-            self._log_debug("Session classified as code (existing blocks)")
             return True
-        for msg in reversed(messages):
-            if msg.get("role") != "user":
-                continue
-            if self._has_code_indicators(msg.get("content", "")):
-                if cache_key:
-                    self._session_classify_cache[cache_key] = (True, time.time())
-                self._log_debug("Session classified as code (heuristic)")
-                return True
-        if not last_user:
-            if cache_key:
-                self._session_classify_cache[cache_key] = (False, time.time())
-            self._log_debug("Session classified as non-code (no user message)")
-            return False
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
+
+    # 4. Explicit command (starts with "/") → treat as coding
+    if last_user and last_user.get("content", "").strip().startswith("/"):
+        if cache_key:
+            self._session_classify_cache[cache_key] = (True, time.time())
+        return True
+
+    # 5. Fallback LLM only when no heuristic matched and there is enough text
+    if not last_user or len(last_user.get("content", "")) < 20:
+        result = False
+    else:
+        model = self.valves.natural_language_forget_model or self.valves.llm_model
+        prompt = (
+            f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\n"
+            f"Message: {last_user.get('content','')[:300]}"
         )
-        prompt = f"Is the following user message about programming/code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:500]}"
-        self._log_debug("Classifying session with LLM...")
         response = await self._try_llm_quick(
             prompt=prompt,
             system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
             model_override=model,
-            max_tokens=5,
+            max_tokens=3,
             temperature=0.0,
-            timeout=8.0,
+            timeout=5.0,
         )
-        result = response and response.strip().lower().startswith("yes")
-        if cache_key:
-            self._session_classify_cache[cache_key] = (result, time.time())
-            if len(self._session_classify_cache) >= 500:
-                # Keep only the 400 most recent entries (batch eviction)
-                items = sorted(
-                    self._session_classify_cache.items(),
-                    key=lambda item: item[1][1],  # sort by timestamp
-                )
-                self._session_classify_cache = dict(items[-400:])
-                self._log_debug("Session classify cache pruned to 400 entries")
-        self._log_debug(
-            f"LLM classification result: {'code' if result else 'non-code'}"
-        )
-        return result
+        result = bool(response and response.strip().lower().startswith("yes"))
+
+    if cache_key:
+        self._session_classify_cache[cache_key] = (result, time.time())
+        # Keep the cache bounded (max 500 entries, retain the 400 most recent)
+        if len(self._session_classify_cache) >= 500:
+            items = sorted(self._session_classify_cache.items(), key=lambda x: x[1][1])
+            self._session_classify_cache = dict(items[-400:])
+    return result
 
     def _has_code_indicators(self, content: str) -> bool:
         if "```" in content:
@@ -3266,18 +3263,23 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
 
     if not messages:
         return body
+
     state = self._get_state(project_id)
     is_code_session = await self._classify_session(messages, project_id)
     self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
-    # 1. Forget
-    if (
-        self.valves.enable_forget_command or self.valves.enable_natural_language_forget
-    ) and (
-        is_code_session
-        or (messages and messages[-1].get("content", "").startswith("/"))
-    ):
-        # Always try the dedicated /forget handler first (covers explicit commands and fallback)
+    # Grab the last user message once – used throughout the pipeline
+    last_user_msg = next(
+        (m for m in reversed(messages) if m.get("role") == "user"), None
+    )
+    is_explicit_command = last_user_msg and last_user_msg.get("content", "").startswith(
+        "/"
+    )
+
+    # ── Unified Intent Handling ──────────────────────────────────────
+    # Handles /forget, /remember, /obsolete and natural-language equivalents
+    # in a single LLM call (when natural language parsing is enabled).
+    if self.valves.enable_forget_command and is_explicit_command:
         new_messages, handled = await self._handle_forget_command(
             messages, project_id, __user__
         )
@@ -3286,137 +3288,71 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             body["messages"] = messages
             return body
 
-        # If natural language parsing produced an intent (but not handled as explicit command),
-        # verify it before executing to prevent accidental triggers.
-        if self.valves.enable_natural_language_forget:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg and not last_user_msg.get("content", "").startswith("/"):
-                intent = await self._parse_forget_intent(
-                    last_user_msg.get("content", "")
-                )
-                if intent and intent.get("action") != "none":
-                    # Build a human-readable description of the action
-                    details = {k: v for k, v in intent.items() if k != "action"}
-                    desc = f"Action: {intent.get('action')}, details: {details}"
-                    if await self._verify_command_intent(
-                        last_user_msg.get("content", ""), desc
-                    ):
-                        confirmation = await self._execute_forget_intent(
-                            project_id, intent
-                        )
-                        status_msg = f"[CodeAware] {confirmation}"
-                        messages.insert(0, {"role": "system", "content": status_msg})
-                        messages.pop()
-                        messages.append({"role": "assistant", "content": confirmation})
-                        messages = self._ensure_last_message_is_user(messages)
-                        body["messages"] = messages
-                        return body
-                    else:
-                        self._log_debug("Forget intent rejected by verification LLM")
+    if (
+        self.valves.enable_natural_language_forget
+        and last_user_msg
+        and not is_explicit_command
+        and (is_code_session or is_explicit_command)
+    ):
+        intents = await self._parse_all_intents(last_user_msg.get("content", ""))
 
-    # 2. Remember
-    if self.valves.enable_natural_language_forget:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
+        # Forget
+        fi = intents.get("forget", {})
+        if fi.get("action") not in (None, "none"):
+            confirmation = await self._execute_forget_intent(project_id, fi)
+            status_msg = f"[CodeAware] {confirmation}"
+            messages.insert(0, {"role": "system", "content": status_msg})
+            messages.pop()
+            messages.append({"role": "assistant", "content": confirmation})
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            return body
+
+        # Remember
+        ri = intents.get("remember", {})
+        if ri.get("action") not in (None, "none"):
+            confirmation = await self._execute_remember_intent(project_id, ri)
+            status_msg = f"[CodeAware] {confirmation}"
+            messages.insert(0, {"role": "system", "content": status_msg})
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            return body
+
+        # Obsolete
+        oi = intents.get("obsolete", {})
+        if (
+            oi.get("action") not in (None, "none")
+            and self.valves.enable_obsolete_marking
         ):
-            remember_intent = await self._parse_remember_intent(
-                last_user_msg.get("content", "")
+            confirmation = await self._execute_obsolete_intent(project_id, oi)
+            status_msg = f"[CodeAware] {confirmation}"
+            messages.insert(0, {"role": "system", "content": status_msg})
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            return body
+
+    # Facts – no LLM, kept as before
+    if self.valves.enable_facts and last_user_msg:
+        facts = await self._extract_facts_from_message(last_user_msg.get("content", ""))
+        for fact_text in facts:
+            await self._add_fact(project_id, fact_text)
+
+        if (
+            last_user_msg.get("content", "")
+            .strip()
+            .startswith(self.valves.fact_command_prefix)
+        ):
+            response_msg = await self._handle_fact_command(
+                last_user_msg.get("content", ""), project_id
             )
-            if (
-                remember_intent
-                and remember_intent.get("action")
-                and remember_intent["action"] != "none"
-            ):
-                details = {k: v for k, v in remember_intent.items() if k != "action"}
-                desc = f"Action: {remember_intent.get('action')}, details: {details}"
-                if await self._verify_command_intent(
-                    last_user_msg.get("content", ""), desc
-                ):
-                    confirmation = await self._execute_remember_intent(
-                        project_id, remember_intent
-                    )
-                    status_msg = f"[CodeAware] {confirmation}"
-                    messages.insert(0, {"role": "system", "content": status_msg})
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    return body
-                else:
-                    self._log_debug("Remember intent rejected by verification LLM")
+            if response_msg:
+                messages.pop()
+                messages.append({"role": "assistant", "content": response_msg})
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
 
-            # 3. Obsolete
-            if self.valves.enable_obsolete_marking:
-                last_user_msg = (
-                    messages[-1]
-                    if messages and messages[-1].get("role") == "user"
-                    else None
-                )
-                if last_user_msg and (
-                    is_code_session or last_user_msg.get("content", "").startswith("/")
-                ):
-                    intent = await self._parse_obsolete_intent(last_user_msg["content"])
-                    if intent and intent.get("action") != "none":
-                        details = {k: v for k, v in intent.items() if k != "action"}
-                        desc = f"Action: {intent.get('action')}, details: {details}"
-                        if await self._verify_command_intent(
-                            last_user_msg.get("content", ""), desc
-                        ):
-                            confirmation = await self._execute_obsolete_intent(
-                                project_id, intent
-                            )
-                            status_msg = f"[CodeAware] {confirmation}"
-                            messages.insert(
-                                0, {"role": "system", "content": status_msg}
-                            )
-                            messages = self._ensure_last_message_is_user(messages)
-                            body["messages"] = messages
-                            return body
-                        else:
-                            self._log_debug(
-                                "Obsolete intent rejected by verification LLM"
-                            )
-
-            # 3.5 Facts extraction and command handling
-            if self.valves.enable_facts:
-                last_user_msg = (
-                    messages[-1]
-                    if messages and messages[-1].get("role") == "user"
-                    else None
-                )
-                if last_user_msg:
-                    # Extract explicit [FACT: ...] tags from the message
-                    facts = await self._extract_facts_from_message(
-                        last_user_msg.get("content", "")
-                    )
-                    for fact_text in facts:
-                        await self._add_fact(project_id, fact_text)
-
-                    # Handle /fact command (explicit management)
-                    if (
-                        last_user_msg.get("content", "")
-                        .strip()
-                        .startswith(self.valves.fact_command_prefix)
-                    ):
-                        response_msg = await self._handle_fact_command(
-                            last_user_msg.get("content", ""), project_id
-                        )
-                        if response_msg:
-                            messages.pop()  # remove the original /fact command
-                            messages.append(
-                                {"role": "assistant", "content": response_msg}
-                            )
-                            messages = self._ensure_last_message_is_user(messages)
-                            body["messages"] = messages
-                            return body
-
-    # 3.6 Code interpretation note for the main model
-    #     (hotfix, so the LLM don't confuse the chat's markdown with the real code)
+    # ── Code interpretation note ──────────────────────────────────────
     if is_code_session:
         note = (
             "When reading user messages, treat code inside triple backticks "
@@ -3430,11 +3366,8 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         else:
             messages.insert(0, {"role": "system", "content": note})
 
-    # 4. /think (explicit) or auto Chain-of-Thought
+    # ── /think (explicit) or auto Chain-of-Thought ────────────────────
     if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
         if last_user_msg:
             user_content = last_user_msg.get("content", "")
             if self.valves.enable_cot_on_demand and user_content.strip().startswith(
@@ -3463,18 +3396,18 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             ):
                 self._log_debug("Auto-injecting Chain-of-Thought prompt")
                 sys_msgs = [m for m in messages if m.get("role") == "system"]
-                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                cot_prompt = (
+                    "Please think step by step before answering. "
+                    "Show your reasoning, then provide the final answer."
+                )
                 if sys_msgs:
                     sys_msgs[0]["content"] = cot_prompt + "\n" + sys_msgs[0]["content"]
                 else:
                     messages.insert(0, {"role": "system", "content": cot_prompt})
                 body["messages"] = messages
 
-    # 5. /assume
+    # ── /assume ────────────────────────────────────────────────────────
     if self.valves.enable_assumption_extraction:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
         if last_user_msg and (
             is_code_session or last_user_msg.get("content", "").startswith("/")
         ):
@@ -3482,35 +3415,20 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 last_user_msg.get("content", "")
             )
             if assumption_target:
-                # Only verify if it was triggered by natural language, not explicit /assume
-                if not last_user_msg.get("content", "").strip().startswith("/assume"):
-                    desc = f"Extract underlying assumptions from: {assumption_target[:200]}"
-                    if not await self._verify_command_intent(
-                        last_user_msg.get("content", ""), desc
-                    ):
-                        self._log_debug(
-                            "Assumption intent rejected by verification LLM"
-                        )
-                        assumption_target = None  # prevent execution
+                analysis = await self._extract_assumptions(assumption_target)
+                messages.pop()
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Assumption Analysis**\n{analysis}",
+                    }
+                )
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
 
-                if assumption_target:
-                    analysis = await self._extract_assumptions(assumption_target)
-                    messages.pop()
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": f"**Assumption Analysis**\n{analysis}",
-                        }
-                    )
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    return body
-
-    # 6. /iterate
+    # ── /iterate ───────────────────────────────────────────────────────
     if self.valves.enable_iterative_mode:
-        last_user_msg = (
-            messages[-1] if messages and messages[-1].get("role") == "user" else None
-        )
         if last_user_msg and (
             is_code_session or last_user_msg.get("content", "").startswith("/")
         ):
@@ -3524,7 +3442,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 body["messages"] = messages
                 return body
 
-    # 7. Smart context selection
+    # ── Smart context selection ────────────────────────────────────────
     if self.valves.smart_context_selection and len(messages) > 0 and is_code_session:
         last_user_idx = -1
         for i in range(len(messages) - 1, -1, -1):
@@ -3552,31 +3470,64 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 messages = system_msgs + new_history
                 body["messages"] = messages
 
-    # 8. Contradiction detection
-    if (
-        self.valves.enable_contradiction_detection
-        and self.valves.contradiction_inject_warning
-        and is_code_session
-    ):
-        contradiction_warning = await self._detect_contradictions(messages)
-        if contradiction_warning:
-            messages.insert(0, {"role": "system", "content": contradiction_warning})
-            body["messages"] = messages
+    # ── Parallel Checks (contradiction, cache, duplicate) ──────────────
+    last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
+    context_hash = self._compute_context_hash(messages)
 
-    # 9. Update active code (process only new messages since last inlet)
+    contradiction_warning, cached_response, duplicate_match = (
+        await self._parallel_context_checks(
+            messages, last_user_query, context_hash, project_id, state
+        )
+    )
+
+    if contradiction_warning and self.valves.contradiction_inject_warning:
+        messages.insert(0, {"role": "system", "content": contradiction_warning})
+        body["messages"] = messages
+
+    if cached_response:
+        messages.append({"role": "assistant", "content": cached_response["response"]})
+        messages = self._ensure_last_message_is_user(messages)
+        body["messages"] = messages
+        return body
+
+    if duplicate_match:
+        warn_msg = (
+            f"⚠️ **Note**: This question is very similar to one you asked before "
+            f"(similarity {duplicate_match['sim']:.2f})."
+        )
+        messages.insert(0, {"role": "system", "content": warn_msg})
+        body["messages"] = messages
+
+    # ── Update active code (historical in background, last message sync) ─
     if self.valves.enable_code_awareness and is_code_session:
         last_idx = len(messages) - 1
         start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
-        for idx in range(start_idx, last_idx + 1):
-            await self._update_active_code(messages[idx], project_id)
+
+        # Process older messages in a background task
+        if start_idx < last_idx:
+
+            async def _process_historical(msgs, start, end, pid):
+                for i in range(start, end):
+                    await self._update_active_code(msgs[i], pid)
+
+            task = asyncio.create_task(
+                _process_historical(messages, start_idx, last_idx, project_id)
+            )
+            task.add_done_callback(
+                lambda t: (
+                    self._log_debug(f"Historical update error: {t.exception()}")
+                    if t.exception()
+                    else None
+                )
+            )
+
+        # Process the current user message synchronously
+        await self._update_active_code(messages[last_idx], project_id)
         self._last_processed_message_idx[project_id] = last_idx
 
-    # 10. LTM retrieval
+    # ── LTM retrieval ──────────────────────────────────────────────────
     unique_meta = []
     if not self.valves.smart_context_selection and is_code_session:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
         if (
             last_user_msg
             and HAS_SENTENCE
@@ -3628,28 +3579,8 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             messages.insert(0, {"role": "system", "content": ctx})
         body["messages"] = messages
 
-    # 11. Response cache
-    if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if last_user_msg:
-            context_hash = self._compute_context_hash(messages)
-            cached = await self._find_cached_response(
-                last_user_msg.get("content", ""), context_hash, state
-            )
-            if cached:
-                messages.append({"role": "assistant", "content": cached["response"]})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # 12. Inject active code context (MODIFIED: lightweight context if threshold exceeded)
+    # ── Inject active code context (lightweight or full) ────────────────
     if is_code_session and self.valves.enable_code_awareness:
-        # Detect structural tasks to avoid expansion
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
         is_structural = last_user_msg and await self._is_structural_task(
             last_user_msg.get("content", "")
         )
@@ -3681,7 +3612,11 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                     active_ctx += "\n" + expanded
             elif is_structural:
                 self._log_debug("Structural task detected, not expanding code bodies.")
-                active_ctx += "\n\n[Note: Structural analysis requested. Use the symbol index with call graphs and summaries to generate the diagram. Do not request code bodies.]"
+                active_ctx += (
+                    "\n\n[Note: Structural analysis requested. Use the symbol index "
+                    "with call graphs and summaries to generate the diagram. Do not "
+                    "request code bodies.]"
+                )
         else:
             active_ctx = self._get_active_code_context(project_id)
 
@@ -3703,19 +3638,12 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 messages.insert(0, {"role": "system", "content": active_ctx})
             body["messages"] = messages
 
-    # 12b. Code review checklist injection
+    # ── Code review checklist injection ────────────────────────────────
     if (
         is_code_session
         and self.valves.enable_code_review_mode
         and self._is_code_review_request(
-            next(
-                (
-                    m.get("content", "")
-                    for m in reversed(messages)
-                    if m.get("role") == "user"
-                ),
-                "",
-            )
+            last_user_msg.get("content", "") if last_user_msg else ""
         )
     ):
         self._log_debug("Injecting code review checklist")
@@ -3736,7 +3664,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             messages.insert(0, {"role": "system", "content": review_prompt})
         body["messages"] = messages
 
-    # 13. Inject facts
+    # ── Inject facts ────────────────────────────────────────────────────
     if (
         is_code_session
         and self.valves.enable_facts
@@ -3751,7 +3679,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 messages.insert(0, {"role": "system", "content": facts_ctx})
             body["messages"] = messages
 
-    # 14. Confidence scoring instruction
+    # ── Confidence scoring ─────────────────────────────────────────────
     if self.valves.enable_confidence_scoring and is_code_session:
         total_tokens = self._estimate_tokens(messages)
         if total_tokens > self.valves.context_window_tokens * 0.8:
@@ -3764,7 +3692,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 )
             body["messages"] = messages
 
-    # 15. Inject feedback context
+    # ── Inject feedback context ─────────────────────────────────────────
     if (
         is_code_session
         and self.valves.enable_feedback_tracking
@@ -3779,7 +3707,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 messages.insert(0, {"role": "system", "content": feedback_ctx})
             body["messages"] = messages
 
-    # 16. Proactive suggestions (summarisation and commands)
+    # ── Proactive suggestions ─────────────────────────────────────────
     system_msgs = [m for m in messages if m.get("role") == "system"]
     history_msgs = [m for m in messages if m.get("role") != "system"]
     total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -3790,26 +3718,13 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         if suggestion:
             messages.insert(0, {"role": "system", "content": suggestion})
             body["messages"] = messages
+
     cmd_suggestion = await self._suggest_commands(project_id, state)
     if cmd_suggestion:
         messages.insert(0, {"role": "system", "content": cmd_suggestion})
         body["messages"] = messages
 
-    # 17. Duplicate question detection
-    if self.valves.duplicate_question_threshold and HAS_SENTENCE:
-        last_user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if last_user_msg:
-            duplicate = await self._find_duplicate_question(
-                last_user_msg.get("content", ""), project_id
-            )
-            if duplicate:
-                warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f})."
-                messages.insert(0, {"role": "system", "content": warn_msg})
-                body["messages"] = messages
-
-    # 18. Adaptive context trim
+    # ── Adaptive context trim ─────────────────────────────────────────
     trim_needed = False
     if self.valves.adaptive_trim:
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -3840,6 +3755,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         else:
             old_block = history_msgs[:-keep] if keep > 0 else []
             kept_block = history_msgs[-keep:] if keep > 0 else []
+
         if self.valves.summarize_old_messages and old_block:
             has_code = any("```" in m.get("content", "") for m in old_block)
             summary = await self._summarize_messages(
@@ -3856,6 +3772,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 history_msgs = kept_block
         else:
             history_msgs = kept_block
+
         if self.valves.preserve_tool_calls:
             while history_msgs and history_msgs[0].get("role") == "tool":
                 history_msgs.pop(0)
@@ -3875,7 +3792,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
 
     messages = system_msgs + history_msgs
 
-    # 19. Final safety: ensure the last message is from the user
+    # ── Final safety: ensure last message is user ──────────────────────
     if messages and messages[-1].get("role") != "user":
         last_user_idx = -1
         for i in range(len(messages) - 1, -1, -1):
@@ -4859,6 +4776,70 @@ Code:
             pass
         return None
 
+
+async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
+    """
+    Detect forget, remember, and obsolete intents in a single LLM call.
+    Returns a dictionary with keys 'forget', 'remember', 'obsolete',
+    each containing the parsed intent dict or {"action": "none"}.
+    When natural‑language parsing is disabled, all intents are 'none'.
+    """
+    if not self.valves.enable_natural_language_forget:
+        none = {"action": "none"}
+        return {"forget": none, "remember": none, "obsolete": none}
+
+    # Strip code blocks so the parser is not confused by source code
+    code_spans = await self._get_code_spans(user_message)
+    cleaned = self._remove_code_spans(user_message, code_spans).strip()
+    if not cleaned or len(cleaned) < 5:
+        none = {"action": "none"}
+        return {"forget": none, "remember": none, "obsolete": none}
+
+    model = (
+        self.valves.natural_language_forget_model
+        or self.valves.llm_model
+        or self.valves.summarization_model
+    )
+    prompt = (
+        "You are a command parser for a code assistant. Analyze the user message and detect "
+        "ALL of these intents simultaneously.\n\n"
+        "FORGET actions: forget_last, forget_n (n=int), forget_file (file=str), "
+        "forget_block (hash=str), forget_all\n"
+        "REMEMBER/PIN actions: pin_last, pin_n (n=int), pin_file (file=str), "
+        "pin_block (description=str), pin_all, unpin_last, unpin_file, unpin_all\n"
+        "OBSOLETE actions: obsolete_last, obsolete_n (n=int), obsolete_file (file=str), "
+        "obsolete_block (hash=str), obsolete_all, revive_last, revive_file, revive_all\n\n"
+        f'User message (code removed): "{cleaned[:400]}"\n\n'
+        "Output JSON with exactly three keys. Use action='none' when not detected:\n"
+        '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
+        "Output only JSON."
+    )
+    response = await self._try_llm_quick(
+        prompt=prompt,
+        system_prompt="You output JSON only.",
+        model_override=model,
+        max_tokens=200,
+        temperature=0.0,
+        timeout=8.0,
+    )
+    none = {"action": "none"}
+    if not response:
+        return {"forget": none, "remember": none, "obsolete": none}
+    try:
+        text = response.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        data = json.loads(text)
+        return {
+            "forget": data.get("forget", none),
+            "remember": data.get("remember", none),
+            "obsolete": data.get("obsolete", none),
+        }
+    except Exception:
+        return {"forget": none, "remember": none, "obsolete": none}
+
     async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
         lock = await self._get_project_lock(project_id)
         async with lock:
@@ -5793,6 +5774,49 @@ Output only the diff, enclosed in diff ... .
                     }
         except Exception as e:
             self._log_debug(f"Duplicate question search failed: {e}")
+        return None
+
+    async def _parallel_context_checks(
+        self,
+        messages: List[dict],
+        query: str,
+        context_hash: str,
+        project_id: str,
+        state: dict,
+    ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
+        """
+        Run three independent checks in parallel:
+          1. contradiction detection
+          2. response cache lookup
+          3. duplicate question detection
+        Returns (contradiction_warning, cached_response, duplicate_match).
+        """
+        tasks = [
+            (
+                self._detect_contradictions(messages)
+                if self.valves.enable_contradiction_detection
+                else Filter._noop()
+            ),
+            (
+                self._find_cached_response(query, context_hash, state)
+                if (self.valves.enable_response_cache and HAS_SENTENCE)
+                else Filter._noop()
+            ),
+            (
+                self._find_duplicate_question(query, project_id)
+                if (self.valves.duplicate_question_threshold and HAS_SENTENCE)
+                else Filter._noop()
+            ),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        contradiction = results[0] if not isinstance(results[0], Exception) else None
+        cached = results[1] if not isinstance(results[1], Exception) else None
+        duplicate = results[2] if not isinstance(results[2], Exception) else None
+        return contradiction, cached, duplicate
+
+    @staticmethod
+    async def _noop():
+        """Coroutine that returns None, used as a placeholder in asyncio.gather."""
         return None
 
     # --------------------------------------------------------------------------
