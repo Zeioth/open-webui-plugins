@@ -1,5 +1,5 @@
 """
-title: Code-Aware Context Manager with LTM & Summarization (v5.29.0)
+title: Code-Aware Context Manager with LTM & Summarization
 description: Full-featured context manager for coding assistants. Persists state per project, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from responses, summarizes inactive code, supports manual markers, natural language forget/remember commands, feedback tracking, hierarchical memory, LRU cache, optional reranking, dependency detection (AST for Python + regex for other languages), handling of oversized blocks, smart context selection, hierarchical compression, duplicate removal, frequency prioritization, selective summarization, iterative commands, consecutive message deduplication, contradiction detection, chain-of-thought reasoning, assumption extraction, obsolete marking, proactive suggestions, duplicate question detection, command suggestions, semantic response caching, raw file priority boost, LTM retrieval token limit, and lightweight signature-based context with call graphs and summaries for massive code injections.
 author: zeioth
 author_url: https://github.com/zeioth
@@ -2309,6 +2309,26 @@ class Filter:
             return True
         return False
 
+    def _format_block_context(self, block: CodeBlock, is_latest: bool = False) -> str:
+        """Format a code block for context injection, with timestamp and optional latest marker."""
+        timestamp_str = datetime.fromtimestamp(
+            block.timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        latest = " [LATEST]" if is_latest else ""
+        loc = ""
+        if block.file_path:
+            loc = f" (file: {block.file_path}"
+            if block.line_range:
+                loc += f", lines {block.line_range[0]}-{block.line_range[1]}"
+            loc += ")"
+        pin = " [PINNED]" if block.pinned else ""
+        raw = " [RAW]" if block.is_raw else ""
+        aff = " [AFFECTED BY DEPENDENCY CHANGE]" if block.potentially_affected else ""
+        return (
+            f"```\n{block.content[:600]}\n```{loc}{latest}  "
+            f"(importance: {block.importance_score:.1f}, modified: {timestamp_str}){aff}{pin}{raw}"
+        )
+
     def _get_active_code_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
@@ -2324,6 +2344,29 @@ class Filter:
             active.append(block)
         if not active:
             return ""
+
+        # Identify the latest block for each file_path
+        latest_per_file: Dict[str, str] = {}
+        for b in active:
+            if b.file_path and not b.obsolete:
+                if (
+                    b.file_path not in latest_per_file
+                    or b.timestamp
+                    > active[0].timestamp  # placeholder, will be checked later
+                ):
+                    # We need to compare properly, so we'll build a dict of best timestamps
+                    pass
+        # Re‑compute properly
+        latest_per_file = {}
+        for b in active:
+            if b.file_path:
+                if b.file_path not in latest_per_file:
+                    latest_per_file[b.file_path] = b
+                elif b.timestamp > latest_per_file[b.file_path].timestamp:
+                    latest_per_file[b.file_path] = b
+        # Now we have the latest block object per file, but we only need its hash for quick lookup
+        latest_hashes = {b.hash for b in latest_per_file.values()}
+
         boost = self.valves.raw_file_priority_boost
         active.sort(
             key=lambda b: b.importance_score + (boost if b.is_raw else 0), reverse=True
@@ -2346,35 +2389,34 @@ class Filter:
             if self.valves.preserve_error_context
             else []
         )
+
         parts = ["## Currently Active Code Context (by importance)\n"]
+        # Note about versions
+        parts.insert(
+            1,
+            "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used. Older versions are retained for reference only.\n",
+        )
+
         if base_codes:
             parts.append("### Base Code (current work):")
             for b in base_codes:
-                loc = (
-                    f" (file: {b.file_path}{(' lines ' + str(b.line_range[0]) + '-' + str(b.line_range[1]) if b.line_range else '')})"
-                    if b.file_path
-                    else ""
-                )
-                pin = " [PINNED]" if b.pinned else ""
-                raw = " [RAW]" if b.is_raw else ""
-                aff = (
-                    " [AFFECTED BY DEPENDENCY CHANGE]" if b.potentially_affected else ""
-                )
-                parts.append(
-                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}{pin}{raw}"
-                )
+                is_latest = b.hash in latest_hashes
+                parts.append(self._format_block_context(b, is_latest))
         if proposed:
             parts.append("### Proposed Changes (pending review):")
             for b in proposed:
-                parts.append(f"```diff\n{b.content[:500]}\n```")
+                is_latest = b.hash in latest_hashes
+                parts.append(self._format_block_context(b, is_latest))
         if committed:
             parts.append("### Recently Committed Changes:")
             for b in committed:
-                parts.append(f"```\n{b.content[:300]}\n```")
+                is_latest = b.hash in latest_hashes
+                parts.append(self._format_block_context(b, is_latest))
         if errors:
             parts.append("### Recent Errors:")
             for b in errors:
-                parts.append(f"```\n{b.content[:500]}\n```")
+                is_latest = b.hash in latest_hashes
+                parts.append(self._format_block_context(b, is_latest))
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
@@ -2601,19 +2643,16 @@ class Filter:
         # Extract symbols for all new blocks OUTSIDE the lock to avoid blocking
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted):
-            # Per‑block file path: use the text immediately preceding this block
             blk_file = None
             if self.valves.track_file_paths and block_spans:
                 blk_file = self._extract_file_path_for_block(
                     content, block_spans[idx][0]
                 )
 
-            # If no per‑block path found, fallback to global detection only for single‑block messages
             if not blk_file and len(extracted) == 1:
                 extracted_paths = self._extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
 
-            # line_start/line_end are still extracted from the whole message (rarely used)
             content_type = self._classify_content(content, extracted)
 
             new_block = CodeBlock(
@@ -2621,7 +2660,7 @@ class Filter:
                 content_type=content_type,
                 generated_by_assistant=(role == "assistant"),
                 file_path=blk_file,
-                line_range=None,  # We no longer use a global line range; per‑block ranges could be added later
+                line_range=None,
                 timestamp=time.time(),
                 is_active=True,
                 mention_count=1,
@@ -2640,7 +2679,6 @@ class Filter:
                 )
             new_blocks_pending.append(new_block)
 
-        # Extract signatures and call graphs sequentially in the same thread
         symbols_list = []
         for blk in new_blocks_pending:
             syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
@@ -2654,7 +2692,6 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
-            # Kick off background tasks
             task = asyncio.create_task(
                 self._summarize_inactive_blocks_safely(project_id)
             )
@@ -2687,11 +2724,9 @@ class Filter:
             if not content and not new_blocks_pending:
                 return
 
-            # Process each new block with its extracted symbols
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
                     syms = []
-                # Compute token count
                 if self.tokenizer:
                     new_block._cached_token_count = len(
                         self.tokenizer.encode(new_block.content)
@@ -2704,7 +2739,6 @@ class Filter:
                 )
                 if is_dup and existing:
                     if existing.pinned or new_block.is_raw:
-                        # Update pinned block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2765,7 +2799,6 @@ class Filter:
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                         continue
                     if self.valves.prioritize_recent_code:
-                        # Update existing block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2821,8 +2854,6 @@ class Filter:
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                     continue
 
-                # --- Only for truly new blocks (not duplicates) ---
-                # Assign symbols and update index
                 for sym in syms:
                     sym.parent_block_hash = new_block.hash
                 new_block.symbols = syms
@@ -2849,8 +2880,19 @@ class Filter:
                     f"New {new_block.content_type.value} block: {new_block.hash}"
                 )
 
+                # AUTO‑OBSOLETE older blocks for the same file (unless pinned)
+                if new_block.file_path and self.valves.enable_obsolete_marking:
+                    for h, blk in list(state["active_blocks"].items()):
+                        if h == new_block.hash:
+                            continue
+                        if blk.file_path == new_block.file_path and not blk.pinned:
+                            blk.obsolete = True
+                            blk._update_importance()
+                            self._log_debug(
+                                f"Auto‑obsoleted older block {h} (file {new_block.file_path})"
+                            )
+
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
-                    # Resolve any previous proposed changes on the same file
                     if new_block.file_path:
                         state["recent_changes"] = [
                             c
@@ -5152,10 +5194,14 @@ Code:
     #  Duplicate removal and hierarchical compression
     # --------------------------------------------------------------------------
     def _remove_duplicate_blocks(self, state: Dict, project_id: str):
+        """Remove code blocks that are very similar to a more important block,
+        and also remove older versions of the same file."""
         if not self.valves.auto_remove_duplicate_blocks:
             return
         blocks = list(state["active_blocks"].values())
         to_remove = set()
+
+        # 1. Original similarity‑based dedup
         for i, block in enumerate(blocks):
             if block.hash in to_remove or block.pinned or block.obsolete:
                 continue
@@ -5187,6 +5233,19 @@ Code:
                         to_remove.add(other.hash)
                     else:
                         to_remove.add(block.hash)
+
+        # 2. NEW: If two blocks share the same file_path, keep only the most recent (unless pinned)
+        blocks_by_file = defaultdict(list)
+        for b in blocks:
+            if b.file_path and not b.pinned:
+                blocks_by_file[b.file_path].append(b)
+        for file_path, blks in blocks_by_file.items():
+            if len(blks) > 1:
+                blks.sort(key=lambda b: b.timestamp, reverse=True)
+                for b in blks[1:]:
+                    to_remove.add(b.hash)
+
+        # Clean up symbol index and remove blocks
         for h in to_remove:
             if h in state["active_blocks"]:
                 block = state["active_blocks"][h]
