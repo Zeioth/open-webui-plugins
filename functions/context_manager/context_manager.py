@@ -1738,6 +1738,8 @@ class Filter:
                                 await self._llm_cache.set(cache_key, content)
                                 future.set_result(content)
                                 return content
+                        except asyncio.CancelledError:
+                            raise  # dejar que se propague
                         except RuntimeError as exc:
                             status_hint = str(exc)
                             if any(
@@ -1833,6 +1835,8 @@ class Filter:
                                         continue
                                 else:
                                     break
+                    except asyncio.CancelledError:
+                        raise  # propagar cancelación
                     except (aiohttp.ClientError, asyncio.TimeoutError):
                         if attempt < max_retries:
                             await asyncio.sleep(base_delay * (2**attempt))
@@ -1840,6 +1844,9 @@ class Filter:
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
             return None
+        except asyncio.CancelledError:
+            future.cancel()
+            raise  # importante: re‑lanzar después de cancelar el futuro
         except Exception as e:
             future.set_exception(e)
             raise
@@ -2113,15 +2120,11 @@ class Filter:
                     raw = content[start:end].strip()
                     lang = tsb.language or "text"
 
-                    # Si Tree‑sitter no pudo determinar el lenguaje, intentamos adivinarlo
                     if lang == "text" or lang == "":
-                        # check for common code patterns
                         guessed = SignatureExtractor._guess_language(None, raw)
                         if guessed != "unknown":
                             lang = guessed
 
-                    # If language is still "text" or "", use the LLM fallback
-                    # Si el lenguaje sigue siendo "text" o "", usar el fallback LLM si está activo
                     if lang == "text" or lang == "":
                         llm_lang = await self._detect_language_via_llm(raw)
                         if llm_lang != "unknown":
@@ -2150,47 +2153,60 @@ class Filter:
                 return blocks, spans
 
             except Exception as e:
-                # Suppress expected fallback when language is empty or unknown
                 if "Language '' not available" not in str(e):
                     self._log_debug(
                         f"Tree‑sitter extraction unexpectedly failed, using regex fallback: {e}"
                     )
-        for match in self.code_pattern.finditer(content):
-            lang = match.group(1) or "text"
-            code = match.group(2).strip()
-            code = await self._handle_oversized_code_block(code, lang)
-            blocks.append({"language": lang, "code": code, "type": "fenced"})
-            spans.append((match.start(), match.end()))
-        lines = content.split("\n")
-        line_offsets = [0]
-        for line in lines:
-            line_offsets.append(line_offsets[-1] + len(line) + 1)
-        indented = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if line.startswith(("    ", "\t")):
-                indented.append(line.lstrip(" \t"))
-                i += 1
-            else:
-                if len(indented) >= 3:
-                    code = "\n".join(indented)
-                    code = await self._handle_oversized_code_block(code, "text")
-                    start_offset = line_offsets[i - len(indented)]
-                    end_offset = line_offsets[i] - 1
-                    blocks.append(
-                        {"language": "text", "code": code, "type": "indented"}
-                    )
-                    spans.append((start_offset, end_offset))
-                indented = []
-                i += 1
-        if len(indented) >= 3:
-            code = "\n".join(indented)
-            code = await self._handle_oversized_code_block(code, "text")
-            start_offset = line_offsets[len(lines) - len(indented)]
-            end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
-            blocks.append({"language": "text", "code": code, "type": "indented"})
-            spans.append((start_offset, end_offset))
+
+        # ====== Fallback por regex, movido a ejecutor ======
+        def _regex_fallback(content):
+            blocks, spans = [], []
+            for match in self.code_pattern.finditer(content):
+                lang = match.group(1) or "text"
+                code = match.group(2).strip()
+                # No podemos await aquí, lo haremos después
+                blocks.append({"language": lang, "code": code, "type": "fenced"})
+                spans.append((match.start(), match.end()))
+            # Indented blocks
+            lines = content.split("\n")
+            line_offsets = [0]
+            for line in lines:
+                line_offsets.append(line_offsets[-1] + len(line) + 1)
+            indented = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith(("    ", "\t")):
+                    indented.append(line.lstrip(" \t"))
+                    i += 1
+                else:
+                    if len(indented) >= 3:
+                        code = "\n".join(indented)
+                        blocks.append(
+                            {"language": "text", "code": code, "type": "indented"}
+                        )
+                        start_offset = line_offsets[i - len(indented)]
+                        end_offset = line_offsets[i] - 1
+                        spans.append((start_offset, end_offset))
+                    indented = []
+                    i += 1
+            if len(indented) >= 3:
+                code = "\n".join(indented)
+                blocks.append({"language": "text", "code": code, "type": "indented"})
+                start_offset = line_offsets[len(lines) - len(indented)]
+                end_offset = (
+                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                )
+                spans.append((start_offset, end_offset))
+            return blocks, spans
+
+        # Ejecutar en hilo para no bloquear
+        blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
+        # Ahora procesar oversized blocks para cada uno (necesitan await)
+        for i in range(len(blocks)):
+            blocks[i]["code"] = await self._handle_oversized_code_block(
+                blocks[i]["code"], blocks[i]["language"]
+            )
         return blocks, spans
 
     async def _detect_language_via_llm(self, code_snippet: str) -> str:
@@ -5473,6 +5489,8 @@ class Filter:
                     dur = time.monotonic() - t0
                     self._log_timing("cot_detection_llm", dur, dur)
                     return level
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self._log_debug(f"LLM CoT detection failed, falling back to heuristic: {e}")
 
@@ -5935,10 +5953,15 @@ class Filter:
     #  Inlet method (contains the main command routing)
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        """
+        Main entry point called before each LLM request.
+        Orchestrates context retrieval, chain-of-thought, response cache,
+        and all system injections. Now parallelizes CoT and cache checks.
+        """
         self._log_debug("inlet called")
-        inlet_start = time.monotonic()  # ⏱️
+        inlet_start = time.monotonic()
 
-        # Helper for timing relative to inlet_start
+        # Helper to log timing relative to inlet start
         def _inlet_timing(step_name: str, start: float, end: float = None):
             if end is None:
                 end = time.monotonic()
@@ -5948,6 +5971,7 @@ class Filter:
         messages = body.get("messages", [])
         project_id = self._get_project_id()
 
+        # Handle project switch: clean up old project's index and caches
         if self._last_project_id and self._last_project_id != project_id:
             self._log_debug(
                 f"Project changed from {self._last_project_id} to {project_id}"
@@ -5969,7 +5993,9 @@ class Filter:
             "content", ""
         ).startswith("/")
 
-        # --- Command routing: /forget (explicit) ---
+        # ------------------------------------------------------------------
+        # Command routing: /forget (explicit)
+        # ------------------------------------------------------------------
         if self.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
                 messages, project_id, __user__
@@ -5977,18 +6003,20 @@ class Filter:
             if handled:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)  # ⏱️
+                _inlet_timing("total_inlet", inlet_start)
                 return body
 
-        # --- Command routing: natural language forget/remember/obsolete ---
+        # ------------------------------------------------------------------
+        # Command routing: natural language forget/remember/obsolete
+        # ------------------------------------------------------------------
         if (
             self.valves.enable_natural_language_forget
             and last_user_msg
             and not is_explicit_command
         ):
-            t0 = time.monotonic()  # ⏱️
+            t0 = time.monotonic()
             intents = await self._parse_all_intents(last_user_msg.get("content", ""))
-            _inlet_timing("parse_nl_intents", t0)  # ⏱️
+            _inlet_timing("parse_nl_intents", t0)
             for intent_type in ("forget", "remember", "obsolete"):
                 fi = intents.get(intent_type, {})
                 if fi.get("action") not in (None, "none"):
@@ -6013,10 +6041,12 @@ class Filter:
                     messages.append({"role": "assistant", "content": confirmation})
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
-                    _inlet_timing("total_inlet", inlet_start)  # ⏱️
+                    _inlet_timing("total_inlet", inlet_start)
                     return body
 
-        # --- Command routing: /status ---
+        # ------------------------------------------------------------------
+        # Command routing: /status
+        # ------------------------------------------------------------------
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip() == "/status"
@@ -6042,10 +6072,12 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)  # ⏱️
+            _inlet_timing("total_inlet", inlet_start)
             return body
 
-        # --- Command routing: /speculative_stats ---
+        # ------------------------------------------------------------------
+        # Command routing: /speculative_stats
+        # ------------------------------------------------------------------
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip() == "/speculative_stats"
@@ -6080,10 +6112,12 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)  # ⏱️
+            _inlet_timing("total_inlet", inlet_start)
             return body
 
-        # --- Command routing: /clean ---
+        # ------------------------------------------------------------------
+        # Command routing: /clean
+        # ------------------------------------------------------------------
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip().startswith("/clean")
@@ -6097,10 +6131,12 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)  # ⏱️
+            _inlet_timing("total_inlet", inlet_start)
             return body
 
-        # --- Command routing: /fact ---
+        # ------------------------------------------------------------------
+        # Command routing: /fact
+        # ------------------------------------------------------------------
         if (
             last_user_msg
             and last_user_msg.get("content", "")
@@ -6116,10 +6152,12 @@ class Filter:
                 messages.append({"role": "assistant", "content": response})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)  # ⏱️
+                _inlet_timing("total_inlet", inlet_start)
                 return body
 
-        # --- Command routing: /expand ---
+        # ------------------------------------------------------------------
+        # Command routing: /expand
+        # ------------------------------------------------------------------
         if last_user_msg and last_user_msg.get("content", "").strip().startswith(
             "/expand"
         ):
@@ -6130,22 +6168,22 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)  # ⏱️
+            _inlet_timing("total_inlet", inlet_start)
             return body
 
-        # ----- NO MORE EARLY RETURNS BEYOND THIS POINT -----
+        # ===== NO MORE EARLY RETURNS BEYOND THIS POINT =====
 
         state = self._get_state(project_id)
 
-        t0 = time.monotonic()  # ⏱️
+        t0 = time.monotonic()
         is_code_session = await self._classify_session(messages, project_id)
-        _inlet_timing("classify_session", t0)  # ⏱️
+        _inlet_timing("classify_session", t0)
 
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
         system_injections = []  # list of (priority, text)
         manual_cot_used = False
-        cot_any_used = False  # flag to know if any CoT reasoning was injected
+        cot_any_used = False
 
         # ------------------------------------------------------------
         # Code interpretation note (critical)
@@ -6162,8 +6200,7 @@ class Filter:
             system_injections.append(("critical", note))
 
         # ------------------------------------------------------------
-        # PARALLEL: Start LTM recovery in background while
-        # updating active code.
+        # Start LTM retrieval in background while we work on CoT
         # ------------------------------------------------------------
         ltm_future = None
         if (
@@ -6175,11 +6212,26 @@ class Filter:
         ):
             query = last_user_msg.get("content", "")
             if query:
-                t0 = time.monotonic()  # ⏱️
+                t0 = time.monotonic()
                 ltm_future = asyncio.create_task(
                     self._retrieve_all_memories_unified(query, project_id)
                 )
-                _inlet_timing("ltm_task_creation", t0)  # ⏱️
+                _inlet_timing("ltm_task_creation", t0)
+
+        # ------------------------------------------------------------
+        # Pre‑launch parallel checks (response cache, contradiction, duplicate question)
+        # This runs in the background while CoT reasoning is generated.
+        # ------------------------------------------------------------
+        parallel_checks_task = None
+        cot_task = None  # will hold the CoT generation task if needed
+        last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
+        context_hash = self._compute_context_hash(messages)
+        if last_user_msg:
+            parallel_checks_task = asyncio.create_task(
+                self._parallel_context_checks(
+                    messages, last_user_query, context_hash, project_id, state
+                )
+            )
 
         # ---------- Chain-of-Thought (manual /think or auto-detection) ----------
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
@@ -6204,16 +6256,10 @@ class Filter:
                             context = (
                                 f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
                             )
-                            reasoning = await self._generate_cot_reasoning(
-                                cot_question, context
+                            # Launch CoT in background
+                            cot_task = asyncio.create_task(
+                                self._generate_cot_reasoning(cot_question, context)
                             )
-                            if reasoning:
-                                system_injections.append(
-                                    (
-                                        "high",
-                                        f"**Chain-of-Thought Reasoning**\n{reasoning}",
-                                    )
-                                )
                             _inlet_timing("cot_manual_level2", t0)
                         elif level == 3:
                             t0 = time.monotonic()
@@ -6222,16 +6268,11 @@ class Filter:
                             context = (
                                 f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
                             )
-                            reasoning = await self._generate_cot_with_self_reflection(
-                                cot_question, context
-                            )
-                            if reasoning:
-                                system_injections.append(
-                                    (
-                                        "high",
-                                        f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
-                                    )
+                            cot_task = asyncio.create_task(
+                                self._generate_cot_with_self_reflection(
+                                    cot_question, context
                                 )
+                            )
                             _inlet_timing("cot_manual_level3", t0)
 
                 # Automatic detection (only if no manual /think was used)
@@ -6250,29 +6291,20 @@ class Filter:
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                        reasoning = await self._generate_cot_reasoning(
-                            user_content, context
+                        cot_task = asyncio.create_task(
+                            self._generate_cot_reasoning(user_content, context)
                         )
-                        if reasoning:
-                            system_injections.append(
-                                ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
-                            )
                         _inlet_timing("cot_level2_reasoning", t0)
                     elif cot_level == 3:
                         t0 = time.monotonic()
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                        reasoning = await self._generate_cot_with_self_reflection(
-                            user_content, context
-                        )
-                        if reasoning:
-                            system_injections.append(
-                                (
-                                    "high",
-                                    f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
-                                )
+                        cot_task = asyncio.create_task(
+                            self._generate_cot_with_self_reflection(
+                                user_content, context
                             )
+                        )
                         _inlet_timing("cot_level3_reflection", t0)
 
         # If any CoT reasoning was used, add a global note for the final model
@@ -6301,7 +6333,7 @@ class Filter:
                 )
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)  # ⏱️
+                _inlet_timing("total_inlet", inlet_start)
                 return body
 
         # Iterative mode
@@ -6314,7 +6346,7 @@ class Filter:
                 messages.append({"role": "assistant", "content": result})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)  # ⏱️
+                _inlet_timing("total_inlet", inlet_start)
                 return body
 
         # Smart context selection (if enabled)
@@ -6323,7 +6355,7 @@ class Filter:
             and len(messages) > 0
             and is_code_session
         ):
-            t0 = time.monotonic()  # ⏱️
+            t0 = time.monotonic()
             last_user_idx = -1
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i].get("role") == "user":
@@ -6349,28 +6381,90 @@ class Filter:
                     )
                     messages = system_msgs + new_history
                     body["messages"] = messages
-            _inlet_timing("smart_context_selection", t0)  # ⏱️
+            _inlet_timing("smart_context_selection", t0)
 
-        # Parallel checks (contradiction, response cache, duplicate question)
-        t0 = time.monotonic()  # ⏱️
-        last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
-        context_hash = self._compute_context_hash(messages)
-        contradiction_warning, cached_response, duplicate_match = (
-            await self._parallel_context_checks(
-                messages, last_user_query, context_hash, project_id, state
+        # ------------------------------------------------------------------
+        # Parallel wait for CoT and parallel checks.
+        # If the response cache hits, we cancel the CoT and return immediately.
+        # ------------------------------------------------------------------
+        contradiction_warning = cached_response = duplicate_match = None
+        reasoning = None
+
+        if parallel_checks_task is not None or cot_task is not None:
+            tasks_to_wait = []
+            if parallel_checks_task is not None:
+                tasks_to_wait.append(parallel_checks_task)
+            if cot_task is not None:
+                tasks_to_wait.append(cot_task)
+
+            if tasks_to_wait:
+                done, pending = await asyncio.wait(
+                    tasks_to_wait,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                # If parallel checks finished first and found a cached response,
+                # cancel CoT (if still running) and return the cached answer.
+                if parallel_checks_task in done:
+                    contradiction_warning, cached_response, duplicate_match = (
+                        await parallel_checks_task
+                    )
+                    if cached_response:
+                        if cot_task is not None and not cot_task.done():
+                            cot_task.cancel()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": cached_response["response"],
+                            }
+                        )
+                        messages = self._ensure_last_message_is_user(messages)
+                        body["messages"] = messages
+                        _inlet_timing("total_inlet", inlet_start)
+                        return body
+
+                # Collect CoT result (either already done or still pending)
+                if cot_task is not None:
+                    if cot_task in done:
+                        reasoning = cot_task.result()
+                    else:
+                        reasoning = await cot_task
+
+                # Ensure parallel checks are fully completed
+                if parallel_checks_task is not None and not parallel_checks_task.done():
+                    contradiction_warning, cached_response, duplicate_match = (
+                        await parallel_checks_task
+                    )
+                elif parallel_checks_task is not None and parallel_checks_task in done:
+                    # already stored from above
+                    pass
+
+                # Double‑check for a late cache hit (shouldn't happen, but just in case)
+                if cached_response:
+                    messages.append(
+                        {"role": "assistant", "content": cached_response["response"]}
+                    )
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    _inlet_timing("total_inlet", inlet_start)
+                    return body
+
+        # Inject the CoT reasoning (if any)
+        if reasoning:
+            system_injections.append(
+                ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
             )
-        )
-        _inlet_timing("parallel_context_checks", t0)  # ⏱️
 
         if contradiction_warning and self.valves.contradiction_inject_warning:
             system_injections.append(("high", contradiction_warning))
         if cached_response:
+            # This case was already handled above; left for safety.
             messages.append(
                 {"role": "assistant", "content": cached_response["response"]}
             )
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)  # ⏱️
+            _inlet_timing("total_inlet", inlet_start)
             return body
         if duplicate_match:
             warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
@@ -6397,9 +6491,9 @@ class Filter:
                     )
                 )
 
-            t0 = time.monotonic()  # ⏱️
+            t0 = time.monotonic()
             await self._update_active_code(messages[last_idx], project_id)
-            _inlet_timing("update_active_code_last", t0)  # ⏱️
+            _inlet_timing("update_active_code_last", t0)
 
             self._last_processed_message_idx[project_id] = last_idx
 
@@ -6408,7 +6502,7 @@ class Filter:
         # ------------------------------------------------------------
         unique_meta = []
         if ltm_future is not None:
-            t0 = time.monotonic()  # ⏱️
+            t0 = time.monotonic()
             all_meta = await ltm_future
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             seen = set()
@@ -6416,7 +6510,7 @@ class Filter:
                 if m["doc"] not in seen:
                     seen.add(m["doc"])
                     unique_meta.append(m)
-            _inlet_timing("ltm_retrieval", t0)  # ⏱️
+            _inlet_timing("ltm_retrieval", t0)
 
         # Format and inject LTM (high priority)
         max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
@@ -6581,18 +6675,18 @@ class Filter:
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
         if self.valves.context_window_tokens > 0:
-            t0 = time.monotonic()  # ⏱️
+            t0 = time.monotonic()
             suggestion = await self._check_and_suggest_summarization(
                 project_id, total_tokens, self.valves.context_window_tokens
             )
-            _inlet_timing("check_summarization_suggestion", t0)  # ⏱️
+            _inlet_timing("check_summarization_suggestion", t0)
             if suggestion:
                 system_injections.append(("medium", suggestion))
 
         # Command suggestion (after a certain number of messages without commands)
-        t0 = time.monotonic()  # ⏱️
+        t0 = time.monotonic()
         cmd_suggestion = await self._suggest_commands(project_id, state)
-        _inlet_timing("suggest_commands", t0)  # ⏱️
+        _inlet_timing("suggest_commands", t0)
         if cmd_suggestion:
             system_injections.append(("medium", cmd_suggestion))
 
@@ -6616,12 +6710,12 @@ class Filter:
                     kept_block = history_msgs[-keep:] if keep > 0 else []
 
                 if self.valves.summarize_old_messages and old_block:
-                    t0 = time.monotonic()  # ⏱️
+                    t0 = time.monotonic()
                     has_code = any("```" in m.get("content", "") for m in old_block)
                     summary = await self._summarize_messages(
                         old_block, is_code_context=has_code
                     )
-                    _inlet_timing("summarize_old_messages", t0)  # ⏱️
+                    _inlet_timing("summarize_old_messages", t0)
                     if summary:
                         system_injections.append(
                             ("high", f"[Summary of earlier conversation]\n{summary}")
@@ -6674,12 +6768,12 @@ class Filter:
                     kept_block = history_msgs[-keep:] if keep > 0 else []
 
                 if self.valves.summarize_old_messages and old_block:
-                    t0 = time.monotonic()  # ⏱️
+                    t0 = time.monotonic()
                     has_code = any("```" in m.get("content", "") for m in old_block)
                     summary = await self._summarize_messages(
                         old_block, is_code_context=has_code
                     )
-                    _inlet_timing("summarize_old_messages", t0)  # ⏱️
+                    _inlet_timing("summarize_old_messages", t0)
                     if summary:
                         system_injections.append(
                             ("high", f"[Summary of earlier conversation]\n{summary}")
@@ -6702,16 +6796,14 @@ class Filter:
             else:
                 messages.append({"role": "user", "content": "continue"})
 
-        # --------------------------------------------------------------------------
         # Assemble system message with token budget
-        # --------------------------------------------------------------------------
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         base_content = ""
         if sys_msgs:
             base_content = sys_msgs[0].get("content", "")
             messages = [m for m in messages if m.get("role") != "system"]
 
-        t0 = time.monotonic()  # ⏱️
+        t0 = time.monotonic()
         budget = self.valves.global_injection_token_budget
         if budget > 0 and self.tokenizer:
             priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -6736,7 +6828,7 @@ class Filter:
             final_system = "\n\n".join(selected_texts)
         else:
             final_system = "\n\n".join(text for _, text in system_injections if text)
-        _inlet_timing("assemble_system_message", t0)  # ⏱️
+        _inlet_timing("assemble_system_message", t0)
 
         if base_content.strip():
             final_system = final_system + "\n\n" + base_content
@@ -6744,9 +6836,7 @@ class Filter:
         if final_system.strip():
             messages.insert(0, {"role": "system", "content": final_system})
 
-        # --------------------------------------------------------------------------
         # Debug log for injected token count
-        # --------------------------------------------------------------------------
         if self.valves.debug:
             total_system_tokens = 0
             for m in messages:
@@ -6760,7 +6850,7 @@ class Filter:
             self._log_debug(f"Injected system tokens: {total_system_tokens}")
 
         body["messages"] = messages
-        _inlet_timing("total_inlet", inlet_start)  # ⏱️
+        _inlet_timing("total_inlet", inlet_start)
         return body
 
     # --------------------------------------------------------------------------
