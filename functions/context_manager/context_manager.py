@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.4
+version: 5.4.1
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1950,11 +1950,7 @@ class Filter:
             if similarity < self.valves.response_cache_similarity_threshold:
                 return None
             meta = results["metadatas"][0][0]
-            if (
-                self.valves.response_cache_include_context_hash
-                and meta.get("context_hash", "") != context_hash
-            ):
-                return None
+
             stored_code_state = meta.get("code_state_hash", "")
             if (
                 stored_code_state
@@ -1965,6 +1961,7 @@ class Filter:
                     lambda: col.delete(ids=[results["ids"][0][0]])
                 )
                 return None
+
             ttl = self.valves.response_cache_ttl_hours * 3600
             ts = meta.get("timestamp", 0)
             if ttl > 0 and time.time() - ts > ttl:
@@ -3295,44 +3292,59 @@ class Filter:
             if results and results["documents"]:
                 for i, doc in enumerate(results["documents"][0]):
                     meta = results["metadatas"][0][i]
-                    sim = 1 - results["distances"][0][i]
+                    # cosene space normalization
+                    sim = 1.0 - (results["distances"][0][i] / 2.0)
                     ts = meta.get("timestamp")
                     if ts is not None and ts < 1000000000:
                         ts = None
+
+                    # First, filter only by raw similitude
+                    if sim < self.valves.long_term_memory_similarity_threshold:
+                        continue
+
+                    # Calculate order score with optional decay
+                    order_score = sim
                     if self.valves.ltm_time_decay_hours > 0 and ts is not None:
                         age_hours = (now - ts) / 3600
-                        sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
-                    if sim >= self.valves.long_term_memory_similarity_threshold:
-                        docs_with_meta.append((doc, sim, ts, meta))
+                        order_score = sim * (
+                            0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
+                        )
 
+                    docs_with_meta.append((doc, order_score, ts, meta))
+
+            # Boost for errors (only modifies order score)
             if self.valves.preserve_error_context:
-                for i, (doc, sim, ts, meta) in enumerate(docs_with_meta):
+                for i, (doc, order_score, ts, meta) in enumerate(docs_with_meta):
                     if meta.get("content_type") == ContentType.ERROR.value:
-                        docs_with_meta[i] = (doc, sim * 1.1, ts, meta)
+                        docs_with_meta[i] = (doc, order_score * 1.1, ts, meta)
 
+            # Order by descending order_score (already includes soft decay)
             docs_with_meta.sort(key=lambda x: x[1], reverse=True)
 
+            # Symbolic boost (applies over order_score)
             if self.valves.ltm_symbol_boost_enabled and query:
                 query_symbols = self._extract_query_symbols(query, project_id)
                 if query_symbols:
                     new_docs = []
-                    for doc, sim, ts, meta in docs_with_meta:
+                    for doc, order_score, ts, meta in docs_with_meta:
                         meta_symbols_str = meta.get("code_symbols", "")
                         if (
                             meta_symbols_str
-                            and sim >= self.valves.ltm_symbol_boost_min_similarity
+                            and order_score
+                            >= self.valves.ltm_symbol_boost_min_similarity
                         ):
                             meta_symbols = set(meta_symbols_str.split(","))
                             common = query_symbols.intersection(meta_symbols)
                             if common:
-                                sim *= self.valves.ltm_symbol_boost_factor
+                                order_score *= self.valves.ltm_symbol_boost_factor
                                 self._log_debug(
-                                    f"Boosted memory {meta.get('memory_id','?')} with symbols {common}, new sim={sim:.3f}"
+                                    f"Boosted memory {meta.get('memory_id','?')} with symbols {common}, new sim={order_score:.3f}"
                                 )
-                        new_docs.append((doc, sim, ts, meta))
+                        new_docs.append((doc, order_score, ts, meta))
                     new_docs.sort(key=lambda x: x[1], reverse=True)
                     docs_with_meta = new_docs
 
+            # Optional reranking (applies over ordered documents by order_score)
             if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
                 rerank_k = min(
                     (
