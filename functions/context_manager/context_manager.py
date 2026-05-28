@@ -1073,6 +1073,10 @@ class Filter:
         expand_default_depth: int = Field(
             default=2, description="Default depth for /expand command"
         )
+        max_change_summaries: int = Field(
+            default=1000,
+            description="Maximum number of block change summaries kept in memory per project.",
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -1228,7 +1232,9 @@ class Filter:
         self._last_project_id: str = ""
         self._response_cache_size: int = 0
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
-        self._block_change_summaries: Dict[str, str] = {}
+        self._block_change_summaries: Dict[str, Tuple[str, float]] = (
+            {}
+        )  # hash -> (summary, timestamp)
 
         print("[CodeAware] Filter loaded")
 
@@ -3963,7 +3969,8 @@ class Filter:
                         ts = datetime.fromtimestamp(
                             v.timestamp, tz=timezone.utc
                         ).strftime("%Y-%m-%d %H:%M:%S")
-                        summary = self._block_change_summaries.get(v.hash, "")
+                        entry = self._block_change_summaries.get(v.hash)
+                        summary = entry[0] if entry else ""
                         if not summary:
                             first_line = v.content.strip().split("\n")[0][:80]
                             summary = f"(first line: {first_line}...)"
@@ -5675,6 +5682,7 @@ class Filter:
             if old_state:
                 self._remove_project_from_index_by_id(self._last_project_id, old_state)
             self._cached_lightweight_context.pop(self._last_project_id, None)
+            self._block_change_summaries.clear()
         self._last_project_id = project_id
 
         if not messages:
@@ -6443,7 +6451,21 @@ class Filter:
             temperature=0.1,
         )
         if summary:
-            self._block_change_summaries[block_hash] = summary.strip()
+            now = time.time()
+            self._block_change_summaries[block_hash] = (summary.strip(), now)
+            # Limit dictionary
+            max_entries = self.valves.max_change_summaries
+            if len(self._block_change_summaries) > max_entries:
+                # Eliminate oldest entries (order by timestamp)
+                sorted_entries = sorted(
+                    self._block_change_summaries.items(), key=lambda x: x[1][1]
+                )
+                # Delete the first (oldest) to be back to the limit
+                to_remove = sorted_entries[
+                    : len(self._block_change_summaries) - max_entries
+                ]
+                for key, _ in to_remove:
+                    del self._block_change_summaries[key]
 
     # --------------------------------------------------------------------------
     #  Auto summaries for missing symbol docstrings
