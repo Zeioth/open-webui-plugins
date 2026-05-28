@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.4
+version: 5.3.5
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -2012,6 +2012,14 @@ class Filter:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
                     lang = tsb.language or "text"
+
+                    # Si Tree‑sitter no pudo determinar el lenguaje, intentamos adivinarlo
+                    if lang == "text" or lang == "":
+                        # Buscamos patrones comunes de código
+                        guessed = SignatureExtractor._guess_language(None, raw)
+                        if guessed != "unknown":
+                            lang = guessed
+
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
                         lines = lines[1:]
@@ -2022,10 +2030,13 @@ class Filter:
                     else:
                         code = raw
                         block_type = "indented"
+
                     code = await self._handle_oversized_code_block(code, lang)
                     blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
+
                 return blocks, spans
+
             except Exception as e:
                 self._log_debug(
                     f"Tree‑sitter extraction failed, falling back to regex: {e}"
