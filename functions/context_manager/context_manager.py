@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.5.4
+version: 5.5.5
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1251,7 +1251,6 @@ class Filter:
         self._cached_lightweight_context: Dict[str, str] = {}
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
-        self._response_cache_size: int = 0
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
         self._block_change_summaries: Dict[str, Tuple[str, float]] = (
             {}
@@ -1273,6 +1272,17 @@ class Filter:
             self._log_debug(
                 f"[Timing] {step_name}: +{elapsed_since_start:.3f}s (dur={duration:.3f}s)"
             )
+
+    def _background_task(self, coro, name: str = "task"):
+        """Wrapper to create a background task that logs errors automatically."""
+        task = asyncio.create_task(coro)
+
+        def _on_done(t):
+            if t.exception():
+                self._log_debug(f"Background task '{name}' failed: {t.exception()}")
+
+        task.add_done_callback(_on_done)
+        return task
 
     # --------------------------------------------------------------------------
     #  Code span utilities
@@ -1943,23 +1953,22 @@ class Filter:
             f"{self.valves.project_id}|{query}".encode()
         ).hexdigest()[:32]
         max_entries = self.valves.response_cache_max_entries
-        if self._response_cache_size >= max_entries:
-            existing = await anyio.to_thread.run_sync(
-                lambda: col.get(
-                    where={"project_id": self.valves.project_id},
-                    include=["metadatas"],
-                )
+        # Check actual collection size instead of manual counter
+        existing = await anyio.to_thread.run_sync(
+            lambda: col.get(
+                where={"project_id": self.valves.project_id},
+                include=["metadatas"],
             )
-            if existing and len(existing["ids"]) >= max_entries:
-                items = sorted(
-                    zip(existing["ids"], existing["metadatas"]),
-                    key=lambda x: x[1].get("timestamp", 0),
-                )
-                to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
-                await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
-                self._response_cache_size = len(existing["ids"]) - len(to_delete)
-            else:
-                self._response_cache_size = len(existing["ids"]) if existing else 0
+        )
+        current_size = len(existing["ids"]) if existing and existing["ids"] else 0
+        if current_size >= max_entries:
+            # Delete oldest 10% to make room
+            items = sorted(
+                zip(existing["ids"], existing["metadatas"]),
+                key=lambda x: x[1].get("timestamp", 0),
+            )
+            to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
+            await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
 
         # ── 3. Upsert into ChromaDB ──
         t_db = time.monotonic()
@@ -1973,8 +1982,9 @@ class Filter:
                         "query": query[:500],
                         "project_id": self.valves.project_id,
                         "context_hash": "",
-                        "code_state_hash": self._compute_code_state_hash(
-                            self.valves.project_id
+                        # Use the state already available to avoid extra DB call
+                        "code_state_hash": self._compute_code_state_hash_from_state(
+                            state
                         ),
                         "timestamp": time.time(),
                     }
@@ -1983,8 +1993,6 @@ class Filter:
         )
         db_dur = time.monotonic() - t_db
         self._log_timing("resp_cache_upsert", db_dur, db_dur)
-
-        self._response_cache_size += 1
 
         total_dur = time.monotonic() - t_start
         self._log_timing("resp_cache_total", total_dur, total_dur)
@@ -2059,6 +2067,15 @@ class Filter:
 
     def _compute_code_state_hash(self, project_id: str) -> str:
         state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        sorted_hashes = sorted(
+            h for h, b in state["active_blocks"].items() if not b.obsolete
+        )
+        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
+
+    def _compute_code_state_hash_from_state(self, state: dict) -> str:
+        """Compute hash of non‑obsolete block hashes using an already‑loaded state."""
         if not state or not state["active_blocks"]:
             return ""
         sorted_hashes = sorted(
@@ -2213,6 +2230,7 @@ class Filter:
         """Use a small, quick LLM call to identify the programming language."""
         if not HAS_AIOHTTP:
             return "unknown"
+        t0 = time.monotonic()
         prompt = (
             "Identify the programming language of this code. "
             "Answer with a single word (e.g., 'python', 'javascript', 'go', 'rust') or 'unknown':\n\n"
@@ -2230,6 +2248,8 @@ class Filter:
                 ),
                 timeout=3.0,
             )
+            dur = time.monotonic() - t0
+            self._log_timing("detect_language_llm", dur, dur)
             if response:
                 lang = response.strip().lower()
                 # Normalize common responses
@@ -2249,8 +2269,12 @@ class Filter:
                     "golang": "go",
                 }
                 return lang_map.get(lang, lang)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        except asyncio.TimeoutError:
+            dur = time.monotonic() - t0
+            self._log_timing("detect_language_llm_timeout", dur, dur)
+        except Exception:
+            dur = time.monotonic() - t0
+            self._log_timing("detect_language_llm_error", dur, dur)
         return "unknown"
 
     def _extract_file_path_for_block(
@@ -2757,21 +2781,11 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
-            task = asyncio.create_task(
-                self._summarize_inactive_blocks_safely(project_id)
+            # Summarize inactive blocks in background (error logging handled by helper)
+            self._background_task(
+                self._summarize_inactive_blocks_safely(project_id),
+                name="summarize_inactive",
             )
-            task.add_done_callback(
-                lambda t: (
-                    self._log_debug(
-                        f"Summarize inactive blocks failed: {t.exception()}"
-                    )
-                    if t.exception()
-                    else None
-                )
-            )
-            self._summarize_tasks.append(task)
-            if len(self._summarize_tasks) > 10:
-                self._summarize_tasks = self._summarize_tasks[-10:]
 
             self._update_mentions_from_message(state, content, project_id)
             for block in state["active_blocks"].values():
@@ -2842,32 +2856,22 @@ class Filter:
                             existing._cached_token_count = len(existing.content) // 4
                         existing._update_importance()
                         if prev_content != new_block.content:
-                            asyncio.create_task(
+                            self._background_task(
                                 self._generate_change_summary(
                                     existing.hash, prev_content, new_block.content
-                                )
+                                ),
+                                name="change_summary",
                             )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
                         ):
-                            task = asyncio.create_task(
+                            self._background_task(
                                 self._refresh_dependencies_for_block(
                                     existing.hash, project_id
-                                )
+                                ),
+                                name="dependency_refresh",
                             )
-                            task.add_done_callback(
-                                lambda t: (
-                                    self._log_debug(
-                                        f"Dependency refresh failed: {t.exception()}"
-                                    )
-                                    if t.exception()
-                                    else None
-                                )
-                            )
-                            self._dependency_tasks.append(task)
-                            if len(self._dependency_tasks) > 10:
-                                self._dependency_tasks = self._dependency_tasks[-10:]
                         continue
                     if self.valves.prioritize_recent_code:
                         self._symbol_index.remove_all_for_block(
@@ -2904,32 +2908,22 @@ class Filter:
                             existing._cached_token_count = len(existing.content) // 4
                         existing._update_importance()
                         if prev_content != new_block.content:
-                            asyncio.create_task(
+                            self._background_task(
                                 self._generate_change_summary(
                                     existing.hash, prev_content, new_block.content
-                                )
+                                ),
+                                name="change_summary",
                             )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
                         ):
-                            task = asyncio.create_task(
+                            self._background_task(
                                 self._refresh_dependencies_for_block(
                                     existing.hash, project_id
-                                )
+                                ),
+                                name="dependency_refresh",
                             )
-                            task.add_done_callback(
-                                lambda t: (
-                                    self._log_debug(
-                                        f"Dependency refresh failed: {t.exception()}"
-                                    )
-                                    if t.exception()
-                                    else None
-                                )
-                            )
-                            self._dependency_tasks.append(task)
-                            if len(self._dependency_tasks) > 10:
-                                self._dependency_tasks = self._dependency_tasks[-10:]
                     continue
 
                 for sym in syms:
@@ -3017,21 +3011,12 @@ class Filter:
                         ContentType.COMMITTED_CHANGE,
                     )
                 ):
-                    task = asyncio.create_task(
-                        self._refresh_dependencies_for_block(new_block.hash, project_id)
+                    self._background_task(
+                        self._refresh_dependencies_for_block(
+                            new_block.hash, project_id
+                        ),
+                        name="dependency_refresh",
                     )
-                    task.add_done_callback(
-                        lambda t: (
-                            self._log_debug(
-                                f"Dependency refresh failed: {t.exception()}"
-                            )
-                            if t.exception()
-                            else None
-                        )
-                    )
-                    self._dependency_tasks.append(task)
-                    if len(self._dependency_tasks) > 10:
-                        self._dependency_tasks = self._dependency_tasks[-10:]
 
             # Assistant update: detect if base code blocks were modified implicitly
             if role == "assistant" and len(extracted) > 0:
@@ -3083,32 +3068,22 @@ class Filter:
                         if any(s.calls for s in best_base.symbols):
                             state["has_any_calls"] = True
                         if prev_content != block_info["code"]:
-                            asyncio.create_task(
+                            self._background_task(
                                 self._generate_change_summary(
                                     best_base.hash, prev_content, block_info["code"]
-                                )
+                                ),
+                                name="change_summary",
                             )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
                         ):
-                            task = asyncio.create_task(
+                            self._background_task(
                                 self._refresh_dependencies_for_block(
                                     best_base.hash, project_id
-                                )
+                                ),
+                                name="dependency_refresh",
                             )
-                            task.add_done_callback(
-                                lambda t: (
-                                    self._log_debug(
-                                        f"Dependency refresh failed: {t.exception()}"
-                                    )
-                                    if t.exception()
-                                    else None
-                                )
-                            )
-                            self._dependency_tasks.append(task)
-                            if len(self._dependency_tasks) > 10:
-                                self._dependency_tasks = self._dependency_tasks[-10:]
 
             state["message_count"] += 1
             if self.valves.auto_remove_duplicate_blocks:
@@ -3119,43 +3094,21 @@ class Filter:
                     % self.valves.hierarchical_compression_interval_messages
                     == 0
                 ):
-                    task = asyncio.create_task(
-                        self._hierarchical_compress(project_id, state)
+                    self._background_task(
+                        self._hierarchical_compress(project_id, state),
+                        name="hierarchical_compress",
                     )
-                    task.add_done_callback(
-                        lambda t: (
-                            self._log_debug(
-                                f"Hierarchical compress failed: {t.exception()}"
-                            )
-                            if t.exception()
-                            else None
-                        )
-                    )
-                    self._hierarchical_compress_tasks.append(task)
-                    if len(self._hierarchical_compress_tasks) > 10:
-                        self._hierarchical_compress_tasks = (
-                            self._hierarchical_compress_tasks[-10:]
-                        )
-            asyncio.create_task(
-                self._expire_blocks_by_time(project_id)
-            ).add_done_callback(
-                lambda t: (
-                    self._log_debug(f"Expire blocks failed: {t.exception()}")
-                    if t.exception()
-                    else None
-                )
+            self._background_task(
+                self._expire_blocks_by_time(project_id), name="expire_blocks"
             )
-            asyncio.create_task(
-                self._clean_affected_flags(project_id)
-            ).add_done_callback(
-                lambda t: (
-                    self._log_debug(f"Clean affected flags failed: {t.exception()}")
-                    if t.exception()
-                    else None
-                )
+            self._background_task(
+                self._clean_affected_flags(project_id), name="clean_affected_flags"
             )
             if self.valves.enable_auto_summaries:
-                asyncio.create_task(self._generate_missing_summaries(project_id))
+                self._background_task(
+                    self._generate_missing_summaries(project_id),
+                    name="generate_missing_summaries",
+                )
             self._invalidate_lightweight_cache(project_id)
             self._set_state(project_id, state)
 
@@ -4807,6 +4760,8 @@ class Filter:
                     + "\n".join(signatures[:50])
                     + "\n\n"
                 )
+            # Time the summarization LLM call
+            t0 = time.monotonic()
             summary = await self._call_llm(
                 prompt=f"Summarize the following {language} code block.\n{header}First part of code:\n```{language}\n{code[:8000]}\n```",
                 system_prompt="You are a code summarization assistant.",
@@ -4814,6 +4769,8 @@ class Filter:
                 max_tokens=self.valves.oversized_summary_max_tokens,
                 temperature=0.2,
             )
+            dur = time.monotonic() - t0
+            self._log_timing("oversized_block_summarize", dur, dur)
             return (
                 f"[Automatic summary of a {estimated} token code block]\n{summary}"
                 if summary
@@ -5175,6 +5132,8 @@ class Filter:
             '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
             "Output only JSON."
         )
+        # Time the LLM call
+        t0 = time.monotonic()
         response = await self._try_llm_quick(
             prompt=prompt,
             system_prompt="You output JSON only.",
@@ -5183,6 +5142,9 @@ class Filter:
             temperature=0.0,
             timeout=8.0,
         )
+        dur = time.monotonic() - t0
+        self._log_timing("parse_intents_llm", dur, dur)
+
         none = {"action": "none"}
         if not response:
             return {"forget": none, "remember": none, "obsolete": none}
@@ -5237,9 +5199,6 @@ class Filter:
         return contradiction, cached, duplicate
 
     # --------------------------------------------------------------------------
-    #  Placeholder methods for contradiction detection and duplicate questions
-    # --------------------------------------------------------------------------
-    # --------------------------------------------------------------------------
     #  Contradiction detection
     # --------------------------------------------------------------------------
     async def _detect_contradictions(self, messages: List[dict]) -> Optional[str]:
@@ -5271,6 +5230,7 @@ class Filter:
             "Answer only 'yes' or 'no'."
         )
         model = self.valves.contradiction_detection_model or self.valves.llm_model
+        t0 = time.monotonic()
         response = await self._try_llm_quick(
             prompt=prompt,
             system_prompt="You are a contradiction detector. Answer only 'yes' or 'no'.",
@@ -5279,6 +5239,8 @@ class Filter:
             temperature=0.0,
             timeout=6.0,
         )
+        dur = time.monotonic() - t0
+        self._log_timing("detect_contradictions_llm", dur, dur)
         if response and response.strip().lower().startswith("yes"):
             return (
                 "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
