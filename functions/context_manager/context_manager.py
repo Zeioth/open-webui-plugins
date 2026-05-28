@@ -5189,7 +5189,7 @@ class Filter:
                     {
                         "timestamp": {
                             "$gt": time.time()
-                            - self.valves.duplicate_question_lookback_hours
+                            - self.valves.duplicate_question_lookback_hours * 3600
                         }
                     },
                 ]
