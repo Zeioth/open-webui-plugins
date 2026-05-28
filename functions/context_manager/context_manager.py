@@ -4788,12 +4788,15 @@ async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
         none = {"action": "none"}
         return {"forget": none, "remember": none, "obsolete": none}
 
-    # Strip code blocks so the parser is not confused by source code
+    # --- NEW: Cheap filters that skip the LLM for most messages ---
     code_spans = await self._get_code_spans(user_message)
-    cleaned = self._remove_code_spans(user_message, code_spans).strip()
-    if not cleaned or len(cleaned) < 5:
+    if not await self._should_parse_intents(user_message, code_spans):
         none = {"action": "none"}
         return {"forget": none, "remember": none, "obsolete": none}
+    # ----------------------------------------------------------------
+
+    cleaned = self._remove_code_spans(user_message, code_spans).strip()
+    # (cleaned is guaranteed to be >=15 chars and contain keywords)
 
     model = (
         self.valves.natural_language_forget_model
@@ -4839,6 +4842,68 @@ async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
         }
     except Exception:
         return {"forget": none, "remember": none, "obsolete": none}
+
+    # --------------------------------------------------------------------------
+    # Constants and helpers for intelligent intent filtering
+    # --------------------------------------------------------------------------
+
+    # Words that strongly suggest a context-management command
+    INTENT_KEYWORDS = {
+        "forget",
+        "olvida",
+        "olvid",
+        "remember",
+        "recuerda",
+        "pin",
+        "fija",
+        "guarda",
+        "obsolete",
+        "obsoleto",
+        "deprecated",
+        "ya no",
+        "remove",
+        "elimina",
+        "borra",
+        "quita",
+        "keep",
+        "mantén",
+        "manten" "conserva",
+    }
+
+    # Pattern that matches technical questions – unlikely to be intents
+    QUESTION_PATTERNS = re.compile(
+        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
+        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
+        re.IGNORECASE,
+    )
+
+    def _has_intent_keywords(self, text: str) -> bool:
+        """Return True if the text contains any intent-related keyword."""
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in INTENT_KEYWORDS)
+
+    async def _should_parse_intents(self, user_message: str, code_spans) -> bool:
+        """Apply cheap filters to avoid calling the LLM for obvious non-intents."""
+        cleaned = self._remove_code_spans(user_message, code_spans).strip()
+
+        # Layer 1 – Minimum length for a meaningful command
+        if len(cleaned) < 15:
+            return False
+
+        # Layer 2 – Keyword gate (filters ~95% of messages)
+        if not self._has_intent_keywords(cleaned):
+            return False
+
+        # Layer 3 – More than 60% of the message is code → unlikely to be an intent
+        code_ratio = sum(e - s for s, e in code_spans) / max(len(user_message), 1)
+        if code_ratio > 0.6:
+            return False
+
+        # Layer 4 – Technical question patterns
+        if QUESTION_PATTERNS.match(cleaned):
+            return False
+
+        return True
 
     async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
         lock = await self._get_project_lock(project_id)
