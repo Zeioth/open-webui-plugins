@@ -2072,6 +2072,10 @@ class Filter:
                         if llm_lang != "unknown":
                             lang = llm_lang
                             self._log_debug(f"LLM detected language: {lang}")
+                        else:
+                            self._log_debug(
+                                "LLM language detection also failed; block will be treated as generic text"
+                            )
 
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
@@ -2091,9 +2095,11 @@ class Filter:
                 return blocks, spans
 
             except Exception as e:
-                self._log_debug(
-                    f"Tree‑sitter extraction failed, falling back to regex: {e}"
-                )
+                # Suppress expected fallback when language is empty or unknown
+                if "Language '' not available" not in str(e):
+                    self._log_debug(
+                        f"Tree‑sitter extraction unexpectedly failed, using regex fallback: {e}"
+                    )
         for match in self.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
