@@ -4867,7 +4867,8 @@ async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
         "quita",
         "keep",
         "mantén",
-        "manten" "conserva",
+        "manten",
+        "conserva",
     }
 
     # Pattern that matches technical questions – unlikely to be intents
