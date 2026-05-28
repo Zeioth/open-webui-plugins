@@ -1,10 +1,10 @@
 """
-title: Code-Aware Context Manager with LTM & Summarization
+title: Code-Aware Context Manager with LTM & Summarization (v5.29.0)
 description: Full-featured context manager for coding assistants. Persists state per project, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from responses, summarizes inactive code, supports manual markers, natural language forget/remember commands, feedback tracking, hierarchical memory, LRU cache, optional reranking, dependency detection (AST for Python + regex for other languages), handling of oversized blocks, smart context selection, hierarchical compression, duplicate removal, frequency prioritization, selective summarization, iterative commands, consecutive message deduplication, contradiction detection, chain-of-thought reasoning, assumption extraction, obsolete marking, proactive suggestions, duplicate question detection, command suggestions, semantic response caching, raw file priority boost, LTM retrieval token limit, and lightweight signature-based context with call graphs and summaries for massive code injections.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.1
+version: 5.3.2
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -2598,21 +2598,22 @@ class Filter:
         role = message.get("role", "")
         extracted, block_spans = await self._extract_code_blocks(content)
 
+        # Extract symbols for all new blocks OUTSIDE the lock to avoid blocking
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted):
+            # Per‑block file path: use the text immediately preceding this block
             blk_file = None
             if self.valves.track_file_paths and block_spans:
                 blk_file = self._extract_file_path_for_block(
                     content, block_spans[idx][0]
                 )
-            if not blk_file and len(extracted) == 1:
-                file_path, _, _ = self._extract_line_range(content)
-                extracted_paths = self._extract_file_paths(content)
-                blk_file = file_path or (
-                    extracted_paths[0] if extracted_paths else None
-                )
 
-            file_path, line_start, line_end = self._extract_line_range(content)
+            # If no per‑block path found, fallback to global detection only for single‑block messages
+            if not blk_file and len(extracted) == 1:
+                extracted_paths = self._extract_file_paths(content)
+                blk_file = extracted_paths[0] if extracted_paths else None
+
+            # line_start/line_end are still extracted from the whole message (rarely used)
             content_type = self._classify_content(content, extracted)
 
             new_block = CodeBlock(
@@ -2620,9 +2621,7 @@ class Filter:
                 content_type=content_type,
                 generated_by_assistant=(role == "assistant"),
                 file_path=blk_file,
-                line_range=(
-                    (line_start, line_end) if line_start and line_end else None
-                ),
+                line_range=None,  # We no longer use a global line range; per‑block ranges could be added later
                 timestamp=time.time(),
                 is_active=True,
                 mention_count=1,
@@ -2641,6 +2640,7 @@ class Filter:
                 )
             new_blocks_pending.append(new_block)
 
+        # Extract signatures and call graphs sequentially in the same thread
         symbols_list = []
         for blk in new_blocks_pending:
             syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
@@ -2654,6 +2654,7 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
+            # Kick off background tasks
             task = asyncio.create_task(
                 self._summarize_inactive_blocks_safely(project_id)
             )
@@ -2686,9 +2687,11 @@ class Filter:
             if not content and not new_blocks_pending:
                 return
 
+            # Process each new block with its extracted symbols
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
                     syms = []
+                # Compute token count
                 if self.tokenizer:
                     new_block._cached_token_count = len(
                         self.tokenizer.encode(new_block.content)
@@ -2701,6 +2704,7 @@ class Filter:
                 )
                 if is_dup and existing:
                     if existing.pinned or new_block.is_raw:
+                        # Update pinned block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2761,6 +2765,7 @@ class Filter:
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                         continue
                     if self.valves.prioritize_recent_code:
+                        # Update existing block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2816,6 +2821,8 @@ class Filter:
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                     continue
 
+                # --- Only for truly new blocks (not duplicates) ---
+                # Assign symbols and update index
                 for sym in syms:
                     sym.parent_block_hash = new_block.hash
                 new_block.symbols = syms
@@ -2843,6 +2850,7 @@ class Filter:
                 )
 
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    # Resolve any previous proposed changes on the same file
                     if new_block.file_path:
                         state["recent_changes"] = [
                             c
@@ -2913,30 +2921,19 @@ class Filter:
                     if len(self._dependency_tasks) > 10:
                         self._dependency_tasks = self._dependency_tasks[-10:]
 
+            # Assistant update: detect if base code blocks were modified implicitly
             if role == "assistant" and len(extracted) > 0:
                 for block_info in extracted:
                     best_base = None
                     best_sim = 0.0
                     for base in state["active_blocks"].values():
                         if base.content_type == ContentType.BASE_CODE:
-                            if (
-                                base.file_path
-                                and file_path
-                                and base.file_path == file_path
-                            ):
-                                sim = self._calculate_code_similarity(
-                                    base.content, block_info["code"]
-                                )
-                                if sim > best_sim:
-                                    best_sim = sim
-                                    best_base = base
-                            else:
-                                sim = self._calculate_code_similarity(
-                                    base.content, block_info["code"]
-                                )
-                                if sim > best_sim and sim > 0.6:
-                                    best_sim = sim
-                                    best_base = base
+                            sim = self._calculate_code_similarity(
+                                base.content, block_info["code"]
+                            )
+                            if sim > best_sim and sim > 0.6:
+                                best_sim = sim
+                                best_base = base
                     if best_base and best_sim > 0.5 and best_sim < 0.98:
                         self._symbol_index.remove_all_for_block(
                             best_base.hash, best_base.symbols, project_id
@@ -3157,6 +3154,8 @@ class Filter:
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
+        inlet_start = time.time()
+
         self._ensure_cleanup_task()
         messages = body.get("messages", [])
         project_id = self._get_project_id()
@@ -3729,6 +3728,11 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
                 self._log_debug("Inserted dummy user message to satisfy API")
 
+        # debug: benchmark results
+        outlet_elapsed = time.time() - outlet_start
+        self._log_debug(f"outlet processing time: {outlet_elapsed:.3f}s")
+
+        # return of inlet
         body["messages"] = messages
         return body
 
@@ -4689,8 +4693,16 @@ Code:
     )
 
     def _has_intent_keywords(self, text: str) -> bool:
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in self.INTENT_KEYWORDS)
+        """Return True if the text contains any intent-related keyword as a whole word."""
+        return bool(
+            re.search(
+                r"\b(?:"
+                + "|".join(re.escape(kw) for kw in self.INTENT_KEYWORDS)
+                + r")\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
 
     async def _should_parse_intents(self, user_message: str, code_spans) -> bool:
         cleaned = self._remove_code_spans(user_message, code_spans).strip()
