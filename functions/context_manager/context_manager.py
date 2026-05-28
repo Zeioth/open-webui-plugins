@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.0
+version: 5.3.1
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -997,18 +997,18 @@ class Filter:
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help."
         )
         enable_cot_on_demand: bool = Field(default=True)
-        auto_cot_enabled: bool = Field(default=True)
+        auto_cot_enabled: bool = Field(default=False)  # Changed
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_model: str = Field(
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
         cot_max_tokens: int = Field(default=1000)
-        enable_assumption_extraction: bool = Field(default=True)
+        enable_assumption_extraction: bool = Field(default=False)  # Changed
         assumption_extraction_model: str = Field(
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
-        enable_contradiction_detection: bool = Field(default=True)
+        enable_contradiction_detection: bool = Field(default=False)  # Changed
         contradiction_detection_model: str = Field(
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
@@ -1042,7 +1042,7 @@ class Filter:
             description="Maximum hours an iterative state persists before being automatically cleared.",
         )
         similar_message_handling: str = Field(default="replace")
-        similar_message_threshold: float = Field(default=0.85)
+        similar_message_threshold: float = Field(default=0.92)  # Raised
         similar_message_check_code_only: bool = Field(default=True)
 
         enable_obsolete_marking: bool = Field(default=True)
@@ -1147,7 +1147,7 @@ class Filter:
         llm_model: str = Field(default="ollama/llama3.2:3b")
 
         enable_forget_command: bool = Field(default=True)
-        enable_natural_language_forget: bool = Field(default=True)
+        enable_natural_language_forget: bool = Field(default=False)  # Changed
         natural_language_forget_model: str = Field(
             default="ollama/Inference/Schematron:3B"
         )
@@ -1166,7 +1166,6 @@ class Filter:
             description="Maximum number of cached LLM responses in RAM.",
         )
 
-        # NEW: threshold for activating lightweight context mode
         huge_injection_threshold_tokens: int = Field(
             default=100000,
             description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
@@ -1254,28 +1253,27 @@ class Filter:
         self._write_counter = 0
         self._response_cache_cleanup_task: Optional[asyncio.Task] = None
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
-        self._session_classify_ttl: float = 300.0
+        self._session_classify_ttl: float = 1800.0  # Extended TTL
 
         # Lightweight context caches and project tracking
         self._symbol_index = SymbolIndex()
         self._cached_lightweight_context: Dict[str, str] = {}
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
-        self._response_cache_size: int = (
-            0  # contador en memoria para evitar full scan en ChromaDB
-        )
+        self._response_cache_size: int = 0
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
 
         print("[CodeAware] Filter loaded")
 
     # --------------------------------------------------------------------------
-    #  Tree-sitter based code span detection (replaces regex fallback)
+    #  Helper methods (logging, state, locks, cache, etc.)
     # --------------------------------------------------------------------------
+    def _log_debug(self, msg: str):
+        if self.valves.debug:
+            print(f"[CodeAware] {msg}")
+            logger.info(msg)
+
     async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
-        """
-        Return character spans of code blocks detected by tree-sitter's process().
-        Caches results by content hash to avoid repeated parses.
-        """
         if not HAS_TREE_SITTER:
             return []
         cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
@@ -1290,7 +1288,6 @@ class Filter:
             self._log_debug(f"Tree‑sitter process failed: {e}")
             spans = []
 
-        # Evict the oldest 50 entries when the cache grows too large (keeps recent results)
         if len(self._code_spans_cache) >= 200:
             keys_to_evict = list(self._code_spans_cache.keys())[:50]
             for key in keys_to_evict:
@@ -1303,7 +1300,6 @@ class Filter:
         return spans
 
     def _remove_code_spans(self, content: str, spans: List[Tuple[int, int]]) -> str:
-        """Return the content with all code spans replaced by whitespace, preserving string length."""
         chars = list(content)
         for start, end in spans:
             for i in range(start, min(end, len(chars))):
@@ -1313,12 +1309,10 @@ class Filter:
     def _is_span_in_code(
         self, code_spans: List[Tuple[int, int]], span: Tuple[int, int]
     ) -> bool:
-        """Return True if the given (start, end) span lies entirely inside a code block."""
         s, e = span
         return any(cs <= s and e <= ce for cs, ce in code_spans)
 
     def _ensure_cleanup_task(self) -> None:
-        """Start the periodic cleanup task if it hasn't been created yet."""
         if (
             not self.valves.enable_response_cache
             or not HAS_CHROMA
@@ -1349,16 +1343,14 @@ class Filter:
             state = self._state_factory()
         self._conversation_state[project_id] = state
         self._conversation_state.move_to_end(project_id)
-        # Clean up index and cache on LRU eviction
         while len(self._conversation_state) > self.valves.max_cached_projects:
             oldest_pid = next(iter(self._conversation_state))
             oldest_state = self._conversation_state[oldest_pid]
             self._remove_project_from_index_by_id(oldest_pid, oldest_state)
             del self._conversation_state[oldest_pid]
             self._cached_lightweight_context.pop(oldest_pid, None)
-            self._project_locks.pop(oldest_pid, None)  # ← new line
+            self._project_locks.pop(oldest_pid, None)
             self._log_debug(f"Evicting project {oldest_pid} from cache")
-        # Rebuild index for newly loaded state (only if not already in index)
         if state["active_blocks"]:
             self._rebuild_symbol_index(state, project_id)
         return state
@@ -1374,7 +1366,6 @@ class Filter:
                 else None
             )
         )
-        # Cache invalidation is done explicitly in methods that modify blocks
 
     async def _save_state_to_db_async(self, project_id: str, state: Dict):
         lock = await self._get_project_lock(project_id)
@@ -1428,19 +1419,17 @@ class Filter:
         if not row:
             return None
         data = json.loads(row[0])
-        if "feedback_history" not in data:
-            data["feedback_history"] = []
-        if "last_compression_timestamp" not in data:
-            data["last_compression_timestamp"] = 0
-        if "facts" not in data:
-            data["facts"] = []
-        if "last_suggestion_timestamp" not in data:
-            data["last_suggestion_timestamp"] = 0
-        if "response_cache" not in data:
-            data["response_cache"] = []
-        if "has_any_calls" not in data:
-            data["has_any_calls"] = False
-
+        for key in [
+            "feedback_history",
+            "last_compression_timestamp",
+            "facts",
+            "last_suggestion_timestamp",
+            "response_cache",
+            "has_any_calls",
+        ]:
+            data.setdefault(
+                key, [] if key in ("feedback_history", "facts", "response_cache") else 0
+            )
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             try:
@@ -1465,7 +1454,6 @@ class Filter:
             "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
             "has_any_calls": data.get("has_any_calls", False),
         }
-        # Recalculate token counts for loaded blocks (not persisted)
         for blk in (
             list(state["active_blocks"].values())
             + state["recent_changes"]
@@ -1476,14 +1464,6 @@ class Filter:
             else:
                 blk._cached_token_count = len(blk.content) // 4
         return state
-
-    # --------------------------------------------------------------------------
-    #  Logging and initialisation helpers
-    # --------------------------------------------------------------------------
-    def _log_debug(self, msg: str):
-        if self.valves.debug:
-            print(f"[CodeAware] {msg}")
-            logger.info(msg)
 
     def _init_long_term_memory(self):
         os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
@@ -1616,12 +1596,10 @@ class Filter:
         if not HAS_AIOHTTP:
             return None
 
-        # Deduplication key – identical requests share the same LLM call
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
 
-        # Check if another task is already running this exact call
         async with self._pending_llm_lock:
             if dedup_key in self._pending_llm:
                 future = self._pending_llm[dedup_key]
@@ -1632,11 +1610,9 @@ class Filter:
                 is_producer = True
 
         if not is_producer:
-            # Wait for the in‑flight call and return its result (or re‑raise its exception)
             self._log_debug(f"Awaiting existing LLM call for dedup key {dedup_key[:8]}")
             return await future
 
-        # ── Producer: execute the actual LLM call ────────────────────────────────
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
             api_token = self.valves.LLM_API_TOKEN.strip() or None
@@ -1809,7 +1785,6 @@ class Filter:
                             )
                             break
 
-            # All models failed
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
             return None
@@ -1830,7 +1805,6 @@ class Filter:
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
-        """Call _call_llm with a timeout. Returns None if it times out."""
         try:
             return await asyncio.wait_for(
                 self._call_llm(
@@ -1849,7 +1823,6 @@ class Filter:
     async def _verify_command_intent(
         self, user_message_cleaned: str, action_description: str
     ) -> bool:
-        """Quick LLM verification that the user actually intends to execute this command."""
         prompt = (
             f"A command parser interpreted the following user message (code already removed) as:\n"
             f"{action_description}\n\n"
@@ -1859,17 +1832,14 @@ class Filter:
         response = await self._try_llm_quick(
             prompt=prompt,
             system_prompt="You are a strict yes/no verifier. Answer only 'yes' or 'no'.",
-            model_override=None,  # use default summarization model
+            model_override=None,
             max_tokens=3,
             temperature=0.0,
-            timeout=4.0,  # short timeout to avoid delays
+            timeout=4.0,
         )
-        if response and response.strip().lower().startswith("yes"):
-            return True
-        return False
+        return bool(response and response.strip().lower().startswith("yes"))
 
     async def _periodic_response_cache_cleanup(self):
-        """Clean up expired response cache entries every hour."""
         while True:
             await asyncio.sleep(3600)
             try:
@@ -1878,7 +1848,6 @@ class Filter:
                 self._log_debug(f"Response cache cleanup error: {e}")
 
     async def _purge_expired_response_cache(self):
-        """Delete response cache entries that have exceeded TTL."""
         if (
             not hasattr(self, "_response_cache_collection")
             or self._response_cache_collection is None
@@ -2014,8 +1983,6 @@ class Filter:
             return None
 
     def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
-        """Trim trailing assistant messages so the list ends with a user.
-        Insert a dummy user only if there is no real user message at all."""
         if not messages:
             messages.append({"role": "user", "content": "continue"})
             self._log_debug("Inserted dummy user message to satisfy API (empty list)")
@@ -2103,26 +2070,20 @@ class Filter:
     async def _extract_code_blocks(
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        """Extract code blocks from message content using tree‑sitter (or regex fallback).
-        Returns a list of block dicts and a parallel list of (start, end) byte offsets.
-        """
         blocks = []
         spans = []
         if not self.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # ── Primary: tree‑sitter native code detection (handles backticks in strings correctly) ──
         if HAS_TREE_SITTER:
             try:
                 config = ProcessConfig()
-                # process() returns a list of objects with start_byte, end_byte, and language
                 ts_blocks = process(content, config)
                 for tsb in ts_blocks:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
                     lang = tsb.language or "text"
 
-                    # Remove the surrounding backtick fence if present
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
                         lines = lines[1:]
@@ -2132,7 +2093,7 @@ class Filter:
                         block_type = "fenced"
                     else:
                         code = raw
-                        block_type = "indented"  # tree‑sitter detected indented code without fences
+                        block_type = "indented"
 
                     code = await self._handle_oversized_code_block(code, lang)
                     blocks.append({"language": lang, "code": code, "type": block_type})
@@ -2146,7 +2107,6 @@ class Filter:
                     f"Tree‑sitter extraction failed, falling back to regex: {e}"
                 )
 
-        # ── Fallback: original regex method (legacy, may break on backticks inside strings) ──
         for match in self.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
@@ -2154,7 +2114,6 @@ class Filter:
             blocks.append({"language": lang, "code": code, "type": "fenced"})
             spans.append((match.start(), match.end()))
 
-        # Indented blocks as fallback as well
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
@@ -2191,26 +2150,21 @@ class Filter:
     def _extract_file_path_for_block(
         self, content: str, block_start: int
     ) -> Optional[str]:
-        """Try to extract a file path from the line immediately preceding a code block."""
         if block_start <= 0:
             return None
-        # Get the text before the block
         before = content[:block_start]
-        # Take the last non-empty line
         lines = before.splitlines()
         for line in reversed(lines):
             line = line.strip()
             if not line:
                 continue
-            # Use the existing file path pattern
             match = re.search(self.valves.file_path_pattern, line)
             if match:
                 return match.group(1) if match.lastindex else match.group(0)
-            # Also try the line range pattern (file:line)
             file_path, _, _ = self._extract_line_range(line)
             if file_path:
                 return file_path
-            break  # Only examine the immediate preceding line
+            break
         return None
 
     def _extract_line_range(
@@ -2269,73 +2223,77 @@ class Filter:
                     return ContentType.BASE_CODE
         return ContentType.GENERAL
 
+    async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
+        """Determine if this is a coding session.
+        Uses a 1800s TTL cache, state heuristics, code indicators in the last
+        10 user messages, and falls back to a fast LLM call only when uncertain.
+        """
+        # 1. Cache check (TTL 1800s set in __init__)
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        cache_key = None
+        if last_user:
+            content_key = last_user.get("content", "")[:200]
+            cache_key = (
+                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
+            )
+            cached = self._session_classify_cache.get(cache_key)
+            if cached is not None:
+                result, ts = cached
+                if time.time() - ts < self._session_classify_ttl:
+                    return result
+                del self._session_classify_cache[cache_key]
 
-async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
-    """Determine if this is a coding session.
-    Uses a 1800s TTL cache, state heuristics, code indicators in the last
-    10 user messages, and falls back to a fast LLM call only when uncertain.
-    """
-    # 1. Cache check (TTL 1800s set in __init__)
-    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    cache_key = None
-    if last_user:
-        content_key = last_user.get("content", "")[:200]
-        cache_key = f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
-        cached = self._session_classify_cache.get(cache_key)
-        if cached is not None:
-            result, ts = cached
-            if time.time() - ts < self._session_classify_ttl:
-                return result
-            del self._session_classify_cache[cache_key]
-
-    # 2. Existing state → definitely a coding session
-    state = self._get_state(project_id)
-    if state and state.get("active_blocks"):
-        if cache_key:
-            self._session_classify_cache[cache_key] = (True, time.time())
-        return True
-
-    # 3. Heuristics on the last 10 user messages (no LLM)
-    for msg in reversed(messages[-10:]):
-        if msg.get("role") != "user":
-            continue
-        if self._has_code_indicators(msg.get("content", "")):
+        # 2. Existing state → definitely a coding session
+        state = self._get_state(project_id)
+        if state and state.get("active_blocks"):
             if cache_key:
                 self._session_classify_cache[cache_key] = (True, time.time())
             return True
 
-    # 4. Explicit command (starts with "/") → treat as coding
-    if last_user and last_user.get("content", "").strip().startswith("/"):
+        # 3. Heuristics on the last 10 user messages (no LLM)
+        for msg in reversed(messages[-10:]):
+            if msg.get("role") != "user":
+                continue
+            if self._has_code_indicators(msg.get("content", "")):
+                if cache_key:
+                    self._session_classify_cache[cache_key] = (True, time.time())
+                return True
+
+        # 4. Explicit command (starts with "/") → treat as coding
+        if last_user and last_user.get("content", "").strip().startswith("/"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+
+        # 5. Fallback LLM only when no heuristic matched and there is enough text
+        if not last_user or len(last_user.get("content", "")) < 20:
+            result = False
+        else:
+            model = self.valves.natural_language_forget_model or self.valves.llm_model
+            prompt = (
+                f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\n"
+                f"Message: {last_user.get('content','')[:300]}"
+            )
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
+                model_override=model,
+                max_tokens=3,
+                temperature=0.0,
+                timeout=5.0,
+            )
+            result = bool(response and response.strip().lower().startswith("yes"))
+
         if cache_key:
-            self._session_classify_cache[cache_key] = (True, time.time())
-        return True
-
-    # 5. Fallback LLM only when no heuristic matched and there is enough text
-    if not last_user or len(last_user.get("content", "")) < 20:
-        result = False
-    else:
-        model = self.valves.natural_language_forget_model or self.valves.llm_model
-        prompt = (
-            f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\n"
-            f"Message: {last_user.get('content','')[:300]}"
-        )
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
-            model_override=model,
-            max_tokens=3,
-            temperature=0.0,
-            timeout=5.0,
-        )
-        result = bool(response and response.strip().lower().startswith("yes"))
-
-    if cache_key:
-        self._session_classify_cache[cache_key] = (result, time.time())
-        # Keep the cache bounded (max 500 entries, retain the 400 most recent)
-        if len(self._session_classify_cache) >= 500:
-            items = sorted(self._session_classify_cache.items(), key=lambda x: x[1][1])
-            self._session_classify_cache = dict(items[-400:])
-    return result
+            self._session_classify_cache[cache_key] = (result, time.time())
+            if len(self._session_classify_cache) >= 500:
+                items = sorted(
+                    self._session_classify_cache.items(), key=lambda x: x[1][1]
+                )
+                self._session_classify_cache = dict(items[-400:])
+        return result
 
     def _has_code_indicators(self, content: str) -> bool:
         if "```" in content:
@@ -2423,7 +2381,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
     #  Lightweight context support methods
     # --------------------------------------------------------------------------
     def _rebuild_symbol_index(self, state: Dict, project_id: str):
-        """Repopulate the in-memory symbol index from stored blocks (after reloading from DB)."""
         self._symbol_index.clear_project(project_id)
         has_any = False
         for block in state["active_blocks"].values():
@@ -2433,25 +2390,13 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                     has_any = True
         state["has_any_calls"] = has_any
 
-    def _remove_project_from_index(self, state: Dict):
-        """Remove all symbols of a project from the index (called on LRU eviction)."""
-        # Need project_id; derive from state if possible, but we'll assume it's the evicted project id
-        # Since this is called only from _get_state during eviction, we know the project_id.
-        # We'll use a helper that takes project_id directly.
-        pass  # Replaced by _remove_project_from_index_by_id below.
-
     def _remove_project_from_index_by_id(self, project_id: str, state: Dict):
-        """Remove all symbols of a project from the index."""
         for block in state["active_blocks"].values():
             self._symbol_index.remove_all_for_block(
                 block.hash, block.symbols, project_id
             )
 
     async def _build_lightweight_context(self, project_id: str) -> str:
-        """
-        Build a compact context containing only function/class signatures,
-        call graphs, summaries, and short previews. Cached per project.
-        """
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
@@ -2461,7 +2406,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
 
         lines = ["## Code Symbol Index (full bodies available on request)\n"]
 
-        # Group symbols by file path
         grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
         for block in state["active_blocks"].values():
             if block.obsolete:
@@ -2489,7 +2433,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                     f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{summary_str}"
                 )
 
-        # Add short previews (first 10 lines) of each non‑obsolete block
         lines.append("\n## Code Previews (first 10 lines of each block)\n")
         max_preview_chars = 4000
         chars_added = 0
@@ -2513,16 +2456,11 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         return result
 
     def _expand_referenced_symbols(self, project_id: str, user_query: str) -> str:
-        """
-        Return the full bodies of code blocks whose symbols appear in the user query.
-        Limits to at most 2 blocks when call graph is available, otherwise 5.
-        """
         state = self._get_state(project_id)
         has_calls = state.get("has_any_calls", False) if state else False
         MAX_EXPANDED_BODIES = (
             2 if (self.valves.enable_call_graph_extraction and has_calls) else 5
         )
-        state = self._get_state(project_id)
         if not state:
             return ""
 
@@ -2557,11 +2495,9 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         return "\n".join(parts)
 
     def _invalidate_lightweight_cache(self, project_id: str):
-        """Call this whenever active_blocks change for a project."""
         self._cached_lightweight_context.pop(project_id, None)
 
     async def _is_structural_task(self, user_message: str) -> bool:
-        """Return True if the user is asking for a diagram, flowchart, or structural analysis."""
         indicators = [
             r"\bdiagrama\b",
             r"\bdiagram\b",
@@ -2594,7 +2530,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         content = user_message.strip().lower()
         if any(re.search(pat, content) for pat in indicators):
             return True
-        # Fallback: use a small LLM if the message looks like a structural question
         if len(content) > 50 and (
             "?" in content or "cómo" in content or "how" in content
         ):
@@ -2619,7 +2554,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         return False
 
     async def _generate_missing_summaries(self, project_id: str):
-        """Generate one-line summaries for symbols that lack them, in batches."""
         if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
             return
         state = self._get_state(project_id)
@@ -2652,13 +2586,9 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
             for (sym, _), resp in zip(batch, responses):
                 if isinstance(resp, str) and resp.strip():
                     sym.summary = resp.strip()
-            await asyncio.sleep(1.0)  # avoid hammering the LLM
+            await asyncio.sleep(1.0)
         self._set_state(project_id, state)
 
-    # --------------------------------------------------------------------------
-    #  MODIFIED: _update_active_code with signature extraction, call graph,
-    #            token caching, and index management.
-    # --------------------------------------------------------------------------
     async def _update_active_code(self, message: dict, project_id: str):
         if not self.valves.enable_code_awareness:
             return
@@ -2668,17 +2598,13 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         role = message.get("role", "")
         extracted, block_spans = await self._extract_code_blocks(content)
 
-        # Extract symbols for all new blocks OUTSIDE the lock to avoid blocking
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted):
-            # Per‑block file path: use the text immediately preceding this block
             blk_file = None
             if self.valves.track_file_paths and block_spans:
                 blk_file = self._extract_file_path_for_block(
                     content, block_spans[idx][0]
                 )
-
-            # If no per‑block path found, fallback to global detection only for single‑block messages
             if not blk_file and len(extracted) == 1:
                 file_path, _, _ = self._extract_line_range(content)
                 extracted_paths = self._extract_file_paths(content)
@@ -2686,7 +2612,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                     extracted_paths[0] if extracted_paths else None
                 )
 
-            # line_start/line_end are still extracted from the whole message (rarely used)
             file_path, line_start, line_end = self._extract_line_range(content)
             content_type = self._classify_content(content, extracted)
 
@@ -2716,7 +2641,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                 )
             new_blocks_pending.append(new_block)
 
-        # Extract signatures and call graphs sequentially in the same thread
         symbols_list = []
         for blk in new_blocks_pending:
             syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
@@ -2730,7 +2654,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
 
         async with lock:
             state = self._get_state(project_id)
-            # Kick off background tasks
             task = asyncio.create_task(
                 self._summarize_inactive_blocks_safely(project_id)
             )
@@ -2763,11 +2686,9 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
             if not content and not new_blocks_pending:
                 return
 
-            # Process each new block with its extracted symbols
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
                     syms = []
-                # Compute token count
                 if self.tokenizer:
                     new_block._cached_token_count = len(
                         self.tokenizer.encode(new_block.content)
@@ -2780,7 +2701,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                 )
                 if is_dup and existing:
                     if existing.pinned or new_block.is_raw:
-                        # Update pinned block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2841,7 +2761,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                         continue
                     if self.valves.prioritize_recent_code:
-                        # Update existing block
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
@@ -2897,8 +2816,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                                 self._dependency_tasks = self._dependency_tasks[-10:]
                     continue
 
-                # --- Only for truly new blocks (not duplicates) ---
-                # Assign symbols and update index
                 for sym in syms:
                     sym.parent_block_hash = new_block.hash
                 new_block.symbols = syms
@@ -2926,7 +2843,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                 )
 
                 if new_block.content_type == ContentType.PROPOSED_CHANGE:
-                    # Resolve any previous proposed changes on the same file
                     if new_block.file_path:
                         state["recent_changes"] = [
                             c
@@ -2997,7 +2913,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                     if len(self._dependency_tasks) > 10:
                         self._dependency_tasks = self._dependency_tasks[-10:]
 
-            # Assistant update: detect if base code blocks were modified implicitly
             if role == "assistant" and len(extracted) > 0:
                 for block_info in extracted:
                     best_base = None
@@ -3165,7 +3080,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
     ) -> Tuple[bool, Optional[CodeBlock]]:
         new_len = len(new_block.content)
         for ex in existing_blocks:
-            # Quick length reject: if lengths differ by >20%, skip expensive comparison
             ex_len = len(ex.content)
             if ex_len > 0 and abs(new_len - ex_len) > 0.2 * max(new_len, ex_len):
                 continue
@@ -3201,7 +3115,6 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
     #  Cleanup
     # --------------------------------------------------------------------------
     def shutdown(self):
-        """Cancel all pending background tasks when the plugin is unloaded."""
         if (
             hasattr(self, "_response_cache_cleanup_task")
             and self._response_cache_cleanup_task is not None
@@ -3228,13 +3141,11 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
                 task.cancel()
             self._log_debug(f"Cancelled {len(self._dependency_tasks)} dependency tasks")
 
-        # Clean up signature index and cache
         self._symbol_index.clear()
         self._cached_lightweight_context.clear()
         self._project_locks.clear()
 
     def _cleanup_completed_tasks(self):
-        """Remove references to completed tasks to free memory."""
         self._hierarchical_compress_tasks = [
             t for t in self._hierarchical_compress_tasks if not t.done()
         ]
@@ -3242,387 +3153,423 @@ async def _classify_session(self, messages: List[dict], project_id: str) -> bool
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
-    #  MODIFIED: inlet – inject lightweight context when threshold exceeded
+    #  MODIFIED: inlet
     # --------------------------------------------------------------------------
+    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        self._log_debug("inlet called")
+        self._ensure_cleanup_task()
+        messages = body.get("messages", [])
+        project_id = self._get_project_id()
 
-
-async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-    self._log_debug("inlet called")
-    self._ensure_cleanup_task()
-    messages = body.get("messages", [])
-    project_id = self._get_project_id()
-
-    # Detect project change and clean up old project index
-    if self._last_project_id and self._last_project_id != project_id:
-        self._log_debug(f"Project changed from {self._last_project_id} to {project_id}")
-        old_state = self._conversation_state.get(self._last_project_id)
-        if old_state:
-            self._remove_project_from_index_by_id(self._last_project_id, old_state)
-        self._cached_lightweight_context.pop(self._last_project_id, None)
-    self._last_project_id = project_id
-
-    if not messages:
-        return body
-
-    state = self._get_state(project_id)
-    is_code_session = await self._classify_session(messages, project_id)
-    self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
-
-    # Grab the last user message once – used throughout the pipeline
-    last_user_msg = next(
-        (m for m in reversed(messages) if m.get("role") == "user"), None
-    )
-    is_explicit_command = last_user_msg and last_user_msg.get("content", "").startswith(
-        "/"
-    )
-
-    # ── Unified Intent Handling ──────────────────────────────────────
-    # Handles /forget, /remember, /obsolete and natural-language equivalents
-    # in a single LLM call (when natural language parsing is enabled).
-    if self.valves.enable_forget_command and is_explicit_command:
-        new_messages, handled = await self._handle_forget_command(
-            messages, project_id, __user__
-        )
-        if handled:
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-    if (
-        self.valves.enable_natural_language_forget
-        and last_user_msg
-        and not is_explicit_command
-        and (is_code_session or is_explicit_command)
-    ):
-        intents = await self._parse_all_intents(last_user_msg.get("content", ""))
-
-        # Forget
-        fi = intents.get("forget", {})
-        if fi.get("action") not in (None, "none"):
-            confirmation = await self._execute_forget_intent(project_id, fi)
-            status_msg = f"[CodeAware] {confirmation}"
-            messages.insert(0, {"role": "system", "content": status_msg})
-            messages.pop()
-            messages.append({"role": "assistant", "content": confirmation})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-        # Remember
-        ri = intents.get("remember", {})
-        if ri.get("action") not in (None, "none"):
-            confirmation = await self._execute_remember_intent(project_id, ri)
-            status_msg = f"[CodeAware] {confirmation}"
-            messages.insert(0, {"role": "system", "content": status_msg})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-        # Obsolete
-        oi = intents.get("obsolete", {})
-        if (
-            oi.get("action") not in (None, "none")
-            and self.valves.enable_obsolete_marking
-        ):
-            confirmation = await self._execute_obsolete_intent(project_id, oi)
-            status_msg = f"[CodeAware] {confirmation}"
-            messages.insert(0, {"role": "system", "content": status_msg})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            return body
-
-    # Facts – no LLM, kept as before
-    if self.valves.enable_facts and last_user_msg:
-        facts = await self._extract_facts_from_message(last_user_msg.get("content", ""))
-        for fact_text in facts:
-            await self._add_fact(project_id, fact_text)
-
-        if (
-            last_user_msg.get("content", "")
-            .strip()
-            .startswith(self.valves.fact_command_prefix)
-        ):
-            response_msg = await self._handle_fact_command(
-                last_user_msg.get("content", ""), project_id
+        if self._last_project_id and self._last_project_id != project_id:
+            self._log_debug(
+                f"Project changed from {self._last_project_id} to {project_id}"
             )
-            if response_msg:
-                messages.pop()
-                messages.append({"role": "assistant", "content": response_msg})
+            old_state = self._conversation_state.get(self._last_project_id)
+            if old_state:
+                self._remove_project_from_index_by_id(self._last_project_id, old_state)
+            self._cached_lightweight_context.pop(self._last_project_id, None)
+        self._last_project_id = project_id
+
+        if not messages:
+            return body
+
+        state = self._get_state(project_id)
+        is_code_session = await self._classify_session(messages, project_id)
+        self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
+
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        is_explicit_command = last_user_msg and last_user_msg.get(
+            "content", ""
+        ).startswith("/")
+
+        # ── Unified Intent Handling ──────────────────────────────────
+        if self.valves.enable_forget_command and is_explicit_command:
+            new_messages, handled = await self._handle_forget_command(
+                messages, project_id, __user__
+            )
+            if handled:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 return body
 
-    # ── Code interpretation note ──────────────────────────────────────
-    if is_code_session:
-        note = (
-            "When reading user messages, treat code inside triple backticks "
-            "as literal source code without interpreting Markdown. "
-            "You may still use Markdown in your own responses."
-        )
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        if sys_msgs:
-            if note not in sys_msgs[0].get("content", ""):
-                sys_msgs[0]["content"] = note + "\n" + sys_msgs[0]["content"]
-        else:
-            messages.insert(0, {"role": "system", "content": note})
+        if (
+            self.valves.enable_natural_language_forget
+            and last_user_msg
+            and not is_explicit_command
+            and (is_code_session or is_explicit_command)
+        ):
+            intents = await self._parse_all_intents(last_user_msg.get("content", ""))
 
-    # ── /think (explicit) or auto Chain-of-Thought ────────────────────
-    if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-        if last_user_msg:
-            user_content = last_user_msg.get("content", "")
-            if self.valves.enable_cot_on_demand and user_content.strip().startswith(
-                "/think"
+            # Forget
+            fi = intents.get("forget", {})
+            if fi.get("action") not in (None, "none"):
+                confirmation = await self._execute_forget_intent(project_id, fi)
+                status_msg = f"[CodeAware] {confirmation}"
+                messages.insert(0, {"role": "system", "content": status_msg})
+                messages.pop()
+                messages.append({"role": "assistant", "content": confirmation})
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
+
+            # Remember
+            ri = intents.get("remember", {})
+            if ri.get("action") not in (None, "none"):
+                confirmation = await self._execute_remember_intent(project_id, ri)
+                status_msg = f"[CodeAware] {confirmation}"
+                messages.insert(0, {"role": "system", "content": status_msg})
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
+
+            # Obsolete
+            oi = intents.get("obsolete", {})
+            if (
+                oi.get("action") not in (None, "none")
+                and self.valves.enable_obsolete_marking
             ):
-                cot_question = await self._parse_cot_intent(user_content)
-                if cot_question:
-                    active_ctx = self._get_active_code_context(project_id)
-                    facts_ctx = self._get_facts_context(project_id)
-                    context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                    reasoning = await self._generate_cot(cot_question, context)
+                confirmation = await self._execute_obsolete_intent(project_id, oi)
+                status_msg = f"[CodeAware] {confirmation}"
+                messages.insert(0, {"role": "system", "content": status_msg})
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                return body
+
+        # Facts – no LLM, kept as before
+        if self.valves.enable_facts and last_user_msg:
+            facts = await self._extract_facts_from_message(
+                last_user_msg.get("content", "")
+            )
+            for fact_text in facts:
+                await self._add_fact(project_id, fact_text)
+            if (
+                last_user_msg.get("content", "")
+                .strip()
+                .startswith(self.valves.fact_command_prefix)
+            ):
+                response_msg = await self._handle_fact_command(
+                    last_user_msg.get("content", ""), project_id
+                )
+                if response_msg:
+                    messages.pop()
+                    messages.append({"role": "assistant", "content": response_msg})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
+
+        # ── Code interpretation note ──────────────────────────────────
+        if is_code_session:
+            note = (
+                "When reading user messages, treat code inside triple backticks "
+                "as literal source code without interpreting Markdown. "
+                "You may still use Markdown in your own responses."
+            )
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                if note not in sys_msgs[0].get("content", ""):
+                    sys_msgs[0]["content"] = note + "\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": note})
+
+        # ── /think or auto Chain-of-Thought ───────────────────────────
+        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+            if last_user_msg:
+                user_content = last_user_msg.get("content", "")
+                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
+                    "/think"
+                ):
+                    cot_question = await self._parse_cot_intent(user_content)
+                    if cot_question:
+                        active_ctx = self._get_active_code_context(project_id)
+                        facts_ctx = self._get_facts_context(project_id)
+                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        reasoning = await self._generate_cot(cot_question, context)
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                            }
+                        )
+                        messages = self._ensure_last_message_is_user(messages)
+                        body["messages"] = messages
+                        return body
+                elif (
+                    self.valves.auto_cot_enabled
+                    and self._should_auto_cot(user_content)
+                    and not user_content.strip().startswith("/")
+                ):
+                    self._log_debug("Auto-injecting Chain-of-Thought prompt")
+                    sys_msgs = [m for m in messages if m.get("role") == "system"]
+                    cot_prompt = (
+                        "Please think step by step before answering. "
+                        "Show your reasoning, then provide the final answer."
+                    )
+                    if sys_msgs:
+                        sys_msgs[0]["content"] = (
+                            cot_prompt + "\n" + sys_msgs[0]["content"]
+                        )
+                    else:
+                        messages.insert(0, {"role": "system", "content": cot_prompt})
+                    body["messages"] = messages
+
+        # ── /assume ────────────────────────────────────────────────────
+        if self.valves.enable_assumption_extraction:
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
+            ):
+                assumption_target = await self._parse_assumption_intent(
+                    last_user_msg.get("content", "")
+                )
+                if assumption_target:
+                    analysis = await self._extract_assumptions(assumption_target)
                     messages.pop()
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                            "content": f"**Assumption Analysis**\n{analysis}",
                         }
                     )
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
                     return body
-            elif (
-                self.valves.auto_cot_enabled
-                and self._should_auto_cot(user_content)
-                and not user_content.strip().startswith("/")
+
+        # ── /iterate ───────────────────────────────────────────────────
+        if self.valves.enable_iterative_mode:
+            if last_user_msg and (
+                is_code_session or last_user_msg.get("content", "").startswith("/")
             ):
-                self._log_debug("Auto-injecting Chain-of-Thought prompt")
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                cot_prompt = (
-                    "Please think step by step before answering. "
-                    "Show your reasoning, then provide the final answer."
-                )
-                if sys_msgs:
-                    sys_msgs[0]["content"] = cot_prompt + "\n" + sys_msgs[0]["content"]
-                else:
-                    messages.insert(0, {"role": "system", "content": cot_prompt})
-                body["messages"] = messages
-
-    # ── /assume ────────────────────────────────────────────────────────
-    if self.valves.enable_assumption_extraction:
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            assumption_target = await self._parse_assumption_intent(
-                last_user_msg.get("content", "")
-            )
-            if assumption_target:
-                analysis = await self._extract_assumptions(assumption_target)
-                messages.pop()
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"**Assumption Analysis**\n{analysis}",
-                    }
-                )
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # ── /iterate ───────────────────────────────────────────────────────
-    if self.valves.enable_iterative_mode:
-        if last_user_msg and (
-            is_code_session or last_user_msg.get("content", "").startswith("/")
-        ):
-            result, consumed = await self._run_iteration(
-                project_id, last_user_msg.get("content", "")
-            )
-            if consumed:
-                messages.pop()
-                messages.append({"role": "assistant", "content": result})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                return body
-
-    # ── Smart context selection ────────────────────────────────────────
-    if self.valves.smart_context_selection and len(messages) > 0 and is_code_session:
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            query = messages[last_user_idx].get("content", "")
-            if query:
-                historical = await self._retrieve_historical_messages(
-                    query, project_id, self.valves.smart_context_top_k
-                )
-                new_history = []
-                for msg in historical:
-                    if msg["content"] != query:
-                        new_history.append(msg)
-                new_history.append(messages[last_user_idx])
-                if (
-                    self.valves.smart_context_include_last_user
-                    and last_user_idx + 1 < len(messages)
-                    and messages[last_user_idx + 1].get("role") == "assistant"
-                ):
-                    new_history.append(messages[last_user_idx + 1])
-                system_msgs = [m for m in messages if m.get("role") == "system"]
-                messages = system_msgs + new_history
-                body["messages"] = messages
-
-    # ── Parallel Checks (contradiction, cache, duplicate) ──────────────
-    last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
-    context_hash = self._compute_context_hash(messages)
-
-    contradiction_warning, cached_response, duplicate_match = (
-        await self._parallel_context_checks(
-            messages, last_user_query, context_hash, project_id, state
-        )
-    )
-
-    if contradiction_warning and self.valves.contradiction_inject_warning:
-        messages.insert(0, {"role": "system", "content": contradiction_warning})
-        body["messages"] = messages
-
-    if cached_response:
-        messages.append({"role": "assistant", "content": cached_response["response"]})
-        messages = self._ensure_last_message_is_user(messages)
-        body["messages"] = messages
-        return body
-
-    if duplicate_match:
-        warn_msg = (
-            f"⚠️ **Note**: This question is very similar to one you asked before "
-            f"(similarity {duplicate_match['sim']:.2f})."
-        )
-        messages.insert(0, {"role": "system", "content": warn_msg})
-        body["messages"] = messages
-
-    # ── Update active code (historical in background, last message sync) ─
-    if self.valves.enable_code_awareness and is_code_session:
-        last_idx = len(messages) - 1
-        start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
-
-        # Process older messages in a background task
-        if start_idx < last_idx:
-
-            async def _process_historical(msgs, start, end, pid):
-                for i in range(start, end):
-                    await self._update_active_code(msgs[i], pid)
-
-            task = asyncio.create_task(
-                _process_historical(messages, start_idx, last_idx, project_id)
-            )
-            task.add_done_callback(
-                lambda t: (
-                    self._log_debug(f"Historical update error: {t.exception()}")
-                    if t.exception()
-                    else None
-                )
-            )
-
-        # Process the current user message synchronously
-        await self._update_active_code(messages[last_idx], project_id)
-        self._last_processed_message_idx[project_id] = last_idx
-
-    # ── LTM retrieval ──────────────────────────────────────────────────
-    unique_meta = []
-    if not self.valves.smart_context_selection and is_code_session:
-        if (
-            last_user_msg
-            and HAS_SENTENCE
-            and HAS_CHROMA
-            and self.valves.enable_code_awareness
-        ):
-            query = last_user_msg.get("content", "")
-            all_meta = await self._retrieve_all_memories_unified(query, project_id)
-            all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-            seen = set()
-            unique_meta = []
-            for m in all_meta:
-                if m["doc"] not in seen:
-                    seen.add(m["doc"])
-                    unique_meta.append(m)
-
-    max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
-    parts = []
-    current_tokens = 0
-    header = "## Relevant Past Context (with timestamps)\n\n"
-    if max_ltm_tokens > 0:
-        current_tokens += (
-            len(self.tokenizer.encode(header)) if self.tokenizer else (len(header) // 4)
-        )
-    for mem in unique_meta:
-        ts = mem.get("timestamp")
-        if ts and ts > 1000000000:
-            time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%SZ"
-            )
-            text = f"[{time_str}] {mem['doc']}"
-        else:
-            text = f"[unknown date] {mem['doc']}"
-        frag_tokens = (
-            len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
-        )
-        if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
-            continue
-        parts.append(text)
-        current_tokens += frag_tokens
-    if parts:
-        ctx = header + "\n---\n".join(parts)
-        if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
-            ctx += "\n[Some older fragments omitted to fit token budget]"
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        if sys_msgs:
-            sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-        else:
-            messages.insert(0, {"role": "system", "content": ctx})
-        body["messages"] = messages
-
-    # ── Inject active code context (lightweight or full) ────────────────
-    if is_code_session and self.valves.enable_code_awareness:
-        is_structural = last_user_msg and await self._is_structural_task(
-            last_user_msg.get("content", "")
-        )
-
-        code_blocks = [
-            b
-            for b in state["active_blocks"].values()
-            if b.content_type
-            in (
-                ContentType.BASE_CODE,
-                ContentType.PROPOSED_CHANGE,
-                ContentType.COMMITTED_CHANGE,
-            )
-            and not b.obsolete
-        ]
-        total_code_tokens = sum(b._cached_token_count for b in code_blocks)
-
-        if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
-            self._log_debug(
-                f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
-            )
-            active_ctx = await self._build_lightweight_context(project_id)
-
-            if last_user_msg and not is_structural:
-                expanded = self._expand_referenced_symbols(
+                result, consumed = await self._run_iteration(
                     project_id, last_user_msg.get("content", "")
                 )
-                if expanded:
-                    active_ctx += "\n" + expanded
-            elif is_structural:
-                self._log_debug("Structural task detected, not expanding code bodies.")
-                active_ctx += (
-                    "\n\n[Note: Structural analysis requested. Use the symbol index "
-                    "with call graphs and summaries to generate the diagram. Do not "
-                    "request code bodies.]"
-                )
-        else:
-            active_ctx = self._get_active_code_context(project_id)
+                if consumed:
+                    messages.pop()
+                    messages.append({"role": "assistant", "content": result})
+                    messages = self._ensure_last_message_is_user(messages)
+                    body["messages"] = messages
+                    return body
 
-        if active_ctx:
-            checklist = (
-                "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+        # ── Smart context selection ────────────────────────────────────
+        if (
+            self.valves.smart_context_selection
+            and len(messages) > 0
+            and is_code_session
+        ):
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                query = messages[last_user_idx].get("content", "")
+                if query:
+                    historical = await self._retrieve_historical_messages(
+                        query, project_id, self.valves.smart_context_top_k
+                    )
+                    new_history = []
+                    for msg in historical:
+                        if msg["content"] != query:
+                            new_history.append(msg)
+                    new_history.append(messages[last_user_idx])
+                    if (
+                        self.valves.smart_context_include_last_user
+                        and last_user_idx + 1 < len(messages)
+                        and messages[last_user_idx + 1].get("role") == "assistant"
+                    ):
+                        new_history.append(messages[last_user_idx + 1])
+                    system_msgs = [m for m in messages if m.get("role") == "system"]
+                    messages = system_msgs + new_history
+                    body["messages"] = messages
+
+        # ── Parallel Checks (contradiction, cache, duplicate) ──────────
+        last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
+        context_hash = self._compute_context_hash(messages)
+
+        contradiction_warning, cached_response, duplicate_match = (
+            await self._parallel_context_checks(
+                messages, last_user_query, context_hash, project_id, state
+            )
+        )
+
+        if contradiction_warning and self.valves.contradiction_inject_warning:
+            messages.insert(0, {"role": "system", "content": contradiction_warning})
+            body["messages"] = messages
+
+        if cached_response:
+            messages.append(
+                {"role": "assistant", "content": cached_response["response"]}
+            )
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            return body
+
+        if duplicate_match:
+            warn_msg = (
+                f"⚠️ **Note**: This question is very similar to one you asked before "
+                f"(similarity {duplicate_match['sim']:.2f})."
+            )
+            messages.insert(0, {"role": "system", "content": warn_msg})
+            body["messages"] = messages
+
+        # ── Update active code (historical in background, last message sync) ─
+        if self.valves.enable_code_awareness and is_code_session:
+            last_idx = len(messages) - 1
+            start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
+
+            if start_idx < last_idx:
+
+                async def _process_historical(msgs, start, end, pid):
+                    for i in range(start, end):
+                        await self._update_active_code(msgs[i], pid)
+
+                task = asyncio.create_task(
+                    _process_historical(messages, start_idx, last_idx, project_id)
+                )
+                task.add_done_callback(
+                    lambda t: (
+                        self._log_debug(f"Historical update error: {t.exception()}")
+                        if t.exception()
+                        else None
+                    )
+                )
+
+            await self._update_active_code(messages[last_idx], project_id)
+            self._last_processed_message_idx[project_id] = last_idx
+
+        # ── LTM retrieval ──────────────────────────────────────────────
+        unique_meta = []
+        if not self.valves.smart_context_selection and is_code_session:
+            if (
+                last_user_msg
+                and HAS_SENTENCE
+                and HAS_CHROMA
+                and self.valves.enable_code_awareness
+            ):
+                query = last_user_msg.get("content", "")
+                all_meta = await self._retrieve_all_memories_unified(query, project_id)
+                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+                seen = set()
+                unique_meta = []
+                for m in all_meta:
+                    if m["doc"] not in seen:
+                        seen.add(m["doc"])
+                        unique_meta.append(m)
+
+        max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
+        parts = []
+        current_tokens = 0
+        header = "## Relevant Past Context (with timestamps)\n\n"
+        if max_ltm_tokens > 0:
+            current_tokens += (
+                len(self.tokenizer.encode(header))
+                if self.tokenizer
+                else (len(header) // 4)
+            )
+        for mem in unique_meta:
+            ts = mem.get("timestamp")
+            if ts and ts > 1000000000:
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
+                )
+                text = f"[{time_str}] {mem['doc']}"
+            else:
+                text = f"[unknown date] {mem['doc']}"
+            frag_tokens = (
+                len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
+            )
+            if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
+                continue
+            parts.append(text)
+            current_tokens += frag_tokens
+        if parts:
+            ctx = header + "\n---\n".join(parts)
+            if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
+                ctx += "\n[Some older fragments omitted to fit token budget]"
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": ctx})
+            body["messages"] = messages
+
+        # ── Inject active code context (lightweight or full) ───────────
+        if is_code_session and self.valves.enable_code_awareness:
+            is_structural = last_user_msg and await self._is_structural_task(
+                last_user_msg.get("content", "")
+            )
+
+            code_blocks = [
+                b
+                for b in state["active_blocks"].values()
+                if b.content_type
+                in (
+                    ContentType.BASE_CODE,
+                    ContentType.PROPOSED_CHANGE,
+                    ContentType.COMMITTED_CHANGE,
+                )
+                and not b.obsolete
+            ]
+            total_code_tokens = sum(b._cached_token_count for b in code_blocks)
+
+            if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
+                self._log_debug(
+                    f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
+                )
+                active_ctx = await self._build_lightweight_context(project_id)
+
+                if last_user_msg and not is_structural:
+                    expanded = self._expand_referenced_symbols(
+                        project_id, last_user_msg.get("content", "")
+                    )
+                    if expanded:
+                        active_ctx += "\n" + expanded
+                elif is_structural:
+                    self._log_debug(
+                        "Structural task detected, not expanding code bodies."
+                    )
+                    active_ctx += (
+                        "\n\n[Note: Structural analysis requested. Use the symbol index "
+                        "with call graphs and summaries to generate the diagram. Do not "
+                        "request code bodies.]"
+                    )
+            else:
+                active_ctx = self._get_active_code_context(project_id)
+
+            if active_ctx:
+                checklist = (
+                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                    "2. Identify every assumption the code makes and verify each one.\n"
+                    "3. For every regex or string match, test it against 5 counter-examples.\n"
+                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                    "6. Output your reasoning step by step, then provide the corrected code.\n"
+                )
+                active_ctx = checklist + "\n\n" + active_ctx
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = (
+                        active_ctx + "\n\n" + sys_msgs[0]["content"]
+                    )
+                else:
+                    messages.insert(0, {"role": "system", "content": active_ctx})
+                body["messages"] = messages
+
+        # ── Code review checklist injection ────────────────────────────
+        if (
+            is_code_session
+            and self.valves.enable_code_review_mode
+            and self._is_code_review_request(
+                last_user_msg.get("content", "") if last_user_msg else ""
+            )
+        ):
+            self._log_debug("Injecting code review checklist")
+            review_prompt = (
+                "## Code Review Checklist\n"
+                "You are reviewing code. Follow these steps:\n"
                 "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
                 "2. Identify every assumption the code makes and verify each one.\n"
                 "3. For every regex or string match, test it against 5 counter-examples.\n"
@@ -3630,187 +3577,163 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 "5. Ask yourself: what is the worst-case scenario for this code?\n"
                 "6. Output your reasoning step by step, then provide the corrected code.\n"
             )
-            active_ctx = checklist + "\n\n" + active_ctx
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
-                sys_msgs[0]["content"] = active_ctx + "\n\n" + sys_msgs[0]["content"]
+                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
             else:
-                messages.insert(0, {"role": "system", "content": active_ctx})
+                messages.insert(0, {"role": "system", "content": review_prompt})
             body["messages"] = messages
 
-    # ── Code review checklist injection ────────────────────────────────
-    if (
-        is_code_session
-        and self.valves.enable_code_review_mode
-        and self._is_code_review_request(
-            last_user_msg.get("content", "") if last_user_msg else ""
-        )
-    ):
-        self._log_debug("Injecting code review checklist")
-        review_prompt = (
-            "## Code Review Checklist\n"
-            "You are reviewing code. Follow these steps:\n"
-            "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-            "2. Identify every assumption the code makes and verify each one.\n"
-            "3. For every regex or string match, test it against 5 counter-examples.\n"
-            "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-            "5. Ask yourself: what is the worst-case scenario for this code?\n"
-            "6. Output your reasoning step by step, then provide the corrected code.\n"
-        )
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        if sys_msgs:
-            sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
-        else:
-            messages.insert(0, {"role": "system", "content": review_prompt})
-        body["messages"] = messages
+        # ── Inject facts ───────────────────────────────────────────────
+        if (
+            is_code_session
+            and self.valves.enable_facts
+            and self.valves.inject_facts_in_context
+        ):
+            facts_ctx = self._get_facts_context(project_id)
+            if facts_ctx:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
+                else:
+                    messages.insert(0, {"role": "system", "content": facts_ctx})
+                body["messages"] = messages
 
-    # ── Inject facts ────────────────────────────────────────────────────
-    if (
-        is_code_session
-        and self.valves.enable_facts
-        and self.valves.inject_facts_in_context
-    ):
-        facts_ctx = self._get_facts_context(project_id)
-        if facts_ctx:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": facts_ctx})
-            body["messages"] = messages
+        # ── Confidence scoring ─────────────────────────────────────────
+        if self.valves.enable_confidence_scoring and is_code_session:
+            total_tokens = self._estimate_tokens(messages)
+            if total_tokens > self.valves.context_window_tokens * 0.8:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] += self.valves.confidence_prompt
+                else:
+                    messages.insert(
+                        0, {"role": "system", "content": self.valves.confidence_prompt}
+                    )
+                body["messages"] = messages
 
-    # ── Confidence scoring ─────────────────────────────────────────────
-    if self.valves.enable_confidence_scoring and is_code_session:
-        total_tokens = self._estimate_tokens(messages)
-        if total_tokens > self.valves.context_window_tokens * 0.8:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] += self.valves.confidence_prompt
-            else:
-                messages.insert(
-                    0, {"role": "system", "content": self.valves.confidence_prompt}
-                )
-            body["messages"] = messages
+        # ── Inject feedback context ────────────────────────────────────
+        if (
+            is_code_session
+            and self.valves.enable_feedback_tracking
+            and self.valves.inject_feedback_context
+        ):
+            feedback_ctx = self._get_feedback_context(project_id)
+            if feedback_ctx:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = (
+                        feedback_ctx + "\n\n" + sys_msgs[0]["content"]
+                    )
+                else:
+                    messages.insert(0, {"role": "system", "content": feedback_ctx})
+                body["messages"] = messages
 
-    # ── Inject feedback context ─────────────────────────────────────────
-    if (
-        is_code_session
-        and self.valves.enable_feedback_tracking
-        and self.valves.inject_feedback_context
-    ):
-        feedback_ctx = self._get_feedback_context(project_id)
-        if feedback_ctx:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = feedback_ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": feedback_ctx})
-            body["messages"] = messages
-
-    # ── Proactive suggestions ─────────────────────────────────────────
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    history_msgs = [m for m in messages if m.get("role") != "system"]
-    total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-    if self.valves.context_window_tokens > 0:
-        suggestion = await self._check_and_suggest_summarization(
-            project_id, total_tokens, self.valves.context_window_tokens
-        )
-        if suggestion:
-            messages.insert(0, {"role": "system", "content": suggestion})
-            body["messages"] = messages
-
-    cmd_suggestion = await self._suggest_commands(project_id, state)
-    if cmd_suggestion:
-        messages.insert(0, {"role": "system", "content": cmd_suggestion})
-        body["messages"] = messages
-
-    # ── Adaptive context trim ─────────────────────────────────────────
-    trim_needed = False
-    if self.valves.adaptive_trim:
+        # ── Proactive suggestions ─────────────────────────────────────
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        if total_tokens > self.valves.context_window_tokens:
-            trim_needed = True
-    else:
-        user_max = (
-            __user__["valves"].max_turns
-            if __user__ and hasattr(__user__, "valves")
-            else None
-        )
-        eff_max = user_max if user_max is not None else self.valves.max_turns
-        if len(history_msgs) > eff_max:
-            trim_needed = True
-
-    if trim_needed or len(history_msgs) > self.valves.max_turns:
-        self._log_debug("Trimming old messages")
-        keep = self.valves.max_turns
-        last_user_idx = -1
-        for i in range(len(history_msgs) - 1, -1, -1):
-            if history_msgs[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            start_idx = max(0, last_user_idx - keep + 1)
-            old_block = history_msgs[:start_idx] if start_idx > 0 else []
-            kept_block = history_msgs[start_idx:]
-        else:
-            old_block = history_msgs[:-keep] if keep > 0 else []
-            kept_block = history_msgs[-keep:] if keep > 0 else []
-
-        if self.valves.summarize_old_messages and old_block:
-            has_code = any("```" in m.get("content", "") for m in old_block)
-            summary = await self._summarize_messages(
-                old_block, is_code_context=has_code
+        if self.valves.context_window_tokens > 0:
+            suggestion = await self._check_and_suggest_summarization(
+                project_id, total_tokens, self.valves.context_window_tokens
             )
-            if summary:
-                history_msgs = [
-                    {
-                        "role": "assistant",
-                        "content": f"[Summary of earlier conversation]\n{summary}",
-                    }
-                ] + kept_block
+            if suggestion:
+                messages.insert(0, {"role": "system", "content": suggestion})
+                body["messages"] = messages
+
+        cmd_suggestion = await self._suggest_commands(project_id, state)
+        if cmd_suggestion:
+            messages.insert(0, {"role": "system", "content": cmd_suggestion})
+            body["messages"] = messages
+
+        # ── Adaptive context trim ─────────────────────────────────────
+        trim_needed = False
+        if self.valves.adaptive_trim:
+            total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+            if total_tokens > self.valves.context_window_tokens:
+                trim_needed = True
+        else:
+            user_max = (
+                __user__["valves"].max_turns
+                if __user__ and hasattr(__user__, "valves")
+                else None
+            )
+            eff_max = user_max if user_max is not None else self.valves.max_turns
+            if len(history_msgs) > eff_max:
+                trim_needed = True
+
+        if trim_needed or len(history_msgs) > self.valves.max_turns:
+            self._log_debug("Trimming old messages")
+            keep = self.valves.max_turns
+            last_user_idx = -1
+            for i in range(len(history_msgs) - 1, -1, -1):
+                if history_msgs[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                start_idx = max(0, last_user_idx - keep + 1)
+                old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                kept_block = history_msgs[start_idx:]
+            else:
+                old_block = history_msgs[:-keep] if keep > 0 else []
+                kept_block = history_msgs[-keep:] if keep > 0 else []
+
+            if self.valves.summarize_old_messages and old_block:
+                has_code = any("```" in m.get("content", "") for m in old_block)
+                summary = await self._summarize_messages(
+                    old_block, is_code_context=has_code
+                )
+                if summary:
+                    history_msgs = [
+                        {
+                            "role": "assistant",
+                            "content": f"[Summary of earlier conversation]\n{summary}",
+                        }
+                    ] + kept_block
+                else:
+                    history_msgs = kept_block
             else:
                 history_msgs = kept_block
-        else:
-            history_msgs = kept_block
 
-        if self.valves.preserve_tool_calls:
-            while history_msgs and history_msgs[0].get("role") == "tool":
-                history_msgs.pop(0)
-            if (
-                history_msgs
-                and history_msgs[0].get("role") == "assistant"
-                and history_msgs[0].get("tool_calls")
-            ):
-                tool_call_ids = {tc.get("id") for tc in history_msgs[0]["tool_calls"]}
-                tool_response_ids = {
-                    m.get("tool_call_id")
-                    for m in history_msgs[1:]
-                    if m.get("role") == "tool"
-                }
-                if not tool_call_ids.issubset(tool_response_ids):
+            if self.valves.preserve_tool_calls:
+                while history_msgs and history_msgs[0].get("role") == "tool":
                     history_msgs.pop(0)
+                if (
+                    history_msgs
+                    and history_msgs[0].get("role") == "assistant"
+                    and history_msgs[0].get("tool_calls")
+                ):
+                    tool_call_ids = {
+                        tc.get("id") for tc in history_msgs[0]["tool_calls"]
+                    }
+                    tool_response_ids = {
+                        m.get("tool_call_id")
+                        for m in history_msgs[1:]
+                        if m.get("role") == "tool"
+                    }
+                    if not tool_call_ids.issubset(tool_response_ids):
+                        history_msgs.pop(0)
 
-    messages = system_msgs + history_msgs
+        messages = system_msgs + history_msgs
 
-    # ── Final safety: ensure last message is user ──────────────────────
-    if messages and messages[-1].get("role") != "user":
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx != -1:
-            messages = messages[: last_user_idx + 1]
-            self._log_debug("Trimmed trailing assistant messages")
-        else:
-            messages.append({"role": "user", "content": "continue"})
-            self._log_debug("Inserted dummy user message to satisfy API")
+        if messages and messages[-1].get("role") != "user":
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                messages = messages[: last_user_idx + 1]
+                self._log_debug("Trimmed trailing assistant messages")
+            else:
+                messages.append({"role": "user", "content": "continue"})
+                self._log_debug("Inserted dummy user message to satisfy API")
 
-    body["messages"] = messages
-    return body
+        body["messages"] = messages
+        return body
 
     # --------------------------------------------------------------------------
-    #  MODIFIED: outlet – skip if already processed in inlet
+    #  MODIFIED: outlet
     # --------------------------------------------------------------------------
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
@@ -3861,7 +3784,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         return body
 
     async def _run_db_checkpoints(self):
-        """Truncate WAL files of SQLite and ChromaDB to reclaim disk space."""
         try:
             await anyio.to_thread.run_sync(
                 lambda: self._db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -3877,7 +3799,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             self._log_debug(f"ChromaDB checkpoint error: {e}")
 
     def _compute_context_hash(self, messages: List[dict]) -> str:
-        """Compute a hash of system messages for response cache invalidation."""
         if not self.valves.response_cache_include_context_hash:
             return ""
         sys_msgs = [m for m in messages if m.get("role") == "system"]
@@ -3885,7 +3806,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
     async def _store_message_in_memory(self, message: dict, project_id: str):
-        """Store a conversation message in long‑term memory (ChromaDB)."""
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return
         content = message.get("content", "")
@@ -3926,9 +3846,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             asyncio.create_task(self._compress_ltm_for_conversation(project_id))
 
     async def _compress_ltm_for_conversation(self, project_id: str):
-        """Summarise older messages in the conversation to save LTM space.
-        Batches entries to respect the prompt character limit and only deletes
-        entries that were actually summarised."""
         if not HAS_AIOHTTP or not self.memory_collection:
             return
         try:
@@ -3952,7 +3869,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             if len(to_compress) < 2:
                 return
 
-            # Split into batches that fit within the prompt limit
             max_chars = 3000
             prompt_template = (
                 "Summarise the following conversation segment, keeping key technical "
@@ -3992,12 +3908,10 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             if not ids_to_delete:
                 return
 
-            # Delete only the entries that were summarised
             await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.delete(ids=ids_to_delete)
             )
 
-            # Store combined or individual summaries
             combined_summary = "\n---\n".join(all_summaries)
             if len(combined_summary) > 2000:
                 combined_summary = combined_summary[:2000] + "\n[summary truncated]"
@@ -4029,11 +3943,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
     async def _retrieve_all_memories_unified(
         self, query: str, project_id: str
     ) -> List[Dict[str, Any]]:
-        """
-        Unified version that computes the embedding only once and performs
-        a single query to ChromaDB, returning all content types together.
-        Replaces the 3 separate calls from step 10 of the inlet.
-        """
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
         try:
@@ -4048,8 +3957,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             results = await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.query(
                     query_embeddings=[q_emb],
-                    n_results=self.valves.long_term_memory_top_k
-                    * 3,  # max results to compensate filtering
+                    n_results=self.valves.long_term_memory_top_k * 3,
                     where=where_filter,
                 )
             )
@@ -4070,7 +3978,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             if self.valves.preserve_error_context:
                 for i, (doc, sim, ts, meta) in enumerate(docs_with_meta):
                     if meta.get("content_type") == ContentType.ERROR.value:
-                        # boost ligero para errores
                         docs_with_meta[i] = (doc, sim * 1.1, ts, meta)
 
             docs_with_meta.sort(key=lambda x: x[1], reverse=True)
@@ -4097,83 +4004,9 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             logger.warning(f"Unified memory retrieval failed: {e}")
             return []
 
-    async def _retrieve_relevant_memories(
-        self,
-        query: str,
-        project_id: str,
-        content_type_filter: Optional[ContentType] = None,
-        include_meta: bool = False,
-    ) -> Union[List[str], List[Dict[str, Any]]]:
-        """Retrieve semantically relevant memories from LTM."""
-        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
-            return [] if not include_meta else []
-        try:
-            q_emb = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode(query[:1000]).tolist()
-            )
-            now = time.time()
-            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
-            if self.valves.long_term_memory_expiration_days > 0:
-                where_filter["$and"].append({"expires_at": {"$gt": now}})
-            if content_type_filter:
-                where_filter["$and"].append(
-                    {"content_type": {"$eq": content_type_filter.value}}
-                )
-            results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.query(
-                    query_embeddings=[q_emb],
-                    n_results=(
-                        self.valves.long_term_memory_top_k * 2
-                        if self.valves.enable_reranking
-                        else self.valves.long_term_memory_top_k
-                    ),
-                    where=where_filter,
-                )
-            )
-            docs_with_meta = []
-            if results and results["documents"]:
-                for i, doc in enumerate(results["documents"][0]):
-                    meta = results["metadatas"][0][i]
-                    sim = 1 - results["distances"][0][i]
-                    ts = meta.get("timestamp")
-                    if ts is not None and ts < 1000000000:
-                        ts = None
-                    if self.valves.ltm_time_decay_hours > 0 and ts is not None:
-                        age_hours = (now - ts) / 3600
-                        sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
-                    if sim >= self.valves.long_term_memory_similarity_threshold:
-                        docs_with_meta.append((doc, sim, ts))
-            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
-            if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
-                rerank_k = (
-                    self.valves.reranker_top_k
-                    if self.valves.reranker_top_k > 0
-                    else self.valves.long_term_memory_top_k
-                )
-                rerank_k = min(rerank_k, 50)
-                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
-                reranked = await self._rerank_results(query, docs_only, rerank_k)
-                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
-                docs_with_meta = [
-                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
-                ]
-            docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
-            if include_meta:
-                return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
-            else:
-                return [doc for doc, _, _ in docs_with_meta]
-        except Exception as e:
-            logger.warning(f"Memory retrieval failed: {e}")
-            return [] if not include_meta else []
-
     async def _retrieve_historical_messages(
         self, query: str, project_id: str, limit: int
     ) -> List[Dict]:
-        """
-        Retrieve full historical messages for smart context selection.
-        Fusiona en una sola query mensajes regulares y summaries jerárquicos,
-        post-filtrando por metadata en Python.
-        """
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
         try:
@@ -4181,11 +4014,7 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 lambda: self.embedder.encode(query[:1000]).tolist()
             )
             now = time.time()
-            where_filter = {
-                "$and": [
-                    {"project_id": {"$eq": project_id}},
-                ]
-            }
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
             if self.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append({"expires_at": {"$gt": now}})
 
@@ -4210,7 +4039,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                     else:
                         regular_messages.append({"role": role, "content": doc})
 
-            # Combine: first summaries, then regular messages
             messages = summary_messages + regular_messages
 
             if (
@@ -4229,7 +4057,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             return []
 
     def _load_reranker(self):
-        """Load the cross‑encoder reranker model if enabled."""
         if not self.valves.enable_reranking or not HAS_CROSS_ENCODER:
             return
         if self._cross_encoder is None:
@@ -4243,7 +4070,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
     ) -> List[str]:
-        """Rerank documents using the cross‑encoder for better relevance."""
         if not self.valves.enable_reranking or not self._cross_encoder or not documents:
             return documents[:top_k]
         pairs = [(query, doc) for doc in documents]
@@ -4252,9 +4078,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
 
-    # --------------------------------------------------------------------------
-    #  MODIFIED: _expire_blocks_by_time – clean symbol index and invalidate cache
-    # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         lock = await self._get_project_lock(project_id)
         async with lock:
@@ -4300,9 +4123,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                 self._invalidate_lightweight_cache(project_id)
                 self._set_state(project_id, state)
 
-    # --------------------------------------------------------------------------
-    #  MODIFIED: _summarize_inactive_blocks_safely – clean index for replaced blocks
-    # --------------------------------------------------------------------------
     async def _summarize_inactive_blocks_safely(self, project_id: str):
         if self._summarize_inactive_in_progress.get(project_id, False):
             self._log_debug(
@@ -4337,7 +4157,6 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                     sig = self._extract_signature(block.content)
                     if sig:
                         summary = f"{sig}\n\n{summary}"
-                    # Remove old block from index
                     self._symbol_index.remove_all_for_block(
                         block.hash, block.symbols, project_id
                     )
@@ -4383,9 +4202,6 @@ Code:
             temperature=0.2,
         )
 
-    # --------------------------------------------------------------------------
-    #  MODIFIED: _handle_forget_command – clean index on block removal
-    # --------------------------------------------------------------------------
     async def _handle_forget_command(
         self, messages: List[dict], project_id: str, __user__: Optional[dict]
     ) -> Tuple[List[dict], bool]:
@@ -4555,100 +4371,8 @@ Code:
                 return "Unrecognized forget action."
 
     # --------------------------------------------------------------------------
-    #  Forget / Remember / Obsolete intent parsers
+    #  Remember & Obsolete execution
     # --------------------------------------------------------------------------
-    async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
-        """Interpret natural language forget command using LLM, after stripping code."""
-        if not self.valves.enable_natural_language_forget:
-            return None
-
-        code_spans = await self._get_code_spans(user_message)
-        cleaned = self._remove_code_spans(user_message, code_spans).strip()
-        if not cleaned or len(cleaned) < 5:
-            return None
-
-        self._log_debug("Calling LLM for forget intent (natural language)")
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = (
-            "You are a command parser for a code assistant. The user may want to forget some part of the context.\n"
-            "Possible actions: forget_last, forget_n (with n), forget_file (with file), forget_block (with hash), forget_all.\n"
-            f'User message (code already removed): "{cleaned}"\n'
-            'Output JSON: {"action": "...", "n": N, "file": "...", "hash": "..."} or {"action": "none"}\n'
-            "Output only JSON."
-        )
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You output JSON only.",
-            model_override=model,
-            max_tokens=150,
-            temperature=0.1,
-            timeout=8.0,
-        )
-        if not response:
-            return None
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("action") != "none":
-                return data
-        except:
-            pass
-        return None
-
-    async def _parse_remember_intent(self, user_message: str) -> Optional[Dict]:
-        """Interpret natural language remember/pin command using LLM, after stripping code."""
-        if not self.valves.enable_natural_language_forget:
-            return None
-
-        code_spans = await self._get_code_spans(user_message)
-        cleaned = self._remove_code_spans(user_message, code_spans).strip()
-        if not cleaned or len(cleaned) < 5:
-            return None
-
-        self._log_debug("Calling LLM for remember intent (natural language)")
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = (
-            "You are a command parser for a code assistant. The user may want to pin/remember some context.\n"
-            "Possible actions: pin_last, pin_n (with n), pin_file (with file), pin_block (with description), pin_all, unpin_last, unpin_file, unpin_all.\n"
-            f'User message (code already removed): "{cleaned}"\n'
-            'Output JSON with action and parameters. If no pinning intent: {"action": "none"}\n'
-            "Output only JSON."
-        )
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You output JSON only.",
-            model_override=model,
-            max_tokens=150,
-            temperature=0.1,
-            timeout=8.0,
-        )
-        if not response:
-            return None
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("action") != "none":
-                return data
-        except:
-            pass
-        return None
-
     async def _execute_remember_intent(self, project_id: str, intent: Dict) -> str:
         lock = await self._get_project_lock(project_id)
         async with lock:
@@ -4730,182 +4454,6 @@ Code:
             else:
                 return "Unrecognized pin action."
 
-    async def _parse_obsolete_intent(self, user_message: str) -> Optional[Dict]:
-        """Interpret natural language obsolete/revive command using LLM, after stripping code."""
-        if not self.valves.enable_obsolete_marking:
-            return None
-
-        code_spans = await self._get_code_spans(user_message)
-        cleaned = self._remove_code_spans(user_message, code_spans).strip()
-        if not cleaned or len(cleaned) < 5:
-            return None
-
-        self._log_debug("Calling LLM for obsolete intent (natural language)")
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = (
-            "You are a command parser for a code assistant. The user may want to mark code as obsolete or revive it.\n"
-            "Possible actions: obsolete_last, obsolete_n (with n), obsolete_file (with file), obsolete_block (with hash/description), obsolete_all, revive_last, revive_file, revive_all.\n"
-            f'User message (code already removed): "{cleaned}"\n'
-            'Output JSON with action and parameters. If no obsolete intent: {"action": "none"}\n'
-            "Output only JSON."
-        )
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You output JSON only.",
-            model_override=model,
-            max_tokens=150,
-            temperature=0.1,
-            timeout=8.0,
-        )
-        if not response:
-            return None
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("action") != "none":
-                return data
-        except:
-            pass
-        return None
-
-
-async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
-    """
-    Detect forget, remember, and obsolete intents in a single LLM call.
-    Returns a dictionary with keys 'forget', 'remember', 'obsolete',
-    each containing the parsed intent dict or {"action": "none"}.
-    When natural‑language parsing is disabled, all intents are 'none'.
-    """
-    if not self.valves.enable_natural_language_forget:
-        none = {"action": "none"}
-        return {"forget": none, "remember": none, "obsolete": none}
-
-    # --- NEW: Cheap filters that skip the LLM for most messages ---
-    code_spans = await self._get_code_spans(user_message)
-    if not await self._should_parse_intents(user_message, code_spans):
-        none = {"action": "none"}
-        return {"forget": none, "remember": none, "obsolete": none}
-    # ----------------------------------------------------------------
-
-    cleaned = self._remove_code_spans(user_message, code_spans).strip()
-    # (cleaned is guaranteed to be >=15 chars and contain keywords)
-
-    model = (
-        self.valves.natural_language_forget_model
-        or self.valves.llm_model
-        or self.valves.summarization_model
-    )
-    prompt = (
-        "You are a command parser for a code assistant. Analyze the user message and detect "
-        "ALL of these intents simultaneously.\n\n"
-        "FORGET actions: forget_last, forget_n (n=int), forget_file (file=str), "
-        "forget_block (hash=str), forget_all\n"
-        "REMEMBER/PIN actions: pin_last, pin_n (n=int), pin_file (file=str), "
-        "pin_block (description=str), pin_all, unpin_last, unpin_file, unpin_all\n"
-        "OBSOLETE actions: obsolete_last, obsolete_n (n=int), obsolete_file (file=str), "
-        "obsolete_block (hash=str), obsolete_all, revive_last, revive_file, revive_all\n\n"
-        f'User message (code removed): "{cleaned[:400]}"\n\n'
-        "Output JSON with exactly three keys. Use action='none' when not detected:\n"
-        '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
-        "Output only JSON."
-    )
-    response = await self._try_llm_quick(
-        prompt=prompt,
-        system_prompt="You output JSON only.",
-        model_override=model,
-        max_tokens=200,
-        temperature=0.0,
-        timeout=8.0,
-    )
-    none = {"action": "none"}
-    if not response:
-        return {"forget": none, "remember": none, "obsolete": none}
-    try:
-        text = response.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        data = json.loads(text)
-        return {
-            "forget": data.get("forget", none),
-            "remember": data.get("remember", none),
-            "obsolete": data.get("obsolete", none),
-        }
-    except Exception:
-        return {"forget": none, "remember": none, "obsolete": none}
-
-    # --------------------------------------------------------------------------
-    # Constants and helpers for intelligent intent filtering
-    # --------------------------------------------------------------------------
-
-    # Words that strongly suggest a context-management command
-    INTENT_KEYWORDS = {
-        "forget",
-        "olvida",
-        "olvid",
-        "remember",
-        "recuerda",
-        "pin",
-        "fija",
-        "guarda",
-        "obsolete",
-        "obsoleto",
-        "deprecated",
-        "ya no",
-        "remove",
-        "elimina",
-        "borra",
-        "quita",
-        "keep",
-        "mantén",
-        "manten",
-        "conserva",
-    }
-
-    # Pattern that matches technical questions – unlikely to be intents
-    QUESTION_PATTERNS = re.compile(
-        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
-        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
-        re.IGNORECASE,
-    )
-
-    def _has_intent_keywords(self, text: str) -> bool:
-        """Return True if the text contains any intent-related keyword."""
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in INTENT_KEYWORDS)
-
-    async def _should_parse_intents(self, user_message: str, code_spans) -> bool:
-        """Apply cheap filters to avoid calling the LLM for obvious non-intents."""
-        cleaned = self._remove_code_spans(user_message, code_spans).strip()
-
-        # Layer 1 – Minimum length for a meaningful command
-        if len(cleaned) < 15:
-            return False
-
-        # Layer 2 – Keyword gate (filters ~95% of messages)
-        if not self._has_intent_keywords(cleaned):
-            return False
-
-        # Layer 3 – More than 60% of the message is code → unlikely to be an intent
-        code_ratio = sum(e - s for s, e in code_spans) / max(len(user_message), 1)
-        if code_ratio > 0.6:
-            return False
-
-        # Layer 4 – Technical question patterns
-        if QUESTION_PATTERNS.match(cleaned):
-            return False
-
-        return True
-
     async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
         lock = await self._get_project_lock(project_id)
         async with lock:
@@ -4981,114 +4529,9 @@ async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
             else:
                 return "Unrecognized obsolete action."
 
-    async def _parse_feedback_intent(self, user_message: str) -> Optional[Dict]:
-        if not self.valves.enable_feedback_tracking:
-            return None
-        content = user_message.strip().lower()
-        if re.search(r"\b(feedback|retroalimentación)\b", content):
-            if "success" in content or "worked" in content:
-                return {"action": "feedback", "outcome": "success", "comment": content}
-            if "fail" in content or "error" in content:
-                return {"action": "feedback", "outcome": "failure", "comment": content}
-        if re.search(
-            r"\b(funcionó perfecto|solucionado|resuelto|solved|fixed|correcto|excelente)\b",
-            content,
-        ):
-            return {"action": "feedback", "outcome": "success", "comment": content}
-        if re.search(
-            r"\b(no funcionó|no funciono|sigue roto|still broken|error|falló|fallo|no solucionado|incorrecto)\b",
-            content,
-        ):
-            return {"action": "feedback", "outcome": "failure", "comment": content}
-        if not re.search(
-            r"\b(worked|did not work|failed|success|correcto|incorrecto|error|fallo|funcionó|funciono)\b",
-            content,
-        ):
-            return None
-        self._log_debug("Calling LLM for feedback intent")
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""You are a feedback interpreter. The user is giving feedback about a code change that was applied.
-Possible outcomes:
-- success: the change worked, problem solved
-- failure: the change did not work, error remains
-- neutral: unclear or not feedback.
-
-User message: "{user_message}"
-
-If feedback, output JSON: {{"action": "feedback", "outcome": "success/failure", "comment": "..."}}
-If not feedback: {{"action": "none"}}
-
-Output only JSON.
-"""
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You output JSON only.",
-            model_override=model,
-            max_tokens=150,
-            temperature=0.1,
-        )
-        if not response:
-            return None
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("action") == "feedback":
-                return data
-        except:
-            pass
-        return None
-
-    async def _record_feedback(self, project_id: str, outcome: str, comment: str):
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            state = self._get_state(project_id)
-            if not state or not state["committed_changes"]:
-                return
-            last_commit = max(state["committed_changes"], key=lambda c: c.timestamp)
-            success = outcome == "success"
-            feedback = AppliedChangeFeedback(
-                change_hash=last_commit.hash,
-                change_description=last_commit.content[:200],
-                file_path=last_commit.file_path,
-                timestamp=time.time(),
-                success=success,
-                user_comment=comment,
-            )
-            state["feedback_history"].append(feedback)
-            if len(state["feedback_history"]) > self.valves.feedback_history_limit:
-                state["feedback_history"] = state["feedback_history"][
-                    -self.valves.feedback_history_limit :
-                ]
-            if not success:
-                last_commit.importance_score /= (
-                    self.valves.feedback_importance_penalty_for_failure
-                )
-                last_commit.importance_score = max(0.5, last_commit.importance_score)
-            else:
-                last_commit.importance_score = min(
-                    10.0, last_commit.importance_score + 1.0
-                )
-            self._set_state(project_id, state)
-
-    def _get_feedback_context(self, project_id: str) -> str:
-        state = self._get_state(project_id)
-        if not state or not state["feedback_history"]:
-            return ""
-        lines = ["## Recent Change Feedback\n"]
-        for fb in state["feedback_history"][-5:]:
-            status = "✅ SUCCESS" if fb.success else "❌ FAILED"
-            desc = fb.change_description.replace("\n", " ")[:100]
-            lines.append(f'- {status}: `{desc}` - User: "{fb.user_comment}"')
-        return "\n".join(lines)
-
+    # --------------------------------------------------------------------------
+    #  Fact management
+    # --------------------------------------------------------------------------
     async def _extract_facts_from_message(self, content: str) -> List[str]:
         pattern = r"\[FACT:\s*(.*?)\]"
         matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
@@ -5140,7 +4583,6 @@ Output only JSON.
     async def _handle_fact_command(
         self, command_text: str, project_id: str
     ) -> Optional[str]:
-        """Parse /fact command and execute it. Returns a confirmation message or None."""
         if not command_text.startswith(self.valves.fact_command_prefix):
             return None
         parts = command_text.split(maxsplit=2)
@@ -5215,631 +4657,113 @@ Output only JSON.
             [f"- {fact}" for fact in active_facts]
         )
 
-    async def _parse_cot_intent(self, user_message: str) -> Optional[str]:
-        if not self.valves.enable_cot_on_demand:
-            return None
-        if user_message.strip().startswith("/think"):
-            parts = user_message.split(maxsplit=1)
-            if len(parts) > 1:
-                return parts[1].strip()
-            return "What would you like me to think step by step about?"
-        if re.search(
-            r"\b(think step by step|reason step by step)\b", user_message, re.IGNORECASE
-        ):
-            return user_message
-        return None
-
-    async def _generate_cot(self, question: str, context: str) -> str:
-        model = (
-            self.valves.cot_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""You are a reasoning assistant. Please think step by step to answer the following question.
-Show your reasoning clearly, then provide a final answer.
-
-Context:
-{context[:2000]}
-
-Question: {question}
-
-Proceed step by step."""
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a meticulous reasoner. Output step-by-step reasoning, then a final answer.",
-            model_override=model,
-            max_tokens=self.valves.cot_max_tokens,
-            temperature=0.3,
-        )
-        return response or "Could not generate reasoning."
-
-    async def _parse_assumption_intent(self, user_message: str) -> Optional[str]:
-        if not self.valves.enable_assumption_extraction:
-            return None
-        if user_message.strip().startswith("/assume"):
-            parts = user_message.split(maxsplit=1)
-            if len(parts) > 1:
-                return parts[1].strip()
-            return None
-        if re.search(
-            r"\b(what assumptions|underlying assumptions)\b",
-            user_message,
-            re.IGNORECASE,
-        ):
-            return user_message
-        return None
-
-    async def _extract_assumptions(self, text: str) -> str:
-        model = (
-            self.valves.assumption_extraction_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""Analyze the following statement or code and extract the underlying assumptions.
-List each assumption clearly. Also note any unstated premises or biases.
-
-Statement/Code:
-{text[:2000]}
-
-Output a structured list of assumptions and a brief comment on their validity or impact."""
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You are an analytical assistant that extracts hidden assumptions.",
-            model_override=model,
-            max_tokens=800,
-            temperature=0.2,
-            timeout=10.0,  # slightly longer because it may be a complex analysis
-        )
-        return response or "Could not extract assumptions."
-
     # --------------------------------------------------------------------------
-    #  Iterative task execution (/iterate)
+    #  Intent detection (natural language)
     # --------------------------------------------------------------------------
-    async def _run_iteration(self, project_id: str, command: str) -> Tuple[str, bool]:
-        if not self.valves.enable_iterative_mode:
-            return "", False
-        state = self._get_state(project_id)
-        current_iter = state.get("iterative_state")
+    INTENT_KEYWORDS = {
+        "forget",
+        "olvida",
+        "olvid",
+        "remember",
+        "recuerda",
+        "pin",
+        "fija",
+        "guarda",
+        "obsolete",
+        "obsoleto",
+        "deprecated",
+        "ya no",
+        "remove",
+        "elimina",
+        "borra",
+        "quita",
+        "keep",
+        "mantén",
+        "conserva",
+    }
 
-        if current_iter:
-            ttl_seconds = self.valves.iterative_state_ttl_hours * 3600
-            created_at = current_iter.get("created_at", 0)
-            if time.time() - created_at > ttl_seconds:
-                state["iterative_state"] = None
-                self._set_state(project_id, state)
-                self._log_debug("Iterative state expired and cleared (TTL).")
-                return "", False
+    QUESTION_PATTERNS = re.compile(
+        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
+        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
+        re.IGNORECASE,
+    )
 
-        if command.startswith("/iterate"):
-            parts = command.split(maxsplit=1)
-            if len(parts) == 1:
-                return (
-                    "**Iterative commands:**\n"
-                    "- `/iterate <goal>` – start a multi-step plan.\n"
-                    "- `/iterate --auto <goal>` – run all steps automatically.\n"
-                    "- `/iterate resume` – resume an interrupted iteration.\n"
-                    "- You can also use natural language: 'implement all features step by step'.",
-                    True,
-                )
-            action = parts[1].lower()
-            if action == "resume":
-                if not current_iter:
-                    return (
-                        "No iteration in progress. Start one with `/iterate <goal>`.",
-                        True,
-                    )
-                return await self._execute_next_step(project_id), True
-            elif action.startswith("--auto"):
-                goal = " ".join(parts[1:]).replace("--auto", "").strip()
-                if not goal:
-                    return "You must specify a goal for the iteration.", True
-                if await self._start_new_iteration(
-                    project_id, goal, auto_continue=True
-                ):
-                    return await self._execute_next_step(project_id), True
-                return "Failed to start iteration.", True
-            else:
-                goal = parts[1]
-                if await self._start_new_iteration(
-                    project_id, goal, auto_continue=False
-                ):
-                    return await self._execute_next_step(project_id), True
-                return "Failed to start iteration.", True
-        # Natural language continuation
-        if current_iter and command.lower() in [
-            "siguiente",
-            "continue",
-            "next",
-            "yes",
-            "si",
-            "ok",
-            "apply",
-        ]:
-            return await self._execute_next_step(project_id), True
-        # Natural language start
-        if re.search(
-            r"\b(implement|do|execute) (all|step by step|iteratively)\b",
-            command,
-            re.IGNORECASE,
-        ):
-            goal = command
-            desc = f"Start a new iterative task with goal: {goal[:200]}"
-            if await self._verify_command_intent(command, desc):
-                if await self._start_new_iteration(
-                    project_id, goal, auto_continue=False
-                ):
-                    return await self._execute_next_step(project_id), True
-            else:
-                self._log_debug("Iterative start rejected by verification LLM")
-        return "", False
+    def _has_intent_keywords(self, text: str) -> bool:
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in self.INTENT_KEYWORDS)
 
-    async def _generate_plan(self, goal: str, context: str) -> List[Dict]:
-        model = (
-            self.valves.iterative_planning_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""You are an expert Python developer. The user wants to perform the following task:
-
-{goal}
-
-Current context (relevant files, functions, etc.):
-{context[:3000]}
-
-Break down the task into a sequence of concrete steps. Each step should be a small, actionable change that can be implemented as a unified diff (patch) to the codebase.
-Output a JSON array of steps, each with:
-- "description": a short description of what the step does
-- "file": the file path to modify (if known, otherwise "unknown")
-- "changes": a brief summary of the changes (will be used to generate the diff later)
-
-Example:
-[
-  {{
-    "description": "Add function calculate_average",
-    "file": "utils/math.py",
-    "changes": "Add function that takes a list and returns average"
-  }}
-]
-
-The plan must have at most {self.valves.iterative_max_steps} steps. Output only JSON, no extra text.
-"""
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a precise task planner. Output only JSON.",
-            model_override=model,
-            max_tokens=1500,
-            temperature=0.2,
-        )
-        if not response:
-            return []
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            plan = json.loads(response)
-            if isinstance(plan, list):
-                return plan[: self.valves.iterative_max_steps]
-        except:
-            pass
-        return []
-
-    async def _generate_diff_for_step(self, step: Dict, project_id: str) -> str:
-        model = (
-            self.valves.iterative_execution_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        state = self._get_state(project_id)
-        active_code = "\n".join(
-            [
-                b.content
-                for b in state["active_blocks"].values()
-                if b.content_type == ContentType.BASE_CODE
-            ]
-        )
-        prompt = f"""You are generating a unified diff (patch) to implement a specific change.
-
-File to modify: {step.get('file', 'unknown')}
-Change description: {step.get('changes', '')}
-Goal: {step.get('description', '')}
-
-Current relevant code (may include multiple files):
-{active_code[:3000]}
-
-Generate a unified diff that applies this change. Use the format:
-
-```diff
---- a/file.py
-+++ b/file.py
-@@ -line,old +line,new @@
- -old line
- +new line
-```
-If the file does not exist in the provided context, assume it is a new file and create a diff from empty (e.g., use /dev/null as original).
-Output only the diff, enclosed in diff ... .
-"""
-
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a code assistant that generates correct unified diffs. Output only the diff with proper formatting.",
-            model_override=model,
-            max_tokens=2000,
-            temperature=0.2,
-        )
-        if not response:
-            return f"# Failed to generate diff for step: {step.get('description')}"
-        diff_match = re.search(r"```diff\n(.*?)\n```", response, re.DOTALL)
-        if diff_match:
-            return diff_match.group(1).strip()
-        if response.strip().startswith("--- "):
-            return response.strip()
-        return response
-
-    async def _start_new_iteration(
-        self, project_id: str, goal: str, auto_continue: bool
-    ) -> bool:
-        """Start a new iterative task."""
-        state = self._get_state(project_id)
-        active_ctx = self._get_active_code_context(project_id)
-        facts_ctx = self._get_facts_context(project_id)
-        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-        plan = await self._generate_plan(goal, context)
-        if not plan:
+    async def _should_parse_intents(self, user_message: str, code_spans) -> bool:
+        cleaned = self._remove_code_spans(user_message, code_spans).strip()
+        if len(cleaned) < 15:
             return False
-        state["iterative_state"] = {
-            "goal": goal,
-            "plan": plan,
-            "current_step": 0,
-            "results": [],
-            "auto_continue": auto_continue,
-            "created_at": time.time(),
-        }
-        self._set_state(project_id, state)
-        self._log_debug(f"Started iteration for goal: {goal} with {len(plan)} steps")
+        if not self._has_intent_keywords(cleaned):
+            return False
+        code_ratio = sum(e - s for s, e in code_spans) / max(len(user_message), 1)
+        if code_ratio > 0.6:
+            return False
+        if self.QUESTION_PATTERNS.match(cleaned):
+            return False
         return True
 
-    async def _execute_next_step(self, project_id: str) -> str:
-        """Execute the next step of an ongoing iteration."""
-        state = self._get_state(project_id)
-        iter_state = state.get("iterative_state")
-        if not iter_state:
-            return "No iteration in progress. Use `/iterate <goal>` to start a task."
-        plan = iter_state["plan"]
-        step_idx = iter_state["current_step"]
-        if step_idx >= len(plan):
-            state["iterative_state"] = None
-            self._set_state(project_id, state)
-            return f"✅ **All steps completed!**\n\nGoal: {iter_state['goal']}\nYou can now apply the diffs manually. Use `/iterate` to start a new task."
+    async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
+        if not self.valves.enable_natural_language_forget:
+            none = {"action": "none"}
+            return {"forget": none, "remember": none, "obsolete": none}
 
-        step = plan[step_idx]
-        pre = f"**Step {step_idx+1}/{len(plan)}: {step.get('description')}**\n- File: {step.get('file', 'unknown')}\n- Changes: {step.get('changes', '')}"
-        diff = await self._generate_diff_for_step(step, project_id)
-        post = f"\n**Generated diff**\n```diff\n{diff[:1000]}\n```"
-        full_output = pre + post
+        code_spans = await self._get_code_spans(user_message)
+        if not await self._should_parse_intents(user_message, code_spans):
+            none = {"action": "none"}
+            return {"forget": none, "remember": none, "obsolete": none}
 
-        iter_state["results"].append((step_idx, diff, full_output))
-        iter_state["current_step"] = step_idx + 1
-        self._set_state(project_id, state)
-
-        if iter_state.get("auto_continue"):
-            next_output = (
-                await self._execute_next_step(project_id)
-                if iter_state["current_step"] < len(plan)
-                else ""
-            )
-            return full_output + "\n\n" + next_output
-        else:
-            return (
-                full_output
-                + "\n\n---\nRespond with **next** / **siguiente** to continue."
-            )
-
-    # --------------------------------------------------------------------------
-    #  Message summarization
-    # --------------------------------------------------------------------------
-    def _get_summary_prompt_for_content(
-        self, content_type: ContentType, text: str, max_tokens: int
-    ) -> str:
-        """Build a prompt for summarization that depends on the content type."""
-        if not self.valves.selective_summarization:
-            return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
-        if content_type == ContentType.ERROR:
-            if self.valves.error_preserve_verbatim:
-                return text
-            else:
-                return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
-        elif content_type in (
-            ContentType.BASE_CODE,
-            ContentType.PROPOSED_CHANGE,
-            ContentType.COMMITTED_CHANGE,
-        ):
-            level = self.valves.code_summary_level
-            if level == "minimal":
-                instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
-            elif level == "detailed":
-                instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
-            else:
-                instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
-            return f"{instruction}\n\n```\n{text[:self.valves.summary_code_max_chars]}\n```"
-        elif content_type == ContentType.TOOL_CALL:
-            if self.valves.tool_call_preserve:
-                return text
-            else:
-                return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
-        else:
-            return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
-
-    async def _summarize_messages(
-        self, messages: List[dict], is_code_context: bool = False
-    ) -> Optional[str]:
-        """Summarize a list of messages using an LLM."""
-        if not HAS_AIOHTTP or not messages:
-            return None
-        content_type_counts = defaultdict(int)
-        for m in messages:
-            content = m.get("content", "")
-            extracted = await self._extract_code_blocks(content)
-            ctype = self._classify_content(content, extracted)
-            content_type_counts[ctype] += 1
-        if (
-            self.valves.selective_summarization
-            and self.valves.error_preserve_verbatim
-            and content_type_counts.get(ContentType.ERROR, 0) > 0
-        ):
-            return "\n".join(
-                [f"{m.get('role')}: {m.get('content', '')}" for m in messages]
-            )
-        conv_text = "\n".join(
-            f"{m.get('role')}: {m.get('content', '')}" for m in messages
-        )
-        dominant_type = (
-            max(content_type_counts.items(), key=lambda x: x[1])[0]
-            if content_type_counts
-            else ContentType.GENERAL
-        )
-        prompt = self._get_summary_prompt_for_content(
-            dominant_type, conv_text, self.valves.general_summary_max_tokens
-        )
-        model_override = (
-            self.valves.summary_fallback_model
-            if self.valves.summary_fallback_model
-            else None
-        )
-        max_tokens = (
-            self.valves.general_summary_max_tokens
-            if dominant_type == ContentType.GENERAL
-            else 500
-        )
-        summary = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
-            model_override=model_override,
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        if not summary:
-            return None
-        if self.valves.selective_summarization and self.valves.summary_include_metadata:
-            summary = f"[Summary of {len(messages)} messages, type: {dominant_type.value}]\n{summary}"
-        return summary
-
-    # --------------------------------------------------------------------------
-    #  Contradiction detection
-    # --------------------------------------------------------------------------
-    async def _detect_contradictions(
-        self, conversation_messages: List[dict]
-    ) -> Optional[str]:
-        """Check the last two user messages for contradictions using the LLM."""
-        if (
-            not self.valves.enable_contradiction_detection
-            or len(conversation_messages) < 2
-        ):
-            return None
-
-        # Collect the last two user messages
-        user_msgs = [m for m in conversation_messages if m.get("role") == "user"]
-        if len(user_msgs) < 2:
-            return None
-
-        msg_a = user_msgs[-2].get("content", "")[:500]
-        msg_b = user_msgs[-1].get("content", "")[:500]
-        if not msg_a.strip() or not msg_b.strip():
-            return None
+        cleaned = self._remove_code_spans(user_message, code_spans).strip()
 
         model = (
-            self.valves.contradiction_detection_model
+            self.valves.natural_language_forget_model
             or self.valves.llm_model
             or self.valves.summarization_model
         )
         prompt = (
-            "Compare the following two user messages. Do they contradict each other? "
-            'If yes, output JSON: {"contradiction": true, "explanation": "...", "suggestion": "..."}.\n'
-            'If no, output: {"contradiction": false}.\n'
-            "Output only JSON.\n\n"
-            f"Message 1: {msg_a}\n\nMessage 2: {msg_b}"
+            "You are a command parser for a code assistant. Analyze the user message and detect "
+            "ALL of these intents simultaneously.\n\n"
+            "FORGET actions: forget_last, forget_n (n=int), forget_file (file=str), "
+            "forget_block (hash=str), forget_all\n"
+            "REMEMBER/PIN actions: pin_last, pin_n (n=int), pin_file (file=str), "
+            "pin_block (description=str), pin_all, unpin_last, unpin_file, unpin_all\n"
+            "OBSOLETE actions: obsolete_last, obsolete_n (n=int), obsolete_file (file=str), "
+            "obsolete_block (hash=str), obsolete_all, revive_last, revive_file, revive_all\n\n"
+            f'User message (code removed): "{cleaned[:400]}"\n\n'
+            "Output JSON with exactly three keys. Use action='none' when not detected:\n"
+            '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
+            "Output only JSON."
         )
         response = await self._try_llm_quick(
             prompt=prompt,
-            system_prompt="You are a contradiction detection assistant. Output only JSON.",
+            system_prompt="You output JSON only.",
             model_override=model,
-            max_tokens=300,
-            temperature=0.1,
-            timeout=6.0,
+            max_tokens=200,
+            temperature=0.0,
+            timeout=8.0,
         )
+        none = {"action": "none"}
         if not response:
-            return None
+            return {"forget": none, "remember": none, "obsolete": none}
         try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("contradiction"):
-                return (
-                    f"⚠️ **Contradiction detected**: {data.get('explanation', '')}\n\n"
-                    f"Suggestion: {data.get('suggestion', '')}"
-                )
+            text = response.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            data = json.loads(text)
+            return {
+                "forget": data.get("forget", none),
+                "remember": data.get("remember", none),
+                "obsolete": data.get("obsolete", none),
+            }
         except Exception:
-            pass
-        return None
+            return {"forget": none, "remember": none, "obsolete": none}
 
-    # --------------------------------------------------------------------------
-    #  Code review and auto-CoT detection
-    # --------------------------------------------------------------------------
-    def _is_code_review_request(self, user_message: str) -> bool:
-        """Return True if the user is asking for a code review or bug fix."""
-        if not user_message:
-            return False
-        content = user_message.strip().lower()
-        review_keywords = [
-            "revisa",
-            "revisar",
-            "review",
-            "check",
-            "bug",
-            "error",
-            "fix",
-            "arregla",
-            "corrige",
-            "mejora",
-            "improve",
-            "refactor",
-            "refactoriza",
-            "optimize",
-            "optimiza",
-            "qué errores tiene",
-            "what errors",
-            "code review",
-        ]
-        return any(kw in content for kw in review_keywords)
-
-    def _should_auto_cot(self, user_message: str) -> bool:
-        """Return True if the user message looks complex enough for chain-of-thought."""
-        if len(user_message) < self.valves.auto_cot_min_chars:
-            return False
-        indicators = [
-            r"\b(if|else|for|while|function|def|class|return)\b",
-            r"\b(error|bug|fix|issue|problem|exception|crash)\b",
-            r"\b(how|why|explain|what|when|where)\b",
-            r"\b(step|implement|create|design|architecture)\b",
-            r"[{};]",
-        ]
-        for pat in indicators:
-            if re.search(pat, user_message, re.IGNORECASE):
-                return True
-        return False
-
-    # --------------------------------------------------------------------------
-    #  Proactive suggestions
-    # --------------------------------------------------------------------------
-    async def _check_and_suggest_summarization(
-        self, project_id: str, current_tokens: int, max_tokens: int
-    ) -> Optional[str]:
-        if not self.valves.proactive_summary_threshold or max_tokens <= 0:
-            return None
-        usage_ratio = current_tokens / max_tokens
-        if usage_ratio < self.valves.proactive_summary_threshold:
-            return None
-        state = self._get_state(project_id)
-        if not state:
-            return None
-        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
-        inactive_count = sum(
-            1
-            for b in state["active_blocks"].values()
-            if not b.is_active and not b.obsolete
-        )
-        suggestion_parts = []
-        if obsolete_count > 2:
-            suggestion_parts.append(
-                f"- You have {obsolete_count} obsolete block(s). Use `/obsolete revive` if needed, or they will be ignored."
-            )
-        if inactive_count > 5:
-            suggestion_parts.append(
-                f"- There are {inactive_count} inactive code blocks. Use `/forget` to remove them or `/remember` to pin important ones."
-            )
-        if not suggestion_parts:
-            suggestion_parts.append(
-                f"- Context is at {int(usage_ratio*100)}% capacity. Consider summarizing old conversations with `/summarize` or using `/forget` to free space."
-            )
-        return "⚠️ **Context nearly full**\n" + "\n".join(suggestion_parts)
-
-    async def _suggest_commands(self, project_id: str, state: Dict) -> Optional[str]:
-        if not self.valves.enable_command_suggestions:
-            return None
-        last_suggestion = state.get("last_suggestion_timestamp", 0)
-        if (
-            time.time() - last_suggestion
-            < self.valves.command_suggestion_cooldown_minutes * 60
-        ):
-            return None
-        suggestions = []
-        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
-        if obsolete_count > 3:
-            suggestions.append(
-                "`/forget all` or `/obsolete revive` to manage obsolete blocks."
-            )
-        high_importance_unpinned = [
-            b
-            for b in state["active_blocks"].values()
-            if b.importance_score > 6.0 and not b.pinned
-        ]
-        if len(high_importance_unpinned) > 2:
-            suggestions.append(
-                "`/remember` to pin important blocks and prevent them from being summarized or expired."
-            )
-        if state.get("recent_changes"):
-            suggestions.append("`/iterate` to apply pending changes automatically.")
-        if len(state["active_blocks"]) > 30:
-            suggestions.append(
-                "Consider using `/summarize` to compress old conversations (if you have that feature)."
-            )
-        if suggestions:
-            state["last_suggestion_timestamp"] = time.time()
-            self._set_state(project_id, state)
-            return "💡 **Tip**: " + " ".join(suggestions)
-        return None
-
-    # --------------------------------------------------------------------------
-    #  Duplicate question detection
-    # --------------------------------------------------------------------------
-    async def _find_duplicate_question(
-        self, query: str, project_id: str
-    ) -> Optional[Dict]:
-        if not self.valves.duplicate_question_threshold or not HAS_SENTENCE:
-            return None
-        if not self.memory_collection:
-            return None
-        try:
-            q_emb = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode([query]).tolist()
-            )
-            results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.query(
-                    query_embeddings=q_emb,
-                    n_results=1,
-                    where={
-                        "$and": [
-                            {"project_id": {"$eq": project_id}},
-                            {"role": {"$eq": "user"}},
-                        ]
-                    },
-                    include=["documents", "metadatas", "distances"],
-                )
-            )
-            if results and results["ids"] and results["ids"][0]:
-                sim = 1 - results["distances"][0][0]  # cosine distance to similarity
-                if sim >= self.valves.duplicate_question_threshold:
-                    return {
-                        "content": results["documents"][0][0],
-                        "sim": sim,
-                        "timestamp": results["metadatas"][0][0].get("timestamp"),
-                    }
-        except Exception as e:
-            self._log_debug(f"Duplicate question search failed: {e}")
+    @staticmethod
+    async def _noop():
         return None
 
     async def _parallel_context_checks(
@@ -5850,28 +4774,21 @@ Output only the diff, enclosed in diff ... .
         project_id: str,
         state: dict,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
-        """
-        Run three independent checks in parallel:
-          1. contradiction detection
-          2. response cache lookup
-          3. duplicate question detection
-        Returns (contradiction_warning, cached_response, duplicate_match).
-        """
         tasks = [
             (
                 self._detect_contradictions(messages)
                 if self.valves.enable_contradiction_detection
-                else Filter._noop()
+                else self._noop()
             ),
             (
                 self._find_cached_response(query, context_hash, state)
                 if (self.valves.enable_response_cache and HAS_SENTENCE)
-                else Filter._noop()
+                else self._noop()
             ),
             (
                 self._find_duplicate_question(query, project_id)
                 if (self.valves.duplicate_question_threshold and HAS_SENTENCE)
-                else Filter._noop()
+                else self._noop()
             ),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -5880,17 +4797,10 @@ Output only the diff, enclosed in diff ... .
         duplicate = results[2] if not isinstance(results[2], Exception) else None
         return contradiction, cached, duplicate
 
-    @staticmethod
-    async def _noop():
-        """Coroutine that returns None, used as a placeholder in asyncio.gather."""
-        return None
-
     # --------------------------------------------------------------------------
-    #  Diff application (with fixes for stale symbols and cache)
+    #  Diff application and dependency tracking (unchanged from original)
     # --------------------------------------------------------------------------
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
-        """Apply a unified diff to an original string and return the result.
-        Returns None if no hunks could be applied."""
         if not self.valves.enable_diff_application:
             return None
         lines = original.splitlines(keepends=False)
@@ -5940,8 +4850,6 @@ Output only the diff, enclosed in diff ... .
     def _apply_change_with_diff(
         self, base_block: CodeBlock, proposed_block: CodeBlock
     ) -> bool:
-        """If the proposed change looks like a diff, apply it to the base block.
-        Updates symbols and cached token count."""
         if proposed_block.content_type != ContentType.PROPOSED_CHANGE:
             return False
         if not (
@@ -5951,11 +4859,9 @@ Output only the diff, enclosed in diff ... .
             return False
         new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
         if new_code and new_code != base_block.content:
-            # Remove old symbols from index
             self._symbol_index.remove_all_for_block(
                 base_block.hash, base_block.symbols, self.valves.project_id
             )
-            # Update content and re-extract symbols
             base_block.content = new_code
             base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
             base_block.symbols = SignatureExtractor._extract_generic(
@@ -5976,11 +4882,7 @@ Output only the diff, enclosed in diff ... .
             return True
         return False
 
-    # --------------------------------------------------------------------------
-    #  Dependency tracking
-    # --------------------------------------------------------------------------
     def _extract_dependencies_ast(self, code: str) -> Tuple[List[str], List[str]]:
-        """Extract imports and function calls from Python code using AST."""
         imports = []
         calls = []
         try:
@@ -6005,7 +4907,6 @@ Output only the diff, enclosed in diff ... .
         return list(set(imports)), list(set(calls))
 
     def _extract_dependencies_regex(self, code: str, language: str) -> List[str]:
-        """Extract dependencies for non‑Python languages using regular expressions."""
         deps = set()
         if language in ("javascript", "typescript", "js", "ts", "jsx", "tsx"):
             for m in re.finditer(r"""from\s+['"]([^'"]+)['"]""", code):
@@ -6031,7 +4932,6 @@ Output only the diff, enclosed in diff ... .
     async def _extract_dependencies_hybrid(
         self, code: str, file_path: Optional[str] = None
     ) -> List[str]:
-        """Extract dependencies using AST (Python) or regex (other languages)."""
         if not self.valves.enable_dependency_tracking:
             return []
         lang = "unknown"
@@ -6066,7 +4966,6 @@ Output only the diff, enclosed in diff ... .
             deps = self._extract_dependencies_regex(code, lang)
             if deps:
                 return deps
-        # Fallback: LLM extraction
         model = (
             self.valves.dependency_extraction_model
             or self.valves.llm_model
@@ -6097,7 +4996,6 @@ Output only the diff, enclosed in diff ... .
         return []
 
     async def _update_dependencies(self, block_hash: str, state: Dict):
-        """Refresh the dependency list for a given code block."""
         block = state["active_blocks"].get(block_hash)
         if not block:
             return
@@ -6113,7 +5011,6 @@ Output only the diff, enclosed in diff ... .
         block.dependencies = deps
 
     async def _mark_affected_blocks(self, changed_hash: str, state: Dict):
-        """Mark other blocks as potentially affected when a dependency changes."""
         changed_block = state["active_blocks"].get(changed_hash)
         if not changed_block:
             return
@@ -6141,7 +5038,6 @@ Output only the diff, enclosed in diff ... .
                 block._update_importance()
 
     async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
-        """Refresh dependencies and mark affected blocks asynchronously."""
         if not self.valves.enable_dependency_tracking:
             return
         lock = await self._get_project_lock(project_id)
@@ -6154,7 +5050,6 @@ Output only the diff, enclosed in diff ... .
             self._set_state(project_id, state)
 
     async def _clean_affected_flags(self, project_id: str):
-        """Remove 'potentially affected' flags after a decay period."""
         if not self.valves.enable_dependency_tracking:
             return
         lock = await self._get_project_lock(project_id)
@@ -6182,15 +5077,11 @@ Output only the diff, enclosed in diff ... .
     #  Oversized code block handling
     # --------------------------------------------------------------------------
     def _estimate_code_tokens(self, code: str) -> int:
-        """Roughly estimate the number of tokens in a code snippet."""
         if self.tokenizer:
             return len(self.tokenizer.encode(code))
         return len(code) // 4
 
     async def _handle_oversized_code_block(self, code: str, language: str) -> str:
-        """Truncate, summarise or warn when a code block exceeds the token limit.
-        When summarizing, extracts function/class signatures to give the LLM a global view.
-        """
         max_tokens = self.valves.max_code_block_tokens
         if max_tokens <= 0:
             return code
@@ -6215,7 +5106,6 @@ Output only the diff, enclosed in diff ... .
                 or self.valves.llm_model
                 or self.valves.summarization_model
             )
-            # Extract function/class signatures to give the LLM an overview
             signatures = []
             for match in re.finditer(
                 r"^\s*(def|class|function|fn|func|async def)\s+(\w+)[^(]*\([^)]*\)",
@@ -6247,11 +5137,9 @@ Output only the diff, enclosed in diff ... .
         return code
 
     # --------------------------------------------------------------------------
-    #  MODIFIED: _remove_duplicate_blocks – cleans up symbol index and invalidates cache
+    #  Duplicate removal and hierarchical compression
     # --------------------------------------------------------------------------
     def _remove_duplicate_blocks(self, state: Dict, project_id: str):
-        """Remove code blocks that are very similar to a more important block.
-        When importance scores are close, keep the more recent block."""
         if not self.valves.auto_remove_duplicate_blocks:
             return
         blocks = list(state["active_blocks"].values())
@@ -6277,10 +5165,8 @@ Output only the diff, enclosed in diff ... .
                         ):
                             to_remove.add(other.hash)
                         continue
-                    # Prefer newer block when scores are close
                     score_diff = abs(block.importance_score - other.importance_score)
                     if score_diff < 1.0:
-                        # Keep the more recent one
                         if block.timestamp >= other.timestamp:
                             to_remove.add(other.hash)
                         else:
@@ -6289,7 +5175,6 @@ Output only the diff, enclosed in diff ... .
                         to_remove.add(other.hash)
                     else:
                         to_remove.add(block.hash)
-        # Clean up symbol index and remove blocks
         for h in to_remove:
             if h in state["active_blocks"]:
                 block = state["active_blocks"][h]
@@ -6309,14 +5194,7 @@ Output only the diff, enclosed in diff ... .
             )
             self._invalidate_lightweight_cache(project_id)
 
-    # --------------------------------------------------------------------------
-    #  Hierarchical compression
-    # --------------------------------------------------------------------------
     async def _hierarchical_compress(self, project_id: str, state: Dict):
-        """Compress older messages into a hierarchical summary, avoiding overlapping runs.
-        Batches entries to respect the prompt character limit and only deletes
-        entries that were actually summarised."""
-        # Prevent concurrent compressions for the same project
         if self._hierarchical_compress_in_progress.get(project_id, False):
             self._log_debug(
                 f"Hierarchical compress already in progress for {project_id}, skipping"
@@ -6330,7 +5208,7 @@ Output only the diff, enclosed in diff ... .
             if not self.memory_collection:
                 return
             last_ts = state.get("last_compression_timestamp", 0)
-            if time.time() - last_ts < 3600:  # at most once per hour
+            if time.time() - last_ts < 3600:
                 return
 
             now = time.time()
@@ -6365,7 +5243,6 @@ Output only the diff, enclosed in diff ... .
                 : self.valves.hierarchical_compression_interval_messages
             ]
 
-            # Split into batches that fit within the prompt limit
             max_chars = 4000
             prompt_template = (
                 "Summarise the following conversation segment, keeping key technical "
@@ -6411,7 +5288,6 @@ Output only the diff, enclosed in diff ... .
             if not ids_to_delete:
                 return
 
-            # Delete only the entries that were summarised
             await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.delete(ids=ids_to_delete)
             )
