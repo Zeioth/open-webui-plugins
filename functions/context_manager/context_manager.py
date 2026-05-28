@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.5.0
+version: 5.5.1
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -847,6 +847,23 @@ class Filter:
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
         cot_max_tokens: int = Field(default=1000)
+        cot_model_level2: str = Field(
+            default="ollama/llama3.2:3b",
+            description="Model used for CoT level 2 (auto-reasoning).",
+        )
+        cot_model_level3: str = Field(
+            default="ollama/llama3.2:3b",
+            description="Model used for CoT level 3 (self-reflection).",
+        )
+        enable_cot_llm_detection: bool = Field(
+            default=True,
+            description="If true, uses a lightweight LLM to decide the CoT level instead of static keywords.",
+        )
+        cot_detection_model: str = Field(
+            default="ollama/llama3.2:3b",
+            description="Model used to detect the appropriate CoT level when enable_cot_llm_detection is active.",
+        )
+
         enable_assumption_extraction: bool = Field(default=False)
         assumption_extraction_model: str = Field(
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
@@ -1903,52 +1920,67 @@ class Filter:
         col = getattr(self, "_response_cache_collection", None)
         if col is None:
             return
-        try:
-            embedding = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
-            )
-            entry_id = hashlib.md5(
-                f"{self.valves.project_id}|{query}".encode()
-            ).hexdigest()[:32]
-            max_entries = self.valves.response_cache_max_entries
-            if self._response_cache_size >= max_entries:
-                existing = await anyio.to_thread.run_sync(
-                    lambda: col.get(
-                        where={"project_id": self.valves.project_id},
-                        include=["metadatas"],
-                    )
-                )
-                if existing and len(existing["ids"]) >= max_entries:
-                    items = sorted(
-                        zip(existing["ids"], existing["metadatas"]),
-                        key=lambda x: x[1].get("timestamp", 0),
-                    )
-                    to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
-                    await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
-                    self._response_cache_size = len(existing["ids"]) - len(to_delete)
-                else:
-                    self._response_cache_size = len(existing["ids"]) if existing else 0
-            await anyio.to_thread.run_sync(
-                lambda: col.upsert(
-                    ids=[entry_id],
-                    embeddings=[embedding],
-                    documents=[response],
-                    metadatas=[
-                        {
-                            "query": query[:500],
-                            "project_id": self.valves.project_id,
-                            "context_hash": "",  # Not used anymore: we keep compatibility.
-                            "code_state_hash": self._compute_code_state_hash(
-                                self.valves.project_id
-                            ),
-                            "timestamp": time.time(),
-                        }
-                    ],
+
+        t_start = time.monotonic()
+
+        # ── 1. Generate embedding ──
+        t_emb = time.monotonic()
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        emb_dur = time.monotonic() - t_emb
+        self._log_timing("resp_cache_embedding", emb_dur, emb_dur)
+
+        # ── 2. Prepare entry ──
+        entry_id = hashlib.md5(
+            f"{self.valves.project_id}|{query}".encode()
+        ).hexdigest()[:32]
+        max_entries = self.valves.response_cache_max_entries
+        if self._response_cache_size >= max_entries:
+            existing = await anyio.to_thread.run_sync(
+                lambda: col.get(
+                    where={"project_id": self.valves.project_id},
+                    include=["metadatas"],
                 )
             )
-            self._response_cache_size += 1
-        except Exception as e:
-            self._log_debug(f"Error storing response in cache: {e}")
+            if existing and len(existing["ids"]) >= max_entries:
+                items = sorted(
+                    zip(existing["ids"], existing["metadatas"]),
+                    key=lambda x: x[1].get("timestamp", 0),
+                )
+                to_delete = [iid for iid, _ in items[: max(1, len(items) // 10)]]
+                await anyio.to_thread.run_sync(lambda: col.delete(ids=to_delete))
+                self._response_cache_size = len(existing["ids"]) - len(to_delete)
+            else:
+                self._response_cache_size = len(existing["ids"]) if existing else 0
+
+        # ── 3. Upsert into ChromaDB ──
+        t_db = time.monotonic()
+        await anyio.to_thread.run_sync(
+            lambda: col.upsert(
+                ids=[entry_id],
+                embeddings=[embedding],
+                documents=[response],
+                metadatas=[
+                    {
+                        "query": query[:500],
+                        "project_id": self.valves.project_id,
+                        "context_hash": "",
+                        "code_state_hash": self._compute_code_state_hash(
+                            self.valves.project_id
+                        ),
+                        "timestamp": time.time(),
+                    }
+                ],
+            )
+        )
+        db_dur = time.monotonic() - t_db
+        self._log_timing("resp_cache_upsert", db_dur, db_dur)
+
+        self._response_cache_size += 1
+
+        total_dur = time.monotonic() - t_start
+        self._log_timing("resp_cache_total", total_dur, total_dur)
 
     async def _find_cached_response(
         self, query: str, context_hash: str, state: dict
@@ -1958,49 +1990,65 @@ class Filter:
         col = getattr(self, "_response_cache_collection", None)
         if col is None:
             return None
-        try:
-            query_vec = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
-            )
-            results = await anyio.to_thread.run_sync(
-                lambda: col.query(
-                    query_embeddings=[query_vec],
-                    n_results=1,
-                    where={"project_id": self.valves.project_id},
-                    include=["documents", "metadatas", "distances"],
-                )
-            )
-            if not results or not results["ids"] or not results["ids"][0]:
-                return None
-            dist = results["distances"][0][0]
-            similarity = 1.0 - (dist / 2.0)
-            if similarity < self.valves.response_cache_similarity_threshold:
-                return None
-            meta = results["metadatas"][0][0]
 
-            stored_code_state = meta.get("code_state_hash", "")
-            if (
-                stored_code_state
-                and stored_code_state
-                != self._compute_code_state_hash(self.valves.project_id)
-            ):
-                await anyio.to_thread.run_sync(
-                    lambda: col.delete(ids=[results["ids"][0][0]])
-                )
-                return None
+        t_start = time.monotonic()
 
-            ttl = self.valves.response_cache_ttl_hours * 3600
-            ts = meta.get("timestamp", 0)
-            if ttl > 0 and time.time() - ts > ttl:
-                await anyio.to_thread.run_sync(
-                    lambda: col.delete(ids=[results["ids"][0][0]])
-                )
-                return None
-            doc = results["documents"][0][0]
-            return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
-        except Exception as e:
-            self._log_debug(f"Error finding cached response: {e}")
+        # ── 1. Generate embedding ──
+        t_emb = time.monotonic()
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        emb_dur = time.monotonic() - t_emb
+        self._log_timing("resp_cache_query_embedding", emb_dur, emb_dur)
+
+        # ── 2. Query ChromaDB ──
+        t_db = time.monotonic()
+        results = await anyio.to_thread.run_sync(
+            lambda: col.query(
+                query_embeddings=[query_vec],
+                n_results=1,
+                where={"project_id": self.valves.project_id},
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        db_dur = time.monotonic() - t_db
+        self._log_timing("resp_cache_query_chromadb", db_dur, db_dur)
+
+        if not results or not results["ids"] or not results["ids"][0]:
             return None
+
+        dist = results["distances"][0][0]
+        similarity = 1.0 - (dist / 2.0)
+        if similarity < self.valves.response_cache_similarity_threshold:
+            return None
+
+        meta = results["metadatas"][0][0]
+
+        # ── 3. Validate code state hash ──
+        stored_code_state = meta.get("code_state_hash", "")
+        if stored_code_state and stored_code_state != self._compute_code_state_hash(
+            self.valves.project_id
+        ):
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        # ── 4. Check TTL ──
+        ttl = self.valves.response_cache_ttl_hours * 3600
+        ts = meta.get("timestamp", 0)
+        if ttl > 0 and time.time() - ts > ttl:
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        doc = results["documents"][0][0]
+
+        total_dur = time.monotonic() - t_start
+        self._log_timing("resp_cache_find_total", total_dur, total_dur)
+
+        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
 
     def _compute_code_state_hash(self, project_id: str) -> str:
         state = self._get_state(project_id)
@@ -3175,6 +3223,18 @@ class Filter:
         content = message.get("content", "")
         if not content or len(content.strip()) < 15:
             return
+
+        t_start = time.monotonic()
+
+        # ── 1. Generate embedding ──
+        t_emb = time.monotonic()
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(content).tolist()
+        )
+        emb_dur = time.monotonic() - t_emb
+        self._log_timing("store_memory_embedding", emb_dur, emb_dur)
+
+        # ── 2. Extract blocks / classify for metadata ──
         extracted, _ = await self._extract_code_blocks(content)
         content_type = self._classify_content(content, extracted)
         msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
@@ -3210,9 +3270,8 @@ class Filter:
                     code_symbols_str = "," + ",".join(sorted(all_symbols)) + ","
                     self._log_debug(f"Indexed symbols for LTM: {code_symbols_str}")
 
-        embedding = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(content).tolist()
-        )
+        # ── 3. Upsert into ChromaDB ──
+        t_db = time.monotonic()
         await anyio.to_thread.run_sync(
             lambda: self.memory_collection.upsert(
                 ids=[msg_id],
@@ -3232,11 +3291,12 @@ class Filter:
                 documents=[content],
             )
         )
+        db_dur = time.monotonic() - t_db
+        self._log_timing("store_memory_upsert", db_dur, db_dur)
+
+        total_dur = time.monotonic() - t_start
+        self._log_timing("store_memory_total", total_dur, total_dur)
         self._log_debug(f"Stored message {msg_id} in LTM")
-        state = self._get_state(project_id)
-        msg_count = state.get("message_count", 0)
-        if msg_count > 0 and msg_count % self.valves.ltm_compress_after_messages == 0:
-            asyncio.create_task(self._compress_ltm_for_conversation(project_id))
 
     async def _compress_ltm_for_conversation(self, project_id: str):
         if not HAS_AIOHTTP or not self.memory_collection:
@@ -3336,14 +3396,23 @@ class Filter:
             )
 
         try:
+            t_start = time.monotonic()
+
+            # ── 1. Generate query embedding ──
+            t_emb = time.monotonic()
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self.embedder.encode(query[:1000]).tolist()
             )
+            emb_dur = time.monotonic() - t_emb
+            self._log_timing("ltm_query_embedding", emb_dur, emb_dur)
+
+            # ── 2. Query ChromaDB ──
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
             if self.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append({"expires_at": {"$gt": now}})
 
+            t_db = time.monotonic()
             results = await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.query(
                     query_embeddings=[q_emb],
@@ -3351,11 +3420,15 @@ class Filter:
                     where=where_filter,
                 )
             )
+            db_dur = time.monotonic() - t_db
+            self._log_timing("ltm_query_chromadb", db_dur, db_dur)
+
+            # ── 3. Process results (scoring, decay, boost, rerank) ──
             docs_with_meta = []
             if results and results["documents"]:
                 for i, doc in enumerate(results["documents"][0]):
                     meta = results["metadatas"][0][i]
-                    # cosene space normalization
+                    # cosine space normalization
                     sim = 1.0 - (results["distances"][0][i] / 2.0)
                     ts = meta.get("timestamp")
                     if ts is not None and ts < 1000000000:
@@ -3425,6 +3498,10 @@ class Filter:
                 ]
 
             docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
+
+            total_dur = time.monotonic() - t_start
+            self._log_timing("ltm_retrieval_total_internal", total_dur, total_dur)
+
             return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
         except Exception as e:
             logger.warning(f"Unified memory retrieval failed: {e}")
@@ -5248,13 +5325,28 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Chain-of-Thought helpers
     # --------------------------------------------------------------------------
-    async def _parse_cot_intent(self, user_content: str) -> Optional[str]:
-        """Extract the question after /think command."""
+    async def _parse_cot_intent(self, user_content: str) -> Tuple[Optional[str], int]:
+        """
+        Extract the question and the requested CoT level from a /think command.
+        Returns (question, level). Level defaults to 2 if not specified.
+        """
         content = user_content.strip()
-        if content.startswith("/think"):
-            question = content[6:].strip()
-            return question if question else None
-        return None
+        if not content.startswith("/think"):
+            return None, 2
+        rest = content[6:].strip()  # remove "/think"
+        if not rest:
+            return None, 2
+        # Check if the first word is a digit (level)
+        parts = rest.split(maxsplit=1)
+        if parts[0].isdigit():
+            level = int(parts[0])
+            if level not in (1, 2, 3):
+                level = 2
+            question = parts[1] if len(parts) > 1 else ""
+        else:
+            level = 2
+            question = rest
+        return question, level
 
     async def _generate_cot(self, question: str, context: str) -> str:
         """Generate chain-of-thought reasoning using the configured COT model."""
@@ -5271,20 +5363,10 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Chain-of-Thought auto-detection (multi-level)
     # --------------------------------------------------------------------------
-    def _detect_cot_level(
+    def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
-        """
-        Heuristically determine the CoT level needed:
-        0: no extra reasoning
-        1: inline CoT (prompt only)
-        2: auto-CoT with background reasoning call
-        3: auto-CoT with self-reflection (two reasoning calls)
-        """
-        if not user_content:
-            return 0
-
-        # Multi-lingual complexity keywords
+        """Original static keyword-based detection (used as fallback)."""
         complex_keywords = {
             "analyze",
             "how",
@@ -5315,15 +5397,104 @@ class Filter:
             "describe",
             "describir",
         }
-        # Keywords that suggest deep reflection
         deep_keywords = {
-            "deep",
+            "deep review",
             "revisión profunda",
             "auto-evalúa",
             "comprueba cada paso",
             "itera varias veces",
             "razonamiento exhaustivo",
             "reflection",
+            "deep",
+            "reflexión",
+        }
+
+        content_lower = user_content.lower()
+        has_code = "```" in user_content
+        length_ok = len(user_content) >= self.valves.auto_cot_min_chars
+
+        signals = 0
+        if any(kw in content_lower for kw in complex_keywords):
+            signals += 1
+        if has_code:
+            signals += 1
+        if length_ok:
+            signals += 1
+        if user_content.count("?") >= 2:
+            signals += 1
+
+        if any(kw in content_lower for kw in deep_keywords):
+            return 3
+        if self.valves.enable_iterative_mode and state.get("iterative_state"):
+            return 3
+
+        if signals >= 3:
+            return 2
+        elif signals >= 2:
+            return 1
+        else:
+            return 0
+
+    def _detect_cot_level(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """
+        Heuristically determine the CoT level needed.
+        If enable_cot_llm_detection is True, delegates the decision to a lightweight LLM.
+        Otherwise, uses static multi‑lingual keywords and complexity signals.
+        """
+        if not user_content:
+            return 0
+
+        # If LLM-based detection is enabled, use the model to decide
+        if self.valves.enable_cot_llm_detection:
+            return self._detect_cot_level_via_llm(user_content, is_code_session, state)
+
+        # ---- Static heuristic (original) ----
+        complex_keywords = {
+            "analyze",
+            "how",
+            "why",
+            "implement",
+            "design",
+            "architecture",
+            "fix",
+            "debug",
+            "optimize",
+            "refactor",
+            "review",
+            "compare",
+            "analiza",
+            "cómo",
+            "por qué",
+            "implementa",
+            "diseña",
+            "arquitectura",
+            "corrige",
+            "depura",
+            "optimiza",
+            "refactoriza",
+            "revisa",
+            "compara",
+            "explain",
+            "explica",
+            "describe",
+            "describir",
+        }
+        deep_keywords = {
+            "deep",
+            "review",
+            "profunda",
+            "profundo",
+            "revisión",
+            "revision",
+            "comprueba cada paso",
+            "itera",
+            "itera varias veces",
+            "razonamiento exhaustivo",
+            "reflection",
+            "reflexióna",
+            "reflexiona",
         }
 
         content_lower = user_content.lower()
@@ -5341,15 +5512,15 @@ class Filter:
         if user_content.count("?") >= 2:
             signals += 1
 
-        # Deep keywords check
+        # Deep keywords → level 3
         if any(kw in content_lower for kw in deep_keywords):
             return 3
 
-        # If iterative mode is active and the state suggests multiple steps
+        # Iterative mode active → level 3
         if self.valves.enable_iterative_mode and state.get("iterative_state"):
             return 3
 
-        # Determine level based on signals
+        # Level 2 for strong complexity, level 1 for moderate
         if signals >= 3:
             return 2
         elif signals >= 2:
@@ -5357,13 +5528,136 @@ class Filter:
         else:
             return 0
 
+    def _detect_cot_level(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """
+        Heuristically determine the CoT level needed.
+        If enable_cot_llm_detection is True, delegates the decision to a lightweight LLM.
+        Otherwise, uses static multi‑lingual keywords and complexity signals.
+        """
+        if not user_content:
+            return 0
+
+        if self.valves.enable_cot_llm_detection:
+            return self._detect_cot_level_via_llm(user_content, is_code_session, state)
+
+        return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+
+    def _detect_cot_level_heuristic(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """Original static keyword-based detection (used as fallback)."""
+        complex_keywords = {
+            "analyze",
+            "how",
+            "why",
+            "implement",
+            "design",
+            "architecture",
+            "fix",
+            "debug",
+            "optimize",
+            "refactor",
+            "review",
+            "compare",
+            "analiza",
+            "cómo",
+            "por qué",
+            "implementa",
+            "diseña",
+            "arquitectura",
+            "corrige",
+            "depura",
+            "optimiza",
+            "refactoriza",
+            "revisa",
+            "compara",
+            "explain",
+            "explica",
+            "describe",
+            "describir",
+        }
+        deep_keywords = {
+            "deep review",
+            "revisión profunda",
+            "auto-evalúa",
+            "comprueba cada paso",
+            "itera varias veces",
+            "razonamiento exhaustivo",
+            "reflection",
+            "deep",
+            "reflexión",
+        }
+
+        content_lower = user_content.lower()
+        has_code = "```" in user_content
+        length_ok = len(user_content) >= self.valves.auto_cot_min_chars
+
+        signals = 0
+        if any(kw in content_lower for kw in complex_keywords):
+            signals += 1
+        if has_code:
+            signals += 1
+        if length_ok:
+            signals += 1
+        if user_content.count("?") >= 2:
+            signals += 1
+
+        if any(kw in content_lower for kw in deep_keywords):
+            return 3
+        if self.valves.enable_iterative_mode and state.get("iterative_state"):
+            return 3
+
+        if signals >= 3:
+            return 2
+        elif signals >= 2:
+            return 1
+        else:
+            return 0
+
+    async def _detect_cot_level_via_llm(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """
+        Use a lightweight LLM to determine the CoT level (0-3).
+        This method is called only when enable_cot_llm_detection is True.
+        """
+        prompt = (
+            f"The user is working on a {'code' if is_code_session else 'general'} task.\n"
+            f"User message:\n{user_content[:500]}\n\n"
+            "Decide the depth of Chain-of-Thought reasoning needed:\n"
+            "0 = none (simple fact, greeting, trivial)\n"
+            "1 = basic (ask to think step by step internally)\n"
+            "2 = moderate (generate reasoning automatically)\n"
+            "3 = deep (generate reasoning + self-critique)\n\n"
+            "Respond with only the digit 0, 1, 2, or 3."
+        )
+        try:
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt="You are a classifier. Output only a single digit.",
+                model_override=self.valves.cot_detection_model,
+                max_tokens=2,
+                temperature=0.0,
+                timeout=5.0,
+            )
+            if response and response.strip().isdigit():
+                level = int(response.strip())
+                if 0 <= level <= 3:
+                    return level
+        except Exception as e:
+            self._log_debug(f"LLM CoT detection failed, falling back to heuristic: {e}")
+
+        return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+
     async def _generate_cot_reasoning(self, question: str, context: str) -> str:
-        """Generate chain-of-thought reasoning using the configured CoT model."""
+        """Generate chain-of-thought reasoning using the configured CoT level 2 model."""
         prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nThink step by step and provide your reasoning:"
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a helpful assistant that thinks step by step before answering.",
-            model_override=self.valves.cot_model,
+            model_override=self.valves.cot_model_level2,
             max_tokens=self.valves.cot_max_tokens,
             temperature=0.4,
         )
@@ -5372,13 +5666,13 @@ class Filter:
     async def _generate_cot_with_self_reflection(
         self, question: str, context: str
     ) -> str:
-        """Generate reasoning and then self-reflect on it for higher accuracy."""
-        # First pass: reasoning
+        """Generate reasoning and then self-reflect on it for higher accuracy.
+        The initial reasoning uses the level 2 model, the reflection uses the level 3 model.
+        """
         reasoning = await self._generate_cot_reasoning(question, context)
         if not reasoning or reasoning == "Unable to generate reasoning.":
             return reasoning
 
-        # Second pass: self-reflection
         reflection_prompt = (
             f"Context:\n{context}\n\n"
             f"Question:\n{question}\n\n"
@@ -5389,7 +5683,7 @@ class Filter:
         refined = await self._call_llm(
             prompt=reflection_prompt,
             system_prompt="You are a critical reviewer. Improve the reasoning provided.",
-            model_override=self.valves.cot_model,
+            model_override=self.valves.cot_model_level3,
             max_tokens=self.valves.cot_max_tokens,
             temperature=0.3,
         )
@@ -6008,6 +6302,7 @@ class Filter:
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
         system_injections = []  # list of (priority, text)
+        manual_cot_used = False
 
         # ------------------------------------------------------------
         # Code interpretation note (critical)
@@ -6043,33 +6338,60 @@ class Filter:
                 )
                 _inlet_timing("ltm_task_creation", t0)  # ⏱️
 
-        # ---------- Chain-of-Thought multi-level auto-detection ----------
+        # ---------- Chain-of-Thought (manual /think or auto-detection) ----------
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             if last_user_msg:
                 user_content = last_user_msg.get("content", "")
+                # Manual /think command (supports /think [level] question)
                 if self.valves.enable_cot_on_demand and user_content.strip().startswith(
                     "/think"
                 ):
-                    # Backward compatibility: explicit /think command uses level 2
-                    cot_question = await self._parse_cot_intent(user_content)
+                    cot_question, level = await self._parse_cot_intent(user_content)
                     if cot_question:
-                        active_ctx = self._get_active_code_context(project_id)
-                        facts_ctx = self._get_facts_context(project_id)
-                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                        reasoning = await self._generate_cot(cot_question, context)
-                        messages.pop()
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
-                            }
-                        )
-                        messages = self._ensure_last_message_is_user(messages)
-                        body["messages"] = messages
-                        _inlet_timing("total_inlet", inlet_start)  # ⏱️
-                        return body
-                else:
-                    # New multi-level CoT detection
+                        manual_cot_used = True
+                        self._log_debug(f"Manual /think requested with level {level}")
+                        if level == 1:
+                            cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                            system_injections.append(("high", cot_prompt))
+                        elif level == 2:
+                            t0 = time.monotonic()
+                            active_ctx = self._get_active_code_context(project_id)
+                            facts_ctx = self._get_facts_context(project_id)
+                            context = (
+                                f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                            )
+                            reasoning = await self._generate_cot_reasoning(
+                                cot_question, context
+                            )
+                            if reasoning:
+                                system_injections.append(
+                                    (
+                                        "high",
+                                        f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                                    )
+                                )
+                            _inlet_timing("cot_manual_level2", t0)
+                        elif level == 3:
+                            t0 = time.monotonic()
+                            active_ctx = self._get_active_code_context(project_id)
+                            facts_ctx = self._get_facts_context(project_id)
+                            context = (
+                                f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                            )
+                            reasoning = await self._generate_cot_with_self_reflection(
+                                cot_question, context
+                            )
+                            if reasoning:
+                                system_injections.append(
+                                    (
+                                        "high",
+                                        f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
+                                    )
+                                )
+                            _inlet_timing("cot_manual_level3", t0)
+
+                # Automatic detection (only if no manual /think was used)
+                elif not manual_cot_used:
                     cot_level = self._detect_cot_level(
                         user_content, is_code_session, state
                     )
@@ -6079,7 +6401,7 @@ class Filter:
                         cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                         system_injections.append(("high", cot_prompt))
                     elif cot_level == 2:
-                        t0 = time.monotonic()  # ⏱️
+                        t0 = time.monotonic()
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
@@ -6090,9 +6412,9 @@ class Filter:
                             system_injections.append(
                                 ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
                             )
-                        _inlet_timing("cot_level2_reasoning", t0)  # ⏱️
+                        _inlet_timing("cot_level2_reasoning", t0)
                     elif cot_level == 3:
-                        t0 = time.monotonic()  # ⏱️
+                        t0 = time.monotonic()
                         active_ctx = self._get_active_code_context(project_id)
                         facts_ctx = self._get_facts_context(project_id)
                         context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
@@ -6106,7 +6428,7 @@ class Filter:
                                     f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
                                 )
                             )
-                        _inlet_timing("cot_level3_reflection", t0)  # ⏱️
+                        _inlet_timing("cot_level3_reflection", t0)
 
         # /assume command
         if self.valves.enable_assumption_extraction and last_user_msg:
