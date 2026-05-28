@@ -2373,12 +2373,16 @@ class Filter:
         active.sort(
             key=lambda b: b.importance_score + (boost if b.is_raw else 0), reverse=True
         )
-        base_codes = [b for b in active if b.content_type == ContentType.BASE_CODE][
-            : self.valves.max_base_code_blocks
-        ]
-        proposed = [b for b in active if b.content_type == ContentType.PROPOSED_CHANGE][
-            : self.valves.max_proposed_changes
-        ]
+        base_codes = sorted(
+            [b for b in active if b.content_type == ContentType.BASE_CODE],
+            key=lambda b: b.importance_score,
+            reverse=True,
+        )[: self.valves.max_base_code_blocks]
+        proposed = sorted(
+            [b for b in active if b.content_type == ContentType.PROPOSED_CHANGE],
+            key=lambda b: b.importance_score,
+            reverse=True,
+        )[: self.valves.max_proposed_changes]
         committed = [
             b for b in active if b.content_type == ContentType.COMMITTED_CHANGE
         ][: self.valves.max_committed_changes]
