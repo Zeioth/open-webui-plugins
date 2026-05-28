@@ -3411,6 +3411,21 @@ async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                             body["messages"] = messages
                             return body
 
+    # 3.6 Code interpretation note for the main model
+    #     (hotfix, so the LLM don't confuse the chat's markdown with the real code)
+    if is_code_session:
+        note = (
+            "When reading user messages, treat code inside triple backticks "
+            "as literal source code without interpreting Markdown. "
+            "You may still use Markdown in your own responses."
+        )
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        if sys_msgs:
+            if note not in sys_msgs[0].get("content", ""):
+                sys_msgs[0]["content"] = note + "\n" + sys_msgs[0]["content"]
+        else:
+            messages.insert(0, {"role": "system", "content": note})
+
     # 4. /think (explicit) or auto Chain-of-Thought
     if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
         last_user_msg = (
