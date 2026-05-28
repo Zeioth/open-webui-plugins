@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.5
+version: 5.4.6
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -4933,6 +4933,13 @@ class Filter:
         expanded = await self._expand_symbol_dependencies(func_name, depth, project_id)
         if not expanded:
             return f"No dependencies found for '{func_name}'."
+        # If only the initial symbol is present (no further dependencies)
+        if expanded.count("### ") <= 1:
+            return (
+                f"## Expanded dependencies for `{func_name}` (depth {depth})\n{expanded}\n\n"
+                "[Note: No further dependencies were found for this symbol. "
+                "The language may not be fully supported or the function has no calls.]"
+            )
         return f"## Expanded dependencies for `{func_name}` (depth {depth})\n{expanded}"
 
     async def _expand_symbol_dependencies(
