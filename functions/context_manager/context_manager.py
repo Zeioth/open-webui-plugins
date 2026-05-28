@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.2
+version: 5.4.4
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1070,6 +1070,9 @@ class Filter:
         duplicate_question_lookback_hours: float = Field(
             default=24.0
         )  # <-- Only last 24h
+        expand_default_depth: int = Field(
+            default=2, description="Default depth for /expand command"
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -2272,10 +2275,6 @@ class Filter:
                 self._session_classify_cache[cache_key] = (True, time.time())
             return True
 
-        # ------------------------------------------------------------------
-        # NUEVO: si el mensaje contiene bloques de código delimitados,
-        # es claramente una sesión de código, sin necesidad de LLM.
-        # ------------------------------------------------------------------
         if last_user and "```" in last_user.get("content", ""):
             if cache_key:
                 self._session_classify_cache[cache_key] = (True, time.time())
@@ -4902,6 +4901,54 @@ class Filter:
         else:
             return f"Unknown subcommand: {subcommand}"
 
+    async def _handle_expand_command(self, text: str, project_id: str) -> Optional[str]:
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return "Usage: `/expand [depth] <function_name>`\nExample: `/expand 3 calcularImpuesto`"
+        depth = self.valves.expand_default_depth
+        if parts[1].isdigit():
+            depth = int(parts[1])
+            func_name = parts[2] if len(parts) > 2 else None
+        else:
+            func_name = parts[1]
+        if not func_name:
+            return "Missing function name."
+        expanded = await self._expand_symbol_dependencies(func_name, depth, project_id)
+        if not expanded:
+            return f"No dependencies found for '{func_name}'."
+        return f"## Expanded dependencies for `{func_name}` (depth {depth})\n{expanded}"
+
+    async def _expand_symbol_dependencies(
+        self, name: str, max_depth: int, project_id: str
+    ) -> str:
+        state = self._get_state(project_id)
+        if not state:
+            return ""
+        visited = set()
+        lines = []
+
+        async def recurse(current_name, current_depth):
+            if current_depth > max_depth or current_name in visited:
+                return
+            visited.add(current_name)
+            blocks = self._symbol_index.find_blocks(current_name, project_id)
+            for h in blocks:
+                block = state["active_blocks"].get(h)
+                if block and not block.obsolete:
+                    loc = f" (file: {block.file_path})" if block.file_path else ""
+                    lines.append(
+                        f"### `{current_name}` (depth {current_depth}){loc}\n```\n{block.content[:2000]}\n```"
+                    )
+                    for sym in block.symbols:
+                        if sym.name == current_name:
+                            for callee in sym.calls:
+                                await recurse(callee, current_depth + 1)
+                            break
+                    break
+
+        await recurse(name, 1)
+        return "\n".join(lines)
+
     def _get_facts_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
         if not state or not state["facts"]:
@@ -5640,7 +5687,7 @@ class Filter:
             "content", ""
         ).startswith("/")
 
-        # --- Command routing ---
+        # --- Command routing: /forget (explicit) ---
         if self.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
                 messages, project_id, __user__
@@ -5650,6 +5697,7 @@ class Filter:
                 body["messages"] = messages
                 return body
 
+        # --- Command routing: natural language forget/remember/obsolete ---
         if (
             self.valves.enable_natural_language_forget
             and last_user_msg
@@ -5682,7 +5730,7 @@ class Filter:
                     body["messages"] = messages
                     return body
 
-        # /status command
+        # --- Command routing: /status ---
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip() == "/status"
@@ -5710,7 +5758,7 @@ class Filter:
             body["messages"] = messages
             return body
 
-        # /speculative_stats command
+        # --- Command routing: /speculative_stats ---
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip() == "/speculative_stats"
@@ -5747,7 +5795,7 @@ class Filter:
             body["messages"] = messages
             return body
 
-        # /clean command
+        # --- Command routing: /clean ---
         if (
             last_user_msg
             and last_user_msg.get("content", "").strip().startswith("/clean")
@@ -5763,7 +5811,7 @@ class Filter:
             body["messages"] = messages
             return body
 
-        # /fact command
+        # --- Command routing: /fact ---
         if (
             last_user_msg
             and last_user_msg.get("content", "")
@@ -5781,16 +5829,32 @@ class Filter:
                 body["messages"] = messages
                 return body
 
+        # --- Command routing: /expand (new) ---
+        if last_user_msg and last_user_msg.get("content", "").strip().startswith(
+            "/expand"
+        ):
+            response = await self._handle_expand_command(
+                last_user_msg.get("content", ""), project_id
+            )
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            return body
+
         state = self._get_state(project_id)
         is_code_session = await self._classify_session(messages, project_id)
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
-        # Code interpretation note
+        # Code interpretation note (now also informs about the /expand command)
         if is_code_session:
             note = (
                 "When reading user messages, treat code inside triple backticks "
                 "as literal source code without interpreting Markdown. "
-                "You may still use Markdown in your own responses."
+                "You may still use Markdown in your own responses.\n"
+                "You can use the command `/expand [depth] <function>` to retrieve "
+                "the full code of a function and its callees up to the specified depth. "
+                "Use it when you need to trace a call chain."
             )
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
@@ -5799,7 +5863,7 @@ class Filter:
             else:
                 messages.insert(0, {"role": "system", "content": note})
 
-        # Chain-of-Thought and /think handling (unchanged from original)
+        # Chain-of-Thought and /think handling
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             if last_user_msg:
                 user_content = last_user_msg.get("content", "")
@@ -6007,7 +6071,7 @@ class Filter:
                 messages.insert(0, {"role": "system", "content": ctx})
             body["messages"] = messages
 
-        # ---- Proactive cleanup suggestion (Feature 5, Phase 2) ----
+        # ---- Proactive cleanup suggestion ----
         if (
             self.valves.cleanup_suggestions_enabled
             and self.valves.cleanup_proactive_suggestions
@@ -6294,19 +6358,19 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # --------------------------------------------------------------------------
-        # Ensure active context is ALWAYS at the begining of system message
+        # Ensure active context is ALWAYS at the beginning of the system message
         # --------------------------------------------------------------------------
         if is_code_session and self.valves.enable_code_awareness:
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
                 content = sys_msgs[0].get("content", "")
-                # Search active context's marker.
+                # Search for the active context marker
                 active_marker = "## Currently Active Code Context"
                 idx = content.find(active_marker)
-                if idx > 0:  # no está al principio.
+                if idx > 0:  # not at the beginning
                     before = content[:idx].strip()
                     active_block = content[idx:]
-                    # Search next marker "## " (next section).
+                    # Search for the next "## " marker (next section)
                     next_marker_match = re.search(
                         r"\n## (?!Currently Active Code Context)", active_block
                     )
@@ -6317,10 +6381,13 @@ class Filter:
                             active_section + "\n\n" + before + "\n\n" + after
                         )
                     else:
-                        # The rest of the message is just active context.
+                        # The rest of the message is just active context
                         sys_msgs[0]["content"] = active_block + "\n\n" + before
-                # If idx == 0, it's already the the beginning, we do nothing.
+                # If idx == 0, it's already at the beginning; do nothing.
 
+        # --------------------------------------------------------------------------
+        # Debug log for injected token count
+        # --------------------------------------------------------------------------
         if self.valves.debug:
             total_system_tokens = 0
             for m in messages:
