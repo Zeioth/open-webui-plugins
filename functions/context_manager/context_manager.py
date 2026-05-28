@@ -1077,6 +1077,10 @@ class Filter:
             default=1000,
             description="Maximum number of block change summaries kept in memory per project.",
         )
+        global_injection_token_budget: int = Field(
+            default=0,
+            description="Maximum tokens allowed for all system injections combined (0 = unlimited). Set to e.g. 30% of context window.",
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -5682,6 +5686,7 @@ class Filter:
             if old_state:
                 self._remove_project_from_index_by_id(self._last_project_id, old_state)
             self._cached_lightweight_context.pop(self._last_project_id, None)
+            # Clean change summaries from previous project
             self._block_change_summaries.clear()
         self._last_project_id = project_id
 
@@ -5850,9 +5855,29 @@ class Filter:
             body["messages"] = messages
             return body
 
+        # ----- NO MORE EARLY RETURNS BEYOND THIS POINT -----
+
         state = self._get_state(project_id)
         is_code_session = await self._classify_session(messages, project_id)
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
+
+        # Collect all system injections with priorities (priority, text)
+        # Order of insertion within the same priority is preserved.
+        system_injections = []  # list of (priority, text)
+
+        # ------------------------------------------------------------
+        # Code interpretation note (critical)
+        # ------------------------------------------------------------
+        if is_code_session:
+            note = (
+                "When reading user messages, treat code inside triple backticks "
+                "as literal source code without interpreting Markdown. "
+                "You may still use Markdown in your own responses.\n"
+                "You can use the command `/expand [depth] <function>` to retrieve "
+                "the full code of a function and its callees up to the specified depth. "
+                "Use it when you need to trace a call chain."
+            )
+            system_injections.append(("critical", note))
 
         # ------------------------------------------------------------
         # PARALLEL: Start LTM recovery in background while
@@ -5871,23 +5896,6 @@ class Filter:
                 ltm_future = asyncio.create_task(
                     self._retrieve_all_memories_unified(query, project_id)
                 )
-
-        # Code interpretation note (now also informs about the /expand command)
-        if is_code_session:
-            note = (
-                "When reading user messages, treat code inside triple backticks "
-                "as literal source code without interpreting Markdown. "
-                "You may still use Markdown in your own responses.\n"
-                "You can use the command `/expand [depth] <function>` to retrieve "
-                "the full code of a function and its callees up to the specified depth. "
-                "Use it when you need to trace a call chain."
-            )
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                if note not in sys_msgs[0].get("content", ""):
-                    sys_msgs[0]["content"] = note + "\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": note})
 
         # Chain-of-Thought and /think handling
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
@@ -5918,15 +5926,8 @@ class Filter:
                     and not user_content.strip().startswith("/")
                 ):
                     self._log_debug("Auto-injecting Chain-of-Thought prompt")
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
                     cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                    if sys_msgs:
-                        sys_msgs[0]["content"] = (
-                            cot_prompt + "\n" + sys_msgs[0]["content"]
-                        )
-                    else:
-                        messages.insert(0, {"role": "system", "content": cot_prompt})
-                    body["messages"] = messages
+                    system_injections.append(("high", cot_prompt))
 
         # /assume command
         if self.valves.enable_assumption_extraction and last_user_msg:
@@ -5987,12 +5988,11 @@ class Filter:
                     # Add preserved at the end so they stay in context
                     new_history.extend(preserved)
                     system_msgs = [m for m in messages if m.get("role") == "system"]
-                    # Add a note explaining the context has been replaced
-                    note = {
-                        "role": "system",
-                        "content": "[Context optimized: only relevant history is shown]",
-                    }
-                    messages = system_msgs + [note] + new_history
+                    # The note about context optimization is collected as low priority
+                    system_injections.append(
+                        ("low", "[Context optimized: only relevant history is shown]")
+                    )
+                    messages = system_msgs + new_history
                     body["messages"] = messages
 
         # Parallel checks (contradiction, response cache, duplicate question)
@@ -6004,8 +6004,7 @@ class Filter:
             )
         )
         if contradiction_warning and self.valves.contradiction_inject_warning:
-            messages.insert(0, {"role": "system", "content": contradiction_warning})
-            body["messages"] = messages
+            system_injections.append(("high", contradiction_warning))
         if cached_response:
             messages.append(
                 {"role": "assistant", "content": cached_response["response"]}
@@ -6015,8 +6014,7 @@ class Filter:
             return body
         if duplicate_match:
             warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
-            messages.insert(0, {"role": "system", "content": warn_msg})
-            body["messages"] = messages
+            system_injections.append(("medium", warn_msg))
 
         # Update active code (historical in background, last message synchronously)
         if self.valves.enable_code_awareness and is_code_session:
@@ -6043,7 +6041,6 @@ class Filter:
 
         # ------------------------------------------------------------
         # Get the result of LTM recovery that started in parallel
-        # at the top. If it didn't launc, ltm_future is None.
         # ------------------------------------------------------------
         unique_meta = []
         if ltm_future is not None:
@@ -6055,7 +6052,7 @@ class Filter:
                     seen.add(m["doc"])
                     unique_meta.append(m)
 
-        # Format and inject LTM
+        # Format and inject LTM (high priority)
         max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
         parts = []
         current_tokens = 0
@@ -6086,12 +6083,7 @@ class Filter:
             ctx = header + "\n---\n".join(parts)
             if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
                 ctx += "\n[Some older fragments omitted to fit token budget]"
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": ctx})
-            body["messages"] = messages
+            system_injections.append(("high", ctx))
 
         # ---- Proactive cleanup suggestion ----
         if (
@@ -6111,7 +6103,7 @@ class Filter:
                         f"Type `/status` to review or `/clean` to forget them. "
                         f"(This note is not part of the conversation with the model.)"
                     )
-                    messages.insert(0, {"role": "system", "content": suggestion})
+                    system_injections.append(("medium", suggestion))
                     state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
                     self._set_state(project_id, state)
 
@@ -6170,14 +6162,7 @@ class Filter:
                     "6. Output your reasoning step by step, then provide the corrected code.\n"
                 )
                 active_ctx = checklist + "\n\n" + active_ctx
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        active_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
-                else:
-                    messages.insert(0, {"role": "system", "content": active_ctx})
-                body["messages"] = messages
+                system_injections.append(("critical", active_ctx))
 
         # Code review checklist injection
         if (
@@ -6198,12 +6183,7 @@ class Filter:
                 "5. Ask yourself: what is the worst-case scenario for this code?\n"
                 "6. Output your reasoning step by step, then provide the corrected code.\n"
             )
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
-            else:
-                messages.insert(0, {"role": "system", "content": review_prompt})
-            body["messages"] = messages
+            system_injections.append(("high", review_prompt))
 
         # Inject facts context
         if (
@@ -6213,25 +6193,13 @@ class Filter:
         ):
             facts_ctx = self._get_facts_context(project_id)
             if facts_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
-                else:
-                    messages.insert(0, {"role": "system", "content": facts_ctx})
-                body["messages"] = messages
+                system_injections.append(("high", facts_ctx))
 
         # Confidence scoring
         if self.valves.enable_confidence_scoring and is_code_session:
             total_tokens = self._estimate_tokens(messages)
             if total_tokens > self.valves.context_window_tokens * 0.8:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] += self.valves.confidence_prompt
-                else:
-                    messages.insert(
-                        0, {"role": "system", "content": self.valves.confidence_prompt}
-                    )
-                body["messages"] = messages
+                system_injections.append(("high", self.valves.confidence_prompt))
 
         # Inject feedback context
         if (
@@ -6241,14 +6209,7 @@ class Filter:
         ):
             feedback_ctx = self._get_feedback_context(project_id)
             if feedback_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        feedback_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
-                else:
-                    messages.insert(0, {"role": "system", "content": feedback_ctx})
-                body["messages"] = messages
+                system_injections.append(("high", feedback_ctx))
 
         # Proactive summary suggestion (if context grows too fast)
         system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -6259,14 +6220,12 @@ class Filter:
                 project_id, total_tokens, self.valves.context_window_tokens
             )
             if suggestion:
-                messages.insert(0, {"role": "system", "content": suggestion})
-                body["messages"] = messages
+                system_injections.append(("medium", suggestion))
 
         # Command suggestion (after a certain number of messages without commands)
         cmd_suggestion = await self._suggest_commands(project_id, state)
         if cmd_suggestion:
-            messages.insert(0, {"role": "system", "content": cmd_suggestion})
-            body["messages"] = messages
+            system_injections.append(("medium", cmd_suggestion))
 
         # Adaptive context trim (based on token count or max_turns)
         if self.valves.adaptive_trim:
@@ -6294,14 +6253,10 @@ class Filter:
                         old_block, is_code_context=has_code
                     )
                     if summary:
-                        history_msgs = [
-                            {
-                                "role": "assistant",
-                                "content": f"[Summary of earlier conversation]\n{summary}",
-                            }
-                        ] + kept_block
-                    else:
-                        history_msgs = kept_block
+                        system_injections.append(
+                            ("high", f"[Summary of earlier conversation]\n{summary}")
+                        )
+                    history_msgs = kept_block
                 else:
                     history_msgs = kept_block
 
@@ -6354,14 +6309,10 @@ class Filter:
                         old_block, is_code_context=has_code
                     )
                     if summary:
-                        history_msgs = [
-                            {
-                                "role": "assistant",
-                                "content": f"[Summary of earlier conversation]\n{summary}",
-                            }
-                        ] + kept_block
-                    else:
-                        history_msgs = kept_block
+                        system_injections.append(
+                            ("high", f"[Summary of earlier conversation]\n{summary}")
+                        )
+                    history_msgs = kept_block
                 else:
                     history_msgs = kept_block
 
@@ -6380,32 +6331,51 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # --------------------------------------------------------------------------
-        # Ensure active context is ALWAYS at the beginning of the system message
+        # Assemble system message with token budget
         # --------------------------------------------------------------------------
-        if is_code_session and self.valves.enable_code_awareness:
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            if sys_msgs:
-                content = sys_msgs[0].get("content", "")
-                # Search for the active context marker
-                active_marker = "## Currently Active Code Context"
-                idx = content.find(active_marker)
-                if idx > 0:  # not at the beginning
-                    before = content[:idx].strip()
-                    active_block = content[idx:]
-                    # Search for the next "## " marker (next section)
-                    next_marker_match = re.search(
-                        r"\n## (?!Currently Active Code Context)", active_block
-                    )
-                    if next_marker_match:
-                        active_section = active_block[: next_marker_match.start()]
-                        after = active_block[next_marker_match.start() :]
-                        sys_msgs[0]["content"] = (
-                            active_section + "\n\n" + before + "\n\n" + after
-                        )
-                    else:
-                        # The rest of the message is just active context
-                        sys_msgs[0]["content"] = active_block + "\n\n" + before
-                # If idx == 0, it's already at the beginning; do nothing.
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        base_content = ""
+        if sys_msgs:
+            base_content = sys_msgs[0].get("content", "")
+            # Remove all existing system messages; we will build a single one
+            messages = [m for m in messages if m.get("role") != "system"]
+
+        budget = self.valves.global_injection_token_budget
+        if budget > 0 and self.tokenizer:
+            # Sort by priority: critical=0, high=1, medium=2, low=3
+            priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+            system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected_texts = []
+            total_tokens = 0
+            for prio, text in system_injections:
+                if not text:
+                    continue
+                tokens = len(self.tokenizer.encode(text))
+                if total_tokens + tokens <= budget:
+                    selected_texts.append(text)
+                    total_tokens += tokens
+                else:
+                    # If it's critical or high, try truncating to fit
+                    if prio in ("critical", "high"):
+                        available = budget - total_tokens
+                        if available > 20:  # at least some useful content
+                            truncated = text[: available * 4] + "\n[truncated]"
+                            selected_texts.append(truncated)
+                            total_tokens += len(self.tokenizer.encode(truncated))
+                            break  # stop adding more after a forced truncation
+                    # For medium or low, just skip
+            final_system = "\n\n".join(selected_texts)
+        else:
+            # No budget: use all injections
+            final_system = "\n\n".join(text for _, text in system_injections if text)
+
+        # Combine with any original system content
+        if base_content.strip():
+            final_system = final_system + "\n\n" + base_content
+
+        # Insert as the only system message at the beginning
+        if final_system.strip():
+            messages.insert(0, {"role": "system", "content": final_system})
 
         # --------------------------------------------------------------------------
         # Debug log for injected token count
