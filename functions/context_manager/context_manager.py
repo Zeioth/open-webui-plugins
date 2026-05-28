@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.3.2
+version: 5.3.3
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1140,6 +1140,10 @@ class Filter:
         llm_request_timeout: int = Field(default=300)
         track_active_code_age: bool = Field(default=True)
         active_code_timeout_minutes: int = Field(default=30)
+        recent_activity_window_minutes: int = Field(
+            default=15,
+            description="How many minutes back to consider a file 'recently modified' in the context header.",
+        )
 
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(default="ollama/llama3.2:3b")
@@ -1262,6 +1266,9 @@ class Filter:
         self._last_project_id: str = ""
         self._response_cache_size: int = 0
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+
+        # In‑memory storage for block change summaries (version history)
+        self._block_change_summaries: Dict[str, str] = {}
 
         print("[CodeAware] Filter loaded")
 
@@ -1924,6 +1931,9 @@ class Filter:
                             "query": query[:500],
                             "project_id": self.valves.project_id,
                             "context_hash": context_hash,
+                            "code_state_hash": self._compute_code_state_hash(
+                                self.valves.project_id
+                            ),
                             "timestamp": time.time(),
                         }
                     ],
@@ -1965,6 +1975,18 @@ class Filter:
                 self.valves.response_cache_include_context_hash
                 and meta.get("context_hash", "") != context_hash
             ):
+                return None
+            # Check if code state has changed since caching
+            stored_code_state = meta.get("code_state_hash", "")
+            if (
+                stored_code_state
+                and stored_code_state
+                != self._compute_code_state_hash(self.valves.project_id)
+            ):
+                # Code has changed → invalidate cache
+                await anyio.to_thread.run_sync(
+                    lambda: col.delete(ids=[results["ids"][0][0]])
+                )
                 return None
             ttl = self.valves.response_cache_ttl_hours * 3600
             ts = meta.get("timestamp", 0)
@@ -2329,7 +2351,7 @@ class Filter:
             f"(importance: {block.importance_score:.1f}, modified: {timestamp_str}){aff}{pin}{raw}"
         )
 
-    def _get_active_code_context(self, project_id: str) -> str:
+    def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
@@ -2345,78 +2367,143 @@ class Filter:
         if not active:
             return ""
 
-        # Identify the latest block for each file_path
-        latest_per_file: Dict[str, str] = {}
+        # ── Recent Activity section ────────────────────────────────────
+        recent_window = self.valves.recent_activity_window_minutes * 60
+        recent_files = {}  # file_path -> latest timestamp
         for b in active:
-            if b.file_path and not b.obsolete:
+            if b.file_path:
                 if (
-                    b.file_path not in latest_per_file
-                    or b.timestamp
-                    > active[0].timestamp  # placeholder, will be checked later
+                    b.file_path not in recent_files
+                    or b.timestamp > recent_files[b.file_path]
                 ):
-                    # We need to compare properly, so we'll build a dict of best timestamps
-                    pass
-        # Re‑compute properly
+                    recent_files[b.file_path] = b.timestamp
+
+        recent_lines = []
+        for file_path, ts in recent_files.items():
+            age_seconds = now - ts
+            if age_seconds <= recent_window:
+                minutes_ago = int(age_seconds / 60)
+                time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
+                recent_lines.append(f"- `{file_path}` ({time_str})")
+
+        recent_section = ""
+        if recent_lines:
+            recent_section = (
+                "## Recent Activity (last {} min)\n".format(
+                    self.valves.recent_activity_window_minutes
+                )
+                + "\n".join(recent_lines)
+                + "\n\n"
+            )
+        # ────────────────────────────────────────────────────────────────
+
+        # ── Dynamic relevancy boost ────────────────────────────────────
+        # Extract file paths and symbol names from the user query
+        mentioned_files = set()
+        mentioned_symbols = set()
+        if user_query:
+            mentioned_files = set(re.findall(self.valves.file_path_pattern, user_query))
+            # symbol names: simple words that match known symbol names
+            all_symbol_names = self._symbol_index.get_all_names(project_id)
+            words = set(re.findall(r"\b[\w-]+\b", user_query))
+            mentioned_symbols = all_symbol_names.intersection(words)
+
+        # Boost factor (added to importance for sorting)
+        BOOST = 5.0
+
+        def relevance_boost(block: CodeBlock) -> float:
+            score = 0.0
+            if block.file_path and block.file_path in mentioned_files:
+                score += BOOST
+            # Also check if any symbol of this block is mentioned
+            for sym in block.symbols:
+                if sym.name in mentioned_symbols:
+                    score += BOOST
+                    break  # one symbol match is enough
+            return score
+
+        # Compute boost for each active block
+        boosted_active = []
+        for b in active:
+            boost = relevance_boost(b)
+            boosted_active.append((b, boost))
+
+        # Sort: first by boosted (descending), then by original importance
+        boost_priority = self.valves.raw_file_priority_boost
+        boosted_active.sort(
+            key=lambda pair: (
+                pair[1] > 0,  # boolean: boosted first
+                pair[1],  # boost magnitude
+                pair[0].importance_score + (boost_priority if pair[0].is_raw else 0),
+            ),
+            reverse=True,
+        )
+
+        # Identify latest per file
         latest_per_file = {}
         for b in active:
             if b.file_path:
-                if b.file_path not in latest_per_file:
+                if (
+                    b.file_path not in latest_per_file
+                    or b.timestamp > latest_per_file[b.file_path].timestamp
+                ):
                     latest_per_file[b.file_path] = b
-                elif b.timestamp > latest_per_file[b.file_path].timestamp:
-                    latest_per_file[b.file_path] = b
-        # Now we have the latest block object per file, but we only need its hash for quick lookup
         latest_hashes = {b.hash for b in latest_per_file.values()}
 
-        boost = self.valves.raw_file_priority_boost
-        active.sort(
-            key=lambda b: b.importance_score + (boost if b.is_raw else 0), reverse=True
-        )
-        base_codes = sorted(
-            [b for b in active if b.content_type == ContentType.BASE_CODE],
-            key=lambda b: b.importance_score,
-            reverse=True,
-        )[: self.valves.max_base_code_blocks]
-        proposed = sorted(
-            [b for b in active if b.content_type == ContentType.PROPOSED_CHANGE],
-            key=lambda b: b.importance_score,
-            reverse=True,
-        )[: self.valves.max_proposed_changes]
+        # Build sections
+        base_codes = [
+            b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
+        ][: self.valves.max_base_code_blocks]
+        proposed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.PROPOSED_CHANGE
+        ][: self.valves.max_proposed_changes]
         committed = [
-            b for b in active if b.content_type == ContentType.COMMITTED_CHANGE
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.COMMITTED_CHANGE
         ][: self.valves.max_committed_changes]
         errors = (
-            [b for b in active if b.content_type == ContentType.ERROR][:3]
+            [b for b, _ in boosted_active if b.content_type == ContentType.ERROR][:3]
             if self.valves.preserve_error_context
             else []
         )
 
         parts = ["## Currently Active Code Context (by importance)\n"]
-        # Note about versions
         parts.insert(
             1,
             "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used. Older versions are retained for reference only.\n",
         )
 
+        # Prepend the recent activity section if there is any
+        if recent_section:
+            parts.insert(0, recent_section)
+
         if base_codes:
             parts.append("### Base Code (current work):")
             for b in base_codes:
                 is_latest = b.hash in latest_hashes
-                parts.append(self._format_block_context(b, is_latest))
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
         if proposed:
             parts.append("### Proposed Changes (pending review):")
             for b in proposed:
                 is_latest = b.hash in latest_hashes
-                parts.append(self._format_block_context(b, is_latest))
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
         if committed:
             parts.append("### Recently Committed Changes:")
             for b in committed:
                 is_latest = b.hash in latest_hashes
-                parts.append(self._format_block_context(b, is_latest))
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
         if errors:
             parts.append("### Recent Errors:")
             for b in errors:
                 is_latest = b.hash in latest_hashes
-                parts.append(self._format_block_context(b, is_latest))
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
@@ -2452,6 +2539,17 @@ class Filter:
 
         lines = ["## Code Symbol Index (full bodies available on request)\n"]
 
+        # ── Precompute reverse call graph ─────────────────────────────
+        # called_by[symbol_name] -> set of caller names
+        called_by: Dict[str, Set[str]] = defaultdict(set)
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                for callee in sym.calls:
+                    called_by[callee].add(sym.name)
+        # ────────────────────────────────────────────────────────────────
+
         # Group symbols by file path
         grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
         for block in state["active_blocks"].values():
@@ -2475,15 +2573,25 @@ class Filter:
                     if len(s.calls) > 5:
                         calls_list += f", ... (+{len(s.calls)-5} more)"
                     calls_str = f" → calls: {calls_list}"
+
+                # ── Impact (used by) ───────────────────────────────────
+                used_by = called_by.get(s.name, set())
+                if used_by:
+                    ub_list = ", ".join(sorted(used_by)[:5])
+                    if len(used_by) > 5:
+                        ub_list += f", ... (+{len(used_by)-5} more)"
+                    used_str = f"  ← used by: {ub_list}"
+                else:
+                    used_str = ""
+                # ────────────────────────────────────────────────────────
+
                 summary_str = f"  Summary: {s.summary}" if s.summary else ""
-                # ── Contador de versiones ──────────────────────────────
                 num_versions = len(self._symbol_index.find_blocks(s.name, project_id))
                 version_info = (
                     f" ({num_versions} versions available)" if num_versions > 1 else ""
                 )
-                # ───────────────────────────────────────────────────────
                 lines.append(
-                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{summary_str}{version_info}"
+                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{used_str}{summary_str}{version_info}"
                 )
 
         # Add short previews (first 10 lines) of each non‑obsolete block
@@ -2513,7 +2621,7 @@ class Filter:
         """
         Return the full bodies of code blocks whose symbols appear in the user query.
         Limits to at most 2 blocks when call graph is available, otherwise 5.
-        Also shows a short diff between the latest and previous version for the same file.
+        Also shows a version history with summaries and auto‑expands small dependencies.
         """
         state = self._get_state(project_id)
         has_calls = state.get("has_any_calls", False) if state else False
@@ -2560,42 +2668,109 @@ class Filter:
             if not block:
                 continue
             expanded_hashes.add(block_hash)
+
             loc = f" (file: {block.file_path})" if block.file_path else ""
             parts.append(
                 f"### Block {block.hash[:8]}{loc}\n```\n{block.content[:3000]}\n```"
             )
 
-            # ── Minidiff between latest and previous version (same file) ──
+            # ── Version history ────────────────────────────────────────
             if block.file_path:
-                # Find the most recent non‑obsolete block with the same file path
-                same_file_blocks = [
-                    (h, b)
-                    for h, b in state["active_blocks"].items()
-                    if b.file_path == block.file_path
-                    and not b.obsolete
-                    and h != block_hash
-                ]
-                if same_file_blocks:
-                    # Pick the previous one = the most recent among them
-                    prev_hash, prev_block = max(
-                        same_file_blocks, key=lambda x: x[1].timestamp
+                versions = sorted(
+                    [
+                        b
+                        for b in state["active_blocks"].values()
+                        if b.file_path == block.file_path and not b.obsolete
+                    ],
+                    key=lambda b: b.timestamp,
+                    reverse=True,
+                )
+                if len(versions) > 1:
+                    parts.append(f"\n**Version history ({len(versions)} versions):**")
+                    for v in versions:
+                        ts = datetime.fromtimestamp(
+                            v.timestamp, tz=timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        summary = self._block_change_summaries.get(v.hash, "")
+                        if not summary:
+                            # Fallback: use first line of the block as pseudo‑summary
+                            first_line = v.content.strip().split("\n")[0][:80]
+                            summary = f"(first line: {first_line}...)"
+                        latest = " ← current" if v.hash == block.hash else ""
+                        parts.append(f"- {ts}: {summary}{latest}")
+                    parts.append("")  # blank line
+            # ────────────────────────────────────────────────────────────
+
+        # ── Auto‑expand dependencies ───────────────────────────────────
+        # For each expanded block, look at its symbols' calls and add small callee blocks.
+        MAX_AUTO_EXPANSIONS = 2
+        MAX_CALLEE_TOKENS = 500  # approximate tokens; use cached token count
+        auto_expanded = 0
+
+        for block_hash in list(expanded_hashes):
+            if auto_expanded >= MAX_AUTO_EXPANSIONS:
+                break
+            block = state["active_blocks"].get(block_hash)
+            if not block:
+                continue
+            for sym in block.symbols:
+                if auto_expanded >= MAX_AUTO_EXPANSIONS:
+                    break
+                for callee_name in sym.calls:
+                    if auto_expanded >= MAX_AUTO_EXPANSIONS:
+                        break
+                    callee_hashes = self._symbol_index.find_blocks(
+                        callee_name, project_id
                     )
-                    diff_lines = list(
-                        difflib.unified_diff(
-                            prev_block.content.splitlines(),
-                            block.content.splitlines(),
-                            fromfile=f"{block.file_path}:prev",
-                            tofile=f"{block.file_path}:latest",
-                            lineterm="",
+                    for callee_hash in callee_hashes:
+                        if callee_hash in expanded_hashes:
+                            continue
+                        callee_block = state["active_blocks"].get(callee_hash)
+                        if not callee_block or callee_block.obsolete:
+                            continue
+                        if callee_block._cached_token_count > MAX_CALLEE_TOKENS:
+                            continue
+                        # Add it
+                        expanded_hashes.add(callee_hash)
+                        auto_expanded += 1
+                        loc = (
+                            f" (file: {callee_block.file_path})"
+                            if callee_block.file_path
+                            else ""
                         )
-                    )
-                    if diff_lines:
                         parts.append(
-                            f"\n**Changes from previous version (block {prev_hash[:8]}):**\n"
-                            f"```diff\n" + "\n".join(diff_lines[:20]) + "\n```"
+                            f"\n### Dependency (auto‑expanded): Block {callee_block.hash[:8]}{loc}\n"
+                            f"```\n{callee_block.content[:2000]}\n```"
                         )
+                        break  # only one block per callee name
+        # ────────────────────────────────────────────────────────────────
 
         return "\n".join(parts)
+
+    async def _generate_change_summary(
+        self, block_hash: str, prev_content: str, new_content: str
+    ):
+        """Generate a one‑line summary of what changed between two versions, using a tiny LLM."""
+        if not HAS_AIOHTTP:
+            return
+        model = (
+            self.valves.natural_language_forget_model or self.valves.summarization_model
+        )
+        prompt = (
+            f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
+            f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
+            f"New:\n```\n{new_content[:1000]}\n```\n\n"
+            f"Change summary:"
+        )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a code change summariser. Output only one short sentence.",
+            model_override=model,
+            max_tokens=40,
+            temperature=0.1,
+        )
+        if summary:
+            self._block_change_summaries[block_hash] = summary.strip()
 
     async def _generate_missing_summaries(self, project_id: str):
         if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
@@ -2744,6 +2919,7 @@ class Filter:
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
+                        prev_content = existing.content
                         existing.content = new_block.content
                         existing.hash = new_block.hash
                         if new_block.file_path:
@@ -2778,6 +2954,13 @@ class Filter:
                         self._log_debug(
                             f"Updated existing pinned block {existing.hash} (raw extraction or similar code)"
                         )
+                        # Schedule change summary
+                        if prev_content != new_block.content:
+                            asyncio.create_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                )
+                            )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
@@ -2804,6 +2987,7 @@ class Filter:
                         self._symbol_index.remove_all_for_block(
                             existing.hash, existing.symbols, project_id
                         )
+                        prev_content = existing.content
                         existing.content = new_block.content
                         existing.hash = new_block.hash
                         if new_block.file_path:
@@ -2833,6 +3017,13 @@ class Filter:
                             existing._cached_token_count = len(existing.content) // 4
                         existing._update_importance()
                         self._log_debug(f"Updated existing block {existing.hash}")
+                        # Schedule change summary
+                        if prev_content != new_block.content:
+                            asyncio.create_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                )
+                            )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
@@ -2982,6 +3173,7 @@ class Filter:
                         self._symbol_index.remove_all_for_block(
                             best_base.hash, best_base.symbols, project_id
                         )
+                        prev_content = best_base.content
                         best_base.content = block_info["code"]
                         best_base.hash = hashlib.md5(
                             block_info["code"].encode()
@@ -3016,6 +3208,13 @@ class Filter:
                         self._log_debug(
                             f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
                         )
+                        # Schedule change summary
+                        if prev_content != block_info["code"]:
+                            asyncio.create_task(
+                                self._generate_change_summary(
+                                    best_base.hash, prev_content, block_info["code"]
+                                )
+                            )
                         if (
                             self.valves.enable_dependency_tracking
                             and self.valves.dependency_refresh_on_update
@@ -3198,8 +3397,6 @@ class Filter:
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
-        inlet_start = time.time()
-
         self._ensure_cleanup_task()
         messages = body.get("messages", [])
         project_id = self._get_project_id()
@@ -3557,6 +3754,9 @@ class Filter:
             ]
             total_code_tokens = sum(b._cached_token_count for b in code_blocks)
 
+            # User query for dynamic relevancy boost and lightweight expansion
+            user_query = last_user_msg.get("content", "") if last_user_msg else ""
+
             if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
                 self._log_debug(
                     f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
@@ -3564,9 +3764,7 @@ class Filter:
                 active_ctx = await self._build_lightweight_context(project_id)
 
                 if last_user_msg and not is_structural:
-                    expanded = self._expand_referenced_symbols(
-                        project_id, last_user_msg.get("content", "")
-                    )
+                    expanded = self._expand_referenced_symbols(project_id, user_query)
                     if expanded:
                         active_ctx += "\n" + expanded
                 elif is_structural:
@@ -3579,7 +3777,9 @@ class Filter:
                         "request code bodies.]"
                     )
             else:
-                active_ctx = self._get_active_code_context(project_id)
+                active_ctx = self._get_active_code_context(
+                    project_id, user_query=user_query
+                )
 
             if active_ctx:
                 checklist = (
@@ -3772,11 +3972,6 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
                 self._log_debug("Inserted dummy user message to satisfy API")
 
-        # debug: benchmark results
-        outlet_elapsed = time.time() - outlet_start
-        self._log_debug(f"outlet processing time: {outlet_elapsed:.3f}s")
-
-        # return of inlet
         body["messages"] = messages
         return body
 
@@ -3852,6 +4047,17 @@ class Filter:
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         context_str = "\n".join([m.get("content", "") for m in sys_msgs])
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
+
+    def _compute_code_state_hash(self, project_id: str) -> str:
+        """Compute a hash representing the current state of all active code blocks."""
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        # Use sorted hashes of all non‑obsolete blocks
+        sorted_hashes = sorted(
+            h for h, b in state["active_blocks"].items() if not b.obsolete
+        )
+        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
 
     async def _store_message_in_memory(self, message: dict, project_id: str):
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
