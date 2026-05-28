@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.4.6
+version: 5.4.7
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -5261,28 +5261,134 @@ class Filter:
         )
         return response if response else "Unable to generate reasoning."
 
-    def _should_auto_cot(self, user_content: str) -> bool:
-        """Determine if auto chain-of-thought should be applied."""
-        if len(user_content) < self.valves.auto_cot_min_chars:
-            return False
-        # Trigger for complex questions containing keywords like "explain", "how", "why", "analyze", etc.
-        trigger_words = {
-            "explain",
+    # --------------------------------------------------------------------------
+    #  Chain-of-Thought auto-detection (multi-level)
+    # --------------------------------------------------------------------------
+    def _detect_cot_level(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """
+        Heuristically determine the CoT level needed:
+        0: no extra reasoning
+        1: inline CoT (prompt only)
+        2: auto-CoT with background reasoning call
+        3: auto-CoT with self-reflection (two reasoning calls)
+        """
+        if not user_content:
+            return 0
+
+        # Multi-lingual complexity keywords
+        complex_keywords = {
+            "analyze",
             "how",
             "why",
-            "analyze",
-            "compare",
-            "what is",
-            "describe",
             "implement",
             "design",
+            "architecture",
             "fix",
             "debug",
             "optimize",
             "refactor",
+            "review",
+            "compare",
+            "analiza",
+            "cómo",
+            "por qué",
+            "implementa",
+            "diseña",
+            "arquitectura",
+            "corrige",
+            "depura",
+            "optimiza",
+            "refactoriza",
+            "revisa",
+            "compara",
+            "explain",
+            "explica",
+            "describe",
+            "describir",
         }
+        # Keywords that suggest deep reflection
+        deep_keywords = {
+            "deep",
+            "revisión profunda",
+            "auto-evalúa",
+            "comprueba cada paso",
+            "itera varias veces",
+            "razonamiento exhaustivo",
+            "reflection",
+        }
+
         content_lower = user_content.lower()
-        return any(word in content_lower for word in trigger_words)
+        has_code = "```" in user_content
+        length_ok = len(user_content) >= self.valves.auto_cot_min_chars
+
+        # Count complexity signals
+        signals = 0
+        if any(kw in content_lower for kw in complex_keywords):
+            signals += 1
+        if has_code:
+            signals += 1
+        if length_ok:
+            signals += 1
+        if user_content.count("?") >= 2:
+            signals += 1
+
+        # Deep keywords check
+        if any(kw in content_lower for kw in deep_keywords):
+            return 3
+
+        # If iterative mode is active and the state suggests multiple steps
+        if self.valves.enable_iterative_mode and state.get("iterative_state"):
+            return 3
+
+        # Determine level based on signals
+        if signals >= 3:
+            return 2
+        elif signals >= 2:
+            return 1
+        else:
+            return 0
+
+    async def _generate_cot_reasoning(self, question: str, context: str) -> str:
+        """Generate chain-of-thought reasoning using the configured CoT model."""
+        prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nThink step by step and provide your reasoning:"
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that thinks step by step before answering.",
+            model_override=self.valves.cot_model,
+            max_tokens=self.valves.cot_max_tokens,
+            temperature=0.4,
+        )
+        return response if response else "Unable to generate reasoning."
+
+    async def _generate_cot_with_self_reflection(
+        self, question: str, context: str
+    ) -> str:
+        """Generate reasoning and then self-reflect on it for higher accuracy."""
+        # First pass: reasoning
+        reasoning = await self._generate_cot_reasoning(question, context)
+        if not reasoning or reasoning == "Unable to generate reasoning.":
+            return reasoning
+
+        # Second pass: self-reflection
+        reflection_prompt = (
+            f"Context:\n{context}\n\n"
+            f"Question:\n{question}\n\n"
+            f"Initial reasoning:\n{reasoning}\n\n"
+            "Review the above reasoning. Are there any errors, unverified assumptions, or missing steps? "
+            "Provide a corrected and improved reasoning."
+        )
+        refined = await self._call_llm(
+            prompt=reflection_prompt,
+            system_prompt="You are a critical reviewer. Improve the reasoning provided.",
+            model_override=self.valves.cot_model,
+            max_tokens=self.valves.cot_max_tokens,
+            temperature=0.3,
+        )
+        if refined:
+            return f"{reasoning}\n\n[Self-Reflection]\n{refined}"
+        return reasoning
 
     # --------------------------------------------------------------------------
     #  Assumption extraction helpers
@@ -5910,13 +6016,14 @@ class Filter:
                     self._retrieve_all_memories_unified(query, project_id)
                 )
 
-        # Chain-of-Thought and /think handling
+        # ---------- Chain-of-Thought multi-level auto-detection ----------
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             if last_user_msg:
                 user_content = last_user_msg.get("content", "")
                 if self.valves.enable_cot_on_demand and user_content.strip().startswith(
                     "/think"
                 ):
+                    # Backward compatibility: explicit /think command uses level 2
                     cot_question = await self._parse_cot_intent(user_content)
                     if cot_question:
                         active_ctx = self._get_active_code_context(project_id)
@@ -5933,14 +6040,43 @@ class Filter:
                         messages = self._ensure_last_message_is_user(messages)
                         body["messages"] = messages
                         return body
-                elif (
-                    self.valves.auto_cot_enabled
-                    and self._should_auto_cot(user_content)
-                    and not user_content.strip().startswith("/")
-                ):
-                    self._log_debug("Auto-injecting Chain-of-Thought prompt")
-                    cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                    system_injections.append(("high", cot_prompt))
+                else:
+                    # New multi-level CoT detection
+                    cot_level = self._detect_cot_level(
+                        user_content, is_code_session, state
+                    )
+                    if cot_level > 0:
+                        self._log_debug(f"Activated CoT level {cot_level}")
+                    if cot_level == 1:
+                        cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                        system_injections.append(("high", cot_prompt))
+                    elif cot_level == 2:
+                        # Auto-CoT in background: generate reasoning and inject as system message
+                        active_ctx = self._get_active_code_context(project_id)
+                        facts_ctx = self._get_facts_context(project_id)
+                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        reasoning = await self._generate_cot_reasoning(
+                            user_content, context
+                        )
+                        if reasoning:
+                            system_injections.append(
+                                ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
+                            )
+                    elif cot_level == 3:
+                        # Auto-CoT with self-reflection
+                        active_ctx = self._get_active_code_context(project_id)
+                        facts_ctx = self._get_facts_context(project_id)
+                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        reasoning = await self._generate_cot_with_self_reflection(
+                            user_content, context
+                        )
+                        if reasoning:
+                            system_injections.append(
+                                (
+                                    "high",
+                                    f"**Chain-of-Thought Reasoning (with self-reflection)**\n{reasoning}",
+                                )
+                            )
 
         # /assume command
         if self.valves.enable_assumption_extraction and last_user_msg:
