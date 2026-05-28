@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.5.2
+version: 5.5.3
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -5363,10 +5363,24 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Chain-of-Thought auto-detection (multi-level)
     # --------------------------------------------------------------------------
-    def _detect_cot_level_heuristic(
+    async def _detect_cot_level(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
-        """Original static keyword-based detection (used as fallback)."""
+        """
+        Heuristically determine the CoT level needed.
+        If enable_cot_llm_detection is True, delegates the decision to a lightweight LLM.
+        Otherwise, uses static multi‑lingual keywords and complexity signals.
+        """
+        if not user_content:
+            return 0
+
+        # If LLM-based detection is enabled, use the model to decide
+        if self.valves.enable_cot_llm_detection:
+            return await self._detect_cot_level_via_llm(
+                user_content, is_code_session, state
+            )
+
+        # ---- Static heuristic (original) ----
         complex_keywords = {
             "analyze",
             "how",
@@ -5616,40 +5630,44 @@ class Filter:
         else:
             return 0
 
-    async def _detect_cot_level_via_llm(
-        self, user_content: str, is_code_session: bool, state: dict
-    ) -> int:
-        """
-        Use a lightweight LLM to determine the CoT level (0-3).
-        This method is called only when enable_cot_llm_detection is True.
-        """
-        prompt = (
-            f"The user is working on a {'code' if is_code_session else 'general'} task.\n"
-            f"User message:\n{user_content[:500]}\n\n"
-            "Decide the depth of Chain-of-Thought reasoning needed:\n"
-            "0 = none (simple fact, greeting, trivial)\n"
-            "1 = basic (ask to think step by step internally)\n"
-            "2 = moderate (generate reasoning automatically)\n"
-            "3 = deep (generate reasoning + self-critique)\n\n"
-            "Respond with only the digit 0, 1, 2, or 3."
-        )
-        try:
-            response = await self._try_llm_quick(
-                prompt=prompt,
-                system_prompt="You are a classifier. Output only a single digit.",
-                model_override=self.valves.cot_detection_model,
-                max_tokens=2,
-                temperature=0.0,
-                timeout=5.0,
-            )
-            if response and response.strip().isdigit():
-                level = int(response.strip())
-                if 0 <= level <= 3:
-                    return level
-        except Exception as e:
-            self._log_debug(f"LLM CoT detection failed, falling back to heuristic: {e}")
 
-        return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+async def _detect_cot_level_via_llm(
+    self, user_content: str, is_code_session: bool, state: dict
+) -> int:
+    """
+    Use a lightweight LLM to determine the CoT level (0-3).
+    This method is called only when enable_cot_llm_detection is True.
+    """
+    t0 = time.monotonic()
+    prompt = (
+        f"The user is working on a {'code' if is_code_session else 'general'} task.\n"
+        f"User message:\n{user_content[:500]}\n\n"
+        "Decide the depth of Chain-of-Thought reasoning needed:\n"
+        "0 = none (simple fact, greeting, trivial)\n"
+        "1 = basic (ask to think step by step internally)\n"
+        "2 = moderate (generate reasoning automatically)\n"
+        "3 = deep (generate reasoning + self-critique)\n\n"
+        "Respond with only the digit 0, 1, 2, or 3."
+    )
+    try:
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt="You are a classifier. Output only a single digit.",
+            model_override=self.valves.cot_detection_model,
+            max_tokens=2,
+            temperature=0.0,
+            timeout=5.0,
+        )
+        if response and response.strip().isdigit():
+            level = int(response.strip())
+            if 0 <= level <= 3:
+                self._log_timing("cot_detection_llm", t0)  # ← añadido
+                return level
+    except Exception as e:
+        self._log_debug(f"LLM CoT detection failed, falling back to heuristic: {e}")
+
+    self._log_timing("cot_detection_llm_fallback", t0)  # ← también en caso de fallo
+    return self._detect_cot_level_heuristic(user_content, is_code_session, state)
 
     async def _generate_cot_reasoning(self, question: str, context: str) -> str:
         """Generate chain-of-thought reasoning using the configured CoT level 2 model."""
@@ -6407,7 +6425,7 @@ class Filter:
 
                 # Automatic detection (only if no manual /think was used)
                 elif not manual_cot_used:
-                    cot_level = self._detect_cot_level(
+                    cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
                     )
                     if cot_level > 0:
