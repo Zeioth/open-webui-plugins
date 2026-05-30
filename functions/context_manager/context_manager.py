@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 5.6.0
 license: GPL3
-requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
+requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
 
 import os
@@ -19,7 +19,7 @@ import ast
 from collections import OrderedDict, defaultdict, Counter
 import json
 import asyncio
-import difflib
+import difflib  # For the future → To allow users to do diff between codes without needing for an LLM.
 import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union, Set
@@ -1289,7 +1289,6 @@ class Filter:
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
-        self._llm_cache_ttl = self.valves.LLM_CACHE_TTL
 
         self._hierarchical_compress_in_progress: Dict[str, bool] = {}
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
@@ -1772,9 +1771,6 @@ class Filter:
 
         return _MinimalLRU(max_size, ttl)
 
-    def _clean_llm_cache(self):
-        pass
-
     async def _call_llm(
         self,
         prompt: str,
@@ -1785,6 +1781,7 @@ class Filter:
     ) -> Optional[str]:
         if not HAS_AIOHTTP:
             return None
+
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -1798,6 +1795,9 @@ class Filter:
                 is_producer = True
         if not is_producer:
             return await future
+
+        # Solo el productor mide el tiempo
+        t_start = time.monotonic()
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
             api_token = self.valves.LLM_API_TOKEN.strip() or None
@@ -1812,6 +1812,7 @@ class Filter:
                 if m and m not in seen:
                     models_to_try.append(m)
                     seen.add(m)
+
             max_retries = 2
             base_delay = 1.0
             for model in models_to_try:
@@ -1821,7 +1822,9 @@ class Filter:
                 cached = await self._llm_cache.get(cache_key)
                 if cached is not None:
                     future.set_result(cached)
+                    self._log_timing(f"LLM/{model} (cached)", t_start, time.monotonic())
                     return cached
+
                 if _SHARED_RESOURCES_AVAILABLE:
                     from shared_resources import call_llm as _shared_call_llm
 
@@ -1841,9 +1844,12 @@ class Filter:
                             if content:
                                 await self._llm_cache.set(cache_key, content)
                                 future.set_result(content)
+                                self._log_timing(
+                                    f"LLM/{model}", t_start, time.monotonic()
+                                )
                                 return content
                         except asyncio.CancelledError:
-                            raise  # dejar que se propague
+                            raise
                         except RuntimeError as exc:
                             status_hint = str(exc)
                             if any(
@@ -1860,6 +1866,7 @@ class Filter:
                                 continue
                             break
                     continue
+
                 try:
                     http_session = await _shared_get_http_session(
                         self.valves.llm_request_timeout
@@ -1868,6 +1875,7 @@ class Filter:
                     http_session = self._http_session
                 if http_session is None:
                     continue
+
                 for attempt in range(max_retries + 1):
                     try:
                         async with self._llm_semaphore:
@@ -1931,6 +1939,9 @@ class Filter:
                                         content = content.strip()
                                     await self._llm_cache.set(cache_key, content)
                                     future.set_result(content)
+                                    self._log_timing(
+                                        f"LLM/{model}", t_start, time.monotonic()
+                                    )
                                     return content
                                 elif resp.status in (429, 500, 502, 503, 504):
                                     if attempt < max_retries:
@@ -1940,17 +1951,24 @@ class Filter:
                                 else:
                                     break
                     except asyncio.CancelledError:
-                        raise  # propagar cancelación
+                        raise
                     except (aiohttp.ClientError, asyncio.TimeoutError):
                         if attempt < max_retries:
                             await asyncio.sleep(base_delay * (2**attempt))
                             continue
+
+            # Si ningún modelo funcionó
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
+            fallback_model = models_to_try[0] if models_to_try else "unknown"
+            self._log_timing(
+                f"LLM/{fallback_model} (failed)", t_start, time.monotonic()
+            )
             return None
+
         except asyncio.CancelledError:
             future.cancel()
-            raise  # importante: re‑lanzar después de cancelar el futuro
+            raise
         except Exception as e:
             future.set_exception(e)
             raise
@@ -3372,91 +3390,6 @@ class Filter:
         self._log_timing("store_memory_total", total_dur, total_dur)
         self._log_debug(f"Stored message {msg_id} in LTM")
 
-    async def _compress_ltm_for_conversation(self, project_id: str):
-        if not HAS_AIOHTTP or not self.memory_collection:
-            return
-        try:
-            results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.get(
-                    where={"$and": [{"project_id": {"$eq": project_id}}]}
-                )
-            )
-            if (
-                not results
-                or len(results["ids"]) < self.valves.ltm_compress_after_messages
-            ):
-                return
-            ids = results["ids"]
-            docs = results["documents"]
-            metadatas = results["metadatas"]
-            pairs = sorted(
-                zip(ids, docs, metadatas), key=lambda x: x[2].get("timestamp", 0)
-            )
-            to_compress = pairs[: max(len(pairs) // 3, 5)]
-            if len(to_compress) < 2:
-                return
-            max_chars = 3000
-            prompt_template = "Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{text}"
-            overhead = len(prompt_template.format(text=""))
-            batches = []
-            current_batch = []
-            current_len = 0
-            for entry in to_compress:
-                entry_len = len(entry[1])
-                if current_len + entry_len > max_chars - overhead and current_batch:
-                    batches.append(current_batch)
-                    current_batch = []
-                    current_len = 0
-                current_batch.append(entry)
-                current_len += entry_len
-            if current_batch:
-                batches.append(current_batch)
-            all_summaries = []
-            ids_to_delete = []
-            for batch in batches:
-                texts = "\n---\n".join([doc for _, doc, _ in batch])
-                prompt = prompt_template.format(text=texts[: max_chars - overhead])
-                summary = await self._call_llm(
-                    prompt=prompt,
-                    system_prompt="You produce concise, information-dense summaries.",
-                    max_tokens=500,
-                    temperature=0.3,
-                )
-                if summary:
-                    all_summaries.append(summary)
-                    ids_to_delete.extend([id for id, _, _ in batch])
-            if not ids_to_delete:
-                return
-            await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.delete(ids=ids_to_delete)
-            )
-            combined_summary = "\n---\n".join(all_summaries)
-            if len(combined_summary) > 2000:
-                combined_summary = combined_summary[:2000] + "\n[summary truncated]"
-            summary_id = f"{project_id}_summary_{int(time.time())}"
-            summary_embedding = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode(combined_summary).tolist()
-            )
-            await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.upsert(
-                    ids=[summary_id],
-                    embeddings=[summary_embedding],
-                    metadatas=[
-                        {
-                            "project_id": project_id,
-                            "is_summary": True,
-                            "timestamp": time.time(),
-                        }
-                    ],
-                    documents=[combined_summary],
-                )
-            )
-            self._log_debug(
-                f"Compressed {len(ids_to_delete)} messages into summary for {project_id}"
-            )
-        except Exception as e:
-            logger.warning(f"LTM compression failed: {e}")
-
     async def _retrieve_all_memories_unified(
         self, query: str, project_id: str
     ) -> List[Dict[str, Any]]:
@@ -4363,7 +4296,6 @@ class Filter:
                 self._set_state(project_id, state)
 
         asyncio.create_task(self._purge_expired_memories())
-        self._clean_llm_cache()
 
         self._write_counter += 1
         if self._write_counter % 100 == 0:
