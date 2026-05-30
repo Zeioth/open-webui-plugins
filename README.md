@@ -34,3 +34,6 @@ My current system prompt:
   `{"name": "Inline Visualizer V2", "parameters": {"code": "graph TD; A-->B"}}`
   No envuelvas el JSON en bloques de código. No escribas ningún otro texto junto con el JSON.
 ```
+
+## TODOS
+- For diffs, it might be a good idea to use a python library instead of the LLM. If we integrate this no the context manager, we can expect a speed improvement of orders of magnitune.
