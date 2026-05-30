@@ -957,8 +957,10 @@ class Filter:
             default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
         )
 
-        max_code_block_tokens: int = Field(default=20000)
-        code_block_overflow_action: str = Field(default="summarize")
+        max_code_block_tokens: int = Field(default=0)
+        code_block_overflow_action: str = Field(
+            default="warn"
+        )  # admits summarize, truncate, warn
         code_block_summary_model: str = Field(default="ollama/llama3.2:3b")
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -1015,7 +1017,7 @@ class Filter:
             default="ollama/Inference/Schematron:3B"
         )
         LLM_MAX_CONCURRENT_CALLS: int = Field(
-            default=3,
+            default=2,
             ge=1,
             le=10,
             description="Max simultaneous LLM calls for summarization, filtering, etc.",
@@ -1290,6 +1292,9 @@ class Filter:
         self._project_locks: dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
+        self._low_priority_llm_semaphore = asyncio.Semaphore(
+            1
+        )  # for non urgen background tasks
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
@@ -1782,6 +1787,7 @@ class Filter:
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
+        semaphore: asyncio.Semaphore = None,  # <-- nuevo parámetro
     ) -> Optional[str]:
         if not HAS_AIOHTTP:
             return None
@@ -1816,6 +1822,9 @@ class Filter:
                     models_to_try.append(m)
                     seen.add(m)
 
+            # Usar el semáforo adecuado
+            effective_semaphore = semaphore or self._llm_semaphore
+
             max_retries = 2
             base_delay = 1.0
             for model in models_to_try:
@@ -1835,7 +1844,7 @@ class Filter:
 
                     for attempt in range(max_retries + 1):
                         try:
-                            async with self._llm_semaphore:
+                            async with effective_semaphore:  # <-- aquí
                                 content = await _shared_call_llm(
                                     prompt=prompt,
                                     system=system_prompt,
@@ -1883,7 +1892,7 @@ class Filter:
 
                 for attempt in range(max_retries + 1):
                     try:
-                        async with self._llm_semaphore:
+                        async with effective_semaphore:  # <-- aquí
                             model_name = (
                                 model.split("/", 1)[1]
                                 if is_ollama and model.startswith("ollama/")
@@ -1962,7 +1971,7 @@ class Filter:
                             await asyncio.sleep(base_delay * (2**attempt))
                             continue
 
-            # If no other model worked
+            # Si ningún modelo funcionó
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
             fallback_model = models_to_try[0] if models_to_try else "unknown"
@@ -2263,7 +2272,6 @@ class Filter:
                             )
                         else:
                             lang = await self._infer_code_language(raw)
-                            # _infer_code_language ya loguea internamente
                             if lang == "unknown":
                                 self._log_debug(
                                     "LLM language detection also failed; block will be treated as generic text"
@@ -2280,6 +2288,7 @@ class Filter:
                         code = raw
                         block_type = "indented"
 
+                    # Oversized handling only for normal blocks (not for raw detection)
                     code = await self._handle_oversized_code_block(code, lang)
                     blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
@@ -2335,7 +2344,8 @@ class Filter:
             return blocks, spans
 
         blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
-        # Ahora procesar oversized blocks para cada uno (necesitan await)
+
+        # ---- Oversized handling for regex blocks ----
         for i in range(len(blocks)):
             blocks[i]["code"] = await self._handle_oversized_code_block(
                 blocks[i]["code"], blocks[i]["language"]
@@ -2351,7 +2361,15 @@ class Filter:
             lang = await self._infer_code_language(content)
             dur_raw = time.monotonic() - t_raw_start
             if lang != "unknown":
-                blocks.append({"language": lang, "code": content, "type": "indented"})
+                # Mark as raw so the full body is preserved during injection
+                blocks.append(
+                    {
+                        "language": lang,
+                        "code": content,
+                        "type": "indented",
+                        "is_raw": True,
+                    }
+                )
                 spans.append((0, len(content)))
                 self._log_debug(
                     f"Raw code detected via LLM as {lang}. Detection took {dur_raw:.3f}s."
@@ -2949,6 +2967,9 @@ class Filter:
                 potentially_affected=False,
                 pinned=False,
                 obsolete=False,
+                is_raw=block_info.get(
+                    "is_raw", False
+                ),  # <-- Preserve raw flag from extraction
             )
             if "[KEEP]" in content:
                 new_block.is_raw = True
@@ -3572,10 +3593,21 @@ class Filter:
 
             docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
 
+            # ── Normalize tuples to exactly 3 elements: (doc, score, timestamp) ──
+            # After reranking, tuples contain (doc, score, ts). Without reranking,
+            # they contain (doc, score, ts, meta). The return needs 3 elements.
+            normalized = []
+            for entry in docs_with_meta:
+                if len(entry) == 4:
+                    doc, score, ts, _ = entry
+                else:
+                    doc, score, ts = entry
+                normalized.append((doc, score, ts))
+
             total_dur = time.monotonic() - t_start
             self._log_timing("ltm_retrieval_total_internal", total_dur, total_dur)
 
-            return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
+            return [{"doc": doc, "timestamp": ts} for doc, _, ts in normalized]
         except Exception as e:
             logger.warning(f"Unified memory retrieval failed: {e}")
             return []
@@ -6714,6 +6746,17 @@ class Filter:
 
         self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
+        # ------------------------------------------------------------------
+        # PROCESS THE LAST USER MESSAGE NOW so that active_blocks are populated
+        # before we build the system prompt.
+        # ------------------------------------------------------------------
+        if self.valves.enable_code_awareness and is_code_session:
+            last_idx = len(messages) - 1
+            t0 = time.monotonic()
+            await self._update_active_code(messages[last_idx], project_id)
+            _inlet_timing("update_active_code_last", t0)
+            self._last_processed_message_idx[project_id] = last_idx
+
         system_injections = []  # list of (priority, text)
         manual_cot_used = False
         cot_any_used = False
@@ -7011,33 +7054,6 @@ class Filter:
             warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
             system_injections.append(("medium", warn_msg))
 
-        # Update active code (historical in background, last message synchronously)
-        if self.valves.enable_code_awareness and is_code_session:
-            last_idx = len(messages) - 1
-            start_idx = max(0, self._last_processed_message_idx.get(project_id, -1) + 1)
-            if start_idx < last_idx:
-
-                async def _process_historical(msgs, start, end, pid):
-                    for i in range(start, end):
-                        await self._update_active_code(msgs[i], pid)
-
-                task = asyncio.create_task(
-                    _process_historical(messages, start_idx, last_idx, project_id)
-                )
-                task.add_done_callback(
-                    lambda t: (
-                        self._log_debug(f"Historical update error: {t.exception()}")
-                        if t.exception()
-                        else None
-                    )
-                )
-
-            t0 = time.monotonic()
-            await self._update_active_code(messages[last_idx], project_id)
-            _inlet_timing("update_active_code_last", t0)
-
-            self._last_processed_message_idx[project_id] = last_idx
-
         # ------------------------------------------------------------
         # LTM retrieval (wait for background task if any)
         # ------------------------------------------------------------
@@ -7109,7 +7125,7 @@ class Filter:
                     self._set_state(project_id, state)
 
         # ------------------------------------------------------------
-        # Inject active code context
+        # Inject active code context (lightweight or full)
         # ------------------------------------------------------------
         if is_code_session and self.valves.enable_code_awareness:
             is_structural = last_user_msg and await self._is_structural_task(
@@ -7486,6 +7502,7 @@ class Filter:
                         model_override=self.valves.summarization_model,
                         max_tokens=50,
                         temperature=0.1,
+                        semaphore=self._low_priority_llm_semaphore,  # <-- usar semáforo separado
                     )
                 )
             responses = await asyncio.gather(*tasks, return_exceptions=True)
