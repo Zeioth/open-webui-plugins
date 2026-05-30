@@ -1112,6 +1112,10 @@ class Filter:
             default=True,
             description="When in lightweight mode, proactively expand symbols needed by the user query.",
         )
+        smart_pre_expand_min_tokens: int = Field(
+            default=2000,
+            description="Maximum tokens injected by the minimum expansion fallback. 0 = unlimited.",
+        )
         smart_pre_expand_max_tokens: int = Field(
             default=0,
             description="Max tokens to inject via smart pre-expansion. 0 = unlimited.",
@@ -1994,7 +1998,7 @@ class Filter:
         self,
         prompt: str,
         system_prompt: str,
-        timeout: float = 8.0,
+        timeout: float = 300,
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
@@ -2399,15 +2403,12 @@ class Filter:
             f"```\n{code_snippet[:800]}\n```"
         )
         try:
-            response = await asyncio.wait_for(
-                self._call_llm(
-                    prompt=prompt,
-                    system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
-                    model_override=self.valves.smart_pre_expand_model,
-                    max_tokens=10,
-                    temperature=0.0,
-                ),
-                timeout=4.0,
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
+                model_override=self.valves.smart_pre_expand_model,
+                max_tokens=10,
+                temperature=0.0,
             )
             dur = time.monotonic() - t_start
             if response:
@@ -2442,12 +2443,8 @@ class Filter:
                     f"[LangDetect] method=llm, result=unknown (empty response), dur={dur:.3f}s"
                 )
                 return "unknown"
-        except asyncio.TimeoutError:
-            dur = time.monotonic() - t_start
-            self._log_debug(
-                f"[LangDetect] method=llm, result=unknown (timeout), dur={dur:.3f}s"
-            )
-            return "unknown"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             dur = time.monotonic() - t_start
             self._log_debug(
@@ -2598,7 +2595,6 @@ class Filter:
                 model_override=model,
                 max_tokens=3,
                 temperature=0.0,
-                timeout=5.0,
             )
             result = bool(response and response.strip().lower().startswith("yes"))
         if cache_key:
@@ -5271,7 +5267,7 @@ class Filter:
              full-code access. If similarity >= threshold, expand all symbols.
           C) Optional LLM‑based detection for ambiguous cases.
           D) Fallback: always expand a minimum number of important symbols
-             if nothing else was injected.
+             if nothing else was injected, but capped at smart_pre_expand_min_tokens.
 
         Expanded code is appended to the system context before the LLM sees it,
         so the assistant never has to ask for /expand.
@@ -5291,6 +5287,7 @@ class Filter:
 
         effective_budget = token_budget or self.valves.smart_pre_expand_max_tokens
         needed_symbols: Set[str] = set()
+        used_minimum_expansion = False  # tracks if we had to fall back to strategy D
 
         # --- A) Direct mention of symbol names in the user query ---
         words = set(re.findall(r"\b\w+\b", user_query))
@@ -5310,7 +5307,6 @@ class Filter:
                             [user_query], convert_to_numpy=True
                         )[0]
                     )
-                    # Simple cache eviction
                     if (
                         len(self._query_embedding_cache)
                         >= self._query_embedding_cache_max_size
@@ -5320,7 +5316,6 @@ class Filter:
                         )
                     self._query_embedding_cache[query_hash] = query_emb
 
-                # Cosine similarity against all intent prototypes
                 similarities = np.dot(self._full_code_intent_embeddings, query_emb) / (
                     np.linalg.norm(self._full_code_intent_embeddings, axis=1)
                     * np.linalg.norm(query_emb)
@@ -5357,7 +5352,6 @@ class Filter:
                 model_override=self.valves.smart_pre_expand_model,
                 max_tokens=100,
                 temperature=0.0,
-                timeout=8.0,
             )
             if response and response.strip().lower() != "none":
                 detected = {
@@ -5370,23 +5364,40 @@ class Filter:
 
         # --- D) Minimum expansion fallback ---
         if not needed_symbols and self.valves.smart_pre_expand_min_symbols > 0:
+            used_minimum_expansion = True
             self._log_debug(
                 "smart_pre_expand: no symbols detected, using minimum expansion"
             )
-            # Grab the most important non‑obsolete blocks
+            min_token_budget = self.valves.smart_pre_expand_min_tokens
             top_blocks = sorted(
                 state["active_blocks"].values(),
                 key=lambda b: b.importance_score,
                 reverse=True,
-            )[: self.valves.smart_pre_expand_min_symbols]
+            )
+            tokens_added = 0
             for block in top_blocks:
+                if min_token_budget > 0 and tokens_added >= min_token_budget:
+                    break
+                block_tokens = block._cached_token_count or (len(block.content) // 4)
                 for sym in block.symbols:
                     if sym.name in all_names:
                         needed_symbols.add(sym.name)
+                tokens_added += block_tokens
 
         if not needed_symbols:
             self._log_debug("smart_pre_expand: no symbols to expand")
             return ""
+
+        # If we are in minimum expansion, enforce its own token cap.
+        # This ensures that when no specific symbols were requested, we don't
+        # flood the context with huge code blocks.
+        if used_minimum_expansion and self.valves.smart_pre_expand_min_tokens > 0:
+            if effective_budget == 0:
+                effective_budget = self.valves.smart_pre_expand_min_tokens
+            else:
+                effective_budget = min(
+                    effective_budget, self.valves.smart_pre_expand_min_tokens
+                )
 
         self._log_debug(
             f"smart_pre_expand: expanding {len(needed_symbols)} symbol(s): "
@@ -5776,7 +5787,6 @@ class Filter:
             model_override=model,
             max_tokens=3,
             temperature=0.0,
-            timeout=6.0,
         )
         dur = time.monotonic() - t0
         self._log_timing("detect_contradictions_llm", dur, dur)
@@ -5982,7 +5992,6 @@ class Filter:
                 model_override=self.valves.cot_detection_model,
                 max_tokens=2,
                 temperature=0.0,
-                timeout=30.0,
             )
             if response and response.strip().isdigit():
                 level = int(response.strip())
