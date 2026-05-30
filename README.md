@@ -17,3 +17,6 @@ My current system prompt:
 
 ## TODOS
 - For diffs, it might be a good idea to use a python library instead of the LLM. If we integrate this no the context manager, we can expect a speed improvement of orders of magnitune.
+
+## NOTES
+- It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
