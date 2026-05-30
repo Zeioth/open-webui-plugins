@@ -20,7 +20,7 @@ My current system prompt:
 
 ## Al generar gráficos
 - Asegúrate de que los colores que elijas destaquen bien sobre un fondo de pantalla negro puro.
-- Asegurate de dejar un poco de margen para no solapar elementos.
+- Asegúrate de dejar un poco de margen para no solapar elementos.
 ```
 
 ## TODOS
