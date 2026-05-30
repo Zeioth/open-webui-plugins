@@ -5,10 +5,6 @@ All my openwebui plugins. So we can have a shared library for further optimizati
 My current system prompt:
 
 ```
-## Razonamiento
-- Asegúrate de no caer en loops de razonamiento.
-- Asegúrate de responder.
-
 ## Búsquedas web
 - El contenido de búsquedas web ya viene procesado. **No menciones la herramienta usada** en tu respuesta.
 - Complementa con conocimiento interno cuando sea adecuado.
