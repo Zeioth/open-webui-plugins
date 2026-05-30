@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.5.5
+version: 5.6.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -20,6 +20,7 @@ from collections import OrderedDict, defaultdict, Counter
 import json
 import asyncio
 import difflib
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union, Set
 from enum import Enum
@@ -490,8 +491,6 @@ class SignatureExtractor:
 
         try:
             loop = asyncio.get_event_loop()
-            # Llama a _parse_sync, que crea un parser NUEVO dentro del hilo,
-            # evitando el error de "unsendable".
             tree = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, SignatureExtractor._parse_sync, code.encode(), lang
@@ -799,7 +798,7 @@ class Filter:
 
     class Valves(BaseModel):
         priority: int = Field(default=0)
-        max_turns: int = Field(default=20)
+        max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
@@ -811,7 +810,7 @@ class Filter:
         long_term_memory_expiration_days: int = Field(default=30)
         long_term_memory_top_k: int = Field(default=10)
         long_term_memory_similarity_threshold: float = Field(default=0.65)
-        ltm_time_decay_hours: float = Field(default=24.0)
+        ltm_time_decay_hours: float = Field(default=12.0)
         enable_reranking: bool = Field(default=False)
         reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
         reranker_top_k: int = Field(default=5)
@@ -844,7 +843,7 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
         )
         cot_max_tokens: int = Field(default=1000)
         cot_model_level2: str = Field(
@@ -864,13 +863,13 @@ class Filter:
             description="Model used to detect the appropriate CoT level when enable_cot_llm_detection is active.",
         )
 
-        enable_assumption_extraction: bool = Field(default=False)
+        enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
         )
         enable_contradiction_detection: bool = Field(default=False)
         contradiction_detection_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
         )
         contradiction_inject_warning: bool = Field(default=True)
         proactive_context_warning_threshold: float = Field(default=0.85)
@@ -889,10 +888,10 @@ class Filter:
         iterative_max_steps: int = Field(default=10)
         iterative_diff_format: str = Field(default="unified")
         iterative_planning_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
         )
         iterative_execution_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
         )
         iterative_resume_command: str = Field(default="/iterate resume")
         natural_language_iterate: bool = Field(default=True)
@@ -999,7 +998,7 @@ class Filter:
 
         llm_request_timeout: int = Field(default=300)
         track_active_code_age: bool = Field(default=True)
-        active_code_timeout_minutes: int = Field(default=30)
+        active_code_timeout_minutes: int = Field(default=45)
         recent_activity_window_minutes: int = Field(
             default=15,
             description="How many minutes back to consider a file 'recently modified' in the context header.",
@@ -1011,7 +1010,7 @@ class Filter:
         llm_model: str = Field(default="ollama/llama3.2:3b")
 
         enable_forget_command: bool = Field(default=True)
-        enable_natural_language_forget: bool = Field(default=False)
+        enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
             default="ollama/Inference/Schematron:3B"
         )
@@ -1030,7 +1029,7 @@ class Filter:
         )
 
         huge_injection_threshold_tokens: int = Field(
-            default=100000,
+            default=25000,
             description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
         )
         enable_call_graph_extraction: bool = Field(
@@ -1059,7 +1058,7 @@ class Filter:
         ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
 
         # Proactive cleanup
-        cleanup_suggestions_enabled: bool = Field(default=False)
+        cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
         cleanup_excluded_content_types: list = Field(
             default_factory=lambda: ["BASE_CODE"]
@@ -1070,7 +1069,7 @@ class Filter:
         cleanup_command_enabled: bool = Field(default=True)
 
         # Speculative preload
-        speculative_log_missed_opportunities: bool = Field(default=False)
+        speculative_log_missed_opportunities: bool = Field(default=True)
         speculative_preload_enabled: bool = Field(default=False)
         speculative_preload_max_tokens_percent: float = Field(default=0.10)
         speculative_preload_max_dependencies: int = Field(default=2)
@@ -1097,6 +1096,61 @@ class Filter:
         global_injection_token_budget: int = Field(
             default=0,
             description="Maximum tokens allowed for all system injections combined (0 = unlimited). Set to e.g. 30% of context window.",
+        )
+
+        full_code_injection_budget_percent: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description="Percentage of the global injection token budget to use for full-code injection when a code review is requested.",
+        )
+
+        # Smart pre-expansion – proactively inject full code bodies before the LLM sees the prompt
+        smart_pre_expand_enabled: bool = Field(
+            default=True,
+            description="When in lightweight mode, proactively expand symbols needed by the user query.",
+        )
+        smart_pre_expand_max_tokens: int = Field(
+            default=0,
+            description="Max tokens to inject via smart pre-expansion. 0 = unlimited.",
+        )
+        smart_pre_expand_use_llm: bool = Field(
+            default=True,
+            description="Use a small LLM to identify which symbols need expansion (slower but more accurate).",
+        )
+        smart_pre_expand_model: str = Field(
+            default="ollama/llama3.2:3b",
+            description="Model used for smart pre-expansion symbol detection.",
+        )
+        smart_pre_expand_full_if_no_match: bool = Field(
+            default=True,
+            description="If the query implies full code is needed but no specific symbols are detected, expand all up to the token budget.",
+        )
+
+        # Outlet expand intercept – auto‑execute /expand commands that the assistant emits
+        outlet_expand_intercept_enabled: bool = Field(
+            default=True,
+            description="Intercept /expand commands emitted by the assistant and auto-execute them.",
+        )
+        outlet_expand_intercept_max_symbols: int = Field(
+            default=0,
+            ge=0,
+            description="Max symbols to auto-expand per outlet intercept. 0 = unlimited.",
+        )
+        outlet_expand_intercept_depth: int = Field(
+            default=5,
+            ge=0,
+            description="Default depth for auto-intercepted /expand calls. 0 = no limit (use with caution).",
+        )
+        smart_pre_expand_embedding_threshold: float = Field(
+            default=0.72,
+            ge=0.0,
+            le=1.0,
+            description="Minimum cosine similarity between user query and 'full code' intent phrases to trigger expansion of all symbols.",
+        )
+        smart_pre_expand_min_symbols: int = Field(
+            default=3,
+            description="Minimum number of important symbols to always expand, even if detection doesn't trigger anything. 0 = disabled.",
         )
 
     class UserValves(BaseModel):
@@ -1256,6 +1310,29 @@ class Filter:
             {}
         )  # hash -> (summary, timestamp)
 
+        # Prototype phrases for “full code” intent detection via embeddings
+        self._full_code_intent_phrases = [
+            "show me the complete code",
+            "generate a flowchart",
+            "draw a diagram of the code",
+            "explain the whole architecture",
+            "give me all the functions",
+            "i need to see everything",
+            "overview of all symbols",
+            "full code for review",
+            "muéstrame el código completo",
+            "genera un diagrama de flujo",
+            "diagrama del código",
+            "explícame toda la arquitectura",
+            "dame todas las funciones",
+            "necesito ver todo el código",
+            "visión general de los símbolos",
+            "código completo para revisar",
+        ]
+        self._full_code_intent_embeddings = None
+        self._query_embedding_cache: Dict[str, np.ndarray] = {}
+        self._query_embedding_cache_max_size = 100
+
         print("[CodeAware] Filter loaded")
 
     # --------------------------------------------------------------------------
@@ -1264,7 +1341,6 @@ class Filter:
     def _log_debug(self, msg: str):
         if self.valves.debug:
             print(f"[CodeAware] {msg}")
-            logger.info(msg)
 
     def _log_timing(self, step_name: str, elapsed_since_start: float, duration: float):
         """Log timing information for a step when debug is enabled."""
@@ -1272,6 +1348,24 @@ class Filter:
             self._log_debug(
                 f"[Timing] {step_name}: +{elapsed_since_start:.3f}s (dur={duration:.3f}s)"
             )
+
+    def _log_section(self, title: str, duration: float = None):
+        """Print a visually distinct banner directly to stdout, without duplicating."""
+        if not self.valves.debug:
+            return
+        line_len = 70
+        title_text = f"  {title}"
+        if duration is not None:
+            title_text += f" (dur={duration:.3f}s)"
+        # Centrar
+        if len(title_text) > line_len - 2:
+            title_text = title_text[: line_len - 5] + "..."
+        filler = "=" * ((line_len - len(title_text)) // 2)
+        line = f"{filler}{title_text}{filler}"
+        if len(line) < line_len:
+            line += "="
+        # Usamos print para evitar el doble log
+        print(f"[CodeAware] {line}")
 
     def _background_task(self, coro, name: str = "task"):
         """Wrapper to create a background task that logs errors automatically."""
@@ -2431,7 +2525,9 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Context formatting
     # --------------------------------------------------------------------------
-    def _format_block_context(self, block: CodeBlock, is_latest: bool = False) -> str:
+    def _format_block_context(
+        self, block: CodeBlock, is_latest: bool = False, full_body: bool = False
+    ) -> str:
         timestamp_str = datetime.fromtimestamp(
             block.timestamp, tz=timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S")
@@ -2445,7 +2541,16 @@ class Filter:
         pin = " [PINNED]" if block.pinned else ""
         raw = " [RAW]" if block.is_raw else ""
         aff = " [AFFECTED BY DEPENDENCY CHANGE]" if block.potentially_affected else ""
-        return f"```\n{block.content[:600]}\n```{loc}{latest}  (importance: {block.importance_score:.1f}, modified: {timestamp_str}){aff}{pin}{raw}"
+
+        # Show full body for pinned / raw blocks or when explicitly requested
+        show_full = full_body or block.is_raw or block.pinned
+        content = block.content if show_full else block.content[:600]
+
+        return (
+            f"```\n{content}\n```{loc}{latest}  "
+            f"(importance: {block.importance_score:.1f}, modified: {timestamp_str})"
+            f"{aff}{pin}{raw}"
+        )
 
     def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         state = self._get_state(project_id)
@@ -3999,9 +4104,9 @@ class Filter:
 
         sorted_hashes = sorted(
             non_obsolete_hashes,
-            key=lambda h: state["active_blocks"]
-            .get(h, CodeBlock(content=""))
-            .importance_score,
+            key=lambda h: state["active_blocks"].get(h, None)
+            and state["active_blocks"][h].importance_score
+            or 0.0,
             reverse=True,
         )
         parts = ["\n## Expanded Code Bodies (referenced symbols)\n"]
@@ -4112,6 +4217,9 @@ class Filter:
     # --------------------------------------------------------------------------
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
+        start_time = time.monotonic()
+        self._log_section("CONTEXT MANAGER - OUTLET START")
+
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
         messages = body.get("messages", [])
@@ -4126,6 +4234,25 @@ class Filter:
                     "outlet: last message already processed in inlet, skipping"
                 )
             else:
+                # ----------------------------------------------------------------
+                # Intercept /expand commands that the assistant may have emitted.
+                # Rewrite history so future turns already contain the full code.
+                # ----------------------------------------------------------------
+                if (
+                    last_msg.get("role") == "assistant"
+                    and is_code_session
+                    and "/expand" in last_msg.get("content", "")
+                ):
+                    modified_content, did_expand = await self._outlet_intercept_expand(
+                        last_msg.get("content", ""), project_id
+                    )
+                    if did_expand:
+                        messages[-1]["content"] = modified_content
+                        body["messages"] = messages
+                        self._log_debug(
+                            "outlet: /expand intercepted — history rewritten with real code"
+                        )
+
                 if last_msg.get("role") in ("user", "assistant"):
                     if is_code_session:
                         await self._update_active_code(last_msg, project_id)
@@ -4243,6 +4370,9 @@ class Filter:
             asyncio.create_task(self._run_db_checkpoints())
             self._cleanup_completed_tasks()
 
+        self._log_section(
+            "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
+        )
         return body
 
     async def _run_db_checkpoints(self):
@@ -4975,7 +5105,9 @@ class Filter:
         else:
             return f"Unknown subcommand: {subcommand}"
 
-    async def _handle_expand_command(self, text: str, project_id: str) -> Optional[str]:
+    async def _handle_expand_command(
+        self, text: str, project_id: str
+    ) -> str:  # ← str, no Optional[str]
         parts = text.strip().split()
         if len(parts) < 2:
             return "Usage: `/expand [depth] <function_name>`\nExample: `/expand 3 calcularImpuesto`"
@@ -4987,17 +5119,70 @@ class Filter:
             func_name = parts[1]
         if not func_name:
             return "Missing function name."
+
+        self._log_debug(f"/expand called for '{func_name}' (depth {depth})")
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        self._log_debug(f"/expand: symbol index has {len(all_names)} symbols")
+
+        if not all_names:
+            state = self._get_state(project_id)
+            self._log_debug(
+                f"/expand: state active_blocks count = "
+                f"{len(state.get('active_blocks', {})) if state else 'NO STATE'}"
+            )
+            if state and state.get("active_blocks"):
+                self._rebuild_symbol_index(state, project_id)
+                all_names = self._symbol_index.get_all_names(project_id)
+                self._log_debug(
+                    f"/expand: after rebuild, index has {len(all_names)} symbols"
+                )
+
+        if not all_names:
+            return (
+                "❌ The symbol index is empty.\n\n"
+                "No code has been processed in this session yet. "
+                "Paste the code you want to analyze first, then use `/expand` again."
+            )
+
+        if func_name not in all_names:
+            lower_name = func_name.lower()
+            suggestions = sorted(
+                [n for n in all_names if lower_name in n.lower()],
+                key=lambda n: (not n.startswith(func_name[0]), n),
+            )[:8]
+            hint = ""
+            if suggestions:
+                hint = "\n\nDid you mean one of these?\n" + "\n".join(
+                    f"- `{s}`" for s in suggestions
+                )
+            else:
+                sample = sorted(all_names)[:10]
+                hint = (
+                    f"\n\nThe index contains {len(all_names)} symbol(s). Sample:\n"
+                    + "\n".join(f"- `{s}`" for s in sample)
+                )
+            return f"❌ Symbol `{func_name}` not found in the index." + hint
+
         expanded = await self._expand_symbol_dependencies(func_name, depth, project_id)
+        self._log_debug(
+            f"/expand result: length={len(expanded) if expanded else 0}, "
+            f"preview: {expanded[:200] if expanded else '(empty)'}"
+        )
+
         if not expanded:
-            return f"No dependencies found for '{func_name}'."
-        # If only the initial symbol is present (no further dependencies)
+            return (
+                f"❌ Symbol `{func_name}` is indexed but its code body could not be retrieved. "
+                "Try pasting the code again."
+            )
+
         if expanded.count("### ") <= 1:
             return (
-                f"## Expanded dependencies for `{func_name}` (depth {depth})\n{expanded}\n\n"
-                "[Note: No further dependencies were found for this symbol. "
-                "The language may not be fully supported or the function has no calls.]"
+                f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}\n\n"
+                "> No further call dependencies found."
             )
-        return f"## Expanded dependencies for `{func_name}` (depth {depth})\n{expanded}"
+
+        return f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}"
 
     async def _expand_symbol_dependencies(
         self, name: str, max_depth: int, project_id: str
@@ -5029,6 +5214,330 @@ class Filter:
 
         await recurse(name, 1)
         return "\n".join(lines)
+
+    async def _ensure_full_code_intent_embeddings(self):
+        if self._full_code_intent_embeddings is not None:
+            return
+        if self.embedder is None:
+            return
+        self._full_code_intent_embeddings = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(
+                self._full_code_intent_phrases, convert_to_numpy=True
+            )
+        )
+
+    async def _smart_pre_expand(
+        self,
+        user_query: str,
+        project_id: str,
+        token_budget: int = 0,
+    ) -> str:
+        """
+        Proactively expand symbols that the user query likely needs.
+
+        Detection strategies (in order):
+          A) Symbol names explicitly mentioned in the query.
+          B) Embedding-based: compare query with prototype phrases that imply
+             full-code access. If similarity >= threshold, expand all symbols.
+          C) Optional LLM‑based detection for ambiguous cases.
+          D) Fallback: always expand a minimum number of important symbols
+             if nothing else was injected.
+
+        Expanded code is appended to the system context before the LLM sees it,
+        so the assistant never has to ask for /expand.
+
+        Returns a formatted string ready for injection, or empty string.
+        """
+        if not self.valves.smart_pre_expand_enabled:
+            return ""
+
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return ""
+
+        effective_budget = token_budget or self.valves.smart_pre_expand_max_tokens
+        needed_symbols: Set[str] = set()
+
+        # --- A) Direct mention of symbol names in the user query ---
+        words = set(re.findall(r"\b\w+\b", user_query))
+        directly_mentioned = all_names.intersection(words)
+        needed_symbols.update(directly_mentioned)
+
+        # --- B) Embedding-based detection of "full code" intent ---
+        if not needed_symbols:
+            await self._ensure_full_code_intent_embeddings()
+            if self._full_code_intent_embeddings is not None:
+                # Get query embedding (with caching)
+                query_hash = hashlib.md5(user_query.encode()).hexdigest()[:12]
+                query_emb = self._query_embedding_cache.get(query_hash)
+                if query_emb is None:
+                    query_emb = await anyio.to_thread.run_sync(
+                        lambda: self.embedder.encode(
+                            [user_query], convert_to_numpy=True
+                        )[0]
+                    )
+                    # Simple cache eviction
+                    if (
+                        len(self._query_embedding_cache)
+                        >= self._query_embedding_cache_max_size
+                    ):
+                        self._query_embedding_cache.pop(
+                            next(iter(self._query_embedding_cache))
+                        )
+                    self._query_embedding_cache[query_hash] = query_emb
+
+                # Cosine similarity against all intent prototypes
+                similarities = np.dot(self._full_code_intent_embeddings, query_emb) / (
+                    np.linalg.norm(self._full_code_intent_embeddings, axis=1)
+                    * np.linalg.norm(query_emb)
+                    + 1e-10
+                )
+                max_sim = similarities.max()
+                self._log_debug(
+                    f"smart_pre_expand: embedding max similarity = {max_sim:.3f}"
+                )
+                if max_sim >= self.valves.smart_pre_expand_embedding_threshold:
+                    needed_symbols = set(all_names)
+
+        # --- C) Optional LLM‑based detection (only if nothing found yet) ---
+        if (
+            self.valves.smart_pre_expand_use_llm
+            and not needed_symbols
+            and len(user_query) > 20
+        ):
+            lightweight_ctx = await self._build_lightweight_context(project_id)
+            available_list = ", ".join(sorted(all_names)[:60])
+            prompt = (
+                f"Symbol index:\n{lightweight_ctx[:2000]}\n\n"
+                f'User query: "{user_query[:300]}"\n\n'
+                f"Available symbols: {available_list}\n\n"
+                f"Which symbols need their full source code to answer this query? "
+                f"Output only a comma-separated list of names, or 'none'."
+            )
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a code context manager. "
+                    "Output only a comma-separated list of symbol names or 'none'."
+                ),
+                model_override=self.valves.smart_pre_expand_model,
+                max_tokens=100,
+                temperature=0.0,
+                timeout=8.0,
+            )
+            if response and response.strip().lower() != "none":
+                detected = {
+                    name.strip()
+                    for name in response.split(",")
+                    if name.strip() in all_names
+                }
+                needed_symbols.update(detected)
+                self._log_debug(f"smart_pre_expand: LLM detected symbols: {detected}")
+
+        # --- D) Minimum expansion fallback ---
+        if not needed_symbols and self.valves.smart_pre_expand_min_symbols > 0:
+            self._log_debug(
+                "smart_pre_expand: no symbols detected, using minimum expansion"
+            )
+            # Grab the most important non‑obsolete blocks
+            top_blocks = sorted(
+                state["active_blocks"].values(),
+                key=lambda b: b.importance_score,
+                reverse=True,
+            )[: self.valves.smart_pre_expand_min_symbols]
+            for block in top_blocks:
+                for sym in block.symbols:
+                    if sym.name in all_names:
+                        needed_symbols.add(sym.name)
+
+        if not needed_symbols:
+            self._log_debug("smart_pre_expand: no symbols to expand")
+            return ""
+
+        self._log_debug(
+            f"smart_pre_expand: expanding {len(needed_symbols)} symbol(s): "
+            f"{sorted(needed_symbols)[:10]}"
+        )
+
+        # --- Build priority list, sorted by block importance ---
+        symbol_priority: List[Tuple[str, "CodeBlock", float]] = []
+        for sym_name in needed_symbols:
+            block_hashes = self._symbol_index.find_blocks(sym_name, project_id)
+            for h in block_hashes:
+                block = state["active_blocks"].get(h)
+                if block and not block.obsolete:
+                    symbol_priority.append((sym_name, block, block.importance_score))
+                    break
+        symbol_priority.sort(key=lambda x: x[2], reverse=True)
+
+        parts = ["\n## Auto-Expanded Code (retrieved for your query)\n"]
+        tokens_used = 0
+        expanded_count = 0
+        seen_hashes: Set[str] = set()
+
+        for sym_name, block, _ in symbol_priority:
+            if block.hash in seen_hashes:
+                continue
+            seen_hashes.add(block.hash)
+
+            tok_count = (
+                len(self.tokenizer.encode(block.content))
+                if self.tokenizer
+                else len(block.content) // 4
+            )
+            if effective_budget > 0 and tokens_used + tok_count > effective_budget:
+                remaining = len(symbol_priority) - expanded_count
+                if remaining > 0:
+                    parts.append(
+                        f"[{remaining} more symbol(s) omitted — "
+                        f"token budget ({effective_budget}) reached]"
+                    )
+                break
+
+            loc = f" (file: {block.file_path})" if block.file_path else ""
+            parts.append(f"### `{sym_name}`{loc}\n```\n{block.content}\n```")
+            tokens_used += tok_count
+            expanded_count += 1
+
+            # Expand immediate callees (depth 1) when call graph is enabled
+            if self.valves.enable_call_graph_extraction:
+                for sym in block.symbols:
+                    if sym.name != sym_name:
+                        continue
+                    for callee_name in sym.calls[:3]:
+                        if callee_name in self._SYMBOL_BLACKLIST:
+                            continue
+                        callee_hashes = self._symbol_index.find_blocks(
+                            callee_name, project_id
+                        )
+                        for ch in callee_hashes:
+                            callee_block = state["active_blocks"].get(ch)
+                            if not callee_block or callee_block.obsolete:
+                                continue
+                            if ch in seen_hashes:
+                                break
+                            ctok = (
+                                len(self.tokenizer.encode(callee_block.content))
+                                if self.tokenizer
+                                else len(callee_block.content) // 4
+                            )
+                            if (
+                                effective_budget > 0
+                                and tokens_used + ctok > effective_budget
+                            ):
+                                break
+                            seen_hashes.add(ch)
+                            callee_loc = (
+                                f" (file: {callee_block.file_path})"
+                                if callee_block.file_path
+                                else ""
+                            )
+                            parts.append(
+                                f"### `{callee_name}` (callee of `{sym_name}`)"
+                                f"{callee_loc}\n```\n{callee_block.content}\n```"
+                            )
+                            tokens_used += ctok
+                            break
+                    break
+
+        if expanded_count == 0:
+            return ""
+
+        self._log_debug(
+            f"smart_pre_expand: injected {expanded_count} symbol(s), ~{tokens_used} tokens"
+        )
+        return "\n".join(parts)
+
+    async def _outlet_intercept_expand(
+        self,
+        assistant_content: str,
+        project_id: str,
+    ) -> Tuple[str, bool]:
+        """
+        Intercept /expand commands that the assistant emitted and execute them.
+
+        Two effects:
+          1. Rewrites the assistant message by replacing the /expand placeholder
+             with the actual retrieved code, so conversation history is accurate.
+          2. Pins the corresponding block in active_blocks so that the code is
+             injected into every subsequent turn without needing another expansion.
+
+        Returns (modified_content, did_expand).
+        """
+        if not self.valves.outlet_expand_intercept_enabled:
+            return assistant_content, False
+
+        EXPAND_RE = re.compile(r"/expand\s+(?:(\d+)\s+)?(\w+)", re.IGNORECASE)
+        matches = list(EXPAND_RE.finditer(assistant_content))
+        if not matches:
+            return assistant_content, False
+
+        self._log_debug(
+            f"outlet_intercept_expand: detected {len(matches)} /expand call(s)"
+        )
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        replaced_content = assistant_content
+        did_any = False
+        state = self._get_state(project_id)
+
+        max_syms = self.valves.outlet_expand_intercept_max_symbols
+        matches_to_process = matches if max_syms == 0 else matches[:max_syms]
+
+        for match in matches_to_process:
+            depth_str = match.group(1)
+            func_name = match.group(2)
+            depth = (
+                int(depth_str)
+                if depth_str
+                else self.valves.outlet_expand_intercept_depth
+            )
+            if depth == 0:
+                depth = 9999  # effectively unlimited
+
+            if func_name not in all_names:
+                self._log_debug(
+                    f"outlet_intercept_expand: '{func_name}' not in index, skipping"
+                )
+                continue
+
+            expanded = await self._expand_symbol_dependencies(
+                func_name, depth, project_id
+            )
+            if not expanded:
+                continue
+
+            did_any = True
+
+            # Replace the /expand command with the actual code
+            replacement = f"[Retrieved `{func_name}`]\n{expanded}"
+            replaced_content = replaced_content.replace(match.group(0), replacement, 1)
+
+            # Pin the block so it stays injected in future turns (thread-safe)
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                block_hashes = self._symbol_index.find_blocks(func_name, project_id)
+                for h in block_hashes:
+                    block = state["active_blocks"].get(h)
+                    if block and not block.obsolete:
+                        block.is_raw = True
+                        block.pinned = True
+                        block.importance_score = 10.0
+                        block.last_mentioned = time.time()
+                        block.last_mentioned_msg_idx = state["message_count"]
+                        self._log_debug(
+                            f"outlet_intercept_expand: pinned block {h[:8]} for '{func_name}'"
+                        )
+                        break
+
+                self._invalidate_lightweight_cache(project_id)
+                self._set_state(project_id, state)
+
+        return replaced_content, did_any
 
     def _get_facts_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
@@ -5443,7 +5952,7 @@ class Filter:
                 model_override=self.valves.cot_detection_model,
                 max_tokens=2,
                 temperature=0.0,
-                timeout=5.0,
+                timeout=30.0,
             )
             if response and response.strip().isdigit():
                 level = int(response.strip())
@@ -5570,8 +6079,30 @@ class Filter:
         return any(kw in query_lower for kw in structural_keywords)
 
     def _is_code_review_request(self, user_content: str) -> bool:
-        """Check if the user message is requesting a code review."""
-        review_phrases = {"review", "check my code", "code review", "audit", "inspect"}
+        """Check if the user message is requesting a code review, bug finding, or syntax analysis."""
+        review_phrases = {
+            "review",
+            "check my code",
+            "code review",
+            "audit",
+            "inspect",
+            "bug",
+            "error",
+            "syntax",
+            "revisa",
+            "revisión",
+            "analiza",
+            "encuentra",
+            "corrige",
+            "fallo",
+            "fallos",
+            "depura",
+            "depurar",
+            "errores",
+            "error de sintaxis",
+            "lógica",
+            "bugs",
+        }
         content_lower = user_content.lower()
         return any(phrase in content_lower for phrase in review_phrases)
 
@@ -5918,10 +6449,11 @@ class Filter:
         """
         Main entry point called before each LLM request.
         Orchestrates context retrieval, chain-of-thought, response cache,
-        and all system injections. Now parallelizes CoT and cache checks.
+        and all system injections. Now parallelises CoT and cache checks.
         """
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
+        self._log_section("CONTEXT MANAGER - INLET START")
 
         # Helper to log timing relative to inlet start
         def _inlet_timing(step_name: str, start: float, end: float = None):
@@ -5962,10 +6494,15 @@ class Filter:
             new_messages, handled = await self._handle_forget_command(
                 messages, project_id, __user__
             )
+            self._log_debug(f"/forget command processed, handled={handled}")
             if handled:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 _inlet_timing("total_inlet", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
                 return body
 
         # ------------------------------------------------------------------
@@ -5978,6 +6515,7 @@ class Filter:
         ):
             t0 = time.monotonic()
             intents = await self._parse_all_intents(last_user_msg.get("content", ""))
+            self._log_debug(f"Natural language intents parsed: {intents}")
             _inlet_timing("parse_nl_intents", t0)
             for intent_type in ("forget", "remember", "obsolete"):
                 fi = intents.get(intent_type, {})
@@ -6004,6 +6542,10 @@ class Filter:
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
                     _inlet_timing("total_inlet", inlet_start)
+                    self._log_section(
+                        "CONTEXT MANAGER - INLET END",
+                        duration=time.monotonic() - inlet_start,
+                    )
                     return body
 
         # ------------------------------------------------------------------
@@ -6016,6 +6558,7 @@ class Filter:
             and self.valves.cleanup_suggestions_enabled
         ):
             candidates = self._get_inactive_block_candidates(project_id)
+            self._log_debug(f"/status command: {len(candidates)} inactive blocks")
             if not candidates:
                 response = "✅ No inactive blocks detected."
             else:
@@ -6035,6 +6578,9 @@ class Filter:
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             _inlet_timing("total_inlet", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
             return body
 
         # ------------------------------------------------------------------
@@ -6048,6 +6594,9 @@ class Filter:
         ):
             state = self._get_state(project_id)
             stats = state.get("speculative_missed_stats", {})
+            self._log_debug(
+                f"/speculative_stats command: total misses={stats.get('total', 0)}"
+            )
             lines = []
             if self.valves.speculative_adaptive:
                 limit = state.get(
@@ -6075,6 +6624,9 @@ class Filter:
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             _inlet_timing("total_inlet", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
             return body
 
         # ------------------------------------------------------------------
@@ -6089,11 +6641,17 @@ class Filter:
             response = await self._handle_clean_command(
                 last_user_msg.get("content", ""), project_id
             )
+            self._log_debug(
+                f"/clean command executed: {last_user_msg.get('content', '')}"
+            )
             messages.pop()
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             _inlet_timing("total_inlet", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
             return body
 
         # ------------------------------------------------------------------
@@ -6109,12 +6667,19 @@ class Filter:
             response = await self._handle_fact_command(
                 last_user_msg.get("content", ""), project_id
             )
+            self._log_debug(
+                f"/fact command executed: {last_user_msg.get('content', '')}"
+            )
             if response:
                 messages.pop()
                 messages.append({"role": "assistant", "content": response})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 _inlet_timing("total_inlet", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
                 return body
 
         # ------------------------------------------------------------------
@@ -6123,6 +6688,9 @@ class Filter:
         if last_user_msg and last_user_msg.get("content", "").strip().startswith(
             "/expand"
         ):
+            self._log_debug(
+                f"/expand command detected: {last_user_msg.get('content', '')}"
+            )
             response = await self._handle_expand_command(
                 last_user_msg.get("content", ""), project_id
             )
@@ -6131,6 +6699,9 @@ class Filter:
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             _inlet_timing("total_inlet", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
             return body
 
         # ===== NO MORE EARLY RETURNS BEYOND THIS POINT =====
@@ -6147,19 +6718,23 @@ class Filter:
         manual_cot_used = False
         cot_any_used = False
 
-        # ------------------------------------------------------------
-        # Code interpretation note (critical)
-        # ------------------------------------------------------------
+        # Concise fallback instruction (kept only for cases where pre-expansion missed something)
         if is_code_session:
-            note = (
-                "When reading user messages, treat code inside triple backticks "
-                "as literal source code without interpreting Markdown. "
-                "You may still use Markdown in your own responses.\n"
-                "You can use the command `/expand [depth] <function>` to retrieve "
-                "the full code of a function and its callees up to the specified depth. "
-                "Use it when you need to trace a call chain."
+            concise_expand_hint = (
+                "**Note:** If you lack the full source code of a function required to answer, "
+                "you may output `/expand <function_name>` on its own line. The system will "
+                "automatically execute it and inject the code for the next turn."
             )
-            system_injections.append(("critical", note))
+            system_injections.append(("medium", concise_expand_hint))
+
+        # ------------------------------------------------------------
+        # Detect if this is a code review / bug finding request
+        # ------------------------------------------------------------
+        force_full_code = False
+        if is_code_session and self._is_code_review_request(
+            last_user_msg.get("content", "") if last_user_msg else ""
+        ):
+            force_full_code = True
 
         # ------------------------------------------------------------
         # Start LTM retrieval in background while we work on CoT
@@ -6182,11 +6757,10 @@ class Filter:
 
         # ------------------------------------------------------------
         # Pre‑launch parallel checks (response cache, contradiction, duplicate question)
-        # This runs in the background while CoT reasoning is generated.
         # ------------------------------------------------------------
         parallel_checks_task = None
-        cot_task = None  # will hold the CoT generation task if needed
-        cot_task_start = None  # timestamp when CoT task was created
+        cot_task = None
+        cot_task_start = None
         last_user_query = last_user_msg.get("content", "") if last_user_msg else ""
         context_hash = self._compute_context_hash(messages)
         if last_user_msg:
@@ -6200,7 +6774,6 @@ class Filter:
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             if last_user_msg:
                 user_content = last_user_msg.get("content", "")
-                # Manual /think command (supports /think [level] question)
                 if self.valves.enable_cot_on_demand and user_content.strip().startswith(
                     "/think"
                 ):
@@ -6219,7 +6792,6 @@ class Filter:
                             context = (
                                 f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
                             )
-                            # Launch CoT in background
                             cot_task = asyncio.create_task(
                                 self._generate_cot_reasoning(cot_question, context)
                             )
@@ -6239,8 +6811,6 @@ class Filter:
                             )
                             cot_task_start = time.monotonic()
                             _inlet_timing("cot_manual_level3", t0)
-
-                # Automatic detection (only if no manual /think was used)
                 elif not manual_cot_used:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
@@ -6274,7 +6844,6 @@ class Filter:
                         cot_task_start = time.monotonic()
                         _inlet_timing("cot_level3_reflection", t0)
 
-        # If any CoT reasoning was used, add a global note for the final model
         if cot_any_used:
             cot_note = (
                 "**Note:** Some sections in this system prompt marked with 🔎 are "
@@ -6289,6 +6858,7 @@ class Filter:
             assumption_target = await self._parse_assumption_intent(
                 last_user_msg.get("content", "")
             )
+            self._log_debug(f"/assume target: {assumption_target}")
             if assumption_target:
                 analysis = await self._extract_assumptions(assumption_target)
                 messages.pop()
@@ -6301,6 +6871,10 @@ class Filter:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 _inlet_timing("total_inlet", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
                 return body
 
         # Iterative mode
@@ -6308,12 +6882,17 @@ class Filter:
             result, consumed = await self._run_iteration(
                 project_id, last_user_msg.get("content", "")
             )
+            self._log_debug(f"Iterative mode triggered, consumed={consumed}")
             if consumed:
                 messages.pop()
                 messages.append({"role": "assistant", "content": result})
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 _inlet_timing("total_inlet", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
                 return body
 
         # Smart context selection (if enabled)
@@ -6370,8 +6949,6 @@ class Filter:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # If parallel checks finished first and found a cached response,
-                # cancel CoT (if still running) and return the cached answer.
                 if parallel_checks_task in done:
                     contradiction_warning, cached_response, duplicate_match = (
                         await parallel_checks_task
@@ -6388,29 +6965,28 @@ class Filter:
                         messages = self._ensure_last_message_is_user(messages)
                         body["messages"] = messages
                         _inlet_timing("total_inlet", inlet_start)
+                        self._log_section(
+                            "CONTEXT MANAGER - INLET END",
+                            duration=time.monotonic() - inlet_start,
+                        )
                         return body
 
-                # Collect CoT result (either already done or still pending)
                 if cot_task is not None:
                     if cot_task in done:
                         reasoning = cot_task.result()
                     else:
                         reasoning = await cot_task
-                    # Log total CoT generation time
                     if cot_task_start is not None:
                         cot_dur = time.monotonic() - cot_task_start
                         self._log_timing("cot_reasoning_total", cot_dur, cot_dur)
 
-                # Ensure parallel checks are fully completed
                 if parallel_checks_task is not None and not parallel_checks_task.done():
                     contradiction_warning, cached_response, duplicate_match = (
                         await parallel_checks_task
                     )
                 elif parallel_checks_task is not None and parallel_checks_task in done:
-                    # already stored from above
                     pass
 
-                # Double‑check for a late cache hit (shouldn't happen, but just in case)
                 if cached_response:
                     messages.append(
                         {"role": "assistant", "content": cached_response["response"]}
@@ -6418,9 +6994,12 @@ class Filter:
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
                     _inlet_timing("total_inlet", inlet_start)
+                    self._log_section(
+                        "CONTEXT MANAGER - INLET END",
+                        duration=time.monotonic() - inlet_start,
+                    )
                     return body
 
-        # Inject the CoT reasoning (if any)
         if reasoning:
             system_injections.append(
                 ("high", f"**Chain-of-Thought Reasoning**\n{reasoning}")
@@ -6428,15 +7007,6 @@ class Filter:
 
         if contradiction_warning and self.valves.contradiction_inject_warning:
             system_injections.append(("high", contradiction_warning))
-        if cached_response:
-            # This case was already handled above; left for safety.
-            messages.append(
-                {"role": "assistant", "content": cached_response["response"]}
-            )
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
-            return body
         if duplicate_match:
             warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
             system_injections.append(("medium", warn_msg))
@@ -6469,7 +7039,7 @@ class Filter:
             self._last_processed_message_idx[project_id] = last_idx
 
         # ------------------------------------------------------------
-        # Get the result of LTM recovery that started in parallel
+        # LTM retrieval (wait for background task if any)
         # ------------------------------------------------------------
         unique_meta = []
         if ltm_future is not None:
@@ -6483,7 +7053,7 @@ class Filter:
                     unique_meta.append(m)
             _inlet_timing("ltm_retrieval", t0)
 
-        # Format and inject LTM (high priority)
+        # Format and inject LTM
         max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
         parts = []
         current_tokens = 0
@@ -6538,7 +7108,9 @@ class Filter:
                     state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
                     self._set_state(project_id, state)
 
-        # Inject active code context (lightweight or full)
+        # ------------------------------------------------------------
+        # Inject active code context
+        # ------------------------------------------------------------
         if is_code_session and self.valves.enable_code_awareness:
             is_structural = last_user_msg and await self._is_structural_task(
                 last_user_msg.get("content", "")
@@ -6557,65 +7129,86 @@ class Filter:
             total_code_tokens = sum(b._cached_token_count for b in code_blocks)
             user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
-            if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
-                self._log_debug(
-                    f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
+            if force_full_code:
+                self._log_debug("Force full code injection for review request")
+                full_parts = []
+                token_budget = self.valves.global_injection_token_budget or 8000
+                max_tokens_for_code = int(
+                    token_budget * self.valves.full_code_injection_budget_percent
                 )
-                active_ctx = await self._build_lightweight_context(project_id)
-                if last_user_msg and not is_structural:
-                    expanded = self._expand_referenced_symbols(project_id, user_query)
-                    if expanded:
-                        active_ctx += "\n" + expanded
-                elif is_structural:
-                    active_ctx += (
-                        "\n\n[Note: Structural analysis requested. Use the symbol index "
-                        "with call graphs and summaries to generate the diagram. Do not "
-                        "request code bodies.]"
+                used_tokens = 0
+                base_blocks = [
+                    b for b in code_blocks if b.content_type == ContentType.BASE_CODE
+                ]
+                for b in sorted(
+                    base_blocks, key=lambda b: b.importance_score, reverse=True
+                ):
+                    content = b.content
+                    tokens = b._cached_token_count
+                    if used_tokens + tokens > max_tokens_for_code:
+                        remaining = len(base_blocks) - len(full_parts)
+                        if remaining > 0:
+                            full_parts.append(
+                                f"[{remaining} more blocks omitted to fit token budget ({max_tokens_for_code} tokens)]"
+                            )
+                        break
+                    loc = f" (file: {b.file_path})" if b.file_path else ""
+                    full_parts.append(
+                        f"### Full code: {b.file_path or 'unknown'}\n```\n{content}\n```"
                     )
-            else:
-                active_ctx = self._get_active_code_context(
-                    project_id, user_query=user_query
-                )
-                if last_user_msg and not is_structural and user_query:
-                    expanded = self._expand_referenced_symbols(project_id, user_query)
-                    if expanded:
-                        active_ctx += "\n" + expanded
-
-            if active_ctx:
-                checklist = (
-                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                    "2. Identify every assumption the code makes and verify each one.\n"
-                    "3. For every regex or string match, test it against 5 counter-examples.\n"
-                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                    "6. Output your reasoning step by step, then provide the corrected code.\n"
-                )
-                active_ctx = checklist + "\n\n" + active_ctx
+                    used_tokens += tokens
+                active_ctx = "\n\n".join(full_parts)
                 system_injections.append(("critical", active_ctx))
+            else:
+                if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
+                    self._log_debug(
+                        f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
+                    )
+                    active_ctx = await self._build_lightweight_context(project_id)
+                    if last_user_msg:
+                        pre_expanded = await self._smart_pre_expand(
+                            user_query=user_query,
+                            project_id=project_id,
+                            token_budget=self.valves.smart_pre_expand_max_tokens,
+                        )
+                        if pre_expanded:
+                            active_ctx += "\n" + pre_expanded
+                        else:
+                            expanded = self._expand_referenced_symbols(
+                                project_id, user_query
+                            )
+                            if expanded:
+                                active_ctx += "\n" + expanded
+                    if is_structural:
+                        active_ctx += (
+                            "\n\n[Note: Structural analysis requested. "
+                            "Full code bodies have been pre-expanded above where available.]"
+                        )
+                else:
+                    active_ctx = self._get_active_code_context(
+                        project_id, user_query=user_query
+                    )
+                    if last_user_msg and not is_structural and user_query:
+                        expanded = self._expand_referenced_symbols(
+                            project_id, user_query
+                        )
+                        if expanded:
+                            active_ctx += "\n" + expanded
 
-        # Code review checklist injection
-        if (
-            is_code_session
-            and self.valves.enable_code_review_mode
-            and self._is_code_review_request(
-                last_user_msg.get("content", "") if last_user_msg else ""
-            )
-        ):
-            self._log_debug("Injecting code review checklist")
-            review_prompt = (
-                "## Code Review Checklist\n"
-                "You are reviewing code. Follow these steps:\n"
-                "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                "2. Identify every assumption the code makes and verify each one.\n"
-                "3. For every regex or string match, test it against 5 counter-examples.\n"
-                "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                "6. Output your reasoning step by step, then provide the corrected code.\n"
-            )
-            system_injections.append(("high", review_prompt))
+                if active_ctx:
+                    checklist = (
+                        "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                        "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                        "2. Identify every assumption the code makes and verify each one.\n"
+                        "3. For every regex or string match, test it against 5 counter-examples.\n"
+                        "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                        "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                        "6. Output your reasoning step by step, then provide the corrected code.\n"
+                    )
+                    active_ctx = checklist + "\n\n" + active_ctx
+                    system_injections.append(("critical", active_ctx))
 
-        # Inject facts context
+        # Inject facts, feedback, confidence, etc. (unchanged from here on)
         if (
             is_code_session
             and self.valves.enable_facts
@@ -6625,13 +7218,11 @@ class Filter:
             if facts_ctx:
                 system_injections.append(("high", facts_ctx))
 
-        # Confidence scoring
         if self.valves.enable_confidence_scoring and is_code_session:
             total_tokens = self._estimate_tokens(messages)
             if total_tokens > self.valves.context_window_tokens * 0.8:
                 system_injections.append(("high", self.valves.confidence_prompt))
 
-        # Inject feedback context
         if (
             is_code_session
             and self.valves.enable_feedback_tracking
@@ -6641,7 +7232,7 @@ class Filter:
             if feedback_ctx:
                 system_injections.append(("high", feedback_ctx))
 
-        # Proactive summary suggestion (if context grows too fast)
+        # Proactive summary suggestion
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -6654,14 +7245,13 @@ class Filter:
             if suggestion:
                 system_injections.append(("medium", suggestion))
 
-        # Command suggestion (after a certain number of messages without commands)
         t0 = time.monotonic()
         cmd_suggestion = await self._suggest_commands(project_id, state)
         _inlet_timing("suggest_commands", t0)
         if cmd_suggestion:
             system_injections.append(("medium", cmd_suggestion))
 
-        # Adaptive context trim (based on token count or max_turns)
+        # Adaptive context trim
         if self.valves.adaptive_trim:
             total_tokens = self._estimate_tokens(system_msgs + history_msgs)
             if total_tokens > self.valves.context_window_tokens:
@@ -6695,7 +7285,6 @@ class Filter:
                 else:
                     history_msgs = kept_block
 
-                # Preserve tool calls if present
                 if self.valves.preserve_tool_calls:
                     while history_msgs and history_msgs[0].get("role") == "tool":
                         history_msgs.pop(0)
@@ -6715,7 +7304,6 @@ class Filter:
                         if not tool_call_ids.issubset(tool_response_ids):
                             history_msgs.pop(0)
         else:
-            # Fallback: trim by max_turns
             user_max = (
                 __user__["valves"].max_turns
                 if __user__ and hasattr(__user__, "valves")
@@ -6807,7 +7395,6 @@ class Filter:
         if final_system.strip():
             messages.insert(0, {"role": "system", "content": final_system})
 
-        # Debug log for injected token count
         if self.valves.debug:
             total_system_tokens = 0
             for m in messages:
@@ -6822,6 +7409,9 @@ class Filter:
 
         body["messages"] = messages
         _inlet_timing("total_inlet", inlet_start)
+        self._log_section(
+            "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+        )
         return body
 
     # --------------------------------------------------------------------------
