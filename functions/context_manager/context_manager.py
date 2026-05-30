@@ -7502,7 +7502,7 @@ class Filter:
                         model_override=self.valves.summarization_model,
                         max_tokens=50,
                         temperature=0.1,
-                        semaphore=self._low_priority_llm_semaphore,  # <-- usar semáforo separado
+                        semaphore=self._low_priority_llm_semaphore,
                     )
                 )
             responses = await asyncio.gather(*tasks, return_exceptions=True)
