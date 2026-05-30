@@ -1152,6 +1152,10 @@ class Filter:
             default=3,
             description="Minimum number of important symbols to always expand, even if detection doesn't trigger anything. 0 = disabled.",
         )
+        enable_raw_code_detection: bool = Field(
+            default=True,
+            description="If no code blocks are extracted via Tree-sitter or regex, use a lightweight LLM to detect raw code in the message and wrap it automatically.",
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -1796,7 +1800,6 @@ class Filter:
         if not is_producer:
             return await future
 
-        # Solo el productor mide el tiempo
         t_start = time.monotonic()
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
@@ -1822,7 +1825,9 @@ class Filter:
                 cached = await self._llm_cache.get(cache_key)
                 if cached is not None:
                     future.set_result(cached)
-                    self._log_timing(f"LLM/{model} (cached)", t_start, time.monotonic())
+                    self._log_debug(
+                        f"[LLM] {model} (cached) took {time.monotonic() - t_start:.3f}s"
+                    )
                     return cached
 
                 if _SHARED_RESOURCES_AVAILABLE:
@@ -1844,8 +1849,8 @@ class Filter:
                             if content:
                                 await self._llm_cache.set(cache_key, content)
                                 future.set_result(content)
-                                self._log_timing(
-                                    f"LLM/{model}", t_start, time.monotonic()
+                                self._log_debug(
+                                    f"[LLM] {model} took {time.monotonic() - t_start:.3f}s"
                                 )
                                 return content
                         except asyncio.CancelledError:
@@ -1939,8 +1944,8 @@ class Filter:
                                         content = content.strip()
                                     await self._llm_cache.set(cache_key, content)
                                     future.set_result(content)
-                                    self._log_timing(
-                                        f"LLM/{model}", t_start, time.monotonic()
+                                    self._log_debug(
+                                        f"[LLM] {model} took {time.monotonic() - t_start:.3f}s"
                                     )
                                     return content
                                 elif resp.status in (429, 500, 502, 503, 504):
@@ -1957,12 +1962,12 @@ class Filter:
                             await asyncio.sleep(base_delay * (2**attempt))
                             continue
 
-            # Si ningún modelo funcionó
+            # If no other model worked
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
             fallback_model = models_to_try[0] if models_to_try else "unknown"
-            self._log_timing(
-                f"LLM/{fallback_model} (failed)", t_start, time.monotonic()
+            self._log_debug(
+                f"[LLM] {fallback_model} (failed) after {time.monotonic() - t_start:.3f}s"
             )
             return None
 
@@ -2253,16 +2258,16 @@ class Filter:
                         guessed = SignatureExtractor._guess_language(None, raw)
                         if guessed != "unknown":
                             lang = guessed
-
-                    if lang == "text" or lang == "":
-                        llm_lang = await self._detect_language_via_llm(raw)
-                        if llm_lang != "unknown":
-                            lang = llm_lang
-                            self._log_debug(f"LLM detected language: {lang}")
-                        else:
                             self._log_debug(
-                                "LLM language detection also failed; block will be treated as generic text"
+                                f"[LangDetect] method=extension_heuristic, result={lang}, dur=0.000s (block inside tree-sitter)"
                             )
+                        else:
+                            lang = await self._infer_code_language(raw)
+                            # _infer_code_language ya loguea internamente
+                            if lang == "unknown":
+                                self._log_debug(
+                                    "LLM language detection also failed; block will be treated as generic text"
+                                )
 
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
@@ -2279,7 +2284,8 @@ class Filter:
                     blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
 
-                return blocks, spans
+                if blocks:
+                    return blocks, spans
 
             except Exception as e:
                 if "Language '' not available" not in str(e):
@@ -2293,7 +2299,6 @@ class Filter:
             for match in self.code_pattern.finditer(content):
                 lang = match.group(1) or "text"
                 code = match.group(2).strip()
-                # No podemos await aquí, lo haremos después
                 blocks.append({"language": lang, "code": code, "type": "fenced"})
                 spans.append((match.start(), match.end()))
             # Indented blocks
@@ -2329,65 +2334,108 @@ class Filter:
                 spans.append((start_offset, end_offset))
             return blocks, spans
 
-        # Ejecutar en hilo para no bloquear
         blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
         # Ahora procesar oversized blocks para cada uno (necesitan await)
         for i in range(len(blocks)):
             blocks[i]["code"] = await self._handle_oversized_code_block(
                 blocks[i]["code"], blocks[i]["language"]
             )
+
+        # ---- Fallback: raw code detection via LLM when no blocks were found ----
+        if (
+            not blocks
+            and self.valves.enable_raw_code_detection
+            and self._has_code_indicators(content)
+        ):
+            t_raw_start = time.monotonic()
+            lang = await self._infer_code_language(content)
+            dur_raw = time.monotonic() - t_raw_start
+            if lang != "unknown":
+                blocks.append({"language": lang, "code": content, "type": "indented"})
+                spans.append((0, len(content)))
+                self._log_debug(
+                    f"Raw code detected via LLM as {lang}. Detection took {dur_raw:.3f}s."
+                )
+            else:
+                self._log_debug(
+                    f"Raw code detection failed (unknown language). Detection took {dur_raw:.3f}s."
+                )
+        # ---- end fallback ----
         return blocks, spans
 
-    async def _detect_language_via_llm(self, code_snippet: str) -> str:
-        """Use a small, quick LLM call to identify the programming language."""
+    async def _infer_code_language(self, code_snippet: str) -> str:
+        """
+        Use a lightweight LLM to identify the programming language of a code snippet.
+        Returns a normalized language name (e.g., 'python', 'javascript') or 'unknown'.
+        """
         if not HAS_AIOHTTP:
+            self._log_debug(
+                "[LangDetect] method=llm, result=unavailable (no aiohttp), dur=0.000s"
+            )
             return "unknown"
-        t0 = time.monotonic()
+
+        t_start = time.monotonic()
         prompt = (
             "Identify the programming language of this code. "
             "Answer with a single word (e.g., 'python', 'javascript', 'go', 'rust') or 'unknown':\n\n"
-            f"```\n{code_snippet[:500]}\n```"
+            f"```\n{code_snippet[:800]}\n```"
         )
         try:
             response = await asyncio.wait_for(
                 self._call_llm(
                     prompt=prompt,
                     system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
-                    model_override=self.valves.natural_language_forget_model
-                    or self.valves.llm_model,
+                    model_override=self.valves.smart_pre_expand_model,
                     max_tokens=10,
                     temperature=0.0,
                 ),
-                timeout=3.0,
+                timeout=4.0,
             )
-            dur = time.monotonic() - t0
-            self._log_timing("detect_language_llm", dur, dur)
+            dur = time.monotonic() - t_start
             if response:
                 lang = response.strip().lower()
-                # Normalize common responses
                 lang_map = {
                     "py": "python",
+                    "python3": "python",
                     "js": "javascript",
+                    "javascript": "javascript",
                     "ts": "typescript",
+                    "typescript": "typescript",
                     "tsx": "tsx",
                     "jsx": "jsx",
-                    "c++": "cpp",
-                    "c#": "csharp",
-                    "bash": "bash",
-                    "sh": "bash",
-                    "zsh": "bash",
-                    "rb": "ruby",
-                    "rs": "rust",
+                    "go": "go",
                     "golang": "go",
+                    "rs": "rust",
+                    "rust": "rust",
+                    "java": "java",
+                    "c": "c",
+                    "cpp": "cpp",
+                    "c++": "cpp",
+                    "h": "c",
+                    "hpp": "cpp",
                 }
-                return lang_map.get(lang, lang)
+                normalized = lang_map.get(lang, lang)
+                self._log_debug(
+                    f"[LangDetect] method=llm, result={normalized}, dur={dur:.3f}s"
+                )
+                return normalized
+            else:
+                self._log_debug(
+                    f"[LangDetect] method=llm, result=unknown (empty response), dur={dur:.3f}s"
+                )
+                return "unknown"
         except asyncio.TimeoutError:
-            dur = time.monotonic() - t0
-            self._log_timing("detect_language_llm_timeout", dur, dur)
-        except Exception:
-            dur = time.monotonic() - t0
-            self._log_timing("detect_language_llm_error", dur, dur)
-        return "unknown"
+            dur = time.monotonic() - t_start
+            self._log_debug(
+                f"[LangDetect] method=llm, result=unknown (timeout), dur={dur:.3f}s"
+            )
+            return "unknown"
+        except Exception as e:
+            dur = time.monotonic() - t_start
+            self._log_debug(
+                f"[LangDetect] method=llm, result=unknown (error: {e}), dur={dur:.3f}s"
+            )
+            return "unknown"
 
     def _extract_file_path_for_block(
         self, content: str, block_start: int
@@ -2502,6 +2550,24 @@ class Filter:
             if cache_key:
                 self._session_classify_cache[cache_key] = (True, time.time())
             return True
+
+        # Intentar extraer código sin delimitadores (fallback LLM) antes de preguntar genéricamente
+        if (
+            last_user
+            and not state.get("active_blocks")
+            and not self._has_code_indicators(last_user.get("content", ""))
+        ):
+            if len(last_user.get("content", "")) > 200:
+                blocks, _ = await self._extract_code_blocks(
+                    last_user.get("content", "")
+                )
+                if blocks:
+                    self._log_debug(
+                        "classify_session: code detected via raw extraction, treating as code session."
+                    )
+                    if cache_key:
+                        self._session_classify_cache[cache_key] = (True, time.time())
+                    return True
 
         if not last_user or len(last_user.get("content", "")) < 20:
             result = False
@@ -6444,6 +6510,8 @@ class Filter:
             self.valves.enable_natural_language_forget
             and last_user_msg
             and not is_explicit_command
+            # NEW GUARD: skip NL intents if message contains code indicators
+            and not self._has_code_indicators(last_user_msg.get("content", ""))
         ):
             t0 = time.monotonic()
             intents = await self._parse_all_intents(last_user_msg.get("content", ""))
@@ -7140,7 +7208,7 @@ class Filter:
                     active_ctx = checklist + "\n\n" + active_ctx
                     system_injections.append(("critical", active_ctx))
 
-        # Inject facts, feedback, confidence, etc. (unchanged from here on)
+        # Inject facts context
         if (
             is_code_session
             and self.valves.enable_facts
