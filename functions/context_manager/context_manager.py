@@ -838,6 +838,7 @@ class AppliedChangeFeedback(BaseModel):
 class Filter:
 
     class Valves(BaseModel):
+        # ──────────── Core / General ────────────
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
@@ -846,35 +847,130 @@ class Filter:
         adaptive_trim: bool = Field(default=True)
         context_window_tokens: int = Field(default=1000000)
         use_tiktoken: bool = Field(default=True)
+        project_id: str = Field(default="default")
 
+        # ───── Long‑Term Memory (ChromaDB) ─────
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
         long_term_memory_expiration_days: int = Field(default=30)
         long_term_memory_top_k: int = Field(default=10)
         long_term_memory_similarity_threshold: float = Field(default=0.65)
         ltm_time_decay_hours: float = Field(default=12.0)
+        ltm_retrieval_max_tokens: int = Field(default=0)
+        ltm_store_only_code_sessions: bool = Field(default=True)
+        ltm_include_timestamps: bool = Field(default=True)
+        ltm_compress_after_messages: int = Field(default=50)
+        ltm_summarization_trigger_similarity: float = Field(default=0.85)
+
+        # LTM symbolic indexing
+        ltm_index_symbols_enabled: bool = Field(default=False)
+        ltm_symbol_index_max_per_message: int = Field(default=20)
+        ltm_symbol_boost_enabled: bool = Field(default=False)
+        ltm_symbol_boost_factor: float = Field(default=1.5)
+        ltm_symbol_boost_min_similarity: float = Field(default=0.5)
+        ltm_symbol_force_mode_enabled: bool = Field(default=False)
+        ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
+
+        # Reranking
         enable_reranking: bool = Field(default=False)
         reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
         reranker_top_k: int = Field(default=5)
 
-        raw_file_priority_boost: float = Field(default=2.0)
-        ltm_retrieval_max_tokens: int = Field(default=0)
+        # ───────── Code Awareness & Context ─────────
+        enable_code_awareness: bool = Field(default=True)
+        code_similarity_threshold: float = Field(default=0.85)
+        max_base_code_blocks: int = Field(default=3)
+        max_proposed_changes: int = Field(default=5)
+        max_committed_changes: int = Field(default=10)
+        prioritize_recent_code: bool = Field(default=True)
+        auto_detect_code_blocks: bool = Field(default=True)
+        max_active_blocks: int = Field(default=50)
+        track_file_paths: bool = Field(default=True)
+        file_path_pattern: str = Field(
+            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
+        )
+        max_code_block_tokens: int = Field(default=0)
+        code_block_overflow_action: str = Field(
+            default="warn"
+        )  # accepts summarize, truncate, warn
+        code_block_summary_model: str = Field(default="ollama/llama3.2:3b")
+        code_block_truncate_keep_head: int = Field(default=50)
+        code_block_truncate_keep_tail: int = Field(default=50)
+        code_block_warn_message: str = Field(
+            default="[Code block too large - truncated by system]"
+        )
+        huge_injection_threshold_tokens: int = Field(
+            default=25000,
+            description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
+        )
+        enable_call_graph_extraction: bool = Field(
+            default=True,
+            description="Extract call relationships (who calls whom) for code symbols.",
+        )
+        enable_auto_summaries: bool = Field(
+            default=False,
+            description="Automatically generate one-line summaries for code symbols using a small LLM.",
+        )
+        summary_code_max_chars: int = Field(
+            default=8000,
+            description="Maximum characters of code to include when summarizing code blocks.",
+        )
+        oversized_summary_max_tokens: int = Field(
+            default=500, description="Max tokens for summarizing oversized code blocks."
+        )
+        full_code_injection_budget_percent: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description="Percentage of the global injection token budget to use for full-code injection when a code review is requested.",
+        )
+        active_context_max_tokens: int = Field(
+            default=0,
+            description="Maximum tokens for the injected active code context. 0 = unlimited.",
+        )
+        global_injection_token_budget: int = Field(
+            default=0,
+            description="Maximum tokens allowed for all system injections combined (0 = unlimited).",
+        )
 
+        # ───── Smart Pre‑Expand ─────
+        smart_pre_expand_enabled: bool = Field(default=True)
+        smart_pre_expand_min_tokens: int = Field(default=2000)
+        smart_pre_expand_max_tokens: int = Field(default=0)
+        smart_pre_expand_use_llm: bool = Field(default=True)
+        smart_pre_expand_model: str = Field(default="ollama/llama3.2:3b")
+        smart_pre_expand_full_if_no_match: bool = Field(default=True)
+        smart_pre_expand_embedding_threshold: float = Field(
+            default=0.72, ge=0.0, le=1.0
+        )
+        smart_pre_expand_min_symbols: int = Field(default=3)
+        enable_raw_code_detection: bool = Field(default=True)
+
+        # ───── Outlet Expand Intercept ─────
+        outlet_expand_intercept_enabled: bool = Field(default=True)
+        outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
+        outlet_expand_intercept_depth: int = Field(default=5, ge=0)
+        expand_default_depth: int = Field(default=2)
+
+        # ───── Smart Context Selection ─────
         smart_context_selection: bool = Field(default=False)
         smart_context_top_k: int = Field(default=15)
         smart_context_min_tokens: int = Field(default=1024)
         smart_context_include_last_user: bool = Field(default=True)
 
+        # ───── Hierarchical Compression ─────
         hierarchical_compression_enabled: bool = Field(default=False)
         hierarchical_compression_interval_messages: int = Field(default=100)
         hierarchical_summary_model: str = Field(default="ollama/llama3.2:3b")
         hierarchical_summary_max_tokens: int = Field(default=800)
 
+        # ───── Duplicate Blocks & Frequency ─────
         auto_remove_duplicate_blocks: bool = Field(default=True)
         max_duplicate_age_hours: float = Field(default=6.0)
         frequency_weight_factor: float = Field(default=0.3)
         min_mentions_for_boost: int = Field(default=3)
         frequency_decay_hours: float = Field(default=12.0)
 
+        # ───── Confidence Scoring & Chain‑of‑Thought ─────
         enable_confidence_scoring: bool = Field(default=True)
         confidence_prompt: str = Field(
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help."
@@ -895,15 +991,10 @@ class Filter:
             default="ollama/llama3.2:3b",
             description="Model used for CoT level 3 (self-reflection).",
         )
-        enable_cot_llm_detection: bool = Field(
-            default=True,
-            description="If true, uses a lightweight LLM to decide the CoT level instead of static keywords.",
-        )
-        cot_detection_model: str = Field(
-            default="ollama/llama3.2:3b",
-            description="Model used to detect the appropriate CoT level when enable_cot_llm_detection is active.",
-        )
+        enable_cot_llm_detection: bool = Field(default=True)
+        cot_detection_model: str = Field(default="ollama/llama3.2:3b")
 
+        # ───── Assumptions & Contradictions ─────
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
             default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
@@ -913,10 +1004,14 @@ class Filter:
             default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         contradiction_inject_warning: bool = Field(default=True)
+
+        # ───── Proactive Context Warning ─────
         proactive_context_warning_threshold: float = Field(default=0.85)
         proactive_context_warning_message: str = Field(
             default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window ({used_tokens}/{max_tokens} tokens). Consider using `/forget` to remove irrelevant parts, `/remember` to pin important context, or ask me to summarize older parts."
         )
+
+        # ───── Facts ─────
         enable_facts: bool = Field(default=True)
         fact_max_age_days: int = Field(default=90)
         inject_facts_in_context: bool = Field(default=True)
@@ -924,6 +1019,7 @@ class Filter:
         fact_command_prefix: str = Field(default="/fact")
         enable_auto_fact_detection: bool = Field(default=False)
 
+        # ───── Iterative Mode ─────
         enable_iterative_mode: bool = Field(default=True)
         iterative_auto_continue: bool = Field(default=False)
         iterative_max_steps: int = Field(default=10)
@@ -936,32 +1032,33 @@ class Filter:
         )
         iterative_resume_command: str = Field(default="/iterate resume")
         natural_language_iterate: bool = Field(default=True)
+        iterative_state_ttl_hours: float = Field(default=2.0)
 
-        iterative_state_ttl_hours: float = Field(
-            default=2.0,
-            description="Maximum hours an iterative state persists before being automatically cleared.",
-        )
+        # ───── Similar Messages & Obsolete Marking ─────
         similar_message_handling: str = Field(default="replace")
         similar_message_threshold: float = Field(default=0.92)
         similar_message_check_code_only: bool = Field(default=True)
-
         enable_obsolete_marking: bool = Field(default=True)
 
+        # ───── Proactive Summary & Command Suggestions ─────
         proactive_summary_threshold: float = Field(default=0.75)
         proactive_summary_growth_window: int = Field(default=3)
-
-        duplicate_question_threshold: float = Field(default=0.92)
-        duplicate_question_lookback: int = Field(default=20)
-
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
 
+        # ───── Duplicate Question Detection ─────
+        duplicate_question_threshold: float = Field(default=0.92)
+        duplicate_question_lookback: int = Field(default=20)
+        duplicate_question_lookback_hours: float = Field(default=24.0)
+
+        # ───── Response Cache ─────
         enable_response_cache: bool = Field(default=True)
         response_cache_similarity_threshold: float = Field(default=0.92)
         response_cache_ttl_hours: float = Field(default=24.0)
         response_cache_max_entries: int = Field(default=100)
         response_cache_include_context_hash: bool = Field(default=True)
 
+        # ───── Selective Summarization ─────
         selective_summarization: bool = Field(default=True)
         error_preserve_verbatim: bool = Field(default=True)
         error_max_age_hours: float = Field(default=48.0)
@@ -972,135 +1069,68 @@ class Filter:
         summary_fallback_model: str = Field(default="ollama/llama3.2:3b")
         summary_include_metadata: bool = Field(default=True)
 
+        # ───── Summarize Old Messages ─────
         summarize_old_messages: bool = Field(default=True)
         summarization_model: str = Field(default="ollama/llama3.2:3b")
+
+        # ───── LLM Configuration ─────
         openai_api_base: str = Field(
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
         )
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434")
         LLM_API_TOKEN: str = Field(default="")
+        llm_model: str = Field(default="ollama/llama3.2:3b")
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
+        llm_request_timeout: int = Field(default=300)
+        LLM_CACHE_TTL: int = Field(default=300)
+        LLM_CACHE_MAX_SIZE: int = Field(default=100)
 
-        enable_code_awareness: bool = Field(default=True)
-        code_similarity_threshold: float = Field(default=0.85)
-        max_base_code_blocks: int = Field(default=3)
-
-        project_id: str = Field(default="default")
-
-        max_proposed_changes: int = Field(default=5)
-        max_committed_changes: int = Field(default=10)
-        prioritize_recent_code: bool = Field(default=True)
-        auto_detect_code_blocks: bool = Field(default=True)
-        max_cached_projects: int = Field(default=10)
-        track_file_paths: bool = Field(default=True)
-        max_active_blocks: int = Field(default=50)
-        file_path_pattern: str = Field(
-            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
-        )
-
-        max_code_block_tokens: int = Field(default=0)
-        code_block_overflow_action: str = Field(
-            default="warn"
-        )  # admits summarize, truncate, warn
-        code_block_summary_model: str = Field(default="ollama/llama3.2:3b")
-        code_block_truncate_keep_head: int = Field(default=50)
-        code_block_truncate_keep_tail: int = Field(default=50)
-        code_block_warn_message: str = Field(
-            default="[Code block too large - truncated by system]"
-        )
-
+        # ───── Importance & Expiration ─────
         importance_mention_boost: float = Field(default=0.2)
         importance_recency_half_life_hours: float = Field(default=2.0)
-
-        ltm_compress_after_messages: int = Field(default=50)
-        ltm_summarization_trigger_similarity: float = Field(default=0.85)
-
-        enable_diff_application: bool = Field(default=True)
-        preserve_error_context: bool = Field(default=True)
-        error_retention_turns: int = Field(default=15)
         block_expiration_hours: float = Field(default=24.0)
         proposed_change_retention_turns: int = Field(default=20)
         preserve_tool_calls: bool = Field(default=True)
+        error_retention_turns: int = Field(default=15)
+        track_active_code_age: bool = Field(default=True)
+        active_code_timeout_minutes: int = Field(default=45)
+        recent_activity_window_minutes: int = Field(default=15)
 
-        enable_feedback_tracking: bool = Field(default=True)
-        feedback_history_limit: int = Field(default=10)
-        inject_feedback_context: bool = Field(default=True)
-        feedback_importance_penalty_for_failure: float = Field(default=2.0)
-
+        # ───── Diff & Patterns ─────
+        enable_diff_application: bool = Field(default=True)
+        preserve_error_context: bool = Field(default=True)
         code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
         diff_pattern: str = Field(
             default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
         )
         commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
 
+        # ───── Dependency Tracking ─────
         enable_dependency_tracking: bool = Field(default=False)
         dependency_extraction_model: str = Field(default="ollama/llama3.2:3b")
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
         affected_decay_hours: float = Field(default=4.0)
 
-        llm_request_timeout: int = Field(default=300)
-        track_active_code_age: bool = Field(default=True)
-        active_code_timeout_minutes: int = Field(default=45)
-        recent_activity_window_minutes: int = Field(
-            default=15,
-            description="How many minutes back to consider a file 'recently modified' in the context header.",
-        )
+        # ───── Feedback Tracking ─────
+        enable_feedback_tracking: bool = Field(default=True)
+        feedback_history_limit: int = Field(default=10)
+        inject_feedback_context: bool = Field(default=True)
+        feedback_importance_penalty_for_failure: float = Field(default=2.0)
 
+        # ───── Summarize Inactive Code ─────
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(default="ollama/llama3.2:3b")
 
-        llm_model: str = Field(default="ollama/llama3.2:3b")
-
+        # ───── Forget Commands ─────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
             default="ollama/Inference/Schematron:3B"
         )
-        LLM_MAX_CONCURRENT_CALLS: int = Field(
-            default=2,
-            ge=1,
-            le=10,
-            description="Max simultaneous LLM calls for summarization, filtering, etc.",
-        )
-        ltm_store_only_code_sessions: bool = Field(default=True)
-        ltm_include_timestamps: bool = Field(default=True)
 
-        LLM_CACHE_TTL: int = Field(default=300)
-        LLM_CACHE_MAX_SIZE: int = Field(
-            default=100, description="Maximum number of cached LLM responses in RAM."
-        )
-
-        huge_injection_threshold_tokens: int = Field(
-            default=25000,
-            description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
-        )
-        enable_call_graph_extraction: bool = Field(
-            default=True,
-            description="Extract call relationships (who calls whom) for code symbols.",
-        )
-        enable_auto_summaries: bool = Field(
-            default=False,
-            description="Automatically generate one-line summaries for code symbols using a small LLM.",
-        )
-        summary_code_max_chars: int = Field(
-            default=8000,
-            description="Maximum characters of code to include when summarizing code blocks.",
-        )
-        oversized_summary_max_tokens: int = Field(
-            default=500, description="Max tokens for summarizing oversized code blocks."
-        )
-
-        # Symbolic LTM indexing and retrieval
-        ltm_index_symbols_enabled: bool = Field(default=False)
-        ltm_symbol_index_max_per_message: int = Field(default=20)
-        ltm_symbol_boost_enabled: bool = Field(default=False)
-        ltm_symbol_boost_factor: float = Field(default=1.5)
-        ltm_symbol_boost_min_similarity: float = Field(default=0.5)
-        ltm_symbol_force_mode_enabled: bool = Field(default=False)
-        ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
-
-        # Proactive cleanup
+        # ───── Proactive Cleanup ─────
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
         cleanup_excluded_content_types: list = Field(
@@ -1111,7 +1141,7 @@ class Filter:
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
 
-        # Speculative preload
+        # ───── Speculative Preload ─────
         speculative_log_missed_opportunities: bool = Field(default=True)
         speculative_preload_enabled: bool = Field(default=False)
         speculative_preload_max_tokens_percent: float = Field(default=0.10)
@@ -1122,174 +1152,18 @@ class Filter:
         speculative_boost_on_miss: float = Field(default=1.0)
         speculative_decay_after_ignored_turns: int = Field(default=3)
         speculative_stats_command_enabled: bool = Field(default=True)
-        active_context_max_tokens: int = Field(
-            default=0,
-            description="Maximum tokens for the injected active code context. 0 = unlimited.",
-        )
-        duplicate_question_lookback_hours: float = Field(
-            default=24.0
-        )  # <-- Only last 24h
-        expand_default_depth: int = Field(
-            default=2, description="Default depth for /expand command"
-        )
-        max_change_summaries: int = Field(
-            default=1000,
-            description="Maximum number of block change summaries kept in memory per project.",
-        )
-        global_injection_token_budget: int = Field(
-            default=0,
-            description="Maximum tokens allowed for all system injections combined (0 = unlimited). Set to e.g. 30% of context window.",
-        )
 
-        full_code_injection_budget_percent: float = Field(
-            default=0.7,
-            ge=0.0,
-            le=1.0,
-            description="Percentage of the global injection token budget to use for full-code injection when a code review is requested.",
-        )
-
-        # Smart pre-expansion – proactively inject full code bodies before the LLM sees the prompt
-        smart_pre_expand_enabled: bool = Field(
-            default=True,
-            description="When in lightweight mode, proactively expand symbols needed by the user query.",
-        )
-        smart_pre_expand_min_tokens: int = Field(
-            default=2000,
-            description="Maximum tokens injected by the minimum expansion fallback. 0 = unlimited.",
-        )
-        smart_pre_expand_max_tokens: int = Field(
-            default=0,
-            description="Max tokens to inject via smart pre-expansion. 0 = unlimited.",
-        )
-        smart_pre_expand_use_llm: bool = Field(
-            default=True,
-            description="Use a small LLM to identify which symbols need expansion (slower but more accurate).",
-        )
-        smart_pre_expand_model: str = Field(
-            default="ollama/llama3.2:3b",
-            description="Model used for smart pre-expansion symbol detection.",
-        )
-        smart_pre_expand_full_if_no_match: bool = Field(
-            default=True,
-            description="If the query implies full code is needed but no specific symbols are detected, expand all up to the token budget.",
-        )
-
-        # Outlet expand intercept – auto‑execute /expand commands that the assistant emits
-        outlet_expand_intercept_enabled: bool = Field(
-            default=True,
-            description="Intercept /expand commands emitted by the assistant and auto-execute them.",
-        )
-        outlet_expand_intercept_max_symbols: int = Field(
-            default=0,
-            ge=0,
-            description="Max symbols to auto-expand per outlet intercept. 0 = unlimited.",
-        )
-        outlet_expand_intercept_depth: int = Field(
-            default=5,
-            ge=0,
-            description="Default depth for auto-intercepted /expand calls. 0 = no limit (use with caution).",
-        )
-        smart_pre_expand_embedding_threshold: float = Field(
-            default=0.72,
-            ge=0.0,
-            le=1.0,
-            description="Minimum cosine similarity between user query and 'full code' intent phrases to trigger expansion of all symbols.",
-        )
-        smart_pre_expand_min_symbols: int = Field(
-            default=3,
-            description="Minimum number of important symbols to always expand, even if detection doesn't trigger anything. 0 = disabled.",
-        )
-        enable_raw_code_detection: bool = Field(
-            default=True,
-            description="If no code blocks are extracted via Tree-sitter or regex, use a lightweight LLM to detect raw code in the message and wrap it automatically.",
-        )
-
-    class UserValves(BaseModel):
-        max_turns: Optional[int] = Field(default=None)
-        enable_code_awareness: Optional[bool] = Field(default=None)
-
-    _SYMBOL_BLACKLIST = {
-        "self",
-        "cls",
-        "args",
-        "kwargs",
-        "init",
-        "main",
-        "len",
-        "print",
-        "range",
-        "int",
-        "str",
-        "float",
-        "bool",
-        "list",
-        "dict",
-        "set",
-        "tuple",
-        "object",
-        "type",
-        "super",
-        "i",
-        "j",
-        "k",
-        "x",
-        "y",
-        "z",
-        "e",
-        "ex",
-        "err",
-        "error",
-        "data",
-        "result",
-        "value",
-        "key",
-        "item",
-        "items",
-        "func",
-        "method",
-        "function",
-        "class",
-        "return",
-        "pass",
-        "break",
-        "continue",
-        "if",
-        "else",
-        "elif",
-        "for",
-        "while",
-        "try",
-        "except",
-        "finally",
-        "with",
-        "as",
-        "import",
-        "from",
-        "def",
-        "lambda",
-        "yield",
-        "raise",
-        "assert",
-        "and",
-        "or",
-        "not",
-        "in",
-        "is",
-        "None",
-        "True",
-        "False",
-    }
+        # ───── Raw File Priority Boost ─────
+        raw_file_priority_boost: float = Field(default=2.0)
 
     def __init__(self):
+        # ──── Valves and basic objects ────
         self.valves = self.Valves()
-        self.embedder = None
-        self.chroma_client = None
-        self.memory_collection = None
-        self._response_cache_collection = None
         self.tokenizer = None
         self._db_conn = None
         self._cross_encoder = None
-        self._init_state_db()
+
+        # ──── Conversation state ────
         self._conversation_state: OrderedDict = OrderedDict()
         self._state_factory = lambda: {
             "active_blocks": {},
@@ -1311,10 +1185,13 @@ class Filter:
             "speculative_last_preloaded_symbols": set(),
             "speculative_last_preload_turn": 0,
         }
+
+        # ──── Patterns ────
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
         self.diff_pattern = re.compile(self.valves.diff_pattern)
         self.commit_pattern = re.compile(self.valves.commit_pattern, re.IGNORECASE)
 
+        # ──── Tokenizer ────
         if HAS_TIKTOKEN and self.valves.use_tiktoken:
             try:
                 self.tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -1322,28 +1199,38 @@ class Filter:
             except Exception as e:
                 logger.warning(f"Failed to load tiktoken: {e}")
 
+        # ──── State database ────
+        self._init_state_db()
+
+        # ──── Long‑term memory (ChromaDB + embeddings) ────
+        self.embedder = None
+        self.chroma_client = None
+        self.memory_collection = None
+        self._response_cache_collection = None
         if HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness:
             self._init_long_term_memory()
         else:
             logger.warning("Long‑term memory or code awareness disabled")
 
+        # ──── Reranker ────
         if self.valves.enable_reranking and HAS_CROSS_ENCODER:
             self._load_reranker()
 
+        # ──── Fact storage log ────
         if self.valves.enable_facts:
             self._log_debug("Fact storage enabled.")
 
+        # ──── HTTP session and locks ────
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._project_locks: dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
-        self._low_priority_llm_semaphore = asyncio.Semaphore(
-            1
-        )  # for non urgen background tasks
+        self._low_priority_llm_semaphore = asyncio.Semaphore(1)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
 
+        # ──── Background tasks ────
         self._hierarchical_compress_in_progress: Dict[str, bool] = {}
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
         self._hierarchical_compress_tasks: list[asyncio.Task] = []
@@ -1351,20 +1238,23 @@ class Filter:
         self._dependency_tasks: list[asyncio.Task] = []
         self._write_counter = 0
         self._response_cache_cleanup_task: Optional[asyncio.Task] = None
+
+        # ──── Session classification cache ────
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
         self._session_classify_ttl: float = 1800.0
 
+        # ──── Symbol index and lightweight context ────
         self._symbol_index = SymbolIndex()
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
+
+        # ──── Project tracking and spans ────
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
-        self._block_change_summaries: Dict[str, Tuple[str, float]] = (
-            {}
-        )  # hash -> (summary, timestamp)
+        self._block_change_summaries: Dict[str, Tuple[str, float]] = {}
 
-        # Prototype phrases for “full code” intent detection via embeddings
+        # ──── Smart pre‑expand: prototype phrases ────
         self._full_code_intent_phrases = [
             "show me the complete code",
             "generate a flowchart",
@@ -1386,8 +1276,11 @@ class Filter:
         self._full_code_intent_embeddings = None
         self._query_embedding_cache: Dict[str, np.ndarray] = {}
         self._query_embedding_cache_max_size = 100
+
+        # ──── Response cache counter ────
         self._response_cache_count: Dict[str, int] = {}
 
+        # ──── Batch LTM ────
         self._pending_ltm_messages: List[dict] = []
         self._ltm_batch_lock = asyncio.Lock()
         self._ltm_batch_task: Optional[asyncio.Task] = None
@@ -6852,8 +6745,8 @@ class Filter:
 
     def _parse_iteration_user_intent(self, message: str) -> str:
         """
-        Detecta la intención del usuario cuando hay una sesión iterativa activa.
-        Retorna: 'continue', 'skip', 'stop', o 'feedback'.
+        Detects the user's intent when an iterative session is active.
+        Returns: 'continue', 'skip', 'stop', or 'feedback'.
         """
         msg = message.strip().lower()
         # Keywords for next step
