@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.8.0
+version: 5.6.0
 license: GPL3
 requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -848,6 +848,7 @@ class Filter:
         context_window_tokens: int = Field(default=1000000)
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
+        max_cached_projects: int = Field(default=10)
 
         # ───── Long‑Term Memory (ChromaDB) ─────
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
