@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.6.0
+version: 5.8.0
 license: GPL3
 requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
