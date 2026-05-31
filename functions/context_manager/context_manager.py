@@ -1097,6 +1097,7 @@ class Filter:
         track_active_code_age: bool = Field(default=True)
         active_code_timeout_minutes: int = Field(default=45)
         recent_activity_window_minutes: int = Field(default=15)
+        max_change_summaries: int = Field(default=1000)
 
         # ───── Diff & Patterns ─────
         enable_diff_application: bool = Field(default=True)
@@ -6334,6 +6335,65 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Iterative mode
     # --------------------------------------------------------------------------
+    async def _detect_iterative_intent(
+        self, user_content: str, project_id: str
+    ) -> bool:
+        """
+        Use a lightweight LLM to decide if the user message is a concrete code-modification
+        request that should trigger iterative planning.
+        """
+        if not HAS_AIOHTTP:
+            return False
+
+        # Quick guard: message must be at least 15 characters
+        if len(user_content.strip()) < 15:
+            return False
+
+        # Build minimal context (active code summary, if any)
+        state = self._get_state(project_id)
+        ctx_lines = []
+        if state and state.get("active_blocks"):
+            # List top 3 active code files (short)
+            active = [
+                b
+                for b in state["active_blocks"].values()
+                if not b.obsolete
+                and b.content_type
+                in (ContentType.BASE_CODE, ContentType.PROPOSED_CHANGE)
+            ]
+            for b in active[:3]:
+                file_str = b.file_path or "unknown"
+                ctx_lines.append(f"- {file_str} ({b.content_type.value})")
+        context_str = "\n".join(ctx_lines) if ctx_lines else "(no active code)"
+
+        prompt = (
+            f"Active code context:\n{context_str}\n\n"
+            f"User message:\n{user_content[:400]}\n\n"
+            "Does this message request a concrete code change (implement, refactor, fix, add, etc.) "
+            "that should be broken into a step‑by‑step plan? "
+            "Answer ONLY 'yes' or 'no'."
+        )
+
+        # Use the smallest available model
+        model = (
+            self.valves.cot_detection_model
+            or self.valves.summarization_model
+            or self.valves.llm_model
+        )
+
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
+            model_override=model,
+            max_tokens=3,
+            temperature=0.0,
+            timeout=4.0,  # fast timeout; if it fails, assume no iterative intent
+        )
+        result = bool(response and response.strip().lower().startswith("yes"))
+        if result:
+            self._log_debug("Iterative intent detected by LLM")
+        return result
+
     async def _run_iteration(
         self, project_id: str, user_content: str
     ) -> Tuple[str, bool]:
@@ -6415,9 +6475,11 @@ class Filter:
                     project_id, user_content, state, iterative_state
                 )
 
-        # Auto-start a new session if natural language and message is long enough
-        if self.valves.natural_language_iterate and len(user_content) > 30:
-            return await self._iterative_start(project_id, user_content, state)
+        # Auto-start a new session if natural language and LLM detects a coding task
+        if self.valves.natural_language_iterate:
+            is_task = await self._detect_iterative_intent(user_content, project_id)
+            if is_task:
+                return await self._iterative_start(project_id, user_content, state)
 
         return "", False
 
