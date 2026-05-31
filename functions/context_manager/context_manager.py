@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.6.0
+version: 5.7.0
 license: GPL3
 requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -19,6 +19,7 @@ import ast
 from collections import OrderedDict, defaultdict, Counter
 import json
 import asyncio
+import threading
 import difflib  # For the future → To allow users to do diff between codes without needing for an LLM.
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -324,19 +325,26 @@ FALLBACK_CALL_QUERIES = {
 # Reentrant async lock
 # ---------------------------------------------------------------------------
 class ReentrantAsyncLock:
-    """Reentrant asyncio lock that allows the same task to acquire it multiple times."""
+    """Reentrant asyncio lock with optional timeout to prevent deadlocks."""
 
-    def __init__(self):
+    def __init__(self, default_timeout: float = 60.0):
         self._lock = asyncio.Lock()
         self._owner: Optional[asyncio.Task] = None
         self._count = 0
+        self._default_timeout = default_timeout
 
-    async def acquire(self):
+    async def acquire(self, timeout: Optional[float] = None):
         task = asyncio.current_task()
         if self._owner is task:
             self._count += 1
             return
-        await self._lock.acquire()
+
+        effective_timeout = timeout if timeout is not None else self._default_timeout
+        if effective_timeout is not None:
+            await asyncio.wait_for(self._lock.acquire(), timeout=effective_timeout)
+        else:
+            await self._lock.acquire()
+
         self._owner = task
         self._count = 1
 
@@ -364,21 +372,25 @@ class SymbolIndex:
     MAX_ENTRIES = 10_000
 
     def __init__(self):
-        self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(
-            set
-        )  # (project_id, name) -> blocks
+        self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        self._callee_to_callers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         self._stats: Counter = Counter()
 
     def _evict_if_needed(self):
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
             least_common = self._stats.most_common()[-1][0]
             del self._name_to_blocks[least_common]
+            del self._callee_to_callers[least_common]
             del self._stats[least_common]
 
     def add(self, symbol: CodeSymbol, block_hash: str, project_id: str):
         key = (project_id, symbol.name)
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
+        # Index inverse: for each called function, add this symbol as caller
+        for callee in symbol.calls:
+            callee_key = (project_id, callee)
+            self._callee_to_callers[callee_key].add(symbol.name)
         self._evict_if_needed()
 
     def remove(self, symbol: CodeSymbol, block_hash: str, project_id: str):
@@ -389,6 +401,12 @@ class SymbolIndex:
             if not s:
                 del self._name_to_blocks[key]
                 del self._stats[key]
+        for callee in symbol.calls:
+            callee_key = (project_id, callee)
+            if callee_key in self._callee_to_callers:
+                self._callee_to_callers[callee_key].discard(symbol.name)
+                if not self._callee_to_callers[callee_key]:
+                    del self._callee_to_callers[callee_key]
 
     def remove_all_for_block(
         self, block_hash: str, symbols: List[CodeSymbol], project_id: str
@@ -402,14 +420,24 @@ class SymbolIndex:
     def get_all_names(self, project_id: str) -> Set[str]:
         return {key[1] for key in self._name_to_blocks if key[0] == project_id}
 
+    def get_callers(self, callee_name: str, project_id: str) -> Set[str]:
+        """Return the set of symbol names that call `callee_name`."""
+        return self._callee_to_callers.get((project_id, callee_name), set())
+
     def clear_project(self, project_id: str):
         keys_to_remove = [key for key in self._name_to_blocks if key[0] == project_id]
         for key in keys_to_remove:
             del self._name_to_blocks[key]
             del self._stats[key]
+        inv_keys_to_remove = [
+            key for key in self._callee_to_callers if key[0] == project_id
+        ]
+        for key in inv_keys_to_remove:
+            del self._callee_to_callers[key]
 
     def clear(self):
         self._name_to_blocks.clear()
+        self._callee_to_callers.clear()
         self._stats.clear()
 
 
@@ -453,20 +481,33 @@ class SignatureExtractor:
             return "javascript"
         return "unknown"
 
+    # Cache of parsers by language (class attribute)
+    _parser_cache: Dict[str, "TSParser"] = {}
+    _parser_cache_lock = threading.Lock()
+
     @staticmethod
     def _parse_sync(code_bytes: bytes, lang: str):
-        """Creates a new parser in the current thread and parses the code."""
-        from tree_sitter import (
-            Parser as TSParser,
-        )  # local import to avoid global dependencies.
+        from tree_sitter import Parser as TSParser
 
-        try:
-            lang_obj = get_language(lang)
+        # Reuse parser if already exists for this language
+        with SignatureExtractor._parser_cache_lock:
+            parser = SignatureExtractor._parser_cache.get(lang)
+
+        if parser is None:
+            try:
+                lang_obj = get_language(lang)
+            except Exception as e:
+                raise RuntimeError(f"Tree‑sitter language '{lang}' not available: {e}")
             parser = TSParser()
             parser.set_language(lang_obj)
-            return parser.parse(code_bytes)
-        except Exception as e:
-            raise RuntimeError(f"Tree‑sitter parse error: {e}")
+            with SignatureExtractor._parser_cache_lock:
+                SignatureExtractor._parser_cache[lang] = parser
+
+        # If parser already existed, the language is already configured
+        # and it's not necessaro to call set_language again unless the instance has been
+        # reused with another language, which won't happen because we have a cache by language.
+
+        return parser.parse(code_bytes)
 
     @staticmethod
     async def extract_async(
@@ -843,7 +884,7 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         cot_max_tokens: int = Field(default=1000)
         cot_model_level2: str = Field(
@@ -865,11 +906,11 @@ class Filter:
 
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         enable_contradiction_detection: bool = Field(default=False)
         contradiction_detection_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         contradiction_inject_warning: bool = Field(default=True)
         proactive_context_warning_threshold: float = Field(default=0.85)
@@ -888,10 +929,10 @@ class Filter:
         iterative_max_steps: int = Field(default=10)
         iterative_diff_format: str = Field(default="unified")
         iterative_planning_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         iterative_execution_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Mini.gguf"
+            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         iterative_resume_command: str = Field(default="/iterate resume")
         natural_language_iterate: bool = Field(default=True)
@@ -2389,13 +2430,43 @@ class Filter:
         """
         Use a lightweight LLM to identify the programming language of a code snippet.
         Returns a normalized language name (e.g., 'python', 'javascript') or 'unknown'.
+        A fast heuristic pre-filter avoids unnecessary LLM calls.
         """
         if not HAS_AIOHTTP:
-            self._log_debug(
-                "[LangDetect] method=llm, result=unavailable (no aiohttp), dur=0.000s"
-            )
             return "unknown"
 
+        # ---- Quick heuristic ----
+        code_indicators = [
+            "def ",
+            "class ",
+            "import ",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "{",
+            "}",
+            ";",
+            "=>",
+            "==",
+            "!=",
+            "return ",
+        ]
+        snippet_lower = code_snippet.lower()
+        indicator_count = sum(snippet_lower.count(ind) for ind in code_indicators)
+        # If too few indicators, it's probably not code
+        if len(code_snippet) > 50 and indicator_count < 2:
+            self._log_debug(
+                "[LangDetect] heuristic: not enough code indicators, skipping LLM"
+            )
+            return "unknown"
+        # Si la proporción de caracteres no-alfabéticos es baja, texto plano
+        non_alpha = sum(1 for c in code_snippet if not c.isalpha() and not c.isspace())
+        if len(code_snippet) > 50 and non_alpha / max(len(code_snippet), 1) < 0.1:
+            self._log_debug("[LangDetect] heuristic: low symbol density, skipping LLM")
+            return "unknown"
+
+        # ---- LLM fallback ----
         t_start = time.monotonic()
         prompt = (
             "Identify the programming language of this code. "
@@ -3789,8 +3860,15 @@ class Filter:
                     to_summarize.append((h, block))
             if not to_summarize:
                 return
-            tasks = [self._summarize_code_block(block) for _, block in to_summarize]
+
+            # Auxiliar semaphore function
+            async def _summarize_with_semaphore(block):
+                async with self._low_priority_llm_semaphore:
+                    return await self._summarize_code_block(block)
+
+            tasks = [_summarize_with_semaphore(block) for _, block in to_summarize]
             summaries = await asyncio.gather(*tasks)
+
             for (h, block), summary in zip(to_summarize, summaries):
                 if summary:
                     sig = self._extract_signature(block.content)
@@ -4077,18 +4155,12 @@ class Filter:
                 break
         if not sym or not sym.calls:
             return []
-        called_by = defaultdict(set)
-        for b in state["active_blocks"].values():
-            if b.obsolete:
-                continue
-            for s in b.symbols:
-                for callee in s.calls:
-                    called_by[callee].add(s.name)
+
         interest = []
         for callee_name in sym.calls:
             if not self._symbol_index.find_blocks(callee_name, project_id):
                 continue
-            num_callers = len(called_by.get(callee_name, set()))
+            num_callers = len(self._symbol_index.get_callers(callee_name, project_id))
             if num_callers < self.valves.speculative_preload_min_callers:
                 continue
             callee_hashes = self._symbol_index.find_blocks(callee_name, project_id)
@@ -4104,7 +4176,12 @@ class Filter:
         interest.sort(key=lambda x: x[1], reverse=True)
         return interest
 
-    def _expand_referenced_symbols(self, project_id: str, user_query: str) -> str:
+    def _expand_referenced_symbols(
+        self,
+        project_id: str,
+        user_query: str,
+        seen_hashes: Optional[Set[str]] = None,
+    ) -> str:
         state = self._get_state(project_id)
         has_calls = state.get("has_any_calls", False) if state else False
         MAX_EXPANDED_BODIES = (
@@ -4140,10 +4217,14 @@ class Filter:
         expanded_hashes = set()
 
         for block_hash in sorted_hashes[:MAX_EXPANDED_BODIES]:
+            if seen_hashes is not None and block_hash in seen_hashes:
+                continue
+            if seen_hashes is not None:
+                seen_hashes.add(block_hash)
+            expanded_hashes.add(block_hash)
             block = state["active_blocks"].get(block_hash)
             if not block:
                 continue
-            expanded_hashes.add(block_hash)
             loc = f" (file: {block.file_path})" if block.file_path else ""
             parts.append(
                 f"### Block {block.hash[:8]}{loc}\n```\n{block.content[:3000]}\n```"
@@ -4173,7 +4254,7 @@ class Filter:
                         parts.append(f"- {ts}: {summary}{latest}")
                     parts.append("")
 
-        # Speculative preload of dependencies
+        # Speculative preload
         if self.valves.speculative_preload_enabled and mentioned_names:
             if self.valves.speculative_adaptive:
                 limit = state.get("speculative_preload_limit")
@@ -4211,6 +4292,9 @@ class Filter:
                         dep_block = state["active_blocks"].get(h)
                         if not dep_block or dep_block.obsolete:
                             continue
+                        # Deduplicate with seen_hashes
+                        if seen_hashes is not None and dep_block.hash in seen_hashes:
+                            continue
                         tokens = dep_block._cached_token_count
                         if preload_tokens_used + tokens > max_preload_tokens:
                             continue
@@ -4221,6 +4305,8 @@ class Filter:
                         preload_blocks.append(dep_block)
                         preloaded_symbols.add(callee_name)
                         preload_tokens_used += tokens
+                        if seen_hashes is not None:
+                            seen_hashes.add(dep_block.hash)
                         break
 
             if self.valves.speculative_adaptive:
@@ -4575,6 +4661,7 @@ class Filter:
             last_ts = state.get("last_compression_timestamp", 0)
             if time.time() - last_ts < 3600:
                 return
+
             now = time.time()
             where_filter = {
                 "$and": [
@@ -4597,6 +4684,7 @@ class Filter:
                 < self.valves.hierarchical_compression_interval_messages
             ):
                 return
+
             pairs = sorted(
                 zip(results["ids"], results["documents"], results["metadatas"]),
                 key=lambda x: x[2].get("timestamp", 0),
@@ -4604,9 +4692,14 @@ class Filter:
             to_compress = pairs[
                 : self.valves.hierarchical_compression_interval_messages
             ]
+
             max_chars = 4000
-            prompt_template = "Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{text}"
+            prompt_template = (
+                "Summarise the following conversation segment, keeping key technical "
+                "decisions and code changes:\n\n{text}"
+            )
             overhead = len(prompt_template.format(text=""))
+
             batches = []
             current_batch = []
             current_len = 0
@@ -4620,37 +4713,57 @@ class Filter:
                 current_len += entry_len
             if current_batch:
                 batches.append(current_batch)
-            all_summaries = []
-            ids_to_delete = []
+
+            # --- Generate all resumes first ---
             model = (
                 self.valves.hierarchical_summary_model
                 or self.valves.llm_model
                 or self.valves.summarization_model
             )
+            summaries = []
+            ids_to_delete = []
+
             for batch in batches:
                 texts = "\n---\n".join([doc for _, doc, _ in batch])
                 prompt = prompt_template.format(text=texts[: max_chars - overhead])
                 summary = await self._call_llm(
                     prompt=prompt,
-                    system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
+                    system_prompt="You are a code-aware assistant that produces concise, "
+                    "information-dense summaries.",
                     model_override=model,
                     max_tokens=self.valves.hierarchical_summary_max_tokens,
                     temperature=0.2,
                 )
-                if summary:
-                    all_summaries.append(summary)
-                    ids_to_delete.extend([id for id, _, _ in batch])
-            if not ids_to_delete:
+                if not summary:
+                    self._log_debug(
+                        "Hierarchical compression aborted: LLM failed to generate summary"
+                    )
+                    return  # No se borra nada
+                summaries.append(summary)
+                ids_to_delete.extend([id for id, _, _ in batch])
+
+            if not summaries:
                 return
-            await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.delete(ids=ids_to_delete)
-            )
-            combined_summary = "\n---\n".join(all_summaries)
+
+            combined_summary = "\n---\n".join(summaries)
             if len(combined_summary) > 4000:
                 combined_summary = combined_summary[:4000] + "\n[summary truncated]"
+
+            # Generate embedding (if fails, abort)
+            try:
+                summary_embedding = await anyio.to_thread.run_sync(
+                    lambda: self.embedder.encode(combined_summary).tolist()
+                )
+            except Exception as e:
+                self._log_debug(
+                    f"Failed to generate embedding for hierarchical summary: {e}"
+                )
+                return
+
+            # --- Now yes, delete and save atomically ---
             summary_id = f"{project_id}_hierarchical_{int(time.time())}"
-            summary_embedding = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode(combined_summary).tolist()
+            await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.delete(ids=ids_to_delete)
             )
             await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.upsert(
@@ -4668,9 +4781,11 @@ class Filter:
                     documents=[f"[Hierarchical summary]\n{combined_summary}"],
                 )
             )
+
             state["last_compression_timestamp"] = time.time()
             self._set_state(project_id, state)
             self._log_debug(f"Hierarchical compression completed for {project_id}")
+
         except Exception as e:
             self._log_debug(f"Error in hierarchical_compress: {e}")
         finally:
@@ -4939,21 +5054,29 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Diff application
     # --------------------------------------------------------------------------
+
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
         if not self.valves.enable_diff_application:
             return None
+
         lines = original.splitlines(keepends=False)
         result_lines = lines[:]
         hunks = []
+
         for match in re.finditer(
             r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
         ):
             old_start = int(match.group(1))
-            old_count = int(match.group(2)) if match.group(2) else 1
+            old_count_str = match.group(2)
+            old_count = int(old_count_str) if old_count_str else 1
+
             new_start = int(match.group(3))
-            new_count = int(match.group(4)) if match.group(4) else 1
+            new_count_str = match.group(4)
+            new_count = int(new_count_str) if new_count_str else 1
+
             hunk_body = match.group(5).strip("\n")
             old_lines, new_lines = [], []
+
             for line in hunk_body.split("\n"):
                 if line.startswith("-"):
                     old_lines.append(line[1:])
@@ -4962,26 +5085,42 @@ class Filter:
                 elif line.startswith(" "):
                     old_lines.append(line[1:])
                     new_lines.append(line[1:])
-            hunks.append((old_start - 1, old_lines, new_lines))
+
+            if old_count == 0:
+                old_start_idx = old_start
+            else:
+                old_start_idx = old_start - 1
+
+            if new_count == 0:
+                new_lines = []
+
+            hunks.append((old_start_idx, old_lines, new_lines))
+
         applied_any = False
-        for old_start, old_lines, new_lines in reversed(hunks):
-            if old_start < 0 or old_start + len(old_lines) > len(result_lines):
+        for old_start_idx, old_lines, new_lines in reversed(hunks):
+            if old_start_idx < 0 or old_start_idx + len(old_lines) > len(result_lines):
                 logger.warning(
-                    f"Unified diff hunk out of bounds (start={old_start}, lines={len(old_lines)}, total={len(result_lines)})"
+                    f"Unified diff hunk out of bounds (start={old_start_idx}, "
+                    f"lines={len(old_lines)}, total={len(result_lines)})"
                 )
                 continue
-            if result_lines[old_start : old_start + len(old_lines)] != old_lines:
-                logger.warning(f"Unified diff hunk mismatch at line {old_start}")
+            if (
+                result_lines[old_start_idx : old_start_idx + len(old_lines)]
+                != old_lines
+            ):
+                logger.warning(f"Unified diff hunk mismatch at line {old_start_idx}")
                 continue
             result_lines = (
-                result_lines[:old_start]
+                result_lines[:old_start_idx]
                 + new_lines
-                + result_lines[old_start + len(old_lines) :]
+                + result_lines[old_start_idx + len(old_lines) :]
             )
             applied_any = True
+
         if not applied_any and hunks:
             logger.warning("No hunks were applied from the unified diff")
             return None
+
         return "\n".join(result_lines)
 
     def _apply_change_with_diff(
@@ -5257,23 +5396,8 @@ class Filter:
         user_query: str,
         project_id: str,
         token_budget: int = 0,
+        seen_hashes: Optional[Set[str]] = None,
     ) -> str:
-        """
-        Proactively expand symbols that the user query likely needs.
-
-        Detection strategies (in order):
-          A) Symbol names explicitly mentioned in the query.
-          B) Embedding-based: compare query with prototype phrases that imply
-             full-code access. If similarity >= threshold, expand all symbols.
-          C) Optional LLM‑based detection for ambiguous cases.
-          D) Fallback: always expand a minimum number of important symbols
-             if nothing else was injected, but capped at smart_pre_expand_min_tokens.
-
-        Expanded code is appended to the system context before the LLM sees it,
-        so the assistant never has to ask for /expand.
-
-        Returns a formatted string ready for injection, or empty string.
-        """
         if not self.valves.smart_pre_expand_enabled:
             return ""
 
@@ -5287,18 +5411,17 @@ class Filter:
 
         effective_budget = token_budget or self.valves.smart_pre_expand_max_tokens
         needed_symbols: Set[str] = set()
-        used_minimum_expansion = False  # tracks if we had to fall back to strategy D
+        used_minimum_expansion = False
 
-        # --- A) Direct mention of symbol names in the user query ---
+        # A) Direct mention
         words = set(re.findall(r"\b\w+\b", user_query))
         directly_mentioned = all_names.intersection(words)
         needed_symbols.update(directly_mentioned)
 
-        # --- B) Embedding-based detection of "full code" intent ---
+        # B) Embedding-based detection
         if not needed_symbols:
             await self._ensure_full_code_intent_embeddings()
             if self._full_code_intent_embeddings is not None:
-                # Get query embedding (with caching)
                 query_hash = hashlib.md5(user_query.encode()).hexdigest()[:12]
                 query_emb = self._query_embedding_cache.get(query_hash)
                 if query_emb is None:
@@ -5328,7 +5451,7 @@ class Filter:
                 if max_sim >= self.valves.smart_pre_expand_embedding_threshold:
                     needed_symbols = set(all_names)
 
-        # --- C) Optional LLM‑based detection (only if nothing found yet) ---
+        # C) Optional LLM detection
         if (
             self.valves.smart_pre_expand_use_llm
             and not needed_symbols
@@ -5362,7 +5485,7 @@ class Filter:
                 needed_symbols.update(detected)
                 self._log_debug(f"smart_pre_expand: LLM detected symbols: {detected}")
 
-        # --- D) Minimum expansion fallback ---
+        # D) Minimum expansion fallback
         if not needed_symbols and self.valves.smart_pre_expand_min_symbols > 0:
             used_minimum_expansion = True
             self._log_debug(
@@ -5388,9 +5511,6 @@ class Filter:
             self._log_debug("smart_pre_expand: no symbols to expand")
             return ""
 
-        # If we are in minimum expansion, enforce its own token cap.
-        # This ensures that when no specific symbols were requested, we don't
-        # flood the context with huge code blocks.
         if used_minimum_expansion and self.valves.smart_pre_expand_min_tokens > 0:
             if effective_budget == 0:
                 effective_budget = self.valves.smart_pre_expand_min_tokens
@@ -5404,7 +5524,6 @@ class Filter:
             f"{sorted(needed_symbols)[:10]}"
         )
 
-        # --- Build priority list, sorted by block importance ---
         symbol_priority: List[Tuple[str, "CodeBlock", float]] = []
         for sym_name in needed_symbols:
             block_hashes = self._symbol_index.find_blocks(sym_name, project_id)
@@ -5418,12 +5537,16 @@ class Filter:
         parts = ["\n## Auto-Expanded Code (retrieved for your query)\n"]
         tokens_used = 0
         expanded_count = 0
-        seen_hashes: Set[str] = set()
+        local_seen: Set[str] = set()
 
         for sym_name, block, _ in symbol_priority:
-            if block.hash in seen_hashes:
+            if seen_hashes is not None and block.hash in seen_hashes:
                 continue
-            seen_hashes.add(block.hash)
+            if block.hash in local_seen:
+                continue
+            local_seen.add(block.hash)
+            if seen_hashes is not None:
+                seen_hashes.add(block.hash)
 
             tok_count = (
                 len(self.tokenizer.encode(block.content))
@@ -5444,7 +5567,6 @@ class Filter:
             tokens_used += tok_count
             expanded_count += 1
 
-            # Expand immediate callees (depth 1) when call graph is enabled
             if self.valves.enable_call_graph_extraction:
                 for sym in block.symbols:
                     if sym.name != sym_name:
@@ -5459,7 +5581,12 @@ class Filter:
                             callee_block = state["active_blocks"].get(ch)
                             if not callee_block or callee_block.obsolete:
                                 continue
-                            if ch in seen_hashes:
+                            if (
+                                seen_hashes is not None
+                                and callee_block.hash in seen_hashes
+                            ):
+                                break
+                            if callee_block.hash in local_seen:
                                 break
                             ctok = (
                                 len(self.tokenizer.encode(callee_block.content))
@@ -5471,7 +5598,9 @@ class Filter:
                                 and tokens_used + ctok > effective_budget
                             ):
                                 break
-                            seen_hashes.add(ch)
+                            local_seen.add(callee_block.hash)
+                            if seen_hashes is not None:
+                                seen_hashes.add(callee_block.hash)
                             callee_loc = (
                                 f" (file: {callee_block.file_path})"
                                 if callee_block.file_path
@@ -6235,7 +6364,14 @@ class Filter:
             state = self._get_state(project_id)
             if not state:
                 return "No active context to forget."
+
             action = intent.get("action")
+            if action == "forget_all":
+                return (
+                    "⚠️ For safety, the natural language 'forget all' is disabled. "
+                    "Please type `/forget all` explicitly to confirm."
+                )
+
             if action == "forget_last":
                 if state["active_blocks"]:
                     last_hash = max(
@@ -6250,6 +6386,7 @@ class Filter:
                     del state["active_blocks"][last_hash]
                     self._invalidate_lightweight_cache(project_id)
                 return "Forgotten the last context block."
+
             elif action == "forget_n":
                 n = intent.get("n", 1)
                 blocks_by_time = sorted(
@@ -6268,6 +6405,7 @@ class Filter:
                 if removed:
                     self._invalidate_lightweight_cache(project_id)
                 return f"Forgotten the last {removed} context block(s)."
+
             elif action == "forget_file":
                 file_path = intent.get("file", "")
                 if not file_path:
@@ -6287,6 +6425,7 @@ class Filter:
                 if to_remove:
                     self._invalidate_lightweight_cache(project_id)
                 return f"Forgotten {len(to_remove)} block(s) related to {file_path}."
+
             elif action == "forget_block":
                 block_id = intent.get("hash") or intent.get("id") or ""
                 if not block_id:
@@ -6311,17 +6450,7 @@ class Filter:
                     self._invalidate_lightweight_cache(project_id)
                     return f"Forgotten {len(matches)} block(s) matching {block_id}."
                 return f"No block found for {block_id}."
-            elif action == "forget_all":
-                for block in state["active_blocks"].values():
-                    self._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                state["active_blocks"].clear()
-                state["recent_changes"].clear()
-                state["committed_changes"].clear()
-                state["has_any_calls"] = False
-                self._invalidate_lightweight_cache(project_id)
-                return "Forgotten all context."
+
             else:
                 return "Unrecognized forget action."
 
@@ -6412,7 +6541,14 @@ class Filter:
             state = self._get_state(project_id)
             if not state:
                 return "No active context to mark as obsolete."
+
             action = intent.get("action", "")
+            if action == "obsolete_all":
+                return (
+                    "⚠️ For safety, the natural language 'obsolete all' is disabled. "
+                    "Please type `/obsolete all` explicitly to confirm."
+                )
+
             blocks = list(state["active_blocks"].values())
             if not blocks:
                 return "No blocks available."
@@ -6427,12 +6563,14 @@ class Filter:
                 last_block = max(blocks, key=lambda b: b.timestamp)
                 set_obsolete([last_block], True)
                 return "Marked last code block as obsolete."
+
             elif action == "obsolete_n":
                 n = intent.get("n", 1)
                 blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
                 to_obsolete = blocks_by_time[:n]
                 count = set_obsolete(to_obsolete, True)
                 return f"Marked {count} block(s) as obsolete."
+
             elif action == "obsolete_file":
                 file_path = intent.get("file", "")
                 if not file_path:
@@ -6444,6 +6582,7 @@ class Filter:
                 ]
                 count = set_obsolete(to_obsolete, True)
                 return f"Marked {count} block(s) related to {file_path} as obsolete."
+
             elif action == "obsolete_block":
                 desc = intent.get("description", "") or intent.get("hash", "")
                 if not desc:
@@ -6457,13 +6596,12 @@ class Filter:
                 ]
                 count = set_obsolete(matches, True)
                 return f"Marked {count} block(s) matching '{desc}' as obsolete."
-            elif action == "obsolete_all":
-                count = set_obsolete(blocks, True)
-                return f"Marked all {count} block(s) as obsolete."
+
             elif action == "revive_last":
                 last_block = max(blocks, key=lambda b: b.timestamp)
                 set_obsolete([last_block], False)
                 return "Removed obsolete mark from last block."
+
             elif action == "revive_file":
                 file_path = intent.get("file", "")
                 if not file_path:
@@ -6475,9 +6613,11 @@ class Filter:
                 ]
                 count = set_obsolete(to_revive, False)
                 return f"Removed obsolete mark from {count} block(s) related to {file_path}."
+
             elif action == "revive_all":
                 count = set_obsolete(blocks, False)
                 return f"Removed obsolete mark from all {count} block(s)."
+
             else:
                 return "Unrecognized obsolete action."
 
@@ -7189,18 +7329,22 @@ class Filter:
                     self._log_debug(
                         f"Massive injection detected ({total_code_tokens} tokens). Using lightweight context."
                     )
-                    active_ctx = await self._build_lightweight_context(project_id)
+                    injected_hashes: Set[str] = set()
+
                     if last_user_msg:
                         pre_expanded = await self._smart_pre_expand(
                             user_query=user_query,
                             project_id=project_id,
                             token_budget=self.valves.smart_pre_expand_max_tokens,
+                            seen_hashes=injected_hashes,
                         )
                         if pre_expanded:
                             active_ctx += "\n" + pre_expanded
                         else:
                             expanded = self._expand_referenced_symbols(
-                                project_id, user_query
+                                project_id,
+                                user_query,
+                                seen_hashes=injected_hashes,
                             )
                             if expanded:
                                 active_ctx += "\n" + expanded
