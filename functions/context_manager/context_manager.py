@@ -20,7 +20,6 @@ from collections import OrderedDict, defaultdict, Counter
 import json
 import asyncio
 import threading
-import difflib  # For the future → To allow users to do diff between codes without needing for an LLM.
 import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union, Set
