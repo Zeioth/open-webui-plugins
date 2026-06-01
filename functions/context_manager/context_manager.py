@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.8.0
+version: 5.9.0
 license: GPL3
 requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
@@ -1012,14 +1012,6 @@ class Filter:
             default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window ({used_tokens}/{max_tokens} tokens). Consider using `/forget` to remove irrelevant parts, `/remember` to pin important context, or ask me to summarize older parts."
         )
 
-        # ───── Facts ─────
-        enable_facts: bool = Field(default=True)
-        fact_max_age_days: int = Field(default=90)
-        inject_facts_in_context: bool = Field(default=True)
-        fact_importance_boost: float = Field(default=1.5)
-        fact_command_prefix: str = Field(default="/fact")
-        enable_auto_fact_detection: bool = Field(default=False)
-
         # ───── Similar Messages & Obsolete Marking ─────
         similar_message_handling: str = Field(default="replace")
         similar_message_threshold: float = Field(default=0.92)
@@ -1158,7 +1150,6 @@ class Filter:
             "committed_changes": [],
             "message_count": 0,
             "feedback_history": [],
-            "facts": [],
             "last_compression_timestamp": 0,
             "last_suggestion_timestamp": 0,
             "response_cache": [],
@@ -1201,10 +1192,6 @@ class Filter:
         # ──── Reranker ────
         if self.valves.enable_reranking and HAS_CROSS_ENCODER:
             self._load_reranker()
-
-        # ──── Fact storage log ────
-        if self.valves.enable_facts:
-            self._log_debug("Fact storage enabled.")
 
         # ──── HTTP session and locks ────
         self._http_session: Optional[aiohttp.ClientSession] = None
@@ -1438,7 +1425,6 @@ class Filter:
             "recent_changes": [b.dict() for b in state["recent_changes"]],
             "committed_changes": [b.dict() for b in state["committed_changes"]],
             "feedback_history": [fb.dict() for fb in state["feedback_history"]],
-            "facts": state.get("facts", []),
             "message_count": state["message_count"],
             "last_compression_timestamp": state.get("last_compression_timestamp", 0),
             "response_cache": state.get("response_cache", []),
@@ -1505,13 +1491,12 @@ class Filter:
         for key in [
             "feedback_history",
             "last_compression_timestamp",
-            "facts",
             "last_suggestion_timestamp",
             "response_cache",
             "has_any_calls",
         ]:
             data.setdefault(
-                key, [] if key in ("feedback_history", "facts", "response_cache") else 0
+                key, [] if key in ("feedback_history", "response_cache") else 0
             )
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
         data.setdefault("speculative_missed_stats", {"total": 0, "details": {}})
@@ -1579,7 +1564,6 @@ class Filter:
             "recent_changes": recent,
             "committed_changes": committed,
             "feedback_history": feedback,
-            "facts": data.get("facts", []),
             "message_count": data.get("message_count", 0),
             "last_compression_timestamp": data.get("last_compression_timestamp", 0),
             "response_cache": data.get("response_cache", []),
@@ -5254,124 +5238,8 @@ class Filter:
         return False
 
     # --------------------------------------------------------------------------
-    #  Fact management
+    #  Expand
     # --------------------------------------------------------------------------
-    async def _extract_facts_from_message(self, content: str) -> List[str]:
-        pattern = r"\[FACT:\s*(.*?)\]"
-        matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
-        return [m.strip() for m in matches]
-
-    async def _add_fact(self, project_id: str, fact_text: str, source: str = "user"):
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            state = self._get_state(project_id)
-            if not state:
-                return
-            # Clean expired facts berofe adding
-            now = time.time()
-            state["facts"] = [
-                f
-                for f in state["facts"]
-                if not f.get("expires_at") or f["expires_at"] > now
-            ]
-            expires_at = None
-            if self.valves.fact_max_age_days > 0:
-                expires_at = now + (self.valves.fact_max_age_days * 86400)
-            new_fact = {
-                "fact": fact_text,
-                "timestamp": now,
-                "source": source,
-                "expires_at": expires_at,
-            }
-            for existing in state["facts"]:
-                if existing["fact"] == fact_text:
-                    return
-            state["facts"].append(new_fact)
-            if len(state["facts"]) > 100:
-                state["facts"] = state["facts"][-100:]
-            self._set_state(project_id, state)
-            self._log_debug(f"Added fact: {fact_text[:50]}...")
-
-    async def _remove_fact(self, project_id: str, fact_text_or_index: str):
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            state = self._get_state(project_id)
-            if not state:
-                return
-            original_len = len(state["facts"])
-            if fact_text_or_index.isdigit():
-                idx = int(fact_text_or_index)
-                if 0 <= idx < len(state["facts"]):
-                    state["facts"].pop(idx)
-            else:
-                state["facts"] = [
-                    f for f in state["facts"] if f["fact"] != fact_text_or_index
-                ]
-            if len(state["facts"]) != original_len:
-                self._set_state(project_id, state)
-                self._log_debug(f"Removed fact: {fact_text_or_index}")
-
-    async def _handle_fact_command(
-        self, command_text: str, project_id: str
-    ) -> Optional[str]:
-        if not command_text.startswith(self.valves.fact_command_prefix):
-            return None
-        parts = command_text.split(maxsplit=2)
-        if len(parts) < 2:
-            return (
-                "**Fact commands:**\n"
-                "- `/fact add <text>` – store a fact\n"
-                "- `/fact list` – list all facts\n"
-                "- `/fact remove <index>` – remove a fact by its number\n"
-                "- `/fact clear` – remove all facts"
-            )
-        subcommand = parts[1].lower()
-        if subcommand == "add":
-            if len(parts) < 3:
-                return "Usage: `/fact add <fact text>`"
-            fact_text = parts[2].strip()
-            await self._add_fact(project_id, fact_text, source="user")
-            return f"Fact added: {fact_text}"
-        elif subcommand == "list":
-            state = self._get_state(project_id)
-            facts = state.get("facts", [])
-            if not facts:
-                return "No facts stored."
-            now = time.time()
-            active_facts = [
-                f for f in facts if not f.get("expires_at") or f["expires_at"] > now
-            ]
-            if not active_facts:
-                return "All facts have expired."
-            lines = ["**Stored facts:**"]
-            for i, f in enumerate(active_facts):
-                lines.append(f"{i}. {f['fact']}")
-            return "\n".join(lines)
-        elif subcommand == "remove":
-            if len(parts) < 3:
-                return "Usage: `/fact remove <index>` (use `/fact list` to see indices)"
-            try:
-                idx = int(parts[2].strip())
-                state = self._get_state(project_id)
-                if 0 <= idx < len(state.get("facts", [])):
-                    removed = state["facts"].pop(idx)
-                    self._set_state(project_id, state)
-                    return f"Fact removed: {removed['fact']}"
-                else:
-                    return (
-                        f"Invalid index. There are {len(state.get('facts', []))} facts."
-                    )
-            except ValueError:
-                return "Index must be a number."
-        elif subcommand == "clear":
-            state = self._get_state(project_id)
-            count = len(state.get("facts", []))
-            state["facts"] = []
-            self._set_state(project_id, state)
-            return f"Cleared {count} fact(s)."
-        else:
-            return f"Unknown subcommand: {subcommand}"
-
     async def _handle_expand_command(
         self, text: str, project_id: str
     ) -> str:  # ← str, no Optional[str]
@@ -5810,22 +5678,6 @@ class Filter:
                 self._set_state(project_id, state)
 
         return replaced_content, did_any
-
-    def _get_facts_context(self, project_id: str) -> str:
-        state = self._get_state(project_id)
-        if not state or not state["facts"]:
-            return ""
-        now = time.time()
-        active_facts = []
-        for f in state["facts"]:
-            if f.get("expires_at") and f["expires_at"] < now:
-                continue
-            active_facts.append(f["fact"])
-        if not active_facts:
-            return ""
-        return "## Explicitly Agreed Facts\n" + "\n".join(
-            [f"- {fact}" for fact in active_facts]
-        )
 
     # --------------------------------------------------------------------------
     #  Intent detection (natural language)
@@ -6707,11 +6559,14 @@ class Filter:
     # --------------------------------------------------------------------------
     #  Inlet method (contains the main command routing)
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    #  Inlet method (contains the main command routing)
+    # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Main entry point called before each LLM request.
         Orchestrates context retrieval, chain-of-thought, response cache,
-        and all system injections. Now parallelises CoT and cache checks.
+        and all system injections.
         """
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6774,7 +6629,6 @@ class Filter:
             self.valves.enable_natural_language_forget
             and last_user_msg
             and not is_explicit_command
-            # NEW GUARD: skip NL intents if message contains code indicators
             and not self._has_code_indicators(last_user_msg.get("content", ""))
         ):
             t0 = time.monotonic()
@@ -6919,34 +6773,6 @@ class Filter:
             return body
 
         # ------------------------------------------------------------------
-        # Command routing: /fact
-        # ------------------------------------------------------------------
-        if (
-            last_user_msg
-            and last_user_msg.get("content", "")
-            .strip()
-            .startswith(self.valves.fact_command_prefix)
-            and self.valves.enable_facts
-        ):
-            response = await self._handle_fact_command(
-                last_user_msg.get("content", ""), project_id
-            )
-            self._log_debug(
-                f"/fact command executed: {last_user_msg.get('content', '')}"
-            )
-            if response:
-                messages.pop()
-                messages.append({"role": "assistant", "content": response})
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)
-                self._log_section(
-                    "CONTEXT MANAGER - INLET END",
-                    duration=time.monotonic() - inlet_start,
-                )
-                return body
-
-        # ------------------------------------------------------------------
         # Command routing: /expand
         # ------------------------------------------------------------------
         if last_user_msg and last_user_msg.get("content", "").strip().startswith(
@@ -6993,7 +6819,7 @@ class Filter:
         manual_cot_used = False
         cot_any_used = False
 
-        # Concise fallback instruction (kept only for cases where pre-expansion missed something)
+        # Concise fallback instruction
         if is_code_session:
             concise_expand_hint = (
                 "**Note:** If you lack the full source code of a function required to answer, "
@@ -7063,10 +6889,7 @@ class Filter:
                         elif level == 2:
                             t0 = time.monotonic()
                             active_ctx = self._get_active_code_context(project_id)
-                            facts_ctx = self._get_facts_context(project_id)
-                            context = (
-                                f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                            )
+                            context = f"Active code:\n{active_ctx}"
                             cot_task = asyncio.create_task(
                                 self._generate_cot_reasoning(cot_question, context)
                             )
@@ -7075,10 +6898,7 @@ class Filter:
                         elif level == 3:
                             t0 = time.monotonic()
                             active_ctx = self._get_active_code_context(project_id)
-                            facts_ctx = self._get_facts_context(project_id)
-                            context = (
-                                f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                            )
+                            context = f"Active code:\n{active_ctx}"
                             cot_task = asyncio.create_task(
                                 self._generate_cot_with_self_reflection(
                                     cot_question, context
@@ -7099,8 +6919,7 @@ class Filter:
                     elif cot_level == 2:
                         t0 = time.monotonic()
                         active_ctx = self._get_active_code_context(project_id)
-                        facts_ctx = self._get_facts_context(project_id)
-                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        context = f"Active code:\n{active_ctx}"
                         cot_task = asyncio.create_task(
                             self._generate_cot_reasoning(user_content, context)
                         )
@@ -7109,8 +6928,7 @@ class Filter:
                     elif cot_level == 3:
                         t0 = time.monotonic()
                         active_ctx = self._get_active_code_context(project_id)
-                        facts_ctx = self._get_facts_context(project_id)
-                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        context = f"Active code:\n{active_ctx}"
                         cot_task = asyncio.create_task(
                             self._generate_cot_with_self_reflection(
                                 user_content, context
@@ -7443,20 +7261,9 @@ class Filter:
                     active_ctx = checklist + "\n\n" + active_ctx
                     system_injections.append(("critical", active_ctx))
 
-        # Inject facts context
-        if (
-            is_code_session
-            and self.valves.enable_facts
-            and self.valves.inject_facts_in_context
-        ):
-            facts_ctx = self._get_facts_context(project_id)
-            if facts_ctx:
-                system_injections.append(("high", facts_ctx))
-
+        # Always show confidence prompt in code sessions
         if self.valves.enable_confidence_scoring and is_code_session:
-            total_tokens = self._estimate_tokens(messages)
-            if total_tokens > self.valves.context_window_tokens * 0.8:
-                system_injections.append(("high", self.valves.confidence_prompt))
+            system_injections.append(("high", self.valves.confidence_prompt))
 
         if (
             is_code_session
