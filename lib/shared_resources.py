@@ -146,23 +146,37 @@ async def call_llm(
     prompt: str,
     *,
     system: str = "",
-    base_url: str = "http://host.docker.internal:11434",
-    model: str = "ollama/llama3.2:3b",
+    base_url: str = "http://localhost:8080",          # sensible default for llama.cpp
+    model: str = "llamacpp/llama3.2:3b",              # placeholder model
     api_token: str = "",
     temperature: float = 0.3,
     max_tokens: int = 500,
     timeout: int = 120,
+    endpoint_type: str = "chat",
 ) -> str:
     """
     Async LLM call. Reuses the shared HTTP session.
-    Handles Ollama and OpenAI-compatible endpoints.
-    Note: base_url should NOT include /v1 (the function appends /chat/completions).
+    Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
+
+    - base_url: may be given with or without trailing /v1 (it is normalized).
+    - model: if it starts with 'llamacpp/', the provider is forced to OpenAI-compatible.
+    - endpoint_type: 'chat' (default) or 'completion' for llama.cpp.
     """
     session = await get_http_session(timeout)
+
+    # Normalise the base URL: strip trailing slash and remove any /v1 suffix so we can add the correct endpoint later.
     base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3].rstrip("/")
+
     is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
-    # Extract model name (discard prefix like "ollama/")
+    # If the model has the llamacpp/ prefix, force OpenAI-compatible path.
+    is_llamacpp = model.startswith("llamacpp/")
+    if is_llamacpp:
+        is_ollama = False
+
+    # Extract the real model name (everything after the first /, if present).
     model_str = model.split("/", 1)[1] if "/" in model else model
 
     headers = {"Content-Type": "application/json"}
@@ -182,16 +196,25 @@ async def call_llm(
             },
         }
     else:
-        url = f"{base_url}/chat/completions"
-        payload = {
-            "model": model_str,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        if endpoint_type == "completion":
+            url = f"{base_url}/v1/completions"
+            payload = {
+                "model": model_str,
+                "prompt": prompt if not system else f"{system}\n\n{prompt}",
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        else:  # default to chat completions
+            url = f"{base_url}/v1/chat/completions"
+            payload = {
+                "model": model_str,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
 
     import aiohttp  # type: ignore
 
@@ -214,7 +237,10 @@ async def call_llm(
         choices = data.get("choices", [])
         if not choices:
             raise RuntimeError("OpenAI response has no choices")
-        content = choices[0].get("message", {}).get("content", "")
+        if endpoint_type == "completion":
+            content = choices[0].get("text", "")
+        else:
+            content = choices[0].get("message", {}).get("content", "")
 
     return content.strip()
 
