@@ -1111,7 +1111,7 @@ class Filter:
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="llamacpp/Inference/Schematron:3B"
+            default="llamacpp/schematron-3b-q4_k_m.gguf"
         )
 
         # ───── Proactive Cleanup ─────
