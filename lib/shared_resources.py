@@ -150,7 +150,7 @@ async def call_llm(
     model: str = "llamacpp/llama3.2:3b",              # placeholder model
     api_token: str = "",
     temperature: float = 0.3,
-    max_tokens: int = 500,
+    max_tokens: Optional[int] = None,                 # <-- now optional (None = No limit)
     timeout: int = 120,
     endpoint_type: str = "chat",
 ) -> str:
@@ -161,6 +161,7 @@ async def call_llm(
     - base_url: may be given with or without trailing /v1 (it is normalized).
     - model: if it starts with 'llamacpp/', the provider is forced to OpenAI-compatible.
     - endpoint_type: 'chat' (default) or 'completion' for llama.cpp.
+    - max_tokens: if None, no explicit limit is sent (server default used).
     """
     session = await get_http_session(timeout)
 
@@ -192,29 +193,30 @@ async def call_llm(
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "num_predict": max_tokens,
             },
         }
+        if max_tokens is not None:
+            payload["options"]["num_predict"] = max_tokens
     else:
         if endpoint_type == "completion":
             url = f"{base_url}/v1/completions"
-            payload = {
+            payload: Dict[str, Any] = {
                 "model": model_str,
                 "prompt": prompt if not system else f"{system}\n\n{prompt}",
                 "temperature": temperature,
-                "max_tokens": max_tokens,
             }
         else:  # default to chat completions
             url = f"{base_url}/v1/chat/completions"
-            payload = {
+            payload: Dict[str, Any] = {
                 "model": model_str,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": temperature,
-                "max_tokens": max_tokens,
             }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
 
     import aiohttp  # type: ignore
 
