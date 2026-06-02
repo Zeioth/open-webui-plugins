@@ -892,7 +892,9 @@ class Filter:
         code_block_overflow_action: str = Field(
             default="warn"
         )  # accepts summarize, truncate, warn
-        code_block_summary_model: str = Field(default="llamacpp/llama3.2:3b")
+        code_block_summary_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
         code_block_warn_message: str = Field(
@@ -937,7 +939,9 @@ class Filter:
         smart_pre_expand_min_tokens: int = Field(default=2000)
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
-        smart_pre_expand_model: str = Field(default="llamacpp/llama3.2:3b")
+        smart_pre_expand_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
             default=0.72, ge=0.0, le=1.0
@@ -960,7 +964,9 @@ class Filter:
         # ───── Hierarchical Compression ─────
         hierarchical_compression_enabled: bool = Field(default=False)
         hierarchical_compression_interval_messages: int = Field(default=100)
-        hierarchical_summary_model: str = Field(default="llamacpp/llama3.2:3b")
+        hierarchical_summary_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         hierarchical_summary_max_tokens: int = Field(default=800)
 
         # ───── Duplicate Blocks & Frequency ─────
@@ -984,15 +990,17 @@ class Filter:
         )
         cot_max_tokens: int = Field(default=1000)
         cot_model_level2: str = Field(
-            default="llamacpp/llama3.2:3b",
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf",
             description="Model used for CoT level 2 (auto-reasoning).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/llama3.2:3b",
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf",
             description="Model used for CoT level 3 (self-reflection).",
         )
         enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(default="llamacpp/llama3.2:3b")
+        cot_detection_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
 
         # ───── Assumptions & Contradictions ─────
         enable_assumption_extraction: bool = Field(default=True)
@@ -1043,12 +1051,16 @@ class Filter:
         general_summary_max_tokens: int = Field(default=200)
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
-        summary_fallback_model: str = Field(default="llamacpp/llama3.2:3b")
+        summary_fallback_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         summary_include_metadata: bool = Field(default=True)
 
         # ───── Summarize Old Messages ─────
         summarize_old_messages: bool = Field(default=True)
-        summarization_model: str = Field(default="llamacpp/llama3.2:3b")
+        summarization_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
 
         # ───── LLM Configuration ─────
         openai_api_base: str = Field(
@@ -1057,7 +1069,7 @@ class Filter:
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="llamacpp/llama3.2:3b")
+        llm_model: str = Field(default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
         llm_request_timeout: int = Field(default=300)
         LLM_CACHE_TTL: int = Field(default=300)
@@ -1092,7 +1104,9 @@ class Filter:
 
         # ───── Dependency Tracking ─────
         enable_dependency_tracking: bool = Field(default=False)
-        dependency_extraction_model: str = Field(default="llamacpp/llama3.2:3b")
+        dependency_extraction_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
         affected_decay_hours: float = Field(default=4.0)
@@ -1105,7 +1119,9 @@ class Filter:
 
         # ───── Summarize Inactive Code ─────
         summarize_inactive_code: bool = Field(default=True)
-        inactive_code_summary_model: str = Field(default="llamacpp/llama3.2:3b")
+        inactive_code_summary_model: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
 
         # ───── Forget Commands ─────
         enable_forget_command: bool = Field(default=True)
