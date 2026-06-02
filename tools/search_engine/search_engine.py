@@ -213,8 +213,12 @@ class Tools:
         LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
         LLM_PROVIDER: str = Field(default="llamacpp/schematron-3b-q4_k_m.gguf")
-        EXPANSION_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
-        FILTER_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
+        EXPANSION_LLM_PROVIDER: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
+        FILTER_LLM_PROVIDER: str = Field(
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf"
+        )
         REFINEMENT_LLM_PROVIDER: str = Field(default="")
         RESEARCH_MODE_POLICY: Literal["always", "never", "auto"] = Field(default="auto")
         RESEARCH_STRATEGY_POLICY: Literal[
