@@ -210,11 +210,12 @@ class Tools:
         SEMANTIC_FILTER_MAX_URLS: int = Field(default=None, ge=1)
         CACHE_TTL_HOURS: int = Field(default=6, ge=1)
         CHROMA_DB_PATH: str = Field(default="./chroma_cache")
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434")
+        LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
-        LLM_PROVIDER: str = Field(default="ollama/Inference/Schematron:3B")
-        EXPANSION_LLM_PROVIDER: str = Field(default="ollama/llama3.2:3B")
-        FILTER_LLM_PROVIDER: str = Field(default="ollama/llama3.2:3B")
+        LLM_PROVIDER: str = Field(default="llamacpp/Inference/Schematron:3B")
+        EXPANSION_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
+        FILTER_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
+        REFINEMENT_LLM_PROVIDER: str = Field(default="")
         RESEARCH_MODE_POLICY: Literal["always", "never", "auto"] = Field(default="auto")
         RESEARCH_STRATEGY_POLICY: Literal[
             "auto", "pseudo_adaptive", "llm_guided", "bfs_deep", "research_filter"
@@ -222,7 +223,6 @@ class Tools:
         RELEVANCE_FILTER_ENABLED: bool = Field(default=True)
         RELEVANCE_THRESHOLD: float = Field(default=0.6, ge=0.0, le=1.0)
         MAX_REFINEMENT_ROUNDS: int = Field(default=2, ge=0, le=5)
-        REFINEMENT_LLM_PROVIDER: str = Field(default="")
         MORE_STATUS: bool = Field(default=True)
         DEBUG: bool = Field(default=True)
         PRELOAD_EMBEDDER: bool = Field(default=True)
@@ -231,6 +231,10 @@ class Tools:
         LLM_TOP_P: float = Field(default=None)
         LLM_FREQUENCY_PENALTY: float = Field(default=None)
         LLM_PRESENCE_PENALTY: float = Field(default=None)
+        LLAMACPP_ENDPOINT_TYPE: str = Field(
+            default="chat",
+            description="Endpoint type for llama.cpp: 'chat' (default) or 'completion'.",
+        )
 
     class UserValves(BaseModel):
         SEARXNG_MAX_RESULTS: Optional[int] = Field(default=None)
@@ -270,8 +274,12 @@ class Tools:
         self._previous_queries: List[str] = []
 
         # Semaphores to prevent resource exhaustion
-        self._cache_filter_llm_sem = asyncio.Semaphore(2)   # Max 2 concurrent cache filter LLM calls
-        self._image_validation_sem = asyncio.Semaphore(10)  # Max 10 concurrent image validations
+        self._cache_filter_llm_sem = asyncio.Semaphore(
+            2
+        )  # Max 2 concurrent cache filter LLM calls
+        self._image_validation_sem = asyncio.Semaphore(
+            10
+        )  # Max 10 concurrent image validations
 
         # Limit the number of pending cache filter tasks to avoid memory pressure
         self._pending_filter_tasks = 0
@@ -822,7 +830,9 @@ class Tools:
                     async with s.get(url, allow_redirects=True) as resp:
                         if resp.status >= 400:
                             return False
-                        content = await resp.content.read(30 * 1024)  # Reduced from 200 KB
+                        content = await resp.content.read(
+                            30 * 1024
+                        )  # Reduced from 200 KB
                         html = content.decode("utf-8", errors="ignore").lower()
             else:
                 async with session.get(url, allow_redirects=True) as resp:
@@ -1116,7 +1126,9 @@ class Tools:
                     # Check if we have too many pending filter tasks
                     async with self._pending_filter_lock:
                         if self._pending_filter_tasks >= self._max_pending_filter_tasks:
-                            logger.debug(f"Too many pending cache filter tasks, skipping filter for {url}")
+                            logger.debug(
+                                f"Too many pending cache filter tasks, skipping filter for {url}"
+                            )
                             should_filter = False
                         else:
                             self._pending_filter_tasks += 1
@@ -1124,9 +1136,13 @@ class Tools:
                     if should_filter:
                         logger.info(f"Started background cache filter for {url}")
                         filter_task = asyncio.create_task(
-                            self._filter_and_update_cache(url, chunks.copy(), __event_emitter__)
+                            self._filter_and_update_cache(
+                                url, chunks.copy(), __event_emitter__
+                            )
                         )
-                        filter_task.add_done_callback(lambda _: self._decrement_filter_tasks())
+                        filter_task.add_done_callback(
+                            lambda _: self._decrement_filter_tasks()
+                        )
                     else:
                         filter_task = None
             else:
@@ -1311,9 +1327,11 @@ class Tools:
             logger.warning(f"Chunk filter LLM error: {e}. Using all True as fallback.")
         return [True] * len(chunks)
 
-    async def _get_cached_chunks(self, url: str, query: str, max_chunks: int = 3) -> list:
+    async def _get_cached_chunks(
+        self, url: str, query: str, max_chunks: int = 3
+    ) -> list:
         """Retrieve cached chunks without blocking the async event loop.
-           All ChromaDB access and embedding computations run in a thread via anyio."""
+        All ChromaDB access and embedding computations run in a thread via anyio."""
         if not self._get_embedder() or not self._get_cache_collection():
             return []
 
@@ -1357,15 +1375,21 @@ class Tools:
 
             filtered_docs, filtered_embs = zip(*filtered)
             if all(e is not None for e in filtered_embs):
-                query_vec = self._get_embedder().encode([query], convert_to_numpy=True)[0]
+                query_vec = self._get_embedder().encode([query], convert_to_numpy=True)[
+                    0
+                ]
                 chunk_matrix = np.array(filtered_embs)
                 q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
                 norms = np.linalg.norm(chunk_matrix, axis=1, keepdims=True) + 1e-10
                 c_norm = chunk_matrix / norms
                 similarities = c_norm @ q_norm
             else:
-                query_embedding = self._get_embedder().encode([query], convert_to_numpy=True)
-                chunk_embeddings = self._get_embedder().encode(list(filtered_docs), convert_to_numpy=True)
+                query_embedding = self._get_embedder().encode(
+                    [query], convert_to_numpy=True
+                )
+                chunk_embeddings = self._get_embedder().encode(
+                    list(filtered_docs), convert_to_numpy=True
+                )
                 query_vec = np.array(query_embedding[0])
                 query_norm = query_vec / np.linalg.norm(query_vec)
                 chunk_norms = chunk_embeddings / np.linalg.norm(
@@ -1899,71 +1923,81 @@ class Tools:
         max_tokens: int = 700,
         timeout: int = 120,
     ) -> str:
-        # Fast path: delegate to shared_resources (pure aiohttp, no threads)
+        model_str = provider or self.valves.LLM_PROVIDER
+
+        # Normalizar base URL (quita /v1 si está presente)
+        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3].rstrip("/")
+
+        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+
+        is_llamacpp = model_str.startswith("llamacpp/")
+        if is_llamacpp:
+            is_ollama = False
+
+        # Extraer nombre real del modelo
+        if "/" in model_str and (
+            model_str.startswith("ollama/") or model_str.startswith("llamacpp/")
+        ):
+            model_name = model_str.split("/", 1)[1]
+        else:
+            model_name = model_str
+
+        ep_type = "chat"
+        if is_llamacpp:
+            ep_type = self.valves.LLAMACPP_ENDPOINT_TYPE  # ← ajustado a mayúsculas
+
         if _SHARED_RESOURCES_AVAILABLE:
             from shared_resources import call_llm as _shared_call_llm
+
             try:
                 return await _shared_call_llm(
                     prompt=prompt,
                     system=system,
                     base_url=self.valves.LLM_BASE_URL,
-                    model=provider or self.valves.LLM_PROVIDER,
+                    model=model_str,
                     api_token=self.valves.LLM_API_TOKEN,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    endpoint_type=ep_type,
                 )
             except Exception as e:
-                logger.warning(f"shared call_llm failed: {e}, using requests fallback")
+                logger.warning(f"shared call_llm failed: {e}, using fallback")
 
-        # Fallback: original implementation using requests
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        # Fallback HTTP (sin bloqueos)
+        import aiohttp
+
         api_token = (
-            self.valves.LLM_API_TOKEN.strip()
-            if self.valves.LLM_API_TOKEN and self.valves.LLM_API_TOKEN.strip()
-            else None
+            self.valves.LLM_API_TOKEN.strip() if self.valves.LLM_API_TOKEN else None
         )
+        headers = {"Content-Type": "application/json"}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
 
-        model_str = provider or self.valves.LLM_PROVIDER
-        if "/" in model_str:
-            model_str = model_str.split("/", 1)[1]
-
-        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-
-        def _blocking():
-            if is_ollama:
-                ollama_url = f"{base_url}/api/generate"
+        if is_ollama:
+            url = f"{base_url}/api/generate"
+            payload = {
+                "model": model_name,
+                "prompt": prompt,
+                "system": system,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+        else:
+            if ep_type == "completion":
+                url = f"{base_url}/v1/completions"
                 payload = {
-                    "model": model_str,
-                    "prompt": prompt,
-                    "system": system,
-                    "stream": False,
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": max_tokens,
-                    },
+                    "model": model_name,
+                    "prompt": prompt if not system else f"{system}\n\n{prompt}",
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
                 }
-                resp = requests.post(ollama_url, json=payload, timeout=timeout)
-                if resp.status_code != 200:
-                    raise RuntimeError(
-                        f"Ollama error {resp.status_code}: {resp.text[:200]}"
-                    )
-                resp_json = resp.json()
-                if "error" in resp_json:
-                    logger.error(f"Ollama model error: {resp_json['error']}")
-                    return ""
-                response_text = resp_json.get("response", "")
-                if not response_text.strip():
-                    logger.warning(
-                        f"Ollama returned empty response. Full JSON: {resp_json}"
-                    )
-                return response_text
             else:
-                headers = {"Content-Type": "application/json"}
-                if api_token:
-                    headers["Authorization"] = f"Bearer {api_token}"
+                url = f"{base_url}/v1/chat/completions"
                 payload = {
-                    "model": model_str,
+                    "model": model_name,
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt},
@@ -1971,27 +2005,33 @@ class Tools:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
-                resp = requests.post(
-                    f"{base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=timeout,
-                )
-                if resp.status_code != 200:
-                    raise RuntimeError(
-                        f"OpenAI error {resp.status_code}: {resp.text[:200]}"
-                    )
-                return resp.json()["choices"][0]["message"]["content"]
 
-        content = await anyio.to_thread.run_sync(_blocking)
+        session = await get_http_session(timeout)
+        try:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"LLM HTTP {resp.status}: {text[:200]}")
+                data = await resp.json()
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"LLM connection error: {exc}") from exc
 
-        if not content or not content.strip():
-            logger.warning(f"LLM call returned empty content for model '{model_str}'.")
-            return ""
+        if is_ollama:
+            content = data.get("response", "")
+            if "error" in data:
+                logger.error(f"Ollama model error: {data['error']}")
+                return ""
+        else:
+            if ep_type == "completion":
+                content = data["choices"][0].get("text", "")
+            else:
+                content = data["choices"][0]["message"]["content"]
 
+        content = content.strip()
+        if not content:
+            logger.warning(f"LLM returned empty content for model '{model_name}'.")
         if self.valves.DEBUG:
-            logger.debug(f"LLM call raw response (first 300 chars): {content[:300]}")
-
+            logger.debug(f"LLM raw response (first 300 chars): {content[:300]}")
         return content
 
     # endregion
@@ -2215,7 +2255,9 @@ Now output your JSON array:
             system_msg = "You only output a JSON array of strings. No other text."
 
             try:
-                provider = self.valves.EXPANSION_LLM_PROVIDER or self.valves.LLM_PROVIDER
+                provider = (
+                    self.valves.EXPANSION_LLM_PROVIDER or self.valves.LLM_PROVIDER
+                )
                 content = await self._call_llm(
                     prompt=prompt,
                     system=system_msg,
@@ -2483,7 +2525,9 @@ Now output your JSON array:
             return urls
 
         if self._detected_homonyms is None:
-            self._detected_homonyms = await self._detect_homonyms_llm(query, __event_emitter__)
+            self._detected_homonyms = await self._detect_homonyms_llm(
+                query, __event_emitter__
+            )
 
         detected = self._detected_homonyms or []
         if detected:
@@ -2491,14 +2535,18 @@ Now output your JSON array:
             for url in urls:
                 slug = urlparse(url).path.lower().replace("_", " ").replace("-", " ")
                 if not any(
-                    re.search(rf"\b{re.escape(h.replace('_',' ').replace('-',' '))}\b", slug)
+                    re.search(
+                        rf"\b{re.escape(h.replace('_',' ').replace('-',' '))}\b", slug
+                    )
                     for h in detected
                 ):
                     pre_filtered.append(url)
             removed = len(urls) - len(pre_filtered)
             if removed > 0:
                 if self.valves.DEBUG:
-                    logger.info(f"Pre-filter removed {removed} URLs by homonym slug match")
+                    logger.info(
+                        f"Pre-filter removed {removed} URLs by homonym slug match"
+                    )
                 if __event_emitter__ and self.valves.MORE_STATUS:
                     await __event_emitter__(
                         {
@@ -2517,13 +2565,19 @@ Now output your JSON array:
         BATCH_SIZE = 10  # Process URLs in batches to keep prompt within context window
         all_decisions = []
 
-        async def _fetch_title(url: str, session: aiohttp.ClientSession) -> tuple[str, str]:
+        async def _fetch_title(
+            url: str, session: aiohttp.ClientSession
+        ) -> tuple[str, str]:
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
-                        content = await resp.content.read(8 * 1024)  # 8 KB is enough for title
+                        content = await resp.content.read(
+                            8 * 1024
+                        )  # 8 KB is enough for title
                         html = content.decode("utf-8", errors="ignore").lower()
-                        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE)
+                        title_match = re.search(
+                            r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE
+                        )
                         if title_match:
                             return url, title_match.group(1).strip()[:200]
             except Exception as e:
@@ -2535,7 +2589,9 @@ Now output your JSON array:
         title_session = await get_http_session(5)
         for i in range(0, len(urls), BATCH_SIZE):
             batch = urls[i : i + BATCH_SIZE]
-            titles = dict(await asyncio.gather(*[_fetch_title(u, title_session) for u in batch]))
+            titles = dict(
+                await asyncio.gather(*[_fetch_title(u, title_session) for u in batch])
+            )
 
             homonym_context = ""
             if detected:
@@ -2572,14 +2628,20 @@ Now evaluate these URLs:
             except Exception as e:
                 logger.error(f"LLM URL filter error: {e}\n{traceback.format_exc()}")
                 all_decisions.extend(
-                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                    [
+                        {"index": i + j + 1, "decision": "KEEP"}
+                        for j in range(len(batch))
+                    ]
                 )
                 continue
 
             if not content or not content.strip():
                 logger.warning("LLM URL filter: empty response for batch, keeping all")
                 all_decisions.extend(
-                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                    [
+                        {"index": i + j + 1, "decision": "KEEP"}
+                        for j in range(len(batch))
+                    ]
                 )
                 continue
 
@@ -2598,16 +2660,21 @@ Now evaluate these URLs:
                     for d in batch_decisions:
                         if isinstance(d, dict) and "decision" in d:
                             original_index = d.get("index", 0)
-                            all_decisions.append({
-                                "index": original_index + i,
-                                "decision": d["decision"],
-                            })
+                            all_decisions.append(
+                                {
+                                    "index": original_index + i,
+                                    "decision": d["decision"],
+                                }
+                            )
                 else:
                     raise ValueError("Not a list")
             except (json.JSONDecodeError, ValueError):
                 logger.warning("Could not parse LLM decision JSON, keeping all")
                 all_decisions.extend(
-                    [{"index": i + j + 1, "decision": "KEEP"} for j in range(len(batch))]
+                    [
+                        {"index": i + j + 1, "decision": "KEEP"}
+                        for j in range(len(batch))
+                    ]
                 )
 
         keep_indices = {
@@ -2737,7 +2804,9 @@ Now evaluate these URLs:
             # Reuse the shared HTTP session instead of creating a new one each time
             session = await get_http_session(self.valves.SEARXNG_TIMEOUT)
             if self.valves.SEARXNG_METHOD == "POST":
-                async with session.post(url, json={"q": query, "format": "json"}, timeout=timeout) as resp:
+                async with session.post(
+                    url, json={"q": query, "format": "json"}, timeout=timeout
+                ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
             else:
@@ -3855,7 +3924,9 @@ Now evaluate these URLs:
         current_query = query
         gathered_for_round = gathered_urls
         user_provided_for_round = user_provided_urls
-        round_start_pages = self.pages_crawled  # Track pages at start of round for correct budget decay
+        round_start_pages = (
+            self.pages_crawled
+        )  # Track pages at start of round for correct budget decay
 
         while round_num <= max_rounds:
             if round_num == 1:
@@ -4225,9 +4296,19 @@ Generate ONLY the new query string, nothing else."""
             extra_args=["--no-sandbox", "--disable-gpu"],
         )
 
+        # Normalize base URL (strip /v1 if present) so crawl4ai can build its own paths
+        llm_base = self.valves.LLM_BASE_URL.rstrip("/")
+        if llm_base.endswith("/v1"):
+            llm_base = llm_base[:-3].rstrip("/")
+
+        # Strip 'llamacpp/' prefix if present, because crawl4ai expects the real model name
+        llm_provider = self.valves.LLM_PROVIDER
+        if llm_provider.startswith("llamacpp/"):
+            llm_provider = llm_provider.split("/", 1)[1]
+
         llm_config = LLMConfig(
-            provider=self.valves.LLM_PROVIDER,
-            base_url=self.valves.LLM_BASE_URL.rstrip("/"),
+            provider=llm_provider,
+            base_url=llm_base,
             temperature=self.valves.LLM_TEMPERATURE or 0.3,
             max_tokens=self.valves.LLM_MAX_TOKENS or None,
             top_p=self.valves.LLM_TOP_P or None,
@@ -4286,8 +4367,7 @@ Generate ONLY the new query string, nothing else."""
 
         # Cap total timeout to avoid blocking the batch for too long
         timeout = min(
-            self.valves.CRAWL4AI_TIMEOUT * len(urls) + 60,
-            300  # 5 minutes max
+            self.valves.CRAWL4AI_TIMEOUT * len(urls) + 60, 300  # 5 minutes max
         )
         try:
             async with aiohttp.ClientSession() as session:
