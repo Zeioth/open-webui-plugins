@@ -892,7 +892,7 @@ class Filter:
         code_block_overflow_action: str = Field(
             default="warn"
         )  # accepts summarize, truncate, warn
-        code_block_summary_model: str = Field(default="ollama/llama3.2:3b")
+        code_block_summary_model: str = Field(default="llamacpp/llama3.2:3b")
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
         code_block_warn_message: str = Field(
@@ -937,7 +937,7 @@ class Filter:
         smart_pre_expand_min_tokens: int = Field(default=2000)
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
-        smart_pre_expand_model: str = Field(default="ollama/llama3.2:3b")
+        smart_pre_expand_model: str = Field(default="llamacpp/llama3.2:3b")
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
             default=0.72, ge=0.0, le=1.0
@@ -960,7 +960,7 @@ class Filter:
         # ───── Hierarchical Compression ─────
         hierarchical_compression_enabled: bool = Field(default=False)
         hierarchical_compression_interval_messages: int = Field(default=100)
-        hierarchical_summary_model: str = Field(default="ollama/llama3.2:3b")
+        hierarchical_summary_model: str = Field(default="llamacpp/llama3.2:3b")
         hierarchical_summary_max_tokens: int = Field(default=800)
 
         # ───── Duplicate Blocks & Frequency ─────
@@ -980,28 +980,28 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
+            default="llamacpp/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         cot_max_tokens: int = Field(default=1000)
         cot_model_level2: str = Field(
-            default="ollama/llama3.2:3b",
+            default="llamacpp/llama3.2:3b",
             description="Model used for CoT level 2 (auto-reasoning).",
         )
         cot_model_level3: str = Field(
-            default="ollama/llama3.2:3b",
+            default="llamacpp/llama3.2:3b",
             description="Model used for CoT level 3 (self-reflection).",
         )
         enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(default="ollama/llama3.2:3b")
+        cot_detection_model: str = Field(default="llamacpp/llama3.2:3b")
 
         # ───── Assumptions & Contradictions ─────
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
+            default="llamacpp/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         enable_contradiction_detection: bool = Field(default=False)
         contradiction_detection_model: str = Field(
-            default="ollama/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
+            default="llamacpp/hf.co/mudler/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-GGUF:Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano.gguf"
         )
         contradiction_inject_warning: bool = Field(default=True)
 
@@ -1043,25 +1043,31 @@ class Filter:
         general_summary_max_tokens: int = Field(default=200)
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
-        summary_fallback_model: str = Field(default="ollama/llama3.2:3b")
+        summary_fallback_model: str = Field(default="llamacpp/llama3.2:3b")
         summary_include_metadata: bool = Field(default=True)
 
         # ───── Summarize Old Messages ─────
         summarize_old_messages: bool = Field(default=True)
-        summarization_model: str = Field(default="ollama/llama3.2:3b")
+        summarization_model: str = Field(default="llamacpp/llama3.2:3b")
 
         # ───── LLM Configuration ─────
         openai_api_base: str = Field(
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
         )
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434")
+        LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="ollama/llama3.2:3b")
+        llm_model: str = Field(default="llamacpp/llama3.2:3b")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
         llm_request_timeout: int = Field(default=300)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
+
+        # ───── New: llama.cpp endpoint type ─────
+        llamacpp_endpoint_type: str = Field(
+            default="chat",
+            description="Endpoint type for llama.cpp: 'chat' (default) or 'completion'.",
+        )
 
         # ───── Importance & Expiration ─────
         importance_mention_boost: float = Field(default=0.2)
@@ -1086,7 +1092,7 @@ class Filter:
 
         # ───── Dependency Tracking ─────
         enable_dependency_tracking: bool = Field(default=False)
-        dependency_extraction_model: str = Field(default="ollama/llama3.2:3b")
+        dependency_extraction_model: str = Field(default="llamacpp/llama3.2:3b")
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
         affected_decay_hours: float = Field(default=4.0)
@@ -1099,13 +1105,13 @@ class Filter:
 
         # ───── Summarize Inactive Code ─────
         summarize_inactive_code: bool = Field(default=True)
-        inactive_code_summary_model: str = Field(default="ollama/llama3.2:3b")
+        inactive_code_summary_model: str = Field(default="llamacpp/llama3.2:3b")
 
         # ───── Forget Commands ─────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="ollama/Inference/Schematron:3B"
+            default="llamacpp/Inference/Schematron:3B"
         )
 
         # ───── Proactive Cleanup ─────
@@ -1727,7 +1733,7 @@ class Filter:
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
-        semaphore: asyncio.Semaphore = None,  # <-- nuevo parámetro
+        semaphore: asyncio.Semaphore = None,
     ) -> Optional[str]:
         if not HAS_AIOHTTP:
             return None
@@ -1749,8 +1755,13 @@ class Filter:
         t_start = time.monotonic()
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
+            # Normalise: remove /v1 if present, so we can add the right endpoint later.
+            if base_url.endswith("/v1"):
+                base_url = base_url[:-3].rstrip("/")
+
             api_token = self.valves.LLM_API_TOKEN.strip() or None
             is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+
             models_to_try = []
             seen = set()
             for m in [
@@ -1762,11 +1773,10 @@ class Filter:
                     models_to_try.append(m)
                     seen.add(m)
 
-            # Usar el semáforo adecuado
             effective_semaphore = semaphore or self._llm_semaphore
-
             max_retries = 2
             base_delay = 1.0
+
             for model in models_to_try:
                 cache_key = hashlib.md5(
                     f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
@@ -1779,12 +1789,17 @@ class Filter:
                     )
                     return cached
 
+                # Determine endpoint type for llama.cpp
+                ep_type = "chat"
+                if model.startswith("llamacpp/"):
+                    ep_type = self.valves.llamacpp_endpoint_type
+
                 if _SHARED_RESOURCES_AVAILABLE:
                     from shared_resources import call_llm as _shared_call_llm
 
                     for attempt in range(max_retries + 1):
                         try:
-                            async with effective_semaphore:  # <-- aquí
+                            async with effective_semaphore:
                                 content = await _shared_call_llm(
                                     prompt=prompt,
                                     system=system_prompt,
@@ -1794,6 +1809,7 @@ class Filter:
                                     temperature=temperature,
                                     max_tokens=max_tokens,
                                     timeout=self.valves.llm_request_timeout,
+                                    endpoint_type=ep_type,
                                 )
                             if content:
                                 await self._llm_cache.set(cache_key, content)
@@ -1819,8 +1835,9 @@ class Filter:
                                 await asyncio.sleep(base_delay * (2**attempt))
                                 continue
                             break
-                    continue
+                    continue  # try next model
 
+                # ---------- Fallback HTTP path (when shared_resources is not available) ----------
                 try:
                     http_session = await _shared_get_http_session(
                         self.valves.llm_request_timeout
@@ -1832,12 +1849,20 @@ class Filter:
 
                 for attempt in range(max_retries + 1):
                     try:
-                        async with effective_semaphore:  # <-- aquí
-                            model_name = (
-                                model.split("/", 1)[1]
-                                if is_ollama and model.startswith("ollama/")
-                                else model
-                            )
+                        async with effective_semaphore:
+                            is_llamacpp = model.startswith("llamacpp/")
+                            if is_llamacpp:
+                                is_ollama = False
+
+                            # Extract real model name (strip provider prefix if present)
+                            if "/" in model and (
+                                model.startswith("ollama/")
+                                or model.startswith("llamacpp/")
+                            ):
+                                model_name = model.split("/", 1)[1]
+                            else:
+                                model_name = model
+
                             if is_ollama:
                                 url = f"{base_url}/api/generate"
                                 payload = {
@@ -1852,7 +1877,6 @@ class Filter:
                                 }
                                 headers = {"Content-Type": "application/json"}
                             else:
-                                url = f"{base_url}/v1/chat/completions"
                                 headers = {"Content-Type": "application/json"}
                                 if api_token:
                                     headers["Authorization"] = f"Bearer {api_token}"
@@ -1860,15 +1884,34 @@ class Filter:
                                     headers["Authorization"] = (
                                         f"Bearer {self.valves.openai_api_key}"
                                     )
-                                payload = {
-                                    "model": model_name,
-                                    "messages": [
-                                        {"role": "system", "content": system_prompt},
-                                        {"role": "user", "content": prompt},
-                                    ],
-                                    "temperature": temperature,
-                                    "max_tokens": max_tokens,
-                                }
+
+                                if ep_type == "completion":
+                                    url = f"{base_url}/v1/completions"
+                                    payload = {
+                                        "model": model_name,
+                                        "prompt": (
+                                            prompt
+                                            if not system_prompt
+                                            else f"{system_prompt}\n\n{prompt}"
+                                        ),
+                                        "temperature": temperature,
+                                        "max_tokens": max_tokens,
+                                    }
+                                else:
+                                    url = f"{base_url}/v1/chat/completions"
+                                    payload = {
+                                        "model": model_name,
+                                        "messages": [
+                                            {
+                                                "role": "system",
+                                                "content": system_prompt,
+                                            },
+                                            {"role": "user", "content": prompt},
+                                        ],
+                                        "temperature": temperature,
+                                        "max_tokens": max_tokens,
+                                    }
+
                             async with http_session.post(
                                 url, json=payload, headers=headers
                             ) as resp:
@@ -1883,14 +1926,17 @@ class Filter:
                                         choices = data.get("choices", [])
                                         if not choices:
                                             continue
-                                        content = (
-                                            choices[0]
-                                            .get("message", {})
-                                            .get("content", "")
-                                        )
+                                        if ep_type == "completion":
+                                            content = choices[0].get("text", "").strip()
+                                        else:
+                                            content = (
+                                                choices[0]
+                                                .get("message", {})
+                                                .get("content", "")
+                                                .strip()
+                                            )
                                         if not content:
                                             continue
-                                        content = content.strip()
                                     await self._llm_cache.set(cache_key, content)
                                     future.set_result(content)
                                     self._log_debug(
@@ -1911,7 +1957,7 @@ class Filter:
                             await asyncio.sleep(base_delay * (2**attempt))
                             continue
 
-            # Si ningún modelo funcionó
+            # All models failed
             logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
             future.set_result(None)
             fallback_model = models_to_try[0] if models_to_try else "unknown"
