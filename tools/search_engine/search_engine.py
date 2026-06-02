@@ -212,7 +212,7 @@ class Tools:
         CHROMA_DB_PATH: str = Field(default="./chroma_cache")
         LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
-        LLM_PROVIDER: str = Field(default="llamacpp/Inference/Schematron:3B")
+        LLM_PROVIDER: str = Field(default="llamacpp/schematron-3b-q4_k_m.gguf")
         EXPANSION_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
         FILTER_LLM_PROVIDER: str = Field(default="llamacpp/llama3.2:3b")
         REFINEMENT_LLM_PROVIDER: str = Field(default="")
