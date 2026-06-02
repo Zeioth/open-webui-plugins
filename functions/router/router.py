@@ -147,7 +147,7 @@ class Filter:
         )
         default_model: str = Field(default="generalista")
         default_model_name: str = Field(
-            default="llamacpp/llama3.2:3b",
+            default="llamacpp/llama-3.2-3b-instruct-q4_k_m.gguf",
             description="Real model name for 'generalista' (with llamacpp/ prefix)",
         )
         change_threshold: int = Field(default=2)
@@ -157,7 +157,7 @@ class Filter:
         LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
         classifier_model: str = Field(
-            default="llamacpp/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Compact.gguf"
         )
         classifier_temperature: float = Field(default=0.0)
         classifier_timeout: int = Field(default=15)
