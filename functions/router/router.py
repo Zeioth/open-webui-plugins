@@ -80,84 +80,84 @@ class Filter:
     class Valves(BaseModel):
         experts_json: str = Field(
             default="""[
-    {
-        "id": "experto-en-neovim",
-        "name": "Neovim",
-        "keywords": ["neovim", "nvim", "vimrc", "init.lua", "lazy.nvim", "vim-plug", "treesitter", "keymap", "which-key"],
-        "description": "Configuration, plugins, and usage of Neovim editor",
-        "examples": ["how to configure LSP in nvim", "best neovim plugins 2025", "treesitter setup init.lua"],
-        "knowledge_base": "the official Neovim documentation and community plugins",
-        "collection_name": "neovim_docs"
-    },
-    {
-        "id": "experto-en-arch-linux",
-        "name": "Arch Linux",
-        "keywords": ["archlinux", "pacman", "yay", "aur", "systemd", "grub", "hyprland", "wayland"],
-        "description": "Installation, maintenance, and troubleshooting of Arch Linux",
-        "examples": ["how to install yay", "hyprland config", "pacman update error"],
-        "knowledge_base": "the official Arch Linux wiki",
-        "collection_name": "archwiki"
-    },
-    {
-        "id": "arquitecto-de-codigo",
-        "name": "Arquitecto de código",
-        "keywords": [
-            "architecture", "arquitectura", "design pattern", "patrón de diseño",
-            "microservices", "microservicios", "system design", "diseño de sistemas",
-            "scalability", "escalabilidad", "ddd", "domain driven design",
-            "event sourcing", "c4 model", "modelo c4", "monolith", "monolito",
-            "orchestration", "orquestación", "saga", "cqrs",
-            "trade-off", "clean architecture", "arquitectura limpia",
-            "hexagonal", "onion architecture", "architectural decision record", "adr",
-            "component diagram", "diagrama de componentes"
-        ],
-        "description": "Maximum precision model for software architecture tasks",
-        "examples": [
-            "compara microservicios con monolito modular",
-            "compare microservices vs modular monolith",
-            "diseña la arquitectura de un sistema de reservas",
-            "design the architecture of a booking system",
-            "when to use event sourcing?",
-            "draw a C4 diagram for an ecommerce app",
-            "explica los componentes de una clean architecture"
-        ]
-    },
-    {
-        "id": "progrmador",
-        "name": "Programador",
-        "keywords": [
-            "function", "función", "class", "clase",
-            "algorithm", "algoritmo", "debug", "depurar", "bug",
-            "implement", "implementar", "python", "javascript", "api", "script",
-            "optimize", "optimizar", "refactor", "refactorizar",
-            "snippet", "fragmento", "error", "excepción",
-            "library", "librería", "framework", "endpoint", "test", "prueba unitaria"
-        ],
-        "description": "Precise model for code implementation tasks",
-        "examples": [
-            "escribe una función que calcule el factorial",
-            "write a function to calculate factorial",
-            "how to fix CORS error in express",
-            "optimize this slow SQL query",
-            "refactor this class using the strategy pattern"
-        ]
-    }
-]""",
+        {
+            "id": "experto-en-neovim",
+            "name": "Neovim",
+            "keywords": ["neovim", "nvim", "vimrc", "init.lua", "lazy.nvim", "vim-plug", "treesitter", "keymap", "which-key"],
+            "description": "Configuration, plugins, and usage of Neovim editor",
+            "examples": ["how to configure LSP in nvim", "best neovim plugins 2025", "treesitter setup init.lua"],
+            "knowledge_base": "the official Neovim documentation and community plugins",
+            "collection_name": "neovim_docs"
+        },
+        {
+            "id": "experto-en-arch-linux",
+            "name": "Arch Linux",
+            "keywords": ["archlinux", "pacman", "yay", "aur", "systemd", "grub", "hyprland", "wayland"],
+            "description": "Installation, maintenance, and troubleshooting of Arch Linux",
+            "examples": ["how to install yay", "hyprland config", "pacman update error"],
+            "knowledge_base": "the official Arch Linux wiki",
+            "collection_name": "archwiki"
+        },
+        {
+            "id": "arquitecto-de-codigo",
+            "name": "Arquitecto de código",
+            "keywords": [
+                "architecture", "arquitectura", "design pattern", "patrón de diseño",
+                "microservices", "microservicios", "system design", "diseño de sistemas",
+                "scalability", "escalabilidad", "ddd", "domain driven design",
+                "event sourcing", "c4 model", "modelo c4", "monolith", "monolito",
+                "orchestration", "orquestación", "saga", "cqrs",
+                "trade-off", "clean architecture", "arquitectura limpia",
+                "hexagonal", "onion architecture", "architectural decision record", "adr",
+                "component diagram", "diagrama de componentes"
+            ],
+            "description": "Maximum precision model for software architecture tasks",
+            "examples": [
+                "compara microservicios con monolito modular",
+                "compare microservices vs modular monolith",
+                "diseña la arquitectura de un sistema de reservas",
+                "design the architecture of a booking system",
+                "when to use event sourcing?",
+                "draw a C4 diagram for an ecommerce app",
+                "explica los componentes de una clean architecture"
+            ]
+        },
+        {
+            "id": "progrmador",
+            "name": "Programador",
+            "keywords": [
+                "function", "función", "class", "clase",
+                "algorithm", "algoritmo", "debug", "depurar", "bug",
+                "implement", "implementar", "python", "javascript", "api", "script",
+                "optimize", "optimizar", "refactor", "refactorizar",
+                "snippet", "fragmento", "error", "excepción",
+                "library", "librería", "framework", "endpoint", "test", "prueba unitaria"
+            ],
+            "description": "Precise model for code implementation tasks",
+            "examples": [
+                "escribe una función que calcule el factorial",
+                "write a function to calculate factorial",
+                "how to fix CORS error in express",
+                "optimize this slow SQL query",
+                "refactor this class using the strategy pattern"
+            ]
+        }
+    ]""",
             description="JSON with expert definitions. 'model' field is no longer needed – the router respects the model already selected by the user.",
         )
         default_model: str = Field(default="generalista")
         default_model_name: str = Field(
-            default="llama3.2:3B",
-            description="Real Ollama model name for 'generalista'",
+            default="llamacpp/llama3.2:3b",
+            description="Real model name for 'generalista' (with llamacpp/ prefix)",
         )
         change_threshold: int = Field(default=2)
         notify_change: bool = Field(default=True)
         notification_template: str = Field(default="🎯 Using expert: {expert}")
 
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434/")
+        LLM_BASE_URL: str = Field(default="http://localhost:8080")
         LLM_API_TOKEN: str = Field(default="")
         classifier_model: str = Field(
-            default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
+            default="llamacpp/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
         classifier_temperature: float = Field(default=0.0)
         classifier_timeout: int = Field(default=15)
@@ -174,6 +174,12 @@ class Filter:
         SEMANTIC_THRESHOLD: float = Field(default=0.55)
         CACHE_DB_PATH: str = Field(default="/app/backend/data/router_cache.db")
         DEBUG: bool = Field(default=True)
+
+        # New valve: choose between chat and text completions for llama.cpp
+        llamacpp_endpoint_type: str = Field(
+            default="chat",
+            description="Endpoint type for llama.cpp: 'chat' (default) or 'completion'.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -258,6 +264,32 @@ class Filter:
             timeout = self.valves.default_llm_timeout
         model_str = provider or self.valves.classifier_model
 
+        # Normalize base URL: remove trailing /v1 if present
+        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3].rstrip("/")
+
+        # Detect Ollama by URL or port (legacy)
+        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+
+        # Force OpenAI-compatible path if model has llamacpp/ prefix
+        is_llamacpp = model_str.startswith("llamacpp/")
+        if is_llamacpp:
+            is_ollama = False
+
+        # Extract real model name (strip provider prefix)
+        if "/" in model_str and (
+            model_str.startswith("ollama/") or model_str.startswith("llamacpp/")
+        ):
+            model_name = model_str.split("/", 1)[1]
+        else:
+            model_name = model_str
+
+        # Determine endpoint type for llama.cpp (from valve)
+        ep_type = "chat"
+        if is_llamacpp:
+            ep_type = self.valves.llamacpp_endpoint_type
+
         if _SHARED_RESOURCES_AVAILABLE:
             from shared_resources import call_llm
 
@@ -271,22 +303,22 @@ class Filter:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    endpoint_type=ep_type,
                 )
             except Exception as e:
                 logger.warning(f"[Router] shared call_llm failed: {e}, using fallback")
 
+        # Fallback HTTP
         import aiohttp
         from shared_resources import get_http_session
 
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
         api_token = (
             self.valves.LLM_API_TOKEN.strip() if self.valves.LLM_API_TOKEN else None
         )
-        model_name = model_str.split("/", 1)[1] if "/" in model_str else model_str
-        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
         headers = {"Content-Type": "application/json"}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
+
         if is_ollama:
             url = f"{base_url}/api/generate"
             payload = {
@@ -297,16 +329,26 @@ class Filter:
                 "options": {"temperature": temperature, "num_predict": max_tokens},
             }
         else:
-            url = f"{base_url}/chat/completions"
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
+            if ep_type == "completion":
+                url = f"{base_url}/v1/completions"
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt if not system else f"{system}\n\n{prompt}",
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+            else:  # chat
+                url = f"{base_url}/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+
         session = await get_http_session(timeout=timeout)
         try:
             async with session.post(
@@ -321,13 +363,18 @@ class Filter:
                 data = await resp.json()
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"Router LLM connection error: {exc}") from exc
+
         if is_ollama:
             content = data.get("response", "")
             if "error" in data:
                 logger.error(f"[Router] Ollama error: {data['error']}")
                 return ""
         else:
-            content = data["choices"][0]["message"]["content"]
+            if ep_type == "completion":
+                content = data["choices"][0].get("text", "")
+            else:
+                content = data["choices"][0]["message"]["content"]
+
         content = content.strip()
         if not content:
             logger.warning(f"[Router] LLM returned empty content for '{model_name}'.")
@@ -505,6 +552,7 @@ class Filter:
         if _SHARED_RESOURCES_AVAILABLE and self.valves.USE_SEMANTIC_CLASSIFY:
             try:
                 from shared_resources import get_active_expert
+
                 active_expert = get_active_expert()
                 if active_expert and active_expert != "generalista":
                     sem_id = await self._semantic_classify(user_query, self._experts)
@@ -717,6 +765,7 @@ class Filter:
         if _SHARED_RESOURCES_AVAILABLE:
             try:
                 from shared_resources import set_active_expert
+
                 set_active_expert(model_to_use)
             except Exception:
                 pass
