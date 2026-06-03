@@ -7085,8 +7085,11 @@ class Filter:
                 self._last_processed_message_idx[project_id] = last_idx
 
             system_injections = []  # list of (priority, text)
+            # CoT detection flags – we only set them now; the actual generation
+            # happens later, after the multi‑call and context compression.
             manual_cot_used = False
             cot_any_used = False
+            cot_level = 2  # default, will be updated if auto‑detection runs
 
             # ------------------------------------------------------------------
             # Start LTM retrieval in background (we'll need it before CoT)
@@ -7107,7 +7110,7 @@ class Filter:
                     _inlet_timing("ltm_task_creation", t0)
 
             # ------------------------------------------------------------------
-            # CoT detection (only set flags, do not generate yet)
+            # Early CoT *detection* – only sets flags, no LLM call yet.
             # ------------------------------------------------------------------
             if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
                 if last_user_msg:
@@ -7120,6 +7123,7 @@ class Filter:
                         if cot_question:
                             manual_cot_used = True
                             cot_any_used = True
+                            cot_level = level
                             self._log_debug(
                                 f"Manual /think requested with level {level}"
                             )
@@ -7246,7 +7250,7 @@ class Filter:
                         self._set_state(project_id, state)
 
             # ==================================================================
-            # MULTI‑CALL CHUNKING LOGIC
+            # MULTI‑CALL CHUNKING LOGIC (with progressive synthesis & caching)
             # ==================================================================
             if is_code_session and self.valves.enable_code_awareness:
                 code_blocks_for_injection = [
@@ -7306,7 +7310,6 @@ class Filter:
                         or self.valves.smart_pre_expand_model
                     )
 
-                    # We'll process chunk analyses as they complete
                     analyses_futures = [
                         self._analyze_chunk(chunk_text, user_query, model)
                         for chunk_text, _ in chunks
@@ -7344,13 +7347,12 @@ class Filter:
                                 f"{len(completed_analyses)} chunks"
                             )
 
-                    valid = completed_analyses  # all are valid dicts (filtered in loop)
+                    valid = completed_analyses
                     self._log_debug(
                         f"Analysis complete – {len(valid)} chunks returned valid JSON, merging..."
                     )
 
                     if valid:
-                        # If we started an early synthesis, wait for it and use its result as a base
                         if early_synthesis_task:
                             preliminary_summary = await early_synthesis_task
                             self._log_debug(
@@ -7407,7 +7409,6 @@ class Filter:
                                         )
                                     )
                     else:
-                        # Fallback if all chunk analyses failed
                         self._log_debug(
                             "All chunk analyses failed – falling back to lightweight context"
                         )
@@ -7572,6 +7573,7 @@ class Filter:
 
             # ------------------------------------------------------------------
             # NOW generate CoT (level 2 or 3) using the preliminary system prompt as context
+            # (which already includes the synthesized summary if multi‑call was used)
             # ------------------------------------------------------------------
             reasoning = None
             if cot_any_used and not manual_cot_used:
