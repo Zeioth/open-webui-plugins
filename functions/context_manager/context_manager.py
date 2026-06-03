@@ -7336,10 +7336,7 @@ class Filter:
                             suggested.update(an.get("suggested_next", []))
 
                         # Optionally inject the code of suggested symbols
-                        if (
-                            self.valves.multi_call_inject_suggested
-                            and suggested
-                        ):
+                        if self.valves.multi_call_inject_suggested and suggested:
                             suggested_blocks = self._get_blocks_for_symbols(
                                 list(suggested), project_id
                             )
@@ -7378,9 +7375,7 @@ class Filter:
                         self._log_debug(
                             "All chunk analyses failed – falling back to lightweight context"
                         )
-                        lightweight = await self._build_lightweight_context(
-                            project_id
-                        )
+                        lightweight = await self._build_lightweight_context(project_id)
                         system_injections.append(("critical", lightweight))
                 else:
                     # ----- Original behaviour (single injection) -----
@@ -7394,9 +7389,7 @@ class Filter:
                         > self.valves.huge_injection_threshold_tokens
                         > 0
                     ):
-                        active_ctx = await self._build_lightweight_context(
-                            project_id
-                        )
+                        active_ctx = await self._build_lightweight_context(project_id)
                         injected_hashes: Set[str] = set()
                         if user_query:
                             pre_expanded = await self._smart_pre_expand(
@@ -7841,9 +7834,22 @@ class Filter:
     async def _analyze_chunk(
         self, chunk_text: str, question: str, model: str
     ) -> Optional[Dict]:
-        prompt = ANALYSIS_PROMPT_TEMPLATE.format(
-            question=question, chunk_text=chunk_text
-        )
+        """
+        Send a single code chunk to the fast analysis model. Cached results are
+        reused for identical (chunk_text, question) pairs.
+        """
+        # Compute cache key from the chunk content and the question
+        chunk_hash = hashlib.md5(chunk_text.encode()).hexdigest()[:16]
+        question_hash = hashlib.md5(question.encode()).hexdigest()[:16]
+        cache_key = (chunk_hash, question_hash)
+    
+        # Return cached result if available
+        cached = self._chunk_analysis_cache.get(cache_key)
+        if cached is not None:
+            self._log_debug(f"Chunk cache hit (key={chunk_hash[:8]}). Reusing previous analysis.")
+            return cached
+    
+        prompt = ANALYSIS_PROMPT_TEMPLATE.format(question=question, chunk_text=chunk_text)
         self._log_debug(f"Analyzing chunk (len={len(chunk_text)})...")
         try:
             async with self._chunk_semaphore:
@@ -7861,15 +7867,21 @@ class Filter:
         except Exception as e:
             self._log_debug(f"Chunk analysis LLM call exception: {e}")
             return None
-
+    
         if not response:
             self._log_debug("Chunk analysis: LLM returned empty response")
             return None
+    
         parsed = self._parse_json_response(response)
         if parsed is None:
             self._log_debug(
                 f"Chunk analysis: JSON parse failed for response: {response[:300]}"
             )
+            # Do not cache invalid results
+            return None
+    
+        # Store in cache (LRU, automatically evicts oldest if full)
+        self._add_to_chunk_analysis_cache(cache_key, parsed)
         return parsed
 
     def _parse_json_response(self, text: str) -> Optional[Dict]:
