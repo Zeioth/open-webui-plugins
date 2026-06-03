@@ -1210,6 +1210,15 @@ class Filter:
             description="Token budget for injecting suggested symbol code into the final prompt.",
         )
 
+        # ───── Multi‑call synthesis model ─────
+        multi_call_synthesis_model: str = Field(
+            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            description="Model used to synthesize the final summary from chunk analyses.",
+        )
+        multi_call_synthesis_max_tokens: int = Field(
+            default=1500, description="Max tokens for the synthesized summary."
+        )
+
     def __init__(self):
         # ──── Valves and basic objects ────
         self.valves = self.Valves()
@@ -7237,7 +7246,7 @@ class Filter:
                         self._set_state(project_id, state)
 
             # ==================================================================
-            # MULTI‑CALL CHUNKING LOGIC (NEW)
+            # MULTI‑CALL CHUNKING LOGIC
             # ==================================================================
             if is_code_session and self.valves.enable_code_awareness:
                 code_blocks_for_injection = [
@@ -7312,18 +7321,27 @@ class Filter:
                     )
 
                     if valid:
-                        summary, suggested = self._merge_chunk_analyses(
+                        # Generate high‑quality summary using smart model
+                        summary = await self._synthesize_final_summary(
                             valid, user_query
                         )
                         self._log_debug(
-                            f"Merged summary length: {len(summary)} chars, suggested symbols: {len(suggested)}"
+                            f"Synthesized summary length: {len(summary)} chars"
                         )
                         system_injections.append(("critical", summary))
 
+                        # Gather suggested symbols from all chunks
+                        suggested = set()
+                        for an in valid:
+                            suggested.update(an.get("suggested_next", []))
+
                         # Optionally inject the code of suggested symbols
-                        if self.valves.multi_call_inject_suggested and suggested:
+                        if (
+                            self.valves.multi_call_inject_suggested
+                            and suggested
+                        ):
                             suggested_blocks = self._get_blocks_for_symbols(
-                                suggested, project_id
+                                list(suggested), project_id
                             )
                             if suggested_blocks:
                                 extra_lines = []
@@ -7360,7 +7378,9 @@ class Filter:
                         self._log_debug(
                             "All chunk analyses failed – falling back to lightweight context"
                         )
-                        lightweight = await self._build_lightweight_context(project_id)
+                        lightweight = await self._build_lightweight_context(
+                            project_id
+                        )
                         system_injections.append(("critical", lightweight))
                 else:
                     # ----- Original behaviour (single injection) -----
@@ -7374,7 +7394,9 @@ class Filter:
                         > self.valves.huge_injection_threshold_tokens
                         > 0
                     ):
-                        active_ctx = await self._build_lightweight_context(project_id)
+                        active_ctx = await self._build_lightweight_context(
+                            project_id
+                        )
                         injected_hashes: Set[str] = set()
                         if user_query:
                             pre_expanded = await self._smart_pre_expand(
@@ -7951,6 +7973,72 @@ class Filter:
 
         summary = "\n".join(lines)
         return summary, list(all_suggested)
+
+    async def _synthesize_final_summary(
+        self, analyses: List[Dict], question: str
+    ) -> str:
+        """
+        Use a larger, smarter model to synthesize a concise, high‑quality summary
+        from all the per‑chunk analyses. This avoids arbitrary truncation and
+        preserves the most important information.
+        Falls back to the basic merge if the synthesis call fails.
+        """
+        if not analyses:
+            return "No chunk analyses available."
+
+        # Build a compact text representation of all findings
+        chunks_text = []
+        for idx, an in enumerate(analyses, 1):
+            funcs = ", ".join(an.get("relevant_functions", [])[:10])
+            findings = " | ".join(an.get("key_findings", [])[:15])
+            issues = " | ".join(an.get("potential_issues", [])[:5])
+            chunks_text.append(
+                f"Chunk {idx}:\n"
+                f"  Functions: {funcs}\n"
+                f"  Findings: {findings}\n"
+                f"  Issues: {issues}"
+            )
+        combined = "\n\n".join(chunks_text)
+
+        # Truncate combined if it's extremely large (precaution)
+        if self.tokenizer:
+            tokens = self.tokenizer.encode(combined)
+            if len(tokens) > 12000:  # model context limit for synthesis
+                combined = (
+                    self.tokenizer.decode(tokens[:12000]) + "\n[analysis truncated]"
+                )
+
+        prompt = (
+            f"User question: {question}\n\n"
+            f"Code analyses from {len(analyses)} chunks:\n{combined}\n\n"
+            "Based on the above analyses, generate a **concise, structured summary** "
+            "of the most important points that are relevant to the user's question. "
+            "Use bullet points. Keep the **entire response under 1500 tokens**. "
+            "Do **not** include code snippets. Focus on key functions, potential issues, and architectural insights."
+        )
+
+        # Use a powerful model for synthesis
+        model = (
+            self.valves.cot_model_level2
+        )  # or self.valves.multi_call_synthesis_model if you added it
+        max_tokens = 1500  # or use valve if added
+
+        try:
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a senior software architect summarizing code analysis results.",
+                model_override=model,
+                max_tokens=max_tokens,
+                temperature=0.2,
+            )
+            if response and response.strip():
+                return response.strip()
+        except Exception as e:
+            self._log_debug(f"Synthesis with smart model failed: {e}")
+
+        # Fallback to the basic merge if synthesis fails
+        summary, _ = self._merge_chunk_analyses(analyses, question)
+        return summary
 
     async def _build_global_context_header(self, project_id: str) -> str:
         """
