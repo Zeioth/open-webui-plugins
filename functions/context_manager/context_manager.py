@@ -7242,6 +7242,19 @@ class Filter:
                     self.valves.context_window_tokens - 4000
                 )
 
+                # <-- TEMPORAL DEBUG DELETEME
+                block_types = Counter(b.content_type for b in code_blocks_for_injection)
+                self._log_debug(
+                    f"Blocks for injection: {len(code_blocks_for_injection)} total, "
+                    f"types: {dict(block_types)}"
+                )
+                for b in list(code_blocks_for_injection)[:3]:
+                    self._log_debug(
+                        f"  block {b.hash[:8]}: type={b.content_type.value}, "
+                        f"tokens={b._cached_token_count}, file={b.file_path}"
+                    )
+                # END OF TEMPORAL DEBUG -->
+
                 use_multi_call = (
                     self.valves.multi_call_enabled
                     and total_code_tokens > max_model_tokens > 0
@@ -7813,15 +7826,13 @@ class Filter:
     async def _analyze_chunk(
         self, chunk_text: str, question: str, model: str
     ) -> Optional[Dict]:
-        """
-        Send a single code chunk to the fast analysis model and return the parsed JSON result.
-        Returns None if the call fails or the response cannot be parsed.
-        """
         prompt = ANALYSIS_PROMPT_TEMPLATE.format(
             question=question, chunk_text=chunk_text
         )
+        self._log_debug(f"Analyzing chunk (len={len(chunk_text)})...")
         try:
             async with self._chunk_semaphore:
+                self._log_debug("Chunk semaphore acquired, calling LLM...")
                 response = await self._call_llm(
                     prompt=prompt,
                     system_prompt="You output only JSON.",
@@ -7829,13 +7840,22 @@ class Filter:
                     max_tokens=600,
                     temperature=0.2,
                 )
+                self._log_debug(
+                    f"LLM response received: {response[:200] if response else 'None'}"
+                )
         except Exception as e:
-            self._log_debug(f"Chunk analysis LLM call failed: {e}")
+            self._log_debug(f"Chunk analysis LLM call exception: {e}")
             return None
 
         if not response:
+            self._log_debug("Chunk analysis: LLM returned empty response")
             return None
-        return self._parse_json_response(response)
+        parsed = self._parse_json_response(response)
+        if parsed is None:
+            self._log_debug(
+                f"Chunk analysis: JSON parse failed for response: {response[:300]}"
+            )
+        return parsed
 
     def _parse_json_response(self, text: str) -> Optional[Dict]:
         """
