@@ -1,17 +1,13 @@
 """
 title: Shared Resources for OpenWebUI Plugins
 description: Shared singletons (embedder, ChromaDB, HTTP session, tiktoken, LRU cache)
-             to avoid resource duplication across web_search_and_crawl, rag_router
-             and code-aware-context-manager.
-
-INSTALLATION:
-  Place this file in your openwebui directory. On docker, this is your volume:
-  /var/lib/docker/volumes/open-webui/_data/custom_lib
-
-  When you import will be:
-  /app/backend/data/custom_lib
-
-COMPATIBILITY: Python 3.10+, OpenWebUI ≥ 0.3
+             to avoid resource duplication across plugins.
+             Now includes a helper to safely unload all llama.cpp models.
+author: zeioth
+author_url: https://github.com/zeioth
+funding_url: https://github.com/open-webui
+version: 2.0.0
+license: GPL3
 requirements: aiohttp, chromadb, tiktoken, sentence-transformers
 """
 
@@ -150,14 +146,13 @@ async def call_llm(
     model: str = "llamacpp/llama3.2:3b",              # placeholder model
     api_token: str = "",
     temperature: float = 0.3,
-    max_tokens: Optional[int] = None,                 # <-- now optional (None = No limit)
+    max_tokens: Optional[int] = None,                 # None = no explicit limit
     timeout: int = 120,
     endpoint_type: str = "chat",
 ) -> str:
     """
     Async LLM call. Reuses the shared HTTP session.
     Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
-
     - base_url: may be given with or without trailing /v1 (it is normalized).
     - model: if it starts with 'llamacpp/', the provider is forced to OpenAI-compatible.
     - endpoint_type: 'chat' (default) or 'completion' for llama.cpp.
@@ -165,19 +160,19 @@ async def call_llm(
     """
     session = await get_http_session(timeout)
 
-    # Normalise the base URL: strip trailing slash and remove any /v1 suffix so we can add the correct endpoint later.
+    # Normalise the base URL: strip trailing slash and remove any /v1 suffix
     base_url = base_url.rstrip("/")
     if base_url.endswith("/v1"):
         base_url = base_url[:-3].rstrip("/")
 
     is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
-    # If the model has the llamacpp/ prefix, force OpenAI-compatible path.
+    # Force OpenAI-compatible path if model has llamacpp/ prefix
     is_llamacpp = model.startswith("llamacpp/")
     if is_llamacpp:
         is_ollama = False
 
-    # Extract the real model name (everything after the first /, if present).
+    # Extract the real model name (everything after the first /, if present)
     model_str = model.split("/", 1)[1] if "/" in model else model
 
     headers = {"Content-Type": "application/json"}
@@ -417,3 +412,59 @@ def set_active_expert(expert_id: str) -> None:
     global _ACTIVE_EXPERT
     with _ACTIVE_EXPERT_LOCK:
         _ACTIVE_EXPERT = expert_id
+
+
+# ---------------------------------------------------------------------------
+# 9. Helper to safely unload all models from a llama.cpp server
+#    (clears the single slot before switching to a different model)
+# ---------------------------------------------------------------------------
+async def unload_all_models(base_url: str) -> None:
+    """
+    List all currently loaded models on a llama.cpp server and unload each one.
+    After completion the server slot should be empty.
+
+    This function is designed to be called before switching to a different model
+    on a server with a single slot, preventing "model failed to load" errors.
+    """
+    import aiohttp
+
+    base_url = base_url.rstrip("/")
+    # Remove /v1 if present – the unload endpoint is at the root
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3].rstrip("/")
+
+    async with aiohttp.ClientSession() as sess:
+        # 1. List models
+        try:
+            async with sess.get(
+                f"{base_url}/v1/models",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        except Exception:
+            return
+
+        models = []
+        for m in data.get("data", []):
+            # Only consider models that are currently loaded
+            if m.get("status", {}).get("value") == "loaded":
+                models.append(m["id"])
+
+        # 2. Unload each loaded model
+        for model_id in models:
+            try:
+                async with sess.post(
+                    f"{base_url}/models/unload",
+                    json={"model": model_id},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        import logging
+                        logging.getLogger(__name__).debug(f"Unloaded model {model_id}")
+            except Exception:
+                pass
+
+        # 3. Wait a moment for slots to be released
+        await asyncio.sleep(0.5)
