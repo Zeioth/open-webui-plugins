@@ -7085,11 +7085,11 @@ class Filter:
                 self._last_processed_message_idx[project_id] = last_idx
 
             system_injections = []  # list of (priority, text)
-            # CoT detection flags – we only set them now; the actual generation
-            # happens later, after the multi‑call and context compression.
+            # CoT flags will be set after the multi‑call block, right before
+            # the generation of the preliminary system message.
             manual_cot_used = False
             cot_any_used = False
-            cot_level = 2  # default, will be updated if auto‑detection runs
+            cot_level = 2
 
             # ------------------------------------------------------------------
             # Start LTM retrieval in background (we'll need it before CoT)
@@ -7108,35 +7108,6 @@ class Filter:
                         self._retrieve_all_memories_unified(user_query, project_id)
                     )
                     _inlet_timing("ltm_task_creation", t0)
-
-            # ------------------------------------------------------------------
-            # Early CoT *detection* – only sets flags, no LLM call yet.
-            # ------------------------------------------------------------------
-            if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-                if last_user_msg:
-                    user_content = last_user_msg.get("content", "")
-                    if (
-                        self.valves.enable_cot_on_demand
-                        and user_content.strip().startswith("/think")
-                    ):
-                        cot_question, level = await self._parse_cot_intent(user_content)
-                        if cot_question:
-                            manual_cot_used = True
-                            cot_any_used = True
-                            cot_level = level
-                            self._log_debug(
-                                f"Manual /think requested with level {level}"
-                            )
-                            if level == 1:
-                                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                                system_injections.append(("high", cot_prompt))
-                    elif not manual_cot_used:
-                        cot_level = await self._detect_cot_level(
-                            user_content, is_code_session, state
-                        )
-                        if cot_level > 0:
-                            cot_any_used = True
-                            self._log_debug(f"Activated CoT level {cot_level}")
 
             # ------------------------------------------------------------------
             # Parallel checks: response cache, contradiction, duplicate question
@@ -7560,6 +7531,35 @@ class Filter:
 
             if base_content.strip():
                 prelim_system = prelim_system + "\n\n" + base_content
+
+            # ------------------------------------------------------------------
+            # CoT DETECTION (moved after context compression so logs are clearer)
+            # ------------------------------------------------------------------
+            if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+                if last_user_msg:
+                    user_content = last_user_msg.get("content", "")
+                    if (
+                        self.valves.enable_cot_on_demand
+                        and user_content.strip().startswith("/think")
+                    ):
+                        cot_question, level = await self._parse_cot_intent(user_content)
+                        if cot_question:
+                            manual_cot_used = True
+                            cot_any_used = True
+                            cot_level = level
+                            self._log_debug(
+                                f"Manual /think requested with level {level}"
+                            )
+                            if level == 1:
+                                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                                system_injections.append(("high", cot_prompt))
+                    elif not manual_cot_used:
+                        cot_level = await self._detect_cot_level(
+                            user_content, is_code_session, state
+                        )
+                        if cot_level > 0:
+                            cot_any_used = True
+                            self._log_debug(f"Activated CoT level {cot_level}")
 
             # ------------------------------------------------------------------
             # Wait for any active background LLM tasks to finish before unloading models
