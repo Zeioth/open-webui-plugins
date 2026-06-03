@@ -916,7 +916,7 @@ class Filter:
             default="warn"
         )  # accepts summarize, truncate, warn
         code_block_summary_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -964,7 +964,7 @@ class Filter:
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
         smart_pre_expand_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
@@ -989,7 +989,7 @@ class Filter:
         hierarchical_compression_enabled: bool = Field(default=False)
         hierarchical_compression_interval_messages: int = Field(default=100)
         hierarchical_summary_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
         hierarchical_summary_max_tokens: int = Field(default=800)
 
@@ -1010,30 +1010,28 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
-        cot_model: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano"
-        )
+        cot_model: str = Field(default="llamacpp/qwen2.5-14b-instruct-q4_k_m")
         cot_model_level2: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
             description="Model used for CoT level 2 (auto-reasoning).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
-            description="llamacpp/llama-3.2-3b-instruct-q4_k_m.",
+            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
+            description="Model used for CoT level 3 (self‑reflection).",
         )
         enable_cot_llm_detection: bool = Field(default=True)
         cot_detection_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
 
         # ───── Assumptions & Contradictions ─────
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano"
+            default="llamacpp/qwen2.5-14b-instruct-q4_k_m"
         )
         enable_contradiction_detection: bool = Field(default=False)
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano"
+            default="llamacpp/qwen2.5-14b-instruct-q4_k_m"
         )
         contradiction_inject_warning: bool = Field(default=True)
 
@@ -1076,14 +1074,14 @@ class Filter:
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
         summary_fallback_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
         summary_include_metadata: bool = Field(default=True)
 
         # ───── Summarize Old Messages ─────
         summarize_old_messages: bool = Field(default=True)
         summarization_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
 
         # ───── LLM Configuration ─────
@@ -1093,8 +1091,10 @@ class Filter:
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="llamacpp/llama-3.2-3b-instruct-q4_k_m")
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
+        llm_model: str = Field(default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m")
+        LLM_MAX_CONCURRENT_CALLS: int = Field(
+            default=2, ge=1, le=10
+        )  # serialized, to avoid VRAM overflow.
         llm_request_timeout: int = Field(default=300)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
@@ -1129,7 +1129,7 @@ class Filter:
         # ───── Dependency Tracking ─────
         enable_dependency_tracking: bool = Field(default=False)
         dependency_extraction_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
@@ -1144,14 +1144,14 @@ class Filter:
         # ───── Summarize Inactive Code ─────
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
 
         # ───── Forget Commands ─────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m"
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
         )
 
         # ───── Proactive Cleanup ─────
@@ -1190,7 +1190,7 @@ class Filter:
             description="Max tokens per chunk sent to the analysis model. Must be below the model's context limit.",
         )
         multi_call_model: str = Field(
-            default="llamacpp/llama-3.2-3b-instruct-q4_k_m",
+            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m",
             description="Fast model used to analyze each code chunk. Should be small and quick.",
         )
         multi_call_max_chunks: int = Field(
@@ -1212,7 +1212,7 @@ class Filter:
 
         # ───── Multi‑call synthesis model ─────
         multi_call_synthesis_model: str = Field(
-            default="llamacpp/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
             description="Model used to synthesize the final summary from chunk analyses.",
         )
         multi_call_synthesis_max_tokens: int = Field(
@@ -7894,18 +7894,17 @@ class Filter:
         )
         self._log_debug(f"Analyzing chunk (len={len(chunk_text)})...")
         try:
-            async with self._chunk_semaphore:
-                self._log_debug("Chunk semaphore acquired, calling LLM...")
-                response = await self._call_llm(
-                    prompt=prompt,
-                    system_prompt="You output only JSON.",
-                    model_override=model,
-                    max_tokens=600,
-                    temperature=0.2,
-                )
-                self._log_debug(
-                    f"LLM response received: {response[:200] if response else 'None'}"
-                )
+            # Concurrency is now only controlled by _call_llm's internal semaphore.
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You output only JSON.",
+                model_override=model,
+                max_tokens=600,
+                temperature=0.2,
+            )
+            self._log_debug(
+                f"LLM response received: {response[:200] if response else 'None'}"
+            )
         except Exception as e:
             self._log_debug(f"Chunk analysis LLM call exception: {e}")
             return None
