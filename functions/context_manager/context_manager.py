@@ -841,6 +841,22 @@ class AppliedChangeFeedback(BaseModel):
     resolved: bool = False
 
 
+ANALYSIS_PROMPT_TEMPLATE = """You are a code analysis assistant. Below is a chunk of the project with a global overview and external dependency signatures. Answer the user's question using only the provided code and context.
+
+User question: {question}
+
+{chunk_text}
+
+Respond with a JSON object containing the following fields:
+- "relevant_functions": list of function/class names in this chunk that are relevant to the question (max 5)
+- "key_findings": list of concise, single‑sentence observations (each MUST be under 100 characters). Do NOT repeat code; describe its purpose or behavior.
+- "potential_issues": list of bugs or concerns (each under 100 characters, max 3)
+- "suggested_next": list of symbol names from OTHER chunks that might be useful (max 3)
+- "confidence": number 0-1 indicating how confident this chunk alone answers the question
+
+CRITICAL: Keep all strings extremely short. No code snippets. No markdown. Only plain JSON."""
+
+
 class Filter:
 
     class Valves(BaseModel):
@@ -7242,18 +7258,10 @@ class Filter:
                     self.valves.context_window_tokens - 4000
                 )
 
-                # <-- TEMPORAL DEBUG DELETEME
-                block_types = Counter(b.content_type for b in code_blocks_for_injection)
                 self._log_debug(
-                    f"Blocks for injection: {len(code_blocks_for_injection)} total, "
-                    f"types: {dict(block_types)}"
+                    f"Active code blocks for injection: {len(code_blocks_for_injection)} "
+                    f"(~{total_code_tokens} tokens)"
                 )
-                for b in list(code_blocks_for_injection)[:3]:
-                    self._log_debug(
-                        f"  block {b.hash[:8]}: type={b.content_type.value}, "
-                        f"tokens={b._cached_token_count}, file={b.file_path}"
-                    )
-                # END OF TEMPORAL DEBUG -->
 
                 use_multi_call = (
                     self.valves.multi_call_enabled
@@ -7808,21 +7816,6 @@ class Filter:
     #  Multi‑call chunking: analysis prompt + per‑chunk LLM call + JSON parser
     # --------------------------------------------------------------------------
 
-    ANALYSIS_PROMPT_TEMPLATE = """You are a code analysis assistant. Below is a chunk of the project with a global overview and external dependency signatures. Answer the user's question using only the provided code and context.
-
-    User question: {question}
-    
-    {chunk_text}
-
-    Respond with a JSON object containing the following fields:
-    - "relevant_functions": list of relevant function/class names in this chunk
-    - "key_findings": list of concise statements (each up to 100 chars) explaining how this chunk addresses the question
-    - "potential_issues": list of bugs or concerns found
-    - "suggested_next": list of symbol names from OTHER chunks that might be useful (based on the global overview)
-    - "confidence": number 0-1 indicating how confident this chunk alone answers the question
-
-    Only output the JSON, no extra text."""
-
     async def _analyze_chunk(
         self, chunk_text: str, question: str, model: str
     ) -> Optional[Dict]:
@@ -7899,11 +7892,13 @@ class Filter:
         Merge the JSON analyses from all chunks into a compact summary string
         and a list of suggested symbol names for further code injection.
 
-        Returns (summary_text, suggested_symbols).
+        Duplicate findings are removed, and findings are prioritized by how many
+        chunks reported them. The total number of findings is capped to keep the
+        summary small without arbitrary truncation.
         """
         all_relevant = set()
-        all_findings = []
-        all_issues = []
+        finding_counts: Dict[str, int] = defaultdict(int)
+        issue_counts: Dict[str, int] = defaultdict(int)
         all_suggested = set()
         total_conf = 0.0
 
@@ -7911,8 +7906,12 @@ class Filter:
             if not an:
                 continue
             all_relevant.update(an.get("relevant_functions", []))
-            all_findings.extend(an.get("key_findings", []))
-            all_issues.extend(an.get("potential_issues", []))
+            for f in an.get("key_findings", []):
+                if isinstance(f, str) and len(f.strip()) > 0:
+                    finding_counts[f.strip()] += 1
+            for i in an.get("potential_issues", []):
+                if isinstance(i, str) and len(i.strip()) > 0:
+                    issue_counts[i.strip()] += 1
             all_suggested.update(an.get("suggested_next", []))
             total_conf += an.get("confidence", 0.0)
 
@@ -7921,22 +7920,37 @@ class Filter:
         lines = [
             f"**Analysis summary for: {question}** (avg confidence: {avg_conf:.2f})"
         ]
+
         if all_relevant:
             lines.append(f"- Relevant symbols: {', '.join(sorted(all_relevant)[:15])}")
-        if all_findings:
+
+        # Sort findings by frequency (descending), then alphabetically for stability
+        sorted_findings = sorted(finding_counts.items(), key=lambda x: (-x[1], x[0]))
+        sorted_issues = sorted(issue_counts.items(), key=lambda x: (-x[1], x[0]))
+
+        # Limit total items to avoid ballooning
+        max_findings = 10
+        max_issues = 5
+
+        if sorted_findings:
             lines.append("- Key findings:")
-            for f in all_findings[:12]:
-                lines.append(f"  - {f}")
-        if all_issues:
+            for text, count in sorted_findings[:max_findings]:
+                freq = f" (×{count})" if count > 1 else ""
+                lines.append(f"  - {text}{freq}")
+
+        if sorted_issues:
             lines.append("- Potential issues:")
-            for i in all_issues[:8]:
-                lines.append(f"  - {i}")
+            for text, count in sorted_issues[:max_issues]:
+                freq = f" (×{count})" if count > 1 else ""
+                lines.append(f"  - {text}{freq}")
+
         if all_suggested:
             lines.append(
                 f"- Suggested further exploration: {', '.join(sorted(all_suggested)[:10])}"
             )
 
-        return "\n".join(lines), list(all_suggested)
+        summary = "\n".join(lines)
+        return summary, list(all_suggested)
 
     async def _build_global_context_header(self, project_id: str) -> str:
         """
@@ -8168,13 +8182,3 @@ class Filter:
                         blocks.append(blk)
                         seen.add(h)
         return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
-
-    def _add_to_chunk_analysis_cache(self, key: Tuple[str, str], value: dict) -> None:
-        """Store a chunk analysis result, evicting the oldest entry if the cache is full."""
-        if key in self._chunk_analysis_cache:
-            # Move to end (mark as recently used)
-            self._chunk_analysis_cache.move_to_end(key)
-        self._chunk_analysis_cache[key] = value
-        if len(self._chunk_analysis_cache) > self._max_chunk_analysis_cache_size:
-            # Remove the oldest item (first in OrderedDict)
-            self._chunk_analysis_cache.popitem(last=False)
