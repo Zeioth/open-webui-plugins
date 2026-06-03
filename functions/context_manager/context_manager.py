@@ -933,8 +933,9 @@ class Filter:
             description="Percentage of the global injection token budget to use for full-code injection when a code review is requested.",
         )
         active_context_max_tokens: int = Field(
-            default=0,
-            description="Maximum tokens for the injected active code context. 0 = unlimited.",
+            default=32000,
+            description="Maximum tokens for the injected active code context. 0 = unlimited. "
+            "If the total active code exceeds this limit, multi‑call chunked analysis is triggered.",
         )
         global_injection_token_budget: int = Field(
             default=0,
@@ -7248,6 +7249,10 @@ class Filter:
                 )
 
                 if use_multi_call:
+                    self._log_debug(
+                        f"MULTI-CALL active – {len(code_blocks_for_injection)} blocks, ~{total_code_tokens} tokens total"
+                    )
+
                     # 1. Cache the full project overview (for other uses, not for chunks)
                     if project_id not in self._cached_global_header:
                         self._cached_global_header[project_id] = (
@@ -7261,6 +7266,9 @@ class Filter:
                         project_id,
                     )
                     chunks = chunks[: self.valves.multi_call_max_chunks]
+                    self._log_debug(
+                        f"Chunking produced {len(chunks)} chunks (limit {self.valves.multi_call_max_chunks})"
+                    )
 
                     # 3. Analyze each chunk in parallel
                     model = (
@@ -7271,14 +7279,23 @@ class Filter:
                         self._analyze_chunk(chunk_text, user_query, model)
                         for chunk_text, _ in chunks
                     ]
+                    self._log_debug(
+                        f"Starting parallel analysis of {len(tasks)} chunks with model {model}"
+                    )
                     partial_results = await asyncio.gather(
                         *tasks, return_exceptions=True
                     )
                     valid = [r for r in partial_results if isinstance(r, dict)]
+                    self._log_debug(
+                        f"Analysis complete – {len(valid)} chunks returned valid JSON, merging..."
+                    )
 
                     if valid:
                         summary, suggested = self._merge_chunk_analyses(
                             valid, user_query
+                        )
+                        self._log_debug(
+                            f"Merged summary length: {len(summary)} chars, suggested symbols: {len(suggested)}"
                         )
                         system_injections.append(("critical", summary))
 
@@ -7319,6 +7336,9 @@ class Filter:
                                     )
                     else:
                         # Fallback if all chunk analyses failed
+                        self._log_debug(
+                            "All chunk analyses failed – falling back to lightweight context"
+                        )
                         lightweight = await self._build_lightweight_context(project_id)
                         system_injections.append(("critical", lightweight))
                 else:
