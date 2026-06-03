@@ -7300,33 +7300,69 @@ class Filter:
                         f"Chunking produced {len(chunks)} chunks (limit {self.valves.multi_call_max_chunks})"
                     )
 
-                    # 3. Analyze each chunk in parallel
+                    # 3. Analyze each chunk in parallel, with progressive synthesis
                     model = (
                         self.valves.multi_call_model
                         or self.valves.smart_pre_expand_model
                     )
-                    tasks = [
+
+                    # We'll process chunk analyses as they complete
+                    analyses_futures = [
                         self._analyze_chunk(chunk_text, user_query, model)
                         for chunk_text, _ in chunks
                     ]
                     self._log_debug(
-                        f"Starting parallel analysis of {len(tasks)} chunks with model {model}"
+                        f"Starting parallel analysis of {len(analyses_futures)} chunks with model {model}"
                     )
-                    partial_results = await asyncio.gather(
-                        *tasks, return_exceptions=True
-                    )
-                    valid = [r for r in partial_results if isinstance(r, dict)]
+
+                    completed_analyses = []
+                    preliminary_summary = None
+                    min_chunks_for_early_synthesis = 3
+                    early_synthesis_task = None
+
+                    for coro in asyncio.as_completed(analyses_futures):
+                        result = await coro
+                        if isinstance(result, dict):
+                            completed_analyses.append(result)
+                            self._log_debug(
+                                f"Chunk analysis completed ({len(completed_analyses)}/{len(chunks)} so far)"
+                            )
+
+                        # Start early synthesis when enough chunks are done, if not already started
+                        if (
+                            len(completed_analyses) >= min_chunks_for_early_synthesis
+                            and early_synthesis_task is None
+                            and len(chunks) > min_chunks_for_early_synthesis
+                        ):
+                            early_synthesis_task = asyncio.create_task(
+                                self._synthesize_partial(
+                                    completed_analyses.copy(), user_query
+                                )
+                            )
+                            self._log_debug(
+                                "Launched early synthesis task with first "
+                                f"{len(completed_analyses)} chunks"
+                            )
+
+                    valid = completed_analyses  # all are valid dicts (filtered in loop)
                     self._log_debug(
                         f"Analysis complete – {len(valid)} chunks returned valid JSON, merging..."
                     )
 
                     if valid:
-                        # Generate high‑quality summary using smart model
+                        # If we started an early synthesis, wait for it and use its result as a base
+                        if early_synthesis_task:
+                            preliminary_summary = await early_synthesis_task
+                            self._log_debug(
+                                f"Preliminary summary length: {len(preliminary_summary)} chars"
+                            )
+
+                        # Final synthesis: incorporate all analyses (and possibly the preliminary summary)
                         summary = await self._synthesize_final_summary(
-                            valid, user_query
+                            valid, user_query, preliminary_summary
                         )
                         self._log_debug(
-                            f"Synthesized summary length: {len(summary)} chars"
+                            f"Final synthesized summary length: {len(summary)} chars"
                         )
                         system_injections.append(("critical", summary))
 
@@ -7835,21 +7871,25 @@ class Filter:
         self, chunk_text: str, question: str, model: str
     ) -> Optional[Dict]:
         """
-        Send a single code chunk to the fast analysis model. Cached results are
-        reused for identical (chunk_text, question) pairs.
+        Send a single code chunk to the fast analysis model.
+        Cached results are reused for identical (chunk_text, question) pairs.
         """
-        # Compute cache key from the chunk content and the question
+        # Compute a cache key from the chunk content and the question
         chunk_hash = hashlib.md5(chunk_text.encode()).hexdigest()[:16]
         question_hash = hashlib.md5(question.encode()).hexdigest()[:16]
         cache_key = (chunk_hash, question_hash)
-    
+
         # Return cached result if available
         cached = self._chunk_analysis_cache.get(cache_key)
         if cached is not None:
-            self._log_debug(f"Chunk cache hit (key={chunk_hash[:8]}). Reusing previous analysis.")
+            self._log_debug(
+                f"Chunk cache hit (key={chunk_hash[:8]}). Reusing previous analysis."
+            )
             return cached
-    
-        prompt = ANALYSIS_PROMPT_TEMPLATE.format(question=question, chunk_text=chunk_text)
+
+        prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+            question=question, chunk_text=chunk_text
+        )
         self._log_debug(f"Analyzing chunk (len={len(chunk_text)})...")
         try:
             async with self._chunk_semaphore:
@@ -7867,19 +7907,18 @@ class Filter:
         except Exception as e:
             self._log_debug(f"Chunk analysis LLM call exception: {e}")
             return None
-    
+
         if not response:
             self._log_debug("Chunk analysis: LLM returned empty response")
             return None
-    
+
         parsed = self._parse_json_response(response)
         if parsed is None:
             self._log_debug(
                 f"Chunk analysis: JSON parse failed for response: {response[:300]}"
             )
-            # Do not cache invalid results
             return None
-    
+
         # Store in cache (LRU, automatically evicts oldest if full)
         self._add_to_chunk_analysis_cache(cache_key, parsed)
         return parsed
@@ -7987,18 +8026,18 @@ class Filter:
         return summary, list(all_suggested)
 
     async def _synthesize_final_summary(
-        self, analyses: List[Dict], question: str
+        self, analyses: List[Dict], question: str, preliminary: str = ""
     ) -> str:
         """
         Use a larger, smarter model to synthesize a concise, high‑quality summary
-        from all the per‑chunk analyses. This avoids arbitrary truncation and
-        preserves the most important information.
+        from all the per‑chunk analyses. If a preliminary summary is provided,
+        it will be refined with the remaining information.
         Falls back to the basic merge if the synthesis call fails.
         """
         if not analyses:
             return "No chunk analyses available."
 
-        # Build a compact text representation of all findings
+        # Build compact text of all findings
         chunks_text = []
         for idx, an in enumerate(analyses, 1):
             funcs = ", ".join(an.get("relevant_functions", [])[:10])
@@ -8012,28 +8051,35 @@ class Filter:
             )
         combined = "\n\n".join(chunks_text)
 
-        # Truncate combined if it's extremely large (precaution)
+        # Truncate combined if extremely large
         if self.tokenizer:
             tokens = self.tokenizer.encode(combined)
-            if len(tokens) > 12000:  # model context limit for synthesis
+            if len(tokens) > 12000:
                 combined = (
                     self.tokenizer.decode(tokens[:12000]) + "\n[analysis truncated]"
                 )
 
-        prompt = (
-            f"User question: {question}\n\n"
-            f"Code analyses from {len(analyses)} chunks:\n{combined}\n\n"
-            "Based on the above analyses, generate a **concise, structured summary** "
-            "of the most important points that are relevant to the user's question. "
-            "Use bullet points. Keep the **entire response under 1500 tokens**. "
-            "Do **not** include code snippets. Focus on key functions, potential issues, and architectural insights."
-        )
+        if preliminary:
+            prompt = (
+                f"User question: {question}\n\n"
+                f"Preliminary analysis summary (based on first chunks):\n{preliminary}\n\n"
+                f"Now we have complete analyses from all {len(analyses)} chunks:\n{combined}\n\n"
+                "Based on the above, generate a **final, comprehensive summary** that "
+                "incorporates all information. Refine the preliminary summary with the new details. "
+                "Use bullet points. Keep the entire response under 1500 tokens. "
+                "Do not include code snippets."
+            )
+        else:
+            prompt = (
+                f"User question: {question}\n\n"
+                f"Code analyses from {len(analyses)} chunks:\n{combined}\n\n"
+                "Based on the above, generate a **concise, structured summary** "
+                "of the most important points. Use bullet points. "
+                "Keep the entire response under 1500 tokens. No code snippets."
+            )
 
-        # Use a powerful model for synthesis
-        model = (
-            self.valves.cot_model_level2
-        )  # or self.valves.multi_call_synthesis_model if you added it
-        max_tokens = 1500  # or use valve if added
+        model = self.valves.cot_model_level2
+        max_tokens = 1500
 
         try:
             response = await self._call_llm(
@@ -8048,7 +8094,63 @@ class Filter:
         except Exception as e:
             self._log_debug(f"Synthesis with smart model failed: {e}")
 
-        # Fallback to the basic merge if synthesis fails
+        # Fallback to basic merge
+        summary, _ = self._merge_chunk_analyses(analyses, question)
+        return summary
+
+    async def _synthesize_partial(self, analyses: List[Dict], question: str) -> str:
+        """
+        Synthesize a preliminary summary from a subset of chunk analyses.
+        Used during progressive synthesis to start early.
+        """
+        if not analyses:
+            return ""
+
+        # Build compact representation of the available findings
+        chunks_text = []
+        for idx, an in enumerate(analyses, 1):
+            funcs = ", ".join(an.get("relevant_functions", [])[:10])
+            findings = " | ".join(an.get("key_findings", [])[:10])
+            issues = " | ".join(an.get("potential_issues", [])[:3])
+            chunks_text.append(
+                f"Chunk {idx}:\n"
+                f"  Functions: {funcs}\n"
+                f"  Findings: {findings}\n"
+                f"  Issues: {issues}"
+            )
+        combined = "\n\n".join(chunks_text)
+
+        # Truncate if extremely large (precaution)
+        if self.tokenizer:
+            tokens = self.tokenizer.encode(combined)
+            if len(tokens) > 8000:
+                combined = (
+                    self.tokenizer.decode(tokens[:8000]) + "\n[analysis truncated]"
+                )
+
+        prompt = (
+            f"User question: {question}\n\n"
+            f"Partial code analyses (first {len(analyses)} chunks):\n{combined}\n\n"
+            "Based on the above, provide a **concise preliminary summary** of the most important points. "
+            "Use bullet points. Keep the response under 800 tokens. "
+            "This summary will be refined later with additional information."
+        )
+
+        model = self.valves.cot_model_level2  # or dedicated synthesis model
+        try:
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a senior software architect summarizing partial code analysis.",
+                model_override=model,
+                max_tokens=800,
+                temperature=0.2,
+            )
+            if response and response.strip():
+                return response.strip()
+        except Exception as e:
+            self._log_debug(f"Partial synthesis failed: {e}")
+
+        # Fallback to basic merge of the subset
         summary, _ = self._merge_chunk_analyses(analyses, question)
         return summary
 
