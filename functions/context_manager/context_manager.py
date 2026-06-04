@@ -6238,9 +6238,8 @@ class Filter:
                     ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
                 )
 
-                self._log_debug(
-                    "Context tokens injected into system prompt for this turn:"
-                )
+                self._log_debug("─" * 50)
+                self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
                 self._log_debug(
                     f"  LTM (past messages, no LLM call):     ~{ltm_tokens}"
                 )
@@ -6259,6 +6258,7 @@ class Filter:
                 self._log_debug(
                     f"  TOTAL injected system tokens:          ~{total_system_tokens}"
                 )
+                self._log_debug("─" * 50)
 
             # Adaptive trim
             if self.valves.adaptive_trim:
