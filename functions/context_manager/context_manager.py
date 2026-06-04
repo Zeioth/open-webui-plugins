@@ -1234,6 +1234,7 @@ class Filter:
         )
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
+        self._db_write_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
 
@@ -1422,10 +1423,45 @@ class Filter:
             )
         )
 
-    async def _save_state_to_db_async(self, project_id: str, state: Dict):
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            await self._save_state_to_db(project_id, state)
+    async def _save_state_to_db(self, project_id: str, state: Dict):
+        active_blocks_meta = {}
+        for k, v in state["active_blocks"].items():
+            d = v.dict()
+            d["content_type"] = v.content_type.value
+            content_hash = v.hash
+            await anyio.to_thread.run_sync(
+                lambda: self._db_conn.execute(
+                    "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
+                    (content_hash, v.content, time.time()),
+                )
+            )
+            d["content"] = f"@@hash:{content_hash}"
+            active_blocks_meta[k] = d
+
+        serializable = {
+            "active_blocks": active_blocks_meta,
+            "recent_changes": [b.dict() for b in state["recent_changes"]],
+            "committed_changes": [b.dict() for b in state["committed_changes"]],
+            "feedback_history": [fb.dict() for fb in state["feedback_history"]],
+            "message_count": state["message_count"],
+            "last_compression_timestamp": state.get("last_compression_timestamp", 0),
+            "response_cache": state.get("response_cache", []),
+            "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
+            "last_cleanup_suggestion_msg_idx": state.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            "has_any_calls": state.get("has_any_calls", False),
+            "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
+        }
+        # ────── WRITE PROTECTED BY DB LOCK ──────
+        async with self._db_write_lock:
+            await anyio.to_thread.run_sync(
+                lambda: self._db_conn.execute(
+                    "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
+                    (project_id, json.dumps(serializable), time.time()),
+                )
+            )
+            await anyio.to_thread.run_sync(lambda: self._db_conn.commit())
 
     async def _save_state_to_db(self, project_id: str, state: Dict):
         active_blocks_meta = {}
@@ -7123,40 +7159,44 @@ class Filter:
         # Generic cache (question‑agnostic)
         if content_hash:
             generic_key = (symbol_name, content_hash)
-            # Keep generic cache size under a limit (e.g., 2000 entries)
             if len(self._symbol_analysis_generic_cache) >= 2000:
                 oldest = next(iter(self._symbol_analysis_generic_cache))
                 del self._symbol_analysis_generic_cache[oldest]
             self._symbol_analysis_generic_cache[generic_key] = result
 
-        # DB persistence (question‑specific)
+        # ────── DB persistence (protected) ──────
         project_id = self.valves.project_id
         result_json = json.dumps(result)
-        self._db_conn.execute(
-            "REPLACE INTO symbol_analysis_cache "
-            "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                project_id,
-                symbol_name,
-                question_hash,
-                content_hash,
-                result_json,
-                time.time(),
-            ),
-        )
-        self._db_conn.commit()
-        # Keep only the most recent 1000 entries per project
-        self._db_conn.execute(
-            "DELETE FROM symbol_analysis_cache "
-            "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
-            "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
-            "  WHERE project_id = ? "
-            "  ORDER BY created_at DESC "
-            "  LIMIT 1000"
-            ")",
-            (project_id, project_id),
-        )
+
+        async def _write():
+            async with self._db_write_lock:
+                self._db_conn.execute(
+                    "REPLACE INTO symbol_analysis_cache "
+                    "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        project_id,
+                        symbol_name,
+                        question_hash,
+                        content_hash,
+                        result_json,
+                        time.time(),
+                    ),
+                )
+                self._db_conn.commit()
+                # Keep only the most recent 1000 entries per project
+                self._db_conn.execute(
+                    "DELETE FROM symbol_analysis_cache "
+                    "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
+                    "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
+                    "  WHERE project_id = ? "
+                    "  ORDER BY created_at DESC "
+                    "  LIMIT 1000"
+                    ")",
+                    (project_id, project_id),
+                )
+
+        asyncio.create_task(_write())
 
     # --------------------------------------------------------------------------
     # Symbol-by-symbol code analysis (with cache)
@@ -7298,7 +7338,7 @@ class Filter:
             f"{len(cached_results)} cached, {len(fresh_indices)} fresh"
         )
 
-        # Prompt templates
+        # Prompt templates (unchanged)
         prompt_template_full = (
             "You are a code analysis assistant. "
             "For the given symbol, provide:\n"
@@ -7330,12 +7370,9 @@ class Filter:
             "OUTPUT:"
         )
 
-        # Use the fast model for per‑symbol analysis
-        model = (
-            self.valves.symbol_analysis_model
-            or self.valves.smart_pre_expand_model
-            or self.valves.llm_model
-        )
+        # ── Model: only the configured symbol‑analysis model, no fallback to other models ──
+        model = self.valves.symbol_analysis_model or self.valves.llm_model
+        # ── Dedicated semaphore so we don't mix with other LLM tasks ──
         semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
 
         max_retries = self.valves.symbol_analysis_max_retries
