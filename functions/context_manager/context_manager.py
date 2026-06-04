@@ -1225,6 +1225,7 @@ class Filter:
         # Caches
         self._symbol_analysis_cache: Dict[Tuple[str, str], Dict] = {}
         self._MAX_SYMBOL_ANALYSIS_CACHE = 1000
+        self._symbol_analysis_generic_cache: Dict[Tuple[str, str], Dict] = {}
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
@@ -6672,7 +6673,7 @@ class Filter:
         return list(deps)
 
     async def _extract_dependencies_hybrid(
-        self, code: str, file_path: Optional[str] = None
+        self, code: str, file_path: Optional[str] = None, model_override: str = None
     ) -> List[str]:
         if not self.valves.enable_dependency_tracking:
             return []
@@ -6709,7 +6710,8 @@ class Filter:
             if deps:
                 return deps
         model = (
-            self.valves.dependency_extraction_model
+            model_override
+            or self.valves.dependency_extraction_model
             or self.valves.llm_model
             or self.valves.summarization_model
         )
@@ -6781,6 +6783,21 @@ class Filter:
     async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
         if not self.valves.enable_dependency_tracking:
             return
+        # Defer the actual extraction to avoid mixing models
+        if self.valves.defer_secondary_tasks:
+            task = SecondaryTask(
+                task_type="dependency_refresh",
+                params={
+                    "block_hash": block_hash,
+                    "project_id": project_id,
+                },
+            )
+            state = self._get_state(project_id)
+            if state is not None:
+                state.setdefault("pending_secondary_tasks", []).append(task.dict())
+                self._set_state(project_id, state)
+            return
+        # Immediate execution (fallback if deferral disabled)
         lock = await self._get_project_lock(project_id)
         async with lock:
             state = self._get_state(project_id)
@@ -7589,6 +7606,36 @@ class Filter:
         state["pending_secondary_tasks"] = remaining
         self._set_state(project_id, state)
 
+    async def _run_dependency_refresh_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred dependency extraction using the secondary model."""
+        block_hash = params["block_hash"]
+        project_id = params["project_id"]
+        lock = await self._get_project_lock(project_id)
+        async with lock:
+            state = self._get_state(project_id)
+            if not state or block_hash not in state["active_blocks"]:
+                return False
+            block = state["active_blocks"].get(block_hash)
+            if not block:
+                return False
+            deps = await self._extract_dependencies_hybrid(
+                block.content, block.file_path, model_override=model
+            )
+            if (
+                block.file_path
+                and block.file_path.endswith(".py")
+                or "def " in block.content
+            ):
+                imports, calls = self._extract_dependencies_ast(block.content)
+                block.ast_imports = imports
+                block.ast_calls = calls
+            block.dependencies = deps
+            await self._mark_affected_blocks(block_hash, state)
+            self._set_state(project_id, state)
+            return True
+
     async def _execute_secondary_task(
         self, task: SecondaryTask, project_id: str
     ) -> bool:
@@ -7606,6 +7653,8 @@ class Filter:
                 )
             elif task.task_type == "session_summary":
                 return await self._run_session_summary_task(task.params, model, sem)
+            elif task.task_type == "dependency_refresh":
+                return await self._run_dependency_refresh_task(task.params, model, sem)
             else:
                 return False
         except asyncio.CancelledError:
