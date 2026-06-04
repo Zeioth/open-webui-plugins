@@ -7387,6 +7387,24 @@ class Filter:
         summary = await self._synthesize_from_symbol_results(all_parsed, question)
         return summary, list(suggested)
 
+    def _get_blocks_for_symbols(
+        self, symbol_names: List[str], project_id: str
+    ) -> List[CodeBlock]:
+        """
+        Return the active, non‑obsolete CodeBlocks that contain any of the given symbols.
+        """
+        state = self._get_state(project_id)
+        blocks = []
+        seen = set()
+        for name in symbol_names:
+            for h in self._symbol_index.find_blocks(name, project_id):
+                if h not in seen:
+                    blk = state["active_blocks"].get(h)
+                    if blk and not blk.obsolete:
+                        blocks.append(blk)
+                        seen.add(h)
+        return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
+
     async def _analyze_single_symbol(
         self, prompt: str, model: str, semaphore: asyncio.Semaphore
     ) -> Optional[str]:
