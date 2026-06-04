@@ -1873,6 +1873,7 @@ class Filter:
         temperature: float = 0.3,
         semaphore: asyncio.Semaphore = None,
         response_format: Optional[Dict[str, Any]] = None,
+        label: str = "",
     ) -> Optional[str]:
         if not HAS_AIOHTTP:
             return None
@@ -1913,7 +1914,9 @@ class Filter:
             if cached is not None:
                 future.set_result(cached)
                 self._log_debug(
-                    f"[LLM] {model} (cached) took {time.monotonic() - t_start:.3f}s"
+                    f"[LLM] {model}"
+                    + (f" ({label})" if label else "")
+                    + f" (cached) took {time.monotonic() - t_start:.3f}s"
                 )
                 return cached
 
@@ -1955,7 +1958,9 @@ class Filter:
                             await self._llm_cache.set(cache_key, content)
                             future.set_result(content)
                             self._log_debug(
-                                f"[LLM] {model} took {time.monotonic() - t_start:.3f}s"
+                                f"[LLM] {model}"
+                                + (f" ({label})" if label else "")
+                                + f" took {time.monotonic() - t_start:.3f}s"
                             )
                             self._last_used_model = model_name
                             return content
@@ -2034,7 +2039,9 @@ class Filter:
                                 await self._llm_cache.set(cache_key, content)
                                 future.set_result(content)
                                 self._log_debug(
-                                    f"[LLM] {model} took {time.monotonic() - t_start:.3f}s"
+                                    f"[LLM] {model}"
+                                    + (f" ({label})" if label else "")
+                                    + f" took {time.monotonic() - t_start:.3f}s"
                                 )
                                 self._last_used_model = model_name
                                 return content
@@ -2087,7 +2094,9 @@ class Filter:
             )
             future.set_result(None)
             self._log_debug(
-                f"[LLM] {model} (failed) after {time.monotonic() - t_start:.3f}s"
+                f"[LLM] {model}"
+                + (f" ({label})" if label else "")
+                + f" (failed) after {time.monotonic() - t_start:.3f}s"
             )
             return None
 
@@ -5067,7 +5076,9 @@ class Filter:
         self._log_timing("cot_detection_llm_fallback", dur, dur)
         return self._detect_cot_level_heuristic(user_content, is_code_session, state)
 
-    async def _generate_cot_reasoning(self, question: str, context: str) -> str:
+    async def _generate_cot_reasoning(
+        self, question: str, context: str, label: str = ""
+    ) -> str:
         effective_max_tokens = (
             self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
         )
@@ -5082,6 +5093,7 @@ class Filter:
             model_override=self.valves.cot_model_level2,
             max_tokens=effective_max_tokens,
             temperature=0.4,
+            label=label,
         )
         if response:
             return (
@@ -5093,9 +5105,9 @@ class Filter:
         return "Unable to generate reasoning."
 
     async def _generate_cot_with_self_reflection(
-        self, question: str, context: str
+        self, question: str, context: str, label: str = ""
     ) -> str:
-        reasoning = await self._generate_cot_reasoning(question, context)
+        reasoning = await self._generate_cot_reasoning(question, context, label=label)
         if not reasoning or reasoning == "Unable to generate reasoning.":
             return reasoning
 
@@ -5116,6 +5128,7 @@ class Filter:
             model_override=self.valves.cot_model_level3,
             max_tokens=effective_max_tokens,
             temperature=0.3,
+            label=label + "_reflection" if label else "cot_reflection",
         )
         if refined:
             return (
@@ -5612,7 +5625,7 @@ class Filter:
             if handled:
                 messages = self._ensure_last_message_is_user(messages)
                 body["messages"] = messages
-                _inlet_timing("total_inlet", inlet_start)
+                _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
                     duration=time.monotonic() - inlet_start,
@@ -5628,7 +5641,7 @@ class Filter:
         ):
             t0 = time.monotonic()
             intents = await self._parse_all_intents(last_user_msg.get("content", ""))
-            _inlet_timing("parse_nl_intents", t0)
+            _inlet_timing("parse_nl_intents (LLM intent detection)", t0)
             for intent_type in ("forget", "remember", "obsolete"):
                 fi = intents.get(intent_type, {})
                 if fi.get("action") not in (None, "none"):
@@ -5653,7 +5666,7 @@ class Filter:
                     messages.append({"role": "assistant", "content": confirmation})
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
-                    _inlet_timing("total_inlet", inlet_start)
+                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
                     self._log_section(
                         "CONTEXT MANAGER - INLET END",
                         duration=time.monotonic() - inlet_start,
@@ -5686,7 +5699,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
@@ -5706,7 +5719,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
@@ -5723,7 +5736,7 @@ class Filter:
             messages.append({"role": "assistant", "content": response})
             messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
@@ -5741,7 +5754,7 @@ class Filter:
 
             t0 = time.monotonic()
             is_code_session = await self._classify_session(messages, project_id)
-            _inlet_timing("classify_session", t0)
+            _inlet_timing("classify_session (code detection)", t0)
 
             if self.valves.enable_code_awareness and is_code_session:
                 last_idx = len(messages) - 1
@@ -5758,7 +5771,9 @@ class Filter:
                         user_question = user_query
                 else:
                     user_question = user_query
-                _inlet_timing("update_active_code_last", t0)
+                _inlet_timing(
+                    "update_active_code_last (extract symbols from last msg)", t0
+                )
                 self._last_processed_message_idx[project_id] = last_idx
 
             system_injections = []
@@ -5780,7 +5795,7 @@ class Filter:
                     ltm_future = asyncio.create_task(
                         self._retrieve_all_memories_unified(user_query, project_id)
                     )
-                    _inlet_timing("ltm_task_creation", t0)
+                    _inlet_timing("ltm_task_creation (launch background LTM query)", t0)
 
             # Parallel checks
             parallel_checks_task = None
@@ -5803,7 +5818,7 @@ class Filter:
                     )
                     messages = self._ensure_last_message_is_user(messages)
                     body["messages"] = messages
-                    _inlet_timing("total_inlet", inlet_start)
+                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
                     self._log_section(
                         "CONTEXT MANAGER - INLET END",
                         duration=time.monotonic() - inlet_start,
@@ -5828,7 +5843,7 @@ class Filter:
                     if m["doc"] not in seen:
                         seen.add(m["doc"])
                         unique_meta.append(m)
-                _inlet_timing("ltm_retrieval", t0)
+                _inlet_timing("ltm_retrieval (wait for LTM results)", t0)
 
             max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
             parts = []
@@ -5912,9 +5927,11 @@ class Filter:
 
                 if self.valves.use_symbol_level_analysis:
                     self._log_debug("Using symbol-level analysis")
+                    t0 = time.monotonic()
                     summary, suggested = await self._analyze_code_via_symbols(
                         user_question, project_id
                     )
+                    _inlet_timing("symbol_analysis (parallel LLM)", t0)
                     if summary:
                         system_injections.append(("critical", summary))
                     # Always inject suggested symbols when available
@@ -6033,14 +6050,14 @@ class Filter:
                 suggestion = await self._check_and_suggest_summarization(
                     project_id, total_tokens, self.valves.context_window_tokens
                 )
-                _inlet_timing("check_summarization_suggestion", t0)
+                _inlet_timing("check_summarization_suggestion (token ratio check)", t0)
                 if suggestion:
                     system_injections.append(("medium", suggestion))
 
             # Command suggestion
             t0 = time.monotonic()
             cmd_suggestion = await self._suggest_commands(project_id, state)
-            _inlet_timing("suggest_commands", t0)
+            _inlet_timing("suggest_commands (heuristic)", t0)
             if cmd_suggestion:
                 system_injections.append(("medium", cmd_suggestion))
 
@@ -6134,27 +6151,31 @@ class Filter:
                     f"Generating CoT level {cot_level} with model "
                     f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                 )
+                t0 = time.monotonic()
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        user_content, prelim_for_cot
+                        user_content, prelim_for_cot, label="cot_generation"
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        user_content, prelim_for_cot
+                        user_content, prelim_for_cot, label="cot_generation"
                     )
+                _inlet_timing("cot_generation (LLM reasoning)", t0)
             elif manual_cot_used and cot_level in (2, 3):
                 self._log_debug(
                     f"Generating manual CoT level {cot_level} with model "
                     f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                 )
+                t0 = time.monotonic()
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        cot_question, prelim_for_cot
+                        cot_question, prelim_for_cot, label="cot_generation"
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        cot_question, prelim_for_cot
+                        cot_question, prelim_for_cot, label="cot_generation"
                     )
+                _inlet_timing("cot_generation (LLM reasoning)", t0)
 
             if reasoning:
                 system_injections.append(("high", reasoning))
@@ -6296,7 +6317,7 @@ class Filter:
                         summary = await self._summarize_messages(
                             old_block, is_code_context=has_code
                         )
-                        _inlet_timing("summarize_old_messages", t0)
+                        _inlet_timing("summarize_old_messages (LLM summary)", t0)
                         if summary:
                             system_injections.append(
                                 (
@@ -6355,7 +6376,7 @@ class Filter:
                         summary = await self._summarize_messages(
                             old_block, is_code_context=has_code
                         )
-                        _inlet_timing("summarize_old_messages", t0)
+                        _inlet_timing("summarize_old_messages (LLM summary)", t0)
                         if summary:
                             system_injections.append(
                                 (
@@ -6382,7 +6403,7 @@ class Filter:
                     messages.append({"role": "user", "content": "continue"})
 
             body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
@@ -7387,7 +7408,7 @@ class Filter:
             f"{len(cached_results)} cached, {len(fresh_indices)} fresh"
         )
 
-        # Prompt templates (unchanged)
+        # Prompt templates
         prompt_template_full = (
             "You are a code analysis assistant. "
             "For the given symbol, provide:\n"
@@ -7447,7 +7468,9 @@ class Filter:
                         f"Retrying symbol analysis for {name} (attempt {attempt+1})"
                     )
                 try:
-                    res = await self._analyze_single_symbol(prompt, model, semaphore)
+                    res = await self._analyze_single_symbol(
+                        prompt, model, semaphore, label=f"symbol:{name}"
+                    )
                 except Exception as e:
                     self._log_debug(
                         f"Symbol analysis attempt {attempt+1} for {name} error: {e}"
@@ -7510,7 +7533,7 @@ class Filter:
         return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
 
     async def _analyze_single_symbol(
-        self, prompt: str, model: str, semaphore: asyncio.Semaphore
+        self, prompt: str, model: str, semaphore: asyncio.Semaphore, label: str = ""
     ) -> Optional[str]:
         """Call the analysis model for one symbol, with concurrency limit."""
         async with semaphore:
@@ -7520,6 +7543,7 @@ class Filter:
                 model_override=model,
                 max_tokens=200,
                 temperature=0.0,
+                label=label,
             )
 
     def _parse_symbol_output(self, text: str) -> Optional[Dict]:
