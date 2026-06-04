@@ -847,14 +847,14 @@ class Filter:
         ltm_include_timestamps: bool = Field(default=True)
         ltm_compress_after_messages: int = Field(default=50)
         ltm_summarization_trigger_similarity: float = Field(default=0.85)
-        ltm_index_symbols_enabled: bool = Field(default=False)
+        ltm_index_symbols_enabled: bool = Field(default=True)
         ltm_symbol_index_max_per_message: int = Field(default=20)
-        ltm_symbol_boost_enabled: bool = Field(default=False)
+        ltm_symbol_boost_enabled: bool = Field(default=True)
         ltm_symbol_boost_factor: float = Field(default=1.5)
         ltm_symbol_boost_min_similarity: float = Field(default=0.5)
         ltm_symbol_force_mode_enabled: bool = Field(default=False)
         ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
-        enable_reranking: bool = Field(default=False)
+        enable_reranking: bool = Field(default=True)
         reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
         reranker_top_k: int = Field(default=5)
 
@@ -890,7 +890,7 @@ class Filter:
             description="Extract call relationships (who calls whom) for code symbols.",
         )
         enable_auto_summaries: bool = Field(
-            default=False,
+            default=True,
             description="Automatically generate one-line summaries for code symbols using a small LLM.",
         )
         summary_code_max_chars: int = Field(
@@ -974,7 +974,7 @@ class Filter:
         assumption_extraction_model: str = Field(
             default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
-        enable_contradiction_detection: bool = Field(default=False)
+        enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
             default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
@@ -1066,7 +1066,7 @@ class Filter:
         commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
 
         # ─── Dependency Tracking ───
-        enable_dependency_tracking: bool = Field(default=False)
+        enable_dependency_tracking: bool = Field(default=True)
         dependency_extraction_model: str = Field(
             default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
@@ -1100,7 +1100,7 @@ class Filter:
             default_factory=lambda: ["BASE_CODE"]
         )
         cleanup_status_command_enabled: bool = Field(default=True)
-        cleanup_proactive_suggestions: bool = Field(default=False)
+        cleanup_proactive_suggestions: bool = Field(default=True)
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
 
