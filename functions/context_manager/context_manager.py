@@ -1441,6 +1441,7 @@ class Filter:
     #  Code span utilities
     # --------------------------------------------------------------------------
     async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
+        """Extract code spans using tree‑sitter. Falls back gracefully on expected empty‑language errors."""
         if not HAS_TREE_SITTER:
             return []
         cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
@@ -1451,8 +1452,19 @@ class Filter:
             blocks = process(content, config)
             spans = [(b.start_byte, b.end_byte) for b in blocks]
         except Exception as e:
-            self._log_debug(f"Tree‑sitter process failed: {e}")
-            spans = []
+            # Known empty‑language issues – silently use regex
+            if any(
+                msg in str(e)
+                for msg in (
+                    "Language '' not available",
+                    "Language '' not available for download",
+                    "Download error: Language ''",
+                )
+            ):
+                spans = []
+            else:
+                self._log_debug(f"Tree‑sitter process failed: {e}")
+                spans = []
         if len(self._code_spans_cache) >= 200:
             keys_to_evict = list(self._code_spans_cache.keys())[:50]
             for key in keys_to_evict:
@@ -3252,10 +3264,8 @@ class Filter:
             if not isinstance(syms, Exception)
         }
 
-        # Precalculate similarities with existing blocks (outside main lock)
-        # Obtain only the contents and hashes to compare
+        # Precalculate similarities with existing blocks
         lock = await self._get_project_lock(project_id)
-        # Obtain a copy of the current active blocks (their contents) without lock
         state_before = self._get_state(project_id)
         existing_contents = {}
         if state_before:
@@ -3281,7 +3291,7 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
-            # Summarize inactive blocks in background (LLM task)
+            # Summarize inactive blocks in background
             self._background_task(
                 self._summarize_inactive_blocks_safely(project_id),
                 name="summarize_inactive",
@@ -3308,6 +3318,11 @@ class Filter:
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
                     syms = []
+
+                # ─────────── SANITIZE CONTENT BEFORE USE ───────────
+                new_block.content = self._sanitize_text(new_block.content)
+                # ────────────────────────────────────────────────────
+
                 if self.tokenizer:
                     new_block._cached_token_count = len(
                         self.tokenizer.encode(new_block.content)
@@ -3550,7 +3565,7 @@ class Filter:
                             best_base.hash, best_base.symbols, project_id
                         )
                         prev_content = best_base.content
-                        best_base.content = block_info["code"]
+                        best_base.content = self._sanitize_text(block_info["code"])
                         best_base.hash = hashlib.md5(
                             block_info["code"].encode()
                         ).hexdigest()[:16]
@@ -3615,7 +3630,7 @@ class Filter:
                         name="hierarchical_compress",
                         is_llm_task=True,
                     )
-            # Expire and clean tasks don't use LLM, so no is_llm_task needed
+            # Expire and clean tasks
             self._background_task(
                 self._expire_blocks_by_time(project_id), name="expire_blocks"
             )
@@ -4325,6 +4340,24 @@ class Filter:
             docstring = doc_match.group(1).strip()[:100] if doc_match else ""
             return f"Class `{name}` - {docstring}" if docstring else f"Class `{name}`"
         return ""
+
+    @staticmethod
+    def _sanitize_signature(sig: str, max_len: int = 200) -> str:
+        """Escape backticks and truncate the signature to avoid breaking prompts."""
+        safe = sig.replace("`", "'")
+        return safe[:max_len] + ("…" if len(safe) > max_len else "")
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """
+        Remove non-printable characters, except newline and tab.
+        Replace backticks inside the text to avoid breaking markdown code spans.
+        """
+        # Remove control characters except \n and \t
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+        # Escape backticks if present (they break `...` in prompts)
+        cleaned = cleaned.replace("`", "'")
+        return cleaned
 
     # --------------------------------------------------------------------------
     #  Forget / remember / obsolete commands
@@ -8644,6 +8677,79 @@ class Filter:
     # --------------------------------------------------------------------------
     # Symbol-by-symbol code analysis (with cache)
     # --------------------------------------------------------------------------
+    def _build_symbol_context(
+        self,
+        sym: CodeSymbol,
+        block: CodeBlock,
+        project_id: str,
+        max_tokens: int = 800,
+        max_body_lines: int = 20,
+    ) -> Optional[str]:
+        """
+        Build a clean, size-limited context for one symbol, guaranteed to not
+        break the LLM prompt. Returns None if the symbol itself is unusable.
+        """
+        import textwrap
+
+        # 1. Sanitize signature
+        sig = self._sanitize_signature(sym.signature or sym.name)
+        if not sig.strip():
+            return None  # unusable symbol
+
+        ctx = f"Symbol: `{sig}` [{sym.kind}]"
+        if sym.file_path:
+            ctx += f" in {sym.file_path}"
+        if sym.summary:
+            ctx += f"\nSummary: {sym.summary}"
+
+        # 2. Safe body preview
+        clean_body = self._sanitize_text(block.content)
+        lines = clean_body.splitlines()
+        # skip first line (already in signature), clean each line
+        preview_lines = []
+        for line in lines[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            # truncate long lines
+            if len(line) > 200:
+                line = line[:200] + "…"
+            preview_lines.append(line)
+            if len(preview_lines) >= max_body_lines:
+                break
+        if preview_lines:
+            body = "\n".join(preview_lines)
+            body = textwrap.shorten(body, width=2000, placeholder="...")
+            ctx += f"\nBody preview:\n```\n{body}\n```"
+
+        # 3. Callers & callees from index (short)
+        callers = self._symbol_index.get_callers(sym.name, project_id)
+        if callers:
+            ctx += f"\nCalled by: {', '.join(sorted(callers)[:5])}"
+        if sym.calls:
+            ctx += f"\nCalls: {', '.join(sym.calls[:5])}"
+
+        # 4. Token limit enforcement
+        if self.tokenizer:
+            tokens = len(self.tokenizer.encode(ctx))
+            if tokens > max_tokens:
+                # Try to trim the body preview first
+                if "\nBody preview:\n" in ctx:
+                    header, body = ctx.split("\nBody preview:\n", 1)
+                    ctx_no_body = header + "\nBody preview omitted (too large)."
+                    if (
+                        self.tokenizer
+                        and len(self.tokenizer.encode(ctx_no_body)) > max_tokens
+                    ):
+                        ctx = header
+                    else:
+                        ctx = ctx_no_body
+                # Final truncation using tokenizer
+                if self.tokenizer and len(self.tokenizer.encode(ctx)) > max_tokens:
+                    ctx = self._truncate_text_to_tokens(ctx, max_tokens)
+
+        return ctx
+
     async def _analyze_code_via_symbols(
         self, question: str, project_id: str
     ) -> Tuple[str, List[str]]:
@@ -8659,7 +8765,7 @@ class Filter:
 
         question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
 
-        # Gather all non‑obsolete symbols with their compact context
+        # Gather symbols with clean contexts
         symbol_contexts = []
         seen_symbols = set()
         for block in state["active_blocks"].values():
@@ -8678,34 +8784,23 @@ class Filter:
                 cached = self._get_cached_symbol_analysis(sym.name, question_hash)
                 if cached is not None:
                     cached["symbol_name"] = sym.name
-                    symbol_contexts.append((sym.name, cached))  # placeholder
+                    symbol_contexts.append((sym.name, cached))
                     continue
 
-                # Build compact context for this symbol
-                ctx = f"Symbol: `{sym.signature}` [{sym.kind}]"
-                if sym.file_path:
-                    ctx += f" in {sym.file_path}"
-                if sym.summary:
-                    ctx += f"\nSummary: {sym.summary}"
-
-                body_lines = block.content.splitlines()
-                body_preview = "\n".join(body_lines[1:11])
-                if len(body_preview) > 400:
-                    body_preview = body_preview[:400] + "..."
-                ctx += f"\nBody preview:\n```\n{body_preview}\n```"
-
-                callers = self._symbol_index.get_callers(sym.name, project_id)
-                if callers:
-                    ctx += f"\nCalled by: {', '.join(sorted(callers))}"
-                if sym.calls:
-                    ctx += f"\nCalls: {', '.join(sym.calls)}"
+                # Build clean context
+                ctx = self._build_symbol_context(sym, block, project_id)
+                if ctx is None:
+                    self._log_debug(
+                        f"Skipping symbol with invalid signature: {sym.name}"
+                    )
+                    continue
 
                 symbol_contexts.append((sym.name, ctx))
 
         if not symbol_contexts:
             return "", []
 
-        # Split into symbols that need fresh analysis vs cached
+        # Split into fresh / cached
         fresh_indices = []
         cached_results = []
         for i, (name, ctx) in enumerate(symbol_contexts):
@@ -8719,7 +8814,8 @@ class Filter:
             f"{len(cached_results)} cached, {len(fresh_indices)} fresh"
         )
 
-        prompt_template = (
+        # Prompt templates
+        prompt_template_full = (
             "You are a code analysis assistant. "
             "For the given symbol, provide:\n"
             "FUNCTIONS: <comma separated list of relevant function/class names>\n"
@@ -8738,20 +8834,38 @@ class Filter:
             "Now analyze:\n{context}\n"
             "OUTPUT:"
         )
+        prompt_template_no_body = (
+            "You are a code analysis assistant. "
+            "For the given symbol, provide:\n"
+            "FUNCTIONS: <comma separated list of relevant function/class names>\n"
+            "FINDINGS: <one key finding>\n"
+            "ISSUES: <any potential issue, or 'none'>\n"
+            "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
+            "CONFIDENCE: <float 0.0-1.0>\n\n"
+            "Now analyze (only signature and call info available):\n{context}\n"
+            "OUTPUT:"
+        )
 
         model = self.valves.multi_call_model or self.valves.smart_pre_expand_model
         semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
 
-        # Process fresh symbols (with retries)
         parsed_fresh = []
         for idx in fresh_indices:
             name, ctx = symbol_contexts[idx]
-            prompt = prompt_template.format(context=ctx)
             success = False
-            last_result = None
 
-            # Try up to 1 + 2 retries = 3 total attempts
             for attempt in range(3):
+                if attempt == 0:
+                    prompt = prompt_template_full.format(context=ctx)
+                elif attempt == 1:
+                    # Second attempt: without body preview
+                    ctx_clean = ctx.split("\nBody preview:\n")[0]
+                    prompt = prompt_template_no_body.format(context=ctx_clean)
+                else:
+                    # Third attempt: signature only
+                    ctx_sig = ctx.split("\n")[0]  # first line is Symbol: ...
+                    prompt = prompt_template_no_body.format(context=ctx_sig)
+
                 if attempt > 0:
                     self._log_debug(
                         f"Retrying symbol analysis for {name} (attempt {attempt+1})"
@@ -8774,8 +8888,6 @@ class Filter:
                     self._set_cached_symbol_analysis(name, question_hash, parsed)
                     success = True
                     break
-                else:
-                    last_result = res  # maybe we can log it
 
             if not success:
                 self._log_debug(f"Symbol analysis failed for {name} after 3 attempts")
