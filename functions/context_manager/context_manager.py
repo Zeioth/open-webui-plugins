@@ -807,6 +807,19 @@ class SignatureExtractor:
 class Filter:
 
     class Valves(BaseModel):
+        # ═══════════════════════════════════════════════════════════════
+        #  MAIN VALVES – most commonly adjusted
+        # ═══════════════════════════════════════════════════════════════
+        # use_symbol_level_analysis – enable per‑symbol analysis (recommended)
+        # symbol_analysis_model      – fast model for per‑symbol analysis
+        # active_context_max_tokens  – max tokens for injected code context
+        # global_injection_token_budget – overall limit for all injections
+        # ltm_retrieval_max_tokens   – max LTM tokens to inject
+        # defer_secondary_tasks      – delay summaries / change logs
+        # secondary_task_model       – model for those secondary tasks
+        # synthesis_max_tokens       – max tokens for the final summary
+        # ═══════════════════════════════════════════════════════════════
+
         # ─── Core ───
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
@@ -1122,6 +1135,10 @@ class Filter:
         symbol_analysis_max_retries: int = Field(
             default=5,
             description="Max attempts per symbol before giving up.",
+        )
+        synthesis_max_tokens: int = Field(
+            default=1500,
+            description="Max tokens for the synthesized summary of symbol analysis.",
         )
 
         # ─── Secondary task deferral ───
@@ -2357,12 +2374,25 @@ class Filter:
         return total_chars // 4
 
     def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        """Truncate text to fit within max_tokens, trying to break at a sentence or newline."""
         if not self.tokenizer:
             return text[: max_tokens * 4]
         tokens = self.tokenizer.encode(text)
         if len(tokens) <= max_tokens:
             return text
-        return self.tokenizer.decode(tokens[:max_tokens])
+
+        # Decode only the allowed tokens
+        truncated = self.tokenizer.decode(tokens[:max_tokens])
+
+        # Try to find a graceful breaking point:
+        # prefer a double newline, then single newline, then a period+space
+        for pattern in ("\n\n", "\n", ". ", " "):
+            last = truncated.rfind(pattern)
+            if last > max_tokens * 0.6:  # only if we don't lose too much
+                truncated = truncated[: last + len(pattern)]
+                break
+
+        return truncated.rstrip()
 
     # --------------------------------------------------------------------------
     # Code extraction and classification
@@ -6183,7 +6213,52 @@ class Filter:
                             if self.tokenizer
                             else len(content) // 4
                         )
-                self._log_debug(f"Injected system tokens: {total_system_tokens}")
+                # ── Token breakdown (injected context, not LLM processing) ──
+                ltm_tokens = 0
+                summary_tokens = 0
+                suggested_tokens = 0
+                cot_tokens = 0
+                for _, text in system_injections:
+                    if not text:
+                        continue
+                    t = (
+                        len(self.tokenizer.encode(text))
+                        if self.tokenizer
+                        else (len(text) // 4)
+                    )
+                    if "Relevant Past Context" in text:
+                        ltm_tokens += t
+                    elif "synthesized" in text.lower() or "Synthesize" in text:
+                        summary_tokens += t
+                    elif "Additional suggested code" in text:
+                        suggested_tokens += t
+                    elif reasoning and text == reasoning:
+                        cot_tokens += t
+                other_tokens = total_system_tokens - (
+                    ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
+                )
+
+                self._log_debug(
+                    "Context tokens injected into system prompt for this turn:"
+                )
+                self._log_debug(
+                    f"  LTM (past messages, no LLM call):     ~{ltm_tokens}"
+                )
+                self._log_debug(
+                    f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
+                )
+                self._log_debug(
+                    f"  Suggested code (verbatim source):      ~{suggested_tokens}"
+                )
+                self._log_debug(
+                    f"  CoT reasoning (LLM generated):         ~{cot_tokens}"
+                )
+                self._log_debug(
+                    f"  Other (confidence, cleanup, etc.):     ~{other_tokens}"
+                )
+                self._log_debug(
+                    f"  TOTAL injected system tokens:          ~{total_system_tokens}"
+                )
 
             # Adaptive trim
             if self.valves.adaptive_trim:
@@ -7705,12 +7780,13 @@ class Filter:
             "Keep the response under 1500 tokens. No code snippets."
         )
 
+        # Use a suitable model for synthesis
         model = self.valves.symbol_analysis_model or self.valves.llm_model
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a senior software architect summarizing code analysis.",
             model_override=model,
-            max_tokens=1500,
+            max_tokens=self.valves.synthesis_max_tokens,
             temperature=0.2,
         )
         return response if response else "Failed to synthesize summary."
