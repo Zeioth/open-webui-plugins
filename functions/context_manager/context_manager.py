@@ -1463,6 +1463,12 @@ class Filter:
             )
             await anyio.to_thread.run_sync(lambda: self._db_conn.commit())
 
+    async def _save_state_to_db_async(self, project_id: str, state: Dict):
+        """Acquire the project lock, then persist the state to DB."""
+        lock = await self._get_project_lock(project_id)
+        async with lock:
+            await self._save_state_to_db(project_id, state)
+
     async def _save_state_to_db(self, project_id: str, state: Dict):
         active_blocks_meta = {}
         for k, v in state["active_blocks"].items():
