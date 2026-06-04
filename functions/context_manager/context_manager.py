@@ -125,6 +125,13 @@ _inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
 )
 
 
+class SecondaryTask(BaseModel):
+    task_type: str  # "change_summary", "missing_summaries", "inactive_code_summary"
+    params: Dict[str, Any]
+    retries: int = 0
+    created_at: float = Field(default_factory=time.time)
+
+
 class ContentType(str, Enum):
     BASE_CODE = "base_code"
     PROPOSED_CHANGE = "proposed_change"
@@ -841,20 +848,18 @@ class AppliedChangeFeedback(BaseModel):
     resolved: bool = False
 
 
-ANALYSIS_PROMPT_TEMPLATE = """You are a code analysis assistant. Below is a chunk of the project with a global overview and external dependency signatures. Answer the user's question using only the provided code and context.
+ANALYSIS_PROMPT_TEMPLATE = """Output ONLY this JSON object. Do not add any text before or after it.
 
-User question: {question}
+{{"relevant_functions":[],"key_findings":[],"potential_issues":[],"suggested_next":[],"confidence":0.5}}
 
+Rules: each string under 80 chars, max 5 relevant_functions, max 5 key_findings, max 3 potential_issues, max 3 suggested_next.
+
+Question: {question}
+
+Code:
 {chunk_text}
 
-Respond with a JSON object containing the following fields:
-- "relevant_functions": list of function/class names in this chunk that are relevant to the question (max 5)
-- "key_findings": list of concise, single‑sentence observations (each MUST be under 100 characters). Do NOT repeat code; describe its purpose or behavior.
-- "potential_issues": list of bugs or concerns (each under 100 characters, max 3)
-- "suggested_next": list of symbol names from OTHER chunks that might be useful (max 3)
-- "confidence": number 0-1 indicating how confident this chunk alone answers the question
-
-CRITICAL: Keep all strings extremely short. No code snippets. No markdown. Only plain JSON."""
+JSON:"""
 
 
 class Filter:
@@ -912,11 +917,9 @@ class Filter:
             default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
         )
         max_code_block_tokens: int = Field(default=0)
-        code_block_overflow_action: str = Field(
-            default="warn"
-        )  # accepts summarize, truncate, warn
+        code_block_overflow_action: str = Field(default="warn")
         code_block_summary_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -963,9 +966,7 @@ class Filter:
         smart_pre_expand_min_tokens: int = Field(default=2000)
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
-        smart_pre_expand_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
-        )
+        smart_pre_expand_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
             default=0.72, ge=0.0, le=1.0
@@ -989,7 +990,7 @@ class Filter:
         hierarchical_compression_enabled: bool = Field(default=False)
         hierarchical_compression_interval_messages: int = Field(default=100)
         hierarchical_summary_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
         hierarchical_summary_max_tokens: int = Field(default=800)
 
@@ -1010,28 +1011,26 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
-        cot_model: str = Field(default="llamacpp/qwen2.5-14b-instruct-q4_k_m")
+        cot_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         cot_model_level2: str = Field(
-            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
-            description="Model used for CoT level 2 (auto-reasoning).",
+            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            description="Model used for CoT level 2 (auto‑reasoning). Must support large contexts.",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
-            description="Model used for CoT level 3 (self‑reflection).",
+            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            description="Model used for CoT level 3 (self‑reflection). Must support large contexts.",
         )
         enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
-        )
+        cot_detection_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
 
         # ───── Assumptions & Contradictions ─────
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="llamacpp/qwen2.5-14b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
         enable_contradiction_detection: bool = Field(default=False)
         contradiction_detection_model: str = Field(
-            default="llamacpp/qwen2.5-14b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
         contradiction_inject_warning: bool = Field(default=True)
 
@@ -1073,16 +1072,12 @@ class Filter:
         general_summary_max_tokens: int = Field(default=200)
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
-        summary_fallback_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
-        )
+        summary_fallback_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         summary_include_metadata: bool = Field(default=True)
 
         # ───── Summarize Old Messages ─────
         summarize_old_messages: bool = Field(default=True)
-        summarization_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
-        )
+        summarization_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
 
         # ───── LLM Configuration ─────
         openai_api_base: str = Field(
@@ -1091,10 +1086,8 @@ class Filter:
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m")
-        LLM_MAX_CONCURRENT_CALLS: int = Field(
-            default=2, ge=1, le=10
-        )  # serialized, to avoid VRAM overflow.
+        llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=1, ge=1, le=10)
         llm_request_timeout: int = Field(default=300)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
@@ -1129,7 +1122,7 @@ class Filter:
         # ───── Dependency Tracking ─────
         enable_dependency_tracking: bool = Field(default=False)
         dependency_extraction_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
@@ -1144,14 +1137,14 @@ class Filter:
         # ───── Summarize Inactive Code ─────
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
 
         # ───── Forget Commands ─────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m"
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
 
         # ───── Proactive Cleanup ─────
@@ -1190,11 +1183,11 @@ class Filter:
             description="Max tokens per chunk sent to the analysis model. Must be below the model's context limit.",
         )
         multi_call_model: str = Field(
-            default="llamacpp/qwen2.5-coder-7b-instruct-q4_k_m",
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M",
             description="Fast model used to analyze each code chunk. Should be small and quick.",
         )
         multi_call_max_chunks: int = Field(
-            default=6,
+            default=12,
             description="Maximum number of chunks to process in parallel. Limits latency and token usage.",
         )
         multi_call_cache_enabled: bool = Field(
@@ -1212,11 +1205,35 @@ class Filter:
 
         # ───── Multi‑call synthesis model ─────
         multi_call_synthesis_model: str = Field(
-            default="llamacpp/qwen2.5-14b-instruct-q4_k_m",
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M",
             description="Model used to synthesize the final summary from chunk analyses.",
         )
         multi_call_synthesis_max_tokens: int = Field(
             default=1500, description="Max tokens for the synthesized summary."
+        )
+        use_symbol_level_analysis: bool = Field(
+            default=True,
+            description="Analyze code symbol by symbol instead of raw chunks. "
+            "Works reliably even with 7B models.",
+        )
+
+        # ───── Secondary task deferral ─────
+        defer_secondary_tasks: bool = Field(
+            default=True,
+            description="Defer secondary LLM tasks (change summaries, auto‑summaries) to the next inlet, "
+            "avoiding concurrency with the main request.",
+        )
+        secondary_task_max_retries: int = Field(
+            default=5,
+            description="Max retries for deferred secondary tasks before giving up.",
+        )
+        secondary_task_model: str = Field(
+            default="llama-3.2-3b-instruct-q4_k_m",
+            description="Model to use for secondary tasks (summaries, change logs).",
+        )
+        secondary_llm_max_concurrent: int = Field(
+            default=2,
+            description="Max concurrent LLM calls for deferred secondary tasks.",
         )
 
     def __init__(self):
@@ -1245,6 +1262,7 @@ class Filter:
             "speculative_ignored_turns": 0,
             "speculative_last_preloaded_symbols": set(),
             "speculative_last_preload_turn": 0,
+            "pending_secondary_tasks": [],
         }
 
         # ──── Patterns ────
@@ -1296,6 +1314,9 @@ class Filter:
         self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
+        self._secondary_llm_semaphore = asyncio.Semaphore(
+            self.valves.secondary_llm_max_concurrent
+        )
 
         # ──── Background tasks ────
         self._hierarchical_compress_in_progress: Dict[str, bool] = {}
@@ -1393,18 +1414,19 @@ class Filter:
         task = asyncio.create_task(coro)
 
         def _on_done_log(t):
+            # Fix 5: Do not log or propagate CancelledError from normal cancellations
+            if t.cancelled():
+                return
             if t.exception():
                 self._log_debug(f"Background task '{name}' failed: {t.exception()}")
 
         task.add_done_callback(_on_done_log)
 
         if is_llm_task:
-            # Try to register this task with the current inlet, if any
             tasks_list = _inlet_background_tasks.get(None)
             if tasks_list is not None:
                 tasks_list.append(task)
 
-                # Remove from list when done, so we don't try to cancel a finished task
                 def _remove_from_list(t):
                     try:
                         tasks_list.remove(t)
@@ -1943,7 +1965,14 @@ class Filter:
         max_tokens: Optional[int] = None,
         temperature: float = 0.3,
         semaphore: asyncio.Semaphore = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
+        """
+        Call the LLM with retries and caching.
+        If `response_format` is provided (e.g. {"type": "json_object"}), it will be
+        injected into the request payload **only on the fallback HTTP path**.
+        The shared‑resources path ignores it until that module is updated.
+        """
         if not HAS_AIOHTTP:
             return None
 
@@ -2007,6 +2036,10 @@ class Filter:
             await self._maybe_unload_for_model(model_name, base_url, is_ollama)
 
             # ---------- Shared resources path ----------
+            # NOTE: shared_resources.call_llm does not yet support response_format.
+            # If response_format is required, a temporary workaround is to set
+            # _SHARED_RESOURCES_AVAILABLE = False before the call so that the
+            # fallback HTTP path is used instead.
             if _SHARED_RESOURCES_AVAILABLE:
                 from shared_resources import call_llm as _shared_call_llm
 
@@ -2085,6 +2118,10 @@ class Filter:
                 api_token=api_token,
                 openai_api_key=self.valves.openai_api_key,
             )
+
+            # Inject response_format (only meaningful for non‑Ollama chat)
+            if response_format is not None and not is_ollama:
+                payload["response_format"] = response_format
 
             for attempt in range(max_retries + 1):
                 try:
@@ -2432,6 +2469,15 @@ class Filter:
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
         total_chars += sum(30 for _ in messages)
         return total_chars // 4
+
+    def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        """Truncate text to fit within max_tokens using the tokenizer."""
+        if not self.tokenizer:
+            return text[: max_tokens * 4]  # fallback 4 chars/token
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return self.tokenizer.decode(tokens[:max_tokens])
 
     # --------------------------------------------------------------------------
     #  Code extraction and classification
@@ -4210,6 +4256,22 @@ class Filter:
     async def _summarize_code_block(self, block: CodeBlock) -> Optional[str]:
         if not self.valves.summarize_inactive_code or not HAS_AIOHTTP:
             return None
+        if self.valves.defer_secondary_tasks:
+            task = SecondaryTask(
+                task_type="inactive_code_summary",
+                params={
+                    "signature": self._extract_signature(block.content),
+                    "content": block.content,
+                    "project_id": self.valves.project_id,  # usar el project id correcto
+                    "block_hash": block.hash,
+                },
+            )
+            state = self._get_state(self.valves.project_id)
+            if state is not None:
+                state.setdefault("pending_secondary_tasks", []).append(task.dict())
+                self._set_state(self.valves.project_id, state)
+            return None  # Se completará en diferido
+        # Ejecución directa (fallback)
         sig = self._extract_signature(block.content)
         if sig:
             prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{block.content[:1000]}```"
@@ -6855,7 +6917,13 @@ class Filter:
             self._cached_lightweight_context.pop(self._last_project_id, None)
             self._block_change_summaries.clear()
             self._chunk_analysis_cache.clear()
+            self._symbol_analysis_cache.clear()
         self._last_project_id = project_id
+
+        # ---------- NEW: process deferred secondary tasks ----------
+        if self.valves.defer_secondary_tasks:
+            await self._process_pending_secondary_tasks(project_id)
+        # -----------------------------------------------------------
 
         if not messages:
             return body
@@ -6864,6 +6932,33 @@ class Filter:
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
         user_query = last_user_msg.get("content", "") if last_user_msg else ""
+
+        # ------------------------------------------------------------------
+        # Extract the real question (without code) to use it in the chunks
+        # ------------------------------------------------------------------
+        user_question = user_query
+        if last_user_msg and user_query:
+            try:
+                spans = await self._get_code_spans(user_query)
+                if spans:
+                    user_question = self._remove_code_spans(user_query, spans).strip()
+            except Exception:
+                spans = None
+
+            if not user_question or len(user_question) < 10:
+                cleaned = re.sub(r"```.*?```", "", user_query, flags=re.DOTALL)
+                cleaned = re.sub(r"`[^`]+`", "", cleaned)
+                cleaned = re.sub(
+                    r"\b(def |class |import |from |function |const |let |var )",
+                    "",
+                    cleaned,
+                )
+                cleaned = cleaned.strip()
+                if cleaned and len(cleaned) >= 10:
+                    user_question = cleaned
+                else:
+                    user_question = user_query
+
         is_explicit_command = last_user_msg and last_user_msg.get(
             "content", ""
         ).startswith("/")
@@ -7063,6 +7158,7 @@ class Filter:
         # ======================================================================
         background_tasks: list[asyncio.Task] = []
         token = _inlet_background_tasks.set(background_tasks)
+        _inlet_aborted = True  # assume abort by default
 
         try:
             # ===== NO MORE EARLY RETURNS BEYOND THIS POINT =====
@@ -7081,18 +7177,29 @@ class Filter:
                 last_idx = len(messages) - 1
                 t0 = time.monotonic()
                 await self._update_active_code(messages[last_idx], project_id)
+
+                extracted_blocks, block_spans = await self._extract_code_blocks(
+                    user_query
+                )
+                if block_spans:
+                    user_question = self._remove_code_spans(
+                        user_query, block_spans
+                    ).strip()
+                    if not user_question or len(user_question) < 10:
+                        user_question = user_query
+                else:
+                    user_question = user_query
+
                 _inlet_timing("update_active_code_last", t0)
                 self._last_processed_message_idx[project_id] = last_idx
 
-            system_injections = []  # list of (priority, text)
-            # CoT flags will be set after the multi‑call block, right before
-            # the generation of the preliminary system message.
+            system_injections = []
             manual_cot_used = False
             cot_any_used = False
             cot_level = 2
 
             # ------------------------------------------------------------------
-            # Start LTM retrieval in background (we'll need it before CoT)
+            # Start LTM retrieval in background
             # ------------------------------------------------------------------
             ltm_future = None
             if (
@@ -7137,6 +7244,7 @@ class Filter:
                         "CONTEXT MANAGER - INLET END",
                         duration=time.monotonic() - inlet_start,
                     )
+                    _inlet_aborted = False
                     return body
 
             if contradiction_warning and self.valves.contradiction_inject_warning:
@@ -7146,7 +7254,7 @@ class Filter:
                 system_injections.append(("medium", warn_msg))
 
             # ------------------------------------------------------------------
-            # Wait for LTM retrieval and format it into system_injections
+            # Wait for LTM retrieval and format it
             # ------------------------------------------------------------------
             unique_meta = []
             if ltm_future is not None:
@@ -7221,7 +7329,7 @@ class Filter:
                         self._set_state(project_id, state)
 
             # ==================================================================
-            # MULTI‑CALL CHUNKING LOGIC (with progressive synthesis & caching)
+            # CODE INJECTION: symbol-level, multi‑call chunking, or lightweight
             # ==================================================================
             if is_code_session and self.valves.enable_code_awareness:
                 code_blocks_for_injection = [
@@ -7247,206 +7355,246 @@ class Filter:
                     f"(~{total_code_tokens} tokens)"
                 )
 
-                use_multi_call = (
-                    self.valves.multi_call_enabled
-                    and total_code_tokens > max_model_tokens > 0
-                    and len(code_blocks_for_injection) > 0
-                )
-
-                if use_multi_call:
-                    self._log_debug(
-                        f"MULTI-CALL active – {len(code_blocks_for_injection)} blocks, ~{total_code_tokens} tokens total"
+                if self.valves.use_symbol_level_analysis:
+                    self._log_debug("Using symbol-level analysis")
+                    summary, suggested = await self._analyze_code_via_symbols(
+                        user_question, project_id
                     )
-
-                    # 1. Cache the full project overview (for other uses, not for chunks)
-                    if project_id not in self._cached_global_header:
-                        self._cached_global_header[project_id] = (
-                            await self._build_global_context_header(project_id)
-                        )
-
-                    # 2. Chunk the code
-                    chunks = self._chunk_code_blocks_with_dependencies(
-                        code_blocks_for_injection,
-                        self.valves.multi_call_chunk_max_tokens,
-                        project_id,
-                    )
-                    chunks = chunks[: self.valves.multi_call_max_chunks]
-                    self._log_debug(
-                        f"Chunking produced {len(chunks)} chunks (limit {self.valves.multi_call_max_chunks})"
-                    )
-
-                    # 3. Analyze each chunk in parallel, with progressive synthesis
-                    model = (
-                        self.valves.multi_call_model
-                        or self.valves.smart_pre_expand_model
-                    )
-
-                    analyses_futures = [
-                        self._analyze_chunk(chunk_text, user_query, model)
-                        for chunk_text, _ in chunks
-                    ]
-                    self._log_debug(
-                        f"Starting parallel analysis of {len(analyses_futures)} chunks with model {model}"
-                    )
-
-                    completed_analyses = []
-                    preliminary_summary = None
-                    min_chunks_for_early_synthesis = 3
-                    early_synthesis_task = None
-
-                    for coro in asyncio.as_completed(analyses_futures):
-                        result = await coro
-                        if isinstance(result, dict):
-                            completed_analyses.append(result)
-                            self._log_debug(
-                                f"Chunk analysis completed ({len(completed_analyses)}/{len(chunks)} so far)"
-                            )
-
-                        # Start early synthesis when enough chunks are done, if not already started
-                        if (
-                            len(completed_analyses) >= min_chunks_for_early_synthesis
-                            and early_synthesis_task is None
-                            and len(chunks) > min_chunks_for_early_synthesis
-                        ):
-                            early_synthesis_task = asyncio.create_task(
-                                self._synthesize_partial(
-                                    completed_analyses.copy(), user_query
-                                )
-                            )
-                            self._log_debug(
-                                "Launched early synthesis task with first "
-                                f"{len(completed_analyses)} chunks"
-                            )
-
-                    valid = completed_analyses
-                    self._log_debug(
-                        f"Analysis complete – {len(valid)} chunks returned valid JSON, merging..."
-                    )
-
-                    if valid:
-                        if early_synthesis_task:
-                            preliminary_summary = await early_synthesis_task
-                            self._log_debug(
-                                f"Preliminary summary length: {len(preliminary_summary)} chars"
-                            )
-
-                        # Final synthesis: incorporate all analyses (and possibly the preliminary summary)
-                        summary = await self._synthesize_final_summary(
-                            valid, user_query, preliminary_summary
-                        )
-                        self._log_debug(
-                            f"Final synthesized summary length: {len(summary)} chars"
-                        )
+                    if summary:
                         system_injections.append(("critical", summary))
-
-                        # Gather suggested symbols from all chunks
-                        suggested = set()
-                        for an in valid:
-                            suggested.update(an.get("suggested_next", []))
-
-                        # Optionally inject the code of suggested symbols
-                        if self.valves.multi_call_inject_suggested and suggested:
-                            suggested_blocks = self._get_blocks_for_symbols(
-                                list(suggested), project_id
-                            )
-                            if suggested_blocks:
-                                extra_lines = []
-                                tokens_used = 0
-                                max_sugg_tokens = (
-                                    self.valves.multi_call_suggested_max_tokens
-                                )
-                                for blk in suggested_blocks[:5]:
-                                    bt = blk._cached_token_count
-                                    if (
-                                        max_sugg_tokens > 0
-                                        and tokens_used + bt > max_sugg_tokens
-                                    ):
-                                        break
-                                    loc = (
-                                        f" (file: {blk.file_path})"
-                                        if blk.file_path
-                                        else ""
-                                    )
-                                    extra_lines.append(
-                                        f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
-                                    )
-                                    tokens_used += bt
-                                if extra_lines:
-                                    system_injections.append(
-                                        (
-                                            "high",
-                                            "## Additional suggested code\n\n"
-                                            + "\n".join(extra_lines),
-                                        )
-                                    )
-                    else:
-                        self._log_debug(
-                            "All chunk analyses failed – falling back to lightweight context"
+                    if suggested:
+                        suggested_blocks = self._get_blocks_for_symbols(
+                            list(suggested), project_id
                         )
-                        lightweight = await self._build_lightweight_context(project_id)
-                        system_injections.append(("critical", lightweight))
-                else:
-                    # ----- Original behaviour (single injection) -----
-                    is_structural = (
-                        await self._is_structural_task(user_query)
-                        if user_query
-                        else False
-                    )
-                    if (
-                        total_code_tokens
-                        > self.valves.huge_injection_threshold_tokens
-                        > 0
-                    ):
-                        active_ctx = await self._build_lightweight_context(project_id)
-                        injected_hashes: Set[str] = set()
-                        if user_query:
-                            pre_expanded = await self._smart_pre_expand(
-                                user_query=user_query,
-                                project_id=project_id,
-                                token_budget=self.valves.smart_pre_expand_max_tokens,
-                                seen_hashes=injected_hashes,
+                        if suggested_blocks:
+                            extra_lines = []
+                            tokens_used = 0
+                            max_sugg_tokens = (
+                                self.valves.multi_call_suggested_max_tokens
                             )
-                            if pre_expanded:
-                                active_ctx += "\n" + pre_expanded
-                            else:
-                                expanded = self._expand_referenced_symbols(
-                                    project_id,
-                                    user_query,
+                            for blk in suggested_blocks[:5]:
+                                bt = blk._cached_token_count
+                                if (
+                                    max_sugg_tokens > 0
+                                    and tokens_used + bt > max_sugg_tokens
+                                ):
+                                    break
+                                loc = (
+                                    f" (file: {blk.file_path})" if blk.file_path else ""
+                                )
+                                extra_lines.append(
+                                    f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
+                                )
+                                tokens_used += bt
+                            if extra_lines:
+                                system_injections.append(
+                                    (
+                                        "high",
+                                        "## Additional suggested code\n\n"
+                                        + "\n".join(extra_lines),
+                                    )
+                                )
+
+                else:
+                    use_multi_call = (
+                        self.valves.multi_call_enabled
+                        and total_code_tokens > max_model_tokens > 0
+                        and len(code_blocks_for_injection) > 0
+                    )
+
+                    if use_multi_call:
+                        self._log_debug(
+                            f"MULTI-CALL active – {len(code_blocks_for_injection)} blocks, ~{total_code_tokens} tokens total"
+                        )
+
+                        if project_id not in self._cached_global_header:
+                            self._cached_global_header[project_id] = (
+                                await self._build_global_context_header(project_id)
+                            )
+
+                        chunks = self._chunk_code_blocks_with_dependencies(
+                            code_blocks_for_injection,
+                            self.valves.multi_call_chunk_max_tokens,
+                            project_id,
+                        )
+                        chunks.sort(
+                            key=lambda c: sum(b._cached_token_count for b in c[1]),
+                            reverse=True,
+                        )
+                        chunks = chunks[: self.valves.multi_call_max_chunks]
+                        self._log_debug(
+                            f"Chunking produced {len(chunks)} chunks (limit {self.valves.multi_call_max_chunks})"
+                        )
+
+                        model = (
+                            self.valves.multi_call_model
+                            or self.valves.smart_pre_expand_model
+                        )
+
+                        analyses_futures = [
+                            self._analyze_chunk(chunk_text, user_question, model)
+                            for chunk_text, _ in chunks
+                        ]
+
+                        completed_analyses = []
+                        preliminary_summary = None
+                        min_chunks_for_early_synthesis = 3
+                        early_synthesis_task = None
+
+                        for coro in asyncio.as_completed(analyses_futures):
+                            result = await coro
+                            if isinstance(result, dict):
+                                completed_analyses.append(result)
+                                self._log_debug(
+                                    f"Chunk analysis completed ({len(completed_analyses)}/{len(chunks)} so far)"
+                                )
+
+                            if (
+                                len(completed_analyses)
+                                >= min_chunks_for_early_synthesis
+                                and early_synthesis_task is None
+                                and len(chunks) > min_chunks_for_early_synthesis
+                            ):
+                                early_synthesis_task = asyncio.create_task(
+                                    self._synthesize_partial(
+                                        completed_analyses.copy(), user_question
+                                    )
+                                )
+                                self._log_debug(
+                                    "Launched early synthesis task with first "
+                                    f"{len(completed_analyses)} chunks"
+                                )
+
+                        valid = completed_analyses
+                        self._log_debug(
+                            f"Analysis complete – {len(valid)} chunks returned valid JSON, merging..."
+                        )
+
+                        if valid:
+                            if early_synthesis_task:
+                                preliminary_summary = await early_synthesis_task
+                                self._log_debug(
+                                    f"Preliminary summary length: {len(preliminary_summary)} chars"
+                                )
+
+                            summary = await self._synthesize_final_summary(
+                                valid, user_question, preliminary_summary
+                            )
+                            self._log_debug(
+                                f"Final synthesized summary length: {len(summary)} chars"
+                            )
+                            system_injections.append(("critical", summary))
+
+                            suggested = set()
+                            for an in valid:
+                                suggested.update(an.get("suggested_next", []))
+
+                            if self.valves.multi_call_inject_suggested and suggested:
+                                suggested_blocks = self._get_blocks_for_symbols(
+                                    list(suggested), project_id
+                                )
+                                if suggested_blocks:
+                                    extra_lines = []
+                                    tokens_used = 0
+                                    max_sugg_tokens = (
+                                        self.valves.multi_call_suggested_max_tokens
+                                    )
+                                    for blk in suggested_blocks[:5]:
+                                        bt = blk._cached_token_count
+                                        if (
+                                            max_sugg_tokens > 0
+                                            and tokens_used + bt > max_sugg_tokens
+                                        ):
+                                            break
+                                        loc = (
+                                            f" (file: {blk.file_path})"
+                                            if blk.file_path
+                                            else ""
+                                        )
+                                        extra_lines.append(
+                                            f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
+                                        )
+                                        tokens_used += bt
+                                    if extra_lines:
+                                        system_injections.append(
+                                            (
+                                                "high",
+                                                "## Additional suggested code\n\n"
+                                                + "\n".join(extra_lines),
+                                            )
+                                        )
+                        else:
+                            self._log_debug(
+                                "All chunk analyses failed – falling back to lightweight context"
+                            )
+                            lightweight = await self._build_lightweight_context(
+                                project_id
+                            )
+                            system_injections.append(("critical", lightweight))
+                    else:
+                        # ----- Original behaviour (single injection) -----
+                        is_structural = (
+                            await self._is_structural_task(user_query)
+                            if user_query
+                            else False
+                        )
+                        if (
+                            total_code_tokens
+                            > self.valves.huge_injection_threshold_tokens
+                            > 0
+                        ):
+                            active_ctx = await self._build_lightweight_context(
+                                project_id
+                            )
+                            injected_hashes: Set[str] = set()
+                            if user_query:
+                                pre_expanded = await self._smart_pre_expand(
+                                    user_query=user_query,
+                                    project_id=project_id,
+                                    token_budget=self.valves.smart_pre_expand_max_tokens,
                                     seen_hashes=injected_hashes,
+                                )
+                                if pre_expanded:
+                                    active_ctx += "\n" + pre_expanded
+                                else:
+                                    expanded = self._expand_referenced_symbols(
+                                        project_id,
+                                        user_query,
+                                        seen_hashes=injected_hashes,
+                                    )
+                                    if expanded:
+                                        active_ctx += "\n" + expanded
+                            if is_structural:
+                                active_ctx += (
+                                    "\n\n[Note: Structural analysis requested. "
+                                    "Full code bodies have been pre-expanded above where available.]"
+                                )
+                        else:
+                            active_ctx = self._get_active_code_context(
+                                project_id, user_query=user_query
+                            )
+                            if user_query and not is_structural:
+                                expanded = self._expand_referenced_symbols(
+                                    project_id, user_query
                                 )
                                 if expanded:
                                     active_ctx += "\n" + expanded
-                        if is_structural:
-                            active_ctx += (
-                                "\n\n[Note: Structural analysis requested. "
-                                "Full code bodies have been pre-expanded above where available.]"
-                            )
-                    else:
-                        active_ctx = self._get_active_code_context(
-                            project_id, user_query=user_query
-                        )
-                        if user_query and not is_structural:
-                            expanded = self._expand_referenced_symbols(
-                                project_id, user_query
-                            )
-                            if expanded:
-                                active_ctx += "\n" + expanded
 
-                    if active_ctx:
-                        checklist = (
-                            "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                            "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                            "2. Identify every assumption the code makes and verify each one.\n"
-                            "3. For every regex or string match, test it against 5 counter-examples.\n"
-                            "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                            "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                            "6. Output your reasoning step by step, then provide the corrected code.\n"
-                        )
-                        active_ctx = checklist + "\n\n" + active_ctx
-                        system_injections.append(("critical", active_ctx))
+                        if active_ctx:
+                            checklist = (
+                                "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                                "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                                "2. Identify every assumption the code makes and verify each one.\n"
+                                "3. For every regex or string match, test it against 5 counter-examples.\n"
+                                "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                                "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                                "6. Output your reasoning step by step, then provide the corrected code.\n"
+                            )
+                            active_ctx = checklist + "\n\n" + active_ctx
+                            system_injections.append(("critical", active_ctx))
 
             # ==================================================================
-            # END MULTI‑CALL BLOCK
+            # END CODE INJECTION
             # ==================================================================
 
             # ------------------------------------------------------------------
@@ -7533,7 +7681,7 @@ class Filter:
                 prelim_system = prelim_system + "\n\n" + base_content
 
             # ------------------------------------------------------------------
-            # CoT DETECTION (moved after context compression so logs are clearer)
+            # CoT DETECTION
             # ------------------------------------------------------------------
             if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
                 if last_user_msg:
@@ -7562,7 +7710,7 @@ class Filter:
                             self._log_debug(f"Activated CoT level {cot_level}")
 
             # ------------------------------------------------------------------
-            # Wait for any active background LLM tasks to finish before unloading models
+            # Wait for any active background LLM tasks to finish
             # ------------------------------------------------------------------
             if background_tasks:
                 self._log_debug(
@@ -7572,27 +7720,42 @@ class Filter:
                 background_tasks.clear()
 
             # ------------------------------------------------------------------
-            # NOW generate CoT (level 2 or 3) using the preliminary system prompt as context
-            # (which already includes the synthesized summary if multi‑call was used)
+            # NOW generate CoT (level 2 or 3)
             # ------------------------------------------------------------------
             reasoning = None
+            _model_ctx = self.valves.multi_call_chunk_max_tokens or 28000
+            _cot_context_limit = _model_ctx // 3
+            if self.tokenizer:
+                _prelim_tokens = len(self.tokenizer.encode(prelim_system))
+                if _prelim_tokens > _cot_context_limit:
+                    prelim_for_cot = self._truncate_text_to_tokens(
+                        prelim_system, _cot_context_limit
+                    )
+                    self._log_debug(
+                        f"CoT context truncated from {_prelim_tokens} to {_cot_context_limit} tokens"
+                    )
+                else:
+                    prelim_for_cot = prelim_system
+            else:
+                prelim_for_cot = prelim_system[: _cot_context_limit * 4]
+
             if cot_any_used and not manual_cot_used:
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        user_content, prelim_system
+                        user_content, prelim_for_cot
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        user_content, prelim_system
+                        user_content, prelim_for_cot
                     )
             elif manual_cot_used and cot_level in (2, 3):
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        cot_question, prelim_system
+                        cot_question, prelim_for_cot
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        cot_question, prelim_system
+                        cot_question, prelim_for_cot
                     )
 
             if reasoning:
@@ -7608,7 +7771,7 @@ class Filter:
                 system_injections.append(("low", cot_note))
 
             # ------------------------------------------------------------------
-            # Final system message assembly (using the same token budget logic)
+            # Final system message assembly
             # ------------------------------------------------------------------
             if budget > 0 and self.tokenizer:
                 system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
@@ -7656,7 +7819,7 @@ class Filter:
                 self._log_debug(f"Injected system tokens: {total_system_tokens}")
 
             # ------------------------------------------------------------------
-            # Adaptive context trim (unchanged)
+            # Adaptive context trim
             # ------------------------------------------------------------------
             if self.valves.adaptive_trim:
                 total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -7772,13 +7935,13 @@ class Filter:
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
+            _inlet_aborted = False  # completed normally
 
         finally:
-            # Cancel any remaining background LLM tasks if the request was aborted
-            for task in background_tasks:
-                if not task.done():
-                    task.cancel()
-            # Reset the context variable
+            if _inlet_aborted:
+                for task in background_tasks:
+                    if not task.done():
+                        task.cancel()
             _inlet_background_tasks.reset(token)
 
         return body
@@ -7789,12 +7952,26 @@ class Filter:
     async def _generate_change_summary(
         self, block_hash: str, prev_content: str, new_content: str
     ):
-        """Generate a one‑line summary of what changed between two versions, using a tiny LLM."""
+        """Enqueue a change summary task (or run immediately if deferral disabled)."""
         if not HAS_AIOHTTP:
             return
-        model = (
-            self.valves.natural_language_forget_model or self.valves.summarization_model
-        )
+        if self.valves.defer_secondary_tasks:
+            task = SecondaryTask(
+                task_type="change_summary",
+                params={
+                    "block_hash": block_hash,
+                    "prev_content": prev_content,
+                    "new_content": new_content,
+                },
+            )
+            state = self._get_state(self.valves.project_id)  # project_id global
+            if state is not None:
+                state.setdefault("pending_secondary_tasks", []).append(task.dict())
+                self._set_state(self.valves.project_id, state)
+            return
+
+        # Original direct execution (fallback)
+        model = self.valves.secondary_task_model or self.valves.smart_pre_expand_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
             f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
@@ -7811,14 +7988,11 @@ class Filter:
         if summary:
             now = time.time()
             self._block_change_summaries[block_hash] = (summary.strip(), now)
-            # Limit dictionary
             max_entries = self.valves.max_change_summaries
             if len(self._block_change_summaries) > max_entries:
-                # Eliminate oldest entries (order by timestamp)
                 sorted_entries = sorted(
                     self._block_change_summaries.items(), key=lambda x: x[1][1]
                 )
-                # Delete the first (oldest) to be back to the limit
                 to_remove = sorted_entries[
                     : len(self._block_change_summaries) - max_entries
                 ]
@@ -7840,8 +8014,25 @@ class Filter:
                 if sym.kind not in ("function", "method"):
                     continue
                 symbols_to_summarize.append((sym, block.content[:500]))
+
         if not symbols_to_summarize:
             return
+
+        if self.valves.defer_secondary_tasks:
+            for sym, code_snippet in symbols_to_summarize:
+                task = SecondaryTask(
+                    task_type="missing_summaries",
+                    params={
+                        "signature": sym.signature,
+                        "code_snippet": code_snippet,
+                        "project_id": project_id,
+                    },
+                )
+                state.setdefault("pending_secondary_tasks", []).append(task.dict())
+            self._set_state(project_id, state)
+            return
+
+        # Original direct execution (fallback)
         batch_size = 10
         for i in range(0, len(symbols_to_summarize), batch_size):
             batch = symbols_to_summarize[i : i + batch_size]
@@ -7876,12 +8067,10 @@ class Filter:
         Send a single code chunk to the fast analysis model.
         Cached results are reused for identical (chunk_text, question) pairs.
         """
-        # Compute a cache key from the chunk content and the question
         chunk_hash = hashlib.md5(chunk_text.encode()).hexdigest()[:16]
         question_hash = hashlib.md5(question.encode()).hexdigest()[:16]
         cache_key = (chunk_hash, question_hash)
 
-        # Return cached result if available
         cached = self._chunk_analysis_cache.get(cache_key)
         if cached is not None:
             self._log_debug(
@@ -7892,16 +8081,44 @@ class Filter:
         prompt = ANALYSIS_PROMPT_TEMPLATE.format(
             question=question, chunk_text=chunk_text
         )
+
+        # Truncate if necessary
+        model_context_limit = 32768
+        max_prompt_tokens = model_context_limit - 800
+        if self.tokenizer:
+            prompt_tokens = len(self.tokenizer.encode(prompt))
+            self._log_debug(f"Chunk prompt token count: {prompt_tokens}")
+            if prompt_tokens > max_prompt_tokens:
+                overhead_tokens = prompt_tokens - len(self.tokenizer.encode(chunk_text))
+                max_chunk_tokens = max_prompt_tokens - overhead_tokens
+                if max_chunk_tokens > 0:
+                    chunk_text = self._truncate_text_to_tokens(
+                        chunk_text, max_chunk_tokens
+                    )
+                    prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+                        question=question, chunk_text=chunk_text
+                    )
+                    self._log_debug(
+                        f"Chunk truncated to {max_chunk_tokens} tokens. New prompt tokens: {len(self.tokenizer.encode(prompt))}"
+                    )
+        else:
+            if len(chunk_text) > max_prompt_tokens * 4:
+                chunk_text = chunk_text[: max_prompt_tokens * 4]
+                prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+                    question=question, chunk_text=chunk_text
+                )
+
         self._log_debug(f"Analyzing chunk (len={len(chunk_text)})...")
         try:
-            # Concurrency is now only controlled by _call_llm's internal semaphore.
+            # Fix 2: sin response_format, temperature=0.0
             response = await self._call_llm(
                 prompt=prompt,
-                system_prompt="You output only JSON.",
+                system_prompt="You output only valid JSON. No markdown. No explanation.",
                 model_override=model,
-                max_tokens=600,
-                temperature=0.2,
+                max_tokens=400,
+                temperature=0.0,
             )
+
             self._log_debug(
                 f"LLM response received: {response[:200] if response else 'None'}"
             )
@@ -7920,7 +8137,6 @@ class Filter:
             )
             return None
 
-        # Store in cache (LRU, automatically evicts oldest if full)
         self._add_to_chunk_analysis_cache(cache_key, parsed)
         return parsed
 
@@ -8249,13 +8465,10 @@ class Filter:
         Blocks that call each other or share a file are grouped together when possible.
         Each chunk includes a local dependency header, the code blocks, and a summary
         of external dependencies (signatures only).
-
-        Returns a list of (chunk_text, list_of_blocks_in_chunk).
         """
         block_map = {b.hash: b for b in blocks}
 
-        # Build adjacency graph: two blocks are connected if they call each other
-        # or if they belong to the same file.
+        # Build adjacency graph
         graph = defaultdict(set)
         for b in blocks:
             for sym in b.symbols:
@@ -8295,7 +8508,6 @@ class Filter:
             if comp_tokens <= max_tokens:
                 final_chunks.append(comp)
             else:
-                # Separate by file, then by token limit
                 by_file = defaultdict(list)
                 for blk in comp:
                     by_file[blk.file_path or ""].append(blk)
@@ -8320,17 +8532,24 @@ class Filter:
         # Build the final chunk strings
         result = []
         for chunk_blocks in final_chunks:
-            # ---- 1. Local dependency header (only symbols in this chunk) ----
+            # ---- 1. Local dependency header ----
             chunk_header = self._build_chunk_context_header(chunk_blocks, project_id)
 
-            # ---- 2. Code blocks ----
+            # ---- 2. Code blocks (con truncado de bloques gigantes) ----
+            _MAX_BLOCK_CHARS = (self.valves.multi_call_chunk_max_tokens or 28000) * 3
             code_parts = []
             for blk in chunk_blocks:
                 loc = f" (file: {blk.file_path})" if blk.file_path else ""
-                code_parts.append(f"### {blk.hash[:8]}{loc}\n```\n{blk.content}\n```")
+                content = blk.content if blk.content else "[empty block]"
+                if len(content) > _MAX_BLOCK_CHARS:
+                    content = (
+                        content[:_MAX_BLOCK_CHARS]
+                        + f"\n... [{len(content) - _MAX_BLOCK_CHARS} chars truncated]"
+                    )
+                code_parts.append(f"### {blk.hash[:8]}{loc}\n```\n{content}\n```")
             chunk_body = "\n\n".join(code_parts)
 
-            # ---- 3. External dependencies (signatures of functions called by this chunk but located elsewhere) ----
+            # ---- 3. External dependencies ----
             external_deps = []
             for blk in chunk_blocks:
                 for sym in blk.symbols:
@@ -8364,6 +8583,14 @@ class Filter:
                 )
 
             chunk_text = f"{chunk_header}\n\n{chunk_body}{dep_str}"
+
+            # Debug: confirm chunk size and content presence
+            self._log_debug(
+                f"Chunk assembled: {len(chunk_blocks)} blocks, "
+                f"chunk_text length={len(chunk_text)} chars, "
+                f"code chars={len(chunk_body)}, header chars={len(chunk_header)}"
+            )
+
             result.append((chunk_text, chunk_blocks))
 
         return result
@@ -8385,3 +8612,431 @@ class Filter:
                         blocks.append(blk)
                         seen.add(h)
         return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
+
+    # --------------------------------------------------------------------------
+    # Symbol-level analysis cache
+    # --------------------------------------------------------------------------
+    _symbol_analysis_cache: Dict[Tuple[str, str], Dict] = {}
+    _MAX_SYMBOL_ANALYSIS_CACHE = 1000
+
+    def _get_cached_symbol_analysis(
+        self, symbol_name: str, question_hash: str
+    ) -> Optional[Dict]:
+        return self._symbol_analysis_cache.get((symbol_name, question_hash))
+
+    def _set_cached_symbol_analysis(
+        self, symbol_name: str, question_hash: str, result: Dict
+    ):
+        if len(self._symbol_analysis_cache) >= self._MAX_SYMBOL_ANALYSIS_CACHE:
+            # Evict oldest entry (FIFO simple)
+            oldest = next(iter(self._symbol_analysis_cache))
+            del self._symbol_analysis_cache[oldest]
+        self._symbol_analysis_cache[(symbol_name, question_hash)] = result
+
+    # --------------------------------------------------------------------------
+    # Symbol-by-symbol code analysis (with cache)
+    # --------------------------------------------------------------------------
+    async def _analyze_code_via_symbols(
+        self, question: str, project_id: str
+    ) -> Tuple[str, List[str]]:
+        """
+        Analyze code by processing each symbol independently,
+        then synthesize a final summary.
+
+        Returns (summary_text, list_of_suggested_symbols).
+        """
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return "", []
+
+        question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
+
+        # Gather all non‑obsolete symbols with their compact context
+        symbol_contexts = []
+        seen_symbols = set()
+        for block in state["active_blocks"].values():
+            if block.obsolete or block.content_type not in (
+                ContentType.BASE_CODE,
+                ContentType.COMMITTED_CHANGE,
+                ContentType.PROPOSED_CHANGE,
+            ):
+                continue
+            for sym in block.symbols:
+                if sym.name in seen_symbols:
+                    continue
+                seen_symbols.add(sym.name)
+
+                # Check cache first
+                cached = self._get_cached_symbol_analysis(sym.name, question_hash)
+                if cached is not None:
+                    cached["symbol_name"] = sym.name
+                    symbol_contexts.append((sym.name, cached))  # placeholder
+                    continue
+
+                # Build compact context for this symbol
+                ctx = f"Symbol: `{sym.signature}` [{sym.kind}]"
+                if sym.file_path:
+                    ctx += f" in {sym.file_path}"
+                if sym.summary:
+                    ctx += f"\nSummary: {sym.summary}"
+
+                body_lines = block.content.splitlines()
+                body_preview = "\n".join(body_lines[1:11])
+                if len(body_preview) > 400:
+                    body_preview = body_preview[:400] + "..."
+                ctx += f"\nBody preview:\n```\n{body_preview}\n```"
+
+                callers = self._symbol_index.get_callers(sym.name, project_id)
+                if callers:
+                    ctx += f"\nCalled by: {', '.join(sorted(callers))}"
+                if sym.calls:
+                    ctx += f"\nCalls: {', '.join(sym.calls)}"
+
+                symbol_contexts.append((sym.name, ctx))
+
+        if not symbol_contexts:
+            return "", []
+
+        # Split into symbols that need fresh analysis vs cached
+        fresh_indices = []
+        cached_results = []
+        for i, (name, ctx) in enumerate(symbol_contexts):
+            if isinstance(ctx, dict):
+                cached_results.append(ctx)
+            else:
+                fresh_indices.append(i)
+
+        self._log_debug(
+            f"Symbol analysis: {len(symbol_contexts)} total, "
+            f"{len(cached_results)} cached, {len(fresh_indices)} fresh"
+        )
+
+        prompt_template = (
+            "You are a code analysis assistant. "
+            "For the given symbol, provide:\n"
+            "FUNCTIONS: <comma separated list of relevant function/class names>\n"
+            "FINDINGS: <one key finding>\n"
+            "ISSUES: <any potential issue, or 'none'>\n"
+            "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
+            "CONFIDENCE: <float 0.0-1.0>\n\n"
+            "EXAMPLE:\n"
+            "Symbol: `def calculate(x, y)` in math_utils.py\n"
+            "Body preview:\n```\nreturn x / y\n```\n"
+            "FUNCTIONS: calculate\n"
+            "FINDINGS: Performs division\n"
+            "ISSUES: Division by zero\n"
+            "SUGGEST: validate_input\n"
+            "CONFIDENCE: 0.9\n\n"
+            "Now analyze:\n{context}\n"
+            "OUTPUT:"
+        )
+
+        model = self.valves.multi_call_model or self.valves.smart_pre_expand_model
+        semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
+
+        # Process fresh symbols (with retries)
+        parsed_fresh = []
+        for idx in fresh_indices:
+            name, ctx = symbol_contexts[idx]
+            prompt = prompt_template.format(context=ctx)
+            success = False
+            last_result = None
+
+            # Try up to 1 + 2 retries = 3 total attempts
+            for attempt in range(3):
+                if attempt > 0:
+                    self._log_debug(
+                        f"Retrying symbol analysis for {name} (attempt {attempt+1})"
+                    )
+                try:
+                    res = await self._analyze_single_symbol(prompt, model, semaphore)
+                except Exception as e:
+                    self._log_debug(
+                        f"Symbol analysis attempt {attempt+1} for {name} error: {e}"
+                    )
+                    continue
+
+                if not res:
+                    continue
+
+                parsed = self._parse_symbol_output(res)
+                if parsed:
+                    parsed["symbol_name"] = name
+                    parsed_fresh.append(parsed)
+                    self._set_cached_symbol_analysis(name, question_hash, parsed)
+                    success = True
+                    break
+                else:
+                    last_result = res  # maybe we can log it
+
+            if not success:
+                self._log_debug(f"Symbol analysis failed for {name} after 3 attempts")
+
+        # Combine cached and fresh
+        all_parsed = cached_results + parsed_fresh
+
+        self._log_debug(
+            f"Symbol analysis completed: {len(all_parsed)}/{len(symbol_contexts)} succeeded"
+        )
+
+        if not all_parsed:
+            return "Symbol analysis produced no results.", []
+
+        suggested = set()
+        for res in all_parsed:
+            if res.get("suggested_next") and res["suggested_next"] != "none":
+                suggested.add(res["suggested_next"])
+
+        summary = await self._synthesize_from_symbol_results(all_parsed, question)
+        return summary, list(suggested)
+
+    async def _analyze_single_symbol(
+        self, prompt: str, model: str, semaphore: asyncio.Semaphore
+    ) -> Optional[str]:
+        """Call the analysis model for one symbol, with concurrency limit."""
+        async with semaphore:
+            return await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code analysis engine. Output only the structured text as requested.",
+                model_override=model,
+                max_tokens=200,
+                temperature=0.0,
+            )
+
+    def _parse_symbol_output(self, text: str) -> Optional[Dict]:
+        """Parse the structured text output from the symbol analysis."""
+        if not text:
+            return None
+        try:
+            result = {}
+            lines = text.strip().splitlines()
+            for line in lines:
+                line = line.strip()
+                if line.startswith("FUNCTIONS:"):
+                    result["relevant_functions"] = [
+                        f.strip() for f in line[10:].split(",") if f.strip()
+                    ]
+                elif line.startswith("FINDINGS:"):
+                    result["key_findings"] = [line[9:].strip()]
+                elif line.startswith("ISSUES:"):
+                    issues = line[7:].strip()
+                    if issues.lower() != "none":
+                        result["potential_issues"] = [issues]
+                    else:
+                        result["potential_issues"] = []
+                elif line.startswith("SUGGEST:"):
+                    suggest = line[8:].strip()
+                    if suggest.lower() != "none":
+                        result["suggested_next"] = suggest
+                elif line.startswith("CONFIDENCE:"):
+                    try:
+                        result["confidence"] = float(line[11:].strip())
+                    except ValueError:
+                        result["confidence"] = 0.5
+            # Ensure required fields
+            result.setdefault("relevant_functions", [])
+            result.setdefault("key_findings", [])
+            result.setdefault("potential_issues", [])
+            result.setdefault("confidence", 0.5)
+            return result
+        except Exception:
+            return None
+
+    async def _synthesize_from_symbol_results(
+        self, symbol_analyses: List[Dict], question: str
+    ) -> str:
+        """Merge symbol-level analyses into a final summary using the synthesis model."""
+        if not symbol_analyses:
+            return "No symbol analyses to synthesize."
+
+        # Build compact representation
+        lines = []
+        for sa in symbol_analyses:
+            lines.append(
+                f"`{sa.get('symbol_name', 'unknown')}`: "
+                f"functions={sa.get('relevant_functions', [])}, "
+                f"findings={sa.get('key_findings', [])}, "
+                f"issues={sa.get('potential_issues', [])}"
+            )
+
+        combined = "\n".join(lines)
+        if self.tokenizer:
+            tokens = len(self.tokenizer.encode(combined))
+            if tokens > 8000:
+                combined = self._truncate_text_to_tokens(combined, 8000)
+
+        prompt = (
+            f"Question: {question}\n\n"
+            f"Individual symbol analyses:\n{combined}\n\n"
+            "Synthesize the above into a concise summary of the codebase. "
+            "Include relevant functions, key findings, issues, and suggestions. "
+            "Keep the response under 1500 tokens. No code snippets."
+        )
+
+        model = self.valves.multi_call_synthesis_model
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a senior software architect summarizing code analysis.",
+            model_override=model,
+            max_tokens=1500,
+            temperature=0.2,
+        )
+        return response if response else "Failed to synthesize summary."
+
+    # --------------------------------------------------------------------------
+    # Deferred secondary task execution
+    # --------------------------------------------------------------------------
+    async def _process_pending_secondary_tasks(self, project_id: str):
+        """Execute all pending secondary tasks at the start of an inlet."""
+        state = self._get_state(project_id)
+        if not state or not state.get("pending_secondary_tasks"):
+            return
+
+        tasks = state["pending_secondary_tasks"]
+        self._log_debug(f"Processing {len(tasks)} pending secondary task(s)...")
+
+        remaining = []
+        for task_dict in tasks:
+            task = SecondaryTask(**task_dict)
+            success = await self._execute_secondary_task(task, project_id)
+            if not success:
+                task.retries += 1
+                if task.retries < self.valves.secondary_task_max_retries:
+                    remaining.append(task.dict())
+                else:
+                    self._log_debug(
+                        f"Dropping secondary task {task.task_type} after {task.retries} retries"
+                    )
+            # else: task succeeded, do not re-add
+
+        state["pending_secondary_tasks"] = remaining
+        self._set_state(project_id, state)
+
+    async def _execute_secondary_task(
+        self, task: SecondaryTask, project_id: str
+    ) -> bool:
+        """Dispatch a single secondary task to the appropriate handler."""
+        model = self.valves.secondary_task_model
+        sem = self._secondary_llm_semaphore
+        try:
+            if task.task_type == "change_summary":
+                return await self._run_change_summary_task(task.params, model, sem)
+            elif task.task_type == "missing_summaries":
+                return await self._run_missing_summaries_task(task.params, model, sem)
+            elif task.task_type == "inactive_code_summary":
+                return await self._run_inactive_code_summary_task(
+                    task.params, model, sem
+                )
+            else:
+                return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log_debug(f"Secondary task {task.task_type} failed: {e}")
+            return False
+
+    async def _run_change_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred change summary generation."""
+        block_hash = params["block_hash"]
+        prev_content = params["prev_content"]
+        new_content = params["new_content"]
+        prompt = (
+            f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
+            f"Previous:\n```\n{prev_content[:500]}\n```\n\n"
+            f"New:\n```\n{new_content[:500]}\n```\n\n"
+            f"Change summary:"
+        )
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code change summariser. Output only one short sentence.",
+                model_override=model,
+                max_tokens=40,
+                temperature=0.1,
+            )
+        if summary:
+            now = time.time()
+            self._block_change_summaries[block_hash] = (summary.strip(), now)
+            max_entries = self.valves.max_change_summaries
+            if len(self._block_change_summaries) > max_entries:
+                sorted_entries = sorted(
+                    self._block_change_summaries.items(), key=lambda x: x[1][1]
+                )
+                to_remove = sorted_entries[
+                    : len(self._block_change_summaries) - max_entries
+                ]
+                for key, _ in to_remove:
+                    del self._block_change_summaries[key]
+            return True
+        return False
+
+    async def _run_missing_summaries_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred missing summary generation for one symbol."""
+        signature = params["signature"]
+        code_snippet = params["code_snippet"]
+        prompt = f"Summarize in one short sentence what this code does:\n\n```{signature}\n{code_snippet}```"
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                model_override=model,
+                max_tokens=50,
+                temperature=0.1,
+            )
+        if summary and summary.strip():
+            # The caller must update the actual symbol, so we just return success
+            # We'll store the summary in a temporary dict for the caller
+            # Since this is deferred, we need to update the symbol in the state.
+            # We'll retrieve the symbol and set summary, then save state.
+            project_id = params["project_id"]
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                state = self._get_state(project_id)
+                for blk in state["active_blocks"].values():
+                    for sym in blk.symbols:
+                        if sym.signature == signature:
+                            sym.summary = summary.strip()
+                self._set_state(project_id, state)
+            return True
+        return False
+
+    async def _run_inactive_code_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred summarisation of an inactive code block."""
+        sig = params.get("signature", "")
+        content = params["content"]
+        if sig:
+            prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{content[:1000]}```"
+        else:
+            prompt = f"Summarise the following code block.\n```{content[:1500]}```"
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code summarization assistant.",
+                model_override=model,
+                max_tokens=200,
+                temperature=0.2,
+            )
+        if summary and summary.strip():
+            # The caller must replace the block content. Since this is deferred,
+            # we'll directly modify the state.
+            project_id = params["project_id"]
+            block_hash = params["block_hash"]
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                state = self._get_state(project_id)
+                if block_hash in state["active_blocks"]:
+                    blk = state["active_blocks"][block_hash]
+                    # Only if it hasn't been updated since
+                    summary_content = f"[Summary of inactive code]\n{summary.strip()}"
+                    blk.content = summary_content
+                    blk.importance_score *= 0.5
+                    self._invalidate_lightweight_cache(project_id)
+                    self._set_state(project_id, state)
+            return True
+        return False
