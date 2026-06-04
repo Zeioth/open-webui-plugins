@@ -1235,9 +1235,13 @@ class Filter:
         )
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
-        self._db_write_lock = asyncio.Lock()
+        self._db_write_lock = asyncio.Lock()  # kept for extra safety, optional
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
+
+        # ── Database write queue (prevents "database is locked") ──
+        self._db_write_queue: asyncio.Queue = asyncio.Queue()
+        self._db_worker_task = asyncio.create_task(self._db_worker())
 
         # Background tasks tracking
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
@@ -1349,6 +1353,18 @@ class Filter:
 
         return task
 
+    async def _db_worker(self):
+        """Serialise all database writes through a single task."""
+        while True:
+            job = await self._db_write_queue.get()
+            try:
+                func, args, kwargs = job
+                await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
+            except Exception as e:
+                self._log_debug(f"DB worker failed: {e}")
+            finally:
+                self._db_write_queue.task_done()
+
     # --------------------------------------------------------------------------
     # State database
     # --------------------------------------------------------------------------
@@ -1454,15 +1470,16 @@ class Filter:
             "has_any_calls": state.get("has_any_calls", False),
             "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
         }
-        # ────── WRITE PROTECTED BY DB LOCK ──────
-        async with self._db_write_lock:
-            await anyio.to_thread.run_sync(
-                lambda: self._db_conn.execute(
-                    "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
-                    (project_id, json.dumps(serializable), time.time()),
-                )
+
+        # ── Enqueue the actual write ──
+        def _write():
+            self._db_conn.execute(
+                "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
+                (project_id, json.dumps(serializable), time.time()),
             )
-            await anyio.to_thread.run_sync(lambda: self._db_conn.commit())
+            self._db_conn.commit()
+
+        await self._db_write_queue.put((_write, (), {}))
 
     async def _save_state_to_db_async(self, project_id: str, state: Dict):
         """Acquire the project lock, then persist the state to DB."""
@@ -6113,6 +6130,10 @@ class Filter:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
             if cot_any_used and not manual_cot_used:
+                self._log_debug(
+                    f"Generating CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
                         user_content, prelim_for_cot
@@ -6122,6 +6143,10 @@ class Filter:
                         user_content, prelim_for_cot
                     )
             elif manual_cot_used and cot_level in (2, 3):
+                self._log_debug(
+                    f"Generating manual CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
                         cot_question, prelim_for_cot
@@ -6500,6 +6525,8 @@ class Filter:
             and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
+        # Cancel database worker
+        self._db_worker_task.cancel()
         for task_list in [self._dependency_tasks]:
             for task in task_list:
                 task.cancel()
@@ -7187,39 +7214,38 @@ class Filter:
                 del self._symbol_analysis_generic_cache[oldest]
             self._symbol_analysis_generic_cache[generic_key] = result
 
-        # ────── DB persistence (protected) ──────
+        # ── Enqueue the DB write ──
         project_id = self.valves.project_id
         result_json = json.dumps(result)
 
-        async def _write():
-            async with self._db_write_lock:
-                self._db_conn.execute(
-                    "REPLACE INTO symbol_analysis_cache "
-                    "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        project_id,
-                        symbol_name,
-                        question_hash,
-                        content_hash,
-                        result_json,
-                        time.time(),
-                    ),
-                )
-                self._db_conn.commit()
-                # Keep only the most recent 1000 entries per project
-                self._db_conn.execute(
-                    "DELETE FROM symbol_analysis_cache "
-                    "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
-                    "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
-                    "  WHERE project_id = ? "
-                    "  ORDER BY created_at DESC "
-                    "  LIMIT 1000"
-                    ")",
-                    (project_id, project_id),
-                )
+        def _write():
+            self._db_conn.execute(
+                "REPLACE INTO symbol_analysis_cache "
+                "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    project_id,
+                    symbol_name,
+                    question_hash,
+                    content_hash,
+                    result_json,
+                    time.time(),
+                ),
+            )
+            self._db_conn.commit()
+            # Keep only the most recent 1000 entries per project
+            self._db_conn.execute(
+                "DELETE FROM symbol_analysis_cache "
+                "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
+                "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
+                "  WHERE project_id = ? "
+                "  ORDER BY created_at DESC "
+                "  LIMIT 1000"
+                ")",
+                (project_id, project_id),
+            )
 
-        asyncio.create_task(_write())
+        asyncio.create_task(self._db_write_queue.put((_write, (), {})))
 
     # --------------------------------------------------------------------------
     # Symbol-by-symbol code analysis (with cache)
