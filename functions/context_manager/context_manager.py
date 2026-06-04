@@ -923,6 +923,14 @@ class Filter:
         smart_context_min_tokens: int = Field(default=1024)
         smart_context_include_last_user: bool = Field(default=True)
 
+        # ─── Hierarchical Compression ───
+        hierarchical_compression_enabled: bool = Field(default=False)
+        hierarchical_compression_interval_messages: int = Field(default=100)
+        hierarchical_summary_model: str = Field(
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+        )
+        hierarchical_summary_max_tokens: int = Field(default=800)
+
         # ─── Duplicate Blocks & Frequency ───
         auto_remove_duplicate_blocks: bool = Field(default=True)
         max_duplicate_age_hours: float = Field(default=6.0)
@@ -1087,6 +1095,18 @@ class Filter:
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
 
+        # ─── Speculative Preload ───
+        speculative_log_missed_opportunities: bool = Field(default=True)
+        speculative_preload_enabled: bool = Field(default=False)
+        speculative_preload_max_tokens_percent: float = Field(default=0.10)
+        speculative_preload_max_dependencies: int = Field(default=2)
+        speculative_preload_min_callers: int = Field(default=1)
+        speculative_adaptive: bool = Field(default=False)
+        speculative_max_limit: int = Field(default=5)
+        speculative_boost_on_miss: float = Field(default=1.0)
+        speculative_decay_after_ignored_turns: int = Field(default=3)
+        speculative_stats_command_enabled: bool = Field(default=True)
+
         # ─── Raw File Priority Boost ───
         raw_file_priority_boost: float = Field(default=2.0)
 
@@ -1145,6 +1165,12 @@ class Filter:
             "response_cache": [],
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
+            "speculative_missed_stats": {"total": 0, "details": {}},
+            "speculative_preload_limit": None,
+            "speculative_miss_count_since_last_boost": 0,
+            "speculative_ignored_turns": 0,
+            "speculative_last_preloaded_symbols": set(),
+            "speculative_last_preload_turn": 0,
             "pending_secondary_tasks": [],
         }
 
@@ -1199,7 +1225,10 @@ class Filter:
         self._last_used_model: Optional[str] = None
 
         # Background tasks tracking
+        self._hierarchical_compress_in_progress: Dict[str, bool] = {}
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
+        self._hierarchical_compress_tasks: List[asyncio.Task] = []
+        self._summarize_tasks: List[asyncio.Task] = []
         self._dependency_tasks: List[asyncio.Task] = []
         self._write_counter = 0
         self._response_cache_cleanup_task: Optional[asyncio.Task] = None
@@ -1412,6 +1441,23 @@ class Filter:
             "last_compression_timestamp": state.get("last_compression_timestamp", 0),
             "response_cache": state.get("response_cache", []),
             "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
+            "last_cleanup_suggestion_msg_idx": state.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            "speculative_missed_stats": state.get(
+                "speculative_missed_stats", {"total": 0, "details": {}}
+            ),
+            "speculative_preload_limit": state.get("speculative_preload_limit"),
+            "speculative_miss_count_since_last_boost": state.get(
+                "speculative_miss_count_since_last_boost", 0
+            ),
+            "speculative_ignored_turns": state.get("speculative_ignored_turns", 0),
+            "speculative_last_preloaded_symbols": list(
+                state.get("speculative_last_preloaded_symbols", set())
+            ),
+            "speculative_last_preload_turn": state.get(
+                "speculative_last_preload_turn", 0
+            ),
             "has_any_calls": state.get("has_any_calls", False),
             "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
         }
@@ -1449,6 +1495,13 @@ class Filter:
                     else 0
                 ),
             )
+        data.setdefault("last_cleanup_suggestion_msg_idx", 0)
+        data.setdefault("speculative_missed_stats", {"total": 0, "details": {}})
+        data.setdefault("speculative_preload_limit", None)
+        data.setdefault("speculative_miss_count_since_last_boost", 0)
+        data.setdefault("speculative_ignored_turns", 0)
+        data.setdefault("speculative_last_preloaded_symbols", set())
+        data.setdefault("speculative_last_preload_turn", 0)
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             try:
@@ -1510,6 +1563,23 @@ class Filter:
             "response_cache": data.get("response_cache", []),
             "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
             "has_any_calls": data.get("has_any_calls", False),
+            "last_cleanup_suggestion_msg_idx": data.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            "speculative_missed_stats": data.get(
+                "speculative_missed_stats", {"total": 0, "details": {}}
+            ),
+            "speculative_preload_limit": data.get("speculative_preload_limit"),
+            "speculative_miss_count_since_last_boost": data.get(
+                "speculative_miss_count_since_last_boost", 0
+            ),
+            "speculative_ignored_turns": data.get("speculative_ignored_turns", 0),
+            "speculative_last_preloaded_symbols": set(
+                data.get("speculative_last_preloaded_symbols", [])
+            ),
+            "speculative_last_preload_turn": data.get(
+                "speculative_last_preload_turn", 0
+            ),
             "pending_secondary_tasks": data.get("pending_secondary_tasks", []),
         }
         for blk in (
@@ -2020,6 +2090,1344 @@ class Filter:
             return None
 
     # --------------------------------------------------------------------------
+    # Response cache (ChromaDB)
+    # --------------------------------------------------------------------------
+    def _ensure_cleanup_task(self) -> None:
+        if (
+            not self.valves.enable_response_cache
+            or not HAS_CHROMA
+            or self._response_cache_cleanup_task is not None
+        ):
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                self._response_cache_cleanup_task = asyncio.create_task(
+                    self._periodic_response_cache_cleanup()
+                )
+        except RuntimeError:
+            pass
+
+    async def _periodic_response_cache_cleanup(self):
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await self._purge_expired_response_cache()
+            except Exception as e:
+                self._log_debug(f"Response cache cleanup error: {e}")
+
+    async def _purge_expired_response_cache(self):
+        if (
+            not hasattr(self, "_response_cache_collection")
+            or self._response_cache_collection is None
+        ):
+            return
+        ttl = self.valves.response_cache_ttl_hours * 3600
+        if ttl <= 0:
+            return
+        try:
+            results = await anyio.to_thread.run_sync(
+                lambda: self._response_cache_collection.get(include=["metadatas"])
+            )
+            if not results or not results["ids"]:
+                return
+            now = time.time()
+            to_delete = []
+            for i, meta in enumerate(results["metadatas"]):
+                if now - meta.get("timestamp", 0) > ttl:
+                    to_delete.append(results["ids"][i])
+            if to_delete:
+                await anyio.to_thread.run_sync(
+                    lambda: self._response_cache_collection.delete(ids=to_delete)
+                )
+                project = self.valves.project_id
+                self._response_cache_count[project] = max(
+                    0, self._response_cache_count.get(project, 0) - len(to_delete)
+                )
+        except Exception as e:
+            self._log_debug(f"Error purging response cache: {e}")
+
+    async def _store_response_in_cache(
+        self, query: str, response: str, context_hash: str, state: dict
+    ):
+        if not self.valves.enable_response_cache or not HAS_SENTENCE:
+            return
+        if not query or not response:
+            return
+        col = getattr(self, "_response_cache_collection", None)
+        if col is None:
+            return
+
+        t_start = time.monotonic()
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        entry_id = hashlib.md5(
+            f"{self.valves.project_id}|{query}".encode()
+        ).hexdigest()[:32]
+        max_entries = self.valves.response_cache_max_entries
+        project = self.valves.project_id
+        current_size = self._response_cache_count.get(project, 0)
+        if current_size >= max_entries:
+            to_delete_count = max(1, max_entries // 10)
+            try:
+                old_entries = await anyio.to_thread.run_sync(
+                    lambda: col.get(
+                        where={"project_id": project},
+                        include=["metadatas"],
+                        limit=to_delete_count,
+                    )
+                )
+                if old_entries and old_entries["ids"]:
+                    await anyio.to_thread.run_sync(
+                        lambda: col.delete(ids=old_entries["ids"])
+                    )
+                    self._response_cache_count[project] -= len(old_entries["ids"])
+            except Exception:
+                pass
+
+        await anyio.to_thread.run_sync(
+            lambda: col.upsert(
+                ids=[entry_id],
+                embeddings=[embedding],
+                documents=[response],
+                metadatas=[
+                    {
+                        "query": query[:500],
+                        "project_id": project,
+                        "context_hash": "",
+                        "code_state_hash": self._compute_code_state_hash_from_state(
+                            state
+                        ),
+                        "timestamp": time.time(),
+                    }
+                ],
+            )
+        )
+        self._response_cache_count[project] = (
+            self._response_cache_count.get(project, 0) + 1
+        )
+        self._log_timing(
+            "resp_cache_total", time.monotonic() - t_start, time.monotonic() - t_start
+        )
+
+    async def _find_cached_response(
+        self, query: str, context_hash: str, state: dict
+    ) -> Optional[dict]:
+        if not self.valves.enable_response_cache or not HAS_SENTENCE:
+            return None
+        col = getattr(self, "_response_cache_collection", None)
+        if col is None:
+            return None
+
+        t_start = time.monotonic()
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        results = await anyio.to_thread.run_sync(
+            lambda: col.query(
+                query_embeddings=[query_vec],
+                n_results=1,
+                where={"project_id": self.valves.project_id},
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        if not results or not results["ids"] or not results["ids"][0]:
+            return None
+
+        dist = results["distances"][0][0]
+        similarity = 1.0 - (dist / 2.0)
+        if similarity < self.valves.response_cache_similarity_threshold:
+            return None
+
+        meta = results["metadatas"][0][0]
+        stored_code_state = meta.get("code_state_hash", "")
+        if stored_code_state and stored_code_state != self._compute_code_state_hash(
+            self.valves.project_id
+        ):
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        ttl = self.valves.response_cache_ttl_hours * 3600
+        ts = meta.get("timestamp", 0)
+        if ttl > 0 and time.time() - ts > ttl:
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        doc = results["documents"][0][0]
+        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
+
+    def _compute_code_state_hash(self, project_id: str) -> str:
+        if self._cached_code_state_hash is not None:
+            return self._cached_code_state_hash
+        state = self._get_state(project_id)
+        h = self._compute_code_state_hash_from_state(state)
+        self._cached_code_state_hash = h
+        return h
+
+    def _compute_code_state_hash_from_state(self, state: dict) -> str:
+        if not state or not state["active_blocks"]:
+            return ""
+        sorted_hashes = sorted(
+            h for h, b in state["active_blocks"].items() if not b.obsolete
+        )
+        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
+
+    # --------------------------------------------------------------------------
+    # Code span utilities
+    # --------------------------------------------------------------------------
+    async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
+        if not HAS_TREE_SITTER:
+            return []
+        cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
+        if cache_key in self._code_spans_cache:
+            return self._code_spans_cache[cache_key]
+        try:
+            config = ProcessConfig()
+            blocks = process(content, config)
+            spans = [(b.start_byte, b.end_byte) for b in blocks]
+        except Exception as e:
+            if any(
+                msg in str(e)
+                for msg in (
+                    "Language '' not available",
+                    "Language '' not available for download",
+                    "Download error: Language ''",
+                )
+            ):
+                spans = []
+            else:
+                self._log_debug(f"Tree‑sitter process failed: {e}")
+                spans = []
+        if len(self._code_spans_cache) >= 200:
+            keys_to_evict = list(self._code_spans_cache.keys())[:50]
+            for key in keys_to_evict:
+                del self._code_spans_cache[key]
+        self._code_spans_cache[cache_key] = spans
+        return spans
+
+    def _remove_code_spans(self, content: str, spans: List[Tuple[int, int]]) -> str:
+        chars = list(content)
+        for start, end in spans:
+            for i in range(start, min(end, len(chars))):
+                chars[i] = " "
+        return "".join(chars)
+
+    def _is_span_in_code(
+        self, code_spans: List[Tuple[int, int]], span: Tuple[int, int]
+    ) -> bool:
+        s, e = span
+        return any(cs <= s and e <= ce for cs, ce in code_spans)
+
+    # --------------------------------------------------------------------------
+    # Message ordering / trimming helpers
+    # --------------------------------------------------------------------------
+    def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
+        if not messages:
+            messages.append({"role": "user", "content": "continue"})
+            return messages
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx == -1:
+            while messages and messages[-1].get("role") != "user":
+                messages.pop()
+            messages.append({"role": "user", "content": "continue"})
+        else:
+            if last_user_idx + 1 < len(messages):
+                messages = messages[: last_user_idx + 1]
+        return messages
+
+    def _estimate_tokens(self, messages: List[dict]) -> int:
+        if self.tokenizer:
+            total = 0
+            for m in messages:
+                content = str(m.get("content", ""))
+                total += len(self.tokenizer.encode(content))
+                total += 4
+            return total
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        total_chars += sum(30 for _ in messages)
+        return total_chars // 4
+
+    def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        if not self.tokenizer:
+            return text[: max_tokens * 4]
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return self.tokenizer.decode(tokens[:max_tokens])
+
+    # --------------------------------------------------------------------------
+    # Code extraction and classification
+    # --------------------------------------------------------------------------
+    async def _extract_code_blocks(
+        self, content: str
+    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+        blocks = []
+        spans = []
+        tree_sitter_error = None
+
+        if not self.valves.auto_detect_code_blocks:
+            return blocks, spans
+
+        if HAS_TREE_SITTER:
+            try:
+                config = ProcessConfig()
+                ts_blocks = await anyio.to_thread.run_sync(
+                    lambda: process(content, config)
+                )
+                for tsb in ts_blocks:
+                    start, end = tsb.start_byte, tsb.end_byte
+                    raw = content[start:end].strip()
+                    lang = tsb.language or "text"
+                    if lang in ("text", ""):
+                        guessed = SignatureExtractor._guess_language(None, raw)
+                        if guessed != "unknown":
+                            lang = guessed
+                        else:
+                            lang = await self._infer_code_language(raw)
+                    lines = raw.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        code = "\n".join(lines).strip()
+                        block_type = "fenced"
+                    else:
+                        code = raw
+                        block_type = "indented"
+                    code = await self._handle_oversized_code_block(code, lang)
+                    blocks.append({"language": lang, "code": code, "type": block_type})
+                    spans.append((start, end))
+                if blocks:
+                    return blocks, spans
+            except Exception as e:
+                if not any(
+                    msg in str(e)
+                    for msg in (
+                        "Language '' not available",
+                        "Language '' not available for download",
+                        "Download error: Language ''",
+                    )
+                ):
+                    tree_sitter_error = e
+
+        # Regex fallback
+        def _regex_fallback(content):
+            blocks, spans = [], []
+            for match in self.code_pattern.finditer(content):
+                lang = match.group(1) or "text"
+                code = match.group(2).strip()
+                blocks.append({"language": lang, "code": code, "type": "fenced"})
+                spans.append((match.start(), match.end()))
+            lines = content.split("\n")
+            line_offsets = [0]
+            for line in lines:
+                line_offsets.append(line_offsets[-1] + len(line) + 1)
+            indented = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith(("    ", "\t")):
+                    indented.append(line.lstrip(" \t"))
+                    i += 1
+                else:
+                    if len(indented) >= 3:
+                        code = "\n".join(indented)
+                        blocks.append(
+                            {"language": "text", "code": code, "type": "indented"}
+                        )
+                        start_offset = line_offsets[i - len(indented)]
+                        end_offset = line_offsets[i] - 1
+                        spans.append((start_offset, end_offset))
+                    indented = []
+                    i += 1
+            if len(indented) >= 3:
+                code = "\n".join(indented)
+                blocks.append({"language": "text", "code": code, "type": "indented"})
+                start_offset = line_offsets[len(lines) - len(indented)]
+                end_offset = (
+                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                )
+                spans.append((start_offset, end_offset))
+            return blocks, spans
+
+        blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
+
+        for i in range(len(blocks)):
+            blocks[i]["code"] = await self._handle_oversized_code_block(
+                blocks[i]["code"], blocks[i]["language"]
+            )
+
+        if (
+            not blocks
+            and self.valves.enable_raw_code_detection
+            and self._has_code_indicators(content)
+        ):
+            t_raw_start = time.monotonic()
+            lang = await self._infer_code_language(content)
+            dur_raw = time.monotonic() - t_raw_start
+            if lang != "unknown":
+                blocks.append(
+                    {
+                        "language": lang,
+                        "code": content,
+                        "type": "indented",
+                        "is_raw": True,
+                    }
+                )
+                spans.append((0, len(content)))
+                self._log_debug(
+                    f"Raw code detected via LLM as {lang}. Detection took {dur_raw:.3f}s."
+                )
+            else:
+                self._log_debug(
+                    f"Raw code detection failed (unknown language). Detection took {dur_raw:.3f}s."
+                )
+
+        if not blocks and tree_sitter_error is not None:
+            self._log_debug(
+                f"All extraction methods failed. Tree‑sitter error: {tree_sitter_error}"
+            )
+
+        return blocks, spans
+
+    async def _infer_code_language(self, code_snippet: str) -> str:
+        if not HAS_AIOHTTP:
+            return "unknown"
+        code_indicators = [
+            "def ",
+            "class ",
+            "import ",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "{",
+            "}",
+            ";",
+            "=>",
+            "==",
+            "!=",
+            "return ",
+        ]
+        snippet_lower = code_snippet.lower()
+        indicator_count = sum(snippet_lower.count(ind) for ind in code_indicators)
+        if len(code_snippet) > 50 and indicator_count < 2:
+            return "unknown"
+        non_alpha = sum(1 for c in code_snippet if not c.isalpha() and not c.isspace())
+        if len(code_snippet) > 50 and non_alpha / max(len(code_snippet), 1) < 0.1:
+            return "unknown"
+        t_start = time.monotonic()
+        prompt = (
+            "Identify the programming language of this code. "
+            "Answer with a single word (e.g., 'python', 'javascript', 'go', 'rust') or 'unknown':\n\n"
+            f"```\n{code_snippet[:800]}\n```"
+        )
+        try:
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
+                model_override=self.valves.smart_pre_expand_model,
+                max_tokens=10,
+                temperature=0.0,
+            )
+            dur = time.monotonic() - t_start
+            if response:
+                lang = response.strip().lower()
+                lang_map = {
+                    "py": "python",
+                    "python3": "python",
+                    "js": "javascript",
+                    "ts": "typescript",
+                    "tsx": "tsx",
+                    "jsx": "jsx",
+                    "go": "go",
+                    "rs": "rust",
+                    "java": "java",
+                    "c": "c",
+                    "cpp": "cpp",
+                    "h": "c",
+                    "hpp": "cpp",
+                }
+                normalized = lang_map.get(lang, lang)
+                self._log_debug(
+                    f"[LangDetect] method=llm, result={normalized}, dur={dur:.3f}s"
+                )
+                return normalized
+            else:
+                return "unknown"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log_debug(f"[LangDetect] method=llm, result=unknown (error: {e})")
+            return "unknown"
+
+    def _extract_file_path_for_block(
+        self, content: str, block_start: int
+    ) -> Optional[str]:
+        if block_start <= 0:
+            return None
+        before = content[:block_start]
+        lines = before.splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(self.valves.file_path_pattern, line)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+            file_path, _, _ = self._extract_line_range(line)
+            if file_path:
+                return file_path
+            break
+        return None
+
+    def _extract_line_range(
+        self, content: str
+    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        if not self.valves.track_line_numbers:
+            return None, None, None
+        pattern = r"(?:^|\s)([^\s:]+\.\w+):(\d+)(?:-(\d+))?"
+        match = re.search(pattern, content)
+        if match:
+            return (
+                match.group(1),
+                int(match.group(2)),
+                int(match.group(3)) if match.group(3) else int(match.group(2)),
+            )
+        return None, None, None
+
+    def _extract_file_paths(self, content: str) -> List[str]:
+        if not self.valves.track_file_paths:
+            return []
+        matches = re.findall(self.valves.file_path_pattern, content)
+        return [m[0] if isinstance(m, tuple) else m for m in matches]
+
+    def _classify_content(
+        self, content: str, extracted_blocks: List[Dict]
+    ) -> ContentType:
+        cl = content.lower()
+        if self.diff_pattern.search(content) or "diff --git" in content:
+            return ContentType.PROPOSED_CHANGE
+        if self.commit_pattern.search(content):
+            return (
+                ContentType.COMMITTED_CHANGE
+                if ("applied" in cl or "committed" in cl or "merged" in cl)
+                else ContentType.PROPOSED_CHANGE
+            )
+        if (
+            "traceback" in cl
+            or ('file "' in cl and "line " in cl)
+            or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
+        ):
+            return ContentType.ERROR
+        if '"tool_calls"' in content or '"function"' in content:
+            return ContentType.TOOL_CALL
+        for blk in extracted_blocks:
+            if blk["language"] in [
+                "python",
+                "javascript",
+                "typescript",
+                "go",
+                "rust",
+                "java",
+                "cpp",
+            ]:
+                if (
+                    "def " in blk["code"]
+                    or "class " in blk["code"]
+                    or "function " in blk["code"]
+                ):
+                    return ContentType.BASE_CODE
+        return ContentType.GENERAL
+
+    async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        cache_key = None
+        if last_user:
+            content_key = last_user.get("content", "")[:200]
+            cache_key = (
+                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
+            )
+            cached = self._session_classify_cache.get(cache_key)
+            if cached is not None:
+                result, ts = cached
+                if time.time() - ts < self._session_classify_ttl:
+                    return result
+                del self._session_classify_cache[cache_key]
+        state = self._get_state(project_id)
+        if state and state.get("active_blocks"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        for msg in reversed(messages[-10:]):
+            if msg.get("role") != "user":
+                continue
+            if self._has_code_indicators(msg.get("content", "")):
+                if cache_key:
+                    self._session_classify_cache[cache_key] = (True, time.time())
+                return True
+        if last_user and last_user.get("content", "").strip().startswith("/"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        if last_user and "```" in last_user.get("content", ""):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        if (
+            last_user
+            and not state.get("active_blocks")
+            and not self._has_code_indicators(last_user.get("content", ""))
+        ):
+            if len(last_user.get("content", "")) > 200:
+                blocks, _ = await self._extract_code_blocks(
+                    last_user.get("content", "")
+                )
+                if blocks:
+                    if cache_key:
+                        self._session_classify_cache[cache_key] = (True, time.time())
+                    return True
+        if not last_user or len(last_user.get("content", "")) < 20:
+            result = False
+        else:
+            model = self.valves.natural_language_forget_model or self.valves.llm_model
+            prompt = f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:300]}"
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
+                model_override=model,
+                max_tokens=3,
+                temperature=0.0,
+            )
+            result = bool(response and response.strip().lower().startswith("yes"))
+        if cache_key:
+            self._session_classify_cache[cache_key] = (result, time.time())
+            if len(self._session_classify_cache) >= 500:
+                items = sorted(
+                    self._session_classify_cache.items(), key=lambda x: x[1][1]
+                )
+                self._session_classify_cache = dict(items[-400:])
+        return result
+
+    def _has_code_indicators(self, content: str) -> bool:
+        if "```" in content:
+            return True
+        if re.search(
+            r"\b(def |class |import |from |function |const |let |var |#include |package |fn |func )",
+            content,
+        ):
+            return True
+        if re.search(
+            r"\b[\w\-/]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp)\b", content
+        ):
+            return True
+        return False
+
+    # --------------------------------------------------------------------------
+    # Context formatting
+    # --------------------------------------------------------------------------
+    def _format_block_context(
+        self, block: CodeBlock, is_latest: bool = False, full_body: bool = False
+    ) -> str:
+        timestamp_str = datetime.fromtimestamp(
+            block.timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        latest = " [LATEST]" if is_latest else ""
+        loc = ""
+        if block.file_path:
+            loc = f" (file: {block.file_path}"
+            if block.line_range:
+                loc += f", lines {block.line_range[0]}-{block.line_range[1]}"
+            loc += ")"
+        pin = " [PINNED]" if block.pinned else ""
+        raw = " [RAW]" if block.is_raw else ""
+        aff = " [AFFECTED BY DEPENDENCY CHANGE]" if block.potentially_affected else ""
+        show_full = full_body or block.is_raw or block.pinned
+        content = block.content if show_full else block.content[:600]
+        return (
+            f"```\n{content}\n```{loc}{latest}  "
+            f"(importance: {block.importance_score:.1f}, modified: {timestamp_str})"
+            f"{aff}{pin}{raw}"
+        )
+
+    def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        now = time.time()
+        active = []
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            if not block.is_active and self.valves.track_active_code_age:
+                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
+                    continue
+            active.append(block)
+        if not active:
+            return ""
+
+        recent_window = self.valves.recent_activity_window_minutes * 60
+        recent_files = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in recent_files
+                    or b.timestamp > recent_files[b.file_path]
+                ):
+                    recent_files[b.file_path] = b.timestamp
+        recent_lines = []
+        for file_path, ts in recent_files.items():
+            age_seconds = now - ts
+            if age_seconds <= recent_window:
+                minutes_ago = int(age_seconds / 60)
+                time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
+                recent_lines.append(f"- `{file_path}` ({time_str})")
+        recent_section = ""
+        if recent_lines:
+            recent_section = (
+                f"## Recent Activity (last {self.valves.recent_activity_window_minutes} min)\n"
+                + "\n".join(recent_lines)
+                + "\n\n"
+            )
+
+        mentioned_files = set()
+        mentioned_symbols = set()
+        if user_query:
+            mentioned_files = set(re.findall(self.valves.file_path_pattern, user_query))
+            all_symbol_names = self._symbol_index.get_all_names(project_id)
+            words = set(re.findall(r"\b[\w-]+\b", user_query))
+            mentioned_symbols = all_symbol_names.intersection(words)
+
+        BOOST = 5.0
+
+        def relevance_boost(block: CodeBlock) -> float:
+            score = 0.0
+            if block.file_path and block.file_path in mentioned_files:
+                score += BOOST
+            for sym in block.symbols:
+                if sym.name in mentioned_symbols:
+                    score += BOOST
+                    break
+            return score
+
+        boosted_active = []
+        for b in active:
+            boost = relevance_boost(b)
+            boosted_active.append((b, boost))
+        boost_priority = self.valves.raw_file_priority_boost
+        boosted_active.sort(
+            key=lambda pair: (
+                pair[1] > 0,
+                pair[1],
+                pair[0].importance_score + (boost_priority if pair[0].is_raw else 0),
+            ),
+            reverse=True,
+        )
+
+        latest_per_file = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in latest_per_file
+                    or b.timestamp > latest_per_file[b.file_path].timestamp
+                ):
+                    latest_per_file[b.file_path] = b
+        latest_hashes = {b.hash for b in latest_per_file.values()}
+
+        base_codes = [
+            b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
+        ][: self.valves.max_base_code_blocks]
+        proposed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.PROPOSED_CHANGE
+        ][: self.valves.max_proposed_changes]
+        committed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.COMMITTED_CHANGE
+        ][: self.valves.max_committed_changes]
+        errors = (
+            [b for b, _ in boosted_active if b.content_type == ContentType.ERROR][:3]
+            if self.valves.preserve_error_context
+            else []
+        )
+
+        parts = ["## Currently Active Code Context (by importance)\n"]
+        parts.insert(
+            1,
+            "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used.\n",
+        )
+        if recent_section:
+            parts.insert(0, recent_section)
+
+        if base_codes:
+            parts.append("### Base Code (current work):")
+            for b in base_codes:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if proposed:
+            parts.append("### Proposed Changes (pending review):")
+            for b in proposed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if committed:
+            parts.append("### Recently Committed Changes:")
+            for b in committed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if errors:
+            parts.append("### Recent Errors:")
+            for b in errors:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+
+        max_tokens = self.valves.active_context_max_tokens
+        if max_tokens > 0 and self.tokenizer:
+            full_text = "\n".join(parts)
+            while len(self.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3:
+                parts.pop()
+                full_text = "\n".join(parts)
+            if len(self.tokenizer.encode(full_text)) > max_tokens:
+                parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
+        return "\n".join(parts)
+
+    # --------------------------------------------------------------------------
+    # Lightweight context and symbol index
+    # --------------------------------------------------------------------------
+    async def _build_lightweight_context(self, project_id: str) -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        if project_id in self._cached_lightweight_context:
+            return self._cached_lightweight_context[project_id]
+
+        lines = ["## Code Symbol Index (full bodies available on request)\n"]
+        grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                key = sym.file_path or "unknown"
+                grouped[key].append(sym)
+
+        for file_path, syms in grouped.items():
+            lines.append(f"### {file_path}")
+            for s in sorted(syms, key=lambda x: x.name.lower()):
+                loc = (
+                    f" (lines {s.line_start}-{s.line_end})"
+                    if s.line_start and s.line_end
+                    else ""
+                )
+                calls_str = ""
+                if s.calls:
+                    calls_list = ", ".join(s.calls[:5])
+                    if len(s.calls) > 5:
+                        calls_list += f", ... (+{len(s.calls)-5} more)"
+                    calls_str = f" → calls: {calls_list}"
+                used_by = self._symbol_index.get_callers(s.name, project_id)
+                if used_by:
+                    ub_list = ", ".join(sorted(used_by)[:5])
+                    if len(used_by) > 5:
+                        ub_list += f", ... (+{len(used_by)-5} more)"
+                    used_str = f"  ← used by: {ub_list}"
+                else:
+                    used_str = ""
+                summary_str = f"  Summary: {s.summary}" if s.summary else ""
+                num_versions = len(self._symbol_index.find_blocks(s.name, project_id))
+                version_info = (
+                    f" ({num_versions} versions available)" if num_versions > 1 else ""
+                )
+                lines.append(
+                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{used_str}{summary_str}{version_info}"
+                )
+
+        lines.append("\n## Code Previews (first 10 lines of each block)\n")
+        max_preview_chars = 4000
+        chars_added = 0
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            preview = "\n".join(block.content.splitlines()[:10])
+            if chars_added + len(preview) > max_preview_chars:
+                lines.append("```\n... (previews truncated)\n```")
+                break
+            loc = f" (file: {block.file_path})" if block.file_path else ""
+            lines.append(f"### Block {block.hash[:8]}{loc}\n```\n{preview}\n```")
+            chars_added += len(preview)
+
+        lines.append(
+            "\nTo see the full body of any symbol, mention it in your message or use `/expand <name>`."
+        )
+        result = "\n".join(lines)
+        self._cached_lightweight_context[project_id] = result
+        return result
+
+    # --------------------------------------------------------------------------
+    # Active code update and mention tracking
+    # --------------------------------------------------------------------------
+    def _update_mentions_from_message(
+        self, state: Dict, message_content: str, project_id: str
+    ):
+        if not message_content:
+            return
+        all_symbol_names = self._symbol_index.get_all_names(project_id)
+        words = set(re.findall(r"\b[\w-]+\b", message_content))
+        mentioned_names = all_symbol_names.intersection(words)
+        if not mentioned_names:
+            return
+        affected_blocks: Set[str] = set()
+        for name in mentioned_names:
+            affected_blocks.update(self._symbol_index.find_blocks(name, project_id))
+        for block_hash in affected_blocks:
+            block = state["active_blocks"].get(block_hash)
+            if block:
+                block.mention_count += 1
+                block.last_mentioned = time.time()
+                block.last_mentioned_msg_idx = state["message_count"]
+                block._update_importance()
+
+    async def _update_active_code(self, message: dict, project_id: str):
+        if not self.valves.enable_code_awareness:
+            return
+
+        content = message.get("content", "")
+        role = message.get("role", "")
+
+        extracted, block_spans = await self._extract_code_blocks(content)
+        new_blocks_pending = []
+        for idx, block_info in enumerate(extracted):
+            blk_file = None
+            if self.valves.track_file_paths and block_spans:
+                blk_file = self._extract_file_path_for_block(
+                    content, block_spans[idx][0]
+                )
+            if not blk_file and len(extracted) == 1:
+                extracted_paths = self._extract_file_paths(content)
+                blk_file = extracted_paths[0] if extracted_paths else None
+            content_type = self._classify_content(content, extracted)
+            new_block = CodeBlock(
+                content=block_info["code"],
+                content_type=content_type,
+                generated_by_assistant=(role == "assistant"),
+                file_path=blk_file,
+                line_range=None,
+                timestamp=time.time(),
+                is_active=True,
+                mention_count=1,
+                dependencies=[],
+                potentially_affected=False,
+                pinned=False,
+                obsolete=False,
+                is_raw=block_info.get("is_raw", False),
+            )
+            if "[KEEP]" in content:
+                new_block.is_raw = True
+            if "[KEEP]" in content or "#important" in content.lower():
+                new_block.importance_score = 10.0
+                new_block.pinned = True
+            new_blocks_pending.append(new_block)
+
+        symbols_list = []
+        for blk in new_blocks_pending:
+            syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
+            symbols_list.append(syms)
+
+        _content_to_syms: Dict[str, List[CodeSymbol]] = {
+            blk.content: syms
+            for blk, syms in zip(new_blocks_pending, symbols_list)
+            if not isinstance(syms, Exception)
+        }
+
+        lock = await self._get_project_lock(project_id)
+        state_before = self._get_state(project_id)
+        existing_contents = {}
+        if state_before:
+            for h, b in state_before["active_blocks"].items():
+                existing_contents[h] = b.content
+
+        duplicate_info = {}
+        for new_block in new_blocks_pending:
+            is_dup = False
+            existing_dup = None
+            for h, ex_content in existing_contents.items():
+                ex_block = state_before["active_blocks"].get(h)
+                if (
+                    ex_block
+                    and self._calculate_code_similarity(new_block.content, ex_content)
+                    >= self.valves.code_similarity_threshold
+                ):
+                    is_dup = True
+                    existing_dup = h
+                    break
+            duplicate_info[new_block.hash] = (is_dup, existing_dup)
+
+        async with lock:
+            state = self._get_state(project_id)
+            self._background_task(
+                self._summarize_inactive_blocks_safely(project_id),
+                name="summarize_inactive",
+                is_llm_task=True,
+            )
+            self._update_mentions_from_message(state, content, project_id)
+            for block in state["active_blocks"].values():
+                if (
+                    block.content
+                    and self._calculate_code_similarity(
+                        block.content[:200], content[:200]
+                    )
+                    > 0.7
+                ):
+                    block.mention_count += 1
+                    block.last_mentioned = time.time()
+                    block.last_mentioned_msg_idx = state["message_count"]
+                    block._update_importance()
+
+            if not content and not new_blocks_pending:
+                return
+
+            for new_block, syms in zip(new_blocks_pending, symbols_list):
+                if isinstance(syms, Exception):
+                    syms = []
+
+                # Sanitize content before use
+                new_block.content = self._sanitize_text(new_block.content)
+
+                if self.tokenizer:
+                    new_block._cached_token_count = len(
+                        self.tokenizer.encode(new_block.content)
+                    )
+                else:
+                    new_block._cached_token_count = len(new_block.content) // 4
+
+                is_dup, existing_hash = duplicate_info.get(
+                    new_block.hash, (False, None)
+                )
+                existing = (
+                    state["active_blocks"].get(existing_hash) if existing_hash else None
+                )
+
+                if is_dup and existing:
+                    if existing.pinned or new_block.is_raw:
+                        self._symbol_index.remove_all_for_block(
+                            existing.hash, existing.symbols, project_id
+                        )
+                        prev_content = existing.content
+                        existing.content = new_block.content
+                        existing.hash = new_block.hash
+                        if new_block.file_path:
+                            existing.file_path = new_block.file_path
+                        existing.line_range = new_block.line_range
+                        existing.timestamp = time.time()
+                        existing.mention_count += 1
+                        existing.last_mentioned = time.time()
+                        existing.last_mentioned_msg_idx = state["message_count"]
+                        existing.pinned = True
+                        existing.is_raw = existing.is_raw or new_block.is_raw
+                        existing.importance_score = 10.0
+                        reused = _content_to_syms.get(new_block.content)
+                        if reused is not None:
+                            existing.symbols = [
+                                s.copy(update={"parent_block_hash": existing.hash})
+                                for s in reused
+                            ]
+                        else:
+                            existing.symbols = await SignatureExtractor.extract_async(
+                                existing.content, existing.file_path
+                            )
+                        for s in existing.symbols:
+                            s.parent_block_hash = existing.hash
+                            self._symbol_index.add(s, existing.hash, project_id)
+                        if self.tokenizer:
+                            existing._cached_token_count = len(
+                                self.tokenizer.encode(existing.content)
+                            )
+                        else:
+                            existing._cached_token_count = len(existing.content) // 4
+                        existing._update_importance()
+                        if prev_content != new_block.content:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    existing.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+                        continue
+
+                    if self.valves.prioritize_recent_code:
+                        self._symbol_index.remove_all_for_block(
+                            existing.hash, existing.symbols, project_id
+                        )
+                        prev_content = existing.content
+                        existing.content = new_block.content
+                        existing.hash = new_block.hash
+                        if new_block.file_path:
+                            existing.file_path = new_block.file_path
+                        existing.line_range = new_block.line_range
+                        existing.timestamp = time.time()
+                        existing.mention_count += 1
+                        existing.last_mentioned = time.time()
+                        existing.last_mentioned_msg_idx = state["message_count"]
+                        reused = _content_to_syms.get(new_block.content)
+                        if reused is not None:
+                            existing.symbols = [
+                                s.copy(update={"parent_block_hash": existing.hash})
+                                for s in reused
+                            ]
+                        else:
+                            existing.symbols = await SignatureExtractor.extract_async(
+                                existing.content, existing.file_path
+                            )
+                        for s in existing.symbols:
+                            s.parent_block_hash = existing.hash
+                            self._symbol_index.add(s, existing.hash, project_id)
+                        if self.tokenizer:
+                            existing._cached_token_count = len(
+                                self.tokenizer.encode(existing.content)
+                            )
+                        else:
+                            existing._cached_token_count = len(existing.content) // 4
+                        existing._update_importance()
+                        if prev_content != new_block.content:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    existing.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+                    continue
+
+                # New non-duplicate block
+                for sym in syms:
+                    sym.parent_block_hash = new_block.hash
+                new_block.symbols = syms
+                new_block.last_mentioned_msg_idx = state["message_count"]
+                for sym in syms:
+                    self._symbol_index.add(sym, new_block.hash, project_id)
+                if any(s.calls for s in syms):
+                    state["has_any_calls"] = True
+
+                is_conflicting = False
+                if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    is_conflicting = self._has_conflicting_proposed_changes(
+                        state, new_block
+                    )
+                    if is_conflicting:
+                        new_block.importance_score = max(
+                            new_block.importance_score, 7.0
+                        )
+
+                state["active_blocks"][new_block.hash] = new_block
+
+                if new_block.file_path and self.valves.enable_obsolete_marking:
+                    for h, blk in list(state["active_blocks"].items()):
+                        if h == new_block.hash:
+                            continue
+                        if blk.file_path == new_block.file_path and not blk.pinned:
+                            blk.obsolete = True
+                            blk._update_importance()
+
+                if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    if new_block.file_path:
+                        state["recent_changes"] = [
+                            c
+                            for c in state["recent_changes"]
+                            if not (
+                                c.file_path
+                                and c.file_path == new_block.file_path
+                                and c.hash != new_block.hash
+                            )
+                        ]
+                    state["recent_changes"].append(new_block)
+                    if self.valves.enable_diff_application and not is_conflicting:
+                        for base in list(state["active_blocks"].values()):
+                            if (
+                                base.content_type == ContentType.BASE_CODE
+                                and base.file_path == new_block.file_path
+                            ):
+                                if self._apply_change_with_diff(base, new_block):
+                                    state["recent_changes"] = [
+                                        c
+                                        for c in state["recent_changes"]
+                                        if c.hash != new_block.hash
+                                    ]
+                                    state["committed_changes"].append(new_block)
+                                    break
+                elif new_block.content_type == ContentType.COMMITTED_CHANGE:
+                    state["committed_changes"].append(new_block)
+                elif (
+                    new_block.content_type == ContentType.ERROR
+                    and self.valves.preserve_error_context
+                ):
+                    new_block.importance_score = min(
+                        new_block.importance_score + 3.0, 10.0
+                    )
+
+                if len(state["active_blocks"]) > self.valves.max_active_blocks:
+                    sorted_blocks = sorted(
+                        state["active_blocks"].values(),
+                        key=lambda b: b.importance_score
+                        + (self.valves.raw_file_priority_boost if b.is_raw else 0),
+                        reverse=True,
+                    )
+                    keep = sorted_blocks[: self.valves.max_active_blocks]
+                    state["active_blocks"] = {b.hash: b for b in keep}
+
+                if (
+                    self.valves.enable_dependency_tracking
+                    and new_block.content_type
+                    in (
+                        ContentType.BASE_CODE,
+                        ContentType.PROPOSED_CHANGE,
+                        ContentType.COMMITTED_CHANGE,
+                    )
+                ):
+                    self._background_task(
+                        self._refresh_dependencies_for_block(
+                            new_block.hash, project_id
+                        ),
+                        name="dependency_refresh",
+                        is_llm_task=True,
+                    )
+
+            # Assistant implicit modifications
+            if role == "assistant" and len(extracted) > 0:
+                for block_info in extracted:
+                    best_base = None
+                    best_sim = 0.0
+                    for base in state["active_blocks"].values():
+                        if base.content_type == ContentType.BASE_CODE:
+                            sim = self._calculate_code_similarity(
+                                base.content, block_info["code"]
+                            )
+                            if sim > best_sim and sim > 0.6:
+                                best_sim = sim
+                                best_base = base
+                    if best_base and best_sim > 0.5 and best_sim < 0.98:
+                        self._symbol_index.remove_all_for_block(
+                            best_base.hash, best_base.symbols, project_id
+                        )
+                        prev_content = best_base.content
+                        best_base.content = self._sanitize_text(block_info["code"])
+                        best_base.hash = hashlib.md5(
+                            block_info["code"].encode()
+                        ).hexdigest()[:16]
+                        best_base.timestamp = time.time()
+                        best_base.is_active = True
+                        best_base.potentially_affected = False
+                        best_base.importance_score = min(
+                            best_base.importance_score + 1.0, 10.0
+                        )
+                        reused = _content_to_syms.get(block_info["code"])
+                        if reused is not None:
+                            best_base.symbols = [
+                                s.copy(update={"parent_block_hash": best_base.hash})
+                                for s in reused
+                            ]
+                        else:
+                            best_base.symbols = await SignatureExtractor.extract_async(
+                                best_base.content, best_base.file_path
+                            )
+                        for s in best_base.symbols:
+                            s.parent_block_hash = best_base.hash
+                            self._symbol_index.add(s, best_base.hash, project_id)
+                        if self.tokenizer:
+                            best_base._cached_token_count = len(
+                                self.tokenizer.encode(best_base.content)
+                            )
+                        else:
+                            best_base._cached_token_count = len(best_base.content) // 4
+                        if any(s.calls for s in best_base.symbols):
+                            state["has_any_calls"] = True
+                        if prev_content != block_info["code"]:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    best_base.hash, prev_content, block_info["code"]
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    best_base.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+
+            state["message_count"] += 1
+            if self.valves.auto_remove_duplicate_blocks:
+                self._remove_duplicate_blocks(state, project_id)
+            if self.valves.hierarchical_compression_enabled:
+                if (
+                    state["message_count"]
+                    % self.valves.hierarchical_compression_interval_messages
+                    == 0
+                ):
+                    self._background_task(
+                        self._hierarchical_compress(project_id, state),
+                        name="hierarchical_compress",
+                        is_llm_task=True,
+                    )
+            self._background_task(
+                self._expire_blocks_by_time(project_id), name="expire_blocks"
+            )
+            self._background_task(
+                self._clean_affected_flags(project_id), name="clean_affected_flags"
+            )
+            if self.valves.enable_auto_summaries:
+                self._background_task(
+                    self._generate_missing_summaries(project_id),
+                    name="generate_missing_summaries",
+                    is_llm_task=True,
+                )
+            self._invalidate_lightweight_cache(project_id)
+            self._set_state(project_id, state)
+
+    # --------------------------------------------------------------------------
     # LTM storage and retrieval
     # --------------------------------------------------------------------------
     def _is_symbol_indexable(self, symbol: CodeSymbol) -> bool:
@@ -2331,11 +3739,7 @@ class Filter:
 
             if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
                 rerank_k = min(
-                    (
-                        self.valves.reranker_top_k
-                        if self.valves.reranker_top_k > 0
-                        else self.valves.long_term_memory_top_k
-                    ),
+                    (self.valves.reranker_top_k or self.valves.long_term_memory_top_k),
                     50,
                 )
                 docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
@@ -4260,6 +5664,46 @@ class Filter:
             )
             return body
 
+        # ── /speculative_stats ──
+        if (
+            last_user_msg
+            and last_user_msg.get("content", "").strip() == "/speculative_stats"
+            and self.valves.speculative_stats_command_enabled
+        ):
+            state = self._get_state(project_id)
+            stats = state.get("speculative_missed_stats", {})
+            lines = []
+            if self.valves.speculative_adaptive:
+                limit = state.get(
+                    "speculative_preload_limit",
+                    self.valves.speculative_preload_max_dependencies,
+                )
+                lines.append(
+                    f"Current speculative preload limit: {limit} (max {self.valves.speculative_max_limit})"
+                )
+            if not stats or stats.get("total", 0) == 0:
+                lines.append("No speculative miss data yet.")
+            else:
+                lines.append(f"Total missed opportunities: {stats['total']}")
+                details = stats.get("details", {})
+                if details:
+                    sorted_syms = sorted(
+                        details.items(), key=lambda x: x[1]["count"], reverse=True
+                    )
+                    lines.append("Most requested symbols:")
+                    for sym, data in sorted_syms[:10]:
+                        lines.append(f"- {sym}: {data['count']} times")
+            response = "\n".join(lines)
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            messages = self._ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            _inlet_timing("total_inlet", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
+            return body
+
         # ======================================================================
         # Per‑request tracking for graceful STOP cancellation
         # ======================================================================
@@ -4938,6 +6382,90 @@ class Filter:
                     state,
                 )
 
+        # Speculative miss logging and adaptive feedback
+        if self.valves.speculative_log_missed_opportunities:
+            last_assistant = next(
+                (m for m in reversed(messages) if m.get("role") == "assistant"), None
+            )
+            if last_assistant:
+                requested = self._extract_requested_symbols(
+                    last_assistant.get("content", "")
+                )
+                if requested:
+                    existing = set()
+                    for sym in requested:
+                        if self._symbol_index.find_blocks(sym, project_id):
+                            existing.add(sym)
+                    if existing:
+                        stats = state.setdefault(
+                            "speculative_missed_stats", {"total": 0, "details": {}}
+                        )
+                        stats["total"] += len(existing)
+                        for sym in existing:
+                            sym_stats = stats["details"].setdefault(sym, {"count": 0})
+                            sym_stats["count"] += 1
+                        self._set_state(project_id, state)
+                        self._log_debug(
+                            f"Missed opportunities: assistant asked for {existing}"
+                        )
+
+        if self.valves.speculative_adaptive and self.valves.speculative_preload_enabled:
+            last_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user:
+                last_preload_turn = state.get("speculative_last_preload_turn", 0)
+                last_preloaded = state.get("speculative_last_preloaded_symbols", set())
+                if state["message_count"] == last_preload_turn + 1:
+                    assistant_response = next(
+                        (m for m in reversed(messages) if m.get("role") == "assistant"),
+                        None,
+                    )
+                    if assistant_response:
+                        requested = self._extract_requested_symbols(
+                            assistant_response.get("content", "")
+                        )
+                        if requested:
+                            hit = last_preloaded.intersection(requested)
+                            if hit:
+                                new_limit = min(
+                                    state.get(
+                                        "speculative_preload_limit",
+                                        self.valves.speculative_preload_max_dependencies,
+                                    )
+                                    + self.valves.speculative_boost_on_miss,
+                                    self.valves.speculative_max_limit,
+                                )
+                                state["speculative_preload_limit"] = new_limit
+                                state["speculative_ignored_turns"] = 0
+                                state["speculative_last_preloaded_symbols"] = set()
+                                self._log_debug(
+                                    f"Speculative preload hit: {hit}. Boosted limit to {new_limit}."
+                                )
+                            else:
+                                state["speculative_ignored_turns"] += 1
+                        else:
+                            state["speculative_ignored_turns"] += 1
+                    else:
+                        state["speculative_ignored_turns"] += 1
+                else:
+                    pass
+
+                ignore_threshold = self.valves.speculative_decay_after_ignored_turns
+                if state.get("speculative_ignored_turns", 0) >= ignore_threshold:
+                    current_limit = state.get(
+                        "speculative_preload_limit",
+                        self.valves.speculative_preload_max_dependencies,
+                    )
+                    new_limit = max(current_limit - 1, 0)
+                    if new_limit != current_limit:
+                        state["speculative_preload_limit"] = new_limit
+                        state["speculative_ignored_turns"] = 0
+                        self._log_debug(
+                            f"Speculative limit decayed to {new_limit} after {ignore_threshold} ignored turns."
+                        )
+                self._set_state(project_id, state)
+
         asyncio.create_task(self._purge_expired_memories())
 
         self._write_counter += 1
@@ -4989,7 +6517,11 @@ class Filter:
             and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
-        for task_list in [self._dependency_tasks]:
+        for task_list in [
+            self._hierarchical_compress_tasks,
+            self._summarize_tasks,
+            self._dependency_tasks,
+        ]:
             for task in task_list:
                 task.cancel()
         self._symbol_index.clear()
@@ -4997,6 +6529,10 @@ class Filter:
         self._project_locks.clear()
 
     def _cleanup_completed_tasks(self):
+        self._hierarchical_compress_tasks = [
+            t for t in self._hierarchical_compress_tasks if not t.done()
+        ]
+        self._summarize_tasks = [t for t in self._summarize_tasks if not t.done()]
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
@@ -5110,6 +6646,145 @@ class Filter:
                 any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
             )
             self._invalidate_lightweight_cache(project_id)
+
+    async def _hierarchical_compress(self, project_id: str, state: Dict):
+        if self._hierarchical_compress_in_progress.get(project_id, False):
+            return
+        self._hierarchical_compress_in_progress[project_id] = True
+        try:
+            if (
+                not self.valves.hierarchical_compression_enabled
+                or not self.memory_collection
+            ):
+                return
+            last_ts = state.get("last_compression_timestamp", 0)
+            if time.time() - last_ts < 3600:
+                return
+
+            now = time.time()
+            where_filter = {
+                "$and": [
+                    {"project_id": {"$eq": project_id}},
+                    {"is_hierarchical_summary": {"$ne": True}},
+                    {"timestamp": {"$lt": now}},
+                ]
+            }
+            results = await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.get(
+                    where=where_filter,
+                    include=["documents", "metadatas", "ids"],
+                    limit=self.valves.hierarchical_compression_interval_messages * 2,
+                )
+            )
+            if (
+                not results
+                or not results["ids"]
+                or len(results["ids"])
+                < self.valves.hierarchical_compression_interval_messages
+            ):
+                return
+
+            pairs = sorted(
+                zip(results["ids"], results["documents"], results["metadatas"]),
+                key=lambda x: x[2].get("timestamp", 0),
+            )
+            to_compress = pairs[
+                : self.valves.hierarchical_compression_interval_messages
+            ]
+
+            max_chars = 4000
+            prompt_template = (
+                "Summarise the following conversation segment, keeping key technical "
+                "decisions and code changes:\n\n{text}"
+            )
+            overhead = len(prompt_template.format(text=""))
+
+            batches = []
+            current_batch = []
+            current_len = 0
+            for entry in to_compress:
+                entry_len = len(entry[1])
+                if current_len + entry_len > max_chars - overhead and current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_len = 0
+                current_batch.append(entry)
+                current_len += entry_len
+            if current_batch:
+                batches.append(current_batch)
+
+            model = (
+                self.valves.hierarchical_summary_model
+                or self.valves.llm_model
+                or self.valves.summarization_model
+            )
+            summaries = []
+            ids_to_delete = []
+
+            for batch in batches:
+                texts = "\n---\n".join([doc for _, doc, _ in batch])
+                prompt = prompt_template.format(text=texts[: max_chars - overhead])
+                summary = await self._call_llm(
+                    prompt=prompt,
+                    system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
+                    model_override=model,
+                    max_tokens=self.valves.hierarchical_summary_max_tokens,
+                    temperature=0.2,
+                )
+                if not summary:
+                    self._log_debug(
+                        "Hierarchical compression aborted: LLM failed to generate summary"
+                    )
+                    return
+                summaries.append(summary)
+                ids_to_delete.extend([id for id, _, _ in batch])
+
+            if not summaries:
+                return
+
+            combined_summary = "\n---\n".join(summaries)
+            if len(combined_summary) > 4000:
+                combined_summary = combined_summary[:4000] + "\n[summary truncated]"
+
+            try:
+                summary_embedding = await anyio.to_thread.run_sync(
+                    lambda: self.embedder.encode(combined_summary).tolist()
+                )
+            except Exception as e:
+                self._log_debug(
+                    f"Failed to generate embedding for hierarchical summary: {e}"
+                )
+                return
+
+            summary_id = f"{project_id}_hierarchical_{int(time.time())}"
+            await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.delete(ids=ids_to_delete)
+            )
+            await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.upsert(
+                    ids=[summary_id],
+                    embeddings=[summary_embedding],
+                    metadatas=[
+                        {
+                            "role": "assistant",
+                            "project_id": project_id,
+                            "timestamp": time.time(),
+                            "is_hierarchical_summary": True,
+                            "summary_level": 1,
+                        }
+                    ],
+                    documents=[f"[Hierarchical summary]\n{combined_summary}"],
+                )
+            )
+
+            state["last_compression_timestamp"] = time.time()
+            self._set_state(project_id, state)
+            self._log_debug(f"Hierarchical compression completed for {project_id}")
+
+        except Exception as e:
+            self._log_debug(f"Error in hierarchical_compress: {e}")
+        finally:
+            self._hierarchical_compress_in_progress[project_id] = False
 
     # --------------------------------------------------------------------------
     # Dependency tracking
