@@ -1236,6 +1236,16 @@ class Filter:
             description="Max concurrent LLM calls for deferred secondary tasks.",
         )
 
+        # ───── Symbol analysis ─────
+        symbol_analysis_model: str = Field(
+            default="llama-3.2-3b-instruct-q4_k_m",
+            description="Fast model used for per‑symbol analysis. Keep it light.",
+        )
+        symbol_analysis_max_retries: int = Field(
+            default=5,
+            description="Max attempts per symbol before giving up.",
+        )
+
     def __init__(self):
         # ──── Valves and basic objects ────
         self.valves = self.Valves()
@@ -8846,15 +8856,21 @@ class Filter:
             "OUTPUT:"
         )
 
-        model = self.valves.multi_call_model or self.valves.smart_pre_expand_model
+        # Use the fast model for per‑symbol analysis
+        model = (
+            self.valves.symbol_analysis_model
+            or self.valves.multi_call_model
+            or self.valves.smart_pre_expand_model
+        )
         semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
 
+        max_retries = self.valves.symbol_analysis_max_retries
         parsed_fresh = []
         for idx in fresh_indices:
             name, ctx = symbol_contexts[idx]
             success = False
 
-            for attempt in range(3):
+            for attempt in range(max_retries):
                 if attempt == 0:
                     prompt = prompt_template_full.format(context=ctx)
                 elif attempt == 1:
@@ -8862,7 +8878,7 @@ class Filter:
                     ctx_clean = ctx.split("\nBody preview:\n")[0]
                     prompt = prompt_template_no_body.format(context=ctx_clean)
                 else:
-                    # Third attempt: signature only
+                    # Third and subsequent attempts: signature only
                     ctx_sig = ctx.split("\n")[0]  # first line is Symbol: ...
                     prompt = prompt_template_no_body.format(context=ctx_sig)
 
@@ -8890,7 +8906,9 @@ class Filter:
                     break
 
             if not success:
-                self._log_debug(f"Symbol analysis failed for {name} after 3 attempts")
+                self._log_debug(
+                    f"Symbol analysis failed for {name} after {max_retries} attempts"
+                )
 
         # Combine cached and fresh
         all_parsed = cached_results + parsed_fresh
