@@ -1487,44 +1487,6 @@ class Filter:
         async with lock:
             await self._save_state_to_db(project_id, state)
 
-    async def _save_state_to_db(self, project_id: str, state: Dict):
-        active_blocks_meta = {}
-        for k, v in state["active_blocks"].items():
-            d = v.dict()
-            d["content_type"] = v.content_type.value
-            content_hash = v.hash
-            await anyio.to_thread.run_sync(
-                lambda: self._db_conn.execute(
-                    "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
-                    (content_hash, v.content, time.time()),
-                )
-            )
-            d["content"] = f"@@hash:{content_hash}"
-            active_blocks_meta[k] = d
-
-        serializable = {
-            "active_blocks": active_blocks_meta,
-            "recent_changes": [b.dict() for b in state["recent_changes"]],
-            "committed_changes": [b.dict() for b in state["committed_changes"]],
-            "feedback_history": [fb.dict() for fb in state["feedback_history"]],
-            "message_count": state["message_count"],
-            "last_compression_timestamp": state.get("last_compression_timestamp", 0),
-            "response_cache": state.get("response_cache", []),
-            "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
-            "last_cleanup_suggestion_msg_idx": state.get(
-                "last_cleanup_suggestion_msg_idx", 0
-            ),
-            "has_any_calls": state.get("has_any_calls", False),
-            "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
-        }
-        await anyio.to_thread.run_sync(
-            lambda: self._db_conn.execute(
-                "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
-                (project_id, json.dumps(serializable), time.time()),
-            )
-        )
-        await anyio.to_thread.run_sync(lambda: self._db_conn.commit())
-
     def _load_state_from_db(self, project_id: str) -> Optional[Dict]:
         cur = self._db_conn.execute(
             "SELECT state_json FROM conversation_state WHERE project_id = ?",
