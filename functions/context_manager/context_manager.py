@@ -2487,8 +2487,12 @@ class Filter:
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         blocks = []
         spans = []
+        tree_sitter_error = None  # Store exception in case all methods fail
+
         if not self.valves.auto_detect_code_blocks:
             return blocks, spans
+
+        # 1. Try tree‑sitter first (save error for later if it fails)
         if HAS_TREE_SITTER:
             try:
                 config = ProcessConfig()
@@ -2500,19 +2504,12 @@ class Filter:
                     raw = content[start:end].strip()
                     lang = tsb.language or "text"
 
-                    if lang == "text" or lang == "":
+                    if lang in ("text", ""):
                         guessed = SignatureExtractor._guess_language(None, raw)
                         if guessed != "unknown":
                             lang = guessed
-                            self._log_debug(
-                                f"[LangDetect] method=extension_heuristic, result={lang}, dur=0.000s (block inside tree-sitter)"
-                            )
                         else:
                             lang = await self._infer_code_language(raw)
-                            if lang == "unknown":
-                                self._log_debug(
-                                    "LLM language detection also failed; block will be treated as generic text"
-                                )
 
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
@@ -2525,7 +2522,6 @@ class Filter:
                         code = raw
                         block_type = "indented"
 
-                    # Oversized handling only for normal blocks (not for raw detection)
                     code = await self._handle_oversized_code_block(code, lang)
                     blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
@@ -2534,12 +2530,18 @@ class Filter:
                     return blocks, spans
 
             except Exception as e:
-                if "Language '' not available" not in str(e):
-                    self._log_debug(
-                        f"Tree‑sitter extraction unexpectedly failed, using regex fallback: {e}"
+                # Ignore known empty-language download errors silently
+                if not any(
+                    msg in str(e)
+                    for msg in (
+                        "Language '' not available",
+                        "Language '' not available for download",
+                        "Download error: Language ''",
                     )
+                ):
+                    tree_sitter_error = e  # Save it, don't log yet
 
-        # ====== Fallback por regex, movido a ejecutor ======
+        # 2. Regex fallback (always runs if tree‑sitter produced no blocks)
         def _regex_fallback(content):
             blocks, spans = [], []
             for match in self.code_pattern.finditer(content):
@@ -2547,6 +2549,7 @@ class Filter:
                 code = match.group(2).strip()
                 blocks.append({"language": lang, "code": code, "type": "fenced"})
                 spans.append((match.start(), match.end()))
+
             # Indented blocks
             lines = content.split("\n")
             line_offsets = [0]
@@ -2582,13 +2585,13 @@ class Filter:
 
         blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
 
-        # ---- Oversized handling for regex blocks ----
+        # Oversized handling for regex blocks
         for i in range(len(blocks)):
             blocks[i]["code"] = await self._handle_oversized_code_block(
                 blocks[i]["code"], blocks[i]["language"]
             )
 
-        # ---- Fallback: raw code detection via LLM when no blocks were found ----
+        # 3. Raw code detection if nothing was found by regex
         if (
             not blocks
             and self.valves.enable_raw_code_detection
@@ -2598,7 +2601,6 @@ class Filter:
             lang = await self._infer_code_language(content)
             dur_raw = time.monotonic() - t_raw_start
             if lang != "unknown":
-                # Mark as raw so the full body is preserved during injection
                 blocks.append(
                     {
                         "language": lang,
@@ -2615,7 +2617,13 @@ class Filter:
                 self._log_debug(
                     f"Raw code detection failed (unknown language). Detection took {dur_raw:.3f}s."
                 )
-        # ---- end fallback ----
+
+        # 4. If still no blocks and we had a tree‑sitter error, show it now
+        if not blocks and tree_sitter_error is not None:
+            self._log_debug(
+                f"All extraction methods failed. Tree‑sitter error: {tree_sitter_error}"
+            )
+
         return blocks, spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
