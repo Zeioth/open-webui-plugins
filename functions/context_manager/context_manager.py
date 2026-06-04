@@ -1033,7 +1033,7 @@ class Filter:
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=1, ge=1, le=10)
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
         llm_request_timeout: int = Field(default=300)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
@@ -6134,6 +6134,10 @@ class Filter:
             if final_system.strip():
                 messages.insert(0, {"role": "system", "content": final_system})
 
+            # ── FIX: re‑capture system_msgs & history_msgs after injection ──
+            system_msgs = [m for m in messages if m.get("role") == "system"]
+            history_msgs = [m for m in messages if m.get("role") != "system"]
+
             # ── Debug: print full injected context if enabled ──
             if self.valves.debug_context:
                 self._log_debug("── BEGIN INJECTED CONTEXT ──")
@@ -7048,14 +7052,16 @@ class Filter:
     _symbol_analysis_cache: Dict[Tuple[str, str], Dict] = {}
     _MAX_SYMBOL_ANALYSIS_CACHE = 1000
 
+    # Generic cache (question‑agnostic) – keyed by (symbol_name, content_hash)
+    _symbol_analysis_generic_cache: Dict[Tuple[str, str], Dict] = {}
+
     def _get_cached_symbol_analysis(
         self, symbol_name: str, question_hash: str, content_hash: str = ""
     ) -> Optional[Dict]:
         """Retrieve cached analysis for a symbol (memory + DB), invalidating if content changed."""
         key = (symbol_name, question_hash)
-        # Memory cache first
+        # Memory cache first (question‑specific)
         if key in self._symbol_analysis_cache:
-            # If caller provides a content_hash, validate it against DB
             if content_hash:
                 row = self._db_conn.execute(
                     "SELECT content_hash FROM symbol_analysis_cache "
@@ -7063,7 +7069,6 @@ class Filter:
                     (self.valves.project_id, symbol_name, question_hash),
                 ).fetchone()
                 if row and row[0] != content_hash:
-                    # Content changed → invalidate
                     del self._symbol_analysis_cache[key]
                     self._db_conn.execute(
                         "DELETE FROM symbol_analysis_cache "
@@ -7074,7 +7079,12 @@ class Filter:
                     return None
             return self._symbol_analysis_cache[key]
 
-        # Fallback: DB lookup
+        # Fallback: generic cache (question‑agnostic)
+        generic_key = (symbol_name, content_hash) if content_hash else None
+        if generic_key and generic_key in self._symbol_analysis_generic_cache:
+            return self._symbol_analysis_generic_cache[generic_key]
+
+        # DB lookup (question‑specific)
         row = self._db_conn.execute(
             "SELECT result_json, content_hash FROM symbol_analysis_cache "
             "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
@@ -7083,7 +7093,6 @@ class Filter:
         if row:
             result_json, stored_content_hash = row
             if content_hash and stored_content_hash != content_hash:
-                # Content changed → delete stale entry
                 self._db_conn.execute(
                     "DELETE FROM symbol_analysis_cache "
                     "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
@@ -7093,7 +7102,6 @@ class Filter:
                 return None
             try:
                 result = json.loads(result_json)
-                # Promote to memory cache
                 if len(self._symbol_analysis_cache) < self._MAX_SYMBOL_ANALYSIS_CACHE:
                     self._symbol_analysis_cache[key] = result
                 return result
@@ -7104,14 +7112,24 @@ class Filter:
     def _set_cached_symbol_analysis(
         self, symbol_name: str, question_hash: str, result: Dict, content_hash: str = ""
     ):
-        """Store analysis in memory + DB."""
+        """Store analysis in memory + DB, and also in the generic cache."""
         key = (symbol_name, question_hash)
-        # Memory cache (with eviction)
+        # Memory cache (question‑specific)
         if len(self._symbol_analysis_cache) >= self._MAX_SYMBOL_ANALYSIS_CACHE:
             oldest = next(iter(self._symbol_analysis_cache))
             del self._symbol_analysis_cache[oldest]
         self._symbol_analysis_cache[key] = result
-        # DB persistence
+
+        # Generic cache (question‑agnostic)
+        if content_hash:
+            generic_key = (symbol_name, content_hash)
+            # Keep generic cache size under a limit (e.g., 2000 entries)
+            if len(self._symbol_analysis_generic_cache) >= 2000:
+                oldest = next(iter(self._symbol_analysis_generic_cache))
+                del self._symbol_analysis_generic_cache[oldest]
+            self._symbol_analysis_generic_cache[generic_key] = result
+
+        # DB persistence (question‑specific)
         project_id = self.valves.project_id
         result_json = json.dumps(result)
         self._db_conn.execute(
