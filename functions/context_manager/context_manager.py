@@ -5472,6 +5472,9 @@ class Filter:
     # --------------------------------------------------------------------------
     # Inlet method
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Inlet method
+    # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -5892,6 +5895,7 @@ class Filter:
                     )
                     if summary:
                         system_injections.append(("critical", summary))
+                    # Always inject suggested symbols when available
                     if suggested:
                         suggested_blocks = self._get_blocks_for_symbols(
                             list(suggested), project_id
@@ -5899,8 +5903,9 @@ class Filter:
                         if suggested_blocks:
                             extra_lines = []
                             tokens_used = 0
-                            max_sugg_tokens = (
-                                self.valves.multi_call_suggested_max_tokens
+                            max_sugg_tokens = min(
+                                self.valves.active_context_max_tokens or 3000,
+                                3000,
                             )
                             for blk in suggested_blocks[:5]:
                                 bt = blk._cached_token_count
@@ -6089,7 +6094,8 @@ class Filter:
 
             # Generate CoT
             reasoning = None
-            _model_ctx = self.valves.multi_call_chunk_max_tokens or 28000
+            # Use active_context_max_tokens instead of removed multi_call_chunk_max_tokens
+            _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
                 _prelim_tokens = len(self.tokenizer.encode(prelim_system))
@@ -7526,8 +7532,8 @@ class Filter:
         # Use the fast model for per‑symbol analysis
         model = (
             self.valves.symbol_analysis_model
-            or self.valves.multi_call_model
             or self.valves.smart_pre_expand_model
+            or self.valves.llm_model
         )
         semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
 
@@ -7681,7 +7687,7 @@ class Filter:
             "Keep the response under 1500 tokens. No code snippets."
         )
 
-        model = self.valves.multi_call_synthesis_model
+        model = self.valves.symbol_analysis_model or self.valves.llm_model
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a senior software architect summarizing code analysis.",
