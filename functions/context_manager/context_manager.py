@@ -824,6 +824,10 @@ class Filter:
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
+        debug_context: bool = Field(
+            default=False,
+            description="Print the full system message content at the end of the inlet for debugging.",
+        )
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
@@ -1100,18 +1104,6 @@ class Filter:
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
 
-        # ─── Speculative Preload ───
-        speculative_log_missed_opportunities: bool = Field(default=True)
-        speculative_preload_enabled: bool = Field(default=False)
-        speculative_preload_max_tokens_percent: float = Field(default=0.10)
-        speculative_preload_max_dependencies: int = Field(default=2)
-        speculative_preload_min_callers: int = Field(default=1)
-        speculative_adaptive: bool = Field(default=False)
-        speculative_max_limit: int = Field(default=5)
-        speculative_boost_on_miss: float = Field(default=1.0)
-        speculative_decay_after_ignored_turns: int = Field(default=3)
-        speculative_stats_command_enabled: bool = Field(default=True)
-
         # ─── Raw File Priority Boost ───
         raw_file_priority_boost: float = Field(default=2.0)
 
@@ -1192,12 +1184,6 @@ class Filter:
             "response_cache": [],
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
-            "speculative_missed_stats": {"total": 0, "details": {}},
-            "speculative_preload_limit": None,
-            "speculative_miss_count_since_last_boost": 0,
-            "speculative_ignored_turns": 0,
-            "speculative_last_preloaded_symbols": set(),
-            "speculative_last_preload_turn": 0,
             "pending_secondary_tasks": [],
         }
 
@@ -1468,20 +1454,6 @@ class Filter:
             "last_cleanup_suggestion_msg_idx": state.get(
                 "last_cleanup_suggestion_msg_idx", 0
             ),
-            "speculative_missed_stats": state.get(
-                "speculative_missed_stats", {"total": 0, "details": {}}
-            ),
-            "speculative_preload_limit": state.get("speculative_preload_limit"),
-            "speculative_miss_count_since_last_boost": state.get(
-                "speculative_miss_count_since_last_boost", 0
-            ),
-            "speculative_ignored_turns": state.get("speculative_ignored_turns", 0),
-            "speculative_last_preloaded_symbols": list(
-                state.get("speculative_last_preloaded_symbols", set())
-            ),
-            "speculative_last_preload_turn": state.get(
-                "speculative_last_preload_turn", 0
-            ),
             "has_any_calls": state.get("has_any_calls", False),
             "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
         }
@@ -1520,12 +1492,6 @@ class Filter:
                 ),
             )
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
-        data.setdefault("speculative_missed_stats", {"total": 0, "details": {}})
-        data.setdefault("speculative_preload_limit", None)
-        data.setdefault("speculative_miss_count_since_last_boost", 0)
-        data.setdefault("speculative_ignored_turns", 0)
-        data.setdefault("speculative_last_preloaded_symbols", set())
-        data.setdefault("speculative_last_preload_turn", 0)
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             try:
@@ -1589,20 +1555,6 @@ class Filter:
             "has_any_calls": data.get("has_any_calls", False),
             "last_cleanup_suggestion_msg_idx": data.get(
                 "last_cleanup_suggestion_msg_idx", 0
-            ),
-            "speculative_missed_stats": data.get(
-                "speculative_missed_stats", {"total": 0, "details": {}}
-            ),
-            "speculative_preload_limit": data.get("speculative_preload_limit"),
-            "speculative_miss_count_since_last_boost": data.get(
-                "speculative_miss_count_since_last_boost", 0
-            ),
-            "speculative_ignored_turns": data.get("speculative_ignored_turns", 0),
-            "speculative_last_preloaded_symbols": set(
-                data.get("speculative_last_preloaded_symbols", [])
-            ),
-            "speculative_last_preload_turn": data.get(
-                "speculative_last_preload_turn", 0
             ),
             "pending_secondary_tasks": data.get("pending_secondary_tasks", []),
         }
@@ -3450,29 +3402,6 @@ class Filter:
                     name="generate_missing_summaries",
                     is_llm_task=True,
                 )
-
-            # ── Session summary (autobiographical mini‑memory) ──
-            if self.valves.enable_session_summary:
-                interval = self.valves.session_summary_interval_messages
-                if (
-                    interval > 0
-                    and state["message_count"] % interval == 0
-                    and state["message_count"] > 0
-                ):
-                    task = SecondaryTask(
-                        task_type="session_summary",
-                        params={
-                            "project_id": project_id,
-                            "message_count": state["message_count"],
-                            "code_state_hash": self._compute_code_state_hash(
-                                project_id
-                            ),
-                        },
-                    )
-                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
-
-            self._invalidate_lightweight_cache(project_id)
-            self._set_state(project_id, state)
 
             # ── Session summary (autobiographical mini‑memory) ──
             if self.valves.enable_session_summary:
@@ -5740,46 +5669,6 @@ class Filter:
             )
             return body
 
-        # ── /speculative_stats ──
-        if (
-            last_user_msg
-            and last_user_msg.get("content", "").strip() == "/speculative_stats"
-            and self.valves.speculative_stats_command_enabled
-        ):
-            state = self._get_state(project_id)
-            stats = state.get("speculative_missed_stats", {})
-            lines = []
-            if self.valves.speculative_adaptive:
-                limit = state.get(
-                    "speculative_preload_limit",
-                    self.valves.speculative_preload_max_dependencies,
-                )
-                lines.append(
-                    f"Current speculative preload limit: {limit} (max {self.valves.speculative_max_limit})"
-                )
-            if not stats or stats.get("total", 0) == 0:
-                lines.append("No speculative miss data yet.")
-            else:
-                lines.append(f"Total missed opportunities: {stats['total']}")
-                details = stats.get("details", {})
-                if details:
-                    sorted_syms = sorted(
-                        details.items(), key=lambda x: x[1]["count"], reverse=True
-                    )
-                    lines.append("Most requested symbols:")
-                    for sym, data in sorted_syms[:10]:
-                        lines.append(f"- {sym}: {data['count']} times")
-            response = "\n".join(lines)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
-
         # ======================================================================
         # Per‑request tracking for graceful STOP cancellation
         # ======================================================================
@@ -6245,6 +6134,14 @@ class Filter:
             if final_system.strip():
                 messages.insert(0, {"role": "system", "content": final_system})
 
+            # ── Debug: print full injected context if enabled ──
+            if self.valves.debug_context:
+                self._log_debug("── BEGIN INJECTED CONTEXT ──")
+                for m in messages:
+                    if m.get("role") == "system":
+                        self._log_debug(m.get("content", ""))
+                self._log_debug("── END INJECTED CONTEXT ──")
+
             if self.valves.debug:
                 total_system_tokens = 0
                 for m in messages:
@@ -6504,90 +6401,6 @@ class Filter:
                     context_hash,
                     state,
                 )
-
-        # Speculative miss logging and adaptive feedback
-        if self.valves.speculative_log_missed_opportunities:
-            last_assistant = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"), None
-            )
-            if last_assistant:
-                requested = self._extract_requested_symbols(
-                    last_assistant.get("content", "")
-                )
-                if requested:
-                    existing = set()
-                    for sym in requested:
-                        if self._symbol_index.find_blocks(sym, project_id):
-                            existing.add(sym)
-                    if existing:
-                        stats = state.setdefault(
-                            "speculative_missed_stats", {"total": 0, "details": {}}
-                        )
-                        stats["total"] += len(existing)
-                        for sym in existing:
-                            sym_stats = stats["details"].setdefault(sym, {"count": 0})
-                            sym_stats["count"] += 1
-                        self._set_state(project_id, state)
-                        self._log_debug(
-                            f"Missed opportunities: assistant asked for {existing}"
-                        )
-
-        if self.valves.speculative_adaptive and self.valves.speculative_preload_enabled:
-            last_user = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
-            )
-            if last_user:
-                last_preload_turn = state.get("speculative_last_preload_turn", 0)
-                last_preloaded = state.get("speculative_last_preloaded_symbols", set())
-                if state["message_count"] == last_preload_turn + 1:
-                    assistant_response = next(
-                        (m for m in reversed(messages) if m.get("role") == "assistant"),
-                        None,
-                    )
-                    if assistant_response:
-                        requested = self._extract_requested_symbols(
-                            assistant_response.get("content", "")
-                        )
-                        if requested:
-                            hit = last_preloaded.intersection(requested)
-                            if hit:
-                                new_limit = min(
-                                    state.get(
-                                        "speculative_preload_limit",
-                                        self.valves.speculative_preload_max_dependencies,
-                                    )
-                                    + self.valves.speculative_boost_on_miss,
-                                    self.valves.speculative_max_limit,
-                                )
-                                state["speculative_preload_limit"] = new_limit
-                                state["speculative_ignored_turns"] = 0
-                                state["speculative_last_preloaded_symbols"] = set()
-                                self._log_debug(
-                                    f"Speculative preload hit: {hit}. Boosted limit to {new_limit}."
-                                )
-                            else:
-                                state["speculative_ignored_turns"] += 1
-                        else:
-                            state["speculative_ignored_turns"] += 1
-                    else:
-                        state["speculative_ignored_turns"] += 1
-                else:
-                    pass
-
-                ignore_threshold = self.valves.speculative_decay_after_ignored_turns
-                if state.get("speculative_ignored_turns", 0) >= ignore_threshold:
-                    current_limit = state.get(
-                        "speculative_preload_limit",
-                        self.valves.speculative_preload_max_dependencies,
-                    )
-                    new_limit = max(current_limit - 1, 0)
-                    if new_limit != current_limit:
-                        state["speculative_preload_limit"] = new_limit
-                        state["speculative_ignored_turns"] = 0
-                        self._log_debug(
-                            f"Speculative limit decayed to {new_limit} after {ignore_threshold} ignored turns."
-                        )
-                self._set_state(project_id, state)
 
         asyncio.create_task(self._purge_expired_memories())
 
