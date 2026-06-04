@@ -936,14 +936,6 @@ class Filter:
         smart_context_min_tokens: int = Field(default=1024)
         smart_context_include_last_user: bool = Field(default=True)
 
-        # ─── Hierarchical Compression ───
-        hierarchical_compression_enabled: bool = Field(default=False)
-        hierarchical_compression_interval_messages: int = Field(default=100)
-        hierarchical_summary_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
-        )
-        hierarchical_summary_max_tokens: int = Field(default=800)
-
         # ─── Duplicate Blocks & Frequency ───
         auto_remove_duplicate_blocks: bool = Field(default=True)
         max_duplicate_age_hours: float = Field(default=6.0)
@@ -1141,6 +1133,24 @@ class Filter:
             description="Max tokens for the synthesized summary of symbol analysis.",
         )
 
+        # ─── Session summaries (autobiographical mini‑memory) ───
+        enable_session_summary: bool = Field(
+            default=True,
+            description="Generate an autobiographical session summary every N turns and store it in LTM.",
+        )
+        session_summary_interval_messages: int = Field(
+            default=8,
+            description="How many messages between session summaries.",
+        )
+        session_summary_model: str = Field(
+            default="llama-3.2-3b-instruct-q4_k_m",
+            description="Model used to generate session summaries.",
+        )
+        session_summary_max_tokens: int = Field(
+            default=200,
+            description="Max tokens for the session summary.",
+        )
+
         # ─── Secondary task deferral ───
         defer_secondary_tasks: bool = Field(
             default=True,
@@ -1242,10 +1252,7 @@ class Filter:
         self._last_used_model: Optional[str] = None
 
         # Background tasks tracking
-        self._hierarchical_compress_in_progress: Dict[str, bool] = {}
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
-        self._hierarchical_compress_tasks: List[asyncio.Task] = []
-        self._summarize_tasks: List[asyncio.Task] = []
         self._dependency_tasks: List[asyncio.Task] = []
         self._write_counter = 0
         self._response_cache_cleanup_task: Optional[asyncio.Task] = None
@@ -3431,17 +3438,6 @@ class Filter:
             state["message_count"] += 1
             if self.valves.auto_remove_duplicate_blocks:
                 self._remove_duplicate_blocks(state, project_id)
-            if self.valves.hierarchical_compression_enabled:
-                if (
-                    state["message_count"]
-                    % self.valves.hierarchical_compression_interval_messages
-                    == 0
-                ):
-                    self._background_task(
-                        self._hierarchical_compress(project_id, state),
-                        name="hierarchical_compress",
-                        is_llm_task=True,
-                    )
             self._background_task(
                 self._expire_blocks_by_time(project_id), name="expire_blocks"
             )
@@ -3454,6 +3450,50 @@ class Filter:
                     name="generate_missing_summaries",
                     is_llm_task=True,
                 )
+
+            # ── Session summary (autobiographical mini‑memory) ──
+            if self.valves.enable_session_summary:
+                interval = self.valves.session_summary_interval_messages
+                if (
+                    interval > 0
+                    and state["message_count"] % interval == 0
+                    and state["message_count"] > 0
+                ):
+                    task = SecondaryTask(
+                        task_type="session_summary",
+                        params={
+                            "project_id": project_id,
+                            "message_count": state["message_count"],
+                            "code_state_hash": self._compute_code_state_hash(
+                                project_id
+                            ),
+                        },
+                    )
+                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
+
+            self._invalidate_lightweight_cache(project_id)
+            self._set_state(project_id, state)
+
+            # ── Session summary (autobiographical mini‑memory) ──
+            if self.valves.enable_session_summary:
+                interval = self.valves.session_summary_interval_messages
+                if (
+                    interval > 0
+                    and state["message_count"] % interval == 0
+                    and state["message_count"] > 0
+                ):
+                    task = SecondaryTask(
+                        task_type="session_summary",
+                        params={
+                            "project_id": project_id,
+                            "message_count": state["message_count"],
+                            "code_state_hash": self._compute_code_state_hash(
+                                project_id
+                            ),
+                        },
+                    )
+                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
+
             self._invalidate_lightweight_cache(project_id)
             self._set_state(project_id, state)
 
@@ -3769,7 +3809,11 @@ class Filter:
 
             if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
                 rerank_k = min(
-                    (self.valves.reranker_top_k or self.valves.long_term_memory_top_k),
+                    (
+                        self.valves.reranker_top_k
+                        if self.valves.reranker_top_k > 0
+                        else self.valves.long_term_memory_top_k
+                    ),
                     50,
                 )
                 docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
@@ -3849,7 +3893,9 @@ class Filter:
                             if common:
                                 sim *= self.valves.ltm_symbol_boost_factor
                     role = meta.get("role", "user")
-                    is_summary = meta.get("is_hierarchical_summary", False)
+                    is_summary = meta.get("is_hierarchical_summary", False) or meta.get(
+                        "is_session_summary", False
+                    )
                     entry = (sim, {"role": role, "content": doc})
                     if is_summary:
                         scored_summaries.append(entry)
@@ -5502,9 +5548,6 @@ class Filter:
     # --------------------------------------------------------------------------
     # Inlet method
     # --------------------------------------------------------------------------
-    # --------------------------------------------------------------------------
-    # Inlet method
-    # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6124,7 +6167,6 @@ class Filter:
 
             # Generate CoT
             reasoning = None
-            # Use active_context_max_tokens instead of removed multi_call_chunk_max_tokens
             _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
@@ -6213,7 +6255,7 @@ class Filter:
                             if self.tokenizer
                             else len(content) // 4
                         )
-                # ── Token breakdown (injected context, not LLM processing) ──
+                # ── Approximate breakdown ──
                 ltm_tokens = 0
                 summary_tokens = 0
                 suggested_tokens = 0
@@ -6598,11 +6640,7 @@ class Filter:
             and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
-        for task_list in [
-            self._hierarchical_compress_tasks,
-            self._summarize_tasks,
-            self._dependency_tasks,
-        ]:
+        for task_list in [self._dependency_tasks]:
             for task in task_list:
                 task.cancel()
         self._symbol_index.clear()
@@ -6610,10 +6648,6 @@ class Filter:
         self._project_locks.clear()
 
     def _cleanup_completed_tasks(self):
-        self._hierarchical_compress_tasks = [
-            t for t in self._hierarchical_compress_tasks if not t.done()
-        ]
-        self._summarize_tasks = [t for t in self._summarize_tasks if not t.done()]
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
@@ -6727,145 +6761,6 @@ class Filter:
                 any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
             )
             self._invalidate_lightweight_cache(project_id)
-
-    async def _hierarchical_compress(self, project_id: str, state: Dict):
-        if self._hierarchical_compress_in_progress.get(project_id, False):
-            return
-        self._hierarchical_compress_in_progress[project_id] = True
-        try:
-            if (
-                not self.valves.hierarchical_compression_enabled
-                or not self.memory_collection
-            ):
-                return
-            last_ts = state.get("last_compression_timestamp", 0)
-            if time.time() - last_ts < 3600:
-                return
-
-            now = time.time()
-            where_filter = {
-                "$and": [
-                    {"project_id": {"$eq": project_id}},
-                    {"is_hierarchical_summary": {"$ne": True}},
-                    {"timestamp": {"$lt": now}},
-                ]
-            }
-            results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.get(
-                    where=where_filter,
-                    include=["documents", "metadatas", "ids"],
-                    limit=self.valves.hierarchical_compression_interval_messages * 2,
-                )
-            )
-            if (
-                not results
-                or not results["ids"]
-                or len(results["ids"])
-                < self.valves.hierarchical_compression_interval_messages
-            ):
-                return
-
-            pairs = sorted(
-                zip(results["ids"], results["documents"], results["metadatas"]),
-                key=lambda x: x[2].get("timestamp", 0),
-            )
-            to_compress = pairs[
-                : self.valves.hierarchical_compression_interval_messages
-            ]
-
-            max_chars = 4000
-            prompt_template = (
-                "Summarise the following conversation segment, keeping key technical "
-                "decisions and code changes:\n\n{text}"
-            )
-            overhead = len(prompt_template.format(text=""))
-
-            batches = []
-            current_batch = []
-            current_len = 0
-            for entry in to_compress:
-                entry_len = len(entry[1])
-                if current_len + entry_len > max_chars - overhead and current_batch:
-                    batches.append(current_batch)
-                    current_batch = []
-                    current_len = 0
-                current_batch.append(entry)
-                current_len += entry_len
-            if current_batch:
-                batches.append(current_batch)
-
-            model = (
-                self.valves.hierarchical_summary_model
-                or self.valves.llm_model
-                or self.valves.summarization_model
-            )
-            summaries = []
-            ids_to_delete = []
-
-            for batch in batches:
-                texts = "\n---\n".join([doc for _, doc, _ in batch])
-                prompt = prompt_template.format(text=texts[: max_chars - overhead])
-                summary = await self._call_llm(
-                    prompt=prompt,
-                    system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
-                    model_override=model,
-                    max_tokens=self.valves.hierarchical_summary_max_tokens,
-                    temperature=0.2,
-                )
-                if not summary:
-                    self._log_debug(
-                        "Hierarchical compression aborted: LLM failed to generate summary"
-                    )
-                    return
-                summaries.append(summary)
-                ids_to_delete.extend([id for id, _, _ in batch])
-
-            if not summaries:
-                return
-
-            combined_summary = "\n---\n".join(summaries)
-            if len(combined_summary) > 4000:
-                combined_summary = combined_summary[:4000] + "\n[summary truncated]"
-
-            try:
-                summary_embedding = await anyio.to_thread.run_sync(
-                    lambda: self.embedder.encode(combined_summary).tolist()
-                )
-            except Exception as e:
-                self._log_debug(
-                    f"Failed to generate embedding for hierarchical summary: {e}"
-                )
-                return
-
-            summary_id = f"{project_id}_hierarchical_{int(time.time())}"
-            await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.delete(ids=ids_to_delete)
-            )
-            await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.upsert(
-                    ids=[summary_id],
-                    embeddings=[summary_embedding],
-                    metadatas=[
-                        {
-                            "role": "assistant",
-                            "project_id": project_id,
-                            "timestamp": time.time(),
-                            "is_hierarchical_summary": True,
-                            "summary_level": 1,
-                        }
-                    ],
-                    documents=[f"[Hierarchical summary]\n{combined_summary}"],
-                )
-            )
-
-            state["last_compression_timestamp"] = time.time()
-            self._set_state(project_id, state)
-            self._log_debug(f"Hierarchical compression completed for {project_id}")
-
-        except Exception as e:
-            self._log_debug(f"Error in hierarchical_compress: {e}")
-        finally:
-            self._hierarchical_compress_in_progress[project_id] = False
 
     # --------------------------------------------------------------------------
     # Dependency tracking
@@ -7679,24 +7574,6 @@ class Filter:
         summary = await self._synthesize_from_symbol_results(all_parsed, question)
         return summary, list(suggested)
 
-    def _get_blocks_for_symbols(
-        self, symbol_names: List[str], project_id: str
-    ) -> List[CodeBlock]:
-        """
-        Return the active, non‑obsolete CodeBlocks that contain any of the given symbols.
-        """
-        state = self._get_state(project_id)
-        blocks = []
-        seen = set()
-        for name in symbol_names:
-            for h in self._symbol_index.find_blocks(name, project_id):
-                if h not in seen:
-                    blk = state["active_blocks"].get(h)
-                    if blk and not blk.obsolete:
-                        blocks.append(blk)
-                        seen.add(h)
-        return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
-
     async def _analyze_single_symbol(
         self, prompt: str, model: str, semaphore: asyncio.Semaphore
     ) -> Optional[str]:
@@ -7835,6 +7712,8 @@ class Filter:
                 return await self._run_inactive_code_summary_task(
                     task.params, model, sem
                 )
+            elif task.task_type == "session_summary":
+                return await self._run_session_summary_task(task.params, model, sem)
             else:
                 return False
         except asyncio.CancelledError:
@@ -7941,6 +7820,68 @@ class Filter:
                     self._set_state(project_id, state)
             return True
         return False
+
+    async def _run_session_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Generate an autobiographical session summary and store it in LTM."""
+        project_id = params["project_id"]
+        code_state_hash = params.get("code_state_hash", "")
+
+        # Retrieve the most recent messages from LTM
+        recent = await self._retrieve_historical_messages(
+            query="recent conversation summary",
+            project_id=project_id,
+            limit=self.valves.session_summary_interval_messages,
+        )
+        if not recent:
+            return False
+
+        conversation_text = "\n".join(
+            f"{m['role']}: {m['content'][:300]}" for m in recent
+        )
+        prompt = (
+            "Summarise the following conversation segment in 2-3 sentences, "
+            "capturing the main task, decisions made, files modified, "
+            "and architectural changes:\n\n"
+            f"{conversation_text[:3000]}"
+        )
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
+                model_override=model,
+                max_tokens=self.valves.session_summary_max_tokens,
+                temperature=0.2,
+            )
+        if not summary:
+            return False
+
+        # Store in LTM with special metadata
+        msg_id = f"{project_id}_session_summary_{int(time.time())}"
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(summary).tolist()
+        )
+        await anyio.to_thread.run_sync(
+            lambda: self.memory_collection.upsert(
+                ids=[msg_id],
+                embeddings=[embedding],
+                metadatas=[
+                    {
+                        "role": "assistant",
+                        "project_id": project_id,
+                        "timestamp": time.time(),
+                        "is_session_summary": True,
+                        "code_state_hash": code_state_hash,
+                        "content_type": ContentType.GENERAL.value,
+                        "has_code": False,
+                    }
+                ],
+                documents=[f"[Session summary]\n{summary}"],
+            )
+        )
+        self._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
+        return True
 
     async def _load_symbol_cache_from_db(self, project_id: str, limit: int = 500):
         """Pre‑load the most recent symbol analyses from DB into memory."""
