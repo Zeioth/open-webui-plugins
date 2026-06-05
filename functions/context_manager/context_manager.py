@@ -2188,21 +2188,14 @@ class Filter:
         return state
 
     def _set_state(self, project_id: str, state: Dict):
+        """Mark the conversation state as dirty without persisting immediately."""
         self._conversation_state[project_id] = state
         self._conversation_state.move_to_end(project_id)
-        task = asyncio.create_task(self._save_state_to_db_async(project_id, state))
-        task.add_done_callback(
-            lambda t: (
-                self._log_debug(f"Failed to save state: {t.exception()}")
-                if t.exception()
-                else None
-            )
-        )
+        self._state_dirty = True
 
     async def _save_state_if_dirty(self, project_id: str):
         """
         Persist the state if dirty and at least 2 seconds have passed since last save.
-
         Creates an async task for the actual DB write and logs any failure.
         """
         if not self._state_dirty:
@@ -5717,6 +5710,7 @@ class Filter:
                 model_override=model,
                 max_tokens=40,
                 temperature=0.1,
+                label="change_summary",
             )
         if summary:
             now = time.time()
@@ -5740,6 +5734,7 @@ class Filter:
                 model_override=model,
                 max_tokens=50,
                 temperature=0.1,
+                label="missing_summaries",
             )
         if summary and summary.strip():
             project_id = params["project_id"]
@@ -5771,6 +5766,7 @@ class Filter:
                 model_override=model,
                 max_tokens=200,
                 temperature=0.2,
+                label="inactive_code_summary",
             )
         if summary and summary.strip():
             project_id = params["project_id"]
@@ -5819,6 +5815,7 @@ class Filter:
                 model_override=model,
                 max_tokens=self.valves.session_summary_max_tokens,
                 temperature=0.2,
+                label="session_summary",
             )
         if not summary:
             return False
@@ -6862,9 +6859,6 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # OUTLET
     # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # OUTLET – with safe purge task, cache fix and state debounce
-    # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
         start_time = time.monotonic()
@@ -7254,6 +7248,7 @@ class Filter:
             model_override=model,
             max_tokens=300,
             temperature=0.1,
+            label="dependency_extraction",
         )
         if not response:
             return []
