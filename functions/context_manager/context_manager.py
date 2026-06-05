@@ -6142,9 +6142,9 @@ class Filter:
         is_code_session: bool,
         last_user_msg: Optional[dict],
         state: dict,
-    ) -> Tuple[List[Tuple[str, str]], str]:
+    ) -> Tuple[List[Tuple[str, str]], Optional[dict], str]:
         """Build all system injections: LTM, code context, confidence, etc.
-        Returns (system_injections, prelim_system).
+        Returns (system_injections, cached_response, prelim_system).
         """
         system_injections: List[Tuple[str, str]] = []
 
@@ -6180,7 +6180,7 @@ class Filter:
 
         if cached_response:
             # Will be handled by caller; we just return early
-            return [], cached_response
+            return [], cached_response, ""
 
         if contradiction_warning and self.valves.contradiction_inject_warning:
             system_injections.append(("high", contradiction_warning))
@@ -6307,14 +6307,16 @@ class Filter:
                             )
             else:
                 is_structural = (
-                    await self._is_structural_task(user_query) if user_query else False
+                    await self._is_structural_task(user_question)  # ← Bug #2 corregido
+                    if user_question
+                    else False
                 )
                 if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
                     active_ctx = await self._build_lightweight_context(project_id)
                     injected_hashes: Set[str] = set()
-                    if user_query:
+                    if user_question:
                         pre_expanded = await self._smart_pre_expand(
-                            user_query=user_query,
+                            user_query=user_question,  # ← Bug #2 corregido
                             project_id=project_id,
                             token_budget=self.valves.smart_pre_expand_max_tokens,
                             seen_hashes=injected_hashes,
@@ -6323,7 +6325,7 @@ class Filter:
                             active_ctx += "\n" + pre_expanded
                         else:
                             expanded = self._expand_referenced_symbols(
-                                project_id, user_query, seen_hashes=injected_hashes
+                                project_id, user_question, seen_hashes=injected_hashes
                             )
                             if expanded:
                                 active_ctx += "\n" + expanded
@@ -6336,9 +6338,9 @@ class Filter:
                     active_ctx = self._get_active_code_context(
                         project_id, user_query=user_query
                     )
-                    if user_query and not is_structural:
+                    if user_question and not is_structural:
                         expanded = self._expand_referenced_symbols(
-                            project_id, user_query
+                            project_id, user_question  # ← Bug #2 corregido
                         )
                         if expanded:
                             active_ctx += "\n" + expanded
@@ -6421,7 +6423,7 @@ class Filter:
         if base_content.strip():
             prelim_system = prelim_system + "\n\n" + base_content
 
-        return system_injections, prelim_system
+        return system_injections, None, prelim_system
 
     async def _inlet_assemble_final_messages(
         self,
@@ -6798,7 +6800,7 @@ class Filter:
             )
 
             # Build system injections
-            system_injections, cached_response = (
+            system_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
                     messages,
                     project_id,
@@ -6829,7 +6831,7 @@ class Filter:
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 system_injections,
-                "",
+                prelim_system,  # ← Bug #1 corregido: pasamos el valor real
                 last_user_msg,
                 is_code_session,
                 state,
