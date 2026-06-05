@@ -6694,6 +6694,22 @@ class Filter:
         context_str = "\n".join([m.get("content", "") for m in sys_msgs])
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
+    def _compute_code_state_hash(self, project_id: str) -> str:
+        if self._cached_code_state_hash is not None:
+            return self._cached_code_state_hash
+        state = self._get_state(project_id)
+        h = self._compute_code_state_hash_from_state(state)
+        self._cached_code_state_hash = h
+        return h
+
+    def _compute_code_state_hash_from_state(self, state: dict) -> str:
+        if not state or not state["active_blocks"]:
+            return ""
+        sorted_hashes = sorted(
+            h for h, b in state["active_blocks"].items() if not b.obsolete
+        )
+        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
+
     # --------------------------------------------------------------------------
     # Shutdown and cleanup
     # --------------------------------------------------------------------------
