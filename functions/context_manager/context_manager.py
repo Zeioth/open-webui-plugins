@@ -1400,6 +1400,632 @@ class Filter:
 
         return task
 
+    # --------------------------------------------------------------------------
+    # Code extraction and classification (critical missing block)
+    # --------------------------------------------------------------------------
+    async def _extract_code_blocks(
+        self, content: str
+    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+        blocks = []
+        spans = []
+        if not self.valves.auto_detect_code_blocks:
+            return blocks, spans
+        # tree-sitter attempt
+        if HAS_TREE_SITTER:
+            try:
+                config = ProcessConfig()
+                ts_blocks = await anyio.to_thread.run_sync(
+                    lambda: process(content, config)
+                )
+                for tsb in ts_blocks:
+                    start, end = tsb.start_byte, tsb.end_byte
+                    raw = content[start:end].strip()
+                    lang = tsb.language or "text"
+                    if lang in ("text", ""):
+                        guessed = SignatureExtractor._guess_language(None, raw)
+                        if guessed != "unknown":
+                            lang = guessed
+                        else:
+                            lang = await self._infer_code_language(raw)
+                    lines = raw.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        code = "\n".join(lines).strip()
+                        block_type = "fenced"
+                    else:
+                        code = raw
+                        block_type = "indented"
+                    code = await self._handle_oversized_code_block(code, lang)
+                    blocks.append({"language": lang, "code": code, "type": block_type})
+                    spans.append((start, end))
+                if blocks:
+                    return blocks, spans
+            except Exception:
+                pass
+
+        # Regex fallback
+        for match in self.code_pattern.finditer(content):
+            lang = match.group(1) or "text"
+            code = match.group(2).strip()
+            blocks.append({"language": lang, "code": code, "type": "fenced"})
+            spans.append((match.start(), match.end()))
+        # indented blocks
+        lines = content.split("\n")
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line) + 1)
+        indented = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith(("    ", "\t")):
+                indented.append(line.lstrip(" \t"))
+                i += 1
+            else:
+                if len(indented) >= 3:
+                    code = "\n".join(indented)
+                    blocks.append(
+                        {"language": "text", "code": code, "type": "indented"}
+                    )
+                    start_offset = line_offsets[i - len(indented)]
+                    end_offset = line_offsets[i] - 1
+                    spans.append((start_offset, end_offset))
+                indented = []
+                i += 1
+        if len(indented) >= 3:
+            code = "\n".join(indented)
+            blocks.append({"language": "text", "code": code, "type": "indented"})
+            start_offset = line_offsets[len(lines) - len(indented)]
+            end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+            spans.append((start_offset, end_offset))
+
+        for i in range(len(blocks)):
+            blocks[i]["code"] = await self._handle_oversized_code_block(
+                blocks[i]["code"], blocks[i]["language"]
+            )
+        return blocks, spans
+
+    async def _infer_code_language(self, code_snippet: str) -> str:
+        if not HAS_AIOHTTP:
+            return "unknown"
+        # simple heuristic first
+        if re.search(r"\bdef\s+\w+\s*\(", code_snippet):
+            return "python"
+        if re.search(r"\bfunction\s+\w+\s*\(", code_snippet):
+            return "javascript"
+        return "unknown"
+
+    def _extract_file_path_for_block(
+        self, content: str, block_start: int
+    ) -> Optional[str]:
+        if block_start <= 0:
+            return None
+        before = content[:block_start]
+        lines = before.splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(self.valves.file_path_pattern, line)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+            file_path, _, _ = self._extract_line_range(line)
+            if file_path:
+                return file_path
+            break
+        return None
+
+    def _extract_line_range(
+        self, content: str
+    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        if not self.valves.track_line_numbers:
+            return None, None, None
+        pattern = r"(?:^|\s)([^\s:]+\.\w+):(\d+)(?:-(\d+))?"
+        match = re.search(pattern, content)
+        if match:
+            return (
+                match.group(1),
+                int(match.group(2)),
+                int(match.group(3)) if match.group(3) else int(match.group(2)),
+            )
+        return None, None, None
+
+    def _extract_file_paths(self, content: str) -> List[str]:
+        if not self.valves.track_file_paths:
+            return []
+        matches = re.findall(self.valves.file_path_pattern, content)
+        return [m[0] if isinstance(m, tuple) else m for m in matches]
+
+    def _classify_content(
+        self, content: str, extracted_blocks: List[Dict]
+    ) -> ContentType:
+        cl = content.lower()
+        if self.diff_pattern.search(content) or "diff --git" in content:
+            return ContentType.PROPOSED_CHANGE
+        if self.commit_pattern.search(content):
+            return (
+                ContentType.COMMITTED_CHANGE
+                if ("applied" in cl or "committed" in cl or "merged" in cl)
+                else ContentType.PROPOSED_CHANGE
+            )
+        if (
+            "traceback" in cl
+            or ('file "' in cl and "line " in cl)
+            or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
+        ):
+            return ContentType.ERROR
+        if '"tool_calls"' in content or '"function"' in content:
+            return ContentType.TOOL_CALL
+        for blk in extracted_blocks:
+            if blk["language"] in [
+                "python",
+                "javascript",
+                "typescript",
+                "go",
+                "rust",
+                "java",
+                "cpp",
+            ]:
+                if (
+                    "def " in blk["code"]
+                    or "class " in blk["code"]
+                    or "function " in blk["code"]
+                ):
+                    return ContentType.BASE_CODE
+        return ContentType.GENERAL
+
+    def _has_code_indicators(self, content: str) -> bool:
+        if "```" in content:
+            return True
+        if re.search(
+            r"\b(def |class |import |from |function |const |let |var |#include |package |fn |func )",
+            content,
+        ):
+            return True
+        if re.search(
+            r"\b[\w\-/]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp)\b", content
+        ):
+            return True
+        return False
+
+    async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        cache_key = None
+        if last_user:
+            content_key = last_user.get("content", "")[:200]
+            cache_key = (
+                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
+            )
+            cached = self._session_classify_cache.get(cache_key)
+            if cached is not None:
+                result, ts = cached
+                if time.time() - ts < self._session_classify_ttl:
+                    return result
+                del self._session_classify_cache[cache_key]
+        state = self._get_state(project_id)
+        if state and state.get("active_blocks"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        for msg in reversed(messages[-10:]):
+            if msg.get("role") != "user":
+                continue
+            if self._has_code_indicators(msg.get("content", "")):
+                if cache_key:
+                    self._session_classify_cache[cache_key] = (True, time.time())
+                return True
+        if last_user and last_user.get("content", "").strip().startswith("/"):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        if last_user and "```" in last_user.get("content", ""):
+            if cache_key:
+                self._session_classify_cache[cache_key] = (True, time.time())
+            return True
+        if (
+            last_user
+            and not state.get("active_blocks")
+            and not self._has_code_indicators(last_user.get("content", ""))
+        ):
+            if len(last_user.get("content", "")) > 200:
+                blocks, _ = await self._extract_code_blocks(
+                    last_user.get("content", "")
+                )
+                if blocks:
+                    if cache_key:
+                        self._session_classify_cache[cache_key] = (True, time.time())
+                    return True
+        if not last_user or len(last_user.get("content", "")) < 20:
+            result = False
+        else:
+            model = self.valves.natural_language_forget_model or self.valves.llm_model
+            prompt = f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:300]}"
+            response = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
+                model_override=model,
+                max_tokens=3,
+                temperature=0.0,
+            )
+            result = bool(response and response.strip().lower().startswith("yes"))
+        if cache_key:
+            self._session_classify_cache[cache_key] = (result, time.time())
+            if len(self._session_classify_cache) >= 500:
+                items = sorted(
+                    self._session_classify_cache.items(), key=lambda x: x[1][1]
+                )
+                self._session_classify_cache = dict(items[-400:])
+        return result
+
+    # --------------------------------------------------------------------------
+    # Context formatting and lightweight context
+    # --------------------------------------------------------------------------
+    def _format_block_context(
+        self, block: CodeBlock, is_latest: bool = False, full_body: bool = False
+    ) -> str:
+        timestamp_str = datetime.fromtimestamp(
+            block.timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        latest = " [LATEST]" if is_latest else ""
+        loc = ""
+        if block.file_path:
+            loc = f" (file: {block.file_path}"
+            if block.line_range:
+                loc += f", lines {block.line_range[0]}-{block.line_range[1]}"
+            loc += ")"
+        pin = " [PINNED]" if block.pinned else ""
+        raw = " [RAW]" if block.is_raw else ""
+        aff = " [AFFECTED BY DEPENDENCY CHANGE]" if block.potentially_affected else ""
+        show_full = full_body or block.is_raw or block.pinned
+        content = block.content if show_full else block.content[:600]
+        return (
+            f"```\n{content}\n```{loc}{latest}  "
+            f"(importance: {block.importance_score:.1f}, modified: {timestamp_str})"
+            f"{aff}{pin}{raw}"
+        )
+
+    def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        now = time.time()
+        active = []
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            if not block.is_active and self.valves.track_active_code_age:
+                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
+                    continue
+            active.append(block)
+        if not active:
+            return ""
+
+        recent_window = self.valves.recent_activity_window_minutes * 60
+        recent_files = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in recent_files
+                    or b.timestamp > recent_files[b.file_path]
+                ):
+                    recent_files[b.file_path] = b.timestamp
+        recent_lines = []
+        for file_path, ts in recent_files.items():
+            age_seconds = now - ts
+            if age_seconds <= recent_window:
+                minutes_ago = int(age_seconds / 60)
+                time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
+                recent_lines.append(f"- `{file_path}` ({time_str})")
+        recent_section = ""
+        if recent_lines:
+            recent_section = (
+                f"## Recent Activity (last {self.valves.recent_activity_window_minutes} min)\n"
+                + "\n".join(recent_lines)
+                + "\n\n"
+            )
+
+        mentioned_files = set()
+        mentioned_symbols = set()
+        if user_query:
+            mentioned_files = set(re.findall(self.valves.file_path_pattern, user_query))
+            all_symbol_names = self._symbol_index.get_all_names(project_id)
+            words = set(re.findall(r"\b[\w-]+\b", user_query))
+            mentioned_symbols = all_symbol_names.intersection(words)
+
+        BOOST = 5.0
+
+        def relevance_boost(block: CodeBlock) -> float:
+            score = 0.0
+            if block.file_path and block.file_path in mentioned_files:
+                score += BOOST
+            for sym in block.symbols:
+                if sym.name in mentioned_symbols:
+                    score += BOOST
+                    break
+            return score
+
+        boosted_active = []
+        for b in active:
+            boost = relevance_boost(b)
+            boosted_active.append((b, boost))
+        boost_priority = self.valves.raw_file_priority_boost
+        boosted_active.sort(
+            key=lambda pair: (
+                pair[1] > 0,
+                pair[1],
+                pair[0].importance_score + (boost_priority if pair[0].is_raw else 0),
+            ),
+            reverse=True,
+        )
+
+        latest_per_file = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in latest_per_file
+                    or b.timestamp > latest_per_file[b.file_path].timestamp
+                ):
+                    latest_per_file[b.file_path] = b
+        latest_hashes = {b.hash for b in latest_per_file.values()}
+
+        base_codes = [
+            b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
+        ][: self.valves.max_base_code_blocks]
+        proposed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.PROPOSED_CHANGE
+        ][: self.valves.max_proposed_changes]
+        committed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.COMMITTED_CHANGE
+        ][: self.valves.max_committed_changes]
+        errors = (
+            [b for b, _ in boosted_active if b.content_type == ContentType.ERROR][:3]
+            if self.valves.preserve_error_context
+            else []
+        )
+
+        parts = ["## Currently Active Code Context (by importance)\n"]
+        parts.insert(
+            1,
+            "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used.\n",
+        )
+        if recent_section:
+            parts.insert(0, recent_section)
+
+        if base_codes:
+            parts.append("### Base Code (current work):")
+            for b in base_codes:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if proposed:
+            parts.append("### Proposed Changes (pending review):")
+            for b in proposed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if committed:
+            parts.append("### Recently Committed Changes:")
+            for b in committed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if errors:
+            parts.append("### Recent Errors:")
+            for b in errors:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+
+        max_tokens = self.valves.active_context_max_tokens
+        if max_tokens > 0 and self.tokenizer:
+            full_text = "\n".join(parts)
+            while len(self.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3:
+                parts.pop()
+                full_text = "\n".join(parts)
+            if len(self.tokenizer.encode(full_text)) > max_tokens:
+                parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
+        return "\n".join(parts)
+
+    async def _build_lightweight_context(self, project_id: str) -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        if project_id in self._cached_lightweight_context:
+            return self._cached_lightweight_context[project_id]
+
+        lines = ["## Code Symbol Index (full bodies available on request)\n"]
+        grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                key = sym.file_path or "unknown"
+                grouped[key].append(sym)
+
+        for file_path, syms in grouped.items():
+            lines.append(f"### {file_path}")
+            for s in sorted(syms, key=lambda x: x.name.lower()):
+                loc = (
+                    f" (lines {s.line_start}-{s.line_end})"
+                    if s.line_start and s.line_end
+                    else ""
+                )
+                calls_str = ""
+                if s.calls:
+                    calls_list = ", ".join(s.calls[:5])
+                    if len(s.calls) > 5:
+                        calls_list += f", ... (+{len(s.calls)-5} more)"
+                    calls_str = f" → calls: {calls_list}"
+                used_by = self._symbol_index.get_callers(s.name, project_id)
+                if used_by:
+                    ub_list = ", ".join(sorted(used_by)[:5])
+                    if len(used_by) > 5:
+                        ub_list += f", ... (+{len(used_by)-5} more)"
+                    used_str = f"  ← used by: {ub_list}"
+                else:
+                    used_str = ""
+                summary_str = f"  Summary: {s.summary}" if s.summary else ""
+                num_versions = len(self._symbol_index.find_blocks(s.name, project_id))
+                version_info = (
+                    f" ({num_versions} versions available)" if num_versions > 1 else ""
+                )
+                lines.append(
+                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{used_str}{summary_str}{version_info}"
+                )
+
+        lines.append("\n## Code Previews (first 10 lines of each block)\n")
+        max_preview_chars = 4000
+        chars_added = 0
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            preview = "\n".join(block.content.splitlines()[:10])
+            if chars_added + len(preview) > max_preview_chars:
+                lines.append("```\n... (previews truncated)\n```")
+                break
+            loc = f" (file: {block.file_path})" if block.file_path else ""
+            lines.append(f"### Block {block.hash[:8]}{loc}\n```\n{preview}\n```")
+            chars_added += len(preview)
+
+        lines.append(
+            "\nTo see the full body of any symbol, mention it in your message or use `/expand <name>`."
+        )
+        result = "\n".join(lines)
+        self._cached_lightweight_context[project_id] = result
+        return result
+
+    # --------------------------------------------------------------------------
+    # Message helpers
+    # --------------------------------------------------------------------------
+    def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
+        if not messages:
+            messages.append({"role": "user", "content": "continue"})
+            return messages
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx == -1:
+            while messages and messages[-1].get("role") != "user":
+                messages.pop()
+            messages.append({"role": "user", "content": "continue"})
+        else:
+            if last_user_idx + 1 < len(messages):
+                messages = messages[: last_user_idx + 1]
+        return messages
+
+    def _estimate_tokens(self, messages: List[dict]) -> int:
+        if self.tokenizer:
+            total = 0
+            for m in messages:
+                content = str(m.get("content", ""))
+                total += len(self.tokenizer.encode(content))
+                total += 4
+            return total
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        total_chars += sum(30 for _ in messages)
+        return total_chars // 4
+
+    def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        if not self.tokenizer:
+            return text[: max_tokens * 4]
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        truncated = self.tokenizer.decode(tokens[:max_tokens])
+        for pattern in ("\n\n", "\n", ". ", " "):
+            last = truncated.rfind(pattern)
+            if last > max_tokens * 0.6:
+                truncated = truncated[: last + len(pattern)]
+                break
+        return truncated.rstrip()
+
+    # --------------------------------------------------------------------------
+    # Oversized code and sanitization
+    # --------------------------------------------------------------------------
+    def _estimate_code_tokens(self, code: str) -> int:
+        if self.tokenizer:
+            return len(self.tokenizer.encode(code))
+        return len(code) // 4
+
+    async def _handle_oversized_code_block(self, code: str, language: str) -> str:
+        max_tokens = self.valves.max_code_block_tokens
+        if max_tokens <= 0:
+            return code
+        estimated = self._estimate_code_tokens(code)
+        if estimated <= max_tokens:
+            return code
+        action = self.valves.code_block_overflow_action.lower()
+        if action == "truncate":
+            lines = code.splitlines()
+            head = self.valves.code_block_truncate_keep_head
+            tail = self.valves.code_block_truncate_keep_tail
+            if len(lines) <= head + tail:
+                return code
+            return "\n".join(
+                lines[:head]
+                + [f"... [{len(lines) - head - tail} lines truncated] ..."]
+                + lines[-tail:]
+            )
+        elif action == "summarize":
+            model = (
+                self.valves.code_block_summary_model
+                or self.valves.llm_model
+                or self.valves.summarization_model
+            )
+            signatures = []
+            for match in re.finditer(
+                r"^\s*(def|class|function|fn|func|async def)\s+(\w+)[^(]*\([^)]*\)",
+                code,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                signatures.append(match.group(0).strip())
+            header = ""
+            if signatures:
+                header = (
+                    f"Signatures found ({len(signatures)}):\n"
+                    + "\n".join(signatures[:50])
+                    + "\n\n"
+                )
+            t0 = time.monotonic()
+            summary = await self._call_llm(
+                prompt=f"Summarize the following {language} code block.\n{header}First part of code:\n```{language}\n{code[:8000]}\n```",
+                system_prompt="You are a code summarization assistant.",
+                model_override=model,
+                max_tokens=self.valves.oversized_summary_max_tokens,
+                temperature=0.2,
+            )
+            dur = time.monotonic() - t0
+            self._log_timing("oversized_block_summarize", dur, dur)
+            return (
+                f"[Automatic summary of a {estimated} token code block]\n{summary}"
+                if summary
+                else f"[Code block too large, could not summarize] Original size: {estimated} tokens."
+            )
+        elif action == "warn":
+            return self.valves.code_block_warn_message
+        return code
+
+    @staticmethod
+    def _sanitize_signature(sig: str, max_len: int = 200) -> str:
+        safe = sig.replace("`", "'")
+        return safe[:max_len] + ("…" if len(safe) > max_len else "")
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+        cleaned = cleaned.replace("`", "'")
+        return cleaned
+
     async def _db_worker(self):
         """Serialise all database writes through a single task."""
         while True:
@@ -2260,7 +2886,7 @@ class Filter:
                         "query": query[:500],
                         "project_id": project,
                         "context_hash": "",
-                        "code_state_hash": code_state_hash,  # passed from outside to avoid lock
+                        "code_state_hash": code_state_hash,
                         "timestamp": time.time(),
                     }
                 ],
@@ -2272,6 +2898,56 @@ class Filter:
         self._log_timing(
             "resp_cache_total", time.monotonic() - t_start, time.monotonic() - t_start
         )
+
+    async def _find_cached_response(
+        self, query: str, context_hash: str, state: dict
+    ) -> Optional[dict]:
+        if not self.valves.enable_response_cache or not HAS_SENTENCE:
+            return None
+        col = getattr(self, "_response_cache_collection", None)
+        if col is None:
+            return None
+
+        t_start = time.monotonic()
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        results = await anyio.to_thread.run_sync(
+            lambda: col.query(
+                query_embeddings=[query_vec],
+                n_results=1,
+                where={"project_id": self.valves.project_id},
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        if not results or not results["ids"] or not results["ids"][0]:
+            return None
+
+        dist = results["distances"][0][0]
+        similarity = 1.0 - (dist / 2.0)
+        if similarity < self.valves.response_cache_similarity_threshold:
+            return None
+
+        meta = results["metadatas"][0][0]
+        stored_code_state = meta.get("code_state_hash", "")
+        if stored_code_state and stored_code_state != self._compute_code_state_hash(
+            self.valves.project_id
+        ):
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        ttl = self.valves.response_cache_ttl_hours * 3600
+        ts = meta.get("timestamp", 0)
+        if ttl > 0 and time.time() - ts > ttl:
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        doc = results["documents"][0][0]
+        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
 
     # --------------------------------------------------------------------------
     # LTM storage and retrieval (symbol‑based & unified)
@@ -4550,10 +5226,7 @@ class Filter:
         self._set_state(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – with race condition fixes
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – full implementation
+    # INLET
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
