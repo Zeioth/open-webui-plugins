@@ -1235,9 +1235,9 @@ class Filter:
         )
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
-        self._db_write_lock = asyncio.Lock()  # kept for extra safety, optional
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
+        self._purge_task: Optional[asyncio.Task] = None
 
         # ── Database write queue (prevents "database is locked") ──
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
@@ -1257,6 +1257,7 @@ class Filter:
         self._symbol_index = SymbolIndex()
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
+        self._SYMBOL_BLACKLIST: Set[str] = set()
 
         # Project tracking
         self._last_processed_message_idx: Dict[str, int] = {}
@@ -1673,12 +1674,13 @@ class Filter:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.create_task(self._purge_expired_memories())
+                self._purge_task = asyncio.create_task(self._purge_expired_memories())
         except RuntimeError:
             pass
         self._log_debug("LTM ready")
 
     async def _purge_expired_memories(self):
+        await asyncio.sleep(0)
         if not HAS_CHROMA or self.memory_collection is None:
             return
         if self.valves.long_term_memory_expiration_days <= 0:
@@ -6457,7 +6459,8 @@ class Filter:
                     state,
                 )
 
-        asyncio.create_task(self._purge_expired_memories())
+        if self._purge_task is None or self._purge_task.done():
+            self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
         self._write_counter += 1
         if self._write_counter % 100 == 0:
