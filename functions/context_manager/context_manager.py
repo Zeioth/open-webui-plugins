@@ -6478,11 +6478,21 @@ class Filter:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
+        # Unload any currently loaded model before CoT to free VRAM
+        if _SHARED_RESOURCES_AVAILABLE:
+            try:
+                from shared_resources import unload_all_models
+
+                base_url = self.valves.LLM_BASE_URL.rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url[:-3].rstrip("/")
+                await unload_all_models(base_url)
+                self._last_used_model = None
+            except Exception:
+                pass
+
         # Generate CoT reasoning if needed
         if cot_any_used:
-            # Small delay to allow the server to stabilize before another request
-            await asyncio.sleep(2.0)
-
             # Log the CoT level being used
             if manual_cot_used:
                 self._log_debug(
@@ -6539,6 +6549,19 @@ class Filter:
                 "Use them to enhance your answer, but always prioritise the actual user query."
             )
             system_injections.append(("low", cot_note))
+
+            # Unload the CoT model immediately to free VRAM for the main model
+            if _SHARED_RESOURCES_AVAILABLE:
+                try:
+                    from shared_resources import unload_all_models
+
+                    base_url = self.valves.LLM_BASE_URL.rstrip("/")
+                    if base_url.endswith("/v1"):
+                        base_url = base_url[:-3].rstrip("/")
+                    await unload_all_models(base_url)
+                    self._last_used_model = None
+                except Exception:
+                    pass
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6831,7 +6854,7 @@ class Filter:
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 system_injections,
-                prelim_system,  # ← Bug #1 corregido: pasamos el valor real
+                prelim_system,
                 last_user_msg,
                 is_code_session,
                 state,
@@ -6849,6 +6872,24 @@ class Filter:
         finally:
             # Save state if dirty (debounced)
             await self._save_state_if_dirty(project_id)
+
+            # Wait for any remaining background tasks before unloading models
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+                background_tasks.clear()
+
+            # Free VRAM for the main model using shared library helper
+            if _SHARED_RESOURCES_AVAILABLE:
+                try:
+                    from shared_resources import unload_all_models
+
+                    base_url = self.valves.LLM_BASE_URL.rstrip("/")
+                    if base_url.endswith("/v1"):
+                        base_url = base_url[:-3].rstrip("/")
+                    await unload_all_models(base_url)
+                    self._last_used_model = None
+                except Exception:
+                    pass
 
             if _inlet_aborted:
                 for task in background_tasks:
@@ -6949,6 +6990,19 @@ class Filter:
 
         # Save state if dirty (debounced)
         await self._save_state_if_dirty(project_id)
+
+        # Free VRAM for the main model using shared library helper
+        if _SHARED_RESOURCES_AVAILABLE:
+            try:
+                from shared_resources import unload_all_models
+
+                base_url = self.valves.LLM_BASE_URL.rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url[:-3].rstrip("/")
+                await unload_all_models(base_url)
+                self._last_used_model = None
+            except Exception:
+                pass
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
