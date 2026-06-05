@@ -5757,7 +5757,7 @@ class Filter:
 
         return messages
 
-    def _inlet_extract_user_info(self, messages: List[dict]):
+    async def _inlet_extract_user_info(self, messages: List[dict]):
         """Extract last user message and question, and detect explicit commands."""
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -5768,7 +5768,7 @@ class Filter:
         user_question = user_query
         if last_user_msg and user_query:
             try:
-                spans = self._get_code_spans(user_query)
+                spans = await self._get_code_spans(user_query)  # <-- await added
                 if spans:
                     user_question = self._remove_code_spans(user_query, spans).strip()
             except Exception:
@@ -6235,6 +6235,7 @@ class Filter:
         cot_any_used = False
         cot_level = 2
         reasoning = None
+        cot_question = ""
 
         if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             if last_user_msg:
@@ -6264,6 +6265,18 @@ class Filter:
 
         # Generate CoT reasoning if needed
         if cot_any_used:
+            # Log the CoT level being used
+            if manual_cot_used:
+                self._log_debug(
+                    f"Generating manual CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
+            else:
+                self._log_debug(
+                    f"Generating auto CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
+
             _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
@@ -6454,8 +6467,57 @@ class Filter:
             else:
                 messages.append({"role": "user", "content": "continue"})
 
+        # ═══════════════════════════════════════════════════════════════
+        # Token breakdown log (only if debug is enabled)
+        # ═══════════════════════════════════════════════════════════════
+        if self.valves.debug and self.tokenizer:
+            total_system_tokens = 0
+            for m in messages:
+                if m.get("role") == "system":
+                    content = m.get("content", "")
+                    total_system_tokens += len(self.tokenizer.encode(content))
+
+            ltm_tokens = 0
+            summary_tokens = 0
+            suggested_tokens = 0
+            cot_tokens = 0
+            for _, text in system_injections:
+                if not text:
+                    continue
+                t = len(self.tokenizer.encode(text))
+                if "Relevant Past Context" in text:
+                    ltm_tokens += t
+                elif "synthesized" in text.lower() or "Synthesize" in text:
+                    summary_tokens += t
+                elif "Additional suggested code" in text:
+                    suggested_tokens += t
+                elif reasoning and text == reasoning:
+                    cot_tokens += t
+            other_tokens = total_system_tokens - (
+                ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
+            )
+
+            self._log_debug("─" * 50)
+            self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
+            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(
+                f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
+            )
+            self._log_debug(
+                f"  Suggested code (verbatim source):      ~{suggested_tokens}"
+            )
+            self._log_debug(f"  CoT reasoning (LLM generated):         ~{cot_tokens}")
+            self._log_debug(f"  Other (confidence, cleanup, etc.):     ~{other_tokens}")
+            self._log_debug(
+                f"  TOTAL injected system tokens:          ~{total_system_tokens}"
+            )
+            self._log_debug("─" * 50)
+
         return messages
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6477,9 +6539,9 @@ class Filter:
         if not messages:
             return body
 
-        # Extract user info
+        # Extract user info (now with await)
         last_user_msg, user_query, user_question, is_explicit_command = (
-            self._inlet_extract_user_info(messages)
+            await self._inlet_extract_user_info(messages)
         )
 
         # Explicit commands
@@ -6547,7 +6609,7 @@ class Filter:
                 _inlet_aborted = False
                 return body
 
-            # Assemble final messages (CoT, trimming, etc.)
+            # Assemble final messages (CoT, trimming, token breakdown, etc.)
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 system_injections,
