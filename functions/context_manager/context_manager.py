@@ -1401,7 +1401,7 @@ class Filter:
         return task
 
     # --------------------------------------------------------------------------
-    # Code extraction and classification (critical missing block)
+    # Code extraction and classification
     # --------------------------------------------------------------------------
     async def _extract_code_blocks(
         self, content: str
@@ -3399,7 +3399,7 @@ class Filter:
         return [doc for doc, _ in scored[:top_k]]
 
     # --------------------------------------------------------------------------
-    # Block expiration and summarization (inactive)
+    # Block expiration and summarization (for inactive code blocks)
     # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         lock = await self._get_project_lock(project_id)
@@ -4067,7 +4067,7 @@ class Filter:
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
-    # Outlet expand intercept (unchanged)
+    # Outlet expand intercept
     # --------------------------------------------------------------------------
     async def _outlet_intercept_expand(
         self,
@@ -4158,7 +4158,7 @@ class Filter:
         return "\n".join(parts) if parts else ""
 
     # --------------------------------------------------------------------------
-    # Intent detection (natural language) – kept as before
+    # Intent detection (natural language)
     # --------------------------------------------------------------------------
 
     def _has_intent_keywords(self, text: str) -> bool:
@@ -4247,7 +4247,7 @@ class Filter:
             return {"forget": none, "remember": none, "obsolete": none}
 
     # --------------------------------------------------------------------------
-    # Parallel context checks (unchanged)
+    # Parallel context checks
     # --------------------------------------------------------------------------
     @staticmethod
     async def _noop():
@@ -5170,7 +5170,7 @@ class Filter:
             return True
 
     # --------------------------------------------------------------------------
-    # Auto summaries for missing symbol docstrings (complete implementation)
+    # Auto summaries for missing symbol docstrings
     # --------------------------------------------------------------------------
     async def _generate_missing_summaries(self, project_id: str):
         if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
@@ -5225,22 +5225,13 @@ class Filter:
             await asyncio.sleep(1.0)
         self._set_state(project_id, state)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET
-    # ═══════════════════════════════════════════════════════════════════════════
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet called")
-        inlet_start = time.monotonic()
-        self._log_section("CONTEXT MANAGER - INLET START")
+    # --------------------------------------------------------------------------
+    # Inlet helper methods 
+    # --------------------------------------------------------------------------
 
-        def _inlet_timing(step_name: str, start: float, end: float = None):
-            if end is None:
-                end = time.monotonic()
-            self._log_timing(step_name, start - inlet_start, end - start)
-
-        self._ensure_cleanup_task()
+    async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
+        """Handle project switching, symbol cache loading, and secondary tasks under lock."""
         messages = body.get("messages", [])
-        project_id = self._get_project_id()
 
         if self._last_project_id and self._last_project_id != project_id:
             self._log_debug(
@@ -5258,14 +5249,15 @@ class Filter:
             await self._load_symbol_cache_from_db(project_id)
             self._symbol_cache_loaded_projects.add(project_id)
 
-        # ── Process pending secondary tasks under lock ──
+        # Process pending secondary tasks under lock to avoid races
         lock = await self._get_project_lock(project_id)
         async with lock:
             await self._process_pending_secondary_tasks(project_id)
 
-        if not messages:
-            return body
+        return messages
 
+    def _inlet_extract_user_info(self, messages: List[dict]):
+        """Extract last user message and question, and detect explicit commands."""
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -5275,7 +5267,7 @@ class Filter:
         user_question = user_query
         if last_user_msg and user_query:
             try:
-                spans = await self._get_code_spans(user_query)
+                spans = self._get_code_spans(user_query)
                 if spans:
                     user_question = self._remove_code_spans(user_query, spans).strip()
             except Exception:
@@ -5297,66 +5289,35 @@ class Filter:
             "content", ""
         ).startswith("/")
 
-        # ── /forget (explicit) ──
+        return last_user_msg, user_query, user_question, is_explicit_command
+
+    async def _inlet_handle_explicit_commands(
+        self,
+        messages: List[dict],
+        project_id: str,
+        is_explicit_command: bool,
+        last_user_msg: Optional[dict],
+        __user__: Optional[dict],
+    ) -> Tuple[bool, Optional[List[dict]]]:
+        """Handle /forget, /status, /clean, /expand.
+        Returns (handled, messages) if a command was processed, else (False, None).
+        """
+        if not last_user_msg:
+            return False, None
+
+        content = last_user_msg.get("content", "").strip()
+
+        # /forget
         if self.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
                 messages, project_id, __user__
             )
             if handled:
-                messages = self._ensure_last_message_is_user(messages)
-                body["messages"] = messages
-                _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                self._log_section(
-                    "CONTEXT MANAGER - INLET END",
-                    duration=time.monotonic() - inlet_start,
-                )
-                return body
+                return True, self._ensure_last_message_is_user(new_messages)
 
-        # ── Natural language forget/remember/obsolete ──
+        # /status
         if (
-            self.valves.enable_natural_language_forget
-            and last_user_msg
-            and not is_explicit_command
-            and not self._has_code_indicators(last_user_msg.get("content", ""))
-        ):
-            t0 = time.monotonic()
-            intents = await self._parse_all_intents(last_user_msg.get("content", ""))
-            _inlet_timing("parse_nl_intents (LLM intent detection)", t0)
-            for intent_type in ("forget", "remember", "obsolete"):
-                fi = intents.get(intent_type, {})
-                if fi.get("action") not in (None, "none"):
-                    if intent_type == "forget":
-                        confirmation = await self._execute_forget_intent(project_id, fi)
-                    elif intent_type == "remember":
-                        confirmation = await self._execute_remember_intent(
-                            project_id, fi
-                        )
-                    elif (
-                        intent_type == "obsolete"
-                        and self.valves.enable_obsolete_marking
-                    ):
-                        confirmation = await self._execute_obsolete_intent(
-                            project_id, fi
-                        )
-                    else:
-                        continue
-                    status_msg = f"[CodeAware] {confirmation}"
-                    messages.insert(0, {"role": "system", "content": status_msg})
-                    messages.pop()
-                    messages.append({"role": "assistant", "content": confirmation})
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                    self._log_section(
-                        "CONTEXT MANAGER - INLET END",
-                        duration=time.monotonic() - inlet_start,
-                    )
-                    return body
-
-        # ── /status ──
-        if (
-            last_user_msg
-            and last_user_msg.get("content", "").strip() == "/status"
+            content == "/status"
             and self.valves.cleanup_status_command_enabled
             and self.valves.cleanup_suggestions_enabled
         ):
@@ -5377,164 +5338,167 @@ class Filter:
                 response = "\n".join(lines)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
+            return True, self._ensure_last_message_is_user(messages)
 
-        # ── /clean ──
+        # /clean
         if (
-            last_user_msg
-            and last_user_msg.get("content", "").strip().startswith("/clean")
+            content.startswith("/clean")
             and self.valves.cleanup_command_enabled
             and self.valves.cleanup_suggestions_enabled
         ):
-            response = await self._handle_clean_command(
-                last_user_msg.get("content", ""), project_id
-            )
+            response = await self._handle_clean_command(content, project_id)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
+            return True, self._ensure_last_message_is_user(messages)
 
-        # ── /expand ──
-        if last_user_msg and last_user_msg.get("content", "").strip().startswith(
-            "/expand"
+        # /expand
+        if content.startswith("/expand"):
+            response = await self._handle_expand_command(content, project_id)
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            return True, self._ensure_last_message_is_user(messages)
+
+        return False, None
+
+    async def _inlet_handle_natural_intents(
+        self,
+        messages: List[dict],
+        project_id: str,
+        is_explicit_command: bool,
+        last_user_msg: Optional[dict],
+    ) -> Tuple[bool, Optional[List[dict]]]:
+        """Handle natural language intents (forget, remember, obsolete).
+        Returns (handled, messages) if an intent was processed, else (False, None).
+        """
+        if (
+            not self.valves.enable_natural_language_forget
+            or not last_user_msg
+            or is_explicit_command
+            or self._has_code_indicators(last_user_msg.get("content", ""))
         ):
-            response = await self._handle_expand_command(
-                last_user_msg.get("content", ""), project_id
-            )
+            return False, None
+
+        intents = await self._parse_all_intents(last_user_msg.get("content", ""))
+        for intent_type in ("forget", "remember", "obsolete"):
+            fi = intents.get(intent_type, {})
+            if fi.get("action") in (None, "none"):
+                continue
+            if intent_type == "forget":
+                confirmation = await self._execute_forget_intent(project_id, fi)
+            elif intent_type == "remember":
+                confirmation = await self._execute_remember_intent(project_id, fi)
+            elif intent_type == "obsolete" and self.valves.enable_obsolete_marking:
+                confirmation = await self._execute_obsolete_intent(project_id, fi)
+            else:
+                continue
+
+            status_msg = f"[CodeAware] {confirmation}"
+            messages.insert(0, {"role": "system", "content": status_msg})
             messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            messages = self._ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
+            messages.append({"role": "assistant", "content": confirmation})
+            return True, self._ensure_last_message_is_user(messages)
 
-        # ======================================================================
-        # Per‑request tracking for graceful STOP cancellation
-        # ======================================================================
-        background_tasks: list[asyncio.Task] = []
-        token = _inlet_background_tasks.set(background_tasks)
-        _inlet_aborted = True
+        return False, None
 
-        try:
-            state = self._get_state(project_id)
+    async def _inlet_prepare_code_session(
+        self,
+        messages: List[dict],
+        project_id: str,
+        user_query: str,
+    ) -> Tuple[bool, str]:
+        """Classify session, update active code, clean user question.
+        Returns (is_code_session, user_question).
+        """
+        is_code_session = await self._classify_session(messages, project_id)
 
-            t0 = time.monotonic()
-            is_code_session = await self._classify_session(messages, project_id)
-            _inlet_timing("classify_session (code detection)", t0)
-
-            if self.valves.enable_code_awareness and is_code_session:
-                last_idx = len(messages) - 1
-                t0 = time.monotonic()
-                await self._update_active_code(messages[last_idx], project_id)
-                extracted_blocks, block_spans = await self._extract_code_blocks(
-                    user_query
-                )
-                if block_spans:
-                    user_question = self._remove_code_spans(
-                        user_query, block_spans
-                    ).strip()
-                    if not user_question or len(user_question) < 10:
-                        user_question = user_query
-                else:
+        if self.valves.enable_code_awareness and is_code_session:
+            last_idx = len(messages) - 1
+            await self._update_active_code(messages[last_idx], project_id)
+            extracted_blocks, block_spans = await self._extract_code_blocks(user_query)
+            if block_spans:
+                user_question = self._remove_code_spans(user_query, block_spans).strip()
+                if not user_question or len(user_question) < 10:
                     user_question = user_query
-                _inlet_timing(
-                    "update_active_code_last (extract symbols from last msg)", t0
+            else:
+                user_question = user_query
+            self._last_processed_message_idx[project_id] = last_idx
+        else:
+            user_question = user_query
+
+        return is_code_session, user_question
+
+    async def _inlet_build_system_injections(
+        self,
+        messages: List[dict],
+        project_id: str,
+        user_query: str,
+        user_question: str,
+        is_code_session: bool,
+        last_user_msg: Optional[dict],
+        state: dict,
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """Build all system injections: LTM, code context, confidence, etc.
+        Returns (system_injections, prelim_system).
+        """
+        system_injections: List[Tuple[str, str]] = []
+
+        # LTM retrieval
+        ltm_future = None
+        if (
+            self.valves.enable_code_awareness
+            and is_code_session
+            and not self.valves.smart_context_selection
+            and HAS_SENTENCE
+            and HAS_CHROMA
+        ):
+            if user_query:
+                ltm_future = asyncio.create_task(
+                    self._retrieve_all_memories_unified(user_query, project_id)
                 )
-                self._last_processed_message_idx[project_id] = last_idx
 
-            system_injections = []
-            manual_cot_used = False
-            cot_any_used = False
-            cot_level = 2
+        # Parallel checks (contradictions, cached response, duplicate question)
+        context_hash = self._compute_context_hash(messages)
+        contradiction_warning = None
+        cached_response = None
+        duplicate_match = None
 
-            # LTM retrieval
-            ltm_future = None
-            if (
-                self.valves.enable_code_awareness
-                and is_code_session
-                and not self.valves.smart_context_selection
-                and HAS_SENTENCE
-                and HAS_CHROMA
-            ):
-                if user_query:
-                    t0 = time.monotonic()
-                    ltm_future = asyncio.create_task(
-                        self._retrieve_all_memories_unified(user_query, project_id)
-                    )
-                    _inlet_timing("ltm_task_creation (launch background LTM query)", t0)
-
-            # Parallel checks
-            parallel_checks_task = None
-            context_hash = self._compute_context_hash(messages)
-            contradiction_warning = cached_response = duplicate_match = None
-
-            if last_user_msg:
-                parallel_checks_task = asyncio.create_task(
-                    self._parallel_context_checks(
-                        messages, user_query, context_hash, project_id, state
-                    )
+        if last_user_msg:
+            parallel_checks_task = asyncio.create_task(
+                self._parallel_context_checks(
+                    messages, user_query, context_hash, project_id, state
                 )
-            if parallel_checks_task is not None:
-                contradiction_warning, cached_response, duplicate_match = (
-                    await parallel_checks_task
-                )
-                if cached_response:
-                    messages.append(
-                        {"role": "assistant", "content": cached_response["response"]}
-                    )
-                    messages = self._ensure_last_message_is_user(messages)
-                    body["messages"] = messages
-                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                    self._log_section(
-                        "CONTEXT MANAGER - INLET END",
-                        duration=time.monotonic() - inlet_start,
-                    )
-                    _inlet_aborted = False
-                    return body
+            )
+            contradiction_warning, cached_response, duplicate_match = (
+                await parallel_checks_task
+            )
 
-            if contradiction_warning and self.valves.contradiction_inject_warning:
-                system_injections.append(("high", contradiction_warning))
-            if duplicate_match:
-                warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
-                system_injections.append(("medium", warn_msg))
+        if cached_response:
+            # Will be handled by caller; we just return early
+            return [], cached_response
 
-            # Wait for LTM and format
+        if contradiction_warning and self.valves.contradiction_inject_warning:
+            system_injections.append(("high", contradiction_warning))
+        if duplicate_match:
+            warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
+            system_injections.append(("medium", warn_msg))
+
+        # Wait for LTM and format
+        if ltm_future is not None:
+            all_meta = await ltm_future
+            all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             unique_meta = []
-            if ltm_future is not None:
-                t0 = time.monotonic()
-                all_meta = await ltm_future
-                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-                seen = set()
-                for m in all_meta:
-                    if m["doc"] not in seen:
-                        seen.add(m["doc"])
-                        unique_meta.append(m)
-                _inlet_timing("ltm_retrieval (wait for LTM results)", t0)
+            seen = set()
+            for m in all_meta:
+                if m["doc"] not in seen:
+                    seen.add(m["doc"])
+                    unique_meta.append(m)
 
             max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
             parts = []
             current_tokens = 0
             header = "## Relevant Past Context (with timestamps)\n\n"
-            if max_ltm_tokens > 0:
-                current_tokens += (
-                    len(self.tokenizer.encode(header))
-                    if self.tokenizer
-                    else (len(header) // 4)
-                )
+            if max_ltm_tokens > 0 and self.tokenizer:
+                current_tokens += len(self.tokenizer.encode(header))
             for mem in unique_meta:
                 ts = mem.get("timestamp")
                 if ts and ts > 1000000000:
@@ -5559,259 +5523,246 @@ class Filter:
                     ctx += "\n[Some older fragments omitted to fit token budget]"
                 system_injections.append(("high", ctx))
 
-            # Proactive cleanup suggestion
-            if (
-                self.valves.cleanup_suggestions_enabled
-                and self.valves.cleanup_proactive_suggestions
-                and is_code_session
-            ):
-                candidates = self._get_inactive_block_candidates(project_id)
-                if candidates:
-                    last_sugg_idx = state.get("last_cleanup_suggestion_msg_idx", 0)
-                    if (
-                        state["message_count"] - last_sugg_idx
-                        >= self.valves.cleanup_suggestion_cooldown_messages
-                    ):
-                        suggestion = (
-                            f"[CodeAware SUGGESTION] You have {len(candidates)} inactive code blocks. "
-                            f"Type `/status` to review or `/clean` to forget them. "
-                            f"(This note is not part of the conversation with the model.)"
-                        )
-                        system_injections.append(("medium", suggestion))
-                        state["last_cleanup_suggestion_msg_idx"] = state[
-                            "message_count"
-                        ]
-                        self._set_state(project_id, state)
-
-            # ============== CODE INJECTION ==============
-            if is_code_session and self.valves.enable_code_awareness:
-                code_blocks_for_injection = [
-                    b
-                    for b in state["active_blocks"].values()
-                    if b.content_type
-                    in (
-                        ContentType.BASE_CODE,
-                        ContentType.COMMITTED_CHANGE,
-                        ContentType.PROPOSED_CHANGE,
+        # Proactive cleanup suggestion
+        if (
+            self.valves.cleanup_suggestions_enabled
+            and self.valves.cleanup_proactive_suggestions
+            and is_code_session
+        ):
+            candidates = self._get_inactive_block_candidates(project_id)
+            if candidates:
+                last_sugg_idx = state.get("last_cleanup_suggestion_msg_idx", 0)
+                if (
+                    state["message_count"] - last_sugg_idx
+                    >= self.valves.cleanup_suggestion_cooldown_messages
+                ):
+                    suggestion = (
+                        f"[CodeAware SUGGESTION] You have {len(candidates)} inactive code blocks. "
+                        f"Type `/status` to review or `/clean` to forget them. "
+                        f"(This note is not part of the conversation with the model.)"
                     )
-                    and not b.obsolete
-                ]
-                total_code_tokens = sum(
-                    b._cached_token_count for b in code_blocks_for_injection
+                    system_injections.append(("medium", suggestion))
+                    state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
+                    self._set_state(project_id, state)
+
+        # ============== CODE INJECTION ==============
+        if is_code_session and self.valves.enable_code_awareness:
+            code_blocks_for_injection = [
+                b
+                for b in state["active_blocks"].values()
+                if b.content_type
+                in (
+                    ContentType.BASE_CODE,
+                    ContentType.COMMITTED_CHANGE,
+                    ContentType.PROPOSED_CHANGE,
                 )
+                and not b.obsolete
+            ]
+            total_code_tokens = sum(
+                b._cached_token_count for b in code_blocks_for_injection
+            )
 
-                self._log_debug(
-                    f"Active code blocks for injection: {len(code_blocks_for_injection)} "
-                    f"(~{total_code_tokens} tokens)"
+            if self.valves.use_symbol_level_analysis:
+                summary, suggested = await self._analyze_code_via_symbols(
+                    user_question, project_id
                 )
-
-                if self.valves.use_symbol_level_analysis:
-                    self._log_debug("Using symbol-level analysis")
-                    t0 = time.monotonic()
-                    summary, suggested = await self._analyze_code_via_symbols(
-                        user_question, project_id
+                if summary:
+                    system_injections.append(("critical", summary))
+                if suggested:
+                    suggested_blocks = self._get_blocks_for_symbols(
+                        list(suggested), project_id
                     )
-                    _inlet_timing("symbol_analysis (parallel LLM)", t0)
-                    if summary:
-                        system_injections.append(("critical", summary))
-                    if suggested:
-                        suggested_blocks = self._get_blocks_for_symbols(
-                            list(suggested), project_id
+                    if suggested_blocks:
+                        extra_lines = []
+                        tokens_used = 0
+                        max_sugg_tokens = min(
+                            self.valves.active_context_max_tokens or 3000,
+                            3000,
                         )
-                        if suggested_blocks:
-                            extra_lines = []
-                            tokens_used = 0
-                            max_sugg_tokens = min(
-                                self.valves.active_context_max_tokens or 3000,
-                                3000,
+                        for blk in suggested_blocks[:5]:
+                            bt = blk._cached_token_count
+                            if (
+                                max_sugg_tokens > 0
+                                and tokens_used + bt > max_sugg_tokens
+                            ):
+                                break
+                            loc = f" (file: {blk.file_path})" if blk.file_path else ""
+                            extra_lines.append(
+                                f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
                             )
-                            for blk in suggested_blocks[:5]:
-                                bt = blk._cached_token_count
-                                if (
-                                    max_sugg_tokens > 0
-                                    and tokens_used + bt > max_sugg_tokens
-                                ):
-                                    break
-                                loc = (
-                                    f" (file: {blk.file_path})" if blk.file_path else ""
+                            tokens_used += bt
+                        if extra_lines:
+                            system_injections.append(
+                                (
+                                    "high",
+                                    "## Additional suggested code\n\n"
+                                    + "\n".join(extra_lines),
                                 )
-                                extra_lines.append(
-                                    f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
-                                )
-                                tokens_used += bt
-                            if extra_lines:
-                                system_injections.append(
-                                    (
-                                        "high",
-                                        "## Additional suggested code\n\n"
-                                        + "\n".join(extra_lines),
-                                    )
-                                )
-                else:
-                    is_structural = (
-                        await self._is_structural_task(user_query)
-                        if user_query
-                        else False
-                    )
-                    if (
-                        total_code_tokens
-                        > self.valves.huge_injection_threshold_tokens
-                        > 0
-                    ):
-                        active_ctx = await self._build_lightweight_context(project_id)
-                        injected_hashes: Set[str] = set()
-                        if user_query:
-                            pre_expanded = await self._smart_pre_expand(
-                                user_query=user_query,
-                                project_id=project_id,
-                                token_budget=self.valves.smart_pre_expand_max_tokens,
-                                seen_hashes=injected_hashes,
                             )
-                            if pre_expanded:
-                                active_ctx += "\n" + pre_expanded
-                            else:
-                                expanded = self._expand_referenced_symbols(
-                                    project_id, user_query, seen_hashes=injected_hashes
-                                )
-                                if expanded:
-                                    active_ctx += "\n" + expanded
-                        if is_structural:
-                            active_ctx += (
-                                "\n\n[Note: Structural analysis requested. "
-                                "Full code bodies have been pre-expanded above where available.]"
-                            )
-                    else:
-                        active_ctx = self._get_active_code_context(
-                            project_id, user_query=user_query
+            else:
+                is_structural = (
+                    await self._is_structural_task(user_query) if user_query else False
+                )
+                if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
+                    active_ctx = await self._build_lightweight_context(project_id)
+                    injected_hashes: Set[str] = set()
+                    if user_query:
+                        pre_expanded = await self._smart_pre_expand(
+                            user_query=user_query,
+                            project_id=project_id,
+                            token_budget=self.valves.smart_pre_expand_max_tokens,
+                            seen_hashes=injected_hashes,
                         )
-                        if user_query and not is_structural:
+                        if pre_expanded:
+                            active_ctx += "\n" + pre_expanded
+                        else:
                             expanded = self._expand_referenced_symbols(
-                                project_id, user_query
+                                project_id, user_query, seen_hashes=injected_hashes
                             )
                             if expanded:
                                 active_ctx += "\n" + expanded
-
-                    if active_ctx:
-                        checklist = (
-                            "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                            "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                            "2. Identify every assumption the code makes and verify each one.\n"
-                            "3. For every regex or string match, test it against 5 counter-examples.\n"
-                            "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                            "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                            "6. Output your reasoning step by step, then provide the corrected code.\n"
+                    if is_structural:
+                        active_ctx += (
+                            "\n\n[Note: Structural analysis requested. "
+                            "Full code bodies have been pre-expanded above where available.]"
                         )
-                        active_ctx = checklist + "\n\n" + active_ctx
-                        system_injections.append(("critical", active_ctx))
-
-            # ============== END CODE INJECTION ==============
-
-            # Confidence scoring
-            if self.valves.enable_confidence_scoring and is_code_session:
-                system_injections.append(("high", self.valves.confidence_prompt))
-
-            # Feedback context
-            if (
-                is_code_session
-                and self.valves.enable_feedback_tracking
-                and self.valves.inject_feedback_context
-            ):
-                feedback_ctx = self._get_feedback_context(project_id)
-                if feedback_ctx:
-                    system_injections.append(("high", feedback_ctx))
-
-            # Proactive summary suggestion
-            system_msgs = [m for m in messages if m.get("role") == "system"]
-            history_msgs = [m for m in messages if m.get("role") != "system"]
-            total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-            if self.valves.context_window_tokens > 0:
-                t0 = time.monotonic()
-                suggestion = await self._check_and_suggest_summarization(
-                    project_id, total_tokens, self.valves.context_window_tokens
-                )
-                _inlet_timing("check_summarization_suggestion (token ratio check)", t0)
-                if suggestion:
-                    system_injections.append(("medium", suggestion))
-
-            # Command suggestion
-            t0 = time.monotonic()
-            cmd_suggestion = await self._suggest_commands(project_id, state)
-            _inlet_timing("suggest_commands (heuristic)", t0)
-            if cmd_suggestion:
-                system_injections.append(("medium", cmd_suggestion))
-
-            # Build prelim_system
-            sys_msgs = [m for m in messages if m.get("role") == "system"]
-            base_content = ""
-            if sys_msgs:
-                base_content = sys_msgs[0].get("content", "")
-                messages = [m for m in messages if m.get("role") != "system"]
-
-            budget = self.valves.global_injection_token_budget
-            if budget > 0 and self.tokenizer:
-                priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-                system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
-                selected_texts = []
-                total_inj_tokens = 0
-                for prio, text in system_injections:
-                    if not text:
-                        continue
-                    tokens = len(self.tokenizer.encode(text))
-                    if total_inj_tokens + tokens <= budget:
-                        selected_texts.append(text)
-                        total_inj_tokens += tokens
-                    else:
-                        if prio in ("critical", "high"):
-                            available = budget - total_inj_tokens
-                            if available > 20:
-                                truncated = text[: available * 4] + "\n[truncated]"
-                                selected_texts.append(truncated)
-                                total_inj_tokens += len(
-                                    self.tokenizer.encode(truncated)
-                                )
-                                break
-                prelim_system = "\n\n".join(selected_texts)
-            else:
-                prelim_system = "\n\n".join(
-                    text for _, text in system_injections if text
-                )
-
-            if base_content.strip():
-                prelim_system = prelim_system + "\n\n" + base_content
-
-            # CoT detection
-            if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-                if last_user_msg:
-                    user_content = last_user_msg.get("content", "")
-                    if (
-                        self.valves.enable_cot_on_demand
-                        and user_content.strip().startswith("/think")
-                    ):
-                        cot_question, level = await self._parse_cot_intent(user_content)
-                        if cot_question:
-                            manual_cot_used = True
-                            cot_any_used = True
-                            cot_level = level
-                            if level == 1:
-                                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                                system_injections.append(("high", cot_prompt))
-                    elif not manual_cot_used:
-                        cot_level = await self._detect_cot_level(
-                            user_content, is_code_session, state
+                else:
+                    active_ctx = self._get_active_code_context(
+                        project_id, user_query=user_query
+                    )
+                    if user_query and not is_structural:
+                        expanded = self._expand_referenced_symbols(
+                            project_id, user_query
                         )
-                        if cot_level > 0:
-                            cot_any_used = True
+                        if expanded:
+                            active_ctx += "\n" + expanded
 
-            # Wait for background tasks
-            if background_tasks:
-                self._log_debug(
-                    f"Waiting for {len(background_tasks)} background LLM task(s) to finish before CoT..."
-                )
-                await asyncio.gather(*background_tasks, return_exceptions=True)
-                background_tasks.clear()
+                if active_ctx:
+                    checklist = (
+                        "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                        "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                        "2. Identify every assumption the code makes and verify each one.\n"
+                        "3. For every regex or string match, test it against 5 counter-examples.\n"
+                        "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                        "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                        "6. Output your reasoning step by step, then provide the corrected code.\n"
+                    )
+                    active_ctx = checklist + "\n\n" + active_ctx
+                    system_injections.append(("critical", active_ctx))
 
-            # Generate CoT
-            reasoning = None
+        # Confidence scoring
+        if self.valves.enable_confidence_scoring and is_code_session:
+            system_injections.append(("high", self.valves.confidence_prompt))
+
+        # Feedback context
+        if (
+            is_code_session
+            and self.valves.enable_feedback_tracking
+            and self.valves.inject_feedback_context
+        ):
+            feedback_ctx = self._get_feedback_context(project_id)
+            if feedback_ctx:
+                system_injections.append(("high", feedback_ctx))
+
+        # Proactive summary suggestion
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        history_msgs = [m for m in messages if m.get("role") != "system"]
+        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+        if self.valves.context_window_tokens > 0:
+            suggestion = await self._check_and_suggest_summarization(
+                project_id, total_tokens, self.valves.context_window_tokens
+            )
+            if suggestion:
+                system_injections.append(("medium", suggestion))
+
+        # Command suggestion
+        cmd_suggestion = await self._suggest_commands(project_id, state)
+        if cmd_suggestion:
+            system_injections.append(("medium", cmd_suggestion))
+
+        # Build preliminary system text respecting token budget
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        base_content = ""
+        if sys_msgs:
+            base_content = sys_msgs[0].get("content", "")
+
+        budget = self.valves.global_injection_token_budget
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+        if budget > 0 and self.tokenizer:
+            system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected_texts = []
+            total_inj_tokens = 0
+            for prio, text in system_injections:
+                if not text:
+                    continue
+                tokens = len(self.tokenizer.encode(text))
+                if total_inj_tokens + tokens <= budget:
+                    selected_texts.append(text)
+                    total_inj_tokens += tokens
+                else:
+                    if prio in ("critical", "high"):
+                        available = budget - total_inj_tokens
+                        if available > 20:
+                            truncated = text[: available * 4] + "\n[truncated]"
+                            selected_texts.append(truncated)
+                            total_inj_tokens += len(self.tokenizer.encode(truncated))
+                            break
+            prelim_system = "\n\n".join(selected_texts)
+        else:
+            prelim_system = "\n\n".join(text for _, text in system_injections if text)
+
+        if base_content.strip():
+            prelim_system = prelim_system + "\n\n" + base_content
+
+        return system_injections, prelim_system
+
+    async def _inlet_assemble_final_messages(
+        self,
+        messages: List[dict],
+        system_injections: List[Tuple[str, str]],
+        prelim_system: str,
+        last_user_msg: Optional[dict],
+        is_code_session: bool,
+        state: dict,
+        __user__: Optional[dict],
+        background_tasks: List[asyncio.Task],
+    ) -> List[dict]:
+        """Apply CoT, final token budget, trimming, and insert system prompt."""
+        # CoT detection
+        manual_cot_used = False
+        cot_any_used = False
+        cot_level = 2
+        reasoning = None
+
+        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+            if last_user_msg:
+                user_content = last_user_msg.get("content", "")
+                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
+                    "/think"
+                ):
+                    cot_question, level = await self._parse_cot_intent(user_content)
+                    if cot_question:
+                        manual_cot_used = True
+                        cot_any_used = True
+                        cot_level = level
+                        if level == 1:
+                            cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                            system_injections.append(("high", cot_prompt))
+                elif not manual_cot_used:
+                    cot_level = await self._detect_cot_level(
+                        user_content, is_code_session, state
+                    )
+                    if cot_level > 0:
+                        cot_any_used = True
+
+        # Wait for background tasks before heavy LLM calls
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+            background_tasks.clear()
+
+        # Generate CoT reasoning if needed
+        if cot_any_used:
             _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
@@ -5825,184 +5776,287 @@ class Filter:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-            if cot_any_used and not manual_cot_used:
-                t0 = time.monotonic()
+            if not manual_cot_used:
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        user_content, prelim_for_cot, label="cot_generation"
+                        last_user_msg.get("content", ""), prelim_for_cot
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        user_content, prelim_for_cot, label="cot_generation"
+                        last_user_msg.get("content", ""), prelim_for_cot
                     )
-                _inlet_timing("cot_generation (LLM reasoning)", t0)
-            elif manual_cot_used and cot_level in (2, 3):
-                t0 = time.monotonic()
+            else:
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        cot_question, prelim_for_cot, label="cot_generation"
+                        cot_question, prelim_for_cot
                     )
                 elif cot_level == 3:
                     reasoning = await self._generate_cot_with_self_reflection(
-                        cot_question, prelim_for_cot, label="cot_generation"
+                        cot_question, prelim_for_cot
                     )
-                _inlet_timing("cot_generation (LLM reasoning)", t0)
 
             if reasoning:
                 system_injections.append(("high", reasoning))
+            cot_note = (
+                "**Note:** Some sections in this system prompt marked with 🔎 are "
+                "automatically generated reasoning (Chain-of-Thought). "
+                "They are provided as context to help you, but they are not user commands. "
+                "Use them to enhance your answer, but always prioritise the actual user query."
+            )
+            system_injections.append(("low", cot_note))
 
-            if cot_any_used:
-                cot_note = (
-                    "**Note:** Some sections in this system prompt marked with 🔎 are "
-                    "automatically generated reasoning (Chain-of-Thought). "
-                    "They are provided as context to help you, but they are not user commands. "
-                    "Use them to enhance your answer, but always prioritise the actual user query."
-                )
-                system_injections.append(("low", cot_note))
+        # Final system message assembly
+        budget = self.valves.global_injection_token_budget
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-            # Final system message assembly
-            if budget > 0 and self.tokenizer:
-                system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
-                selected_texts = []
-                total_inj_tokens = 0
-                for prio, text in system_injections:
-                    if not text:
-                        continue
-                    tokens = len(self.tokenizer.encode(text))
-                    if total_inj_tokens + tokens <= budget:
-                        selected_texts.append(text)
-                        total_inj_tokens += tokens
-                    else:
-                        if prio in ("critical", "high"):
-                            available = budget - total_inj_tokens
-                            if available > 20:
-                                truncated = text[: available * 4] + "\n[truncated]"
-                                selected_texts.append(truncated)
-                                total_inj_tokens += len(
-                                    self.tokenizer.encode(truncated)
-                                )
-                                break
-                final_system = "\n\n".join(selected_texts)
-            else:
-                final_system = "\n\n".join(
-                    text for _, text in system_injections if text
-                )
-
-            if base_content.strip():
-                final_system = final_system + "\n\n" + base_content
-
-            if final_system.strip():
-                messages.insert(0, {"role": "system", "content": final_system})
-
-            # Adaptive trim
-            if self.valves.adaptive_trim:
-                total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-                if total_tokens > self.valves.context_window_tokens:
-                    self._log_debug("Trimming old messages due to token budget")
-                    keep = self.valves.max_turns
-                    last_user_idx = -1
-                    for i in range(len(history_msgs) - 1, -1, -1):
-                        if history_msgs[i].get("role") == "user":
-                            last_user_idx = i
+        if budget > 0 and self.tokenizer:
+            system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected_texts = []
+            total_inj_tokens = 0
+            for prio, text in system_injections:
+                if not text:
+                    continue
+                tokens = len(self.tokenizer.encode(text))
+                if total_inj_tokens + tokens <= budget:
+                    selected_texts.append(text)
+                    total_inj_tokens += tokens
+                else:
+                    if prio in ("critical", "high"):
+                        available = budget - total_inj_tokens
+                        if available > 20:
+                            truncated = text[: available * 4] + "\n[truncated]"
+                            selected_texts.append(truncated)
+                            total_inj_tokens += len(self.tokenizer.encode(truncated))
                             break
-                    if last_user_idx != -1:
-                        start_idx = max(0, last_user_idx - keep + 1)
-                        old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                        kept_block = history_msgs[start_idx:]
-                    else:
-                        old_block = history_msgs[:-keep] if keep > 0 else []
-                        kept_block = history_msgs[-keep:] if keep > 0 else []
+            final_system = "\n\n".join(selected_texts)
+        else:
+            final_system = "\n\n".join(text for _, text in system_injections if text)
 
-                    if self.valves.summarize_old_messages and old_block:
-                        t0 = time.monotonic()
-                        has_code = any("```" in m.get("content", "") for m in old_block)
-                        summary = await self._summarize_messages(
-                            old_block, is_code_context=has_code
-                        )
-                        _inlet_timing("summarize_old_messages (LLM summary)", t0)
-                        if summary:
-                            system_injections.append(
-                                (
-                                    "high",
-                                    f"[Summary of earlier conversation]\n{summary}",
-                                )
-                            )
-                        history_msgs = kept_block
-                    else:
-                        history_msgs = kept_block
+        # Append base content
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
+        if base_content.strip():
+            final_system = final_system + "\n\n" + base_content
 
-                    if self.valves.preserve_tool_calls:
-                        while history_msgs and history_msgs[0].get("role") == "tool":
-                            history_msgs.pop(0)
-                        if (
-                            history_msgs
-                            and history_msgs[0].get("role") == "assistant"
-                            and history_msgs[0].get("tool_calls")
-                        ):
-                            tool_call_ids = {
-                                tc.get("id") for tc in history_msgs[0]["tool_calls"]
-                            }
-                            tool_response_ids = {
-                                m.get("tool_call_id")
-                                for m in history_msgs[1:]
-                                if m.get("role") == "tool"
-                            }
-                            if not tool_call_ids.issubset(tool_response_ids):
-                                history_msgs.pop(0)
-            else:
-                user_max = (
-                    __user__["valves"].max_turns
-                    if __user__ and hasattr(__user__, "valves")
-                    else None
-                )
-                eff_max = user_max if user_max is not None else self.valves.max_turns
-                if len(history_msgs) > eff_max:
-                    self._log_debug("Trimming old messages based on max_turns")
-                    keep = eff_max
-                    last_user_idx = -1
-                    for i in range(len(history_msgs) - 1, -1, -1):
-                        if history_msgs[i].get("role") == "user":
-                            last_user_idx = i
-                            break
-                    if last_user_idx != -1:
-                        start_idx = max(0, last_user_idx - keep + 1)
-                        old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                        kept_block = history_msgs[start_idx:]
-                    else:
-                        old_block = history_msgs[:-keep] if keep > 0 else []
-                        kept_block = history_msgs[-keep:] if keep > 0 else []
+        if final_system.strip():
+            messages = [m for m in messages if m.get("role") != "system"]
+            messages.insert(0, {"role": "system", "content": final_system})
+        else:
+            messages = [m for m in messages if m.get("role") != "system"]
 
-                    if self.valves.summarize_old_messages and old_block:
-                        t0 = time.monotonic()
-                        has_code = any("```" in m.get("content", "") for m in old_block)
-                        summary = await self._summarize_messages(
-                            old_block, is_code_context=has_code
-                        )
-                        _inlet_timing("summarize_old_messages (LLM summary)", t0)
-                        if summary:
-                            system_injections.append(
-                                (
-                                    "high",
-                                    f"[Summary of earlier conversation]\n{summary}",
-                                )
-                            )
-                        history_msgs = kept_block
-                    else:
-                        history_msgs = kept_block
+        # Adaptive trimming
+        history_msgs = [m for m in messages if m.get("role") != "system"]
+        system_msgs = [m for m in messages if m.get("role") == "system"]
 
-            messages = system_msgs + history_msgs
-
-            # Ensure last message is user
-            if messages and messages[-1].get("role") != "user":
+        if self.valves.adaptive_trim:
+            total_tokens = self._estimate_tokens(messages)
+            if total_tokens > self.valves.context_window_tokens:
+                keep = self.valves.max_turns
                 last_user_idx = -1
-                for i in range(len(messages) - 1, -1, -1):
-                    if messages[i].get("role") == "user":
+                for i in range(len(history_msgs) - 1, -1, -1):
+                    if history_msgs[i].get("role") == "user":
                         last_user_idx = i
                         break
                 if last_user_idx != -1:
-                    messages = messages[: last_user_idx + 1]
+                    start_idx = max(0, last_user_idx - keep + 1)
+                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                    kept_block = history_msgs[start_idx:]
                 else:
-                    messages.append({"role": "user", "content": "continue"})
+                    old_block = history_msgs[:-keep] if keep > 0 else []
+                    kept_block = history_msgs[-keep:] if keep > 0 else []
+
+                if self.valves.summarize_old_messages and old_block:
+                    has_code = any("```" in m.get("content", "") for m in old_block)
+                    summary = await self._summarize_messages(
+                        old_block, is_code_context=has_code
+                    )
+                    if summary:
+                        kept_block.insert(
+                            0,
+                            {
+                                "role": "system",
+                                "content": f"[Summary of earlier conversation]\n{summary}",
+                            },
+                        )
+                    history_msgs = kept_block
+                else:
+                    history_msgs = kept_block
+
+                if self.valves.preserve_tool_calls:
+                    while history_msgs and history_msgs[0].get("role") == "tool":
+                        history_msgs.pop(0)
+                    if (
+                        history_msgs
+                        and history_msgs[0].get("role") == "assistant"
+                        and history_msgs[0].get("tool_calls")
+                    ):
+                        tool_call_ids = {
+                            tc.get("id") for tc in history_msgs[0]["tool_calls"]
+                        }
+                        tool_response_ids = {
+                            m.get("tool_call_id")
+                            for m in history_msgs[1:]
+                            if m.get("role") == "tool"
+                        }
+                        if not tool_call_ids.issubset(tool_response_ids):
+                            history_msgs.pop(0)
+        else:
+            user_max = (
+                __user__["valves"].max_turns
+                if __user__ and hasattr(__user__, "valves")
+                else None
+            )
+            eff_max = user_max if user_max is not None else self.valves.max_turns
+            if len(history_msgs) > eff_max:
+                keep = eff_max
+                last_user_idx = -1
+                for i in range(len(history_msgs) - 1, -1, -1):
+                    if history_msgs[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                if last_user_idx != -1:
+                    start_idx = max(0, last_user_idx - keep + 1)
+                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                    kept_block = history_msgs[start_idx:]
+                else:
+                    old_block = history_msgs[:-keep] if keep > 0 else []
+                    kept_block = history_msgs[-keep:] if keep > 0 else []
+
+                if self.valves.summarize_old_messages and old_block:
+                    has_code = any("```" in m.get("content", "") for m in old_block)
+                    summary = await self._summarize_messages(
+                        old_block, is_code_context=has_code
+                    )
+                    if summary:
+                        kept_block.insert(
+                            0,
+                            {
+                                "role": "system",
+                                "content": f"[Summary of earlier conversation]\n{summary}",
+                            },
+                        )
+                    history_msgs = kept_block
+                else:
+                    history_msgs = kept_block
+
+        messages = system_msgs + history_msgs
+
+        # Ensure last message is user
+        if messages and messages[-1].get("role") != "user":
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                messages = messages[: last_user_idx + 1]
+            else:
+                messages.append({"role": "user", "content": "continue"})
+
+        return messages
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
+    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        self._log_debug("inlet called")
+        inlet_start = time.monotonic()
+        self._log_section("CONTEXT MANAGER - INLET START")
+
+        def _inlet_timing(step_name: str, start: float, end: float = None):
+            if end is None:
+                end = time.monotonic()
+            self._log_timing(step_name, start - inlet_start, end - start)
+
+        self._ensure_cleanup_task()
+        project_id = self._get_project_id()
+
+        # Preprocessing
+        messages = await self._inlet_preprocess(body, project_id)
+        if not messages:
+            return body
+
+        # Extract user info
+        last_user_msg, user_query, user_question, is_explicit_command = (
+            self._inlet_extract_user_info(messages)
+        )
+
+        # Explicit commands
+        handled, handled_messages = await self._inlet_handle_explicit_commands(
+            messages, project_id, is_explicit_command, last_user_msg, __user__
+        )
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
+            return body
+
+        # Natural language intents
+        handled, handled_messages = await self._inlet_handle_natural_intents(
+            messages, project_id, is_explicit_command, last_user_msg
+        )
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
+            return body
+
+        # Per‑request tracking for graceful STOP cancellation
+        background_tasks: list[asyncio.Task] = []
+        token = _inlet_background_tasks.set(background_tasks)
+        _inlet_aborted = True
+
+        try:
+            state = self._get_state(project_id)
+
+            # Code session preparation
+            is_code_session, user_question = await self._inlet_prepare_code_session(
+                messages, project_id, user_query
+            )
+
+            # Build system injections
+            system_injections, cached_response = (
+                await self._inlet_build_system_injections(
+                    messages,
+                    project_id,
+                    user_query,
+                    user_question,
+                    is_code_session,
+                    last_user_msg,
+                    state,
+                )
+            )
+
+            # If a cached response was found, return it immediately
+            if isinstance(cached_response, dict):
+                messages.append(
+                    {"role": "assistant", "content": cached_response["response"]}
+                )
+                messages = self._ensure_last_message_is_user(messages)
+                body["messages"] = messages
+                _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
+                _inlet_aborted = False
+                return body
+
+            # Assemble final messages (CoT, trimming, etc.)
+            messages = await self._inlet_assemble_final_messages(
+                messages,
+                system_injections,
+                "",
+                last_user_msg,
+                is_code_session,
+                state,
+                __user__,
+                background_tasks,
+            )
 
             body["messages"] = messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -6021,7 +6075,7 @@ class Filter:
         return body
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # OUTLET – with safe purge task and cache fix
+    # OUTLET
     # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
@@ -6115,7 +6169,7 @@ class Filter:
         return body
 
     # --------------------------------------------------------------------------
-    # DB checkpoints (unchanged)
+    # DB checkpoints
     # --------------------------------------------------------------------------
     async def _run_db_checkpoints(self):
         try:
@@ -6140,7 +6194,7 @@ class Filter:
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
     # --------------------------------------------------------------------------
-    # Shutdown and cleanup (with executor shutdown)
+    # Shutdown and cleanup
     # --------------------------------------------------------------------------
     def shutdown(self):
         if self._pending_ltm_messages:
@@ -6172,7 +6226,7 @@ class Filter:
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
-    # Miscellaneous helpers (duplicates, diffs, dependencies)
+    # Miscellaneous helpers
     # --------------------------------------------------------------------------
     def _calculate_code_similarity(self, code1: str, code2: str) -> float:
         if not HAS_FUZZ:
@@ -6657,7 +6711,7 @@ class Filter:
         return False
 
     # --------------------------------------------------------------------------
-    # Change summary generation (with LRU and SQLite persistence)
+    # Change summary generation
     # --------------------------------------------------------------------------
     async def _generate_change_summary(
         self, block_hash: str, prev_content: str, new_content: str
@@ -7014,7 +7068,7 @@ class Filter:
         return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
 
     # --------------------------------------------------------------------------
-    # Symbol-level analysis – using OrderedDict caches
+    # Symbol-level analysis
     # --------------------------------------------------------------------------
     def _get_cached_symbol_analysis(
         self, symbol_name: str, question_hash: str, content_hash: str = ""
