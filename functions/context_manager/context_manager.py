@@ -6274,6 +6274,8 @@ class Filter:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
                     )
+                    # Log detected level always
+                    self._log_debug(f"CoT level detected: {cot_level} (manual=False)")
                     if cot_level > 0:
                         cot_any_used = True
                         # For automatic CoT, cap at level 2 to avoid heavy models
