@@ -1538,6 +1538,52 @@ class Filter:
         matches = re.findall(self.valves.file_path_pattern, content)
         return [m[0] if isinstance(m, tuple) else m for m in matches]
 
+    # --------------------------------------------------------------------------
+    # Code span utilities
+    # --------------------------------------------------------------------------
+    async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
+        if not HAS_TREE_SITTER:
+            return []
+        cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
+        if cache_key in self._code_spans_cache:
+            return self._code_spans_cache[cache_key]
+        try:
+            config = ProcessConfig()
+            blocks = process(content, config)
+            spans = [(b.start_byte, b.end_byte) for b in blocks]
+        except Exception as e:
+            if any(
+                msg in str(e)
+                for msg in (
+                    "Language '' not available",
+                    "Language '' not available for download",
+                    "Download error: Language ''",
+                )
+            ):
+                spans = []
+            else:
+                self._log_debug(f"Tree‑sitter process failed: {e}")
+                spans = []
+        if len(self._code_spans_cache) >= 200:
+            keys_to_evict = list(self._code_spans_cache.keys())[:50]
+            for key in keys_to_evict:
+                del self._code_spans_cache[key]
+        self._code_spans_cache[cache_key] = spans
+        return spans
+
+    def _remove_code_spans(self, content: str, spans: List[Tuple[int, int]]) -> str:
+        chars = list(content)
+        for start, end in spans:
+            for i in range(start, min(end, len(chars))):
+                chars[i] = " "
+        return "".join(chars)
+
+    def _is_span_in_code(
+        self, code_spans: List[Tuple[int, int]], span: Tuple[int, int]
+    ) -> bool:
+        s, e = span
+        return any(cs <= s and e <= ce for cs, ce in code_spans)
+
     def _classify_content(
         self, content: str, extracted_blocks: List[Dict]
     ) -> ContentType:
