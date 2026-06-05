@@ -1216,6 +1216,7 @@ class Filter:
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
             "pending_secondary_tasks": [],
+            "last_cot_level": 0,
         }
 
         # Patterns
@@ -1342,6 +1343,11 @@ class Filter:
         self._chroma_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="codeaware_chroma"
         )
+
+        # ── CoT heuristic feature flags ──
+        self.ENABLE_ACCENT_NORMALIZATION = True  # normalize Spanish accents in keywords
+        self.ENABLE_KEYWORD_COUNT_WEIGHT = True  # multiple keywords increase signals
+        self.ENABLE_COT_STICKY = False  # keep last CoT level in conversation state
 
         print("[CodeAware] Filter loaded")
 
@@ -4928,13 +4934,24 @@ class Filter:
         return response if response else "Unable to generate reasoning."
 
     async def _detect_cot_level(self, user_content, is_code_session, state):
+        """Determine CoT depth, optionally storing it in conversation state."""
         if not user_content:
             return 0
+
         if self.valves.enable_cot_llm_detection:
-            return await self._detect_cot_level_via_llm(
+            level = await self._detect_cot_level_via_llm(
                 user_content, is_code_session, state
             )
-        return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+        else:
+            level = self._detect_cot_level_heuristic(
+                user_content, is_code_session, state
+            )
+
+        # Persist level for conversational continuity if feature is enabled
+        if self.ENABLE_COT_STICKY:
+            state["last_cot_level"] = level
+
+        return level
 
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
@@ -4949,14 +4966,7 @@ class Filter:
             3 — deep, generate CoT reasoning + self-reflection
         """
 
-        # ── Feature flags (can be enabled later) ───────────────────────────
-        ENABLE_ACCENT_NORMALIZATION = True  # normalise Spanish accents
-        ENABLE_KEYWORD_COUNT_WEIGHT = True  # multiple keywords increase signals
-        ENABLE_COT_HISTORY = False  # use last_cot_level from state
-        # ────────────────────────────────────────────────────────────────────
-
         # ── Keyword sets ────────────────────────────────────────────────────
-        # Generic complex keywords — safe in any context
         complex_keywords_generic = {
             "explain how",
             "explica cómo",
@@ -5006,7 +5016,6 @@ class Filter:
             "en detalle",
         }
 
-        # Code‑only keywords — ambiguous without code‑session context
         complex_keywords_code_only = {
             "test",
             "prueba",
@@ -5021,7 +5030,6 @@ class Filter:
             "estructura",
         }
 
-        # Deep keywords — require exhaustive multi‑step analysis
         deep_keywords = {
             "deep review",
             "revisión profunda",
@@ -5059,7 +5067,7 @@ class Filter:
         }
 
         # ── Optional accent normalisation ───────────────────────────────────
-        if ENABLE_ACCENT_NORMALIZATION:
+        if self.ENABLE_ACCENT_NORMALIZATION:
             import unicodedata
 
             def _normalize(text: str) -> str:
@@ -5067,7 +5075,6 @@ class Filter:
                 return nfkd.encode("ascii", "ignore").decode("ascii")
 
             content_lower = _normalize(user_content.lower())
-            # Apply same normalisation to all keyword sets
             complex_keywords_generic = {_normalize(k) for k in complex_keywords_generic}
             complex_keywords_code_only = {
                 _normalize(k) for k in complex_keywords_code_only
@@ -5109,7 +5116,7 @@ class Filter:
         is_elaborate = length_ok or word_count > 30
 
         signals = 0
-        if ENABLE_KEYWORD_COUNT_WEIGHT:
+        if self.ENABLE_KEYWORD_COUNT_WEIGHT:
             # Count how many complex keywords matched (capped at 4)
             kw_matches = sum(1 for kw in _sorted_complex if kw in content_lower)
             signals += min(kw_matches + 2, 4)
@@ -5128,7 +5135,7 @@ class Filter:
             signals += 1
 
         # ── Optional: conversation history ─────────────────────────────────
-        if ENABLE_COT_HISTORY:
+        if self.ENABLE_COT_STICKY:
             prev_level = state.get("last_cot_level", 0)
             if prev_level >= 2 and has_complex_kw:
                 signals += 1
