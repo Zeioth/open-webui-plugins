@@ -2475,9 +2475,16 @@ class Filter:
     async def _maybe_unload_for_model(
         self, model_name: str, base_url: str, is_ollama: bool
     ) -> None:
+        """
+        Unload all models if switching to a *different* model.
+        Skips unloading if the target model is the same as the last used one.
+        """
         if is_ollama:
             return
         if self._last_used_model is not None and model_name != self._last_used_model:
+            self._log_debug(
+                f"Switching model from '{self._last_used_model}' to '{model_name}'"
+            )
             try:
                 from shared_resources import unload_all_models
 
@@ -2486,6 +2493,10 @@ class Filter:
                 self._last_used_model = None
             except Exception as e:
                 self._log_debug(f"Unload via shared_resources failed: {e}")
+        elif self._last_used_model is None:
+            self._log_debug(f"Loading first model '{model_name}'")
+        else:
+            self._log_debug(f"Reusing model '{model_name}' (already loaded)")
 
     @staticmethod
     def _build_llm_request(
@@ -6265,6 +6276,12 @@ class Filter:
                     )
                     if cot_level > 0:
                         cot_any_used = True
+                        # For automatic CoT, cap at level 2 to avoid heavy models
+                        if cot_level == 3:
+                            self._log_debug(
+                                "Auto CoT capped to level 2 to prevent heavy model usage"
+                            )
+                            cot_level = 2
 
         # Wait for background tasks before heavy LLM calls
         if background_tasks:
@@ -6273,6 +6290,9 @@ class Filter:
 
         # Generate CoT reasoning if needed
         if cot_any_used:
+            # Small delay to allow the server to stabilize before another request
+            await asyncio.sleep(2.0)
+
             # Log the CoT level being used
             if manual_cot_used:
                 self._log_debug(
@@ -6282,7 +6302,7 @@ class Filter:
             else:
                 self._log_debug(
                     f"Generating auto CoT level {cot_level} with model "
-                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                    f"{self.valves.cot_model_level2}"
                 )
 
             _model_ctx = self.valves.active_context_max_tokens or 28000
@@ -6319,6 +6339,9 @@ class Filter:
 
             if reasoning:
                 system_injections.append(("high", reasoning))
+            else:
+                self._log_debug("CoT reasoning generation returned empty or failed")
+
             cot_note = (
                 "**Note:** Some sections in this system prompt marked with 🔎 are "
                 "automatically generated reasoning (Chain-of-Thought). "
@@ -6526,9 +6549,6 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6547,7 +6567,7 @@ class Filter:
         if not messages:
             return body
 
-        # Extract user info (now with await)
+        # Extract user info (with await)
         last_user_msg, user_query, user_question, is_explicit_command = (
             await self._inlet_extract_user_info(messages)
         )
