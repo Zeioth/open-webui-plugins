@@ -1161,12 +1161,43 @@ class Filter:
             description="Max concurrent LLM calls for deferred secondary tasks.",
         )
 
+    INTENT_KEYWORDS = {
+        "forget",
+        "olvida",
+        "olvid",
+        "remember",
+        "recuerda",
+        "pin",
+        "fija",
+        "guarda",
+        "obsolete",
+        "obsoleto",
+        "deprecated",
+        "ya no",
+        "remove",
+        "elimina",
+        "borra",
+        "quita",
+        "keep",
+        "mantén",
+        "conserva",
+    }
+
+    QUESTION_PATTERNS = re.compile(
+        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
+        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
+        re.IGNORECASE,
+    )
+
     # --------------------------------------------------------------------------
     # Initialization
     # --------------------------------------------------------------------------
     def __init__(self):
         # Valves and basic objects
         self.valves = self.Valves()
+        # ── Purge task tracker MUST be before _init_long_term_memory ──
+        self._purge_task: Optional[asyncio.Task] = None
+
         self.tokenizer = None
         self._db_conn = None
         self._cross_encoder = None
@@ -1222,10 +1253,10 @@ class Filter:
         self._project_locks: Dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
 
-        # Caches
-        self._symbol_analysis_cache: Dict[Tuple[str, str], Dict] = {}
+        # ── Caches ──
+        self._symbol_analysis_cache: OrderedDict = OrderedDict()
         self._MAX_SYMBOL_ANALYSIS_CACHE = 1000
-        self._symbol_analysis_generic_cache: Dict[Tuple[str, str], Dict] = {}
+        self._symbol_analysis_generic_cache: OrderedDict = OrderedDict()
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
@@ -1235,9 +1266,9 @@ class Filter:
         )
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
+        self._db_write_lock = asyncio.Lock()  # kept for extra safety, optional
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
-        self._purge_task: Optional[asyncio.Task] = None
 
         # ── Database write queue (prevents "database is locked") ──
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
@@ -1257,13 +1288,11 @@ class Filter:
         self._symbol_index = SymbolIndex()
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
-        self._SYMBOL_BLACKLIST: Set[str] = set()
 
         # Project tracking
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
-        self._block_change_summaries: Dict[str, Tuple[str, float]] = {}
         self._symbol_cache_loaded_projects: Set[str] = set()
 
         # Smart pre‑expand prototype phrases
@@ -1296,6 +1325,23 @@ class Filter:
         self._pending_ltm_messages: List[dict] = []
         self._ltm_batch_lock = asyncio.Lock()
         self._ltm_batch_task: Optional[asyncio.Task] = None
+
+        # ── New: Symbol blacklist (empty by default) ──
+        self._SYMBOL_BLACKLIST: Set[str] = set()
+
+        # ── New: LRU-ordered cache for block change summaries (max size from valves) ──
+        self._block_change_summaries: OrderedDict = OrderedDict()
+        self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
+
+        # ── New: Dedicated thread pools for blocking DB and ChromaDB operations ──
+        import concurrent.futures
+
+        self._db_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="codeaware_db"
+        )
+        self._chroma_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="codeaware_chroma"
+        )
 
         print("[CodeAware] Filter loaded")
 
@@ -1399,6 +1445,15 @@ class Filter:
                 PRIMARY KEY (project_id, symbol_name, question_hash)
             )
         """)
+        # ── New table for persistent block change summaries ──
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS block_change_summaries (
+                block_hash TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        self._db_conn.commit()
 
     def _get_project_id(self) -> str:
         return self.valves.project_id
@@ -1472,7 +1527,6 @@ class Filter:
             "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
         }
 
-        # ── Enqueue the actual write ──
         def _write():
             self._db_conn.execute(
                 "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
@@ -1671,16 +1725,15 @@ class Filter:
             name=f"response_cache_{self.valves.project_id or 'default'}",
             metadata={"hnsw:space": "cosine"},
         )
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+        # ── Only launch purge task if not already active ──
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            if self._purge_task is None or self._purge_task.done():
                 self._purge_task = asyncio.create_task(self._purge_expired_memories())
-        except RuntimeError:
-            pass
         self._log_debug("LTM ready")
 
     async def _purge_expired_memories(self):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # yield to event loop to avoid blocking
         if not HAS_CHROMA or self.memory_collection is None:
             return
         if self.valves.long_term_memory_expiration_days <= 0:
@@ -2099,7 +2152,7 @@ class Filter:
             return None
 
     # --------------------------------------------------------------------------
-    # Response cache (ChromaDB)
+    # Response cache (ChromaDB) – with thread pool
     # --------------------------------------------------------------------------
     def _ensure_cleanup_task(self) -> None:
         if (
@@ -2108,14 +2161,11 @@ class Filter:
             or self._response_cache_cleanup_task is not None
         ):
             return
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                self._response_cache_cleanup_task = asyncio.create_task(
-                    self._periodic_response_cache_cleanup()
-                )
-        except RuntimeError:
-            pass
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            self._response_cache_cleanup_task = asyncio.create_task(
+                self._periodic_response_cache_cleanup()
+            )
 
     async def _periodic_response_cache_cleanup(self):
         while True:
@@ -2157,7 +2207,12 @@ class Filter:
             self._log_debug(f"Error purging response cache: {e}")
 
     async def _store_response_in_cache(
-        self, query: str, response: str, context_hash: str, state: dict
+        self,
+        query: str,
+        response: str,
+        context_hash: str,
+        state: dict,
+        code_state_hash: str,
     ):
         if not self.valves.enable_response_cache or not HAS_SENTENCE:
             return
@@ -2205,9 +2260,7 @@ class Filter:
                         "query": query[:500],
                         "project_id": project,
                         "context_hash": "",
-                        "code_state_hash": self._compute_code_state_hash_from_state(
-                            state
-                        ),
+                        "code_state_hash": code_state_hash,  # passed from outside to avoid lock
                         "timestamp": time.time(),
                     }
                 ],
@@ -2220,1247 +2273,8 @@ class Filter:
             "resp_cache_total", time.monotonic() - t_start, time.monotonic() - t_start
         )
 
-    async def _find_cached_response(
-        self, query: str, context_hash: str, state: dict
-    ) -> Optional[dict]:
-        if not self.valves.enable_response_cache or not HAS_SENTENCE:
-            return None
-        col = getattr(self, "_response_cache_collection", None)
-        if col is None:
-            return None
-
-        t_start = time.monotonic()
-        query_vec = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode([query], convert_to_numpy=True)[0].tolist()
-        )
-        results = await anyio.to_thread.run_sync(
-            lambda: col.query(
-                query_embeddings=[query_vec],
-                n_results=1,
-                where={"project_id": self.valves.project_id},
-                include=["documents", "metadatas", "distances"],
-            )
-        )
-        if not results or not results["ids"] or not results["ids"][0]:
-            return None
-
-        dist = results["distances"][0][0]
-        similarity = 1.0 - (dist / 2.0)
-        if similarity < self.valves.response_cache_similarity_threshold:
-            return None
-
-        meta = results["metadatas"][0][0]
-        stored_code_state = meta.get("code_state_hash", "")
-        if stored_code_state and stored_code_state != self._compute_code_state_hash(
-            self.valves.project_id
-        ):
-            await anyio.to_thread.run_sync(
-                lambda: col.delete(ids=[results["ids"][0][0]])
-            )
-            return None
-
-        ttl = self.valves.response_cache_ttl_hours * 3600
-        ts = meta.get("timestamp", 0)
-        if ttl > 0 and time.time() - ts > ttl:
-            await anyio.to_thread.run_sync(
-                lambda: col.delete(ids=[results["ids"][0][0]])
-            )
-            return None
-
-        doc = results["documents"][0][0]
-        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
-
-    def _compute_code_state_hash(self, project_id: str) -> str:
-        if self._cached_code_state_hash is not None:
-            return self._cached_code_state_hash
-        state = self._get_state(project_id)
-        h = self._compute_code_state_hash_from_state(state)
-        self._cached_code_state_hash = h
-        return h
-
-    def _compute_code_state_hash_from_state(self, state: dict) -> str:
-        if not state or not state["active_blocks"]:
-            return ""
-        sorted_hashes = sorted(
-            h for h, b in state["active_blocks"].items() if not b.obsolete
-        )
-        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
-
     # --------------------------------------------------------------------------
-    # Code span utilities
-    # --------------------------------------------------------------------------
-    async def _get_code_spans(self, content: str) -> List[Tuple[int, int]]:
-        if not HAS_TREE_SITTER:
-            return []
-        cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
-        if cache_key in self._code_spans_cache:
-            return self._code_spans_cache[cache_key]
-        try:
-            config = ProcessConfig()
-            blocks = process(content, config)
-            spans = [(b.start_byte, b.end_byte) for b in blocks]
-        except Exception as e:
-            if any(
-                msg in str(e)
-                for msg in (
-                    "Language '' not available",
-                    "Language '' not available for download",
-                    "Download error: Language ''",
-                )
-            ):
-                spans = []
-            else:
-                self._log_debug(f"Tree‑sitter process failed: {e}")
-                spans = []
-        if len(self._code_spans_cache) >= 200:
-            keys_to_evict = list(self._code_spans_cache.keys())[:50]
-            for key in keys_to_evict:
-                del self._code_spans_cache[key]
-        self._code_spans_cache[cache_key] = spans
-        return spans
-
-    def _remove_code_spans(self, content: str, spans: List[Tuple[int, int]]) -> str:
-        chars = list(content)
-        for start, end in spans:
-            for i in range(start, min(end, len(chars))):
-                chars[i] = " "
-        return "".join(chars)
-
-    def _is_span_in_code(
-        self, code_spans: List[Tuple[int, int]], span: Tuple[int, int]
-    ) -> bool:
-        s, e = span
-        return any(cs <= s and e <= ce for cs, ce in code_spans)
-
-    # --------------------------------------------------------------------------
-    # Message ordering / trimming helpers
-    # --------------------------------------------------------------------------
-    def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
-        if not messages:
-            messages.append({"role": "user", "content": "continue"})
-            return messages
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx == -1:
-            while messages and messages[-1].get("role") != "user":
-                messages.pop()
-            messages.append({"role": "user", "content": "continue"})
-        else:
-            if last_user_idx + 1 < len(messages):
-                messages = messages[: last_user_idx + 1]
-        return messages
-
-    def _estimate_tokens(self, messages: List[dict]) -> int:
-        if self.tokenizer:
-            total = 0
-            for m in messages:
-                content = str(m.get("content", ""))
-                total += len(self.tokenizer.encode(content))
-                total += 4
-            return total
-        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-        total_chars += sum(30 for _ in messages)
-        return total_chars // 4
-
-    def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
-        """Truncate text to fit within max_tokens, trying to break at a sentence or newline."""
-        if not self.tokenizer:
-            return text[: max_tokens * 4]
-        tokens = self.tokenizer.encode(text)
-        if len(tokens) <= max_tokens:
-            return text
-
-        # Decode only the allowed tokens
-        truncated = self.tokenizer.decode(tokens[:max_tokens])
-
-        # Try to find a graceful breaking point:
-        # prefer a double newline, then single newline, then a period+space
-        for pattern in ("\n\n", "\n", ". ", " "):
-            last = truncated.rfind(pattern)
-            if last > max_tokens * 0.6:  # only if we don't lose too much
-                truncated = truncated[: last + len(pattern)]
-                break
-
-        return truncated.rstrip()
-
-    # --------------------------------------------------------------------------
-    # Code extraction and classification
-    # --------------------------------------------------------------------------
-    async def _extract_code_blocks(
-        self, content: str
-    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        blocks = []
-        spans = []
-        tree_sitter_error = None
-
-        if not self.valves.auto_detect_code_blocks:
-            return blocks, spans
-
-        if HAS_TREE_SITTER:
-            try:
-                config = ProcessConfig()
-                ts_blocks = await anyio.to_thread.run_sync(
-                    lambda: process(content, config)
-                )
-                for tsb in ts_blocks:
-                    start, end = tsb.start_byte, tsb.end_byte
-                    raw = content[start:end].strip()
-                    lang = tsb.language or "text"
-                    if lang in ("text", ""):
-                        guessed = SignatureExtractor._guess_language(None, raw)
-                        if guessed != "unknown":
-                            lang = guessed
-                        else:
-                            lang = await self._infer_code_language(raw)
-                    lines = raw.splitlines()
-                    if lines and lines[0].startswith("```"):
-                        lines = lines[1:]
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        code = "\n".join(lines).strip()
-                        block_type = "fenced"
-                    else:
-                        code = raw
-                        block_type = "indented"
-                    code = await self._handle_oversized_code_block(code, lang)
-                    blocks.append({"language": lang, "code": code, "type": block_type})
-                    spans.append((start, end))
-                if blocks:
-                    return blocks, spans
-            except Exception as e:
-                if not any(
-                    msg in str(e)
-                    for msg in (
-                        "Language '' not available",
-                        "Language '' not available for download",
-                        "Download error: Language ''",
-                    )
-                ):
-                    tree_sitter_error = e
-
-        # Regex fallback
-        def _regex_fallback(content):
-            blocks, spans = [], []
-            for match in self.code_pattern.finditer(content):
-                lang = match.group(1) or "text"
-                code = match.group(2).strip()
-                blocks.append({"language": lang, "code": code, "type": "fenced"})
-                spans.append((match.start(), match.end()))
-            lines = content.split("\n")
-            line_offsets = [0]
-            for line in lines:
-                line_offsets.append(line_offsets[-1] + len(line) + 1)
-            indented = []
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-                if line.startswith(("    ", "\t")):
-                    indented.append(line.lstrip(" \t"))
-                    i += 1
-                else:
-                    if len(indented) >= 3:
-                        code = "\n".join(indented)
-                        blocks.append(
-                            {"language": "text", "code": code, "type": "indented"}
-                        )
-                        start_offset = line_offsets[i - len(indented)]
-                        end_offset = line_offsets[i] - 1
-                        spans.append((start_offset, end_offset))
-                    indented = []
-                    i += 1
-            if len(indented) >= 3:
-                code = "\n".join(indented)
-                blocks.append({"language": "text", "code": code, "type": "indented"})
-                start_offset = line_offsets[len(lines) - len(indented)]
-                end_offset = (
-                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
-                )
-                spans.append((start_offset, end_offset))
-            return blocks, spans
-
-        blocks, spans = await anyio.to_thread.run_sync(_regex_fallback, content)
-
-        for i in range(len(blocks)):
-            blocks[i]["code"] = await self._handle_oversized_code_block(
-                blocks[i]["code"], blocks[i]["language"]
-            )
-
-        if (
-            not blocks
-            and self.valves.enable_raw_code_detection
-            and self._has_code_indicators(content)
-        ):
-            t_raw_start = time.monotonic()
-            lang = await self._infer_code_language(content)
-            dur_raw = time.monotonic() - t_raw_start
-            if lang != "unknown":
-                blocks.append(
-                    {
-                        "language": lang,
-                        "code": content,
-                        "type": "indented",
-                        "is_raw": True,
-                    }
-                )
-                spans.append((0, len(content)))
-                self._log_debug(
-                    f"Raw code detected via LLM as {lang}. Detection took {dur_raw:.3f}s."
-                )
-            else:
-                self._log_debug(
-                    f"Raw code detection failed (unknown language). Detection took {dur_raw:.3f}s."
-                )
-
-        if not blocks and tree_sitter_error is not None:
-            self._log_debug(
-                f"All extraction methods failed. Tree‑sitter error: {tree_sitter_error}"
-            )
-
-        return blocks, spans
-
-    async def _infer_code_language(self, code_snippet: str) -> str:
-        if not HAS_AIOHTTP:
-            return "unknown"
-        code_indicators = [
-            "def ",
-            "class ",
-            "import ",
-            "function ",
-            "const ",
-            "let ",
-            "var ",
-            "{",
-            "}",
-            ";",
-            "=>",
-            "==",
-            "!=",
-            "return ",
-        ]
-        snippet_lower = code_snippet.lower()
-        indicator_count = sum(snippet_lower.count(ind) for ind in code_indicators)
-        if len(code_snippet) > 50 and indicator_count < 2:
-            return "unknown"
-        non_alpha = sum(1 for c in code_snippet if not c.isalpha() and not c.isspace())
-        if len(code_snippet) > 50 and non_alpha / max(len(code_snippet), 1) < 0.1:
-            return "unknown"
-        t_start = time.monotonic()
-        prompt = (
-            "Identify the programming language of this code. "
-            "Answer with a single word (e.g., 'python', 'javascript', 'go', 'rust') or 'unknown':\n\n"
-            f"```\n{code_snippet[:800]}\n```"
-        )
-        try:
-            response = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a programming language detector. Answer with only the language name or 'unknown'.",
-                model_override=self.valves.smart_pre_expand_model,
-                max_tokens=10,
-                temperature=0.0,
-            )
-            dur = time.monotonic() - t_start
-            if response:
-                lang = response.strip().lower()
-                lang_map = {
-                    "py": "python",
-                    "python3": "python",
-                    "js": "javascript",
-                    "ts": "typescript",
-                    "tsx": "tsx",
-                    "jsx": "jsx",
-                    "go": "go",
-                    "rs": "rust",
-                    "java": "java",
-                    "c": "c",
-                    "cpp": "cpp",
-                    "h": "c",
-                    "hpp": "cpp",
-                }
-                normalized = lang_map.get(lang, lang)
-                self._log_debug(
-                    f"[LangDetect] method=llm, result={normalized}, dur={dur:.3f}s"
-                )
-                return normalized
-            else:
-                return "unknown"
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log_debug(f"[LangDetect] method=llm, result=unknown (error: {e})")
-            return "unknown"
-
-    def _extract_file_path_for_block(
-        self, content: str, block_start: int
-    ) -> Optional[str]:
-        if block_start <= 0:
-            return None
-        before = content[:block_start]
-        lines = before.splitlines()
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            match = re.search(self.valves.file_path_pattern, line)
-            if match:
-                return match.group(1) if match.lastindex else match.group(0)
-            file_path, _, _ = self._extract_line_range(line)
-            if file_path:
-                return file_path
-            break
-        return None
-
-    def _extract_line_range(
-        self, content: str
-    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-        if not self.valves.track_line_numbers:
-            return None, None, None
-        pattern = r"(?:^|\s)([^\s:]+\.\w+):(\d+)(?:-(\d+))?"
-        match = re.search(pattern, content)
-        if match:
-            return (
-                match.group(1),
-                int(match.group(2)),
-                int(match.group(3)) if match.group(3) else int(match.group(2)),
-            )
-        return None, None, None
-
-    def _extract_file_paths(self, content: str) -> List[str]:
-        if not self.valves.track_file_paths:
-            return []
-        matches = re.findall(self.valves.file_path_pattern, content)
-        return [m[0] if isinstance(m, tuple) else m for m in matches]
-
-    def _classify_content(
-        self, content: str, extracted_blocks: List[Dict]
-    ) -> ContentType:
-        cl = content.lower()
-        if self.diff_pattern.search(content) or "diff --git" in content:
-            return ContentType.PROPOSED_CHANGE
-        if self.commit_pattern.search(content):
-            return (
-                ContentType.COMMITTED_CHANGE
-                if ("applied" in cl or "committed" in cl or "merged" in cl)
-                else ContentType.PROPOSED_CHANGE
-            )
-        if (
-            "traceback" in cl
-            or ('file "' in cl and "line " in cl)
-            or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
-        ):
-            return ContentType.ERROR
-        if '"tool_calls"' in content or '"function"' in content:
-            return ContentType.TOOL_CALL
-        for blk in extracted_blocks:
-            if blk["language"] in [
-                "python",
-                "javascript",
-                "typescript",
-                "go",
-                "rust",
-                "java",
-                "cpp",
-            ]:
-                if (
-                    "def " in blk["code"]
-                    or "class " in blk["code"]
-                    or "function " in blk["code"]
-                ):
-                    return ContentType.BASE_CODE
-        return ContentType.GENERAL
-
-    async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
-        last_user = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        cache_key = None
-        if last_user:
-            content_key = last_user.get("content", "")[:200]
-            cache_key = (
-                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
-            )
-            cached = self._session_classify_cache.get(cache_key)
-            if cached is not None:
-                result, ts = cached
-                if time.time() - ts < self._session_classify_ttl:
-                    return result
-                del self._session_classify_cache[cache_key]
-        state = self._get_state(project_id)
-        if state and state.get("active_blocks"):
-            if cache_key:
-                self._session_classify_cache[cache_key] = (True, time.time())
-            return True
-        for msg in reversed(messages[-10:]):
-            if msg.get("role") != "user":
-                continue
-            if self._has_code_indicators(msg.get("content", "")):
-                if cache_key:
-                    self._session_classify_cache[cache_key] = (True, time.time())
-                return True
-        if last_user and last_user.get("content", "").strip().startswith("/"):
-            if cache_key:
-                self._session_classify_cache[cache_key] = (True, time.time())
-            return True
-        if last_user and "```" in last_user.get("content", ""):
-            if cache_key:
-                self._session_classify_cache[cache_key] = (True, time.time())
-            return True
-        if (
-            last_user
-            and not state.get("active_blocks")
-            and not self._has_code_indicators(last_user.get("content", ""))
-        ):
-            if len(last_user.get("content", "")) > 200:
-                blocks, _ = await self._extract_code_blocks(
-                    last_user.get("content", "")
-                )
-                if blocks:
-                    if cache_key:
-                        self._session_classify_cache[cache_key] = (True, time.time())
-                    return True
-        if not last_user or len(last_user.get("content", "")) < 20:
-            result = False
-        else:
-            model = self.valves.natural_language_forget_model or self.valves.llm_model
-            prompt = f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:300]}"
-            response = await self._try_llm_quick(
-                prompt=prompt,
-                system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
-                model_override=model,
-                max_tokens=3,
-                temperature=0.0,
-            )
-            result = bool(response and response.strip().lower().startswith("yes"))
-        if cache_key:
-            self._session_classify_cache[cache_key] = (result, time.time())
-            if len(self._session_classify_cache) >= 500:
-                items = sorted(
-                    self._session_classify_cache.items(), key=lambda x: x[1][1]
-                )
-                self._session_classify_cache = dict(items[-400:])
-        return result
-
-    def _has_code_indicators(self, content: str) -> bool:
-        if "```" in content:
-            return True
-        if re.search(
-            r"\b(def |class |import |from |function |const |let |var |#include |package |fn |func )",
-            content,
-        ):
-            return True
-        if re.search(
-            r"\b[\w\-/]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp)\b", content
-        ):
-            return True
-        return False
-
-    # --------------------------------------------------------------------------
-    # Context formatting
-    # --------------------------------------------------------------------------
-    def _format_block_context(
-        self, block: CodeBlock, is_latest: bool = False, full_body: bool = False
-    ) -> str:
-        timestamp_str = datetime.fromtimestamp(
-            block.timestamp, tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        latest = " [LATEST]" if is_latest else ""
-        loc = ""
-        if block.file_path:
-            loc = f" (file: {block.file_path}"
-            if block.line_range:
-                loc += f", lines {block.line_range[0]}-{block.line_range[1]}"
-            loc += ")"
-        pin = " [PINNED]" if block.pinned else ""
-        raw = " [RAW]" if block.is_raw else ""
-        aff = " [AFFECTED BY DEPENDENCY CHANGE]" if block.potentially_affected else ""
-        show_full = full_body or block.is_raw or block.pinned
-        content = block.content if show_full else block.content[:600]
-        return (
-            f"```\n{content}\n```{loc}{latest}  "
-            f"(importance: {block.importance_score:.1f}, modified: {timestamp_str})"
-            f"{aff}{pin}{raw}"
-        )
-
-    def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return ""
-        now = time.time()
-        active = []
-        for block in state["active_blocks"].values():
-            if block.obsolete:
-                continue
-            if not block.is_active and self.valves.track_active_code_age:
-                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
-                    continue
-            active.append(block)
-        if not active:
-            return ""
-
-        recent_window = self.valves.recent_activity_window_minutes * 60
-        recent_files = {}
-        for b in active:
-            if b.file_path:
-                if (
-                    b.file_path not in recent_files
-                    or b.timestamp > recent_files[b.file_path]
-                ):
-                    recent_files[b.file_path] = b.timestamp
-        recent_lines = []
-        for file_path, ts in recent_files.items():
-            age_seconds = now - ts
-            if age_seconds <= recent_window:
-                minutes_ago = int(age_seconds / 60)
-                time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
-                recent_lines.append(f"- `{file_path}` ({time_str})")
-        recent_section = ""
-        if recent_lines:
-            recent_section = (
-                f"## Recent Activity (last {self.valves.recent_activity_window_minutes} min)\n"
-                + "\n".join(recent_lines)
-                + "\n\n"
-            )
-
-        mentioned_files = set()
-        mentioned_symbols = set()
-        if user_query:
-            mentioned_files = set(re.findall(self.valves.file_path_pattern, user_query))
-            all_symbol_names = self._symbol_index.get_all_names(project_id)
-            words = set(re.findall(r"\b[\w-]+\b", user_query))
-            mentioned_symbols = all_symbol_names.intersection(words)
-
-        BOOST = 5.0
-
-        def relevance_boost(block: CodeBlock) -> float:
-            score = 0.0
-            if block.file_path and block.file_path in mentioned_files:
-                score += BOOST
-            for sym in block.symbols:
-                if sym.name in mentioned_symbols:
-                    score += BOOST
-                    break
-            return score
-
-        boosted_active = []
-        for b in active:
-            boost = relevance_boost(b)
-            boosted_active.append((b, boost))
-        boost_priority = self.valves.raw_file_priority_boost
-        boosted_active.sort(
-            key=lambda pair: (
-                pair[1] > 0,
-                pair[1],
-                pair[0].importance_score + (boost_priority if pair[0].is_raw else 0),
-            ),
-            reverse=True,
-        )
-
-        latest_per_file = {}
-        for b in active:
-            if b.file_path:
-                if (
-                    b.file_path not in latest_per_file
-                    or b.timestamp > latest_per_file[b.file_path].timestamp
-                ):
-                    latest_per_file[b.file_path] = b
-        latest_hashes = {b.hash for b in latest_per_file.values()}
-
-        base_codes = [
-            b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
-        ][: self.valves.max_base_code_blocks]
-        proposed = [
-            b
-            for b, _ in boosted_active
-            if b.content_type == ContentType.PROPOSED_CHANGE
-        ][: self.valves.max_proposed_changes]
-        committed = [
-            b
-            for b, _ in boosted_active
-            if b.content_type == ContentType.COMMITTED_CHANGE
-        ][: self.valves.max_committed_changes]
-        errors = (
-            [b for b, _ in boosted_active if b.content_type == ContentType.ERROR][:3]
-            if self.valves.preserve_error_context
-            else []
-        )
-
-        parts = ["## Currently Active Code Context (by importance)\n"]
-        parts.insert(
-            1,
-            "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used.\n",
-        )
-        if recent_section:
-            parts.insert(0, recent_section)
-
-        if base_codes:
-            parts.append("### Base Code (current work):")
-            for b in base_codes:
-                is_latest = b.hash in latest_hashes
-                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._format_block_context(b, is_latest) + tag)
-        if proposed:
-            parts.append("### Proposed Changes (pending review):")
-            for b in proposed:
-                is_latest = b.hash in latest_hashes
-                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._format_block_context(b, is_latest) + tag)
-        if committed:
-            parts.append("### Recently Committed Changes:")
-            for b in committed:
-                is_latest = b.hash in latest_hashes
-                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._format_block_context(b, is_latest) + tag)
-        if errors:
-            parts.append("### Recent Errors:")
-            for b in errors:
-                is_latest = b.hash in latest_hashes
-                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._format_block_context(b, is_latest) + tag)
-
-        max_tokens = self.valves.active_context_max_tokens
-        if max_tokens > 0 and self.tokenizer:
-            full_text = "\n".join(parts)
-            while len(self.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3:
-                parts.pop()
-                full_text = "\n".join(parts)
-            if len(self.tokenizer.encode(full_text)) > max_tokens:
-                parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
-        return "\n".join(parts)
-
-    # --------------------------------------------------------------------------
-    # Lightweight context and symbol index
-    # --------------------------------------------------------------------------
-    async def _build_lightweight_context(self, project_id: str) -> str:
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return ""
-        if project_id in self._cached_lightweight_context:
-            return self._cached_lightweight_context[project_id]
-
-        lines = ["## Code Symbol Index (full bodies available on request)\n"]
-        grouped: Dict[str, List[CodeSymbol]] = defaultdict(list)
-        for block in state["active_blocks"].values():
-            if block.obsolete:
-                continue
-            for sym in block.symbols:
-                key = sym.file_path or "unknown"
-                grouped[key].append(sym)
-
-        for file_path, syms in grouped.items():
-            lines.append(f"### {file_path}")
-            for s in sorted(syms, key=lambda x: x.name.lower()):
-                loc = (
-                    f" (lines {s.line_start}-{s.line_end})"
-                    if s.line_start and s.line_end
-                    else ""
-                )
-                calls_str = ""
-                if s.calls:
-                    calls_list = ", ".join(s.calls[:5])
-                    if len(s.calls) > 5:
-                        calls_list += f", ... (+{len(s.calls)-5} more)"
-                    calls_str = f" → calls: {calls_list}"
-                used_by = self._symbol_index.get_callers(s.name, project_id)
-                if used_by:
-                    ub_list = ", ".join(sorted(used_by)[:5])
-                    if len(used_by) > 5:
-                        ub_list += f", ... (+{len(used_by)-5} more)"
-                    used_str = f"  ← used by: {ub_list}"
-                else:
-                    used_str = ""
-                summary_str = f"  Summary: {s.summary}" if s.summary else ""
-                num_versions = len(self._symbol_index.find_blocks(s.name, project_id))
-                version_info = (
-                    f" ({num_versions} versions available)" if num_versions > 1 else ""
-                )
-                lines.append(
-                    f"- `{s.signature}` [{s.kind}]{loc}{calls_str}{used_str}{summary_str}{version_info}"
-                )
-
-        lines.append("\n## Code Previews (first 10 lines of each block)\n")
-        max_preview_chars = 4000
-        chars_added = 0
-        for block in state["active_blocks"].values():
-            if block.obsolete:
-                continue
-            preview = "\n".join(block.content.splitlines()[:10])
-            if chars_added + len(preview) > max_preview_chars:
-                lines.append("```\n... (previews truncated)\n```")
-                break
-            loc = f" (file: {block.file_path})" if block.file_path else ""
-            lines.append(f"### Block {block.hash[:8]}{loc}\n```\n{preview}\n```")
-            chars_added += len(preview)
-
-        lines.append(
-            "\nTo see the full body of any symbol, mention it in your message or use `/expand <name>`."
-        )
-        result = "\n".join(lines)
-        self._cached_lightweight_context[project_id] = result
-        return result
-
-    # --------------------------------------------------------------------------
-    # Active code update and mention tracking
-    # --------------------------------------------------------------------------
-    def _update_mentions_from_message(
-        self, state: Dict, message_content: str, project_id: str
-    ):
-        if not message_content:
-            return
-        all_symbol_names = self._symbol_index.get_all_names(project_id)
-        words = set(re.findall(r"\b[\w-]+\b", message_content))
-        mentioned_names = all_symbol_names.intersection(words)
-        if not mentioned_names:
-            return
-        affected_blocks: Set[str] = set()
-        for name in mentioned_names:
-            affected_blocks.update(self._symbol_index.find_blocks(name, project_id))
-        for block_hash in affected_blocks:
-            block = state["active_blocks"].get(block_hash)
-            if block:
-                block.mention_count += 1
-                block.last_mentioned = time.time()
-                block.last_mentioned_msg_idx = state["message_count"]
-                block._update_importance()
-
-    async def _update_active_code(self, message: dict, project_id: str):
-        if not self.valves.enable_code_awareness:
-            return
-
-        content = message.get("content", "")
-        role = message.get("role", "")
-
-        extracted, block_spans = await self._extract_code_blocks(content)
-        new_blocks_pending = []
-        for idx, block_info in enumerate(extracted):
-            blk_file = None
-            if self.valves.track_file_paths and block_spans:
-                blk_file = self._extract_file_path_for_block(
-                    content, block_spans[idx][0]
-                )
-            if not blk_file and len(extracted) == 1:
-                extracted_paths = self._extract_file_paths(content)
-                blk_file = extracted_paths[0] if extracted_paths else None
-            content_type = self._classify_content(content, extracted)
-            new_block = CodeBlock(
-                content=block_info["code"],
-                content_type=content_type,
-                generated_by_assistant=(role == "assistant"),
-                file_path=blk_file,
-                line_range=None,
-                timestamp=time.time(),
-                is_active=True,
-                mention_count=1,
-                dependencies=[],
-                potentially_affected=False,
-                pinned=False,
-                obsolete=False,
-                is_raw=block_info.get("is_raw", False),
-            )
-            if "[KEEP]" in content:
-                new_block.is_raw = True
-            if "[KEEP]" in content or "#important" in content.lower():
-                new_block.importance_score = 10.0
-                new_block.pinned = True
-            new_blocks_pending.append(new_block)
-
-        symbols_list = []
-        for blk in new_blocks_pending:
-            syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
-            symbols_list.append(syms)
-
-        _content_to_syms: Dict[str, List[CodeSymbol]] = {
-            blk.content: syms
-            for blk, syms in zip(new_blocks_pending, symbols_list)
-            if not isinstance(syms, Exception)
-        }
-
-        lock = await self._get_project_lock(project_id)
-        state_before = self._get_state(project_id)
-        existing_contents = {}
-        if state_before:
-            for h, b in state_before["active_blocks"].items():
-                existing_contents[h] = b.content
-
-        duplicate_info = {}
-        for new_block in new_blocks_pending:
-            is_dup = False
-            existing_dup = None
-            for h, ex_content in existing_contents.items():
-                ex_block = state_before["active_blocks"].get(h)
-                if (
-                    ex_block
-                    and self._calculate_code_similarity(new_block.content, ex_content)
-                    >= self.valves.code_similarity_threshold
-                ):
-                    is_dup = True
-                    existing_dup = h
-                    break
-            duplicate_info[new_block.hash] = (is_dup, existing_dup)
-
-        async with lock:
-            state = self._get_state(project_id)
-            self._background_task(
-                self._summarize_inactive_blocks_safely(project_id),
-                name="summarize_inactive",
-                is_llm_task=True,
-            )
-            self._update_mentions_from_message(state, content, project_id)
-            for block in state["active_blocks"].values():
-                if (
-                    block.content
-                    and self._calculate_code_similarity(
-                        block.content[:200], content[:200]
-                    )
-                    > 0.7
-                ):
-                    block.mention_count += 1
-                    block.last_mentioned = time.time()
-                    block.last_mentioned_msg_idx = state["message_count"]
-                    block._update_importance()
-
-            if not content and not new_blocks_pending:
-                return
-
-            for new_block, syms in zip(new_blocks_pending, symbols_list):
-                if isinstance(syms, Exception):
-                    syms = []
-
-                # Sanitize content before use
-                new_block.content = self._sanitize_text(new_block.content)
-
-                if self.tokenizer:
-                    new_block._cached_token_count = len(
-                        self.tokenizer.encode(new_block.content)
-                    )
-                else:
-                    new_block._cached_token_count = len(new_block.content) // 4
-
-                is_dup, existing_hash = duplicate_info.get(
-                    new_block.hash, (False, None)
-                )
-                existing = (
-                    state["active_blocks"].get(existing_hash) if existing_hash else None
-                )
-
-                if is_dup and existing:
-                    if existing.pinned or new_block.is_raw:
-                        self._symbol_index.remove_all_for_block(
-                            existing.hash, existing.symbols, project_id
-                        )
-                        prev_content = existing.content
-                        existing.content = new_block.content
-                        existing.hash = new_block.hash
-                        if new_block.file_path:
-                            existing.file_path = new_block.file_path
-                        existing.line_range = new_block.line_range
-                        existing.timestamp = time.time()
-                        existing.mention_count += 1
-                        existing.last_mentioned = time.time()
-                        existing.last_mentioned_msg_idx = state["message_count"]
-                        existing.pinned = True
-                        existing.is_raw = existing.is_raw or new_block.is_raw
-                        existing.importance_score = 10.0
-                        reused = _content_to_syms.get(new_block.content)
-                        if reused is not None:
-                            existing.symbols = [
-                                s.copy(update={"parent_block_hash": existing.hash})
-                                for s in reused
-                            ]
-                        else:
-                            existing.symbols = await SignatureExtractor.extract_async(
-                                existing.content, existing.file_path
-                            )
-                        for s in existing.symbols:
-                            s.parent_block_hash = existing.hash
-                            self._symbol_index.add(s, existing.hash, project_id)
-                        if self.tokenizer:
-                            existing._cached_token_count = len(
-                                self.tokenizer.encode(existing.content)
-                            )
-                        else:
-                            existing._cached_token_count = len(existing.content) // 4
-                        existing._update_importance()
-                        if prev_content != new_block.content:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    existing.hash, prev_content, new_block.content
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
-                            )
-                        if (
-                            self.valves.enable_dependency_tracking
-                            and self.valves.dependency_refresh_on_update
-                        ):
-                            self._background_task(
-                                self._refresh_dependencies_for_block(
-                                    existing.hash, project_id
-                                ),
-                                name="dependency_refresh",
-                                is_llm_task=True,
-                            )
-                        continue
-
-                    if self.valves.prioritize_recent_code:
-                        self._symbol_index.remove_all_for_block(
-                            existing.hash, existing.symbols, project_id
-                        )
-                        prev_content = existing.content
-                        existing.content = new_block.content
-                        existing.hash = new_block.hash
-                        if new_block.file_path:
-                            existing.file_path = new_block.file_path
-                        existing.line_range = new_block.line_range
-                        existing.timestamp = time.time()
-                        existing.mention_count += 1
-                        existing.last_mentioned = time.time()
-                        existing.last_mentioned_msg_idx = state["message_count"]
-                        reused = _content_to_syms.get(new_block.content)
-                        if reused is not None:
-                            existing.symbols = [
-                                s.copy(update={"parent_block_hash": existing.hash})
-                                for s in reused
-                            ]
-                        else:
-                            existing.symbols = await SignatureExtractor.extract_async(
-                                existing.content, existing.file_path
-                            )
-                        for s in existing.symbols:
-                            s.parent_block_hash = existing.hash
-                            self._symbol_index.add(s, existing.hash, project_id)
-                        if self.tokenizer:
-                            existing._cached_token_count = len(
-                                self.tokenizer.encode(existing.content)
-                            )
-                        else:
-                            existing._cached_token_count = len(existing.content) // 4
-                        existing._update_importance()
-                        if prev_content != new_block.content:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    existing.hash, prev_content, new_block.content
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
-                            )
-                        if (
-                            self.valves.enable_dependency_tracking
-                            and self.valves.dependency_refresh_on_update
-                        ):
-                            self._background_task(
-                                self._refresh_dependencies_for_block(
-                                    existing.hash, project_id
-                                ),
-                                name="dependency_refresh",
-                                is_llm_task=True,
-                            )
-                    continue
-
-                # New non-duplicate block
-                for sym in syms:
-                    sym.parent_block_hash = new_block.hash
-                new_block.symbols = syms
-                new_block.last_mentioned_msg_idx = state["message_count"]
-                for sym in syms:
-                    self._symbol_index.add(sym, new_block.hash, project_id)
-                if any(s.calls for s in syms):
-                    state["has_any_calls"] = True
-
-                is_conflicting = False
-                if new_block.content_type == ContentType.PROPOSED_CHANGE:
-                    is_conflicting = self._has_conflicting_proposed_changes(
-                        state, new_block
-                    )
-                    if is_conflicting:
-                        new_block.importance_score = max(
-                            new_block.importance_score, 7.0
-                        )
-
-                state["active_blocks"][new_block.hash] = new_block
-
-                if new_block.file_path and self.valves.enable_obsolete_marking:
-                    for h, blk in list(state["active_blocks"].items()):
-                        if h == new_block.hash:
-                            continue
-                        if blk.file_path == new_block.file_path and not blk.pinned:
-                            blk.obsolete = True
-                            blk._update_importance()
-
-                if new_block.content_type == ContentType.PROPOSED_CHANGE:
-                    if new_block.file_path:
-                        state["recent_changes"] = [
-                            c
-                            for c in state["recent_changes"]
-                            if not (
-                                c.file_path
-                                and c.file_path == new_block.file_path
-                                and c.hash != new_block.hash
-                            )
-                        ]
-                    state["recent_changes"].append(new_block)
-                    if self.valves.enable_diff_application and not is_conflicting:
-                        for base in list(state["active_blocks"].values()):
-                            if (
-                                base.content_type == ContentType.BASE_CODE
-                                and base.file_path == new_block.file_path
-                            ):
-                                if self._apply_change_with_diff(base, new_block):
-                                    state["recent_changes"] = [
-                                        c
-                                        for c in state["recent_changes"]
-                                        if c.hash != new_block.hash
-                                    ]
-                                    state["committed_changes"].append(new_block)
-                                    break
-                elif new_block.content_type == ContentType.COMMITTED_CHANGE:
-                    state["committed_changes"].append(new_block)
-                elif (
-                    new_block.content_type == ContentType.ERROR
-                    and self.valves.preserve_error_context
-                ):
-                    new_block.importance_score = min(
-                        new_block.importance_score + 3.0, 10.0
-                    )
-
-                if len(state["active_blocks"]) > self.valves.max_active_blocks:
-                    sorted_blocks = sorted(
-                        state["active_blocks"].values(),
-                        key=lambda b: b.importance_score
-                        + (self.valves.raw_file_priority_boost if b.is_raw else 0),
-                        reverse=True,
-                    )
-                    keep = sorted_blocks[: self.valves.max_active_blocks]
-                    state["active_blocks"] = {b.hash: b for b in keep}
-
-                if (
-                    self.valves.enable_dependency_tracking
-                    and new_block.content_type
-                    in (
-                        ContentType.BASE_CODE,
-                        ContentType.PROPOSED_CHANGE,
-                        ContentType.COMMITTED_CHANGE,
-                    )
-                ):
-                    self._background_task(
-                        self._refresh_dependencies_for_block(
-                            new_block.hash, project_id
-                        ),
-                        name="dependency_refresh",
-                        is_llm_task=True,
-                    )
-
-            # Assistant implicit modifications
-            if role == "assistant" and len(extracted) > 0:
-                for block_info in extracted:
-                    best_base = None
-                    best_sim = 0.0
-                    for base in state["active_blocks"].values():
-                        if base.content_type == ContentType.BASE_CODE:
-                            sim = self._calculate_code_similarity(
-                                base.content, block_info["code"]
-                            )
-                            if sim > best_sim and sim > 0.6:
-                                best_sim = sim
-                                best_base = base
-                    if best_base and best_sim > 0.5 and best_sim < 0.98:
-                        self._symbol_index.remove_all_for_block(
-                            best_base.hash, best_base.symbols, project_id
-                        )
-                        prev_content = best_base.content
-                        best_base.content = self._sanitize_text(block_info["code"])
-                        best_base.hash = hashlib.md5(
-                            block_info["code"].encode()
-                        ).hexdigest()[:16]
-                        best_base.timestamp = time.time()
-                        best_base.is_active = True
-                        best_base.potentially_affected = False
-                        best_base.importance_score = min(
-                            best_base.importance_score + 1.0, 10.0
-                        )
-                        reused = _content_to_syms.get(block_info["code"])
-                        if reused is not None:
-                            best_base.symbols = [
-                                s.copy(update={"parent_block_hash": best_base.hash})
-                                for s in reused
-                            ]
-                        else:
-                            best_base.symbols = await SignatureExtractor.extract_async(
-                                best_base.content, best_base.file_path
-                            )
-                        for s in best_base.symbols:
-                            s.parent_block_hash = best_base.hash
-                            self._symbol_index.add(s, best_base.hash, project_id)
-                        if self.tokenizer:
-                            best_base._cached_token_count = len(
-                                self.tokenizer.encode(best_base.content)
-                            )
-                        else:
-                            best_base._cached_token_count = len(best_base.content) // 4
-                        if any(s.calls for s in best_base.symbols):
-                            state["has_any_calls"] = True
-                        if prev_content != block_info["code"]:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    best_base.hash, prev_content, block_info["code"]
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
-                            )
-                        if (
-                            self.valves.enable_dependency_tracking
-                            and self.valves.dependency_refresh_on_update
-                        ):
-                            self._background_task(
-                                self._refresh_dependencies_for_block(
-                                    best_base.hash, project_id
-                                ),
-                                name="dependency_refresh",
-                                is_llm_task=True,
-                            )
-
-            state["message_count"] += 1
-            if self.valves.auto_remove_duplicate_blocks:
-                self._remove_duplicate_blocks(state, project_id)
-            self._background_task(
-                self._expire_blocks_by_time(project_id), name="expire_blocks"
-            )
-            self._background_task(
-                self._clean_affected_flags(project_id), name="clean_affected_flags"
-            )
-            if self.valves.enable_auto_summaries:
-                self._background_task(
-                    self._generate_missing_summaries(project_id),
-                    name="generate_missing_summaries",
-                    is_llm_task=True,
-                )
-
-            # ── Session summary (autobiographical mini‑memory) ──
-            if self.valves.enable_session_summary:
-                interval = self.valves.session_summary_interval_messages
-                if (
-                    interval > 0
-                    and state["message_count"] % interval == 0
-                    and state["message_count"] > 0
-                ):
-                    task = SecondaryTask(
-                        task_type="session_summary",
-                        params={
-                            "project_id": project_id,
-                            "message_count": state["message_count"],
-                            "code_state_hash": self._compute_code_state_hash(
-                                project_id
-                            ),
-                        },
-                    )
-                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
-
-            self._invalidate_lightweight_cache(project_id)
-            self._set_state(project_id, state)
-
-    # --------------------------------------------------------------------------
-    # LTM storage and retrieval
+    # LTM storage and retrieval (symbol‑based & unified)
     # --------------------------------------------------------------------------
     def _is_symbol_indexable(self, symbol: CodeSymbol) -> bool:
         if symbol.kind not in ("function", "class", "method"):
@@ -3909,7 +2723,7 @@ class Filter:
         return [doc for doc, _ in scored[:top_k]]
 
     # --------------------------------------------------------------------------
-    # Block expiration and summarization
+    # Block expiration and summarization (inactive)
     # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         lock = await self._get_project_lock(project_id)
@@ -4084,16 +2898,11 @@ class Filter:
 
     @staticmethod
     def _sanitize_signature(sig: str, max_len: int = 200) -> str:
-        """Escape backticks and truncate the signature to avoid breaking prompts."""
         safe = sig.replace("`", "'")
         return safe[:max_len] + ("…" if len(safe) > max_len else "")
 
     @staticmethod
     def _sanitize_text(text: str) -> str:
-        """
-        Remove non-printable characters, except newline and tab.
-        Replace backticks inside the text to avoid breaking markdown code spans.
-        """
         cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
         cleaned = cleaned.replace("`", "'")
         return cleaned
@@ -4280,8 +3089,6 @@ class Filter:
         if not func_name:
             return "Missing function name."
 
-        self._log_debug(f"/expand called for '{func_name}' (depth {depth})")
-
         all_names = self._symbol_index.get_all_names(project_id)
         if not all_names:
             state = self._get_state(project_id)
@@ -4359,7 +3166,7 @@ class Filter:
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Smart pre‑expand
+    # Smart pre‑expand (unchanged logic)
     # --------------------------------------------------------------------------
     async def _ensure_full_code_intent_embeddings(self):
         if self._full_code_intent_embeddings is not None:
@@ -4584,7 +3391,7 @@ class Filter:
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
-    # Outlet expand intercept
+    # Outlet expand intercept (unchanged)
     # --------------------------------------------------------------------------
     async def _outlet_intercept_expand(
         self,
@@ -4648,36 +3455,35 @@ class Filter:
 
         return replaced_content, did_any
 
-    # --------------------------------------------------------------------------
-    # Intent detection (natural language)
-    # --------------------------------------------------------------------------
-    INTENT_KEYWORDS = {
-        "forget",
-        "olvida",
-        "olvid",
-        "remember",
-        "recuerda",
-        "pin",
-        "fija",
-        "guarda",
-        "obsolete",
-        "obsoleto",
-        "deprecated",
-        "ya no",
-        "remove",
-        "elimina",
-        "borra",
-        "quita",
-        "keep",
-        "mantén",
-        "conserva",
-    }
+    def _expand_referenced_symbols(
+        self, project_id: str, user_query: str, seen_hashes: Optional[Set[str]] = None
+    ) -> str:
+        """Expand symbols mentioned directly or via file paths in the query."""
+        state = self._get_state(project_id)
+        if not state:
+            return ""
+        all_names = self._symbol_index.get_all_names(project_id)
+        words = set(re.findall(r"\b\w+\b", user_query))
+        mentioned = all_names.intersection(words)
 
-    QUESTION_PATTERNS = re.compile(
-        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
-        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
-        re.IGNORECASE,
-    )
+        parts = []
+        for name in sorted(mentioned):
+            blocks = self._symbol_index.find_blocks(name, project_id)
+            for h in blocks:
+                block = state["active_blocks"].get(h)
+                if block and not block.obsolete:
+                    if seen_hashes is not None:
+                        if block.hash in seen_hashes:
+                            continue
+                        seen_hashes.add(block.hash)
+                    loc = f" (file: {block.file_path})" if block.file_path else ""
+                    parts.append(f"### `{name}`{loc}\n```\n{block.content[:2000]}\n```")
+                    break
+        return "\n".join(parts) if parts else ""
+
+    # --------------------------------------------------------------------------
+    # Intent detection (natural language) – kept as before
+    # --------------------------------------------------------------------------
 
     def _has_intent_keywords(self, text: str) -> bool:
         return bool(
@@ -4764,6 +3570,9 @@ class Filter:
         except Exception:
             return {"forget": none, "remember": none, "obsolete": none}
 
+    # --------------------------------------------------------------------------
+    # Parallel context checks (unchanged)
+    # --------------------------------------------------------------------------
     @staticmethod
     async def _noop():
         return None
@@ -4922,9 +3731,6 @@ class Filter:
         )
         return response if response else "Unable to generate reasoning."
 
-    # --------------------------------------------------------------------------
-    # Chain‑of‑Thought auto‑detection (multi‑level)
-    # --------------------------------------------------------------------------
     async def _detect_cot_level(self, user_content, is_code_session, state):
         if not user_content:
             return 0
@@ -5046,10 +3852,6 @@ class Filter:
         effective_max_tokens = (
             self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
         )
-        self._log_debug(
-            f"CoT model: {self.valves.cot_model_level2}, max_tokens: {effective_max_tokens}"
-        )
-
         prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nThink step by step and provide your reasoning:"
         response = await self._call_llm(
             prompt=prompt,
@@ -5078,7 +3880,6 @@ class Filter:
         effective_max_tokens = (
             self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
         )
-
         reflection_prompt = (
             f"Context:\n{context}\n\n"
             f"Question:\n{question}\n\n"
@@ -5126,7 +3927,7 @@ class Filter:
         return response if response else "No assumptions identified."
 
     # --------------------------------------------------------------------------
-    # Context helpers for structural / code review tasks
+    # Structural / code review helpers
     # --------------------------------------------------------------------------
     async def _is_structural_task(self, user_query: str) -> bool:
         structural_keywords = {
@@ -5228,7 +4029,7 @@ class Filter:
         return summary.strip() if summary else None
 
     # --------------------------------------------------------------------------
-    # Command suggestion (heuristic)
+    # Command suggestion
     # --------------------------------------------------------------------------
     async def _suggest_commands(self, project_id: str, state: dict) -> Optional[str]:
         if not self.valves.enable_command_suggestions:
@@ -5511,9 +4312,249 @@ class Filter:
             else:
                 return "Unrecognized obsolete action."
 
+    async def _run_change_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred change summary generation."""
+        block_hash = params["block_hash"]
+        prev_content = params["prev_content"]
+        new_content = params["new_content"]
+        prompt = (
+            f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
+            f"Previous:\n```\n{prev_content[:500]}\n```\n\n"
+            f"New:\n```\n{new_content[:500]}\n```\n\n"
+            f"Change summary:"
+        )
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code change summariser. Output only one short sentence.",
+                model_override=model,
+                max_tokens=40,
+                temperature=0.1,
+            )
+        if summary:
+            now = time.time()
+            self._block_change_summaries[block_hash] = (summary.strip(), now)
+            if len(self._block_change_summaries) > self._MAX_CHANGE_SUMMARIES:
+                self._block_change_summaries.popitem(last=False)
+            return True
+        return False
+
+    async def _run_missing_summaries_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred missing summary generation for one symbol."""
+        signature = params["signature"]
+        code_snippet = params["code_snippet"]
+        prompt = f"Summarize in one short sentence what this code does:\n\n```{signature}\n{code_snippet}```"
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                model_override=model,
+                max_tokens=50,
+                temperature=0.1,
+            )
+        if summary and summary.strip():
+            project_id = params["project_id"]
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                state = self._get_state(project_id)
+                for blk in state["active_blocks"].values():
+                    for sym in blk.symbols:
+                        if sym.signature == signature:
+                            sym.summary = summary.strip()
+                self._set_state(project_id, state)
+            return True
+        return False
+
+    async def _run_inactive_code_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred summarisation of an inactive code block."""
+        sig = params.get("signature", "")
+        content = params["content"]
+        if sig:
+            prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{content[:1000]}```"
+        else:
+            prompt = f"Summarise the following code block.\n```{content[:1500]}```"
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a code summarization assistant.",
+                model_override=model,
+                max_tokens=200,
+                temperature=0.2,
+            )
+        if summary and summary.strip():
+            project_id = params["project_id"]
+            block_hash = params["block_hash"]
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                state = self._get_state(project_id)
+                if block_hash in state["active_blocks"]:
+                    blk = state["active_blocks"][block_hash]
+                    summary_content = f"[Summary of inactive code]\n{summary.strip()}"
+                    blk.content = summary_content
+                    blk.importance_score *= 0.5
+                    self._invalidate_lightweight_cache(project_id)
+                    self._set_state(project_id, state)
+            return True
+        return False
+
+    async def _run_session_summary_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Generate an autobiographical session summary and store it in LTM."""
+        project_id = params["project_id"]
+        code_state_hash = params.get("code_state_hash", "")
+
+        recent = await self._retrieve_historical_messages(
+            query="recent conversation summary",
+            project_id=project_id,
+            limit=self.valves.session_summary_interval_messages,
+        )
+        if not recent:
+            return False
+
+        conversation_text = "\n".join(
+            f"{m['role']}: {m['content'][:300]}" for m in recent
+        )
+        prompt = (
+            "Summarise the following conversation segment in 2-3 sentences, "
+            "capturing the main task, decisions made, files modified, "
+            "and architectural changes:\n\n"
+            f"{conversation_text[:3000]}"
+        )
+        async with sem:
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
+                model_override=model,
+                max_tokens=self.valves.session_summary_max_tokens,
+                temperature=0.2,
+            )
+        if not summary:
+            return False
+
+        msg_id = f"{project_id}_session_summary_{int(time.time())}"
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(summary).tolist()
+        )
+        await anyio.to_thread.run_sync(
+            lambda: self.memory_collection.upsert(
+                ids=[msg_id],
+                embeddings=[embedding],
+                metadatas=[
+                    {
+                        "role": "assistant",
+                        "project_id": project_id,
+                        "timestamp": time.time(),
+                        "is_session_summary": True,
+                        "code_state_hash": code_state_hash,
+                        "content_type": ContentType.GENERAL.value,
+                        "has_code": False,
+                    }
+                ],
+                documents=[f"[Session summary]\n{summary}"],
+            )
+        )
+        self._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
+        return True
+
+    async def _run_dependency_refresh_task(
+        self, params: dict, model: str, sem: asyncio.Semaphore
+    ) -> bool:
+        """Execute a deferred dependency extraction using the secondary model."""
+        block_hash = params["block_hash"]
+        project_id = params["project_id"]
+        lock = await self._get_project_lock(project_id)
+        async with lock:
+            state = self._get_state(project_id)
+            if not state or block_hash not in state["active_blocks"]:
+                return False
+            block = state["active_blocks"].get(block_hash)
+            if not block:
+                return False
+            deps = await self._extract_dependencies_hybrid(
+                block.content, block.file_path, model_override=model
+            )
+            if (
+                block.file_path
+                and block.file_path.endswith(".py")
+                or "def " in block.content
+            ):
+                imports, calls = self._extract_dependencies_ast(block.content)
+                block.ast_imports = imports
+                block.ast_calls = calls
+            block.dependencies = deps
+            await self._mark_affected_blocks(block_hash, state)
+            self._set_state(project_id, state)
+            return True
+
     # --------------------------------------------------------------------------
-    # Inlet method
+    # Auto summaries for missing symbol docstrings (complete implementation)
     # --------------------------------------------------------------------------
+    async def _generate_missing_summaries(self, project_id: str):
+        if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
+            return
+        state = self._get_state(project_id)
+        symbols_to_summarize = []
+        for block in state["active_blocks"].values():
+            for sym in block.symbols:
+                if sym.summary:
+                    continue
+                if sym.kind not in ("function", "method"):
+                    continue
+                symbols_to_summarize.append((sym, block.content[:500]))
+
+        if not symbols_to_summarize:
+            return
+
+        if self.valves.defer_secondary_tasks:
+            for sym, code_snippet in symbols_to_summarize:
+                task = SecondaryTask(
+                    task_type="missing_summaries",
+                    params={
+                        "signature": sym.signature,
+                        "code_snippet": code_snippet,
+                        "project_id": project_id,
+                    },
+                )
+                state.setdefault("pending_secondary_tasks", []).append(task.dict())
+            self._set_state(project_id, state)
+            return
+
+        batch_size = 10
+        for i in range(0, len(symbols_to_summarize), batch_size):
+            batch = symbols_to_summarize[i : i + batch_size]
+            tasks = []
+            for sym, code_snippet in batch:
+                prompt = f"Summarize in one short sentence what this code does:\n\n```{sym.signature}\n{code_snippet}```"
+                tasks.append(
+                    self._call_llm(
+                        prompt=prompt,
+                        system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                        model_override=self.valves.summarization_model,
+                        max_tokens=50,
+                        temperature=0.1,
+                        semaphore=self._low_priority_llm_semaphore,
+                    )
+                )
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for (sym, _), resp in zip(batch, responses):
+                if isinstance(resp, str) and resp.strip():
+                    sym.summary = resp.strip()
+            await asyncio.sleep(1.0)
+        self._set_state(project_id, state)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – with race condition fixes
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – full implementation
+    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -5544,7 +4585,9 @@ class Filter:
             await self._load_symbol_cache_from_db(project_id)
             self._symbol_cache_loaded_projects.add(project_id)
 
-        if self.valves.defer_secondary_tasks:
+        # ── Process pending secondary tasks under lock ──
+        lock = await self._get_project_lock(project_id)
+        async with lock:
             await self._process_pending_secondary_tasks(project_id)
 
         if not messages:
@@ -5898,7 +4941,6 @@ class Filter:
                     _inlet_timing("symbol_analysis (parallel LLM)", t0)
                     if summary:
                         system_injections.append(("critical", summary))
-                    # Always inject suggested symbols when available
                     if suggested:
                         suggested_blocks = self._get_blocks_for_symbols(
                             list(suggested), project_id
@@ -6111,10 +5153,6 @@ class Filter:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
             if cot_any_used and not manual_cot_used:
-                self._log_debug(
-                    f"Generating CoT level {cot_level} with model "
-                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                )
                 t0 = time.monotonic()
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
@@ -6126,10 +5164,6 @@ class Filter:
                     )
                 _inlet_timing("cot_generation (LLM reasoning)", t0)
             elif manual_cot_used and cot_level in (2, 3):
-                self._log_debug(
-                    f"Generating manual CoT level {cot_level} with model "
-                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                )
                 t0 = time.monotonic()
                 if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
@@ -6186,75 +5220,6 @@ class Filter:
 
             if final_system.strip():
                 messages.insert(0, {"role": "system", "content": final_system})
-
-            # ── FIX: re‑capture system_msgs & history_msgs after injection ──
-            system_msgs = [m for m in messages if m.get("role") == "system"]
-            history_msgs = [m for m in messages if m.get("role") != "system"]
-
-            # ── Debug: print full injected context if enabled ──
-            if self.valves.debug_context:
-                self._log_debug("── BEGIN INJECTED CONTEXT ──")
-                for m in messages:
-                    if m.get("role") == "system":
-                        self._log_debug(m.get("content", ""))
-                self._log_debug("── END INJECTED CONTEXT ──")
-
-            if self.valves.debug:
-                total_system_tokens = 0
-                for m in messages:
-                    if m.get("role") == "system":
-                        content = m.get("content", "")
-                        total_system_tokens += (
-                            len(self.tokenizer.encode(content))
-                            if self.tokenizer
-                            else len(content) // 4
-                        )
-                # ── Approximate breakdown ──
-                ltm_tokens = 0
-                summary_tokens = 0
-                suggested_tokens = 0
-                cot_tokens = 0
-                for _, text in system_injections:
-                    if not text:
-                        continue
-                    t = (
-                        len(self.tokenizer.encode(text))
-                        if self.tokenizer
-                        else (len(text) // 4)
-                    )
-                    if "Relevant Past Context" in text:
-                        ltm_tokens += t
-                    elif "synthesized" in text.lower() or "Synthesize" in text:
-                        summary_tokens += t
-                    elif "Additional suggested code" in text:
-                        suggested_tokens += t
-                    elif reasoning and text == reasoning:
-                        cot_tokens += t
-                other_tokens = total_system_tokens - (
-                    ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
-                )
-
-                self._log_debug("─" * 50)
-                self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-                self._log_debug(
-                    f"  LTM (past messages, no LLM call):     ~{ltm_tokens}"
-                )
-                self._log_debug(
-                    f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
-                )
-                self._log_debug(
-                    f"  Suggested code (verbatim source):      ~{suggested_tokens}"
-                )
-                self._log_debug(
-                    f"  CoT reasoning (LLM generated):         ~{cot_tokens}"
-                )
-                self._log_debug(
-                    f"  Other (confidence, cleanup, etc.):     ~{other_tokens}"
-                )
-                self._log_debug(
-                    f"  TOTAL injected system tokens:          ~{total_system_tokens}"
-                )
-                self._log_debug("─" * 50)
 
             # Adaptive trim
             if self.valves.adaptive_trim:
@@ -6354,7 +5319,7 @@ class Filter:
 
             messages = system_msgs + history_msgs
 
-            # Final safety: ensure last message is from user
+            # Ensure last message is user
             if messages and messages[-1].get("role") != "user":
                 last_user_idx = -1
                 for i in range(len(messages) - 1, -1, -1):
@@ -6382,9 +5347,9 @@ class Filter:
 
         return body
 
-    # --------------------------------------------------------------------------
-    # Outlet
-    # --------------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # OUTLET – with safe purge task and cache fix
+    # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
         start_time = time.monotonic()
@@ -6443,6 +5408,7 @@ class Filter:
                                         self._flush_ltm_batch(project_id)
                                     )
 
+        # Response cache storage (with code_state_hash precomputed to avoid extra lock)
         if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
             last_user = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -6452,19 +5418,22 @@ class Filter:
             )
             if last_user and last_assistant:
                 context_hash = self._compute_context_hash(messages[:-1])
+                code_state_hash = self._compute_code_state_hash(project_id)
                 await self._store_response_in_cache(
                     last_user.get("content", ""),
                     last_assistant.get("content", ""),
                     context_hash,
                     state,
+                    code_state_hash,
                 )
 
+        # Purge expired memories only if no purge is already running
         if self._purge_task is None or self._purge_task.done():
             self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
         self._write_counter += 1
         if self._write_counter % 100 == 0:
-            asyncio.create_task(self._run_db_checkpoints())
+            self._purge_task = asyncio.create_task(self._run_db_checkpoints())
             self._cleanup_completed_tasks()
 
         self._log_section(
@@ -6472,6 +5441,9 @@ class Filter:
         )
         return body
 
+    # --------------------------------------------------------------------------
+    # DB checkpoints (unchanged)
+    # --------------------------------------------------------------------------
     async def _run_db_checkpoints(self):
         try:
             await anyio.to_thread.run_sync(
@@ -6495,7 +5467,7 @@ class Filter:
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
     # --------------------------------------------------------------------------
-    # Shutdown and cleanup
+    # Shutdown and cleanup (with executor shutdown)
     # --------------------------------------------------------------------------
     def shutdown(self):
         if self._pending_ltm_messages:
@@ -6519,6 +5491,9 @@ class Filter:
         self._symbol_index.clear()
         self._cached_lightweight_context.clear()
         self._project_locks.clear()
+        # Shut down thread pools
+        self._db_executor.shutdown(wait=True)
+        self._chroma_executor.shutdown(wait=True)
 
     def _cleanup_completed_tasks(self):
         self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
@@ -6796,7 +5771,6 @@ class Filter:
     async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
         if not self.valves.enable_dependency_tracking:
             return
-        # Defer the actual extraction to avoid mixing models
         if self.valves.defer_secondary_tasks:
             task = SecondaryTask(
                 task_type="dependency_refresh",
@@ -6810,7 +5784,6 @@ class Filter:
                 state.setdefault("pending_secondary_tasks", []).append(task.dict())
                 self._set_state(project_id, state)
             return
-        # Immediate execution (fallback if deferral disabled)
         lock = await self._get_project_lock(project_id)
         async with lock:
             state = self._get_state(project_id)
@@ -7011,7 +5984,7 @@ class Filter:
         return False
 
     # --------------------------------------------------------------------------
-    # Change summary generation
+    # Change summary generation (with LRU and SQLite persistence)
     # --------------------------------------------------------------------------
     async def _generate_change_summary(
         self, block_hash: str, prev_content: str, new_content: str
@@ -7050,191 +6023,28 @@ class Filter:
         )
         if summary:
             now = time.time()
+            # LRU in memory
             self._block_change_summaries[block_hash] = (summary.strip(), now)
-            max_entries = self.valves.max_change_summaries
-            if len(self._block_change_summaries) > max_entries:
-                sorted_entries = sorted(
-                    self._block_change_summaries.items(), key=lambda x: x[1][1]
-                )
-                to_remove = sorted_entries[
-                    : len(self._block_change_summaries) - max_entries
-                ]
-                for key, _ in to_remove:
-                    del self._block_change_summaries[key]
+            if len(self._block_change_summaries) > self._MAX_CHANGE_SUMMARIES:
+                self._block_change_summaries.popitem(last=False)
 
-    # --------------------------------------------------------------------------
-    # Auto summaries for missing symbol docstrings
-    # --------------------------------------------------------------------------
-    async def _generate_missing_summaries(self, project_id: str):
-        if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
-            return
-        state = self._get_state(project_id)
-        symbols_to_summarize = []
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.summary:
-                    continue
-                if sym.kind not in ("function", "method"):
-                    continue
-                symbols_to_summarize.append((sym, block.content[:500]))
-
-        if not symbols_to_summarize:
-            return
-
-        if self.valves.defer_secondary_tasks:
-            for sym, code_snippet in symbols_to_summarize:
-                task = SecondaryTask(
-                    task_type="missing_summaries",
-                    params={
-                        "signature": sym.signature,
-                        "code_snippet": code_snippet,
-                        "project_id": project_id,
-                    },
-                )
-                state.setdefault("pending_secondary_tasks", []).append(task.dict())
-            self._set_state(project_id, state)
-            return
-
-        batch_size = 10
-        for i in range(0, len(symbols_to_summarize), batch_size):
-            batch = symbols_to_summarize[i : i + batch_size]
-            tasks = []
-            for sym, code_snippet in batch:
-                prompt = f"Summarize in one short sentence what this code does:\n\n```{sym.signature}\n{code_snippet}```"
-                tasks.append(
-                    self._call_llm(
-                        prompt=prompt,
-                        system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                        model_override=self.valves.summarization_model,
-                        max_tokens=50,
-                        temperature=0.1,
-                        semaphore=self._low_priority_llm_semaphore,
-                    )
-                )
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for (sym, _), resp in zip(batch, responses):
-                if isinstance(resp, str) and resp.strip():
-                    sym.summary = resp.strip()
-            await asyncio.sleep(1.0)
-        self._set_state(project_id, state)
-
-    # --------------------------------------------------------------------------
-    # Symbol-level analysis cache (memory + SQLite)
-    # --------------------------------------------------------------------------
-    _symbol_analysis_cache: Dict[Tuple[str, str], Dict] = {}
-    _MAX_SYMBOL_ANALYSIS_CACHE = 1000
-
-    # Generic cache (question‑agnostic) – keyed by (symbol_name, content_hash)
-    _symbol_analysis_generic_cache: Dict[Tuple[str, str], Dict] = {}
-
-    def _get_cached_symbol_analysis(
-        self, symbol_name: str, question_hash: str, content_hash: str = ""
-    ) -> Optional[Dict]:
-        """Retrieve cached analysis for a symbol (memory + DB), invalidating if content changed."""
-        key = (symbol_name, question_hash)
-        # Memory cache first (question‑specific)
-        if key in self._symbol_analysis_cache:
-            if content_hash:
-                row = self._db_conn.execute(
-                    "SELECT content_hash FROM symbol_analysis_cache "
-                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                    (self.valves.project_id, symbol_name, question_hash),
-                ).fetchone()
-                if row and row[0] != content_hash:
-                    del self._symbol_analysis_cache[key]
-                    self._db_conn.execute(
-                        "DELETE FROM symbol_analysis_cache "
-                        "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                        (self.valves.project_id, symbol_name, question_hash),
-                    )
-                    self._db_conn.commit()
-                    return None
-            return self._symbol_analysis_cache[key]
-
-        # Fallback: generic cache (question‑agnostic)
-        generic_key = (symbol_name, content_hash) if content_hash else None
-        if generic_key and generic_key in self._symbol_analysis_generic_cache:
-            return self._symbol_analysis_generic_cache[generic_key]
-
-        # DB lookup (question‑specific)
-        row = self._db_conn.execute(
-            "SELECT result_json, content_hash FROM symbol_analysis_cache "
-            "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-            (self.valves.project_id, symbol_name, question_hash),
-        ).fetchone()
-        if row:
-            result_json, stored_content_hash = row
-            if content_hash and stored_content_hash != content_hash:
+            # Persist to SQLite
+            def _write():
                 self._db_conn.execute(
-                    "DELETE FROM symbol_analysis_cache "
-                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                    (self.valves.project_id, symbol_name, question_hash),
+                    "INSERT OR REPLACE INTO block_change_summaries (block_hash, summary, created_at) VALUES (?, ?, ?)",
+                    (block_hash, summary.strip(), now),
+                )
+                # Enforce max entries
+                self._db_conn.execute(
+                    "DELETE FROM block_change_summaries WHERE block_hash NOT IN (SELECT block_hash FROM block_change_summaries ORDER BY created_at DESC LIMIT ?)",
+                    (self._MAX_CHANGE_SUMMARIES,),
                 )
                 self._db_conn.commit()
-                return None
-            try:
-                result = json.loads(result_json)
-                if len(self._symbol_analysis_cache) < self._MAX_SYMBOL_ANALYSIS_CACHE:
-                    self._symbol_analysis_cache[key] = result
-                return result
-            except Exception:
-                pass
-        return None
 
-    def _set_cached_symbol_analysis(
-        self, symbol_name: str, question_hash: str, result: Dict, content_hash: str = ""
-    ):
-        """Store analysis in memory + DB, and also in the generic cache."""
-        key = (symbol_name, question_hash)
-        # Memory cache (question‑specific)
-        if len(self._symbol_analysis_cache) >= self._MAX_SYMBOL_ANALYSIS_CACHE:
-            oldest = next(iter(self._symbol_analysis_cache))
-            del self._symbol_analysis_cache[oldest]
-        self._symbol_analysis_cache[key] = result
-
-        # Generic cache (question‑agnostic)
-        if content_hash:
-            generic_key = (symbol_name, content_hash)
-            if len(self._symbol_analysis_generic_cache) >= 2000:
-                oldest = next(iter(self._symbol_analysis_generic_cache))
-                del self._symbol_analysis_generic_cache[oldest]
-            self._symbol_analysis_generic_cache[generic_key] = result
-
-        # ── Enqueue the DB write ──
-        project_id = self.valves.project_id
-        result_json = json.dumps(result)
-
-        def _write():
-            self._db_conn.execute(
-                "REPLACE INTO symbol_analysis_cache "
-                "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    project_id,
-                    symbol_name,
-                    question_hash,
-                    content_hash,
-                    result_json,
-                    time.time(),
-                ),
-            )
-            self._db_conn.commit()
-            # Keep only the most recent 1000 entries per project
-            self._db_conn.execute(
-                "DELETE FROM symbol_analysis_cache "
-                "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
-                "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
-                "  WHERE project_id = ? "
-                "  ORDER BY created_at DESC "
-                "  LIMIT 1000"
-                ")",
-                (project_id, project_id),
-            )
-
-        asyncio.create_task(self._db_write_queue.put((_write, (), {})))
+            await self._db_write_queue.put((_write, (), {}))
 
     # --------------------------------------------------------------------------
-    # Symbol-by-symbol code analysis (with cache)
+    # Symbol-level analysis
     # --------------------------------------------------------------------------
     def _build_symbol_context(
         self,
@@ -7244,31 +6054,22 @@ class Filter:
         max_tokens: int = 800,
         max_body_lines: int = 20,
     ) -> Optional[str]:
-        """
-        Build a clean, size-limited context for one symbol, guaranteed to not
-        break the LLM prompt. Returns None if the symbol itself is unusable.
-        """
-        # 1. Sanitize signature
         sig = self._sanitize_signature(sym.signature or sym.name)
         if not sig.strip():
-            return None  # unusable symbol
-
+            return None
         ctx = f"Symbol: `{sig}` [{sym.kind}]"
         if sym.file_path:
             ctx += f" in {sym.file_path}"
         if sym.summary:
             ctx += f"\nSummary: {sym.summary}"
 
-        # 2. Safe body preview
         clean_body = self._sanitize_text(block.content)
         lines = clean_body.splitlines()
-        # skip first line (already in signature), clean each line
         preview_lines = []
         for line in lines[1:]:
             line = line.strip()
             if not line:
                 continue
-            # truncate long lines
             if len(line) > 200:
                 line = line[:200] + "…"
             preview_lines.append(line)
@@ -7279,18 +6080,15 @@ class Filter:
             body = textwrap.shorten(body, width=2000, placeholder="...")
             ctx += f"\nBody preview:\n```\n{body}\n```"
 
-        # 3. Callers & callees from index (short)
         callers = self._symbol_index.get_callers(sym.name, project_id)
         if callers:
             ctx += f"\nCalled by: {', '.join(sorted(callers)[:5])}"
         if sym.calls:
             ctx += f"\nCalls: {', '.join(sym.calls[:5])}"
 
-        # 4. Token limit enforcement
         if self.tokenizer:
             tokens = len(self.tokenizer.encode(ctx))
             if tokens > max_tokens:
-                # Try to trim the body preview first
                 if "\nBody preview:\n" in ctx:
                     header, body = ctx.split("\nBody preview:\n", 1)
                     ctx_no_body = header + "\nBody preview omitted (too large)."
@@ -7301,29 +6099,20 @@ class Filter:
                         ctx = header
                     else:
                         ctx = ctx_no_body
-                # Final truncation using tokenizer
                 if self.tokenizer and len(self.tokenizer.encode(ctx)) > max_tokens:
                     ctx = self._truncate_text_to_tokens(ctx, max_tokens)
-
         return ctx
 
     async def _analyze_code_via_symbols(
         self, question: str, project_id: str
     ) -> Tuple[str, List[str]]:
-        """
-        Analyze code by processing each symbol independently,
-        then synthesize a final summary.
-
-        Returns (summary_text, list_of_suggested_symbols).
-        """
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return "", []
 
         question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
 
-        # Gather symbols with clean contexts, storing block hash for cache
-        symbol_contexts = []  # (name, ctx_or_cached_dict, block_hash)
+        symbol_contexts = []
         seen_symbols = set()
         for block in state["active_blocks"].values():
             if block.obsolete or block.content_type not in (
@@ -7337,7 +6126,6 @@ class Filter:
                     continue
                 seen_symbols.add(sym.name)
 
-                # Check cache (memory + DB) with content hash for invalidation
                 cached = self._get_cached_symbol_analysis(
                     sym.name, question_hash, content_hash=block.hash
                 )
@@ -7346,12 +6134,8 @@ class Filter:
                     symbol_contexts.append((sym.name, cached, block.hash))
                     continue
 
-                # Build clean context
                 ctx = self._build_symbol_context(sym, block, project_id)
                 if ctx is None:
-                    self._log_debug(
-                        f"Skipping symbol with invalid signature: {sym.name}"
-                    )
                     continue
 
                 symbol_contexts.append((sym.name, ctx, block.hash))
@@ -7359,7 +6143,6 @@ class Filter:
         if not symbol_contexts:
             return "", []
 
-        # Split into fresh / cached
         fresh_indices = []
         cached_results = []
         for i, (name, ctx_or_cached, block_hash) in enumerate(symbol_contexts):
@@ -7368,12 +6151,6 @@ class Filter:
             else:
                 fresh_indices.append(i)
 
-        self._log_debug(
-            f"Symbol analysis: {len(symbol_contexts)} total, "
-            f"{len(cached_results)} cached, {len(fresh_indices)} fresh"
-        )
-
-        # Prompt templates
         prompt_template_full = (
             "You are a code analysis assistant. "
             "For the given symbol, provide:\n"
@@ -7405,9 +6182,7 @@ class Filter:
             "OUTPUT:"
         )
 
-        # ── Model: only the configured symbol‑analysis model, no fallback to other models ──
         model = self.valves.symbol_analysis_model or self.valves.llm_model
-        # ── Dedicated semaphore so we don't mix with other LLM tasks ──
         semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
 
         max_retries = self.valves.symbol_analysis_max_retries
@@ -7420,26 +6195,17 @@ class Filter:
                 if attempt == 0:
                     prompt = prompt_template_full.format(context=ctx)
                 elif attempt == 1:
-                    # Second attempt: without body preview
                     ctx_clean = ctx.split("\nBody preview:\n")[0]
                     prompt = prompt_template_no_body.format(context=ctx_clean)
                 else:
-                    # Third and subsequent attempts: signature only
-                    ctx_sig = ctx.split("\n")[0]  # first line is Symbol: ...
+                    ctx_sig = ctx.split("\n")[0]
                     prompt = prompt_template_no_body.format(context=ctx_sig)
 
-                if attempt > 0:
-                    self._log_debug(
-                        f"Retrying symbol analysis for {name} (attempt {attempt+1})"
-                    )
                 try:
                     res = await self._analyze_single_symbol(
                         prompt, model, semaphore, label=f"symbol:{name}"
                     )
-                except Exception as e:
-                    self._log_debug(
-                        f"Symbol analysis attempt {attempt+1} for {name} error: {e}"
-                    )
+                except Exception:
                     continue
 
                 if not res:
@@ -7449,7 +6215,6 @@ class Filter:
                 if parsed:
                     parsed["symbol_name"] = name
                     parsed_fresh.append(parsed)
-                    # Store with content hash for future invalidation
                     self._set_cached_symbol_analysis(
                         name, question_hash, parsed, content_hash=block_hash
                     )
@@ -7457,17 +6222,9 @@ class Filter:
                     break
 
             if not success:
-                self._log_debug(
-                    f"Symbol analysis failed for {name} after {max_retries} attempts"
-                )
+                self._log_debug(f"Symbol analysis failed for {name}")
 
-        # Combine cached and fresh
         all_parsed = cached_results + parsed_fresh
-
-        self._log_debug(
-            f"Symbol analysis completed: {len(all_parsed)}/{len(symbol_contexts)} succeeded"
-        )
-
         if not all_parsed:
             return "Symbol analysis produced no results.", []
 
@@ -7479,28 +6236,9 @@ class Filter:
         summary = await self._synthesize_from_symbol_results(all_parsed, question)
         return summary, list(suggested)
 
-    def _get_blocks_for_symbols(
-        self, symbol_names: List[str], project_id: str
-    ) -> List[CodeBlock]:
-        """
-        Return the active, non‑obsolete CodeBlocks that contain any of the given symbols.
-        """
-        state = self._get_state(project_id)
-        blocks = []
-        seen = set()
-        for name in symbol_names:
-            for h in self._symbol_index.find_blocks(name, project_id):
-                if h not in seen:
-                    blk = state["active_blocks"].get(h)
-                    if blk and not blk.obsolete:
-                        blocks.append(blk)
-                        seen.add(h)
-        return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
-
     async def _analyze_single_symbol(
         self, prompt: str, model: str, semaphore: asyncio.Semaphore, label: str = ""
     ) -> Optional[str]:
-        """Call the analysis model for one symbol, with concurrency limit."""
         async with semaphore:
             return await self._call_llm(
                 prompt=prompt,
@@ -7512,7 +6250,6 @@ class Filter:
             )
 
     def _parse_symbol_output(self, text: str) -> Optional[Dict]:
-        """Parse the structured text output from the symbol analysis."""
         if not text:
             return None
         try:
@@ -7541,7 +6278,6 @@ class Filter:
                         result["confidence"] = float(line[11:].strip())
                     except ValueError:
                         result["confidence"] = 0.5
-            # Ensure required fields
             result.setdefault("relevant_functions", [])
             result.setdefault("key_findings", [])
             result.setdefault("potential_issues", [])
@@ -7553,11 +6289,9 @@ class Filter:
     async def _synthesize_from_symbol_results(
         self, symbol_analyses: List[Dict], question: str
     ) -> str:
-        """Merge symbol-level analyses into a final summary using the synthesis model."""
         if not symbol_analyses:
             return "No symbol analyses to synthesize."
 
-        # Build compact representation
         lines = []
         for sa in symbol_analyses:
             lines.append(
@@ -7581,7 +6315,6 @@ class Filter:
             "Keep the response under 1500 tokens. No code snippets."
         )
 
-        # Use a suitable model for synthesis
         model = self.valves.symbol_analysis_model or self.valves.llm_model
         response = await self._call_llm(
             prompt=prompt,
@@ -7592,11 +6325,129 @@ class Filter:
         )
         return response if response else "Failed to synthesize summary."
 
+    def _get_blocks_for_symbols(
+        self, symbol_names: List[str], project_id: str
+    ) -> List[CodeBlock]:
+        state = self._get_state(project_id)
+        blocks = []
+        seen = set()
+        for name in symbol_names:
+            for h in self._symbol_index.find_blocks(name, project_id):
+                if h not in seen:
+                    blk = state["active_blocks"].get(h)
+                    if blk and not blk.obsolete:
+                        blocks.append(blk)
+                        seen.add(h)
+        return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
+
+    # --------------------------------------------------------------------------
+    # Symbol-level analysis – using OrderedDict caches
+    # --------------------------------------------------------------------------
+    def _get_cached_symbol_analysis(
+        self, symbol_name: str, question_hash: str, content_hash: str = ""
+    ) -> Optional[Dict]:
+        key = (symbol_name, question_hash)
+        if key in self._symbol_analysis_cache:
+            if content_hash:
+                row = self._db_conn.execute(
+                    "SELECT content_hash FROM symbol_analysis_cache "
+                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
+                    (self.valves.project_id, symbol_name, question_hash),
+                ).fetchone()
+                if row and row[0] != content_hash:
+                    del self._symbol_analysis_cache[key]
+                    self._db_conn.execute(
+                        "DELETE FROM symbol_analysis_cache "
+                        "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
+                        (self.valves.project_id, symbol_name, question_hash),
+                    )
+                    self._db_conn.commit()
+                    return None
+            # Refresh LRU order
+            self._symbol_analysis_cache.move_to_end(key)
+            return self._symbol_analysis_cache[key]
+
+        generic_key = (symbol_name, content_hash) if content_hash else None
+        if generic_key and generic_key in self._symbol_analysis_generic_cache:
+            return self._symbol_analysis_generic_cache[generic_key]
+
+        row = self._db_conn.execute(
+            "SELECT result_json, content_hash FROM symbol_analysis_cache "
+            "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
+            (self.valves.project_id, symbol_name, question_hash),
+        ).fetchone()
+        if row:
+            result_json, stored_content_hash = row
+            if content_hash and stored_content_hash != content_hash:
+                self._db_conn.execute(
+                    "DELETE FROM symbol_analysis_cache "
+                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
+                    (self.valves.project_id, symbol_name, question_hash),
+                )
+                self._db_conn.commit()
+                return None
+            try:
+                result = json.loads(result_json)
+                if len(self._symbol_analysis_cache) < self._MAX_SYMBOL_ANALYSIS_CACHE:
+                    self._symbol_analysis_cache[key] = result
+                    self._symbol_analysis_cache.move_to_end(key)
+                return result
+            except Exception:
+                pass
+        return None
+
+    def _set_cached_symbol_analysis(
+        self, symbol_name: str, question_hash: str, result: Dict, content_hash: str = ""
+    ):
+        key = (symbol_name, question_hash)
+        if len(self._symbol_analysis_cache) >= self._MAX_SYMBOL_ANALYSIS_CACHE:
+            self._symbol_analysis_cache.popitem(last=False)
+        self._symbol_analysis_cache[key] = result
+        self._symbol_analysis_cache.move_to_end(key)
+
+        if content_hash:
+            generic_key = (symbol_name, content_hash)
+            if len(self._symbol_analysis_generic_cache) >= 2000:
+                self._symbol_analysis_generic_cache.popitem(last=False)
+            self._symbol_analysis_generic_cache[generic_key] = result
+            self._symbol_analysis_generic_cache.move_to_end(generic_key)
+
+        project_id = self.valves.project_id
+        result_json = json.dumps(result)
+
+        def _write():
+            self._db_conn.execute(
+                "REPLACE INTO symbol_analysis_cache "
+                "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    project_id,
+                    symbol_name,
+                    question_hash,
+                    content_hash,
+                    result_json,
+                    time.time(),
+                ),
+            )
+            self._db_conn.commit()
+            self._db_conn.execute(
+                "DELETE FROM symbol_analysis_cache "
+                "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
+                "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
+                "  WHERE project_id = ? "
+                "  ORDER BY created_at DESC "
+                "  LIMIT 1000"
+                ")",
+                (project_id, project_id),
+            )
+
+        asyncio.create_task(self._db_write_queue.put((_write, (), {})))
+
     # --------------------------------------------------------------------------
     # Deferred secondary task execution
     # --------------------------------------------------------------------------
     async def _process_pending_secondary_tasks(self, project_id: str):
-        """Execute all pending secondary tasks at the start of an inlet."""
+        """Execute all pending secondary tasks at the start of an inlet (MUST be called under project lock)."""
         state = self._get_state(project_id)
         if not state or not state.get("pending_secondary_tasks"):
             return
@@ -7616,40 +6467,9 @@ class Filter:
                     self._log_debug(
                         f"Dropping secondary task {task.task_type} after {task.retries} retries"
                     )
-            # else: task succeeded, do not re-add
 
         state["pending_secondary_tasks"] = remaining
         self._set_state(project_id, state)
-
-    async def _run_dependency_refresh_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred dependency extraction using the secondary model."""
-        block_hash = params["block_hash"]
-        project_id = params["project_id"]
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            state = self._get_state(project_id)
-            if not state or block_hash not in state["active_blocks"]:
-                return False
-            block = state["active_blocks"].get(block_hash)
-            if not block:
-                return False
-            deps = await self._extract_dependencies_hybrid(
-                block.content, block.file_path, model_override=model
-            )
-            if (
-                block.file_path
-                and block.file_path.endswith(".py")
-                or "def " in block.content
-            ):
-                imports, calls = self._extract_dependencies_ast(block.content)
-                block.ast_imports = imports
-                block.ast_calls = calls
-            block.dependencies = deps
-            await self._mark_affected_blocks(block_hash, state)
-            self._set_state(project_id, state)
-            return True
 
     async def _execute_secondary_task(
         self, task: SecondaryTask, project_id: str
@@ -7678,167 +6498,6 @@ class Filter:
             self._log_debug(f"Secondary task {task.task_type} failed: {e}")
             return False
 
-    async def _run_change_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred change summary generation."""
-        block_hash = params["block_hash"]
-        prev_content = params["prev_content"]
-        new_content = params["new_content"]
-        prompt = (
-            f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
-            f"Previous:\n```\n{prev_content[:500]}\n```\n\n"
-            f"New:\n```\n{new_content[:500]}\n```\n\n"
-            f"Change summary:"
-        )
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code change summariser. Output only one short sentence.",
-                model_override=model,
-                max_tokens=40,
-                temperature=0.1,
-            )
-        if summary:
-            now = time.time()
-            self._block_change_summaries[block_hash] = (summary.strip(), now)
-            max_entries = self.valves.max_change_summaries
-            if len(self._block_change_summaries) > max_entries:
-                sorted_entries = sorted(
-                    self._block_change_summaries.items(), key=lambda x: x[1][1]
-                )
-                to_remove = sorted_entries[
-                    : len(self._block_change_summaries) - max_entries
-                ]
-                for key, _ in to_remove:
-                    del self._block_change_summaries[key]
-            return True
-        return False
-
-    async def _run_missing_summaries_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred missing summary generation for one symbol."""
-        signature = params["signature"]
-        code_snippet = params["code_snippet"]
-        prompt = f"Summarize in one short sentence what this code does:\n\n```{signature}\n{code_snippet}```"
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                model_override=model,
-                max_tokens=50,
-                temperature=0.1,
-            )
-        if summary and summary.strip():
-            project_id = params["project_id"]
-            lock = await self._get_project_lock(project_id)
-            async with lock:
-                state = self._get_state(project_id)
-                for blk in state["active_blocks"].values():
-                    for sym in blk.symbols:
-                        if sym.signature == signature:
-                            sym.summary = summary.strip()
-                self._set_state(project_id, state)
-            return True
-        return False
-
-    async def _run_inactive_code_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred summarisation of an inactive code block."""
-        sig = params.get("signature", "")
-        content = params["content"]
-        if sig:
-            prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{content[:1000]}```"
-        else:
-            prompt = f"Summarise the following code block.\n```{content[:1500]}```"
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code summarization assistant.",
-                model_override=model,
-                max_tokens=200,
-                temperature=0.2,
-            )
-        if summary and summary.strip():
-            project_id = params["project_id"]
-            block_hash = params["block_hash"]
-            lock = await self._get_project_lock(project_id)
-            async with lock:
-                state = self._get_state(project_id)
-                if block_hash in state["active_blocks"]:
-                    blk = state["active_blocks"][block_hash]
-                    summary_content = f"[Summary of inactive code]\n{summary.strip()}"
-                    blk.content = summary_content
-                    blk.importance_score *= 0.5
-                    self._invalidate_lightweight_cache(project_id)
-                    self._set_state(project_id, state)
-            return True
-        return False
-
-    async def _run_session_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Generate an autobiographical session summary and store it in LTM."""
-        project_id = params["project_id"]
-        code_state_hash = params.get("code_state_hash", "")
-
-        # Retrieve the most recent messages from LTM
-        recent = await self._retrieve_historical_messages(
-            query="recent conversation summary",
-            project_id=project_id,
-            limit=self.valves.session_summary_interval_messages,
-        )
-        if not recent:
-            return False
-
-        conversation_text = "\n".join(
-            f"{m['role']}: {m['content'][:300]}" for m in recent
-        )
-        prompt = (
-            "Summarise the following conversation segment in 2-3 sentences, "
-            "capturing the main task, decisions made, files modified, "
-            "and architectural changes:\n\n"
-            f"{conversation_text[:3000]}"
-        )
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
-                model_override=model,
-                max_tokens=self.valves.session_summary_max_tokens,
-                temperature=0.2,
-            )
-        if not summary:
-            return False
-
-        # Store in LTM with special metadata
-        msg_id = f"{project_id}_session_summary_{int(time.time())}"
-        embedding = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(summary).tolist()
-        )
-        await anyio.to_thread.run_sync(
-            lambda: self.memory_collection.upsert(
-                ids=[msg_id],
-                embeddings=[embedding],
-                metadatas=[
-                    {
-                        "role": "assistant",
-                        "project_id": project_id,
-                        "timestamp": time.time(),
-                        "is_session_summary": True,
-                        "code_state_hash": code_state_hash,
-                        "content_type": ContentType.GENERAL.value,
-                        "has_code": False,
-                    }
-                ],
-                documents=[f"[Session summary]\n{summary}"],
-            )
-        )
-        self._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
-        return True
-
     async def _load_symbol_cache_from_db(self, project_id: str, limit: int = 500):
         """Pre‑load the most recent symbol analyses from DB into memory."""
         rows = await anyio.to_thread.run_sync(
@@ -7855,7 +6514,8 @@ class Filter:
         for symbol_name, question_hash, content_hash, result_json in rows:
             try:
                 result = json.loads(result_json)
-                self._symbol_analysis_cache[(symbol_name, question_hash)] = result
+                key = (symbol_name, question_hash)
+                self._symbol_analysis_cache[key] = result
                 loaded += 1
             except Exception:
                 pass
