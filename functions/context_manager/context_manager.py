@@ -99,17 +99,14 @@ import sys
 if "/app/backend/data/custom_lib" not in sys.path:
     sys.path.append("/app/backend/data/custom_lib")
 
-try:
-    from shared_resources import (
-        get_embedder as _shared_get_embedder,
-        get_chroma_client as _shared_get_chroma_client,
-        AsyncLRUCache as _AsyncLRUCache,
-        get_http_session as _shared_get_http_session,
-    )
-
-    _SHARED_RESOURCES_AVAILABLE = True
-except ImportError:
-    _SHARED_RESOURCES_AVAILABLE = False
+from shared_resources import (
+    get_embedder as _shared_get_embedder,
+    get_chroma_client as _shared_get_chroma_client,
+    AsyncLRUCache as _AsyncLRUCache,
+    get_http_session as _shared_get_http_session,
+    call_llm as _shared_call_llm,
+    unload_all_models as _shared_unload_all_models,
+)
 
 _inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
     "_inlet_background_tasks", default=None
@@ -2399,45 +2396,11 @@ class Filter:
     # --------------------------------------------------------------------------
     def _init_long_term_memory(self):
         os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
-        if _SHARED_RESOURCES_AVAILABLE:
-            try:
-                self.embedder = _shared_get_embedder()
-                self._log_debug("Embedder: using shared singleton")
-            except Exception as e:
-                self._log_debug(f"shared embedder failed ({e}), loading local")
-                self.embedder = (
-                    SentenceTransformer("all-MiniLM-L6-v2") if HAS_SENTENCE else None
-                )
-        else:
-            self.embedder = (
-                SentenceTransformer("all-MiniLM-L6-v2") if HAS_SENTENCE else None
-            )
+        self.embedder = _shared_get_embedder()
+        self._log_debug("Embedder: using shared singleton")
 
-        if _SHARED_RESOURCES_AVAILABLE:
-            try:
-                self.chroma_client = _shared_get_chroma_client(
-                    self.valves.long_term_memory_dir
-                )
-                self._log_debug("ChromaDB: using shared singleton")
-            except Exception as e:
-                self._log_debug(f"shared chroma failed ({e}), opening local")
-                self.chroma_client = (
-                    chromadb.PersistentClient(
-                        path=self.valves.long_term_memory_dir,
-                        settings=Settings(anonymized_telemetry=False),
-                    )
-                    if HAS_CHROMA
-                    else None
-                )
-        else:
-            self.chroma_client = (
-                chromadb.PersistentClient(
-                    path=self.valves.long_term_memory_dir,
-                    settings=Settings(anonymized_telemetry=False),
-                )
-                if HAS_CHROMA
-                else None
-            )
+        self.chroma_client = _shared_get_chroma_client(self.valves.long_term_memory_dir)
+        self._log_debug("ChromaDB: using shared singleton")
 
         if self.chroma_client is None:
             self._log_debug("ChromaDB not available")
@@ -2479,43 +2442,11 @@ class Filter:
     # LLM calling infrastructure
     # --------------------------------------------------------------------------
     def _init_llm_cache(self):
-        ttl = self.valves.LLM_CACHE_TTL
-        max_size = self.valves.LLM_CACHE_MAX_SIZE
-        if _SHARED_RESOURCES_AVAILABLE:
-            return _AsyncLRUCache(max_size=max_size, ttl=ttl)
-        import asyncio as _asyncio, time as _t
-
-        class _MinimalLRU:
-            def __init__(self, max_size, ttl):
-                self._store = {}
-                self.max_size = max_size
-                self.ttl = ttl
-                self._lock = _asyncio.Lock()
-
-            async def get(self, key):
-                async with self._lock:
-                    e = self._store.get(key)
-                    if not e:
-                        return None
-                    val, ts = e
-                    if self.ttl > 0 and _t.time() - ts > self.ttl:
-                        del self._store[key]
-                        return None
-                    self._store[key] = self._store.pop(key)
-                    return val
-
-            async def set(self, key, val):
-                async with self._lock:
-                    if (
-                        self.max_size > 0
-                        and len(self._store) >= self.max_size
-                        and key not in self._store
-                    ):
-                        del self._store[next(iter(self._store))]
-                    self._store[key] = (val, _t.time())
-                    self._store[key] = self._store.pop(key)
-
-        return _MinimalLRU(max_size, ttl)
+        """Return the shared AsyncLRUCache instance for LLM response caching."""
+        return _AsyncLRUCache(
+            max_size=self.valves.LLM_CACHE_MAX_SIZE,
+            ttl=self.valves.LLM_CACHE_TTL,
+        )
 
     async def _maybe_unload_for_model(
         self, model_name: str, base_url: str, is_ollama: bool
@@ -2531,9 +2462,7 @@ class Filter:
                 f"Switching model from '{self._last_used_model}' to '{model_name}'"
             )
             try:
-                from shared_resources import unload_all_models
-
-                await unload_all_models(base_url)
+                await _shared_unload_all_models(base_url)
                 self._log_debug("All loaded models unloaded before switching")
                 self._last_used_model = None
             except Exception as e:
@@ -2651,7 +2580,6 @@ class Filter:
             if base_url.endswith("/v1"):
                 base_url = base_url[:-3].rstrip("/")
 
-            api_token = self.valves.LLM_API_TOKEN.strip() or None
             is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
             model = model_override or self.valves.llm_model
@@ -2677,164 +2605,62 @@ class Filter:
             if model.startswith("llamacpp/"):
                 ep_type = self.valves.llamacpp_endpoint_type
 
-            if "/" in model and (
-                model.startswith("ollama/") or model.startswith("llamacpp/")
-            ):
-                model_name = model.split("/", 1)[1]
-            else:
-                model_name = model
-
             effective_semaphore = semaphore or self._llm_semaphore
             max_retries = 2
             base_delay = 1.0
 
-            await self._maybe_unload_for_model(model_name, base_url, is_ollama)
-
-            if _SHARED_RESOURCES_AVAILABLE:
-                from shared_resources import call_llm as _shared_call_llm
-
-                for attempt in range(max_retries + 1):
-                    try:
-                        async with effective_semaphore:
-                            content = await _shared_call_llm(
-                                prompt=prompt,
-                                system=system_prompt,
-                                base_url=self.valves.LLM_BASE_URL,
-                                model=model,
-                                api_token=self.valves.LLM_API_TOKEN,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                timeout=self.valves.llm_request_timeout,
-                                endpoint_type=ep_type,
-                            )
-                        if content:
-                            await self._llm_cache.set(cache_key, content)
-                            future.set_result(content)
-                            self._log_debug(
-                                f"[LLM] {model}"
-                                + (f" ({label})" if label else "")
-                                + f" took {time.monotonic() - t_start:.3f}s"
-                            )
-                            self._last_used_model = model_name
-                            return content
-                    except asyncio.CancelledError:
-                        raise
-                    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                        self._log_debug(f"[LLM] {model} connection error: {exc}")
-                        if attempt < max_retries:
-                            try:
-                                from shared_resources import close_http_session
-
-                                await close_http_session()
-                            except Exception:
-                                pass
-                            await asyncio.sleep(base_delay * (2**attempt))
-                            continue
-                        break
-                    except RuntimeError as exc:
-                        self._log_debug(f"[LLM] {model} HTTP error: {exc}")
-                        if any(
-                            c in str(exc) for c in ("429", "500", "502", "503", "504")
-                        ):
-                            if attempt < max_retries:
-                                await asyncio.sleep(base_delay * (2**attempt))
-                                continue
-                        break
-                    except Exception:
-                        if attempt < max_retries:
-                            await asyncio.sleep(base_delay * (2**attempt))
-                            continue
-                        break
-
-            try:
-                http_session = await _shared_get_http_session(
-                    self.valves.llm_request_timeout
-                )
-            except Exception:
-                http_session = self._http_session
-            if http_session is None:
-                logger.warning(f"No HTTP session for {model}")
-                future.set_result(None)
-                return None
-
-            url, payload, headers = self._build_llm_request(
-                model_name=model_name,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                is_ollama=is_ollama,
-                ep_type=ep_type,
-                base_url=base_url,
-                api_token=api_token,
-                openai_api_key=self.valves.openai_api_key,
-            )
-
-            if response_format is not None and not is_ollama:
-                payload["response_format"] = response_format
+            await self._maybe_unload_for_model(model, base_url, is_ollama)
 
             for attempt in range(max_retries + 1):
                 try:
                     async with effective_semaphore:
-                        async with http_session.post(
-                            url, json=payload, headers=headers
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                try:
-                                    content = self._parse_llm_response(
-                                        data, is_ollama, ep_type
-                                    )
-                                except RuntimeError:
-                                    continue
-                                if not content:
-                                    continue
-                                await self._llm_cache.set(cache_key, content)
-                                future.set_result(content)
-                                self._log_debug(
-                                    f"[LLM] {model}"
-                                    + (f" ({label})" if label else "")
-                                    + f" took {time.monotonic() - t_start:.3f}s"
-                                )
-                                self._last_used_model = model_name
-                                return content
-                            else:
-                                error_text = await resp.text()
-                                self._log_debug(
-                                    f"[LLM] {model} HTTP {resp.status}: {error_text[:500]}"
-                                )
-                                if resp.status in (429, 500, 502, 503, 504):
-                                    if attempt < max_retries:
-                                        delay = base_delay * (2**attempt)
-                                        await asyncio.sleep(delay)
-                                        continue
-                                break
+                        content = await _shared_call_llm(
+                            prompt=prompt,
+                            system=system_prompt,
+                            base_url=self.valves.LLM_BASE_URL,
+                            model=model,
+                            api_token=self.valves.LLM_API_TOKEN,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=self.valves.llm_request_timeout,
+                            endpoint_type=ep_type,
+                        )
+                    if content:
+                        await self._llm_cache.set(cache_key, content)
+                        future.set_result(content)
+                        self._log_debug(
+                            f"[LLM] {model}"
+                            + (f" ({label})" if label else "")
+                            + f" took {time.monotonic() - t_start:.3f}s"
+                        )
+                        self._last_used_model = model
+                        return content
                 except asyncio.CancelledError:
                     raise
                 except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                    self._log_debug(f"[LLM] {model} connection error: {exc}")
+                    self._log_debug(
+                        f"[LLM] {model}{f' ({label})' if label else ''} "
+                        f"connection error: {exc}"
+                    )
                     if attempt < max_retries:
                         try:
-                            if _SHARED_RESOURCES_AVAILABLE:
-                                from shared_resources import close_http_session
+                            from shared_resources import close_http_session
 
-                                await close_http_session()
-                            else:
-                                if self._http_session and not self._http_session.closed:
-                                    await self._http_session.close()
-                                    self._http_session = None
+                            await close_http_session()
                         except Exception:
                             pass
                         await asyncio.sleep(base_delay * (2**attempt))
-                        try:
-                            http_session = await _shared_get_http_session(
-                                self.valves.llm_request_timeout
-                            )
-                        except Exception:
-                            http_session = self._http_session
-                        if http_session is None:
-                            continue
                         continue
+                    break
+                except RuntimeError as exc:
+                    self._log_debug(
+                        f"[LLM] {model}{f' ({label})' if label else ''} "
+                        f"HTTP error: {exc}"
+                    )
+                    if any(c in str(exc) for c in ("429", "500", "502", "503", "504")):
+                        if attempt < max_retries:
+                            await asyncio.sleep(base_delay * (2**attempt))
+                            continue
                     break
                 except Exception:
                     if attempt < max_retries:
@@ -6462,11 +6288,9 @@ class Filter:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
                     )
-                    # Log detected level always
                     self._log_debug(f"CoT level detected: {cot_level} (manual=False)")
                     if cot_level > 0:
                         cot_any_used = True
-                        # For automatic CoT, cap at level 2 to avoid heavy models
                         if cot_level == 3:
                             self._log_debug(
                                 "Auto CoT capped to level 2 to prevent heavy model usage"
@@ -6479,21 +6303,14 @@ class Filter:
             background_tasks.clear()
 
         # Unload any currently loaded model before CoT to free VRAM
-        if _SHARED_RESOURCES_AVAILABLE:
-            try:
-                from shared_resources import unload_all_models
-
-                base_url = self.valves.LLM_BASE_URL.rstrip("/")
-                if base_url.endswith("/v1"):
-                    base_url = base_url[:-3].rstrip("/")
-                await unload_all_models(base_url)
-                self._last_used_model = None
-            except Exception:
-                pass
+        try:
+            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+            self._last_used_model = None
+        except Exception:
+            pass
 
         # Generate CoT reasoning if needed
         if cot_any_used:
-            # Log the CoT level being used
             if manual_cot_used:
                 self._log_debug(
                     f"Generating manual CoT level {cot_level} with model "
@@ -6551,17 +6368,11 @@ class Filter:
             system_injections.append(("low", cot_note))
 
             # Unload the CoT model immediately to free VRAM for the main model
-            if _SHARED_RESOURCES_AVAILABLE:
-                try:
-                    from shared_resources import unload_all_models
-
-                    base_url = self.valves.LLM_BASE_URL.rstrip("/")
-                    if base_url.endswith("/v1"):
-                        base_url = base_url[:-3].rstrip("/")
-                    await unload_all_models(base_url)
-                    self._last_used_model = None
-                except Exception:
-                    pass
+            try:
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                self._last_used_model = None
+            except Exception:
+                pass
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6743,7 +6554,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -6878,18 +6689,12 @@ class Filter:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
 
-            # Free VRAM for the main model using shared library helper
-            if _SHARED_RESOURCES_AVAILABLE:
-                try:
-                    from shared_resources import unload_all_models
-
-                    base_url = self.valves.LLM_BASE_URL.rstrip("/")
-                    if base_url.endswith("/v1"):
-                        base_url = base_url[:-3].rstrip("/")
-                    await unload_all_models(base_url)
-                    self._last_used_model = None
-                except Exception:
-                    pass
+            # Free VRAM for the main model
+            try:
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                self._last_used_model = None
+            except Exception:
+                pass
 
             if _inlet_aborted:
                 for task in background_tasks:
@@ -6991,18 +6796,12 @@ class Filter:
         # Save state if dirty (debounced)
         await self._save_state_if_dirty(project_id)
 
-        # Free VRAM for the main model using shared library helper
-        if _SHARED_RESOURCES_AVAILABLE:
-            try:
-                from shared_resources import unload_all_models
-
-                base_url = self.valves.LLM_BASE_URL.rstrip("/")
-                if base_url.endswith("/v1"):
-                    base_url = base_url[:-3].rstrip("/")
-                await unload_all_models(base_url)
-                self._last_used_model = None
-            except Exception:
-                pass
+        # Free VRAM for the main model
+        try:
+            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+            self._last_used_model = None
+        except Exception:
+            pass
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
