@@ -4939,71 +4939,207 @@ class Filter:
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
-        complex_keywords = {
-            "analyze",
-            "how",
-            "why",
+        """
+        Determine the depth of Chain-of-Thought reasoning needed.
+
+        Returns:
+            0 — inconclusive, let LLM decide
+            1 — simple, inject a think-step-by-step prompt
+            2 — complex, generate a CoT reasoning chain
+            3 — deep, generate CoT reasoning + self-reflection
+        """
+
+        # ── Feature flags (can be enabled later) ───────────────────────────
+        ENABLE_ACCENT_NORMALIZATION = True  # normalise Spanish accents
+        ENABLE_KEYWORD_COUNT_WEIGHT = True  # multiple keywords increase signals
+        ENABLE_COT_HISTORY = False  # use last_cot_level from state
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── Keyword sets ────────────────────────────────────────────────────
+        # Generic complex keywords — safe in any context
+        complex_keywords_generic = {
+            "explain how",
+            "explica cómo",
+            "how does",
+            "cómo funciona",
+            "how to implement",
+            "cómo implementar",
+            "why does",
+            "por qué falla",
             "implement",
-            "design",
-            "architecture",
-            "fix",
-            "debug",
-            "optimize",
-            "refactor",
-            "review",
-            "compare",
-            "analiza",
-            "cómo",
-            "por qué",
             "implementa",
+            "design",
             "diseña",
+            "architecture",
             "arquitectura",
-            "corrige",
+            "build a",
+            "construye",
+            "create a class",
+            "crea una clase",
+            "debug",
             "depura",
+            "fix the",
+            "corrige el",
+            "optimize",
             "optimiza",
+            "refactor",
             "refactoriza",
-            "revisa",
+            "improve",
+            "mejora",
+            "migrate",
+            "migra",
+            "compare",
             "compara",
-            "explain",
-            "explica",
-            "describe",
-            "describir",
+            "code review",
+            "revisión de código",
+            "audit",
+            "audita",
+            "validate",
+            "valida",
+            "integrate",
+            "integra",
+            "deploy",
+            "despliega",
+            "set up",
+            "configura el entorno",
+            "in detail",
+            "en detalle",
         }
+
+        # Code‑only keywords — ambiguous without code‑session context
+        complex_keywords_code_only = {
+            "test",
+            "prueba",
+            "configure",
+            "configura",
+            "scaffold",
+            "fix",
+            "corrige",
+            "review",
+            "revisa",
+            "structure",
+            "estructura",
+        }
+
+        # Deep keywords — require exhaustive multi‑step analysis
         deep_keywords = {
             "deep review",
             "revisión profunda",
-            "auto-evalúa",
+            "check every step",
             "comprueba cada paso",
-            "itera varias veces",
             "razonamiento exhaustivo",
-            "reflection",
-            "deep",
-            "reflexión",
+            "best practices",
+            "buenas prácticas",
+            "production ready",
+            "listo para producción",
+            "edge cases",
+            "casos límite",
+            "step by step",
+            "paso a paso",
+            "trade-offs",
+            "ventajas y desventajas",
+            "comprehensive",
+            "completo y detallado",
+            "full implementation",
+            "implementación completa",
+            "end to end",
+            "de extremo a extremo",
+            "security review",
+            "revisión de seguridad",
+            "performance analysis",
+            "análisis de rendimiento",
+            "ensure correctness",
+            "garantiza la corrección",
+            "deep reflection",
+            "reflexión profunda",
+            "self-reflection",
+            "auto-reflexión",
+            "auto-evalúa",
+            "itera varias veces",
         }
 
-        content_lower = user_content.lower()
+        # ── Optional accent normalisation ───────────────────────────────────
+        if ENABLE_ACCENT_NORMALIZATION:
+            import unicodedata
+
+            def _normalize(text: str) -> str:
+                nfkd = unicodedata.normalize("NFKD", text)
+                return nfkd.encode("ascii", "ignore").decode("ascii")
+
+            content_lower = _normalize(user_content.lower())
+            # Apply same normalisation to all keyword sets
+            complex_keywords_generic = {_normalize(k) for k in complex_keywords_generic}
+            complex_keywords_code_only = {
+                _normalize(k) for k in complex_keywords_code_only
+            }
+            deep_keywords = {_normalize(k) for k in deep_keywords}
+        else:
+            content_lower = user_content.lower()
+
+        word_count = len(user_content.split())
         has_code = "```" in user_content
         length_ok = len(user_content) >= self.valves.auto_cot_min_chars
+        too_short = word_count < 5
+
+        # ── Context: expand active set when in a code session ──────────────
+        active_complex = set(complex_keywords_generic)
+        if is_code_session:
+            active_complex |= complex_keywords_code_only
+
+        # ── Pre‑sort keyword lists once for efficient compound matching ────
+        _sorted_deep = sorted(deep_keywords, key=len, reverse=True)
+        _sorted_complex = sorted(active_complex, key=len, reverse=True)
+
+        def _contains_any(text: str, sorted_kw: list) -> bool:
+            """Check if text contains any keyword; longer (compound) phrases first."""
+            return any(kw in text for kw in sorted_kw)
+
+        # ── Guard: very short messages → inconclusive ──────────────────────
+        if too_short and not has_code:
+            return 0
+
+        # ── Level 3: deep (highest priority) ───────────────────────────────
+        if _contains_any(content_lower, _sorted_deep):
+            return 3
+
+        # ── Signals for level 1 / 2 ────────────────────────────────────────
+        has_complex_kw = _contains_any(content_lower, _sorted_complex)
+
+        # Combine redundant length signals into a single elaborated-message flag
+        is_elaborate = length_ok or word_count > 30
 
         signals = 0
-        if any(kw in content_lower for kw in complex_keywords):
-            signals += 1
+        if ENABLE_KEYWORD_COUNT_WEIGHT:
+            # Count how many complex keywords matched (capped at 4)
+            kw_matches = sum(1 for kw in _sorted_complex if kw in content_lower)
+            signals += min(kw_matches + 2, 4)
+        else:
+            if has_complex_kw:
+                signals += 3
+
         if has_code:
             signals += 1
-        if length_ok:
+        if is_elaborate:
             signals += 1
         if user_content.count("?") >= 2:
             signals += 1
+        # Bonus: code session + any complex keyword → higher confidence
+        if is_code_session and has_complex_kw:
+            signals += 1
 
-        if any(kw in content_lower for kw in deep_keywords):
-            return 3
+        # ── Optional: conversation history ─────────────────────────────────
+        if ENABLE_COT_HISTORY:
+            prev_level = state.get("last_cot_level", 0)
+            if prev_level >= 2 and has_complex_kw:
+                signals += 1
 
-        if signals >= 3:
+        # ── Thresholds ─────────────────────────────────────────────────────
+        if signals >= 5:
             return 2
-        elif signals >= 2:
+        elif signals >= 3:
             return 1
         else:
-            return 0
+            return 0  # inconclusive → LLM decides
 
     async def _detect_cot_level_via_llm(
         self, user_content: str, is_code_session: bool, state: dict
