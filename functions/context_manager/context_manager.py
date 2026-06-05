@@ -2073,12 +2073,20 @@ class Filter:
         return cleaned
 
     async def _db_worker(self):
-        """Serialise all database writes through a single task."""
+        """Serialise all database writes through a single task with retry on lock."""
         while True:
             job = await self._db_write_queue.get()
             try:
                 func, args, kwargs = job
-                await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
+                for attempt in range(3):
+                    try:
+                        await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() and attempt < 2:
+                            await asyncio.sleep(0.2 * (attempt + 1))
+                        else:
+                            raise
             except Exception as e:
                 self._log_debug(f"DB worker failed: {e}")
             finally:
@@ -2091,6 +2099,7 @@ class Filter:
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db_conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._db_conn.execute("PRAGMA busy_timeout = 5000")  # 5 seconds wait on lock
         self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 project_id TEXT PRIMARY KEY,
@@ -2117,7 +2126,6 @@ class Filter:
                 PRIMARY KEY (project_id, symbol_name, question_hash)
             )
         """)
-        # ── New table for persistent block change summaries ──
         self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS block_change_summaries (
                 block_hash TEXT PRIMARY KEY,
@@ -7752,17 +7760,22 @@ class Filter:
     # --------------------------------------------------------------------------
     # Deferred secondary task execution
     # --------------------------------------------------------------------------
+    MAX_TASKS_PER_INLET = 50
+
     async def _process_pending_secondary_tasks(self, project_id: str):
-        """Execute all pending secondary tasks at the start of an inlet (MUST be called under project lock)."""
         state = self._get_state(project_id)
         if not state or not state.get("pending_secondary_tasks"):
             return
 
         tasks = state["pending_secondary_tasks"]
-        self._log_debug(f"Processing {len(tasks)} pending secondary task(s)...")
+        to_process = tasks[:MAX_TASKS_PER_INLET]
+        rest = tasks[MAX_TASKS_PER_INLET:]
+        self._log_debug(
+            f"Processing {len(to_process)} of {len(tasks)} pending secondary tasks..."
+        )
 
-        remaining = []
-        for task_dict in tasks:
+        remaining = rest
+        for task_dict in to_process:
             task = SecondaryTask(**task_dict)
             success = await self._execute_secondary_task(task, project_id)
             if not success:
