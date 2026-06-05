@@ -7780,9 +7780,9 @@ class Filter:
     # --------------------------------------------------------------------------
     # Deferred secondary task execution
     # --------------------------------------------------------------------------
-    MAX_TASKS_PER_INLET = 50
 
     async def _process_pending_secondary_tasks(self, project_id: str):
+        MAX_TASKS_PER_INLET = 50
         state = self._get_state(project_id)
         if not state or not state.get("pending_secondary_tasks"):
             return
