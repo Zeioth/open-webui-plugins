@@ -3446,6 +3446,461 @@ class Filter:
                 self._invalidate_lightweight_cache(project_id)
                 self._set_state(project_id, state)
 
+    def _update_mentions_from_message(
+        self, state: Dict, message_content: str, project_id: str
+    ):
+        if not message_content:
+            return
+        all_symbol_names = self._symbol_index.get_all_names(project_id)
+        words = set(re.findall(r"\b[\w-]+\b", message_content))
+        mentioned_names = all_symbol_names.intersection(words)
+        if not mentioned_names:
+            return
+        affected_blocks: Set[str] = set()
+        for name in mentioned_names:
+            affected_blocks.update(self._symbol_index.find_blocks(name, project_id))
+        for block_hash in affected_blocks:
+            block = state["active_blocks"].get(block_hash)
+            if block:
+                block.mention_count += 1
+                block.last_mentioned = time.time()
+                block.last_mentioned_msg_idx = state["message_count"]
+                block._update_importance()
+
+    async def _update_active_code(self, message: dict, project_id: str):
+        if not self.valves.enable_code_awareness:
+            return
+
+        content = message.get("content", "")
+        role = message.get("role", "")
+
+        extracted, block_spans = await self._extract_code_blocks(content)
+        new_blocks_pending = []
+        for idx, block_info in enumerate(extracted):
+            blk_file = None
+            if self.valves.track_file_paths and block_spans:
+                blk_file = self._extract_file_path_for_block(
+                    content, block_spans[idx][0]
+                )
+            if not blk_file and len(extracted) == 1:
+                extracted_paths = self._extract_file_paths(content)
+                blk_file = extracted_paths[0] if extracted_paths else None
+            content_type = self._classify_content(content, extracted)
+            new_block = CodeBlock(
+                content=block_info["code"],
+                content_type=content_type,
+                generated_by_assistant=(role == "assistant"),
+                file_path=blk_file,
+                line_range=None,
+                timestamp=time.time(),
+                is_active=True,
+                mention_count=1,
+                dependencies=[],
+                potentially_affected=False,
+                pinned=False,
+                obsolete=False,
+                is_raw=block_info.get("is_raw", False),
+            )
+            if "[KEEP]" in content:
+                new_block.is_raw = True
+            if "[KEEP]" in content or "#important" in content.lower():
+                new_block.importance_score = 10.0
+                new_block.pinned = True
+            new_blocks_pending.append(new_block)
+
+        symbols_list = []
+        for blk in new_blocks_pending:
+            syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
+            symbols_list.append(syms)
+
+        _content_to_syms: Dict[str, List[CodeSymbol]] = {
+            blk.content: syms
+            for blk, syms in zip(new_blocks_pending, symbols_list)
+            if not isinstance(syms, Exception)
+        }
+
+        lock = await self._get_project_lock(project_id)
+        state_before = self._get_state(project_id)
+        existing_contents = {}
+        if state_before:
+            for h, b in state_before["active_blocks"].items():
+                existing_contents[h] = b.content
+
+        duplicate_info = {}
+        for new_block in new_blocks_pending:
+            is_dup = False
+            existing_dup = None
+            for h, ex_content in existing_contents.items():
+                ex_block = state_before["active_blocks"].get(h)
+                if (
+                    ex_block
+                    and self._calculate_code_similarity(new_block.content, ex_content)
+                    >= self.valves.code_similarity_threshold
+                ):
+                    is_dup = True
+                    existing_dup = h
+                    break
+            duplicate_info[new_block.hash] = (is_dup, existing_dup)
+
+        async with lock:
+            state = self._get_state(project_id)
+            self._background_task(
+                self._summarize_inactive_blocks_safely(project_id),
+                name="summarize_inactive",
+                is_llm_task=True,
+            )
+            self._update_mentions_from_message(state, content, project_id)
+            for block in state["active_blocks"].values():
+                if (
+                    block.content
+                    and self._calculate_code_similarity(
+                        block.content[:200], content[:200]
+                    )
+                    > 0.7
+                ):
+                    block.mention_count += 1
+                    block.last_mentioned = time.time()
+                    block.last_mentioned_msg_idx = state["message_count"]
+                    block._update_importance()
+
+            if not content and not new_blocks_pending:
+                return
+
+            for new_block, syms in zip(new_blocks_pending, symbols_list):
+                if isinstance(syms, Exception):
+                    syms = []
+
+                new_block.content = self._sanitize_text(new_block.content)
+
+                if self.tokenizer:
+                    new_block._cached_token_count = len(
+                        self.tokenizer.encode(new_block.content)
+                    )
+                else:
+                    new_block._cached_token_count = len(new_block.content) // 4
+
+                is_dup, existing_hash = duplicate_info.get(
+                    new_block.hash, (False, None)
+                )
+                existing = (
+                    state["active_blocks"].get(existing_hash) if existing_hash else None
+                )
+
+                if is_dup and existing:
+                    if existing.pinned or new_block.is_raw:
+                        self._symbol_index.remove_all_for_block(
+                            existing.hash, existing.symbols, project_id
+                        )
+                        prev_content = existing.content
+                        existing.content = new_block.content
+                        existing.hash = new_block.hash
+                        if new_block.file_path:
+                            existing.file_path = new_block.file_path
+                        existing.line_range = new_block.line_range
+                        existing.timestamp = time.time()
+                        existing.mention_count += 1
+                        existing.last_mentioned = time.time()
+                        existing.last_mentioned_msg_idx = state["message_count"]
+                        existing.pinned = True
+                        existing.is_raw = existing.is_raw or new_block.is_raw
+                        existing.importance_score = 10.0
+                        reused = _content_to_syms.get(new_block.content)
+                        if reused is not None:
+                            existing.symbols = [
+                                s.copy(update={"parent_block_hash": existing.hash})
+                                for s in reused
+                            ]
+                        else:
+                            existing.symbols = await SignatureExtractor.extract_async(
+                                existing.content, existing.file_path
+                            )
+                        for s in existing.symbols:
+                            s.parent_block_hash = existing.hash
+                            self._symbol_index.add(s, existing.hash, project_id)
+                        if self.tokenizer:
+                            existing._cached_token_count = len(
+                                self.tokenizer.encode(existing.content)
+                            )
+                        else:
+                            existing._cached_token_count = len(existing.content) // 4
+                        existing._update_importance()
+                        if prev_content != new_block.content:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    existing.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+                        continue
+
+                    if self.valves.prioritize_recent_code:
+                        self._symbol_index.remove_all_for_block(
+                            existing.hash, existing.symbols, project_id
+                        )
+                        prev_content = existing.content
+                        existing.content = new_block.content
+                        existing.hash = new_block.hash
+                        if new_block.file_path:
+                            existing.file_path = new_block.file_path
+                        existing.line_range = new_block.line_range
+                        existing.timestamp = time.time()
+                        existing.mention_count += 1
+                        existing.last_mentioned = time.time()
+                        existing.last_mentioned_msg_idx = state["message_count"]
+                        reused = _content_to_syms.get(new_block.content)
+                        if reused is not None:
+                            existing.symbols = [
+                                s.copy(update={"parent_block_hash": existing.hash})
+                                for s in reused
+                            ]
+                        else:
+                            existing.symbols = await SignatureExtractor.extract_async(
+                                existing.content, existing.file_path
+                            )
+                        for s in existing.symbols:
+                            s.parent_block_hash = existing.hash
+                            self._symbol_index.add(s, existing.hash, project_id)
+                        if self.tokenizer:
+                            existing._cached_token_count = len(
+                                self.tokenizer.encode(existing.content)
+                            )
+                        else:
+                            existing._cached_token_count = len(existing.content) // 4
+                        existing._update_importance()
+                        if prev_content != new_block.content:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    existing.hash, prev_content, new_block.content
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    existing.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+                    continue
+
+                # New non‑duplicate block
+                for sym in syms:
+                    sym.parent_block_hash = new_block.hash
+                new_block.symbols = syms
+                new_block.last_mentioned_msg_idx = state["message_count"]
+                for sym in syms:
+                    self._symbol_index.add(sym, new_block.hash, project_id)
+                if any(s.calls for s in syms):
+                    state["has_any_calls"] = True
+
+                is_conflicting = False
+                if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    is_conflicting = self._has_conflicting_proposed_changes(
+                        state, new_block
+                    )
+                    if is_conflicting:
+                        new_block.importance_score = max(
+                            new_block.importance_score, 7.0
+                        )
+
+                state["active_blocks"][new_block.hash] = new_block
+
+                if new_block.file_path and self.valves.enable_obsolete_marking:
+                    for h, blk in list(state["active_blocks"].items()):
+                        if h == new_block.hash:
+                            continue
+                        if blk.file_path == new_block.file_path and not blk.pinned:
+                            blk.obsolete = True
+                            blk._update_importance()
+
+                if new_block.content_type == ContentType.PROPOSED_CHANGE:
+                    if new_block.file_path:
+                        state["recent_changes"] = [
+                            c
+                            for c in state["recent_changes"]
+                            if not (
+                                c.file_path
+                                and c.file_path == new_block.file_path
+                                and c.hash != new_block.hash
+                            )
+                        ]
+                    state["recent_changes"].append(new_block)
+                    if self.valves.enable_diff_application and not is_conflicting:
+                        for base in list(state["active_blocks"].values()):
+                            if (
+                                base.content_type == ContentType.BASE_CODE
+                                and base.file_path == new_block.file_path
+                            ):
+                                if self._apply_change_with_diff(base, new_block):
+                                    state["recent_changes"] = [
+                                        c
+                                        for c in state["recent_changes"]
+                                        if c.hash != new_block.hash
+                                    ]
+                                    state["committed_changes"].append(new_block)
+                                    break
+                elif new_block.content_type == ContentType.COMMITTED_CHANGE:
+                    state["committed_changes"].append(new_block)
+                elif (
+                    new_block.content_type == ContentType.ERROR
+                    and self.valves.preserve_error_context
+                ):
+                    new_block.importance_score = min(
+                        new_block.importance_score + 3.0, 10.0
+                    )
+
+                if len(state["active_blocks"]) > self.valves.max_active_blocks:
+                    sorted_blocks = sorted(
+                        state["active_blocks"].values(),
+                        key=lambda b: b.importance_score
+                        + (self.valves.raw_file_priority_boost if b.is_raw else 0),
+                        reverse=True,
+                    )
+                    keep = sorted_blocks[: self.valves.max_active_blocks]
+                    state["active_blocks"] = {b.hash: b for b in keep}
+
+                if (
+                    self.valves.enable_dependency_tracking
+                    and new_block.content_type
+                    in (
+                        ContentType.BASE_CODE,
+                        ContentType.PROPOSED_CHANGE,
+                        ContentType.COMMITTED_CHANGE,
+                    )
+                ):
+                    self._background_task(
+                        self._refresh_dependencies_for_block(
+                            new_block.hash, project_id
+                        ),
+                        name="dependency_refresh",
+                        is_llm_task=True,
+                    )
+
+            # Assistant implicit modifications
+            if role == "assistant" and len(extracted) > 0:
+                for block_info in extracted:
+                    best_base = None
+                    best_sim = 0.0
+                    for base in state["active_blocks"].values():
+                        if base.content_type == ContentType.BASE_CODE:
+                            sim = self._calculate_code_similarity(
+                                base.content, block_info["code"]
+                            )
+                            if sim > best_sim and sim > 0.6:
+                                best_sim = sim
+                                best_base = base
+                    if best_base and best_sim > 0.5 and best_sim < 0.98:
+                        self._symbol_index.remove_all_for_block(
+                            best_base.hash, best_base.symbols, project_id
+                        )
+                        prev_content = best_base.content
+                        best_base.content = self._sanitize_text(block_info["code"])
+                        best_base.hash = hashlib.md5(
+                            block_info["code"].encode()
+                        ).hexdigest()[:16]
+                        best_base.timestamp = time.time()
+                        best_base.is_active = True
+                        best_base.potentially_affected = False
+                        best_base.importance_score = min(
+                            best_base.importance_score + 1.0, 10.0
+                        )
+                        reused = _content_to_syms.get(block_info["code"])
+                        if reused is not None:
+                            best_base.symbols = [
+                                s.copy(update={"parent_block_hash": best_base.hash})
+                                for s in reused
+                            ]
+                        else:
+                            best_base.symbols = await SignatureExtractor.extract_async(
+                                best_base.content, best_base.file_path
+                            )
+                        for s in best_base.symbols:
+                            s.parent_block_hash = best_base.hash
+                            self._symbol_index.add(s, best_base.hash, project_id)
+                        if self.tokenizer:
+                            best_base._cached_token_count = len(
+                                self.tokenizer.encode(best_base.content)
+                            )
+                        else:
+                            best_base._cached_token_count = len(best_base.content) // 4
+                        if any(s.calls for s in best_base.symbols):
+                            state["has_any_calls"] = True
+                        if prev_content != block_info["code"]:
+                            self._background_task(
+                                self._generate_change_summary(
+                                    best_base.hash, prev_content, block_info["code"]
+                                ),
+                                name="change_summary",
+                                is_llm_task=True,
+                            )
+                        if (
+                            self.valves.enable_dependency_tracking
+                            and self.valves.dependency_refresh_on_update
+                        ):
+                            self._background_task(
+                                self._refresh_dependencies_for_block(
+                                    best_base.hash, project_id
+                                ),
+                                name="dependency_refresh",
+                                is_llm_task=True,
+                            )
+
+            state["message_count"] += 1
+            if self.valves.auto_remove_duplicate_blocks:
+                self._remove_duplicate_blocks(state, project_id)
+            self._background_task(
+                self._expire_blocks_by_time(project_id), name="expire_blocks"
+            )
+            self._background_task(
+                self._clean_affected_flags(project_id), name="clean_affected_flags"
+            )
+            if self.valves.enable_auto_summaries:
+                self._background_task(
+                    self._generate_missing_summaries(project_id),
+                    name="generate_missing_summaries",
+                    is_llm_task=True,
+                )
+
+            # ── Session summary (autobiographical mini‑memory) ──
+            if self.valves.enable_session_summary:
+                interval = self.valves.session_summary_interval_messages
+                if (
+                    interval > 0
+                    and state["message_count"] % interval == 0
+                    and state["message_count"] > 0
+                ):
+                    task = SecondaryTask(
+                        task_type="session_summary",
+                        params={
+                            "project_id": project_id,
+                            "message_count": state["message_count"],
+                            "code_state_hash": self._compute_code_state_hash(
+                                project_id
+                            ),
+                        },
+                    )
+                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
+
+            self._invalidate_lightweight_cache(project_id)
+            self._set_state(project_id, state)
+
     async def _summarize_inactive_blocks_safely(self, project_id: str):
         if self._summarize_inactive_in_progress.get(project_id, False):
             return
@@ -5226,7 +5681,7 @@ class Filter:
         self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Inlet helper methods 
+    # Inlet helper methods
     # --------------------------------------------------------------------------
 
     async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
