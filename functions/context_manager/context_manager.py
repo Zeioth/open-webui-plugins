@@ -114,6 +114,7 @@ except ImportError:
 _inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
     "_inlet_background_tasks", default=None
 )
+_db_global_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1350,10 @@ class Filter:
         self.ENABLE_KEYWORD_COUNT_WEIGHT = True  # multiple keywords increase signals
         self.ENABLE_COT_STICKY = False  # keep last CoT level in conversation state
 
+        # ── State debounce (to reduce DB writes) ──
+        self._state_dirty = False
+        self._state_last_saved = 0.0
+
         print("[CodeAware] Filter loaded")
 
     # --------------------------------------------------------------------------
@@ -2079,24 +2084,36 @@ class Filter:
         return cleaned
 
     async def _db_worker(self):
-        """Serialise all database writes through a single task with retry on lock."""
-        while True:
-            job = await self._db_write_queue.get()
-            try:
+        """Serialize all database writes through a single task with global lock and retry."""
+        try:
+            while True:
+                try:
+                    job = await asyncio.wait_for(
+                        self._db_write_queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
+
                 func, args, kwargs = job
-                for attempt in range(3):
-                    try:
-                        await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
-                        break
-                    except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() and attempt < 2:
-                            await asyncio.sleep(0.2 * (attempt + 1))
-                        else:
-                            raise
-            except Exception as e:
-                self._log_debug(f"DB worker failed: {e}")
-            finally:
-                self._db_write_queue.task_done()
+                # Acquire global lock to ensure only one write at a time across all workers
+                with _db_global_lock:
+                    for attempt in range(5):
+                        try:
+                            await anyio.to_thread.run_sync(
+                                lambda: func(*args, **kwargs)
+                            )
+                            break
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e).lower() and attempt < 4:
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                            else:
+                                raise
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._log_debug("DB worker exiting")
 
     # --------------------------------------------------------------------------
     # State database
@@ -2105,7 +2122,7 @@ class Filter:
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db_conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._db_conn.execute("PRAGMA busy_timeout = 5000")  # 5 seconds wait on lock
+        self._db_conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds wait on lock
         self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 project_id TEXT PRIMARY KEY,
@@ -2174,6 +2191,35 @@ class Filter:
         self._conversation_state[project_id] = state
         self._conversation_state.move_to_end(project_id)
         task = asyncio.create_task(self._save_state_to_db_async(project_id, state))
+        task.add_done_callback(
+            lambda t: (
+                self._log_debug(f"Failed to save state: {t.exception()}")
+                if t.exception()
+                else None
+            )
+        )
+
+    async def _save_state_if_dirty(self, project_id: str):
+        """
+        Persist the state if dirty and at least 2 seconds have passed since last save.
+
+        Creates an async task for the actual DB write and logs any failure.
+        """
+        if not self._state_dirty:
+            return
+        now = time.time()
+        if now - self._state_last_saved < 2.0:
+            return
+
+        self._state_last_saved = now
+        self._state_dirty = False
+
+        # Schedule the DB write just like the original _set_state did
+        task = asyncio.create_task(
+            self._save_state_to_db_async(
+                project_id, self._conversation_state[project_id]
+            )
+        )
         task.add_done_callback(
             lambda t: (
                 self._log_debug(f"Failed to save state: {t.exception()}")
@@ -6802,6 +6848,9 @@ class Filter:
             _inlet_aborted = False
 
         finally:
+            # Save state if dirty (debounced)
+            await self._save_state_if_dirty(project_id)
+
             if _inlet_aborted:
                 for task in background_tasks:
                     if not task.done():
@@ -6812,6 +6861,9 @@ class Filter:
 
     # ═══════════════════════════════════════════════════════════════════════════
     # OUTLET
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # OUTLET – with safe purge task, cache fix and state debounce
     # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
@@ -6899,6 +6951,9 @@ class Filter:
             self._purge_task = asyncio.create_task(self._run_db_checkpoints())
             self._cleanup_completed_tasks()
 
+        # Save state if dirty (debounced)
+        await self._save_state_if_dirty(project_id)
+
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
         )
@@ -6962,14 +7017,24 @@ class Filter:
             and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
-        # Cancel database worker
+
+        # Cancel and wait for the database worker to finish cleanly
         self._db_worker_task.cancel()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._db_worker_task)
+        except Exception:
+            pass
+
         for task_list in [self._dependency_tasks]:
             for task in task_list:
                 task.cancel()
+
         self._symbol_index.clear()
         self._cached_lightweight_context.clear()
         self._project_locks.clear()
+
         # Shut down thread pools
         self._db_executor.shutdown(wait=True)
         self._chroma_executor.shutdown(wait=True)
