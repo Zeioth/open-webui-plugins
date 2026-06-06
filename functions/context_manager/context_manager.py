@@ -6971,11 +6971,18 @@ class Filter:
             await self._save_state_if_dirty(project_id)
 
             # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
+            #self._log_debug(
+            #    "🚀 RESOURCE OPTIMISATION – Freeing VRAM "
+            #    "(unloading models so the next request starts with a clean slot)"
+            #)
+            #await self._unload_models_under_lock()
+
+            # NOTE: We do NOT unload models here. The main model may still be needed
+            # by OpenWebUI for title generation and other tasks.
+            # The inlet already unloads auxiliary models after building the prompt.
             self._log_debug(
-                "🚀 RESOURCE OPTIMISATION – Freeing VRAM "
-                "(unloading models so the next request starts with a clean slot)"
-            )
-            await self._unload_models_under_lock()
+                "🚀 RESOURCE OPTIMISATION – Skipping unload to keep main model available for OpenWebUI"
+            )        
         finally:
             pass
 
