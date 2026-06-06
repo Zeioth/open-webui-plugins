@@ -6605,7 +6605,7 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # OUTLET
     # ═══════════════════════════════════════════════════════════════════════════
-    # Value categories:
+    # Value categories (same as inlet):
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ═══════════════════════════════════════════════════════════════════════════
