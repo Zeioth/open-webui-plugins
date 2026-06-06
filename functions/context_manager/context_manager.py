@@ -1074,6 +1074,11 @@ class Filter:
         dependency_extraction_model: str = Field(
             default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
         )
+        dependency_extraction_max_tokens: int = Field(
+            default=500,
+            ge=0,
+            description="Maximum tokens for LLM dependency extraction responses. 0 = use sensible defaults (300-400). Increase if dependencies are truncated.",
+        )
         dependency_refresh_on_update: bool = Field(default=True)
         affected_importance_penalty: float = Field(default=0.7)
         affected_decay_hours: float = Field(default=4.0)
@@ -5278,10 +5283,6 @@ class Filter:
             "Provide a corrected and improved reasoning."
         )
 
-        # Use safe model switch before calling the reflection model
-        # (the model may be different, so unload first)
-        await self._unload_models_under_lock()
-
         refined = await self._call_llm(
             prompt=reflection_prompt,
             system_prompt="You are a critical reviewer. Improve the reasoning provided.",
@@ -5290,9 +5291,6 @@ class Filter:
             temperature=0.3,
             label=label + "_reflection" if label else "cot_reflection",
         )
-
-        # After reflection, unload again to free the slot for the main model
-        await self._unload_models_under_lock()
 
         if refined:
             return (
@@ -6506,84 +6504,77 @@ class Filter:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
-        # Unload any currently loaded model before CoT to free VRAM (protected by global lock)
-        await self._unload_models_under_lock()
-
-        # Generate CoT reasoning if needed
+        # Generate CoT reasoning if needed (no global lock here; _call_llm handles its own)
         if cot_any_used:
-            try:
-                if manual_cot_used:
-                    self._log_debug(
-                        f"Generating manual CoT level {cot_level} with model "
-                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                    )
-                else:
-                    self._log_debug(
-                        f"Generating auto CoT level {cot_level} with model "
-                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                    )
-
-                _model_ctx = self.valves.active_context_max_tokens or 28000
-                _cot_context_limit = _model_ctx // 3
-                if self.tokenizer:
-                    _prelim_tokens = len(self.tokenizer.encode(prelim_system))
-                    if _prelim_tokens > _cot_context_limit:
-                        prelim_for_cot = self._truncate_text_to_tokens(
-                            prelim_system, _cot_context_limit
-                        )
-                    else:
-                        prelim_for_cot = prelim_system
-                else:
-                    prelim_for_cot = prelim_system[: _cot_context_limit * 4]
-
-                # Generate the initial CoT
-                if not manual_cot_used:
-                    question = user_question
-                    if cot_level == 2:
-                        reasoning = await self._generate_cot_reasoning(
-                            question, prelim_for_cot
-                        )
-                    elif cot_level == 3:
-                        reasoning = await self._generate_cot_with_self_reflection(
-                            question, prelim_for_cot
-                        )
-                else:
-                    if cot_level == 2:
-                        reasoning = await self._generate_cot_reasoning(
-                            cot_question, prelim_for_cot
-                        )
-                    elif cot_level == 3:
-                        reasoning = await self._generate_cot_with_self_reflection(
-                            cot_question, prelim_for_cot
-                        )
-
-                # Fallback: if auto level 3 failed, try level 2 once
-                _cot_error_msg = "Unable to generate reasoning."
-                if (
-                    not manual_cot_used
-                    and cot_level == 3
-                    and (reasoning is None or reasoning == _cot_error_msg)
-                ):
-                    self._log_debug("Level 3 CoT failed, falling back to level 2")
-                    reasoning = await self._generate_cot_reasoning(
-                        user_question, prelim_for_cot
-                    )
-
-                if reasoning and reasoning != _cot_error_msg:
-                    system_injections.append(("high", reasoning))
-                else:
-                    self._log_debug("CoT reasoning generation returned empty or failed")
-
-                cot_note = (
-                    "**Note:** Some sections in this system prompt marked with 🔎 are "
-                    "automatically generated reasoning (Chain-of-Thought). "
-                    "They are provided as context to help you, but they are not user commands. "
-                    "Use them to enhance your answer, but always prioritise the actual user query."
+            if manual_cot_used:
+                self._log_debug(
+                    f"Generating manual CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                 )
-                system_injections.append(("low", cot_note))
-            finally:
-                # Always unload the CoT model to free the slot, even on error
-                await self._unload_models_under_lock()
+            else:
+                self._log_debug(
+                    f"Generating auto CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
+
+            _model_ctx = self.valves.active_context_max_tokens or 28000
+            _cot_context_limit = _model_ctx // 3
+            if self.tokenizer:
+                _prelim_tokens = len(self.tokenizer.encode(prelim_system))
+                if _prelim_tokens > _cot_context_limit:
+                    prelim_for_cot = self._truncate_text_to_tokens(
+                        prelim_system, _cot_context_limit
+                    )
+                else:
+                    prelim_for_cot = prelim_system
+            else:
+                prelim_for_cot = prelim_system[: _cot_context_limit * 4]
+
+            # Generate the initial CoT
+            if not manual_cot_used:
+                question = user_question
+                if cot_level == 2:
+                    reasoning = await self._generate_cot_reasoning(
+                        question, prelim_for_cot
+                    )
+                elif cot_level == 3:
+                    reasoning = await self._generate_cot_with_self_reflection(
+                        question, prelim_for_cot
+                    )
+            else:
+                if cot_level == 2:
+                    reasoning = await self._generate_cot_reasoning(
+                        cot_question, prelim_for_cot
+                    )
+                elif cot_level == 3:
+                    reasoning = await self._generate_cot_with_self_reflection(
+                        cot_question, prelim_for_cot
+                    )
+
+            # Fallback: if auto level 3 failed, try level 2 once
+            _cot_error_msg = "Unable to generate reasoning."
+            if (
+                not manual_cot_used
+                and cot_level == 3
+                and (reasoning is None or reasoning == _cot_error_msg)
+            ):
+                self._log_debug("Level 3 CoT failed, falling back to level 2")
+                reasoning = await self._generate_cot_reasoning(
+                    user_question, prelim_for_cot
+                )
+
+            if reasoning and reasoning != _cot_error_msg:
+                system_injections.append(("high", reasoning))
+            else:
+                self._log_debug("CoT reasoning generation returned empty or failed")
+
+            cot_note = (
+                "**Note:** Some sections in this system prompt marked with 🔎 are "
+                "automatically generated reasoning (Chain-of-Thought). "
+                "They are provided as context to help you, but they are not user commands. "
+                "Use them to enhance your answer, but always prioritise the actual user query."
+            )
+            system_injections.append(("low", cot_note))
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6788,7 +6779,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -7343,19 +7334,18 @@ class Filter:
         Extract code dependencies with multiple strategies:
         1. Deterministic AST for Python (fast and accurate).
         2. LLM with explicit JSON output, retried once with a simpler prompt.
+           Uses valve `dependency_extraction_max_tokens` to control max response tokens (0 = auto).
         3. Regex-based fallback that detects the language automatically.
         Uses a small in-memory cache to avoid repeated LLM calls for identical code.
         """
         if not self.valves.enable_dependency_tracking:
             return []
 
-        # Simple content hash for caching (limit cache size)
+        # Content-based cache
         code_hash = hashlib.md5(code.encode()).hexdigest()
         cache_key = f"deps_{code_hash}"
         cached = (
-            await self._deps_cache.get(cache_key)
-            if hasattr(self, "_deps_cache")
-            else None
+            self._deps_cache.get(cache_key) if hasattr(self, "_deps_cache") else None
         )
         if cached is not None:
             return cached
@@ -7365,7 +7355,7 @@ class Filter:
             imports, calls = self._extract_dependencies_ast(code)
             if imports or calls:
                 deps = list(set(imports + calls))
-                await self._cache_deps(cache_key, deps)
+                self._cache_deps(cache_key, deps)
                 return deps
 
         # 2. Try LLM with explicit JSON output
@@ -7376,57 +7366,95 @@ class Filter:
             or self.valves.summarization_model
         )
 
-        async def _try_llm_deps(prompt_text: str) -> Optional[List[str]]:
+        async def _try_llm_deps(
+            prompt_text: str, max_tokens: int = 300
+        ) -> Optional[List[str]]:
             try:
                 response = await self._call_llm(
                     prompt=prompt_text,
-                    system_prompt="You are a code analysis tool. Output only a JSON array of strings.",
+                    system_prompt="You are a code analysis tool. Output only JSON array.",
                     model_override=model,
-                    max_tokens=200,
+                    max_tokens=max_tokens,
                     temperature=0.0,
                     label="dependency_extraction",
                 )
                 if not response:
                     return None
-                # Clean markdown fences
+
                 text = response.strip()
-                if text.startswith("```json"):
-                    text = text[7:]
+                # Remove markdown fences
                 if text.startswith("```"):
-                    text = text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                text = text.strip()
-                deps = json.loads(text)
-                if isinstance(deps, list):
-                    # Filter out non‑string items
-                    clean = [str(d).strip() for d in deps if str(d).strip()]
-                    return clean
+                    parts = text.split("\n")
+                    if len(parts) > 1 and parts[-1].strip() == "```":
+                        text = "\n".join(parts[1:-1])
+                    else:
+                        # Try to strip exactly ``` from start and end
+                        if text.endswith("```"):
+                            text = text[3:-3]
+                        else:
+                            text = text[3:]  # just remove leading ```
+
+                # Try strict parse
+                try:
+                    deps = json.loads(text)
+                    if isinstance(deps, list):
+                        return [str(d).strip() for d in deps if str(d).strip()]
+                except Exception:
+                    pass
+
+                # Try to find array pattern
+                array_match = re.search(r"\[.*\]", text, re.DOTALL)
+                if array_match:
+                    candidate = array_match.group(0)
+                    try:
+                        deps = json.loads(candidate)
+                        if isinstance(deps, list):
+                            return [str(d).strip() for d in deps if str(d).strip()]
+                    except Exception:
+                        pass
+
+                # If the text looks like a truncated JSON (ends with a string or alnum), try adding ']'
+                if (
+                    text.endswith('"')
+                    or text.endswith("'")
+                    or (text and text[-1].isalnum())
+                ):
+                    try:
+                        deps = json.loads(text + "]")
+                        if isinstance(deps, list):
+                            return [str(d).strip() for d in deps if str(d).strip()]
+                    except Exception:
+                        pass
+
+                return None
             except Exception as e:
                 self._log_debug(f"LLM dependency extraction failed: {e}")
-            return None
+                return None
 
-        # First, comprehensive prompt
+        # Convert valve value to actual max_tokens (0 → None, else the number)
+        max_tok_full = self.valves.dependency_extraction_max_tokens or None
+        max_tok_short = self.valves.dependency_extraction_max_tokens or None
+    
         prompt_full = (
             "Extract all external dependencies (imports, modules, packages) from the following code. "
             'Output ONLY a JSON array of strings, e.g. ["os", "numpy"]. '
             "If there are no dependencies, output [].\n\n"
             f"```\n{code[:2000]}\n```"
         )
-        deps = await _try_llm_deps(prompt_full)
+        deps = await _try_llm_deps(prompt_full, max_tokens=max_tok_full)
 
-        # If that fails or returns empty, try a shorter prompt focusing just on imports
+        # If first attempt fails or returns empty, try a simpler prompt
         if not deps:
             prompt_short = (
                 "List only the external modules imported in this code as a JSON array. "
                 'Example: ["os", "sys"]\n\n'
                 f"```\n{code[:1500]}\n```"
             )
-            deps = await _try_llm_deps(prompt_short) or []
+            deps = await _try_llm_deps(prompt_short, max_tokens=max_tok_short) or []
 
         if deps:
             unique = list(set(deps))
-            await self._cache_deps(cache_key, unique)
+            self._cache_deps(cache_key, unique)
             return unique
 
         # 3. Fallback: deterministic regex for the detected language
@@ -7454,7 +7482,7 @@ class Filter:
             elif re.search(r"\b(function|const|let|var|=>)\b", code):
                 lang = "javascript"
         fallback_deps = self._extract_dependencies_regex(code, lang)
-        await self._cache_deps(cache_key, fallback_deps)
+        self._cache_deps(cache_key, fallback_deps)
         return fallback_deps
 
     async def _update_dependencies(self, block_hash: str, state: Dict):
