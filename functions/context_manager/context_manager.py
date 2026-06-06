@@ -6551,7 +6551,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -6564,6 +6564,28 @@ class Filter:
                 f"  TOTAL injected system tokens:          ~{total_system_tokens}"
             )
             self._log_debug("─" * 50)
+
+        return messages
+
+    async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
+        """Handle project switching, symbol cache loading. No secondary tasks here."""
+        messages = body.get("messages", [])
+
+        if self._last_project_id and self._last_project_id != project_id:
+            self._log_debug(
+                f"Project changed from {self._last_project_id} to {project_id}"
+            )
+            old_state = self._conversation_state.get(self._last_project_id)
+            if old_state:
+                self._remove_project_from_index_by_id(self._last_project_id, old_state)
+            self._cached_lightweight_context.pop(self._last_project_id, None)
+            self._block_change_summaries.clear()
+            self._symbol_analysis_cache.clear()
+        self._last_project_id = project_id
+
+        if project_id not in self._symbol_cache_loaded_projects:
+            await self._load_symbol_cache_from_db(project_id)
+            self._symbol_cache_loaded_projects.add(project_id)
 
         return messages
 
@@ -6583,12 +6605,16 @@ class Filter:
         self._ensure_cleanup_task()
         project_id = self._get_project_id()
 
-        # Preprocessing
+        # Preprocessing (no secondary tasks)
         messages = await self._inlet_preprocess(body, project_id)
         if not messages:
             return body
 
-        # Free VRAM before any LLM call, to avoid competing with the main model
+        # Pause the secondary task worker for the entire inlet to avoid model conflicts
+        if hasattr(self, "_secondary_worker_paused"):
+            self._secondary_worker_paused.clear()
+
+        # Free VRAM before any LLM call
         try:
             await _shared_unload_all_models(self.valves.LLM_BASE_URL)
             self._last_used_model = None
@@ -6637,7 +6663,12 @@ class Filter:
                 messages, project_id, user_query
             )
 
-            # Build system injections
+            # Wait for background tasks launched by _update_active_code
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+                background_tasks.clear()
+
+            # Build system injections (uses symbol analysis, LTM, etc.)
             system_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
                     messages,
@@ -6688,6 +6719,11 @@ class Filter:
             # Save state if dirty (debounced)
             await self._save_state_if_dirty(project_id)
 
+            # Process all pending secondary tasks synchronously while worker is paused
+            lock = await self._get_project_lock(project_id)
+            async with lock:
+                await self._process_pending_secondary_tasks(project_id)
+
             # Wait for any remaining background tasks before unloading models
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
@@ -6699,6 +6735,10 @@ class Filter:
                 self._last_used_model = None
             except Exception:
                 pass
+
+            # Resume the secondary task worker (the queue is now empty)
+            if hasattr(self, "_secondary_worker_paused"):
+                self._secondary_worker_paused.set()
 
             if _inlet_aborted:
                 for task in background_tasks:
