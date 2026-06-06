@@ -5677,6 +5677,7 @@ class Filter:
         project_id: str,
         is_explicit_command: bool,
         last_user_msg: Optional[dict],
+        slot_free: bool = True,
     ) -> Tuple[bool, Optional[List[dict]]]:
         """Handle natural language intents (forget, remember, obsolete).
         Returns (handled, messages) if an intent was processed, else (False, None).
@@ -5687,6 +5688,13 @@ class Filter:
             or is_explicit_command
             or self._has_code_indicators(last_user_msg.get("content", ""))
         ):
+            return False, None
+
+        # Skip LLM-based intent parsing if the main model is loaded
+        if not slot_free:
+            self._log_debug(
+                "⚡ COMMAND HANDLING – Natural intents skipped (no free slot)"
+            )
             return False, None
 
         intents = await self._parse_all_intents(last_user_msg.get("content", ""))
@@ -5747,6 +5755,7 @@ class Filter:
         is_code_session: bool,
         last_user_msg: Optional[dict],
         state: dict,
+        slot_free: bool = True,
     ) -> Tuple[List[Tuple[str, str]], Optional[dict], str]:
         """Build all system injections: LTM, code context, confidence, etc.
         Returns (system_injections, cached_response, prelim_system).
@@ -5756,7 +5765,7 @@ class Filter:
         )
         system_injections: List[Tuple[str, str]] = []
 
-        # ── 🧠 ENRICHMENT – Step 1/6: LTM retrieval ──
+        # ── 🧠 ENRICHMENT – Step 1/6: Retrieve Long‑Term Memory (LTM) ──
         self._log_debug("🧠 ENRICHMENT – Step 1/6: Retrieve Long‑Term Memory (LTM)")
         ltm_future = None
         if (
@@ -5771,21 +5780,36 @@ class Filter:
                     self._retrieve_all_memories_unified(user_query, project_id)
                 )
 
-        # Parallel checks (contradictions, cached response, duplicate question)
+        # Parallel checks – skip contradiction detection if no free slot
         context_hash = self._compute_context_hash(messages)
         contradiction_warning = None
         cached_response = None
         duplicate_match = None
 
         if last_user_msg:
-            parallel_checks_task = asyncio.create_task(
-                self._parallel_context_checks(
-                    messages, user_query, context_hash, project_id, state
+            # We'll still run parallel checks, but contradiction detection uses LLM
+            if slot_free or not self.valves.enable_contradiction_detection:
+                parallel_checks_task = asyncio.create_task(
+                    self._parallel_context_checks(
+                        messages,
+                        user_query,
+                        context_hash,
+                        project_id,
+                        state,
+                        skip_contradiction=not slot_free,
+                    )
                 )
-            )
-            contradiction_warning, cached_response, duplicate_match = (
-                await parallel_checks_task
-            )
+                contradiction_warning, cached_response, duplicate_match = (
+                    await parallel_checks_task
+                )
+            else:
+                # Still check cache and duplicate questions (no LLM needed)
+                cached_response = await self._find_cached_response(
+                    user_query, context_hash, state
+                )
+                duplicate_match = await self._find_duplicate_question(
+                    user_query, project_id
+                )
 
         if cached_response:
             return [], cached_response, ""
@@ -5844,7 +5868,7 @@ class Filter:
                 "🧠 ENRICHMENT – Step 1/6: LTM retrieval skipped (no query or disabled)"
             )
 
-        # Proactive cleanup suggestion
+        # Proactive cleanup suggestion (no LLM)
         if (
             self.valves.cleanup_suggestions_enabled
             and self.valves.cleanup_proactive_suggestions
@@ -5886,7 +5910,7 @@ class Filter:
                 b._cached_token_count for b in code_blocks_for_injection
             )
 
-            if self.valves.use_symbol_level_analysis:
+            if self.valves.use_symbol_level_analysis and slot_free:
                 summary, suggested = await self._analyze_code_via_symbols(
                     user_question, project_id
                 )
@@ -5930,6 +5954,7 @@ class Filter:
                                 "🧠 ENRICHMENT – Step 2/6: Suggested code blocks injected"
                             )
             else:
+                # Fallback to structural task check or normal context (no LLM needed)
                 is_structural = (
                     await self._is_structural_task(user_question)
                     if user_question
@@ -5984,6 +6009,10 @@ class Filter:
                     self._log_debug(
                         "🧠 ENRICHMENT – Step 2/6: Active code context injected"
                     )
+            if not slot_free:
+                self._log_debug(
+                    "🧠 ENRICHMENT – Step 2/6: Symbol analysis skipped (no free slot)"
+                )
         else:
             self._log_debug(
                 "🧠 ENRICHMENT – Step 2/6: Active code context skipped (not a code session or disabled)"
@@ -6017,7 +6046,6 @@ class Filter:
 
         # ── 🧠 ENRICHMENT – Step 5/6: Proactive suggestions (cleanup, command, summary) ──
         self._log_debug("🧠 ENRICHMENT – Step 5/6: Proactive suggestions")
-        # Proactive summary suggestion
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -6027,7 +6055,6 @@ class Filter:
             )
             if suggestion:
                 system_injections.append(("medium", suggestion))
-        # Command suggestion
         cmd_suggestion = await self._suggest_commands(project_id, state)
         if cmd_suggestion:
             system_injections.append(("medium", cmd_suggestion))
@@ -6114,14 +6141,22 @@ class Filter:
         background_tasks: List[asyncio.Task],
         user_question: str,
         has_code_blocks: bool,
+        slot_free: bool = True,
     ) -> List[dict]:
         """Apply CoT, final token budget, trimming, and insert system prompt."""
         self._log_debug(
             "Assembling final messages (CoT, trimming, system prompt injection)"
         )
 
-        # Determine user intent for context reduction (also used by CoT detection)
-        self._user_intent_full_code = await self._should_keep_full_code(user_question)
+        # Determine user intent for context reduction (only if slot is free, otherwise keep full code)
+        if slot_free:
+            self._user_intent_full_code = await self._should_keep_full_code(
+                user_question
+            )
+        else:
+            self._user_intent_full_code = (
+                True  # keep full code to avoid degrading response
+            )
 
         # ── 🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level ──
         self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
@@ -6145,7 +6180,7 @@ class Filter:
                         if level == 1:
                             cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                             system_injections.append(("high", cot_prompt))
-                elif not manual_cot_used:
+                elif not manual_cot_used and slot_free:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
                     )
@@ -6156,20 +6191,22 @@ class Filter:
                         cot_any_used = True
         if not cot_any_used:
             self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: No CoT needed")
+        elif not slot_free:
+            self._log_debug(
+                "🧠 ENRICHMENT – CoT Step 1/3: CoT detection skipped (no free slot)"
+            )
 
         # Wait for background tasks before heavy LLM calls
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
-        # ── Check if slot is free for CoT; if main model is loaded, skip CoT to avoid OOM ──
-        if cot_any_used:
-            slot_empty = await self._wait_for_empty_slot(retries=1, delay=0.5)
-            if not slot_empty:
-                self._log_debug(
-                    "🧠 ENRICHMENT – CoT skipped because main model is still loaded (no free slot)"
-                )
-                cot_any_used = False
+        # If the main model is loaded, disable CoT entirely
+        if cot_any_used and not slot_free:
+            self._log_debug(
+                "🧠 ENRICHMENT – CoT skipped because main model is still loaded (no free slot)"
+            )
+            cot_any_used = False
 
         # ── 🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning ──
         if cot_any_used:
@@ -6348,7 +6385,6 @@ class Filter:
                         )
                     history_msgs = kept_block
                 else:
-                    # Even if old_block exists, we keep it if summarization is off or it's empty
                     self._log_debug(
                         "📦 COMPRESSION – Context exceeds token budget, "
                         "older messages trimmed (summarization disabled)"
@@ -6485,22 +6521,17 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # ═══════════════════════════════════════════════════════════════
-        # Token breakdown log
+        # Token breakdown log (precise, using tiktoken on the final system prompt)
         # ═══════════════════════════════════════════════════════════════
         if self.valves.debug and self.tokenizer and final_system.strip():
             total_system_tokens = len(self.tokenizer.encode(final_system))
 
-            # Split final_system back into the injection texts (same order as system_injections)
             injection_texts = [text for _, text in system_injections if text]
-            # Re-join them to get the combined injections part (excluding base_content if any)
             combined_injections = "\n\n".join(injection_texts)
-            # If base_content was appended, it's part of final_system but not in system_injections
             base_content_tokens = 0
             if base_content.strip():
                 base_content_tokens = len(self.tokenizer.encode(base_content))
-                # Subtract base content to isolate the injections part
                 inj_only_tokens = total_system_tokens - base_content_tokens
-                # Re-measure combined injections for accurate split
                 if combined_injections:
                     inj_only_tokens = len(self.tokenizer.encode(combined_injections))
                 else:
@@ -6508,13 +6539,11 @@ class Filter:
             else:
                 inj_only_tokens = total_system_tokens if combined_injections else 0
 
-            # Initialize counters
             ltm_tokens = 0
             code_context_tokens = 0
             cot_tokens = 0
             other_instructions = 0
 
-            # Classify each injection by its content (same heuristics as before)
             for inj_text in injection_texts:
                 t = len(self.tokenizer.encode(inj_text))
                 if "Relevant Past Context" in inj_text:
@@ -6528,13 +6557,11 @@ class Filter:
                 else:
                     other_instructions += t
 
-            # The sum of categorized tokens should now match inj_only_tokens
-            # (or be very close; any tiny diff goes to other_instructions)
             diff = inj_only_tokens - (
                 ltm_tokens + code_context_tokens + cot_tokens + other_instructions
             )
             if diff != 0:
-                other_instructions += diff  # absorb rounding mismatches
+                other_instructions += diff
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
@@ -6565,26 +6592,6 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Value categories (see project documentation):
-    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
-    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
-    #   🧠 ENRICHMENT          – Features that add information to the system prompt
-    #   📦 COMPRESSION         – Features that reduce context size to fit the window
-    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Value categories (see project documentation):
-    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
-    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
-    #   🧠 ENRICHMENT          – Features that add information to the system prompt
-    #   📦 COMPRESSION         – Features that reduce context size to fit the window
-    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
-    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6597,6 +6604,16 @@ class Filter:
 
         self._ensure_cleanup_task()
         project_id = self._get_project_id()
+
+        # ─────────────────────────────────────────────────────────────────
+        # 🚀 RESOURCE OPTIMISATION – Check if the main model is loaded
+        # We will avoid loading any auxiliary model while the slot is occupied.
+        # ─────────────────────────────────────────────────────────────────
+        slot_free = await self._wait_for_empty_slot(retries=1, delay=0.5)
+        if not slot_free:
+            self._log_debug(
+                "Main model slot occupied – auxiliary model calls will be skipped"
+            )
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
@@ -6657,7 +6674,11 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_natural_intents(
-            messages, project_id, is_explicit_command, last_user_msg
+            messages,
+            project_id,
+            is_explicit_command,
+            last_user_msg,
+            slot_free=slot_free,  # <-- pass the flag
         )
         _inlet_timing("Step 6/9: Handle natural language intents", step_start)
         if handled:
@@ -6722,6 +6743,7 @@ class Filter:
                     is_code_session,
                     last_user_msg,
                     state,
+                    slot_free=slot_free,  # <-- pass the flag
                 )
             )
             _inlet_timing("Step 8/9: Build system injections", step_start)
@@ -6766,6 +6788,7 @@ class Filter:
                 background_tasks,
                 user_question,
                 has_code_blocks,
+                slot_free=slot_free,  # <-- pass the flag
             )
             _inlet_timing(
                 "Step 9/9: Assemble final messages (CoT, trim, system prompt)",
