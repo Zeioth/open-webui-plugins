@@ -6399,34 +6399,34 @@ class Filter:
         project_id = self._get_project_id()
 
         # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT (Critical)
-        #   1. Preprocess (project switch, cache load)
-        #   2. Process pending secondary tasks (session summaries, etc.)
-        #   4. Extract user info (last message, question, code blocks)
+        # 🔥 STATE MANAGEMENT – Step 1: Preprocess
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug("Step 1/9: Preprocess (project switch, cache load)")
+        self._log_debug(
+            "🔥 STATE MANAGEMENT – Step 1/9: Preprocess (project switch, cache load)"
+        )
         messages = await self._inlet_preprocess(body, project_id)
         if not messages:
             return body
 
+        # 🔥 STATE MANAGEMENT – Step 2: Pending secondary tasks
         self._log_debug(
-            "Step 2/9: Process pending secondary tasks (session summaries, etc.)"
+            "🔥 STATE MANAGEMENT – Step 2/9: Process pending secondary tasks"
         )
         await self._process_pending_secondary_tasks(project_id)
 
         # ─────────────────────────────────────────────────────────────────
-        # 🚀 RESOURCE OPTIMISATION (Critical)
-        #   3. Free VRAM safely (global lock, avoids slot conflicts)
+        # 🚀 RESOURCE OPTIMISATION – Step 3: Free VRAM
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug("Step 3/9: Unload models safely (free VRAM)")
+        self._log_debug(
+            "🚀 RESOURCE OPTIMISATION – Step 3/9: Unload models safely (free VRAM)"
+        )
         await self._unload_models_under_lock()
 
         # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT (Critical)
-        #   (continued) 4. Extract user info
+        # 🔥 STATE MANAGEMENT – Step 4: Extract user info
         # ─────────────────────────────────────────────────────────────────
         self._log_debug(
-            "Step 4/9: Extract user info (last message, question, code blocks)"
+            "🔥 STATE MANAGEMENT – Step 4/9: Extract user info (last message, question, code blocks)"
         )
         (
             last_user_msg,
@@ -6437,12 +6437,9 @@ class Filter:
         ) = await self._inlet_extract_user_info(messages)
 
         # ─────────────────────────────────────────────────────────────────
-        # ⚡ COMMAND HANDLING (High value)
-        #   5. Explicit commands (/forget, /status, /clean, /expand)
+        # ⚡ COMMAND HANDLING – Step 5: Explicit commands
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug(
-            "Step 5/9: Handle explicit commands (/forget, /status, /clean, /expand)"
-        )
+        self._log_debug("⚡ COMMAND HANDLING – Step 5/9: Handle explicit commands")
         handled, handled_messages = await self._inlet_handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
@@ -6454,12 +6451,9 @@ class Filter:
             )
             return body
 
-        # ─────────────────────────────────────────────────────────────────
-        # ⚡ COMMAND HANDLING (High value)
-        #   6. Natural language intents (forget, remember, obsolete)
-        # ─────────────────────────────────────────────────────────────────
+        # ⚡ COMMAND HANDLING – Step 6: Natural language intents
         self._log_debug(
-            "Step 6/9: Handle natural language intents (forget, remember, obsolete)"
+            "⚡ COMMAND HANDLING – Step 6/9: Handle natural language intents"
         )
         handled, handled_messages = await self._inlet_handle_natural_intents(
             messages, project_id, is_explicit_command, last_user_msg
@@ -6481,15 +6475,10 @@ class Filter:
             state = self._get_state(project_id)
 
             # ─────────────────────────────────────────────────────────────
-            # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT (Critical)
-            #   7. Prepare code session:
-            #      - classify if session is about code
-            #      - update active blocks (extract code, detect duplicates)
-            #      - run immediate enrichment tasks (auto‑summaries)
-            #      - evict blocks if max_active_blocks > 0
+            # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT – Step 7: Prepare code session
             # ─────────────────────────────────────────────────────────────
             self._log_debug(
-                "Step 7/9: Prepare code session (classify, update blocks, immediate enrichment)"
+                "🔥 STATE MANAGEMENT + 🧠 ENRICHMENT – Step 7/9: Prepare code session"
             )
             is_code_session, user_question = await self._inlet_prepare_code_session(
                 messages, project_id, user_query
@@ -6501,18 +6490,10 @@ class Filter:
                 background_tasks.clear()
 
             # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT (Critical)
-            #   8. Build system injections:
-            #      - LTM retrieval
-            #      - Active code context (full or lightweight)
-            #      - Symbol analysis summary
-            #      - Chain‑of‑Thought detection (level computed here)
-            #      - Feedback context, cleanup suggestions, confidence
-            #      - Parallel checks: contradictions, duplicate questions,
-            #        response cache lookup
+            # 🧠 ENRICHMENT – Step 8: Build system injections
             # ─────────────────────────────────────────────────────────────
             self._log_debug(
-                "Step 8/9: Build system injections (LTM, code context, symbol analysis, CoT detection, etc.)"
+                "🧠 ENRICHMENT – Step 8/9: Build system injections (LTM, code, symbol analysis, etc.)"
             )
             system_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
@@ -6526,8 +6507,7 @@ class Filter:
                 )
             )
 
-            # 🚀 RESOURCE OPTIMISATION (High value)
-            #    Return cached response immediately if found
+            # 🚀 RESOURCE OPTIMISATION – Return cached response if found
             if isinstance(cached_response, dict):
                 messages.append(
                     {"role": "assistant", "content": cached_response["response"]}
@@ -6543,16 +6523,10 @@ class Filter:
                 return body
 
             # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT + 📦 COMPRESSION (Critical)
-            #   9. Assemble final messages:
-            #      - Apply Chain‑of‑Thought reasoning
-            #      - Trim old history (adaptive or max_turns)
-            #      - Summarise trimmed messages if enabled
-            #      - Inject final system prompt respecting token budget
-            #      - Display token breakdown (debug)
+            # 🧠 ENRICHMENT + 📦 COMPRESSION – Step 9: Assemble final messages
             # ─────────────────────────────────────────────────────────────
             self._log_debug(
-                "Step 9/9: Assemble final messages (CoT, trim, token budget, system prompt)"
+                "🧠 ENRICHMENT + 📦 COMPRESSION – Step 9/9: Assemble final messages (CoT, trim, system prompt)"
             )
             messages = await self._inlet_assemble_final_messages(
                 messages,
@@ -6575,20 +6549,16 @@ class Filter:
             _inlet_aborted = False
 
         finally:
-            # 🔥 STATE MANAGEMENT (Medium)
-            #   - Save state if dirty (debounced write)
-            #   - Process remaining secondary tasks (session summaries, etc.)
+            # 🔥 STATE MANAGEMENT – Save state and remaining secondary tasks
             self._log_debug(
-                "Final: saving state and processing remaining secondary tasks"
+                "🔥 STATE MANAGEMENT – Final: saving state and processing remaining secondary tasks"
             )
             await self._save_state_if_dirty(project_id)
             lock = await self._get_project_lock(project_id)
             async with lock:
                 await self._process_pending_secondary_tasks(project_id)
 
-            # 🚀 RESOURCE OPTIMISATION (Critical)
-            #   - Wait for any unfinished background tasks
-            #   - Free VRAM for the main model
+            # 🚀 RESOURCE OPTIMISATION – Cleanup and free VRAM
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
@@ -6636,6 +6606,9 @@ class Filter:
                         and is_code_session
                         and "/expand" in last_msg.get("content", "")
                     ):
+                        self._log_debug(
+                            "🔥 STATE MANAGEMENT – Intercepting /expand commands"
+                        )
                         modified_content, did_expand = (
                             await self._outlet_intercept_expand(
                                 last_msg.get("content", ""), project_id
@@ -6651,6 +6624,9 @@ class Filter:
                     # ── 🔥 STATE MANAGEMENT: update active code blocks & LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
                         if is_code_session:
+                            self._log_debug(
+                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing LTM"
+                            )
                             await self._update_active_code(last_msg, project_id)
                             async with self._ltm_batch_lock:
                                 self._pending_ltm_messages.append(last_msg)
@@ -6663,6 +6639,9 @@ class Filter:
                                     )
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
+                                self._log_debug(
+                                    "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
+                                )
                                 async with self._ltm_batch_lock:
                                     self._pending_ltm_messages.append(last_msg)
                                     if (
@@ -6679,6 +6658,7 @@ class Filter:
                 and HAS_SENTENCE
                 and len(messages) >= 2
             ):
+                self._log_debug("🚀 RESOURCE OPTIMISATION – Storing response in cache")
                 last_user = next(
                     (m for m in reversed(messages) if m.get("role") == "user"), None
                 )
@@ -6699,17 +6679,21 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
             if self._purge_task is None or self._purge_task.done():
+                self._log_debug("🚀 RESOURCE OPTIMISATION – Purging expired memories")
                 self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
             # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
             if self._write_counter % 100 == 0:
+                self._log_debug("🚀 RESOURCE OPTIMISATION – Running DB checkpoints")
                 self._purge_task = asyncio.create_task(self._run_db_checkpoints())
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
+            self._log_debug("🔥 STATE MANAGEMENT – Saving conversation state")
             await self._save_state_if_dirty(project_id)
 
             # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
+            self._log_debug("🚀 RESOURCE OPTIMISATION – Freeing VRAM")
             await self._unload_models_under_lock()
         finally:
             pass
