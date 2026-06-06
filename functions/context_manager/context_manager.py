@@ -2160,6 +2160,7 @@ class Filter:
             ),
             "has_any_calls": state.get("has_any_calls", False),
             "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
+            "last_cot_level": state.get("last_cot_level", 0),
         }
 
         def _write():
@@ -2193,6 +2194,7 @@ class Filter:
             "response_cache",
             "has_any_calls",
             "pending_secondary_tasks",
+            "last_cot_level",
         ]:
             data.setdefault(
                 key,
@@ -2269,6 +2271,7 @@ class Filter:
                 "last_cleanup_suggestion_msg_idx", 0
             ),
             "pending_secondary_tasks": data.get("pending_secondary_tasks", []),
+            "last_cot_level": data.get("last_cot_level", 0),
         }
         for blk in (
             list(state["active_blocks"].values())
@@ -4134,6 +4137,9 @@ class Filter:
         if self._full_code_intent_embeddings is not None:
             return
         if self.embedder is None:
+            self._log_debug(
+                "Embedder not available, skipping full code intent embeddings"
+            )
             return
         self._full_code_intent_embeddings = await anyio.to_thread.run_sync(
             lambda: self.embedder.encode(
