@@ -1025,7 +1025,7 @@ class Filter:
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
-        llm_request_timeout: int = Field(default=300)
+        llm_request_timeout: int = Field(default=900)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
 
@@ -1114,6 +1114,10 @@ class Filter:
         synthesis_max_tokens: int = Field(
             default=1500,
             description="Max tokens for the synthesized summary of symbol analysis.",
+        )
+        symbol_batch_size: int = Field(
+            default=20,
+            description="Number of symbols to analyze in parallel per batch (lower = less RAM).",
         )
 
         # ─── Session summaries (autobiographical mini‑memory) ───
@@ -1264,6 +1268,11 @@ class Filter:
         # ── Database write queue (prevents "database is locked") ──
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
         self._db_worker_task = asyncio.create_task(self._db_worker())
+
+        # ── Secondary task background worker ──
+        self._secondary_task_worker_task = asyncio.create_task(
+            self._secondary_task_worker()
+        )
 
         # Background tasks tracking
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
@@ -2027,6 +2036,79 @@ class Filter:
             pass
         finally:
             self._log_debug("DB worker exiting")
+
+    async def _secondary_task_worker(self):
+        """
+        Continuously process pending secondary tasks in the background,
+        with a small delay between batches to avoid overwhelming the DB.
+        """
+        while True:
+            try:
+                # Wait a bit before next batch to throttle writes
+                await asyncio.sleep(2.0)
+
+                project_id = self.valves.project_id
+                lock = await self._get_project_lock(project_id)
+                async with lock:
+                    state = self._get_state(project_id)
+                    tasks = state.get("pending_secondary_tasks", [])
+                    if not tasks:
+                        continue
+
+                    # Take a batch (all or a reasonable chunk)
+                    batch_size = 20
+                    batch = tasks[:batch_size]
+                    state["pending_secondary_tasks"] = tasks[batch_size:]
+                    # Don't save state here – tasks are processed outside the lock
+                    # to avoid holding it during LLM calls.
+
+                # Process the batch without holding the lock (LLM calls are slow)
+                for task_dict in batch:
+                    try:
+                        task = SecondaryTask(**task_dict)
+                        success = await self._execute_secondary_task(task, project_id)
+                        if not success:
+                            # Re‑queue on failure, with retry count
+                            task.retries += 1
+                            if task.retries < self.valves.secondary_task_max_retries:
+                                async with lock:
+                                    state = self._get_state(project_id)
+                                    state.setdefault(
+                                        "pending_secondary_tasks", []
+                                    ).append(task.dict())
+                                    self._set_state(project_id, state)
+                            else:
+                                self._log_debug(
+                                    f"Dropping secondary task {task.task_type} after {task.retries} retries"
+                                )
+                    except Exception as e:
+                        self._log_debug(
+                            f"Secondary task {task_dict['task_type']} failed: {e}"
+                        )
+                        # Re‑queue once on unexpected error
+                        task_dict["retries"] = task_dict.get("retries", 0) + 1
+                        if (
+                            task_dict["retries"]
+                            < self.valves.secondary_task_max_retries
+                        ):
+                            async with lock:
+                                state = self._get_state(project_id)
+                                state.setdefault("pending_secondary_tasks", []).append(
+                                    task_dict
+                                )
+                                self._set_state(project_id, state)
+
+                # Persist the final state after processing the batch
+                async with lock:
+                    state = self._get_state(project_id)
+                    self._set_state(project_id, state)
+
+            except asyncio.CancelledError:
+                self._log_debug("Secondary task worker shutting down")
+                break
+            except Exception as e:
+                self._log_debug(f"Secondary task worker error: {e}")
+                await asyncio.sleep(5.0)  # avoid tight loop on persistent error
 
     def _init_state_db(self):
         db_path = self.valves.state_db_path
@@ -3309,6 +3391,18 @@ class Filter:
         role = message.get("role", "")
 
         extracted, block_spans = await self._extract_code_blocks(content)
+
+        # ── Filter out self‑referencing code (prevents analysing the filter itself) ──
+        extracted = [
+            b
+            for b in extracted
+            if "Code-Aware Context Manager" not in b.get("code", "")
+            and "FALLBACK_LANGUAGE_QUERIES" not in b.get("code", "")
+        ]
+        if not extracted:
+            return
+        # ─────────────────────────────────────────────────────────────────────────
+
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted):
             blk_file = None
@@ -6779,6 +6873,10 @@ class Filter:
         except Exception:
             pass
 
+        # Cancel the secondary task worker
+        if hasattr(self, "_secondary_task_worker_task"):
+            self._secondary_task_worker_task.cancel()
+
         for task_list in [self._dependency_tasks]:
             for task in task_list:
                 task.cancel()
@@ -7401,13 +7499,20 @@ class Filter:
     async def _analyze_code_via_symbols(
         self, question: str, project_id: str
     ) -> Tuple[str, List[str]]:
+        """
+        Analyze code symbols in batches to keep RAM usage low.
+        Each batch produces an intermediate summary; a final summary
+        is synthesized from those intermediates.
+        Returns (final_summary, list_of_suggested_symbols).
+        """
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
             return "", []
 
         question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
 
-        symbol_contexts = []
+        # ── Collect symbol contexts (lazy, no LLM calls yet) ────────────
+        symbol_entries = []  # (name, importance_score, block_hash, ctx_or_cached)
         seen_symbols = set()
         for block in state["active_blocks"].values():
             if block.obsolete or block.content_type not in (
@@ -7426,110 +7531,161 @@ class Filter:
                 )
                 if cached is not None:
                     cached["symbol_name"] = sym.name
-                    symbol_contexts.append((sym.name, cached, block.hash))
+                    symbol_entries.append(
+                        (sym.name, block.importance_score, block.hash, cached)
+                    )
                     continue
 
                 ctx = self._build_symbol_context(sym, block, project_id)
                 if ctx is None:
                     continue
+                symbol_entries.append(
+                    (sym.name, block.importance_score, block.hash, ctx)
+                )
 
-                symbol_contexts.append((sym.name, ctx, block.hash))
-
-        if not symbol_contexts:
+        if not symbol_entries:
             return "", []
 
-        fresh_indices = []
-        cached_results = []
-        for i, (name, ctx_or_cached, block_hash) in enumerate(symbol_contexts):
-            if isinstance(ctx_or_cached, dict):
-                cached_results.append(ctx_or_cached)
-            else:
-                fresh_indices.append(i)
+        # Sort by importance descending so that the most relevant blocks are processed first
+        symbol_entries.sort(key=lambda x: x[1], reverse=True)
 
-        prompt_template_full = (
-            "You are a code analysis assistant. "
-            "For the given symbol, provide:\n"
-            "FUNCTIONS: <comma separated list of relevant function/class names>\n"
-            "FINDINGS: <one key finding>\n"
-            "ISSUES: <any potential issue, or 'none'>\n"
-            "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
-            "CONFIDENCE: <float 0.0-1.0>\n\n"
-            "EXAMPLE:\n"
-            "Symbol: `def calculate(x, y)` in math_utils.py\n"
-            "Body preview:\n```\nreturn x / y\n```\n"
-            "FUNCTIONS: calculate\n"
-            "FINDINGS: Performs division\n"
-            "ISSUES: Division by zero\n"
-            "SUGGEST: validate_input\n"
-            "CONFIDENCE: 0.9\n\n"
-            "Now analyze:\n{context}\n"
-            "OUTPUT:"
-        )
-        prompt_template_no_body = (
-            "You are a code analysis assistant. "
-            "For the given symbol, provide:\n"
-            "FUNCTIONS: <comma separated list of relevant function/class names>\n"
-            "FINDINGS: <one key finding>\n"
-            "ISSUES: <any potential issue, or 'none'>\n"
-            "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
-            "CONFIDENCE: <float 0.0-1.0>\n\n"
-            "Now analyze (only signature and call info available):\n{context}\n"
-            "OUTPUT:"
-        )
+        total_symbols = len(symbol_entries)
+        batch_size = self.valves.symbol_batch_size
+        intermediate_summaries = []
+        all_suggested = set()
 
-        model = self.valves.symbol_analysis_model or self.valves.llm_model
-        semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
+        # ── Process in batches ─────────────────────────────────────────
+        for batch_start in range(0, total_symbols, batch_size):
+            batch = symbol_entries[batch_start : batch_start + batch_size]
 
-        max_retries = self.valves.symbol_analysis_max_retries
-        parsed_fresh = []
-        for idx in fresh_indices:
-            name, ctx, block_hash = symbol_contexts[idx]
-            success = False
-
-            for attempt in range(max_retries):
-                if attempt == 0:
-                    prompt = prompt_template_full.format(context=ctx)
-                elif attempt == 1:
-                    ctx_clean = ctx.split("\nBody preview:\n")[0]
-                    prompt = prompt_template_no_body.format(context=ctx_clean)
+            # Separate fresh vs cached
+            fresh_entries = []
+            cached_results = []
+            for name, _, block_hash, ctx_or_cached in batch:
+                if isinstance(ctx_or_cached, dict):
+                    cached_results.append(ctx_or_cached)
                 else:
-                    ctx_sig = ctx.split("\n")[0]
-                    prompt = prompt_template_no_body.format(context=ctx_sig)
+                    fresh_entries.append((name, block_hash, ctx_or_cached))
 
-                try:
-                    res = await self._analyze_single_symbol(
-                        prompt, model, semaphore, label=f"symbol:{name}"
-                    )
-                except Exception:
-                    continue
+            # Analyze fresh symbols in parallel
+            if fresh_entries:
+                prompt_template_full = (
+                    "You are a code analysis assistant. "
+                    "For the given symbol, provide:\n"
+                    "FUNCTIONS: <comma separated list of relevant function/class names>\n"
+                    "FINDINGS: <one key finding>\n"
+                    "ISSUES: <any potential issue, or 'none'>\n"
+                    "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
+                    "CONFIDENCE: <float 0.0-1.0>\n\n"
+                    "EXAMPLE:\n"
+                    "Symbol: `def calculate(x, y)` in math_utils.py\n"
+                    "Body preview:\n```\nreturn x / y\n```\n"
+                    "FUNCTIONS: calculate\n"
+                    "FINDINGS: Performs division\n"
+                    "ISSUES: Division by zero\n"
+                    "SUGGEST: validate_input\n"
+                    "CONFIDENCE: 0.9\n\n"
+                    "Now analyze:\n{context}\n"
+                    "OUTPUT:"
+                )
+                prompt_template_no_body = (
+                    "You are a code analysis assistant. "
+                    "For the given symbol, provide:\n"
+                    "FUNCTIONS: <comma separated list of relevant function/class names>\n"
+                    "FINDINGS: <one key finding>\n"
+                    "ISSUES: <any potential issue, or 'none'>\n"
+                    "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
+                    "CONFIDENCE: <float 0.0-1.0>\n\n"
+                    "Now analyze (only signature and call info available):\n{context}\n"
+                    "OUTPUT:"
+                )
 
-                if not res:
-                    continue
+                model = self.valves.symbol_analysis_model or self.valves.llm_model
+                semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
+                max_retries = self.valves.symbol_analysis_max_retries
 
-                parsed = self._parse_symbol_output(res)
-                if parsed:
-                    parsed["symbol_name"] = name
-                    parsed_fresh.append(parsed)
-                    self._set_cached_symbol_analysis(
-                        name, question_hash, parsed, content_hash=block_hash
-                    )
-                    success = True
-                    break
+                parsed_fresh = []
+                for name, block_hash, ctx in fresh_entries:
+                    success = False
+                    for attempt in range(max_retries):
+                        if attempt == 0:
+                            prompt = prompt_template_full.format(context=ctx)
+                        elif attempt == 1:
+                            ctx_clean = ctx.split("\nBody preview:\n")[0]
+                            prompt = prompt_template_no_body.format(context=ctx_clean)
+                        else:
+                            ctx_sig = ctx.split("\n")[0]
+                            prompt = prompt_template_no_body.format(context=ctx_sig)
 
-            if not success:
-                self._log_debug(f"Symbol analysis failed for {name}")
+                        try:
+                            res = await self._analyze_single_symbol(
+                                prompt, model, semaphore, label=f"symbol:{name}"
+                            )
+                        except Exception:
+                            continue
 
-        all_parsed = cached_results + parsed_fresh
-        if not all_parsed:
+                        if not res:
+                            continue
+
+                        parsed = self._parse_symbol_output(res)
+                        if parsed:
+                            parsed["symbol_name"] = name
+                            parsed_fresh.append(parsed)
+                            self._set_cached_symbol_analysis(
+                                name, question_hash, parsed, content_hash=block_hash
+                            )
+                            success = True
+                            break
+
+                    if not success:
+                        self._log_debug(f"Symbol analysis failed for {name}")
+
+                # Combine with cached for this batch
+                batch_analyses = cached_results + parsed_fresh
+            else:
+                batch_analyses = cached_results
+
+            if batch_analyses:
+                # Collect suggested symbols
+                for r in batch_analyses:
+                    if r.get("suggested_next") and r["suggested_next"] != "none":
+                        all_suggested.add(r["suggested_next"])
+
+                # Generate an intermediate summary for this batch
+                batch_summary = await self._synthesize_from_symbol_results(
+                    batch_analyses, question
+                )
+                if batch_summary:
+                    intermediate_summaries.append(batch_summary)
+
+        if not intermediate_summaries:
             return "Symbol analysis produced no results.", []
 
-        suggested = set()
-        for res in all_parsed:
-            if res.get("suggested_next") and res["suggested_next"] != "none":
-                suggested.add(res["suggested_next"])
+        # ── Synthesize final summary from intermediate summaries ──────
+        if len(intermediate_summaries) == 1:
+            final_summary = intermediate_summaries[0]
+        else:
+            combined = "\n\n".join(
+                f"Batch {i+1}:\n{s}" for i, s in enumerate(intermediate_summaries)
+            )
+            prompt = (
+                f"Question: {question}\n\n"
+                f"Intermediate batch summaries:\n{combined}\n\n"
+                "Combine these into a single concise summary of the codebase. "
+                "Include relevant functions, key findings, issues, and suggestions. "
+                "Keep the response under {max_tokens} tokens. No code snippets."
+            )
+            model = self.valves.symbol_analysis_model or self.valves.llm_model
+            final_summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You are a senior software architect summarizing code analysis.",
+                model_override=model,
+                max_tokens=self.valves.synthesis_max_tokens,
+                temperature=0.2,
+            )
+            final_summary = final_summary or "\n".join(intermediate_summaries)
 
-        summary = await self._synthesize_from_symbol_results(all_parsed, question)
-        return summary, list(suggested)
+        return final_summary, list(all_suggested)
 
     async def _analyze_single_symbol(
         self, prompt: str, model: str, semaphore: asyncio.Semaphore, label: str = ""
@@ -7743,21 +7899,16 @@ class Filter:
     # --------------------------------------------------------------------------
 
     async def _process_pending_secondary_tasks(self, project_id: str):
-        MAX_TASKS_PER_INLET = 50
-
+        """Execute all pending secondary tasks at the start of an inlet (MUST be called under project lock)."""
         state = self._get_state(project_id)
         if not state or not state.get("pending_secondary_tasks"):
             return
 
         tasks = state["pending_secondary_tasks"]
-        to_process = tasks[:MAX_TASKS_PER_INLET]
-        rest = tasks[MAX_TASKS_PER_INLET:]
-        self._log_debug(
-            f"Processing {len(to_process)} of {len(tasks)} pending secondary tasks..."
-        )
+        self._log_debug(f"Processing {len(tasks)} pending secondary task(s)...")
 
-        remaining = rest
-        for task_dict in to_process:
+        remaining = []
+        for task_dict in tasks:
             task = SecondaryTask(**task_dict)
             success = await self._execute_secondary_task(task, project_id)
             if not success:
