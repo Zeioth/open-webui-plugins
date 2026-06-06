@@ -2553,8 +2553,11 @@ class Filter:
                     f"– prompt size: ~{prompt_tokens} tokens"
                 )
 
-            # ── Track this task as an active LLM user ──
-            async with self._track_llm_task():
+            # ── Register this task as an active LLM user ──
+            task = asyncio.current_task()
+            async with self._active_llm_tasks_lock:
+                self._active_llm_tasks.add(task)
+            try:
                 # ── Inter‑process lock: only one process can use the LLM at a time ──
                 llm_fd = await self._acquire_llm_lock()
                 try:
@@ -2620,6 +2623,10 @@ class Filter:
                                 break
                 finally:
                     self._release_llm_lock(llm_fd)
+            finally:
+                # Remove task from active set
+                async with self._active_llm_tasks_lock:
+                    self._active_llm_tasks.discard(task)
 
             logger.warning(
                 f"LLM call failed for model {model}: prompt={prompt[:100]}..."
