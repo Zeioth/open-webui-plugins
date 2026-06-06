@@ -2417,7 +2417,7 @@ class Filter:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
 
-        for _ in range(retries):
+        for attempt in range(retries):
             await asyncio.sleep(delay)
             try:
                 session = await get_http_session(timeout=5)
@@ -2430,8 +2430,16 @@ class Filter:
                         )
                         if not loaded:
                             return True
-            except Exception:
-                pass
+                        else:
+                            self._log_debug(
+                                f"Models still loaded: {[m['id'] for m in data.get('data', []) if m.get('status', {}).get('value') == 'loaded']}"
+                            )
+                    else:
+                        self._log_debug(f"Model list returned status {resp.status}")
+            except Exception as e:
+                self._log_debug(f"Error checking models (attempt {attempt+1}): {e}")
+
+        self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
     async def _unload_models_under_lock(self):
@@ -2448,6 +2456,8 @@ class Filter:
                 self._log_debug("Slot not empty after unload – forcing extra unload")
                 await _shared_unload_all_models(self.valves.LLM_BASE_URL)
                 await self._wait_for_empty_slot(retries=2, delay=3.0)
+            # Additional breathing room for the server to fully release resources
+            await asyncio.sleep(3.0)
         finally:
             self._release_llm_lock(llm_fd)
 
@@ -6199,6 +6209,9 @@ class Filter:
         history_msgs = [m for m in messages if m.get("role") != "system"]
         system_msgs = [m for m in messages if m.get("role") == "system"]
 
+        # ── 📦 COMPRESSION – start ──
+        self._log_debug("📦 COMPRESSION – Checking if context fits within the window")
+
         if self.valves.adaptive_trim:
             total_tokens = self._estimate_tokens(messages)
             if total_tokens > self.valves.context_window_tokens:
@@ -6225,9 +6238,17 @@ class Filter:
                         pending_summary = (
                             f"[Summary of earlier conversation]\n{summary}"
                         )
+                        self._log_debug(
+                            "📦 COMPRESSION – Eliminating context useless to answer user prompt "
+                            "(After moving it to LTM cache)"
+                        )
                     history_msgs = kept_block
                 else:
-                    history_msgs = kept_block
+                    # Even if old_block exists, we keep it if summarization is off or it's empty
+                    self._log_debug(
+                        "📦 COMPRESSION – Context fits within window, keeping full context for accurate response"
+                    )
+                    history_msgs = kept_block if old_block else history_msgs
 
                 if self.valves.preserve_tool_calls:
                     while history_msgs and history_msgs[0].get("role") == "tool":
@@ -6247,7 +6268,12 @@ class Filter:
                         }
                         if not tool_call_ids.issubset(tool_response_ids):
                             history_msgs.pop(0)
+            else:
+                self._log_debug(
+                    "📦 COMPRESSION – Context window not exceeded, no eviction needed"
+                )
         else:
+            # Non-adaptive trimming (max_turns)
             user_max = (
                 __user__["valves"].max_turns
                 if __user__ and hasattr(__user__, "valves")
@@ -6278,9 +6304,16 @@ class Filter:
                         pending_summary = (
                             f"[Summary of earlier conversation]\n{summary}"
                         )
+                        self._log_debug(
+                            "📦 COMPRESSION – Eliminating context useless to answer user prompt "
+                            "(After moving it to LTM cache)"
+                        )
                     history_msgs = kept_block
                 else:
                     history_msgs = kept_block
+                    self._log_debug(
+                        "📦 COMPRESSION – Context fits within window, keeping full context for accurate response"
+                    )
 
         # ── Lean user message: replace full code with relevant fragments ──
         if has_code_blocks and last_user_msg:
@@ -6376,14 +6409,7 @@ class Filter:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Value categories (see project documentation):
-    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
-    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
-    #   🧠 ENRICHMENT          – Features that add information to the system prompt
-    #   📦 COMPRESSION         – Features that reduce context size to fit the window
-    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
+    # INLET – orchestrated entry point (see project documentation for categories)
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
@@ -6401,33 +6427,28 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT – Step 1: Preprocess
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug(
-            "🔥 STATE MANAGEMENT – Step 1/9: Preprocess (project switch, cache load)"
-        )
+        step_start = time.monotonic()
         messages = await self._inlet_preprocess(body, project_id)
+        _inlet_timing("Step 1/9: Preprocess (project switch, cache load)", step_start)
         if not messages:
             return body
 
         # 🔥 STATE MANAGEMENT – Step 2: Pending secondary tasks
-        self._log_debug(
-            "🔥 STATE MANAGEMENT – Step 2/9: Process pending secondary tasks"
-        )
+        step_start = time.monotonic()
         await self._process_pending_secondary_tasks(project_id)
+        _inlet_timing("Step 2/9: Process pending secondary tasks", step_start)
 
         # ─────────────────────────────────────────────────────────────────
         # 🚀 RESOURCE OPTIMISATION – Step 3: Free VRAM
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug(
-            "🚀 RESOURCE OPTIMISATION – Step 3/9: Unload models safely (free VRAM)"
-        )
+        step_start = time.monotonic()
         await self._unload_models_under_lock()
+        _inlet_timing("Step 3/9: Unload models safely (free VRAM)", step_start)
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT – Step 4: Extract user info
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug(
-            "🔥 STATE MANAGEMENT – Step 4/9: Extract user info (last message, question, code blocks)"
-        )
+        step_start = time.monotonic()
         (
             last_user_msg,
             user_query,
@@ -6435,14 +6456,16 @@ class Filter:
             is_explicit_command,
             has_code_blocks,
         ) = await self._inlet_extract_user_info(messages)
+        _inlet_timing("Step 4/9: Extract user info", step_start)
 
         # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING – Step 5: Explicit commands
         # ─────────────────────────────────────────────────────────────────
-        self._log_debug("⚡ COMMAND HANDLING – Step 5/9: Handle explicit commands")
+        step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
+        _inlet_timing("Step 5/9: Handle explicit commands", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -6452,12 +6475,11 @@ class Filter:
             return body
 
         # ⚡ COMMAND HANDLING – Step 6: Natural language intents
-        self._log_debug(
-            "⚡ COMMAND HANDLING – Step 6/9: Handle natural language intents"
-        )
+        step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_natural_intents(
             messages, project_id, is_explicit_command, last_user_msg
         )
+        _inlet_timing("Step 6/9: Handle natural language intents", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -6477,11 +6499,13 @@ class Filter:
             # ─────────────────────────────────────────────────────────────
             # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT – Step 7: Prepare code session
             # ─────────────────────────────────────────────────────────────
-            self._log_debug(
-                "🔥 STATE MANAGEMENT + 🧠 ENRICHMENT – Step 7/9: Prepare code session"
-            )
+            step_start = time.monotonic()
             is_code_session, user_question = await self._inlet_prepare_code_session(
                 messages, project_id, user_query
+            )
+            _inlet_timing(
+                "Step 7/9: Prepare code session (classify, update blocks, enrich)",
+                step_start,
             )
 
             # Wait for any background tasks launched by _update_active_code
@@ -6492,9 +6516,7 @@ class Filter:
             # ─────────────────────────────────────────────────────────────
             # 🧠 ENRICHMENT – Step 8: Build system injections
             # ─────────────────────────────────────────────────────────────
-            self._log_debug(
-                "🧠 ENRICHMENT – Step 8/9: Build system injections (LTM, code, symbol analysis, etc.)"
-            )
+            step_start = time.monotonic()
             system_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
                     messages,
@@ -6506,9 +6528,13 @@ class Filter:
                     state,
                 )
             )
+            _inlet_timing("Step 8/9: Build system injections", step_start)
 
             # 🚀 RESOURCE OPTIMISATION – Return cached response if found
             if isinstance(cached_response, dict):
+                self._log_debug(
+                    "🚀 RESOURCE OPTIMISATION – Returning cached response (no further processing)"
+                )
                 messages.append(
                     {"role": "assistant", "content": cached_response["response"]}
                 )
@@ -6525,9 +6551,7 @@ class Filter:
             # ─────────────────────────────────────────────────────────────
             # 🧠 ENRICHMENT + 📦 COMPRESSION – Step 9: Assemble final messages
             # ─────────────────────────────────────────────────────────────
-            self._log_debug(
-                "🧠 ENRICHMENT + 📦 COMPRESSION – Step 9/9: Assemble final messages (CoT, trim, system prompt)"
-            )
+            step_start = time.monotonic()
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 system_injections,
@@ -6540,6 +6564,10 @@ class Filter:
                 user_question,
                 has_code_blocks,
             )
+            _inlet_timing(
+                "Step 9/9: Assemble final messages (CoT, trim, system prompt)",
+                step_start,
+            )
 
             body["messages"] = messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -6550,9 +6578,6 @@ class Filter:
 
         finally:
             # 🔥 STATE MANAGEMENT – Save state and remaining secondary tasks
-            self._log_debug(
-                "🔥 STATE MANAGEMENT – Final: saving state and processing remaining secondary tasks"
-            )
             await self._save_state_if_dirty(project_id)
             lock = await self._get_project_lock(project_id)
             async with lock:
@@ -6573,7 +6598,7 @@ class Filter:
         return body
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # OUTLET
+    # OUTLET – Post‑response processing
     # ═══════════════════════════════════════════════════════════════════════════
     # Value categories (same as inlet):
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
@@ -6607,7 +6632,7 @@ class Filter:
                         and "/expand" in last_msg.get("content", "")
                     ):
                         self._log_debug(
-                            "🔥 STATE MANAGEMENT – Intercepting /expand commands"
+                            "🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code"
                         )
                         modified_content, did_expand = (
                             await self._outlet_intercept_expand(
@@ -6625,7 +6650,8 @@ class Filter:
                     if last_msg.get("role") in ("user", "assistant"):
                         if is_code_session:
                             self._log_debug(
-                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing LTM"
+                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM "
+                                "(new code detected)"
                             )
                             await self._update_active_code(last_msg, project_id)
                             async with self._ltm_batch_lock:
@@ -6640,7 +6666,7 @@ class Filter:
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 self._log_debug(
-                                    "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
+                                    "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
                                 )
                                 async with self._ltm_batch_lock:
                                     self._pending_ltm_messages.append(last_msg)
@@ -6658,7 +6684,10 @@ class Filter:
                 and HAS_SENTENCE
                 and len(messages) >= 2
             ):
-                self._log_debug("🚀 RESOURCE OPTIMISATION – Storing response in cache")
+                self._log_debug(
+                    "🚀 RESOURCE OPTIMISATION – Storing response in cache "
+                    "(to avoid recomputation for similar future requests)"
+                )
                 last_user = next(
                     (m for m in reversed(messages) if m.get("role") == "user"), None
                 )
@@ -6679,21 +6708,33 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
             if self._purge_task is None or self._purge_task.done():
-                self._log_debug("🚀 RESOURCE OPTIMISATION – Purging expired memories")
+                self._log_debug(
+                    "🚀 RESOURCE OPTIMISATION – Purging expired memories "
+                    "(reclaiming disk space and keeping LTM fresh)"
+                )
                 self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
             # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
             if self._write_counter % 100 == 0:
-                self._log_debug("🚀 RESOURCE OPTIMISATION – Running DB checkpoints")
+                self._log_debug(
+                    "🚀 RESOURCE OPTIMISATION – Running DB checkpoints "
+                    "(to ensure data durability and prevent WAL buildup)"
+                )
                 self._purge_task = asyncio.create_task(self._run_db_checkpoints())
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
-            self._log_debug("🔥 STATE MANAGEMENT – Saving conversation state")
+            self._log_debug(
+                "🔥 STATE MANAGEMENT – Saving conversation state "
+                "(to preserve context across restarts)"
+            )
             await self._save_state_if_dirty(project_id)
 
             # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
-            self._log_debug("🚀 RESOURCE OPTIMISATION – Freeing VRAM")
+            self._log_debug(
+                "🚀 RESOURCE OPTIMISATION – Freeing VRAM "
+                "(unloading models so the next request starts with a clean slot)"
+            )
             await self._unload_models_under_lock()
         finally:
             pass
