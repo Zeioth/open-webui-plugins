@@ -6190,13 +6190,6 @@ class Filter:
                         user_content, is_code_session, state
                     )
                     self._log_debug(f"CoT level detected: {cot_level} (manual=False)")
-                    if cot_level > 0:
-                        cot_any_used = True
-                        if cot_level == 3:
-                            self._log_debug(
-                                "Auto CoT capped to level 2 to prevent heavy model usage"
-                            )
-                            cot_level = 2
 
         # Wait for background tasks before heavy LLM calls
         if background_tasks:
