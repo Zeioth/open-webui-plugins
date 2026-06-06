@@ -5117,8 +5117,20 @@ class Filter:
             "1 = basic (ask to think step by step internally)\n"
             "2 = moderate (generate reasoning automatically)\n"
             "3 = deep (generate reasoning + self-critique)\n\n"
-            "Respond with only the digit 0, 1, 2, or 3."
         )
+        # Include user intent regarding code completeness
+        if (
+            hasattr(self, "_user_intent_full_code")
+            and self._user_intent_full_code is not None
+        ):
+            intent_note = (
+                "The user likely needs the full code."
+                if self._user_intent_full_code
+                else "The user likely needs only a summary of the code."
+            )
+            prompt += f"{intent_note}\n"
+        prompt += "Respond with only the digit 0, 1, 2, or 3."
+
         try:
             response = await self._try_llm_quick(
                 prompt=prompt,
@@ -6365,6 +6377,10 @@ class Filter:
         has_code_blocks: bool,
     ) -> List[dict]:
         """Apply CoT, final token budget, trimming, and insert system prompt."""
+
+        # Determine user intent for context reduction (also used by CoT detection)
+        self._user_intent_full_code = await self._should_keep_full_code(user_question)
+
         # CoT detection
         manual_cot_used = False
         cot_any_used = False
@@ -6628,11 +6644,10 @@ class Filter:
             analysis_summary = getattr(self, "_last_analysis_summary", None)
             suggested_blocks = getattr(self, "_last_suggested_blocks", None)
 
-            # Ask the LLM whether to keep the original code
-            keep_original = await self._should_keep_full_code(user_question)
+            # Reuse the already‑computed intent (saves a second LLM call)
+            keep_original = self._user_intent_full_code
 
             if not keep_original and (analysis_summary or suggested_blocks):
-                # Build lean user content
                 lean_parts = [user_question.strip()]
                 if suggested_blocks:
                     lean_parts.append("\n## Relevant code\n")
@@ -6641,7 +6656,6 @@ class Filter:
                         lean_parts.append(
                             f"### {blk.hash[:8]}{loc}\n```\n{blk.content[:2000]}\n```"
                         )
-                # Replace the last user message content
                 last_user_msg["content"] = "\n".join(lean_parts)
 
         # ── Concatenate pending summary to the final system message ──
@@ -6702,7 +6716,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
