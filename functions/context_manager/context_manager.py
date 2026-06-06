@@ -951,7 +951,7 @@ class Filter:
         cot_max_tokens: int = Field(default=0)
         cot_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         cot_model_level2: str = Field(
-            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
+            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M",
             description="Model used for CoT level 2 (auto‑reasoning). Must support large contexts.",
         )
         cot_model_level3: str = Field(
@@ -1374,7 +1374,8 @@ class Filter:
     # --------------------------------------------------------------------------
     def _log_debug(self, msg: str):
         if self.valves.debug:
-            print(f"[CodeAware] {msg}")
+            timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"[{timestamp}] [CodeAware] {msg}")
 
     def _log_timing(self, step_name: str, elapsed_since_start: float, duration: float):
         if self.valves.debug:
@@ -2618,10 +2619,18 @@ class Filter:
             max_retries = 2
             base_delay = 1.0
 
-            await self._maybe_unload_for_model(model, base_url, is_ollama)
+            # ── Log prompt size for diagnostics ──
+            if self.tokenizer:
+                prompt_tokens = len(self.tokenizer.encode(prompt))
+                self._log_debug(
+                    f"LLM call to {model}{f' ({label})' if label else ''} "
+                    f"– prompt size: ~{prompt_tokens} tokens"
+                )
 
             # ── Acquire global LLM semaphore to serialize all server calls ──
             async with _llm_semaphore:
+                await self._maybe_unload_for_model(model, base_url, is_ollama)
+
                 for attempt in range(max_retries + 1):
                     try:
                         async with effective_semaphore:
@@ -2639,9 +2648,21 @@ class Filter:
                         if content:
                             await self._llm_cache.set(cache_key, content)
                             future.set_result(content)
+                            # ── Log input and output tokens ──
+                            in_tokens = (
+                                len(self.tokenizer.encode(prompt))
+                                if self.tokenizer
+                                else "?"
+                            )
+                            out_tokens = (
+                                len(self.tokenizer.encode(content))
+                                if self.tokenizer
+                                else "?"
+                            )
                             self._log_debug(
                                 f"[LLM] {model}"
                                 + (f" ({label})" if label else "")
+                                + f" – in:{in_tokens} out:{out_tokens}"
                                 + f" took {time.monotonic() - t_start:.3f}s"
                             )
                             self._last_used_model = model
@@ -5830,7 +5851,7 @@ class Filter:
     # --------------------------------------------------------------------------
 
     async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
-        """Handle project switching, symbol cache loading, and secondary tasks under lock."""
+        """Handle project switching, symbol cache loading. No secondary tasks here."""
         messages = body.get("messages", [])
 
         if self._last_project_id and self._last_project_id != project_id:
@@ -5848,11 +5869,6 @@ class Filter:
         if project_id not in self._symbol_cache_loaded_projects:
             await self._load_symbol_cache_from_db(project_id)
             self._symbol_cache_loaded_projects.add(project_id)
-
-        # Process pending secondary tasks under lock to avoid races
-        lock = await self._get_project_lock(project_id)
-        async with lock:
-            await self._process_pending_secondary_tasks(project_id)
 
         return messages
 
@@ -6329,6 +6345,7 @@ class Filter:
         state: dict,
         __user__: Optional[dict],
         background_tasks: List[asyncio.Task],
+        user_question: str,
     ) -> List[dict]:
         """Apply CoT, final token budget, trimming, and insert system prompt."""
         # CoT detection
@@ -6404,13 +6421,15 @@ class Filter:
 
                 # Generate the initial CoT
                 if not manual_cot_used:
+                    # Use the cleaned user question, not the raw message with code
+                    question = user_question
                     if cot_level == 2:
                         reasoning = await self._generate_cot_reasoning(
-                            last_user_msg.get("content", ""), prelim_for_cot
+                            question, prelim_for_cot
                         )
                     elif cot_level == 3:
                         reasoning = await self._generate_cot_with_self_reflection(
-                            last_user_msg.get("content", ""), prelim_for_cot
+                            question, prelim_for_cot
                         )
                 else:
                     if cot_level == 2:
@@ -6431,7 +6450,7 @@ class Filter:
                 ):
                     self._log_debug("Level 3 CoT failed, falling back to level 2")
                     reasoning = await self._generate_cot_reasoning(
-                        last_user_msg.get("content", ""), prelim_for_cot
+                        user_question, prelim_for_cot  # use the same cleaned question
                     )
 
                 if reasoning and reasoning != _cot_error_msg:
@@ -6453,9 +6472,7 @@ class Filter:
                     self._last_used_model = None
                 except Exception:
                     pass
-                # Resume the secondary task worker
-                if hasattr(self, "_secondary_worker_paused"):
-                    self._secondary_worker_paused.set()
+                # ── Worker is NOT resumed here – the inlet's finally will do it ──
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6490,9 +6507,11 @@ class Filter:
         if base_content.strip():
             final_system = final_system + "\n\n" + base_content
 
+        # ── Variable to hold any pending summary (from trimming) ──
+        pending_summary = ""
+
         if final_system.strip():
             messages = [m for m in messages if m.get("role") != "system"]
-            messages.insert(0, {"role": "system", "content": final_system})
         else:
             messages = [m for m in messages if m.get("role") != "system"]
 
@@ -6523,12 +6542,8 @@ class Filter:
                         old_block, is_code_context=has_code
                     )
                     if summary:
-                        kept_block.insert(
-                            0,
-                            {
-                                "role": "system",
-                                "content": f"[Summary of earlier conversation]\n{summary}",
-                            },
+                        pending_summary = (
+                            f"[Summary of earlier conversation]\n{summary}"
                         )
                     history_msgs = kept_block
                 else:
@@ -6580,16 +6595,24 @@ class Filter:
                         old_block, is_code_context=has_code
                     )
                     if summary:
-                        kept_block.insert(
-                            0,
-                            {
-                                "role": "system",
-                                "content": f"[Summary of earlier conversation]\n{summary}",
-                            },
+                        pending_summary = (
+                            f"[Summary of earlier conversation]\n{summary}"
                         )
                     history_msgs = kept_block
                 else:
                     history_msgs = kept_block
+
+        # ── Concatenate pending summary to the final system message ──
+        if pending_summary:
+            final_system = (
+                final_system + "\n\n" + pending_summary
+                if final_system
+                else pending_summary
+            )
+            pending_summary = ""
+
+        if final_system.strip():
+            messages.insert(0, {"role": "system", "content": final_system})
 
         messages = system_msgs + history_msgs
 
@@ -6650,28 +6673,6 @@ class Filter:
                 f"  TOTAL injected system tokens:          ~{total_system_tokens}"
             )
             self._log_debug("─" * 50)
-
-        return messages
-
-    async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
-        """Handle project switching, symbol cache loading. No secondary tasks here."""
-        messages = body.get("messages", [])
-
-        if self._last_project_id and self._last_project_id != project_id:
-            self._log_debug(
-                f"Project changed from {self._last_project_id} to {project_id}"
-            )
-            old_state = self._conversation_state.get(self._last_project_id)
-            if old_state:
-                self._remove_project_from_index_by_id(self._last_project_id, old_state)
-            self._cached_lightweight_context.pop(self._last_project_id, None)
-            self._block_change_summaries.clear()
-            self._symbol_analysis_cache.clear()
-        self._last_project_id = project_id
-
-        if project_id not in self._symbol_cache_loaded_projects:
-            await self._load_symbol_cache_from_db(project_id)
-            self._symbol_cache_loaded_projects.add(project_id)
 
         return messages
 
@@ -6792,6 +6793,7 @@ class Filter:
                 state,
                 __user__,
                 background_tasks,
+                user_question,  # ← cleaned question without code blocks
             )
 
             body["messages"] = messages
@@ -6845,47 +6847,43 @@ class Filter:
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
 
-        messages = body.get("messages", [])
-        project_id = self._get_project_id()
-        state = self._get_state(project_id)
-        is_code_session = await self._classify_session(messages, project_id)
-        last_msg = messages[-1] if messages else None
-        if last_msg:
-            last_idx = len(messages) - 1
-            if last_idx <= self._last_processed_message_idx.get(project_id, -1):
-                self._log_debug(
-                    "outlet: last message already processed in inlet, skipping"
-                )
-            else:
-                if (
-                    last_msg.get("role") == "assistant"
-                    and is_code_session
-                    and "/expand" in last_msg.get("content", "")
-                ):
-                    modified_content, did_expand = await self._outlet_intercept_expand(
-                        last_msg.get("content", ""), project_id
-                    )
-                    if did_expand:
-                        messages[-1]["content"] = modified_content
-                        body["messages"] = messages
-                        self._log_debug(
-                            "outlet: /expand intercepted — history rewritten with real code"
-                        )
+        # Pause the secondary task worker to avoid model slot competition
+        if hasattr(self, "_secondary_worker_paused"):
+            self._secondary_worker_paused.clear()
 
-                if last_msg.get("role") in ("user", "assistant"):
-                    if is_code_session:
-                        await self._update_active_code(last_msg, project_id)
-                        async with self._ltm_batch_lock:
-                            self._pending_ltm_messages.append(last_msg)
-                            if (
-                                self._ltm_batch_task is None
-                                or self._ltm_batch_task.done()
-                            ):
-                                self._ltm_batch_task = asyncio.create_task(
-                                    self._flush_ltm_batch(project_id)
-                                )
-                    else:
-                        if not self.valves.ltm_store_only_code_sessions:
+        try:
+            messages = body.get("messages", [])
+            project_id = self._get_project_id()
+            state = self._get_state(project_id)
+            is_code_session = await self._classify_session(messages, project_id)
+            last_msg = messages[-1] if messages else None
+            if last_msg:
+                last_idx = len(messages) - 1
+                if last_idx <= self._last_processed_message_idx.get(project_id, -1):
+                    self._log_debug(
+                        "outlet: last message already processed in inlet, skipping"
+                    )
+                else:
+                    if (
+                        last_msg.get("role") == "assistant"
+                        and is_code_session
+                        and "/expand" in last_msg.get("content", "")
+                    ):
+                        modified_content, did_expand = (
+                            await self._outlet_intercept_expand(
+                                last_msg.get("content", ""), project_id
+                            )
+                        )
+                        if did_expand:
+                            messages[-1]["content"] = modified_content
+                            body["messages"] = messages
+                            self._log_debug(
+                                "outlet: /expand intercepted — history rewritten with real code"
+                            )
+
+                    if last_msg.get("role") in ("user", "assistant"):
+                        if is_code_session:
+                            await self._update_active_code(last_msg, project_id)
                             async with self._ltm_batch_lock:
                                 self._pending_ltm_messages.append(last_msg)
                                 if (
@@ -6895,44 +6893,64 @@ class Filter:
                                     self._ltm_batch_task = asyncio.create_task(
                                         self._flush_ltm_batch(project_id)
                                     )
+                        else:
+                            if not self.valves.ltm_store_only_code_sessions:
+                                async with self._ltm_batch_lock:
+                                    self._pending_ltm_messages.append(last_msg)
+                                    if (
+                                        self._ltm_batch_task is None
+                                        or self._ltm_batch_task.done()
+                                    ):
+                                        self._ltm_batch_task = asyncio.create_task(
+                                            self._flush_ltm_batch(project_id)
+                                        )
 
-        # Response cache storage (with code_state_hash precomputed to avoid extra lock)
-        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
-            last_user = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
-            )
-            last_assistant = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"), None
-            )
-            if last_user and last_assistant:
-                context_hash = self._compute_context_hash(messages[:-1])
-                code_state_hash = self._compute_code_state_hash(project_id)
-                await self._store_response_in_cache(
-                    last_user.get("content", ""),
-                    last_assistant.get("content", ""),
-                    context_hash,
-                    state,
-                    code_state_hash,
+            # Response cache storage (with code_state_hash precomputed to avoid extra lock)
+            if (
+                self.valves.enable_response_cache
+                and HAS_SENTENCE
+                and len(messages) >= 2
+            ):
+                last_user = next(
+                    (m for m in reversed(messages) if m.get("role") == "user"), None
                 )
+                last_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                    None,
+                )
+                if last_user and last_assistant:
+                    context_hash = self._compute_context_hash(messages[:-1])
+                    code_state_hash = self._compute_code_state_hash(project_id)
+                    await self._store_response_in_cache(
+                        last_user.get("content", ""),
+                        last_assistant.get("content", ""),
+                        context_hash,
+                        state,
+                        code_state_hash,
+                    )
 
-        # Purge expired memories only if no purge is already running
-        if self._purge_task is None or self._purge_task.done():
-            self._purge_task = asyncio.create_task(self._purge_expired_memories())
+            # Purge expired memories only if no purge is already running
+            if self._purge_task is None or self._purge_task.done():
+                self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
-        self._write_counter += 1
-        if self._write_counter % 100 == 0:
-            self._purge_task = asyncio.create_task(self._run_db_checkpoints())
-            self._cleanup_completed_tasks()
+            self._write_counter += 1
+            if self._write_counter % 100 == 0:
+                self._purge_task = asyncio.create_task(self._run_db_checkpoints())
+                self._cleanup_completed_tasks()
 
-        # Save state if dirty (debounced)
-        await self._save_state_if_dirty(project_id)
+            # Save state if dirty (debounced)
+            await self._save_state_if_dirty(project_id)
 
-        # Free VRAM for the main model
-        try:
-            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-            self._last_used_model = None
-        except Exception:
-            pass
+            # Free VRAM for the main model
+            try:
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                self._last_used_model = None
+            except Exception:
+                pass
+        finally:
+            # Resume the secondary task worker
+            if hasattr(self, "_secondary_worker_paused"):
+                self._secondary_worker_paused.set()
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
@@ -6984,37 +7002,47 @@ class Filter:
     # Shutdown and cleanup
     # --------------------------------------------------------------------------
     def shutdown(self):
+        # Flush pending LTM batch synchronously with a short timeout
         if self._pending_ltm_messages:
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    asyncio.create_task(self._flush_ltm_batch(self._get_project_id()))
-            except RuntimeError:
+                    task = asyncio.create_task(
+                        self._flush_ltm_batch(self._get_project_id())
+                    )
+                    # Give it up to 2 seconds to complete
+                    loop.run_until_complete(asyncio.wait_for(task, timeout=2.0))
+            except Exception:
                 pass
 
+        # Cancel response cache cleanup task if it exists
         if (
             hasattr(self, "_response_cache_cleanup_task")
             and self._response_cache_cleanup_task is not None
         ):
             self._response_cache_cleanup_task.cancel()
 
-        # Cancel and wait for the database worker to finish cleanly
+        # Cancel the database worker cleanly – do NOT try to create a new task
         self._db_worker_task.cancel()
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self._db_worker_task)
-        except Exception:
-            pass
 
         # Cancel the secondary task worker
         if hasattr(self, "_secondary_task_worker_task"):
             self._secondary_task_worker_task.cancel()
 
-        for task_list in [self._dependency_tasks]:
-            for task in task_list:
-                task.cancel()
+        # Cancel dependency tasks and wait for them to finish
+        for task in self._dependency_tasks:
+            task.cancel()
+        if self._dependency_tasks:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.run_until_complete(
+                        asyncio.gather(*self._dependency_tasks, return_exceptions=True)
+                    )
+            except Exception:
+                pass
 
+        # Clear in‑memory structures
         self._symbol_index.clear()
         self._cached_lightweight_context.clear()
         self._project_locks.clear()
@@ -7690,7 +7718,13 @@ class Filter:
 
         # ── Process in batches ─────────────────────────────────────────
         for batch_start in range(0, total_symbols, batch_size):
+            batch_num = batch_start // batch_size + 1
+            total_batches = (total_symbols + batch_size - 1) // batch_size
             batch = symbol_entries[batch_start : batch_start + batch_size]
+            self._log_debug(
+                f"Symbol analysis batch {batch_num}/{total_batches} "
+                f"({len(batch)} symbols)"
+            )
 
             # Separate fresh vs cached
             fresh_entries = []
@@ -7791,6 +7825,10 @@ class Filter:
                 )
                 if batch_summary:
                     intermediate_summaries.append(batch_summary)
+
+            self._log_debug(
+                f"Symbol analysis batch {batch_num}/{total_batches} complete"
+            )
 
         if not intermediate_summaries:
             return "Symbol analysis produced no results.", []
