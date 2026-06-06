@@ -1488,9 +1488,7 @@ class Filter:
         return blocks, spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
-        if not HAS_AIOHTTP:
-            return "unknown"
-        # simple heuristic first
+        # Simple heuristic first
         if re.search(r"\bdef\s+\w+\s*\(", code_snippet):
             return "python"
         if re.search(r"\bfunction\s+\w+\s*\(", code_snippet):
