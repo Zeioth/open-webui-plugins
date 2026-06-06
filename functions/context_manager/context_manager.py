@@ -2409,17 +2409,6 @@ class Filter:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
 
-    async def _track_llm_task(self):
-        """Context manager that registers the current task as using the LLM."""
-        task = asyncio.current_task()
-        async with self._active_llm_tasks_lock:
-            self._active_llm_tasks.add(task)
-        try:
-            yield
-        finally:
-            async with self._active_llm_tasks_lock:
-                self._active_llm_tasks.discard(task)
-
     async def _wait_for_llm_tasks(self):
         """Block until all LLM-using tasks have completed."""
         while True:
@@ -2465,12 +2454,13 @@ class Filter:
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
-    async def _unload_models_under_lock(self):
+    async def _unload_models_under_lock(self, wait_for_tasks: bool = True):
         """
         Unload all models from the LLM server while holding the global file lock.
-        This prevents other processes/tasks from interfering during the unload/check cycle.
+        If wait_for_tasks is True, it ensures no LLM tasks are active first.
         """
-        await self._wait_for_llm_tasks()
+        if wait_for_tasks:
+            await self._wait_for_llm_tasks()
         llm_fd = await self._acquire_llm_lock()
         try:
             await _shared_unload_all_models(self.valves.LLM_BASE_URL)
@@ -6172,6 +6162,15 @@ class Filter:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
+        # ── Check if slot is free for CoT; if main model is loaded, skip CoT to avoid OOM ──
+        if cot_any_used:
+            slot_empty = await self._wait_for_empty_slot(retries=1, delay=0.5)
+            if not slot_empty:
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT skipped because main model is still loaded (no free slot)"
+                )
+                cot_any_used = False
+
         # ── 🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning ──
         if cot_any_used:
             self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
@@ -6569,14 +6568,12 @@ class Filter:
         await self._process_pending_secondary_tasks(project_id)
         _inlet_timing("Step 2/9: Process pending secondary tasks", step_start)
 
-        # ─────────────────────────────────────────────────────────────────
-        # 🚀 RESOURCE OPTIMISATION (Critical)
-        #   3. Free VRAM safely (global lock, avoids slot conflicts)
-        # ─────────────────────────────────────────────────────────────────
+        # NOTE: We no longer unload models at the start; the outlet handles cleanup.
+        # Step 3 is now a no‑op for resource optimisation.
         step_start = time.monotonic()
-        await self._wait_for_llm_tasks()
-        await self._unload_models_under_lock()
-        _inlet_timing("Step 3/9: Unload models safely (free VRAM)", step_start)
+        _inlet_timing(
+            "Step 3/9: Unload models safely (free VRAM) – SKIPPED", step_start
+        )
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
@@ -6747,11 +6744,13 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION (Critical)
             #   - Wait for any unfinished background tasks
-            #   - Free VRAM for the main model
+            #   - Free VRAM for the main model (but only if no main model is loaded)
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
-            await self._unload_models_under_lock()
+
+            # We do not force unload here; the outlet will do it.
+            # Avoid unloading the main model that is still in use.
 
             if _inlet_aborted:
                 for task in background_tasks:
