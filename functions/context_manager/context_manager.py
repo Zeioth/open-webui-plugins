@@ -914,6 +914,10 @@ class Filter:
             default=0,
             description="Maximum tokens allowed for all system injections combined (0 = unlimited).",
         )
+        exclude_filter_internals: bool = Field(
+            default=True,
+            description="Exclude symbols from the filter's own source code to prevent self-analysis. This prevent openwebui from analyzing its own code.",
+        )
 
         # ─── Smart Pre‑Expand ───
         smart_pre_expand_enabled: bool = Field(default=True)
@@ -1411,120 +1415,115 @@ class Filter:
 
         return task
 
-        # --------------------------------------------------------------------------
-        # Code extraction and classification
-        # --------------------------------------------------------------------------
-        async def _extract_code_blocks(
-            self, content: str
-        ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-            blocks = []
-            spans = []
-            if not self.valves.auto_detect_code_blocks:
-                return blocks, spans
-            # tree-sitter attempt
-            if HAS_TREE_SITTER:
-                try:
-                    config = ProcessConfig()
-                    ts_blocks = await anyio.to_thread.run_sync(
-                        lambda: process(content, config)
-                    )
-                    for tsb in ts_blocks:
-                        start, end = tsb.start_byte, tsb.end_byte
-                        raw = content[start:end].strip()
-                        lang = tsb.language or "text"
-                        if lang in ("text", ""):
-                            guessed = SignatureExtractor._guess_language(None, raw)
-                            if guessed != "unknown":
-                                lang = guessed
-                            else:
-                                lang = await self._infer_code_language(raw)
-                        lines = raw.splitlines()
-                        if lines and lines[0].startswith("```"):
-                            lines = lines[1:]
-                            if lines and lines[-1].startswith("```"):
-                                lines = lines[:-1]
-                            code = "\n".join(lines).strip()
-                            block_type = "fenced"
+    # --------------------------------------------------------------------------
+    # Code extraction and classification
+    # --------------------------------------------------------------------------
+    async def _extract_code_blocks(
+        self, content: str
+    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+        blocks = []
+        spans = []
+        if not self.valves.auto_detect_code_blocks:
+            return blocks, spans
+        # tree-sitter attempt
+        if HAS_TREE_SITTER:
+            try:
+                config = ProcessConfig()
+                ts_blocks = await anyio.to_thread.run_sync(
+                    lambda: process(content, config)
+                )
+                for tsb in ts_blocks:
+                    start, end = tsb.start_byte, tsb.end_byte
+                    raw = content[start:end].strip()
+                    lang = tsb.language or "text"
+                    if lang in ("text", ""):
+                        guessed = SignatureExtractor._guess_language(None, raw)
+                        if guessed != "unknown":
+                            lang = guessed
                         else:
-                            code = raw
-                            block_type = "indented"
-                        code = await self._handle_oversized_code_block(code, lang)
-                        blocks.append(
-                            {"language": lang, "code": code, "type": block_type}
-                        )
-                        spans.append((start, end))
-                    if blocks:
-                        return blocks, spans
-                except Exception:
-                    pass
+                            lang = await self._infer_code_language(raw)
+                    lines = raw.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        code = "\n".join(lines).strip()
+                        block_type = "fenced"
+                    else:
+                        code = raw
+                        block_type = "indented"
+                    code = await self._handle_oversized_code_block(code, lang)
+                    blocks.append({"language": lang, "code": code, "type": block_type})
+                    spans.append((start, end))
+                if blocks:
+                    return blocks, spans
+            except Exception:
+                pass
 
-            # Regex fallback
-            for match in self.code_pattern.finditer(content):
-                lang = match.group(1) or "text"
-                code = match.group(2).strip()
-                blocks.append({"language": lang, "code": code, "type": "fenced"})
-                spans.append((match.start(), match.end()))
-            # indented blocks
-            lines = content.split("\n")
-            line_offsets = [0]
-            for line in lines:
-                line_offsets.append(line_offsets[-1] + len(line) + 1)
-            indented = []
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-                if line.startswith(("    ", "\t")):
-                    indented.append(line.lstrip(" \t"))
-                    i += 1
-                else:
-                    if len(indented) >= 3:
-                        code = "\n".join(indented)
-                        blocks.append(
-                            {"language": "text", "code": code, "type": "indented"}
-                        )
-                        start_offset = line_offsets[i - len(indented)]
-                        end_offset = line_offsets[i] - 1
-                        spans.append((start_offset, end_offset))
-                    indented = []
-                    i += 1
-            if len(indented) >= 3:
-                code = "\n".join(indented)
-                blocks.append({"language": "text", "code": code, "type": "indented"})
-                start_offset = line_offsets[len(lines) - len(indented)]
-                end_offset = (
-                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
-                )
-                spans.append((start_offset, end_offset))
+        # Regex fallback
+        for match in self.code_pattern.finditer(content):
+            lang = match.group(1) or "text"
+            code = match.group(2).strip()
+            blocks.append({"language": lang, "code": code, "type": "fenced"})
+            spans.append((match.start(), match.end()))
+        # indented blocks
+        lines = content.split("\n")
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line) + 1)
+        indented = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith(("    ", "\t")):
+                indented.append(line.lstrip(" \t"))
+                i += 1
+            else:
+                if len(indented) >= 3:
+                    code = "\n".join(indented)
+                    blocks.append(
+                        {"language": "text", "code": code, "type": "indented"}
+                    )
+                    start_offset = line_offsets[i - len(indented)]
+                    end_offset = line_offsets[i] - 1
+                    spans.append((start_offset, end_offset))
+                indented = []
+                i += 1
+        if len(indented) >= 3:
+            code = "\n".join(indented)
+            blocks.append({"language": "text", "code": code, "type": "indented"})
+            start_offset = line_offsets[len(lines) - len(indented)]
+            end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+            spans.append((start_offset, end_offset))
 
-            # Post-processing and file path extraction
-            processed_blocks = []
-            processed_spans = []
-            for idx, block in enumerate(blocks):
-                blk_file = None
-                if self.valves.track_file_paths and spans:
-                    blk_file = self._extract_file_path_for_block(content, spans[idx][0])
-                if not blk_file and len(blocks) == 1:
-                    extracted_paths = self._extract_file_paths(content)
-                    blk_file = extracted_paths[0] if extracted_paths else None
+        # Post-processing and file path extraction with auto‑symbol filter
+        processed_blocks = []
+        processed_spans = []
+        for idx, block in enumerate(blocks):
+            blk_file = None
+            if self.valves.track_file_paths and spans:
+                blk_file = self._extract_file_path_for_block(content, spans[idx][0])
+            if not blk_file and len(blocks) == 1:
+                extracted_paths = self._extract_file_paths(content)
+                blk_file = extracted_paths[0] if extracted_paths else None
 
-                # === Exclude blocks that belong to the filter's own source code ===
-                if self.valves.exclude_filter_internals and blk_file:
-                    # Typical paths where OpenWebUI functions are stored
-                    if (
-                        "/app/backend/data/functions/" in blk_file
-                        or "open-webui/functions/" in blk_file
-                    ):
-                        continue  # skip this block entirely
-                # ================================================================
+            # === Exclude blocks that belong to the filter's own source code ===
+            if self.valves.exclude_filter_internals and blk_file:
+                if (
+                    "/app/backend/data/functions/" in blk_file
+                    or "open-webui/functions/" in blk_file
+                ):
+                    continue  # skip this block entirely
+            # ================================================================
 
-                block["code"] = await self._handle_oversized_code_block(
-                    block["code"], block["language"]
-                )
-                block["file_path"] = blk_file
-                processed_blocks.append(block)
-                processed_spans.append(spans[idx])
+            block["code"] = await self._handle_oversized_code_block(
+                block["code"], block["language"]
+            )
+            block["file_path"] = blk_file
+            processed_blocks.append(block)
+            processed_spans.append(spans[idx])
 
-            return processed_blocks, processed_spans
+        return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
         # Simple heuristic first
@@ -2502,6 +2501,41 @@ class Filter:
         fd = open(_llm_lock_path, "w")
         await loop.run_in_executor(self._db_executor, fcntl.flock, fd, fcntl.LOCK_EX)
         return fd
+
+    async def _wait_for_empty_slot(self, retries: int = 3, delay: float = 2.0) -> bool:
+        """
+        Check that the LLM server has no loaded models.
+        Retries a few times with a delay between checks.
+        Returns True if the slot is empty, False otherwise.
+        """
+        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3].rstrip("/")
+
+        for attempt in range(retries):
+            await asyncio.sleep(delay)
+            try:
+                session = await get_http_session(timeout=5)
+                async with session.get(f"{base_url}/v1/models") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        loaded_models = [
+                            m["id"]
+                            for m in data.get("data", [])
+                            if m.get("status", {}).get("value") == "loaded"
+                        ]
+                        self._log_debug(
+                            f"Models currently loaded: {loaded_models if loaded_models else 'none'}"
+                        )
+                        if not loaded_models:
+                            return True
+                    else:
+                        self._log_debug(f"Model list returned status {resp.status}")
+            except Exception as e:
+                self._log_debug(f"Error checking models: {e}")
+
+        self._log_debug(f"Slot still occupied after {retries} retries")
+        return False
 
     @staticmethod
     def _release_llm_lock(fd):
