@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 6.0.0
 license: GPL3
-requirements: aiohttp, loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
+requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
 """
 
 import os
@@ -2624,25 +2624,10 @@ class Filter:
                         return content
                 except asyncio.CancelledError:
                     raise
-                except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                    self._log_debug(
-                        f"[LLM] {model}{f' ({label})' if label else ''} "
-                        f"connection error: {exc}"
-                    )
-                    if attempt < max_retries:
-                        try:
-                            from shared_resources import close_http_session
-
-                            await close_http_session()
-                        except Exception:
-                            pass
-                        await asyncio.sleep(base_delay * (2**attempt))
-                        continue
-                    break
                 except RuntimeError as exc:
                     self._log_debug(
                         f"[LLM] {model}{f' ({label})' if label else ''} "
-                        f"HTTP error: {exc}"
+                        f"error: {exc}"
                     )
                     if any(c in str(exc) for c in ("429", "500", "502", "503", "504")):
                         if attempt < max_retries:
