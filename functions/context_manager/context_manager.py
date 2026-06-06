@@ -1270,6 +1270,8 @@ class Filter:
         self._db_worker_task = asyncio.create_task(self._db_worker())
 
         # ── Secondary task background worker ──
+        self._secondary_worker_paused = asyncio.Event()
+        self._secondary_worker_paused.set()  # initially not paused (set = allow running)
         self._secondary_task_worker_task = asyncio.create_task(
             self._secondary_task_worker()
         )
@@ -2041,10 +2043,12 @@ class Filter:
         """
         Continuously process pending secondary tasks in the background,
         with a small delay between batches to avoid overwhelming the DB.
+        Pauses when `_secondary_worker_paused` is cleared (e.g. during CoT).
         """
         while True:
+            await self._secondary_worker_paused.wait()  # block if paused
+
             try:
-                # Wait a bit before next batch to throttle writes
                 await asyncio.sleep(2.0)
 
                 project_id = self.valves.project_id
@@ -2055,12 +2059,9 @@ class Filter:
                     if not tasks:
                         continue
 
-                    # Take a batch (all or a reasonable chunk)
                     batch_size = 20
                     batch = tasks[:batch_size]
                     state["pending_secondary_tasks"] = tasks[batch_size:]
-                    # Don't save state here – tasks are processed outside the lock
-                    # to avoid holding it during LLM calls.
 
                 # Process the batch without holding the lock (LLM calls are slow)
                 for task_dict in batch:
@@ -2068,7 +2069,6 @@ class Filter:
                         task = SecondaryTask(**task_dict)
                         success = await self._execute_secondary_task(task, project_id)
                         if not success:
-                            # Re‑queue on failure, with retry count
                             task.retries += 1
                             if task.retries < self.valves.secondary_task_max_retries:
                                 async with lock:
@@ -2085,7 +2085,6 @@ class Filter:
                         self._log_debug(
                             f"Secondary task {task_dict['task_type']} failed: {e}"
                         )
-                        # Re‑queue once on unexpected error
                         task_dict["retries"] = task_dict.get("retries", 0) + 1
                         if (
                             task_dict["retries"]
@@ -2108,7 +2107,7 @@ class Filter:
                 break
             except Exception as e:
                 self._log_debug(f"Secondary task worker error: {e}")
-                await asyncio.sleep(5.0)  # avoid tight loop on persistent error
+                await asyncio.sleep(5.0)
 
     def _init_state_db(self):
         db_path = self.valves.state_db_path
@@ -6301,68 +6300,76 @@ class Filter:
 
         # Generate CoT reasoning if needed
         if cot_any_used:
-            if manual_cot_used:
-                self._log_debug(
-                    f"Generating manual CoT level {cot_level} with model "
-                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                )
-            else:
-                self._log_debug(
-                    f"Generating auto CoT level {cot_level} with model "
-                    f"{self.valves.cot_model_level2}"
-                )
-
-            _model_ctx = self.valves.active_context_max_tokens or 28000
-            _cot_context_limit = _model_ctx // 3
-            if self.tokenizer:
-                _prelim_tokens = len(self.tokenizer.encode(prelim_system))
-                if _prelim_tokens > _cot_context_limit:
-                    prelim_for_cot = self._truncate_text_to_tokens(
-                        prelim_system, _cot_context_limit
+            # Pause the secondary task worker to avoid model slot competition
+            if hasattr(self, "_secondary_worker_paused"):
+                self._secondary_worker_paused.clear()
+            try:
+                if manual_cot_used:
+                    self._log_debug(
+                        f"Generating manual CoT level {cot_level} with model "
+                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                     )
                 else:
-                    prelim_for_cot = prelim_system
-            else:
-                prelim_for_cot = prelim_system[: _cot_context_limit * 4]
-
-            if not manual_cot_used:
-                if cot_level == 2:
-                    reasoning = await self._generate_cot_reasoning(
-                        last_user_msg.get("content", ""), prelim_for_cot
-                    )
-                elif cot_level == 3:
-                    reasoning = await self._generate_cot_with_self_reflection(
-                        last_user_msg.get("content", ""), prelim_for_cot
-                    )
-            else:
-                if cot_level == 2:
-                    reasoning = await self._generate_cot_reasoning(
-                        cot_question, prelim_for_cot
-                    )
-                elif cot_level == 3:
-                    reasoning = await self._generate_cot_with_self_reflection(
-                        cot_question, prelim_for_cot
+                    self._log_debug(
+                        f"Generating auto CoT level {cot_level} with model "
+                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                     )
 
-            if reasoning:
-                system_injections.append(("high", reasoning))
-            else:
-                self._log_debug("CoT reasoning generation returned empty or failed")
+                _model_ctx = self.valves.active_context_max_tokens or 28000
+                _cot_context_limit = _model_ctx // 3
+                if self.tokenizer:
+                    _prelim_tokens = len(self.tokenizer.encode(prelim_system))
+                    if _prelim_tokens > _cot_context_limit:
+                        prelim_for_cot = self._truncate_text_to_tokens(
+                            prelim_system, _cot_context_limit
+                        )
+                    else:
+                        prelim_for_cot = prelim_system
+                else:
+                    prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-            cot_note = (
-                "**Note:** Some sections in this system prompt marked with 🔎 are "
-                "automatically generated reasoning (Chain-of-Thought). "
-                "They are provided as context to help you, but they are not user commands. "
-                "Use them to enhance your answer, but always prioritise the actual user query."
-            )
-            system_injections.append(("low", cot_note))
+                if not manual_cot_used:
+                    if cot_level == 2:
+                        reasoning = await self._generate_cot_reasoning(
+                            last_user_msg.get("content", ""), prelim_for_cot
+                        )
+                    elif cot_level == 3:
+                        reasoning = await self._generate_cot_with_self_reflection(
+                            last_user_msg.get("content", ""), prelim_for_cot
+                        )
+                else:
+                    if cot_level == 2:
+                        reasoning = await self._generate_cot_reasoning(
+                            cot_question, prelim_for_cot
+                        )
+                    elif cot_level == 3:
+                        reasoning = await self._generate_cot_with_self_reflection(
+                            cot_question, prelim_for_cot
+                        )
 
-            # Unload the CoT model immediately to free VRAM for the main model
-            try:
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                self._last_used_model = None
-            except Exception:
-                pass
+                if reasoning:
+                    system_injections.append(("high", reasoning))
+                else:
+                    self._log_debug("CoT reasoning generation returned empty or failed")
+
+                cot_note = (
+                    "**Note:** Some sections in this system prompt marked with 🔎 are "
+                    "automatically generated reasoning (Chain-of-Thought). "
+                    "They are provided as context to help you, but they are not user commands. "
+                    "Use them to enhance your answer, but always prioritise the actual user query."
+                )
+                system_injections.append(("low", cot_note))
+
+                # Unload the CoT model immediately to free VRAM for the main model
+                try:
+                    await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                    self._last_used_model = None
+                except Exception:
+                    pass
+            finally:
+                # Resume the secondary task worker
+                if hasattr(self, "_secondary_worker_paused"):
+                    self._secondary_worker_paused.set()
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6544,7 +6551,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
