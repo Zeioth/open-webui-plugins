@@ -1362,15 +1362,15 @@ class Filter:
         if not self.valves.debug:
             return
         line_len = 70
-        title_text = f"  {title}"
+        title_text = f"  {title}  "
         if duration is not None:
-            title_text += f" (dur={duration:.3f}s)"
+            title_text += f"(dur={duration:.3f}s)  "
         if len(title_text) > line_len - 2:
             title_text = title_text[: line_len - 5] + "..."
-        filler = "=" * ((line_len - len(title_text)) // 2)
-        line = f"{filler}{title_text}{filler}"
-        if len(line) < line_len:
-            line += "="
+        remaining = line_len - len(title_text)
+        left = remaining // 2
+        right = remaining - left
+        line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
 
     def _background_task(self, coro, name: str = "task", is_llm_task: bool = False):
