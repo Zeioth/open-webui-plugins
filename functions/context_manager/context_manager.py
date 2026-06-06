@@ -5849,19 +5849,26 @@ class Filter:
         return messages
 
     async def _inlet_extract_user_info(self, messages: List[dict]):
-        """Extract last user message and question, and detect explicit commands."""
+        """Extract last user message, question, and detect explicit commands."""
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
         user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
-        # Extract real question
+        # Extract real question and determine if there are code blocks
+        has_code_blocks = False
         user_question = user_query
         if last_user_msg and user_query:
             try:
-                spans = await self._get_code_spans(user_query)  # <-- await added
+                spans = await self._get_code_spans(user_query)
                 if spans:
                     user_question = self._remove_code_spans(user_query, spans).strip()
+                # Check for fenced code blocks independently of tree‑sitter
+                if "```" in user_query:
+                    has_code_blocks = True
+                # If spans were found, code blocks exist
+                if spans:
+                    has_code_blocks = True
             except Exception:
                 spans = None
             if not user_question or len(user_question) < 10:
@@ -5881,7 +5888,13 @@ class Filter:
             "content", ""
         ).startswith("/")
 
-        return last_user_msg, user_query, user_question, is_explicit_command
+        return (
+            last_user_msg,
+            user_query,
+            user_question,
+            is_explicit_command,
+            has_code_blocks,
+        )
 
     async def _inlet_handle_explicit_commands(
         self,
