@@ -3889,7 +3889,7 @@ class Filter:
             self._summarize_inactive_in_progress[project_id] = False
 
     async def _summarize_code_block(self, block: CodeBlock) -> Optional[str]:
-        if not self.valves.summarize_inactive_code or not HAS_AIOHTTP:
+        if not self.valves.summarize_inactive_code:
             return None
         if self.valves.defer_secondary_tasks:
             task = SecondaryTask(
@@ -5694,7 +5694,7 @@ class Filter:
     # Auto summaries for missing symbol docstrings
     # --------------------------------------------------------------------------
     async def _generate_missing_summaries(self, project_id: str):
-        if not self.valves.enable_auto_summaries or not HAS_AIOHTTP:
+        if not self.valves.enable_auto_summaries:
             return
         state = self._get_state(project_id)
         symbols_to_summarize = []
@@ -7373,8 +7373,6 @@ class Filter:
         self, block_hash: str, prev_content: str, new_content: str
     ):
         """Enqueue a change summary task (or run immediately if deferral disabled)."""
-        if not HAS_AIOHTTP:
-            return
         if self.valves.defer_secondary_tasks:
             task = SecondaryTask(
                 task_type="change_summary",
