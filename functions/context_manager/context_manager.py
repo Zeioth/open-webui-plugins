@@ -4483,11 +4483,15 @@ class Filter:
         context_hash: str,
         project_id: str,
         state: dict,
+        skip_contradiction: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
         tasks = [
             (
                 self._detect_contradictions(messages)
-                if self.valves.enable_contradiction_detection
+                if (
+                    self.valves.enable_contradiction_detection
+                    and not skip_contradiction
+                )
                 else self._noop()
             ),
             (
