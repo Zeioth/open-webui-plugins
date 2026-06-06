@@ -1994,82 +1994,8 @@ class Filter:
         return truncated.rstrip()
 
     # --------------------------------------------------------------------------
-    # Oversized code and sanitization
+    # State database
     # --------------------------------------------------------------------------
-    def _estimate_code_tokens(self, code: str) -> int:
-        if self.tokenizer:
-            return len(self.tokenizer.encode(code))
-        return len(code) // 4
-
-    async def _handle_oversized_code_block(self, code: str, language: str) -> str:
-        max_tokens = self.valves.max_code_block_tokens
-        if max_tokens <= 0:
-            return code
-        estimated = self._estimate_code_tokens(code)
-        if estimated <= max_tokens:
-            return code
-        action = self.valves.code_block_overflow_action.lower()
-        if action == "truncate":
-            lines = code.splitlines()
-            head = self.valves.code_block_truncate_keep_head
-            tail = self.valves.code_block_truncate_keep_tail
-            if len(lines) <= head + tail:
-                return code
-            return "\n".join(
-                lines[:head]
-                + [f"... [{len(lines) - head - tail} lines truncated] ..."]
-                + lines[-tail:]
-            )
-        elif action == "summarize":
-            model = (
-                self.valves.code_block_summary_model
-                or self.valves.llm_model
-                or self.valves.summarization_model
-            )
-            signatures = []
-            for match in re.finditer(
-                r"^\s*(def|class|function|fn|func|async def)\s+(\w+)[^(]*\([^)]*\)",
-                code,
-                re.MULTILINE | re.IGNORECASE,
-            ):
-                signatures.append(match.group(0).strip())
-            header = ""
-            if signatures:
-                header = (
-                    f"Signatures found ({len(signatures)}):\n"
-                    + "\n".join(signatures[:50])
-                    + "\n\n"
-                )
-            t0 = time.monotonic()
-            summary = await self._call_llm(
-                prompt=f"Summarize the following {language} code block.\n{header}First part of code:\n```{language}\n{code[:8000]}\n```",
-                system_prompt="You are a code summarization assistant.",
-                model_override=model,
-                max_tokens=self.valves.oversized_summary_max_tokens,
-                temperature=0.2,
-            )
-            dur = time.monotonic() - t0
-            self._log_timing("oversized_block_summarize", dur, dur)
-            return (
-                f"[Automatic summary of a {estimated} token code block]\n{summary}"
-                if summary
-                else f"[Code block too large, could not summarize] Original size: {estimated} tokens."
-            )
-        elif action == "warn":
-            return self.valves.code_block_warn_message
-        return code
-
-    @staticmethod
-    def _sanitize_signature(sig: str, max_len: int = 200) -> str:
-        safe = sig.replace("`", "'")
-        return safe[:max_len] + ("…" if len(safe) > max_len else "")
-
-    @staticmethod
-    def _sanitize_text(text: str) -> str:
-        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
-        cleaned = cleaned.replace("`", "'")
-        return cleaned
-
     async def _db_worker(self):
         """Serialize all database writes through a single task with global lock and retry."""
         try:
@@ -2102,9 +2028,6 @@ class Filter:
         finally:
             self._log_debug("DB worker exiting")
 
-    # --------------------------------------------------------------------------
-    # State database
-    # --------------------------------------------------------------------------
     def _init_state_db(self):
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -4205,7 +4128,7 @@ class Filter:
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Smart pre‑expand (unchanged logic)
+    # Smart pre‑expand
     # --------------------------------------------------------------------------
     async def _ensure_full_code_intent_embeddings(self):
         if self._full_code_intent_embeddings is not None:
