@@ -4981,9 +4981,9 @@ class Filter:
                     break
                 before = text[:idx].strip().split()[-3:]
                 if not any(neg in before for neg in self._COT_NEGATION_PREFIXES):
-                    return False  # found an occurrence without negation
+                    return False
                 start = idx + 1
-            return True  # all occurrences were negated
+            return True
 
         # ── Pre‑sort keyword lists once for efficient compound matching ────
         _sorted_deep = sorted(deep_keywords, key=len, reverse=True)
@@ -5012,14 +5012,11 @@ class Filter:
 
         signals = 0
         if self.ENABLE_KEYWORD_COUNT_WEIGHT:
-            # Count how many complex keywords matched (capped at 4)
             kw_matches = sum(
                 1
                 for kw in _sorted_complex
                 if kw in content_lower and not _is_negated(content_lower, kw)
             )
-            # Base offset ensures non‑trivial messages without keywords can still
-            # reach level 1 when combined with other signals.
             signals += min(kw_matches + 2, 4)
         else:
             if has_complex_kw:
