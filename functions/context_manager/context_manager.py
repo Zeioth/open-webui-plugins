@@ -6580,6 +6580,13 @@ class Filter:
         if not messages:
             return body
 
+        # Free VRAM before any LLM call, to avoid competing with the main model
+        try:
+            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+            self._last_used_model = None
+        except Exception:
+            pass
+
         # Extract user info (with await)
         last_user_msg, user_query, user_question, is_explicit_command = (
             await self._inlet_extract_user_info(messages)
