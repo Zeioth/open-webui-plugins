@@ -5718,6 +5718,9 @@ class Filter:
         """Build all system injections: LTM, code context, confidence, etc.
         Returns (system_injections, cached_response, prelim_system).
         """
+        self._log_debug(
+            "Building system injections (LTM, code context, symbol analysis, etc.)"
+        )
         system_injections: List[Tuple[str, str]] = []
 
         # LTM retrieval
@@ -5879,7 +5882,7 @@ class Filter:
                             )
             else:
                 is_structural = (
-                    await self._is_structural_task(user_question)  # ← Bug #2 corregido
+                    await self._is_structural_task(user_question)
                     if user_question
                     else False
                 )
@@ -5888,7 +5891,7 @@ class Filter:
                     injected_hashes: Set[str] = set()
                     if user_question:
                         pre_expanded = await self._smart_pre_expand(
-                            user_query=user_question,  # ← Bug #2 corregido
+                            user_query=user_question,
                             project_id=project_id,
                             token_budget=self.valves.smart_pre_expand_max_tokens,
                             seen_hashes=injected_hashes,
@@ -5912,7 +5915,7 @@ class Filter:
                     )
                     if user_question and not is_structural:
                         expanded = self._expand_referenced_symbols(
-                            project_id, user_question  # ← Bug #2 corregido
+                            project_id, user_question
                         )
                         if expanded:
                             active_ctx += "\n" + expanded
@@ -6038,6 +6041,9 @@ class Filter:
         has_code_blocks: bool,
     ) -> List[dict]:
         """Apply CoT, final token budget, trimming, and insert system prompt."""
+        self._log_debug(
+            "Assembling final messages (CoT, trimming, system prompt injection)"
+        )
 
         # Determine user intent for context reduction (also used by CoT detection)
         self._user_intent_full_code = await self._should_keep_full_code(user_question)
@@ -6398,22 +6404,30 @@ class Filter:
         #   2. Process pending secondary tasks (session summaries, etc.)
         #   4. Extract user info (last message, question, code blocks)
         # ─────────────────────────────────────────────────────────────────
+        self._log_debug("Step 1/9: Preprocess (project switch, cache load)")
         messages = await self._inlet_preprocess(body, project_id)
         if not messages:
             return body
 
+        self._log_debug(
+            "Step 2/9: Process pending secondary tasks (session summaries, etc.)"
+        )
         await self._process_pending_secondary_tasks(project_id)
 
         # ─────────────────────────────────────────────────────────────────
         # 🚀 RESOURCE OPTIMISATION (Critical)
         #   3. Free VRAM safely (global lock, avoids slot conflicts)
         # ─────────────────────────────────────────────────────────────────
+        self._log_debug("Step 3/9: Unload models safely (free VRAM)")
         await self._unload_models_under_lock()
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   (continued) 4. Extract user info
         # ─────────────────────────────────────────────────────────────────
+        self._log_debug(
+            "Step 4/9: Extract user info (last message, question, code blocks)"
+        )
         (
             last_user_msg,
             user_query,
@@ -6426,6 +6440,9 @@ class Filter:
         # ⚡ COMMAND HANDLING (High value)
         #   5. Explicit commands (/forget, /status, /clean, /expand)
         # ─────────────────────────────────────────────────────────────────
+        self._log_debug(
+            "Step 5/9: Handle explicit commands (/forget, /status, /clean, /expand)"
+        )
         handled, handled_messages = await self._inlet_handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
@@ -6441,6 +6458,9 @@ class Filter:
         # ⚡ COMMAND HANDLING (High value)
         #   6. Natural language intents (forget, remember, obsolete)
         # ─────────────────────────────────────────────────────────────────
+        self._log_debug(
+            "Step 6/9: Handle natural language intents (forget, remember, obsolete)"
+        )
         handled, handled_messages = await self._inlet_handle_natural_intents(
             messages, project_id, is_explicit_command, last_user_msg
         )
@@ -6468,6 +6488,9 @@ class Filter:
             #      - run immediate enrichment tasks (auto‑summaries)
             #      - evict blocks if max_active_blocks > 0
             # ─────────────────────────────────────────────────────────────
+            self._log_debug(
+                "Step 7/9: Prepare code session (classify, update blocks, immediate enrichment)"
+            )
             is_code_session, user_question = await self._inlet_prepare_code_session(
                 messages, project_id, user_query
             )
@@ -6488,6 +6511,9 @@ class Filter:
             #      - Parallel checks: contradictions, duplicate questions,
             #        response cache lookup
             # ─────────────────────────────────────────────────────────────
+            self._log_debug(
+                "Step 8/9: Build system injections (LTM, code context, symbol analysis, CoT detection, etc.)"
+            )
             system_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
                     messages,
@@ -6525,6 +6551,9 @@ class Filter:
             #      - Inject final system prompt respecting token budget
             #      - Display token breakdown (debug)
             # ─────────────────────────────────────────────────────────────
+            self._log_debug(
+                "Step 9/9: Assemble final messages (CoT, trim, token budget, system prompt)"
+            )
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 system_injections,
@@ -6549,6 +6578,9 @@ class Filter:
             # 🔥 STATE MANAGEMENT (Medium)
             #   - Save state if dirty (debounced write)
             #   - Process remaining secondary tasks (session summaries, etc.)
+            self._log_debug(
+                "Final: saving state and processing remaining secondary tasks"
+            )
             await self._save_state_if_dirty(project_id)
             lock = await self._get_project_lock(project_id)
             async with lock:
