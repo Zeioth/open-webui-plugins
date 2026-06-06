@@ -149,13 +149,8 @@ class CodeBlock(BaseModel):
     mention_count: int = 1
     last_mentioned: float = Field(default_factory=time.time)
     generated_by_assistant: bool = False
-    dependencies: List[str] = Field(default_factory=list)
-    potentially_affected: bool = False
     pinned: bool = False
-    affected_timestamp: float = 0.0
     obsolete: bool = False
-    ast_imports: List[str] = Field(default_factory=list)
-    ast_calls: List[str] = Field(default_factory=list)
     is_raw: bool = False
     symbols: List[CodeSymbol] = Field(default_factory=list)
     _cached_token_count: int = 0
@@ -187,7 +182,8 @@ class CodeBlock(BaseModel):
             base_score *= 0.8
         mention_boost = min(self.mention_count / 5, 3.0)
         recency_factor = 0.5 ** ((time.time() - self.last_mentioned) / 3600)
-        penalty = 0.7 if self.potentially_affected else 1.0
+        # The penalty for potentially_affected has been removed because that feature is gone
+        penalty = 1.0
         if self.obsolete:
             penalty = 0.1
             self.is_active = False
@@ -1287,7 +1283,6 @@ class Filter:
 
         # Background tasks tracking
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
-        self._dependency_tasks: List[asyncio.Task] = []
         self._write_counter = 0
         self._response_cache_cleanup_task: Optional[asyncio.Task] = None
 
@@ -1305,10 +1300,6 @@ class Filter:
         self._last_project_id: str = ""
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
         self._symbol_cache_loaded_projects: Set[str] = set()
-
-        # Smart pre‑expand prototype phrases
-        self._query_embedding_cache: Dict[str, np.ndarray] = {}
-        self._query_embedding_cache_max_size = 100
 
         # Response cache counter
         self._response_cache_count: Dict[str, int] = {}
@@ -1600,12 +1591,6 @@ class Filter:
             for i in range(start, min(end, len(chars))):
                 chars[i] = " "
         return "".join(chars)
-
-    def _is_span_in_code(
-        self, code_spans: List[Tuple[int, int]], span: Tuple[int, int]
-    ) -> bool:
-        s, e = span
-        return any(cs <= s and e <= ce for cs, ce in code_spans)
 
     def _classify_content(
         self, content: str, extracted_blocks: List[Dict]
@@ -2407,121 +2392,12 @@ class Filter:
         else:
             self._log_debug(f"Reusing model '{model_name}' (already loaded)")
 
-    @staticmethod
-    def _build_llm_request(
-        model_name: str,
-        prompt: str,
-        system_prompt: str,
-        temperature: float,
-        max_tokens: Optional[int],
-        is_ollama: bool,
-        ep_type: str,
-        base_url: str,
-        api_token: Optional[str],
-        openai_api_key: Optional[str],
-    ) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
-        headers = {"Content-Type": "application/json"}
-        if not is_ollama:
-            if api_token:
-                headers["Authorization"] = f"Bearer {api_token}"
-            elif openai_api_key:
-                headers["Authorization"] = f"Bearer {openai_api_key}"
-
-        if is_ollama:
-            url = f"{base_url}/api/generate"
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "system": system_prompt,
-                "stream": False,
-                "options": {"temperature": temperature},
-            }
-            if max_tokens is not None:
-                payload["options"]["num_predict"] = max_tokens
-        else:
-            if ep_type == "completion":
-                url = f"{base_url}/v1/completions"
-                payload = {
-                    "model": model_name,
-                    "prompt": (
-                        prompt if not system_prompt else f"{system_prompt}\n\n{prompt}"
-                    ),
-                    "temperature": temperature,
-                }
-            else:  # chat
-                url = f"{base_url}/v1/chat/completions"
-                payload = {
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": temperature,
-                }
-            if max_tokens is not None:
-                payload["max_tokens"] = max_tokens
-
-        return url, payload, headers
-
-    @staticmethod
-    def _parse_llm_response(data: Dict[str, Any], is_ollama: bool, ep_type: str) -> str:
-        if is_ollama:
-            content = data.get("response", "")
-            if not content:
-                err = data.get("error", "")
-                if err:
-                    raise RuntimeError(f"Ollama model error: {err}")
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                raise RuntimeError("OpenAI response has no choices")
-            if ep_type == "completion":
-                content = choices[0].get("text", "")
-            else:
-                content = choices[0].get("message", {}).get("content", "")
-        return content.strip()
-
     async def _acquire_llm_lock(self):
         """Acquire an inter‑process file lock for exclusive LLM access."""
         loop = asyncio.get_event_loop()
         fd = open(_llm_lock_path, "w")
         await loop.run_in_executor(self._db_executor, fcntl.flock, fd, fcntl.LOCK_EX)
         return fd
-
-    async def _wait_for_empty_slot(self, retries: int = 3, delay: float = 2.0) -> bool:
-        """
-        Check that the LLM server has no loaded models.
-        Retries a few times with a delay between checks.
-        Returns True if the slot is empty, False otherwise.
-        """
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3].rstrip("/")
-
-        for attempt in range(retries):
-            await asyncio.sleep(delay)
-            try:
-                session = await get_http_session(timeout=5)
-                async with session.get(f"{base_url}/v1/models") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        loaded_models = [
-                            m["id"]
-                            for m in data.get("data", [])
-                            if m.get("status", {}).get("value") == "loaded"
-                        ]
-                        self._log_debug(
-                            f"Models currently loaded: {loaded_models if loaded_models else 'none'}"
-                        )
-                        if not loaded_models:
-                            return True
-                    else:
-                        self._log_debug(f"Model list returned status {resp.status}")
-            except Exception as e:
-                self._log_debug(f"Error checking models: {e}")
-
-        self._log_debug(f"Slot still occupied after {retries} retries")
-        return False
 
     @staticmethod
     def _release_llm_lock(fd):
@@ -3089,68 +2965,6 @@ class Filter:
             self._pending_ltm_messages.clear()
             self._ltm_batch_task = None
         await self._batch_store_messages(project_id, messages_to_store)
-
-    async def _store_message_in_memory(self, message: dict, project_id: str):
-        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
-            return
-        content = message.get("content", "")
-        if not content or len(content.strip()) < 15:
-            return
-        embedding = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(content).tolist()
-        )
-        extracted, _ = await self._extract_code_blocks(content)
-        content_type = self._classify_content(content, extracted)
-        msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
-        expires_at = (
-            time.time() + (self.valves.long_term_memory_expiration_days * 86400)
-            if self.valves.long_term_memory_expiration_days > 0
-            else None
-        )
-        code_symbols_str = ""
-        if self.valves.ltm_index_symbols_enabled:
-            blocks_for_symbols = extracted if extracted else []
-            if not blocks_for_symbols:
-                blocks_for_symbols, _ = await self._extract_code_blocks(content)
-            if blocks_for_symbols:
-                all_symbols = set()
-                for blk in blocks_for_symbols:
-                    try:
-                        syms = await SignatureExtractor.extract_async(
-                            blk["code"], blk.get("language")
-                        )
-                        for sym in syms:
-                            if self._is_symbol_indexable(sym):
-                                all_symbols.add(sym.name)
-                                if (
-                                    len(all_symbols)
-                                    >= self.valves.ltm_symbol_index_max_per_message
-                                ):
-                                    break
-                    except Exception:
-                        pass
-                if all_symbols:
-                    code_symbols_str = "," + ",".join(sorted(all_symbols)) + ","
-        await anyio.to_thread.run_sync(
-            lambda: self.memory_collection.upsert(
-                ids=[msg_id],
-                embeddings=[embedding],
-                metadatas=[
-                    {
-                        "role": message.get("role"),
-                        "project_id": project_id,
-                        "timestamp": time.time(),
-                        "expires_at": expires_at,
-                        "content_type": content_type.value,
-                        "has_code": len(extracted) > 0,
-                        "code_symbols": code_symbols_str,
-                        "memory_id": msg_id,
-                    }
-                ],
-                documents=[content],
-            )
-        )
-        self._log_debug(f"Stored message {msg_id} in LTM")
 
     async def _retrieve_all_memories_unified(
         self, query: str, project_id: str
@@ -3890,69 +3704,67 @@ class Filter:
             self._invalidate_lightweight_cache(project_id)
             self._set_state(project_id, state)
 
-        async def _summarize_inactive_blocks_safely(self, project_id: str):
-            if self._summarize_inactive_in_progress.get(project_id, False):
+    async def _summarize_inactive_blocks_safely(self, project_id: str):
+        if self._summarize_inactive_in_progress.get(project_id, False):
+            return
+        self._summarize_inactive_in_progress[project_id] = True
+        try:
+            if not self.valves.summarize_inactive_code:
                 return
-            self._summarize_inactive_in_progress[project_id] = True
-            try:
-                if not self.valves.summarize_inactive_code:
-                    return
-                state = self._get_state(project_id)
-                if not state or not state["active_blocks"]:
-                    return
-                now = time.time()
-                timeout = self.valves.active_code_timeout_minutes * 60
-                to_summarize = []
-                for h, block in state["active_blocks"].items():
-                    if block.pinned or block.obsolete:
-                        continue
-                    if (
-                        not block.is_active
-                        and (now - block.timestamp) > timeout
-                        and block.importance_score < 5.0
-                    ):
-                        to_summarize.append((h, block))
-                if not to_summarize:
-                    return
+            state = self._get_state(project_id)
+            if not state or not state["active_blocks"]:
+                return
+            now = time.time()
+            timeout = self.valves.active_code_timeout_minutes * 60
+            to_summarize = []
+            for h, block in state["active_blocks"].items():
+                if block.pinned or block.obsolete:
+                    continue
+                if (
+                    not block.is_active
+                    and (now - block.timestamp) > timeout
+                    and block.importance_score < 5.0
+                ):
+                    to_summarize.append((h, block))
+            if not to_summarize:
+                return
 
-                async def _summarize_with_semaphore(block):
-                    async with self._low_priority_llm_semaphore:
-                        return await self._summarize_code_block(block)
+            async def _summarize_with_semaphore(block):
+                async with self._low_priority_llm_semaphore:
+                    return await self._summarize_code_block(block)
 
-                tasks = [_summarize_with_semaphore(block) for _, block in to_summarize]
-                summaries = await asyncio.gather(*tasks)
+            tasks = [_summarize_with_semaphore(block) for _, block in to_summarize]
+            summaries = await asyncio.gather(*tasks)
 
-                for (h, block), summary in zip(to_summarize, summaries):
-                    if summary:
-                        sig = self._extract_signature(block.content)
-                        if sig:
-                            summary = f"{sig}\n\n{summary}"
-                        self._symbol_index.remove_all_for_block(
-                            block.hash, block.symbols, project_id
+            for (h, block), summary in zip(to_summarize, summaries):
+                if summary:
+                    sig = self._extract_signature(block.content)
+                    if sig:
+                        summary = f"{sig}\n\n{summary}"
+                    self._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                    summary_content = f"[Summary of inactive code]\n{summary}"
+                    summary_block = CodeBlock(
+                        content=summary_content,
+                        content_type=ContentType.GENERAL,
+                        timestamp=time.time(),
+                        is_active=False,
+                        importance_score=block.importance_score * 0.5,
+                    )
+                    if self.tokenizer:
+                        summary_block._cached_token_count = len(
+                            self.tokenizer.encode(summary_content)
                         )
-                        summary_content = f"[Summary of inactive code]\n{summary}"
-                        summary_block = CodeBlock(
-                            content=summary_content,
-                            content_type=ContentType.GENERAL,
-                            timestamp=time.time(),
-                            is_active=False,
-                            importance_score=block.importance_score * 0.5,
-                        )
-                        if self.tokenizer:
-                            summary_block._cached_token_count = len(
-                                self.tokenizer.encode(summary_content)
-                            )
-                        else:
-                            summary_block._cached_token_count = (
-                                len(summary_content) // 4
-                            )
-                        state["active_blocks"][h] = summary_block
-                self._invalidate_lightweight_cache(project_id)
-                self._set_state(project_id, state)
-            except Exception as e:
-                self._log_debug(f"Error in summarize_inactive_blocks_safely: {e}")
-            finally:
-                self._summarize_inactive_in_progress[project_id] = False
+                    else:
+                        summary_block._cached_token_count = len(summary_content) // 4
+                    state["active_blocks"][h] = summary_block
+            self._invalidate_lightweight_cache(project_id)
+            self._set_state(project_id, state)
+        except Exception as e:
+            self._log_debug(f"Error in summarize_inactive_blocks_safely: {e}")
+        finally:
+            self._summarize_inactive_in_progress[project_id] = False
 
     async def _summarize_code_block(self, block: CodeBlock) -> Optional[str]:
         if not self.valves.summarize_inactive_code:
@@ -4290,20 +4102,6 @@ class Filter:
     # --------------------------------------------------------------------------
     # Smart pre‑expand
     # --------------------------------------------------------------------------
-    async def _ensure_full_code_intent_embeddings(self):
-        if self._full_code_intent_embeddings is not None:
-            return
-        if self.embedder is None:
-            self._log_debug(
-                "Embedder not available, skipping full code intent embeddings"
-            )
-            return
-        self._full_code_intent_embeddings = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(
-                self._full_code_intent_phrases, convert_to_numpy=True
-            )
-        )
-
     async def _smart_pre_expand(
         self,
         user_query: str,
@@ -4579,40 +4377,13 @@ class Filter:
     # --------------------------------------------------------------------------
     # Intent detection (natural language)
     # --------------------------------------------------------------------------
-
-    def _has_intent_keywords(self, text: str) -> bool:
-        return bool(
-            re.search(
-                r"\b(?:"
-                + "|".join(re.escape(kw) for kw in self.INTENT_KEYWORDS)
-                + r")\b",
-                text,
-                re.IGNORECASE,
-            )
-        )
-
-    async def _should_parse_intents(self, user_message: str, code_spans) -> bool:
-        cleaned = self._remove_code_spans(user_message, code_spans).strip()
-        if len(cleaned) < 15:
-            return False
-        if not self._has_intent_keywords(cleaned):
-            return False
-        code_ratio = sum(e - s for s, e in code_spans) / max(len(user_message), 1)
-        if code_ratio > 0.6:
-            return False
-        if self.QUESTION_PATTERNS.match(cleaned):
-            return False
-        return True
-
     async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
         if not self.valves.enable_natural_language_forget:
             none = {"action": "none"}
             return {"forget": none, "remember": none, "obsolete": none}
 
         code_spans = await self._get_code_spans(user_message)
-        if not await self._should_parse_intents(user_message, code_spans):
-            none = {"action": "none"}
-            return {"forget": none, "remember": none, "obsolete": none}
+        # (ya no filtramos con _should_parse_intents; la detección LLM se encarga)
 
         cleaned = self._remove_code_spans(user_message, code_spans).strip()
 
@@ -4814,17 +4585,6 @@ class Filter:
             level = 2
             question = rest
         return question, level
-
-    async def _generate_cot(self, question: str, context: str) -> str:
-        prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nThink step by step and provide your reasoning:"
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a helpful assistant that thinks step by step before answering.",
-            model_override=self.valves.cot_model,
-            max_tokens=self.valves.cot_max_tokens,
-            temperature=0.4,
-        )
-        return response if response else "Unable to generate reasoning."
 
     async def _detect_cot_level(self, user_content, is_code_session, state):
         """Determine CoT depth, optionally storing it in conversation state."""
@@ -5220,26 +4980,6 @@ class Filter:
                 f"### 🔁 Self-Reflection\n{refined}"
             )
         return reasoning
-
-    # --------------------------------------------------------------------------
-    # Assumption extraction helpers
-    # --------------------------------------------------------------------------
-    async def _parse_assumption_intent(self, user_content: str) -> Optional[str]:
-        if user_content.strip().startswith("/assume"):
-            target = user_content.strip()[7:].strip()
-            return target if target else None
-        return None
-
-    async def _extract_assumptions(self, target: str) -> str:
-        prompt = f"Analyze the following and list all assumptions it makes:\n\n{target}\n\nList each assumption clearly."
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are an expert at identifying hidden assumptions in text and code.",
-            model_override=self.valves.assumption_extraction_model,
-            max_tokens=600,
-            temperature=0.3,
-        )
-        return response if response else "No assumptions identified."
 
     # --------------------------------------------------------------------------
     # Structural / code review helpers
@@ -5754,62 +5494,6 @@ class Filter:
         )
         self._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
         return True
-
-    # --------------------------------------------------------------------------
-    # Auto summaries for missing symbol docstrings
-    # --------------------------------------------------------------------------
-    async def _generate_missing_summaries(self, project_id: str):
-        if not self.valves.enable_auto_summaries:
-            return
-        state = self._get_state(project_id)
-        symbols_to_summarize = []
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.summary:
-                    continue
-                if sym.kind not in ("function", "method"):
-                    continue
-                symbols_to_summarize.append((sym, block.content[:500]))
-
-        if not symbols_to_summarize:
-            return
-
-        if self.valves.defer_secondary_tasks:
-            for sym, code_snippet in symbols_to_summarize:
-                task = SecondaryTask(
-                    task_type="missing_summaries",
-                    params={
-                        "signature": sym.signature,
-                        "code_snippet": code_snippet,
-                        "project_id": project_id,
-                    },
-                )
-                state.setdefault("pending_secondary_tasks", []).append(task.dict())
-            self._set_state(project_id, state)
-            return
-
-        batch_size = 10
-        for i in range(0, len(symbols_to_summarize), batch_size):
-            batch = symbols_to_summarize[i : i + batch_size]
-            tasks = []
-            for sym, code_snippet in batch:
-                prompt = f"Summarize in one short sentence what this code does:\n\n```{sym.signature}\n{code_snippet}```"
-                tasks.append(
-                    self._call_llm(
-                        prompt=prompt,
-                        system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                        model_override=self.valves.summarization_model,
-                        max_tokens=50,
-                        temperature=0.1,
-                        semaphore=self._low_priority_llm_semaphore,
-                    )
-                )
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for (sym, _), resp in zip(batch, responses):
-                if isinstance(resp, str) and resp.strip():
-                    sym.summary = resp.strip()
-            await asyncio.sleep(1.0)
-        self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
     # Inlet helper methods
@@ -6889,6 +6573,10 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # OUTLET
     # ═══════════════════════════════════════════════════════════════════════════
+    # Value categories:
+    #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
+    #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
+    # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet called")
         start_time = time.monotonic()
@@ -6910,6 +6598,7 @@ class Filter:
                         "outlet: last message already processed in inlet, skipping"
                     )
                 else:
+                    # ── 🔥 STATE MANAGEMENT: intercept /expand commands ──
                     if (
                         last_msg.get("role") == "assistant"
                         and is_code_session
@@ -6927,6 +6616,7 @@ class Filter:
                                 "outlet: /expand intercepted — history rewritten with real code"
                             )
 
+                    # ── 🔥 STATE MANAGEMENT: update active code blocks & LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
                         if is_code_session:
                             await self._update_active_code(last_msg, project_id)
@@ -6951,7 +6641,7 @@ class Filter:
                                             self._flush_ltm_batch(project_id)
                                         )
 
-            # Response cache storage (with code_state_hash precomputed to avoid extra lock)
+            # 🚀 RESOURCE OPTIMISATION: response cache storage
             if (
                 self.valves.enable_response_cache
                 and HAS_SENTENCE
@@ -6975,22 +6665,21 @@ class Filter:
                         code_state_hash,
                     )
 
-            # Purge expired memories only if no purge is already running
+            # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
             if self._purge_task is None or self._purge_task.done():
                 self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
+            # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
             if self._write_counter % 100 == 0:
                 self._purge_task = asyncio.create_task(self._run_db_checkpoints())
-                self._cleanup_completed_tasks()
 
-            # Save state if dirty (debounced)
+            # 🔥 STATE MANAGEMENT: persist conversation state if dirty
             await self._save_state_if_dirty(project_id)
 
-            # Free VRAM for the main model
+            # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
             await self._unload_models_under_lock()
         finally:
-            # No secondary worker to resume – nothing to do
             pass
 
         self._log_section(
@@ -7063,25 +6752,8 @@ class Filter:
         ):
             self._response_cache_cleanup_task.cancel()
 
-        # Cancel the database worker cleanly – do NOT try to create a new task
+        # Cancel the database worker cleanly
         self._db_worker_task.cancel()
-
-        # Cancel the secondary task worker
-        if hasattr(self, "_secondary_task_worker_task"):
-            self._secondary_task_worker_task.cancel()
-
-        # Cancel dependency tasks and wait for them to finish
-        for task in self._dependency_tasks:
-            task.cancel()
-        if self._dependency_tasks:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.run_until_complete(
-                        asyncio.gather(*self._dependency_tasks, return_exceptions=True)
-                    )
-            except Exception:
-                pass
 
         # Clear in‑memory structures
         self._symbol_index.clear()
@@ -7091,9 +6763,6 @@ class Filter:
         # Shut down thread pools
         self._db_executor.shutdown(wait=True)
         self._chroma_executor.shutdown(wait=True)
-
-    def _cleanup_completed_tasks(self):
-        self._dependency_tasks = [t for t in self._dependency_tasks if not t.done()]
 
     # --------------------------------------------------------------------------
     # Miscellaneous helpers
@@ -7106,21 +6775,6 @@ class Filter:
             common = sum(1 for a, b in zip(code1[:min_len], code2[:min_len]) if a == b)
             return common / max(len(code1), len(code2))
         return fuzz.token_sort_ratio(code1, code2) / 100.0
-
-    def _is_duplicate_code(
-        self, new_block: CodeBlock, existing_blocks: List[CodeBlock]
-    ) -> Tuple[bool, Optional[CodeBlock]]:
-        new_len = len(new_block.content)
-        for ex in existing_blocks:
-            ex_len = len(ex.content)
-            if ex_len > 0 and abs(new_len - ex_len) > 0.2 * max(new_len, ex_len):
-                continue
-            if (
-                self._calculate_code_similarity(new_block.content, ex.content)
-                >= self.valves.code_similarity_threshold
-            ):
-                return True, ex
-        return False, None
 
     def _has_conflicting_proposed_changes(
         self, state: Dict, new_block: CodeBlock
