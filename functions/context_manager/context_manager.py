@@ -1179,10 +1179,22 @@ class Filter:
         "conserva",
     }
 
-    QUESTION_PATTERNS = re.compile(
-        r"^\s*(how|what|why|when|where|can you|could you|please|fix|help|"
-        r"cómo|qué|por qué|arregla|ayuda|explica)\b",
-        re.IGNORECASE,
+    _COT_NEGATION_PREFIXES: frozenset = frozenset(
+        {
+            "don't",
+            "do not",
+            "dont",
+            "no need to",
+            "without",
+            "not",
+            "never",
+            "avoid",
+            "skip",
+            "no",
+            "sin",
+            "no hace falta",
+            "no es necesario",
+        }
     )
 
     # --------------------------------------------------------------------------
