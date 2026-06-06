@@ -1756,6 +1756,152 @@ class Filter:
             f"{pin}{raw}"
         )
 
+    def _get_active_code_context(self, project_id: str, user_query: str = "") -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        now = time.time()
+        active = []
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            if not block.is_active and self.valves.track_active_code_age:
+                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
+                    continue
+            active.append(block)
+        if not active:
+            return ""
+
+        recent_window = self.valves.recent_activity_window_minutes * 60
+        recent_files = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in recent_files
+                    or b.timestamp > recent_files[b.file_path]
+                ):
+                    recent_files[b.file_path] = b.timestamp
+        recent_lines = []
+        for file_path, ts in recent_files.items():
+            age_seconds = now - ts
+            if age_seconds <= recent_window:
+                minutes_ago = int(age_seconds / 60)
+                time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
+                recent_lines.append(f"- `{file_path}` ({time_str})")
+        recent_section = ""
+        if recent_lines:
+            recent_section = (
+                f"## Recent Activity (last {self.valves.recent_activity_window_minutes} min)\n"
+                + "\n".join(recent_lines)
+                + "\n\n"
+            )
+
+        mentioned_files = set()
+        mentioned_symbols = set()
+        if user_query:
+            mentioned_files = set(re.findall(self.valves.file_path_pattern, user_query))
+            all_symbol_names = self._symbol_index.get_all_names(project_id)
+            words = set(re.findall(r"\b[\w-]+\b", user_query))
+            mentioned_symbols = all_symbol_names.intersection(words)
+
+        BOOST = 5.0
+
+        def relevance_boost(block: CodeBlock) -> float:
+            score = 0.0
+            if block.file_path and block.file_path in mentioned_files:
+                score += BOOST
+            for sym in block.symbols:
+                if sym.name in mentioned_symbols:
+                    score += BOOST
+                    break
+            return score
+
+        boosted_active = []
+        for b in active:
+            boost = relevance_boost(b)
+            boosted_active.append((b, boost))
+        boost_priority = self.valves.raw_file_priority_boost
+        boosted_active.sort(
+            key=lambda pair: (
+                pair[1] > 0,
+                pair[1],
+                pair[0].importance_score + (boost_priority if pair[0].is_raw else 0),
+            ),
+            reverse=True,
+        )
+
+        latest_per_file = {}
+        for b in active:
+            if b.file_path:
+                if (
+                    b.file_path not in latest_per_file
+                    or b.timestamp > latest_per_file[b.file_path].timestamp
+                ):
+                    latest_per_file[b.file_path] = b
+        latest_hashes = {b.hash for b in latest_per_file.values()}
+
+        base_codes = [
+            b for b, _ in boosted_active if b.content_type == ContentType.BASE_CODE
+        ][: self.valves.max_base_code_blocks]
+        proposed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.PROPOSED_CHANGE
+        ][: self.valves.max_proposed_changes]
+        committed = [
+            b
+            for b, _ in boosted_active
+            if b.content_type == ContentType.COMMITTED_CHANGE
+        ][: self.valves.max_committed_changes]
+        errors = (
+            [b for b, _ in boosted_active if b.content_type == ContentType.ERROR][:3]
+            if self.valves.preserve_error_context
+            else []
+        )
+
+        parts = ["## Currently Active Code Context (by importance)\n"]
+        parts.insert(
+            1,
+            "> **Note**: If multiple versions of a file appear, the one marked [LATEST] is the most recent and should be used.\n",
+        )
+        if recent_section:
+            parts.insert(0, recent_section)
+
+        if base_codes:
+            parts.append("### Base Code (current work):")
+            for b in base_codes:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if proposed:
+            parts.append("### Proposed Changes (pending review):")
+            for b in proposed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if committed:
+            parts.append("### Recently Committed Changes:")
+            for b in committed:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+        if errors:
+            parts.append("### Recent Errors:")
+            for b in errors:
+                is_latest = b.hash in latest_hashes
+                tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
+                parts.append(self._format_block_context(b, is_latest) + tag)
+
+        max_tokens = self.valves.active_context_max_tokens
+        if max_tokens > 0 and self.tokenizer:
+            full_text = "\n".join(parts)
+            while len(self.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3:
+                parts.pop()
+                full_text = "\n".join(parts)
+            if len(self.tokenizer.encode(full_text)) > max_tokens:
+                parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
+        return "\n".join(parts)
+
     async def _build_lightweight_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
         if not state or not state["active_blocks"]:
