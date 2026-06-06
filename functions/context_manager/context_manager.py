@@ -55,13 +55,6 @@ except ImportError:
     HAS_CHROMA = False
 
 try:
-    import aiohttp
-
-    HAS_AIOHTTP = True
-except ImportError:
-    HAS_AIOHTTP = False
-
-try:
     from rapidfuzz import fuzz
 
     HAS_FUZZ = True
@@ -1248,7 +1241,6 @@ class Filter:
             self._load_reranker()
 
         # HTTP session and locks
-        self._http_session: Optional[aiohttp.ClientSession] = None
         self._project_locks: Dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
 
@@ -2557,9 +2549,6 @@ class Filter:
         response_format: Optional[Dict[str, Any]] = None,
         label: str = "",
     ) -> Optional[str]:
-        if not HAS_AIOHTTP:
-            return None
-
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
