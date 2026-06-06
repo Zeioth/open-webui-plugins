@@ -6565,6 +6565,16 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Value categories (see project documentation):
+    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
+    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
+    #   🧠 ENRICHMENT          – Features that add information to the system prompt
+    #   📦 COMPRESSION         – Features that reduce context size to fit the window
+    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
+    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6770,13 +6780,13 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION (Critical)
             #   - Wait for any unfinished background tasks
-            #   - Free VRAM for the main model (but only if no main model is loaded)
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
 
-            # We do not force unload here; the outlet will do it.
-            # Avoid unloading the main model that is still in use.
+            # Unload any auxiliary models we may have loaded during enrichment/CoT
+            # so that OpenWebUI has a free slot for the main model.
+            await self._unload_models_under_lock(wait_for_tasks=False)
 
             if _inlet_aborted:
                 for task in background_tasks:
