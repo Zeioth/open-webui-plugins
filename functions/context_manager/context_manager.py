@@ -862,7 +862,11 @@ class Filter:
         max_committed_changes: int = Field(default=10)
         prioritize_recent_code: bool = Field(default=True)
         auto_detect_code_blocks: bool = Field(default=True)
-        max_active_blocks: int = Field(default=50)
+        max_active_blocks: int = Field(
+            default=0,
+            ge=0,
+            description="Maximum number of active code blocks to keep (0 = unlimited). If you limit this value, the remaining symbols will be just inclued without beign enriched.",
+        )
         track_file_paths: bool = Field(default=True)
         file_path_pattern: str = Field(
             default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
@@ -1286,13 +1290,6 @@ class Filter:
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
         self._db_worker_task = asyncio.create_task(self._db_worker())
 
-        # ── Secondary task background worker ──
-        self._secondary_worker_paused = asyncio.Event()
-        self._secondary_worker_paused.set()  # initially not paused (set = allow running)
-        self._secondary_task_worker_task = asyncio.create_task(
-            self._secondary_task_worker()
-        )
-
         # Background tasks tracking
         self._summarize_inactive_in_progress: Dict[str, bool] = {}
         self._dependency_tasks: List[asyncio.Task] = []
@@ -1332,6 +1329,10 @@ class Filter:
         # ── New: LRU-ordered cache for block change summaries (max size from valves) ──
         self._block_change_summaries: OrderedDict = OrderedDict()
         self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
+
+        # ── Dependency extraction cache (small LRU to avoid repeated LLM calls) ──
+        self._deps_cache: OrderedDict = OrderedDict()
+        self._MAX_DEPS_CACHE = 200
 
         # ── New: Dedicated thread pools for blocking DB and ChromaDB operations ──
         import concurrent.futures
@@ -1410,92 +1411,120 @@ class Filter:
 
         return task
 
-    # --------------------------------------------------------------------------
-    # Code extraction and classification
-    # --------------------------------------------------------------------------
-    async def _extract_code_blocks(
-        self, content: str
-    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        blocks = []
-        spans = []
-        if not self.valves.auto_detect_code_blocks:
-            return blocks, spans
-        # tree-sitter attempt
-        if HAS_TREE_SITTER:
-            try:
-                config = ProcessConfig()
-                ts_blocks = await anyio.to_thread.run_sync(
-                    lambda: process(content, config)
-                )
-                for tsb in ts_blocks:
-                    start, end = tsb.start_byte, tsb.end_byte
-                    raw = content[start:end].strip()
-                    lang = tsb.language or "text"
-                    if lang in ("text", ""):
-                        guessed = SignatureExtractor._guess_language(None, raw)
-                        if guessed != "unknown":
-                            lang = guessed
-                        else:
-                            lang = await self._infer_code_language(raw)
-                    lines = raw.splitlines()
-                    if lines and lines[0].startswith("```"):
-                        lines = lines[1:]
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        code = "\n".join(lines).strip()
-                        block_type = "fenced"
-                    else:
-                        code = raw
-                        block_type = "indented"
-                    code = await self._handle_oversized_code_block(code, lang)
-                    blocks.append({"language": lang, "code": code, "type": block_type})
-                    spans.append((start, end))
-                if blocks:
-                    return blocks, spans
-            except Exception:
-                pass
-
-        # Regex fallback
-        for match in self.code_pattern.finditer(content):
-            lang = match.group(1) or "text"
-            code = match.group(2).strip()
-            blocks.append({"language": lang, "code": code, "type": "fenced"})
-            spans.append((match.start(), match.end()))
-        # indented blocks
-        lines = content.split("\n")
-        line_offsets = [0]
-        for line in lines:
-            line_offsets.append(line_offsets[-1] + len(line) + 1)
-        indented = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if line.startswith(("    ", "\t")):
-                indented.append(line.lstrip(" \t"))
-                i += 1
-            else:
-                if len(indented) >= 3:
-                    code = "\n".join(indented)
-                    blocks.append(
-                        {"language": "text", "code": code, "type": "indented"}
+        # --------------------------------------------------------------------------
+        # Code extraction and classification
+        # --------------------------------------------------------------------------
+        async def _extract_code_blocks(
+            self, content: str
+        ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+            blocks = []
+            spans = []
+            if not self.valves.auto_detect_code_blocks:
+                return blocks, spans
+            # tree-sitter attempt
+            if HAS_TREE_SITTER:
+                try:
+                    config = ProcessConfig()
+                    ts_blocks = await anyio.to_thread.run_sync(
+                        lambda: process(content, config)
                     )
-                    start_offset = line_offsets[i - len(indented)]
-                    end_offset = line_offsets[i] - 1
-                    spans.append((start_offset, end_offset))
-                indented = []
-                i += 1
-        if len(indented) >= 3:
-            code = "\n".join(indented)
-            blocks.append({"language": "text", "code": code, "type": "indented"})
-            start_offset = line_offsets[len(lines) - len(indented)]
-            end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
-            spans.append((start_offset, end_offset))
+                    for tsb in ts_blocks:
+                        start, end = tsb.start_byte, tsb.end_byte
+                        raw = content[start:end].strip()
+                        lang = tsb.language or "text"
+                        if lang in ("text", ""):
+                            guessed = SignatureExtractor._guess_language(None, raw)
+                            if guessed != "unknown":
+                                lang = guessed
+                            else:
+                                lang = await self._infer_code_language(raw)
+                        lines = raw.splitlines()
+                        if lines and lines[0].startswith("```"):
+                            lines = lines[1:]
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            code = "\n".join(lines).strip()
+                            block_type = "fenced"
+                        else:
+                            code = raw
+                            block_type = "indented"
+                        code = await self._handle_oversized_code_block(code, lang)
+                        blocks.append(
+                            {"language": lang, "code": code, "type": block_type}
+                        )
+                        spans.append((start, end))
+                    if blocks:
+                        return blocks, spans
+                except Exception:
+                    pass
 
-        for i in range(len(blocks)):
-            blocks[i]["code"] = await self._handle_oversized_code_block(
-                blocks[i]["code"], blocks[i]["language"]
-            )
-        return blocks, spans
+            # Regex fallback
+            for match in self.code_pattern.finditer(content):
+                lang = match.group(1) or "text"
+                code = match.group(2).strip()
+                blocks.append({"language": lang, "code": code, "type": "fenced"})
+                spans.append((match.start(), match.end()))
+            # indented blocks
+            lines = content.split("\n")
+            line_offsets = [0]
+            for line in lines:
+                line_offsets.append(line_offsets[-1] + len(line) + 1)
+            indented = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith(("    ", "\t")):
+                    indented.append(line.lstrip(" \t"))
+                    i += 1
+                else:
+                    if len(indented) >= 3:
+                        code = "\n".join(indented)
+                        blocks.append(
+                            {"language": "text", "code": code, "type": "indented"}
+                        )
+                        start_offset = line_offsets[i - len(indented)]
+                        end_offset = line_offsets[i] - 1
+                        spans.append((start_offset, end_offset))
+                    indented = []
+                    i += 1
+            if len(indented) >= 3:
+                code = "\n".join(indented)
+                blocks.append({"language": "text", "code": code, "type": "indented"})
+                start_offset = line_offsets[len(lines) - len(indented)]
+                end_offset = (
+                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                )
+                spans.append((start_offset, end_offset))
+
+            # Post-processing and file path extraction
+            processed_blocks = []
+            processed_spans = []
+            for idx, block in enumerate(blocks):
+                blk_file = None
+                if self.valves.track_file_paths and spans:
+                    blk_file = self._extract_file_path_for_block(content, spans[idx][0])
+                if not blk_file and len(blocks) == 1:
+                    extracted_paths = self._extract_file_paths(content)
+                    blk_file = extracted_paths[0] if extracted_paths else None
+
+                # === Exclude blocks that belong to the filter's own source code ===
+                if self.valves.exclude_filter_internals and blk_file:
+                    # Typical paths where OpenWebUI functions are stored
+                    if (
+                        "/app/backend/data/functions/" in blk_file
+                        or "open-webui/functions/" in blk_file
+                    ):
+                        continue  # skip this block entirely
+                # ================================================================
+
+                block["code"] = await self._handle_oversized_code_block(
+                    block["code"], block["language"]
+                )
+                block["file_path"] = blk_file
+                processed_blocks.append(block)
+                processed_spans.append(spans[idx])
+
+            return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
         # Simple heuristic first
@@ -2038,83 +2067,6 @@ class Filter:
         finally:
             self._log_debug("DB worker exiting")
 
-    async def _secondary_task_worker(self):
-        """
-        Continuously process pending secondary tasks in the background,
-        with a small delay between batches to avoid overwhelming the DB.
-        Pauses when `_secondary_worker_paused` is cleared (e.g. during inlet).
-        """
-        while True:
-            await self._secondary_worker_paused.wait()  # block if paused
-
-            try:
-                await asyncio.sleep(2.0)
-
-                project_id = self.valves.project_id
-                lock = await self._get_project_lock(project_id)
-                async with lock:
-                    state = self._get_state(project_id)
-                    tasks = state.get("pending_secondary_tasks", [])
-                    if not tasks:
-                        continue
-
-                    batch_size = 20
-                    batch = tasks[:batch_size]
-                    state["pending_secondary_tasks"] = tasks[batch_size:]
-
-                # Process the batch without holding the project lock (LLM calls are slow)
-                for task_dict in batch:
-                    try:
-                        task = SecondaryTask(**task_dict)
-                        success = await self._execute_secondary_task(task, project_id)
-                        if not success:
-                            task.retries += 1
-                            if task.retries < self.valves.secondary_task_max_retries:
-                                async with lock:
-                                    state = self._get_state(project_id)
-                                    state.setdefault(
-                                        "pending_secondary_tasks", []
-                                    ).append(task.dict())
-                                    self._set_state(project_id, state)
-                            else:
-                                self._log_debug(
-                                    f"Dropping secondary task {task.task_type} after {task.retries} retries"
-                                )
-                    except Exception as e:
-                        import traceback
-
-                        self._log_debug(
-                            f"Secondary task {task_dict.get('task_type', 'unknown')} "
-                            f"failed: {e}\n{traceback.format_exc()}"
-                        )
-                        task_dict["retries"] = task_dict.get("retries", 0) + 1
-                        if (
-                            task_dict["retries"]
-                            < self.valves.secondary_task_max_retries
-                        ):
-                            async with lock:
-                                state = self._get_state(project_id)
-                                state.setdefault("pending_secondary_tasks", []).append(
-                                    task_dict
-                                )
-                                self._set_state(project_id, state)
-
-                # Persist the final state after processing the batch
-                async with lock:
-                    state = self._get_state(project_id)
-                    self._set_state(project_id, state)
-
-            except asyncio.CancelledError:
-                self._log_debug("Secondary task worker shutting down")
-                break
-            except Exception as e:
-                import traceback
-
-                self._log_debug(
-                    f"Secondary task worker error: {e}\n{traceback.format_exc()}"
-                )
-                await asyncio.sleep(5.0)
-
     def _init_state_db(self):
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -2585,6 +2537,23 @@ class Filter:
             except Exception:
                 pass
         return False
+
+    async def _unload_models_under_lock(self):
+        """
+        Unload all models from the LLM server while holding the global file lock.
+        This prevents other processes/tasks from interfering during the unload/check cycle.
+        """
+        llm_fd = await self._acquire_llm_lock()
+        try:
+            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+            self._last_used_model = None
+            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
+            if not slot_empty:
+                self._log_debug("Slot not empty after unload – forcing extra unload")
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                await self._wait_for_empty_slot(retries=2, delay=3.0)
+        finally:
+            self._release_llm_lock(llm_fd)
 
     async def _call_llm(
         self,
@@ -3754,16 +3723,6 @@ class Filter:
                         new_block.importance_score + 3.0, 10.0
                     )
 
-                if len(state["active_blocks"]) > self.valves.max_active_blocks:
-                    sorted_blocks = sorted(
-                        state["active_blocks"].values(),
-                        key=lambda b: b.importance_score
-                        + (self.valves.raw_file_priority_boost if b.is_raw else 0),
-                        reverse=True,
-                    )
-                    keep = sorted_blocks[: self.valves.max_active_blocks]
-                    state["active_blocks"] = {b.hash: b for b in keep}
-
                 if (
                     self.valves.enable_dependency_tracking
                     and new_block.content_type
@@ -3859,14 +3818,101 @@ class Filter:
             self._background_task(
                 self._clean_affected_flags(project_id), name="clean_affected_flags"
             )
-            if self.valves.enable_auto_summaries:
-                self._background_task(
-                    self._generate_missing_summaries(project_id),
-                    name="generate_missing_summaries",
-                    is_llm_task=True,
-                )
 
-            # ── Session summary (autobiographical mini‑memory) ──
+            # ── Enrichment tasks (run immediately with limited concurrency) ──
+            tasks_to_run = []
+            max_tasks_per_type = 5  # avoid overwhelming the LLM
+
+            for block in list(state["active_blocks"].values()):
+                if block.obsolete:
+                    continue
+
+                # Auto‑summaries for symbols missing summaries
+                if self.valves.enable_auto_summaries:
+                    syms_without_summary = [
+                        s
+                        for s in block.symbols
+                        if not s.summary and s.kind in ("function", "method")
+                    ]
+                    for sym in syms_without_summary[:3]:  # at most 3 per block
+                        tasks_to_run.append(
+                            (
+                                "missing_summaries",
+                                {
+                                    "signature": sym.signature,
+                                    "code_snippet": block.content[:500],
+                                    "project_id": project_id,
+                                },
+                            )
+                        )
+                        if len(tasks_to_run) >= max_tasks_per_type:
+                            break
+
+                # Dependency refresh for blocks that lack dependencies
+                if self.valves.enable_dependency_tracking and not block.dependencies:
+                    tasks_to_run.append(
+                        (
+                            "dependency_refresh",
+                            {
+                                "block_hash": block.hash,
+                                "project_id": project_id,
+                            },
+                        )
+                    )
+                    if len(tasks_to_run) >= max_tasks_per_type * 2:
+                        break
+
+            if tasks_to_run:
+                sem = self._secondary_llm_semaphore
+
+                async def _run_one(task_type, params):
+                    try:
+                        if task_type == "missing_summaries":
+                            await self._run_missing_summaries_task(
+                                params, self.valves.secondary_task_model, sem
+                            )
+                        elif task_type == "dependency_refresh":
+                            await self._run_dependency_refresh_task(
+                                params, self.valves.secondary_task_model, sem
+                            )
+                    except Exception as e:
+                        self._log_debug(
+                            f"Immediate enrichment task {task_type} failed: {e}"
+                        )
+
+                # Limit concurrent enrichment tasks to 4
+                sem_enrich = asyncio.Semaphore(4)
+                async with sem_enrich:
+                    await asyncio.gather(*[_run_one(t, p) for t, p in tasks_to_run])
+
+            # ── Eviction by max_active_blocks (only if limit > 0) ──
+            # Moved AFTER enrichment so blocks get summaries/deps before possible removal,
+            # and we keep their symbols in the index for lightweight context.
+            if (
+                self.valves.max_active_blocks > 0
+                and len(state["active_blocks"]) > self.valves.max_active_blocks
+            ):
+                sorted_blocks = sorted(
+                    state["active_blocks"].values(),
+                    key=lambda b: b.importance_score
+                    + (self.valves.raw_file_priority_boost if b.is_raw else 0),
+                    reverse=True,
+                )
+                keep_hashes = {
+                    b.hash for b in sorted_blocks[: self.valves.max_active_blocks]
+                }
+                to_remove = [h for h in state["active_blocks"] if h not in keep_hashes]
+                for h in to_remove:
+                    # Do NOT remove symbols from the index – they may still be needed for context
+                    # self._symbol_index.remove_all_for_block(...) is intentionally omitted
+                    del state["active_blocks"][h]
+                if to_remove:
+                    self._log_debug(
+                        f"Evicted {len(to_remove)} blocks due to max_active_blocks limit. "
+                        f"Their symbols remain in the index for lightweight context."
+                    )
+
+            # ── Session summary (still deferred because not needed for current prompt) ──
             if self.valves.enable_session_summary:
                 interval = self.valves.session_summary_interval_messages
                 if (
@@ -5181,6 +5227,8 @@ class Filter:
     async def _generate_cot_with_self_reflection(
         self, question: str, context: str, label: str = ""
     ) -> str:
+        """Generate CoT reasoning with self-reflection, using safe model switching."""
+        # Generate initial reasoning (level 2)
         reasoning = await self._generate_cot_reasoning(question, context, label=label)
         if not reasoning or reasoning == "Unable to generate reasoning.":
             return reasoning
@@ -5195,6 +5243,11 @@ class Filter:
             "Review the above reasoning. Are there any errors, unverified assumptions, or missing steps? "
             "Provide a corrected and improved reasoning."
         )
+
+        # Use safe model switch before calling the reflection model
+        # (the model may be different, so unload first)
+        await self._unload_models_under_lock()
+
         refined = await self._call_llm(
             prompt=reflection_prompt,
             system_prompt="You are a critical reviewer. Improve the reasoning provided.",
@@ -5203,6 +5256,10 @@ class Filter:
             temperature=0.3,
             label=label + "_reflection" if label else "cot_reflection",
         )
+
+        # After reflection, unload again to free the slot for the main model
+        await self._unload_models_under_lock()
+
         if refined:
             return (
                 f"## 🔎🔎 Automated Chain-of-Thought with Self-Reflection (Level 3)\n"
@@ -6415,23 +6472,11 @@ class Filter:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
-        # Unload any currently loaded model before CoT to free VRAM
-        try:
-            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-            self._last_used_model = None
-            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
-            if not slot_empty:
-                self._log_debug("Slot not empty before CoT – forcing extra unload")
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                await self._wait_for_empty_slot(retries=2, delay=3.0)
-        except Exception:
-            pass
+        # Unload any currently loaded model before CoT to free VRAM (protected by global lock)
+        await self._unload_models_under_lock()
 
         # Generate CoT reasoning if needed
         if cot_any_used:
-            # Pause the secondary task worker to avoid model slot competition
-            if hasattr(self, "_secondary_worker_paused"):
-                self._secondary_worker_paused.clear()
             try:
                 if manual_cot_used:
                     self._log_debug(
@@ -6504,12 +6549,7 @@ class Filter:
                 system_injections.append(("low", cot_note))
             finally:
                 # Always unload the CoT model to free the slot, even on error
-                try:
-                    await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                    self._last_used_model = None
-                except Exception:
-                    pass
-                # ── Worker is NOT resumed here – the inlet's finally will do it ──
+                await self._unload_models_under_lock()
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6685,19 +6725,16 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # ═══════════════════════════════════════════════════════════════
-        # Token breakdown log (only if debug is enabled)
+        # Token breakdown log (only if debug is enabled and there is content)
         # ═══════════════════════════════════════════════════════════════
-        if self.valves.debug and self.tokenizer:
-            total_system_tokens = 0
-            for m in messages:
-                if m.get("role") == "system":
-                    content = m.get("content", "")
-                    total_system_tokens += len(self.tokenizer.encode(content))
-
+        if self.valves.debug and self.tokenizer and final_system.strip():
+            total_system_tokens = len(self.tokenizer.encode(final_system))
             ltm_tokens = 0
             summary_tokens = 0
             suggested_tokens = 0
             cot_tokens = 0
+            other_tokens = total_system_tokens
+
             for _, text in system_injections:
                 if not text:
                     continue
@@ -6710,13 +6747,14 @@ class Filter:
                     suggested_tokens += t
                 elif reasoning and text == reasoning:
                     cot_tokens += t
+
             other_tokens = total_system_tokens - (
                 ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
             )
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -6729,6 +6767,8 @@ class Filter:
                 f"  TOTAL injected system tokens:          ~{total_system_tokens}"
             )
             self._log_debug("─" * 50)
+        elif self.valves.debug:
+            self._log_debug("No system prompt injected (token breakdown skipped).")
 
         return messages
 
@@ -6753,21 +6793,11 @@ class Filter:
         if not messages:
             return body
 
-        # Pause the secondary task worker for the entire inlet to avoid model conflicts
-        if hasattr(self, "_secondary_worker_paused"):
-            self._secondary_worker_paused.clear()
+        # Process any pending secondary tasks from previous inlets BEFORE touching models
+        await self._process_pending_secondary_tasks(project_id)
 
-        # Free VRAM before any LLM call and verify slot is empty
-        try:
-            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-            self._last_used_model = None
-            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
-            if not slot_empty:
-                self._log_debug("Slot not empty after unload – retrying unload")
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                await self._wait_for_empty_slot(retries=2, delay=3.0)
-        except Exception:
-            pass
+        # Free VRAM safely (protected by global LLM file lock)
+        await self._unload_models_under_lock()
 
         # Extract user info (with await) – now returns has_code_blocks too
         (
@@ -6884,15 +6914,7 @@ class Filter:
                 background_tasks.clear()
 
             # Free VRAM for the main model
-            try:
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                self._last_used_model = None
-            except Exception:
-                pass
-
-            # Resume the secondary task worker (the queue is now empty)
-            if hasattr(self, "_secondary_worker_paused"):
-                self._secondary_worker_paused.set()
+            await self._unload_models_under_lock()
 
             if _inlet_aborted:
                 for task in background_tasks:
@@ -6912,10 +6934,6 @@ class Filter:
 
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
-
-        # Pause the secondary task worker to avoid model slot competition
-        if hasattr(self, "_secondary_worker_paused"):
-            self._secondary_worker_paused.clear()
 
         try:
             messages = body.get("messages", [])
@@ -7008,15 +7026,10 @@ class Filter:
             await self._save_state_if_dirty(project_id)
 
             # Free VRAM for the main model
-            try:
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                self._last_used_model = None
-            except Exception:
-                pass
+            await self._unload_models_under_lock()
         finally:
-            # Resume the secondary task worker
-            if hasattr(self, "_secondary_worker_paused"):
-                self._secondary_worker_paused.set()
+            # No secondary worker to resume – nothing to do
+            pass
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
@@ -7282,11 +7295,107 @@ class Filter:
                 deps.add(m.group(1))
         return list(deps)
 
+    def _cache_deps(self, key: str, deps: List[str]):
+        """Store dependency extraction result in the in‑memory LRU cache."""
+        if len(self._deps_cache) >= self._MAX_DEPS_CACHE:
+            self._deps_cache.popitem(last=False)
+        self._deps_cache[key] = deps
+        self._deps_cache.move_to_end(key)
+
     async def _extract_dependencies_hybrid(
         self, code: str, file_path: Optional[str] = None, model_override: str = None
     ) -> List[str]:
+        """
+        Extract code dependencies with multiple strategies:
+        1. Deterministic AST for Python (fast and accurate).
+        2. LLM with explicit JSON output, retried once with a simpler prompt.
+        3. Regex-based fallback that detects the language automatically.
+        Uses a small in-memory cache to avoid repeated LLM calls for identical code.
+        """
         if not self.valves.enable_dependency_tracking:
             return []
+
+        # Simple content hash for caching (limit cache size)
+        code_hash = hashlib.md5(code.encode()).hexdigest()
+        cache_key = f"deps_{code_hash}"
+        cached = (
+            await self._deps_cache.get(cache_key)
+            if hasattr(self, "_deps_cache")
+            else None
+        )
+        if cached is not None:
+            return cached
+
+        # 1. Try deterministic AST for Python
+        if (file_path and file_path.endswith(".py")) or "def " in code:
+            imports, calls = self._extract_dependencies_ast(code)
+            if imports or calls:
+                deps = list(set(imports + calls))
+                await self._cache_deps(cache_key, deps)
+                return deps
+
+        # 2. Try LLM with explicit JSON output
+        model = (
+            model_override
+            or self.valves.dependency_extraction_model
+            or self.valves.llm_model
+            or self.valves.summarization_model
+        )
+
+        async def _try_llm_deps(prompt_text: str) -> Optional[List[str]]:
+            try:
+                response = await self._call_llm(
+                    prompt=prompt_text,
+                    system_prompt="You are a code analysis tool. Output only a JSON array of strings.",
+                    model_override=model,
+                    max_tokens=200,
+                    temperature=0.0,
+                    label="dependency_extraction",
+                )
+                if not response:
+                    return None
+                # Clean markdown fences
+                text = response.strip()
+                if text.startswith("```json"):
+                    text = text[7:]
+                if text.startswith("```"):
+                    text = text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+                deps = json.loads(text)
+                if isinstance(deps, list):
+                    # Filter out non‑string items
+                    clean = [str(d).strip() for d in deps if str(d).strip()]
+                    return clean
+            except Exception as e:
+                self._log_debug(f"LLM dependency extraction failed: {e}")
+            return None
+
+        # First, comprehensive prompt
+        prompt_full = (
+            "Extract all external dependencies (imports, modules, packages) from the following code. "
+            'Output ONLY a JSON array of strings, e.g. ["os", "numpy"]. '
+            "If there are no dependencies, output [].\n\n"
+            f"```\n{code[:2000]}\n```"
+        )
+        deps = await _try_llm_deps(prompt_full)
+
+        # If that fails or returns empty, try a shorter prompt focusing just on imports
+        if not deps:
+            prompt_short = (
+                "List only the external modules imported in this code as a JSON array. "
+                'Example: ["os", "sys"]\n\n'
+                f"```\n{code[:1500]}\n```"
+            )
+            deps = await _try_llm_deps(prompt_short) or []
+
+        if deps:
+            unique = list(set(deps))
+            await self._cache_deps(cache_key, unique)
+            return unique
+
+        # 3. Fallback: deterministic regex for the detected language
         lang = "unknown"
         if file_path:
             ext = os.path.splitext(file_path)[1].lower()
@@ -7305,49 +7414,14 @@ class Filter:
                 ".hpp": "cpp",
             }
             lang = lang_map.get(ext, "unknown")
-        else:
-            if re.search(r"\bdef\s+\w+\s*\(", code) and re.search(
-                r"\bimport\s+\w+", code
-            ):
+        if lang == "unknown":
+            if re.search(r"\bdef\s+\w+\s*\(", code):
                 lang = "python"
             elif re.search(r"\b(function|const|let|var|=>)\b", code):
                 lang = "javascript"
-        if lang == "python":
-            imports, calls = self._extract_dependencies_ast(code)
-            return list(set(imports + calls))
-        if lang != "unknown":
-            deps = self._extract_dependencies_regex(code, lang)
-            if deps:
-                return deps
-        model = (
-            model_override
-            or self.valves.dependency_extraction_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"Analyze the following code and extract dependencies...\n```\n{code[:1500]}\n```"
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You output only JSON arrays.",
-            model_override=model,
-            max_tokens=300,
-            temperature=0.1,
-            label="dependency_extraction",
-        )
-        if not response:
-            return []
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            deps = json.loads(response)
-            if isinstance(deps, list):
-                return list(set(deps))
-        except:
-            pass
-        return []
+        fallback_deps = self._extract_dependencies_regex(code, lang)
+        await self._cache_deps(cache_key, fallback_deps)
+        return fallback_deps
 
     async def _update_dependencies(self, block_hash: str, state: Dict):
         block = state["active_blocks"].get(block_hash)
