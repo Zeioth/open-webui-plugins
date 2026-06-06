@@ -823,7 +823,7 @@ class Filter:
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
-        context_window_tokens: int = Field(default=1000000)
+        context_window_tokens: int = Field(default=110000)
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
@@ -1034,7 +1034,7 @@ class Filter:
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
-        llm_request_timeout: int = Field(default=900)
+        llm_request_timeout: int = Field(default=600)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
 
@@ -2411,8 +2411,6 @@ class Filter:
         Retries a few times with a delay between checks.
         Returns True if the slot is empty, False otherwise.
         """
-        from shared_resources import get_http_session
-
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
@@ -2420,7 +2418,7 @@ class Filter:
         for attempt in range(retries):
             await asyncio.sleep(delay)
             try:
-                session = await get_http_session(timeout=5)
+                session = await _shared_get_http_session(timeout_seconds=5)
                 async with session.get(f"{base_url}/v1/models") as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -5733,7 +5731,8 @@ class Filter:
         )
         system_injections: List[Tuple[str, str]] = []
 
-        # LTM retrieval
+        # ── 🧠 ENRICHMENT – Step 1/6: LTM retrieval ──
+        self._log_debug("🧠 ENRICHMENT – Step 1/6: Retrieve Long‑Term Memory (LTM)")
         ltm_future = None
         if (
             self.valves.enable_code_awareness
@@ -5764,7 +5763,6 @@ class Filter:
             )
 
         if cached_response:
-            # Will be handled by caller; we just return early
             return [], cached_response, ""
 
         if contradiction_warning and self.valves.contradiction_inject_warning:
@@ -5813,6 +5811,13 @@ class Filter:
                 if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
                     ctx += "\n[Some older fragments omitted to fit token budget]"
                 system_injections.append(("high", ctx))
+                self._log_debug("🧠 ENRICHMENT – Step 1/6: LTM injected")
+            else:
+                self._log_debug("🧠 ENRICHMENT – Step 1/6: No LTM fragments matched")
+        else:
+            self._log_debug(
+                "🧠 ENRICHMENT – Step 1/6: LTM retrieval skipped (no query or disabled)"
+            )
 
         # Proactive cleanup suggestion
         if (
@@ -5836,7 +5841,10 @@ class Filter:
                     state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
                     self._set_state(project_id, state)
 
-        # ============== CODE INJECTION ==============
+        # ── 🧠 ENRICHMENT – Step 2/6: Active code context ──
+        self._log_debug(
+            "🧠 ENRICHMENT – Step 2/6: Active code context (full or lightweight)"
+        )
         if is_code_session and self.valves.enable_code_awareness:
             code_blocks_for_injection = [
                 b
@@ -5859,6 +5867,9 @@ class Filter:
                 )
                 if summary:
                     system_injections.append(("critical", summary))
+                    self._log_debug(
+                        "🧠 ENRICHMENT – Step 2/6: Symbol analysis summary injected"
+                    )
                 if suggested:
                     suggested_blocks = self._get_blocks_for_symbols(
                         list(suggested), project_id
@@ -5889,6 +5900,9 @@ class Filter:
                                     "## Additional suggested code\n\n"
                                     + "\n".join(extra_lines),
                                 )
+                            )
+                            self._log_debug(
+                                "🧠 ENRICHMENT – Step 2/6: Suggested code blocks injected"
                             )
             else:
                 is_structural = (
@@ -5942,12 +5956,24 @@ class Filter:
                     )
                     active_ctx = checklist + "\n\n" + active_ctx
                     system_injections.append(("critical", active_ctx))
+                    self._log_debug(
+                        "🧠 ENRICHMENT – Step 2/6: Active code context injected"
+                    )
+        else:
+            self._log_debug(
+                "🧠 ENRICHMENT – Step 2/6: Active code context skipped (not a code session or disabled)"
+            )
 
-        # Confidence scoring
+        # ── 🧠 ENRICHMENT – Step 3/6: Confidence scoring ──
+        self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence scoring")
         if self.valves.enable_confidence_scoring and is_code_session:
             system_injections.append(("high", self.valves.confidence_prompt))
+            self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence prompt injected")
+        else:
+            self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence scoring skipped")
 
-        # Feedback context
+        # ── 🧠 ENRICHMENT – Step 4/6: Feedback context ──
+        self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context")
         if (
             is_code_session
             and self.valves.enable_feedback_tracking
@@ -5956,7 +5982,16 @@ class Filter:
             feedback_ctx = self._get_feedback_context(project_id)
             if feedback_ctx:
                 system_injections.append(("high", feedback_ctx))
+                self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context injected")
+            else:
+                self._log_debug(
+                    "🧠 ENRICHMENT – Step 4/6: No feedback history to inject"
+                )
+        else:
+            self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context skipped")
 
+        # ── 🧠 ENRICHMENT – Step 5/6: Proactive suggestions (cleanup, command, summary) ──
+        self._log_debug("🧠 ENRICHMENT – Step 5/6: Proactive suggestions")
         # Proactive summary suggestion
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
@@ -5967,13 +6002,17 @@ class Filter:
             )
             if suggestion:
                 system_injections.append(("medium", suggestion))
-
         # Command suggestion
         cmd_suggestion = await self._suggest_commands(project_id, state)
         if cmd_suggestion:
             system_injections.append(("medium", cmd_suggestion))
+        if suggestion or cmd_suggestion:
+            self._log_debug("🧠 ENRICHMENT – Step 5/6: Suggestions injected")
+        else:
+            self._log_debug("🧠 ENRICHMENT – Step 5/6: No suggestions needed")
 
-        # Build preliminary system text respecting token budget
+        # ── 🧠 ENRICHMENT – Step 6/6: Assemble preliminary system prompt ──
+        self._log_debug("🧠 ENRICHMENT – Step 6/6: Assemble preliminary system prompt")
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         base_content = ""
         if sys_msgs:
@@ -6008,6 +6047,7 @@ class Filter:
         if base_content.strip():
             prelim_system = prelim_system + "\n\n" + base_content
 
+        self._log_debug("🧠 ENRICHMENT – Step 6/6: Preliminary system prompt ready")
         return system_injections, None, prelim_system
 
     async def _should_keep_full_code(self, user_question: str) -> bool:
@@ -6058,7 +6098,8 @@ class Filter:
         # Determine user intent for context reduction (also used by CoT detection)
         self._user_intent_full_code = await self._should_keep_full_code(user_question)
 
-        # CoT detection
+        # ── 🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level ──
+        self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
         manual_cot_used = False
         cot_any_used = False
         cot_level = 2
@@ -6083,17 +6124,22 @@ class Filter:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
                     )
-                    self._log_debug(f"CoT level detected: {cot_level} (manual=False)")
+                    self._log_debug(
+                        f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
+                    )
                     if cot_level > 0:
                         cot_any_used = True
+        if not cot_any_used:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: No CoT needed")
 
         # Wait for background tasks before heavy LLM calls
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
-        # Generate CoT reasoning if needed (no global lock here; _call_llm handles its own)
+        # ── 🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning ──
         if cot_any_used:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
             if manual_cot_used:
                 self._log_debug(
                     f"Generating manual CoT level {cot_level} with model "
@@ -6146,16 +6192,30 @@ class Filter:
                 and cot_level == 3
                 and (reasoning is None or reasoning == _cot_error_msg)
             ):
-                self._log_debug("Level 3 CoT failed, falling back to level 2")
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT Step 2/3: Level 3 failed, falling back to level 2"
+                )
                 reasoning = await self._generate_cot_reasoning(
                     user_question, prelim_for_cot
                 )
 
             if reasoning and reasoning != _cot_error_msg:
-                system_injections.append(("high", reasoning))
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generated successfully"
+                )
             else:
-                self._log_debug("CoT reasoning generation returned empty or failed")
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generation failed"
+                )
+        else:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Skipped (no CoT)")
 
+        # ── 🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning ──
+        if cot_any_used and reasoning and reasoning != "Unable to generate reasoning.":
+            self._log_debug(
+                "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
+            )
+            system_injections.append(("high", reasoning))
             cot_note = (
                 "**Note:** Some sections in this system prompt marked with 🔎 are "
                 "automatically generated reasoning (Chain-of-Thought). "
@@ -6163,6 +6223,8 @@ class Filter:
                 "Use them to enhance your answer, but always prioritise the actual user query."
             )
             system_injections.append(("low", cot_note))
+        else:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6209,7 +6271,10 @@ class Filter:
         history_msgs = [m for m in messages if m.get("role") != "system"]
         system_msgs = [m for m in messages if m.get("role") == "system"]
 
-        # ── 📦 COMPRESSION – start ──
+        # ── 📦 COMPRESSION – Step 1/2: Trimming / Summarization (if needed) ──
+        self._log_debug(
+            "📦 COMPRESSION – Step 1/2: Trimming / Summarization (if needed)"
+        )
         self._log_debug("📦 COMPRESSION – Checking if context fits within the window")
 
         if self.valves.adaptive_trim:
@@ -6239,14 +6304,20 @@ class Filter:
                             f"[Summary of earlier conversation]\n{summary}"
                         )
                         self._log_debug(
-                            "📦 COMPRESSION – Eliminating context useless to answer user prompt "
-                            "(After moving it to LTM cache)"
+                            "📦 COMPRESSION – Context exceeds token budget, "
+                            "older messages trimmed and summarized"
+                        )
+                    else:
+                        self._log_debug(
+                            "📦 COMPRESSION – Context exceeds token budget, "
+                            "older messages trimmed (summarization failed or empty)"
                         )
                     history_msgs = kept_block
                 else:
                     # Even if old_block exists, we keep it if summarization is off or it's empty
                     self._log_debug(
-                        "📦 COMPRESSION – Context fits within window, keeping full context for accurate response"
+                        "📦 COMPRESSION – Context exceeds token budget, "
+                        "older messages trimmed (summarization disabled)"
                     )
                     history_msgs = kept_block if old_block else history_msgs
 
@@ -6270,7 +6341,8 @@ class Filter:
                             history_msgs.pop(0)
             else:
                 self._log_debug(
-                    "📦 COMPRESSION – Context window not exceeded, no eviction needed"
+                    "📦 COMPRESSION – Context fits within token budget, "
+                    "no trimming needed"
                 )
         else:
             # Non-adaptive trimming (max_turns)
@@ -6305,22 +6377,29 @@ class Filter:
                             f"[Summary of earlier conversation]\n{summary}"
                         )
                         self._log_debug(
-                            "📦 COMPRESSION – Eliminating context useless to answer user prompt "
-                            "(After moving it to LTM cache)"
+                            "📦 COMPRESSION – Context exceeds max turns, "
+                            "older messages trimmed and summarized"
                         )
                     history_msgs = kept_block
                 else:
-                    history_msgs = kept_block
                     self._log_debug(
-                        "📦 COMPRESSION – Context fits within window, keeping full context for accurate response"
+                        "📦 COMPRESSION – Context exceeds max turns, "
+                        "older messages trimmed (summarization disabled)"
                     )
+                    history_msgs = kept_block
+            else:
+                self._log_debug(
+                    "📦 COMPRESSION – Context fits within max turns, "
+                    "no trimming needed"
+                )
 
-        # ── Lean user message: replace full code with relevant fragments ──
+        # ── 📦 COMPRESSION – Step 2/2: Lean user message ──
+        self._log_debug(
+            "📦 COMPRESSION – Step 2/2: Lean context (replace full code with relevant fragments)"
+        )
         if has_code_blocks and last_user_msg:
             analysis_summary = getattr(self, "_last_analysis_summary", None)
             suggested_blocks = getattr(self, "_last_suggested_blocks", None)
-
-            # Reuse the already‑computed intent (saves a second LLM call)
             keep_original = self._user_intent_full_code
 
             if not keep_original and (analysis_summary or suggested_blocks):
@@ -6333,6 +6412,17 @@ class Filter:
                             f"### {blk.hash[:8]}{loc}\n```\n{blk.content[:2000]}\n```"
                         )
                 last_user_msg["content"] = "\n".join(lean_parts)
+                self._log_debug(
+                    "📦 COMPRESSION – Lean user message applied (full code replaced by fragments)"
+                )
+            else:
+                self._log_debug(
+                    "📦 COMPRESSION – Lean user message not applied (full code kept)"
+                )
+        else:
+            self._log_debug(
+                "📦 COMPRESSION – Lean user message not applied (no code blocks or no user message)"
+            )
 
         # ── Concatenate pending summary to the final system message ──
         if pending_summary:
@@ -6361,15 +6451,14 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # ═══════════════════════════════════════════════════════════════
-        # Token breakdown log (only if debug is enabled and there is content)
+        # Token breakdown log (refined)
         # ═══════════════════════════════════════════════════════════════
         if self.valves.debug and self.tokenizer and final_system.strip():
             total_system_tokens = len(self.tokenizer.encode(final_system))
             ltm_tokens = 0
-            summary_tokens = 0
-            suggested_tokens = 0
+            code_context_tokens = 0  # active code, symbol analysis, suggested code
             cot_tokens = 0
-            other_tokens = total_system_tokens
+            other_instructions = 0  # confidence, feedback, suggestions, etc.
 
             for _, text in system_injections:
                 if not text:
@@ -6378,29 +6467,27 @@ class Filter:
                 if "Relevant Past Context" in text:
                     ltm_tokens += t
                 elif "synthesized" in text.lower() or "Synthesize" in text:
-                    summary_tokens += t
+                    code_context_tokens += t
                 elif "Additional suggested code" in text:
-                    suggested_tokens += t
+                    code_context_tokens += t
                 elif reasoning and text == reasoning:
                     cot_tokens += t
-
-            other_tokens = total_system_tokens - (
-                ltm_tokens + summary_tokens + suggested_tokens + cot_tokens
-            )
+                else:
+                    # All other injections (confidence, feedback, cleanup, commands, etc.)
+                    other_instructions += t
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages):                  ~{ltm_tokens}")
             self._log_debug(
-                f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
+                f"  Code context (active code, symbols):  ~{code_context_tokens}"
+            )
+            self._log_debug(f"  CoT reasoning (LLM generated):        ~{cot_tokens}")
+            self._log_debug(
+                f"  System instructions (confidence, cleanup, etc.): ~{other_instructions}"
             )
             self._log_debug(
-                f"  Suggested code (verbatim source):      ~{suggested_tokens}"
-            )
-            self._log_debug(f"  CoT reasoning (LLM generated):         ~{cot_tokens}")
-            self._log_debug(f"  Other (confidence, cleanup, etc.):     ~{other_tokens}")
-            self._log_debug(
-                f"  TOTAL injected system tokens:          ~{total_system_tokens}"
+                f"  TOTAL injected system tokens:         ~{total_system_tokens}"
             )
             self._log_debug("─" * 50)
         elif self.valves.debug:
