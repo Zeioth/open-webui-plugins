@@ -1277,6 +1277,10 @@ class Filter:
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
 
+        # ── Tracking of active LLM tasks (prevents model switching conflicts) ──
+        self._active_llm_tasks: Set[asyncio.Task] = set()
+        self._active_llm_tasks_lock = asyncio.Lock()
+
         # ── Database write queue (prevents "database is locked") ──
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
         self._db_worker_task = asyncio.create_task(self._db_worker())
@@ -2405,6 +2409,27 @@ class Filter:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
 
+    async def _track_llm_task(self):
+        """Context manager that registers the current task as using the LLM."""
+        task = asyncio.current_task()
+        async with self._active_llm_tasks_lock:
+            self._active_llm_tasks.add(task)
+        try:
+            yield
+        finally:
+            async with self._active_llm_tasks_lock:
+                self._active_llm_tasks.discard(task)
+
+    async def _wait_for_llm_tasks(self):
+        """Block until all LLM-using tasks have completed."""
+        while True:
+            async with self._active_llm_tasks_lock:
+                if not self._active_llm_tasks:
+                    break
+                tasks = list(self._active_llm_tasks)
+            if tasks:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
     async def _wait_for_empty_slot(self, retries: int = 3, delay: float = 2.0) -> bool:
         """
         Check that the LLM server has no loaded models.
@@ -2445,17 +2470,18 @@ class Filter:
         Unload all models from the LLM server while holding the global file lock.
         This prevents other processes/tasks from interfering during the unload/check cycle.
         """
+        await self._wait_for_llm_tasks()
         llm_fd = await self._acquire_llm_lock()
         try:
             await _shared_unload_all_models(self.valves.LLM_BASE_URL)
             self._last_used_model = None
-            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
+            slot_empty = await self._wait_for_empty_slot(retries=5, delay=3.0)
             if not slot_empty:
                 self._log_debug("Slot not empty after unload – forcing extra unload")
                 await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                await self._wait_for_empty_slot(retries=2, delay=3.0)
+                await self._wait_for_empty_slot(retries=3, delay=4.0)
             # Additional breathing room for the server to fully release resources
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(5.0)
         finally:
             self._release_llm_lock(llm_fd)
 
@@ -2527,71 +2553,73 @@ class Filter:
                     f"– prompt size: ~{prompt_tokens} tokens"
                 )
 
-            # ── Inter‑process lock: only one process can use the LLM at a time ──
-            llm_fd = await self._acquire_llm_lock()
-            try:
-                # ── Acquire global LLM semaphore to serialize all server calls ──
-                async with _llm_semaphore:
-                    await self._maybe_unload_for_model(model, base_url, is_ollama)
+            # ── Track this task as an active LLM user ──
+            async with self._track_llm_task():
+                # ── Inter‑process lock: only one process can use the LLM at a time ──
+                llm_fd = await self._acquire_llm_lock()
+                try:
+                    # ── Acquire global LLM semaphore to serialize all server calls ──
+                    async with _llm_semaphore:
+                        await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-                    for attempt in range(max_retries + 1):
-                        try:
-                            async with effective_semaphore:
-                                content = await _shared_call_llm(
-                                    prompt=prompt,
-                                    system=system_prompt,
-                                    base_url=self.valves.LLM_BASE_URL,
-                                    model=model,
-                                    api_token=self.valves.LLM_API_TOKEN,
-                                    temperature=temperature,
-                                    max_tokens=max_tokens,
-                                    timeout=self.valves.llm_request_timeout,
-                                    endpoint_type=ep_type,
-                                )
-                            if content:
-                                await self._llm_cache.set(cache_key, content)
-                                future.set_result(content)
-                                # ── Log input and output tokens ──
-                                in_tokens = (
-                                    len(self.tokenizer.encode(prompt))
-                                    if self.tokenizer
-                                    else "?"
-                                )
-                                out_tokens = (
-                                    len(self.tokenizer.encode(content))
-                                    if self.tokenizer
-                                    else "?"
-                                )
+                        for attempt in range(max_retries + 1):
+                            try:
+                                async with effective_semaphore:
+                                    content = await _shared_call_llm(
+                                        prompt=prompt,
+                                        system=system_prompt,
+                                        base_url=self.valves.LLM_BASE_URL,
+                                        model=model,
+                                        api_token=self.valves.LLM_API_TOKEN,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens,
+                                        timeout=self.valves.llm_request_timeout,
+                                        endpoint_type=ep_type,
+                                    )
+                                if content:
+                                    await self._llm_cache.set(cache_key, content)
+                                    future.set_result(content)
+                                    # ── Log input and output tokens ──
+                                    in_tokens = (
+                                        len(self.tokenizer.encode(prompt))
+                                        if self.tokenizer
+                                        else "?"
+                                    )
+                                    out_tokens = (
+                                        len(self.tokenizer.encode(content))
+                                        if self.tokenizer
+                                        else "?"
+                                    )
+                                    self._log_debug(
+                                        f"[LLM] {model}"
+                                        + (f" ({label})" if label else "")
+                                        + f" – in:{in_tokens} out:{out_tokens}"
+                                        + f" took {time.monotonic() - t_start:.3f}s"
+                                    )
+                                    self._last_used_model = model
+                                    return content
+                            except asyncio.CancelledError:
+                                raise
+                            except RuntimeError as exc:
                                 self._log_debug(
-                                    f"[LLM] {model}"
-                                    + (f" ({label})" if label else "")
-                                    + f" – in:{in_tokens} out:{out_tokens}"
-                                    + f" took {time.monotonic() - t_start:.3f}s"
+                                    f"[LLM] {model}{f' ({label})' if label else ''} "
+                                    f"error: {exc}"
                                 )
-                                self._last_used_model = model
-                                return content
-                        except asyncio.CancelledError:
-                            raise
-                        except RuntimeError as exc:
-                            self._log_debug(
-                                f"[LLM] {model}{f' ({label})' if label else ''} "
-                                f"error: {exc}"
-                            )
-                            if any(
-                                c in str(exc)
-                                for c in ("429", "500", "502", "503", "504")
-                            ):
+                                if any(
+                                    c in str(exc)
+                                    for c in ("429", "500", "502", "503", "504")
+                                ):
+                                    if attempt < max_retries:
+                                        await asyncio.sleep(base_delay * (2**attempt))
+                                        continue
+                                break
+                            except Exception:
                                 if attempt < max_retries:
                                     await asyncio.sleep(base_delay * (2**attempt))
                                     continue
-                            break
-                        except Exception:
-                            if attempt < max_retries:
-                                await asyncio.sleep(base_delay * (2**attempt))
-                                continue
-                            break
-            finally:
-                self._release_llm_lock(llm_fd)
+                                break
+                finally:
+                    self._release_llm_lock(llm_fd)
 
             logger.warning(
                 f"LLM call failed for model {model}: prompt={prompt[:100]}..."
@@ -6496,7 +6524,14 @@ class Filter:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point (see project documentation for categories)
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Value categories (see project documentation):
+    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
+    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
+    #   🧠 ENRICHMENT          – Features that add information to the system prompt
+    #   📦 COMPRESSION         – Features that reduce context size to fit the window
+    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
@@ -6512,7 +6547,10 @@ class Filter:
         project_id = self._get_project_id()
 
         # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT – Step 1: Preprocess
+        # 🔥 STATE MANAGEMENT (Critical)
+        #   1. Preprocess (project switch, cache load)
+        #   2. Process pending secondary tasks (session summaries, etc.)
+        #   4. Extract user info (last message, question, code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         messages = await self._inlet_preprocess(body, project_id)
@@ -6520,20 +6558,22 @@ class Filter:
         if not messages:
             return body
 
-        # 🔥 STATE MANAGEMENT – Step 2: Pending secondary tasks
         step_start = time.monotonic()
         await self._process_pending_secondary_tasks(project_id)
         _inlet_timing("Step 2/9: Process pending secondary tasks", step_start)
 
         # ─────────────────────────────────────────────────────────────────
-        # 🚀 RESOURCE OPTIMISATION – Step 3: Free VRAM
+        # 🚀 RESOURCE OPTIMISATION (Critical)
+        #   3. Free VRAM safely (global lock, avoids slot conflicts)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
+        await self._wait_for_llm_tasks()
         await self._unload_models_under_lock()
         _inlet_timing("Step 3/9: Unload models safely (free VRAM)", step_start)
 
         # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT – Step 4: Extract user info
+        # 🔥 STATE MANAGEMENT (Critical)
+        #   (continued) 4. Extract user info
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         (
@@ -6546,7 +6586,8 @@ class Filter:
         _inlet_timing("Step 4/9: Extract user info", step_start)
 
         # ─────────────────────────────────────────────────────────────────
-        # ⚡ COMMAND HANDLING – Step 5: Explicit commands
+        # ⚡ COMMAND HANDLING (High value)
+        #   5. Explicit commands (/forget, /status, /clean, /expand)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_explicit_commands(
@@ -6561,7 +6602,9 @@ class Filter:
             )
             return body
 
-        # ⚡ COMMAND HANDLING – Step 6: Natural language intents
+        # ⚡ COMMAND HANDLING (High value)
+        #   6. Natural language intents (forget, remember, obsolete)
+        # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_natural_intents(
             messages, project_id, is_explicit_command, last_user_msg
@@ -6584,7 +6627,12 @@ class Filter:
             state = self._get_state(project_id)
 
             # ─────────────────────────────────────────────────────────────
-            # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT – Step 7: Prepare code session
+            # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT (Critical)
+            #   7. Prepare code session:
+            #      - classify if session is about code
+            #      - update active blocks (extract code, detect duplicates)
+            #      - run immediate enrichment tasks (auto‑summaries)
+            #      - evict blocks if max_active_blocks > 0
             # ─────────────────────────────────────────────────────────────
             step_start = time.monotonic()
             is_code_session, user_question = await self._inlet_prepare_code_session(
@@ -6600,8 +6648,19 @@ class Filter:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
 
+            # Ensure all LLM-related work from this step is complete
+            await self._wait_for_llm_tasks()
+
             # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT – Step 8: Build system injections
+            # 🧠 ENRICHMENT (Critical)
+            #   8. Build system injections:
+            #      - LTM retrieval
+            #      - Active code context (full or lightweight)
+            #      - Symbol analysis summary
+            #      - Chain‑of‑Thought detection (level computed here)
+            #      - Feedback context, cleanup suggestions, confidence
+            #      - Parallel checks: contradictions, duplicate questions,
+            #        response cache lookup
             # ─────────────────────────────────────────────────────────────
             step_start = time.monotonic()
             system_injections, cached_response, prelim_system = (
@@ -6617,7 +6676,8 @@ class Filter:
             )
             _inlet_timing("Step 8/9: Build system injections", step_start)
 
-            # 🚀 RESOURCE OPTIMISATION – Return cached response if found
+            # 🚀 RESOURCE OPTIMISATION (High value)
+            #    Return cached response immediately if found
             if isinstance(cached_response, dict):
                 self._log_debug(
                     "🚀 RESOURCE OPTIMISATION – Returning cached response (no further processing)"
@@ -6636,7 +6696,13 @@ class Filter:
                 return body
 
             # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT + 📦 COMPRESSION – Step 9: Assemble final messages
+            # 🧠 ENRICHMENT + 📦 COMPRESSION (Critical)
+            #   9. Assemble final messages:
+            #      - Apply Chain‑of‑Thought reasoning
+            #      - Trim old history (adaptive or max_turns)
+            #      - Summarise trimmed messages if enabled
+            #      - Inject final system prompt respecting token budget
+            #      - Display token breakdown (debug)
             # ─────────────────────────────────────────────────────────────
             step_start = time.monotonic()
             messages = await self._inlet_assemble_final_messages(
@@ -6664,13 +6730,17 @@ class Filter:
             _inlet_aborted = False
 
         finally:
-            # 🔥 STATE MANAGEMENT – Save state and remaining secondary tasks
+            # 🔥 STATE MANAGEMENT (Medium)
+            #   - Save state if dirty (debounced write)
+            #   - Process remaining secondary tasks (session summaries, etc.)
             await self._save_state_if_dirty(project_id)
             lock = await self._get_project_lock(project_id)
             async with lock:
                 await self._process_pending_secondary_tasks(project_id)
 
-            # 🚀 RESOURCE OPTIMISATION – Cleanup and free VRAM
+            # 🚀 RESOURCE OPTIMISATION (Critical)
+            #   - Wait for any unfinished background tasks
+            #   - Free VRAM for the main model
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
