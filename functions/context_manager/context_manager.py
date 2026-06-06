@@ -6575,6 +6575,16 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Value categories (see project documentation):
+    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
+    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
+    #   🧠 ENRICHMENT          – Features that add information to the system prompt
+    #   📦 COMPRESSION         – Features that reduce context size to fit the window
+    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
+    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
