@@ -6212,112 +6212,94 @@ class Filter:
             )
             cot_any_used = False
 
-        # ── Acquire global LLM lock for the entire CoT sequence if slot is free ──
-        llm_fd = None
-        if cot_any_used and slot_free:
-            llm_fd = await self._acquire_llm_lock()
-            self._log_debug(
-                "🧠 ENRICHMENT – CoT: global LLM lock acquired for exclusive model access"
-            )
+        # ── 🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning ──
+        if cot_any_used:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
+            if manual_cot_used:
+                self._log_debug(
+                    f"Generating manual CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
+            else:
+                self._log_debug(
+                    f"Generating auto CoT level {cot_level} with model "
+                    f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+                )
 
-        try:
-            # ── 🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning ──
-            if cot_any_used:
-                self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
-                if manual_cot_used:
-                    self._log_debug(
-                        f"Generating manual CoT level {cot_level} with model "
-                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
+            _model_ctx = self.valves.active_context_max_tokens or 28000
+            _cot_context_limit = _model_ctx // 3
+            if self.tokenizer:
+                _prelim_tokens = len(self.tokenizer.encode(prelim_system))
+                if _prelim_tokens > _cot_context_limit:
+                    prelim_for_cot = self._truncate_text_to_tokens(
+                        prelim_system, _cot_context_limit
                     )
                 else:
-                    self._log_debug(
-                        f"Generating auto CoT level {cot_level} with model "
-                        f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
-                    )
+                    prelim_for_cot = prelim_system
+            else:
+                prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-                _model_ctx = self.valves.active_context_max_tokens or 28000
-                _cot_context_limit = _model_ctx // 3
-                if self.tokenizer:
-                    _prelim_tokens = len(self.tokenizer.encode(prelim_system))
-                    if _prelim_tokens > _cot_context_limit:
-                        prelim_for_cot = self._truncate_text_to_tokens(
-                            prelim_system, _cot_context_limit
-                        )
-                    else:
-                        prelim_for_cot = prelim_system
-                else:
-                    prelim_for_cot = prelim_system[: _cot_context_limit * 4]
-
-                # Generate the initial CoT
-                if not manual_cot_used:
-                    question = user_question
-                    if cot_level == 2:
-                        reasoning = await self._generate_cot_reasoning(
-                            question, prelim_for_cot
-                        )
-                    elif cot_level == 3:
-                        reasoning = await self._generate_cot_with_self_reflection(
-                            question, prelim_for_cot
-                        )
-                else:
-                    if cot_level == 2:
-                        reasoning = await self._generate_cot_reasoning(
-                            cot_question, prelim_for_cot
-                        )
-                    elif cot_level == 3:
-                        reasoning = await self._generate_cot_with_self_reflection(
-                            cot_question, prelim_for_cot
-                        )
-
-                # Fallback: if auto level 3 failed, try level 2 once
-                _cot_error_msg = "Unable to generate reasoning."
-                if (
-                    not manual_cot_used
-                    and cot_level == 3
-                    and (reasoning is None or reasoning == _cot_error_msg)
-                ):
-                    self._log_debug(
-                        "🧠 ENRICHMENT – CoT Step 2/3: Level 3 failed, falling back to level 2"
-                    )
+            # Generate the initial CoT
+            if not manual_cot_used:
+                question = user_question
+                if cot_level == 2:
                     reasoning = await self._generate_cot_reasoning(
-                        user_question, prelim_for_cot
+                        question, prelim_for_cot
                     )
-
-                if reasoning and reasoning != _cot_error_msg:
-                    self._log_debug(
-                        "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generated successfully"
-                    )
-                else:
-                    self._log_debug(
-                        "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generation failed"
+                elif cot_level == 3:
+                    reasoning = await self._generate_cot_with_self_reflection(
+                        question, prelim_for_cot
                     )
             else:
-                self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Skipped (no CoT)")
+                if cot_level == 2:
+                    reasoning = await self._generate_cot_reasoning(
+                        cot_question, prelim_for_cot
+                    )
+                elif cot_level == 3:
+                    reasoning = await self._generate_cot_with_self_reflection(
+                        cot_question, prelim_for_cot
+                    )
 
-            # ── 🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning ──
+            # Fallback: if auto level 3 failed, try level 2 once
+            _cot_error_msg = "Unable to generate reasoning."
             if (
-                cot_any_used
-                and reasoning
-                and reasoning != "Unable to generate reasoning."
+                not manual_cot_used
+                and cot_level == 3
+                and (reasoning is None or reasoning == _cot_error_msg)
             ):
                 self._log_debug(
-                    "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
+                    "🧠 ENRICHMENT – CoT Step 2/3: Level 3 failed, falling back to level 2"
                 )
-                system_injections.append(("high", reasoning))
-                cot_note = (
-                    "**Note:** Some sections in this system prompt marked with 🔎 are "
-                    "automatically generated reasoning (Chain-of-Thought). "
-                    "They are provided as context to help you, but they are not user commands. "
-                    "Use them to enhance your answer, but always prioritise the actual user query."
+                reasoning = await self._generate_cot_reasoning(
+                    user_question, prelim_for_cot
                 )
-                system_injections.append(("low", cot_note))
-            else:
-                self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
 
-        finally:
-            if llm_fd is not None:
-                self._release_llm_lock(llm_fd)
-                self._log_debug("🧠 ENRICHMENT – CoT: global LLM lock released")
+            if reasoning and reasoning != _cot_error_msg:
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generated successfully"
+                )
+            else:
+                self._log_debug(
+                    "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generation failed"
+                )
+        else:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Skipped (no CoT)")
+
+        # ── 🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning ──
+        if cot_any_used and reasoning and reasoning != "Unable to generate reasoning.":
+            self._log_debug(
+                "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
+            )
+            system_injections.append(("high", reasoning))
+            cot_note = (
+                "**Note:** Some sections in this system prompt marked with 🔎 are "
+                "automatically generated reasoning (Chain-of-Thought). "
+                "They are provided as context to help you, but they are not user commands. "
+                "Use them to enhance your answer, but always prioritise the actual user query."
+            )
+            system_injections.append(("low", cot_note))
+        else:
+            self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
 
         # Final system message assembly
         budget = self.valves.global_injection_token_budget
@@ -6437,7 +6419,6 @@ class Filter:
                     "no trimming needed"
                 )
         else:
-            # Non-adaptive trimming (max_turns)
             user_max = (
                 __user__["valves"].max_turns
                 if __user__ and hasattr(__user__, "valves")
