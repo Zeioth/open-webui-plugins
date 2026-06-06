@@ -6485,30 +6485,56 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # ═══════════════════════════════════════════════════════════════
-        # Token breakdown log (refined)
+        # Token breakdown log
         # ═══════════════════════════════════════════════════════════════
         if self.valves.debug and self.tokenizer and final_system.strip():
             total_system_tokens = len(self.tokenizer.encode(final_system))
-            ltm_tokens = 0
-            code_context_tokens = 0  # active code, symbol analysis, suggested code
-            cot_tokens = 0
-            other_instructions = 0  # confidence, feedback, suggestions, etc.
 
-            for _, text in system_injections:
-                if not text:
-                    continue
-                t = len(self.tokenizer.encode(text))
-                if "Relevant Past Context" in text:
+            # Split final_system back into the injection texts (same order as system_injections)
+            injection_texts = [text for _, text in system_injections if text]
+            # Re-join them to get the combined injections part (excluding base_content if any)
+            combined_injections = "\n\n".join(injection_texts)
+            # If base_content was appended, it's part of final_system but not in system_injections
+            base_content_tokens = 0
+            if base_content.strip():
+                base_content_tokens = len(self.tokenizer.encode(base_content))
+                # Subtract base content to isolate the injections part
+                inj_only_tokens = total_system_tokens - base_content_tokens
+                # Re-measure combined injections for accurate split
+                if combined_injections:
+                    inj_only_tokens = len(self.tokenizer.encode(combined_injections))
+                else:
+                    inj_only_tokens = 0
+            else:
+                inj_only_tokens = total_system_tokens if combined_injections else 0
+
+            # Initialize counters
+            ltm_tokens = 0
+            code_context_tokens = 0
+            cot_tokens = 0
+            other_instructions = 0
+
+            # Classify each injection by its content (same heuristics as before)
+            for inj_text in injection_texts:
+                t = len(self.tokenizer.encode(inj_text))
+                if "Relevant Past Context" in inj_text:
                     ltm_tokens += t
-                elif "synthesized" in text.lower() or "Synthesize" in text:
+                elif "synthesized" in inj_text.lower() or "Synthesize" in inj_text:
                     code_context_tokens += t
-                elif "Additional suggested code" in text:
+                elif "Additional suggested code" in inj_text:
                     code_context_tokens += t
-                elif reasoning and text == reasoning:
+                elif reasoning and inj_text == reasoning:
                     cot_tokens += t
                 else:
-                    # All other injections (confidence, feedback, cleanup, commands, etc.)
                     other_instructions += t
+
+            # The sum of categorized tokens should now match inj_only_tokens
+            # (or be very close; any tiny diff goes to other_instructions)
+            diff = inj_only_tokens - (
+                ltm_tokens + code_context_tokens + cot_tokens + other_instructions
+            )
+            if diff != 0:
+                other_instructions += diff  # absorb rounding mismatches
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
