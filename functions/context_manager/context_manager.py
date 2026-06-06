@@ -105,6 +105,7 @@ _inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
     "_inlet_background_tasks", default=None
 )
 _db_global_lock = threading.Lock()
+_llm_semaphore = asyncio.Semaphore(1)
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +360,6 @@ class ReentrantAsyncLock:
 
     async def __aexit__(self, *args):
         self.release()
-
-
-# instantiate
-_global_llm_lock = ReentrantAsyncLock()
 
 
 # ---------------------------------------------------------------------------
@@ -2198,7 +2195,7 @@ class Filter:
     async def _save_state_if_dirty(self, project_id: str):
         """
         Persist the state if dirty and at least 2 seconds have passed since last save.
-        Creates an async task for the actual DB write and logs any failure.
+        Waits for the DB write to complete, logging any error.
         """
         if not self._state_dirty:
             return
@@ -2209,19 +2206,14 @@ class Filter:
         self._state_last_saved = now
         self._state_dirty = False
 
-        def _log_save_result(t):
-            if t.exception():
-                self._log_debug(f"Failed to save state: {t.exception()}")
-            elif t.cancelled():
-                self._log_debug("Save state task was cancelled")
-            # success is silent
-
-        task = asyncio.create_task(
-            self._save_state_to_db_async(
+        try:
+            await self._save_state_to_db_async(
                 project_id, self._conversation_state[project_id]
             )
-        )
-        task.add_done_callback(_log_save_result)
+        except Exception as e:
+            import traceback
+
+            self._log_debug(f"Failed to save state: {e}\n{traceback.format_exc()}")
 
     async def _save_state_to_db(self, project_id: str, state: Dict):
         active_blocks_meta = {}
@@ -2616,47 +2608,51 @@ class Filter:
 
             await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-            for attempt in range(max_retries + 1):
-                try:
-                    async with effective_semaphore:
-                        content = await _shared_call_llm(
-                            prompt=prompt,
-                            system=system_prompt,
-                            base_url=self.valves.LLM_BASE_URL,
-                            model=model,
-                            api_token=self.valves.LLM_API_TOKEN,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            timeout=self.valves.llm_request_timeout,
-                            endpoint_type=ep_type,
-                        )
-                    if content:
-                        await self._llm_cache.set(cache_key, content)
-                        future.set_result(content)
+            # ── Acquire global LLM semaphore to serialize all server calls ──
+            async with _llm_semaphore:
+                for attempt in range(max_retries + 1):
+                    try:
+                        async with effective_semaphore:
+                            content = await _shared_call_llm(
+                                prompt=prompt,
+                                system=system_prompt,
+                                base_url=self.valves.LLM_BASE_URL,
+                                model=model,
+                                api_token=self.valves.LLM_API_TOKEN,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                timeout=self.valves.llm_request_timeout,
+                                endpoint_type=ep_type,
+                            )
+                        if content:
+                            await self._llm_cache.set(cache_key, content)
+                            future.set_result(content)
+                            self._log_debug(
+                                f"[LLM] {model}"
+                                + (f" ({label})" if label else "")
+                                + f" took {time.monotonic() - t_start:.3f}s"
+                            )
+                            self._last_used_model = model
+                            return content
+                    except asyncio.CancelledError:
+                        raise
+                    except RuntimeError as exc:
                         self._log_debug(
-                            f"[LLM] {model}"
-                            + (f" ({label})" if label else "")
-                            + f" took {time.monotonic() - t_start:.3f}s"
+                            f"[LLM] {model}{f' ({label})' if label else ''} "
+                            f"error: {exc}"
                         )
-                        self._last_used_model = model
-                        return content
-                except asyncio.CancelledError:
-                    raise
-                except RuntimeError as exc:
-                    self._log_debug(
-                        f"[LLM] {model}{f' ({label})' if label else ''} "
-                        f"error: {exc}"
-                    )
-                    if any(c in str(exc) for c in ("429", "500", "502", "503", "504")):
+                        if any(
+                            c in str(exc) for c in ("429", "500", "502", "503", "504")
+                        ):
+                            if attempt < max_retries:
+                                await asyncio.sleep(base_delay * (2**attempt))
+                                continue
+                        break
+                    except Exception:
                         if attempt < max_retries:
                             await asyncio.sleep(base_delay * (2**attempt))
                             continue
-                    break
-                except Exception:
-                    if attempt < max_retries:
-                        await asyncio.sleep(base_delay * (2**attempt))
-                        continue
-                    break
+                        break
 
             logger.warning(
                 f"LLM call failed for model {model}: prompt={prompt[:100]}..."
@@ -6673,9 +6669,6 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
-    # ═══════════════════════════════════════════════════════════════════════════
-    # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6688,9 +6681,6 @@ class Filter:
 
         self._ensure_cleanup_task()
         project_id = self._get_project_id()
-
-        # ── Acquire global LLM lock so no other instance interferes ──────
-        await _global_llm_lock.acquire()
 
         # Preprocessing (no secondary tasks)
         messages = await self._inlet_preprocess(body, project_id)
@@ -6833,9 +6823,6 @@ class Filter:
                         task.cancel()
             _inlet_background_tasks.reset(token)
 
-            # ── Release the global LLM lock ────────────────────────────
-            _global_llm_lock.release()
-
         return body
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6849,41 +6836,47 @@ class Filter:
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
 
-        # Acquire global LLM lock – outlet may also use models
-        await _global_llm_lock.acquire()
-        try:
-            messages = body.get("messages", [])
-            project_id = self._get_project_id()
-            state = self._get_state(project_id)
-            is_code_session = await self._classify_session(messages, project_id)
-            last_msg = messages[-1] if messages else None
-            if last_msg:
-                last_idx = len(messages) - 1
-                if last_idx <= self._last_processed_message_idx.get(project_id, -1):
-                    self._log_debug(
-                        "outlet: last message already processed in inlet, skipping"
+        messages = body.get("messages", [])
+        project_id = self._get_project_id()
+        state = self._get_state(project_id)
+        is_code_session = await self._classify_session(messages, project_id)
+        last_msg = messages[-1] if messages else None
+        if last_msg:
+            last_idx = len(messages) - 1
+            if last_idx <= self._last_processed_message_idx.get(project_id, -1):
+                self._log_debug(
+                    "outlet: last message already processed in inlet, skipping"
+                )
+            else:
+                if (
+                    last_msg.get("role") == "assistant"
+                    and is_code_session
+                    and "/expand" in last_msg.get("content", "")
+                ):
+                    modified_content, did_expand = await self._outlet_intercept_expand(
+                        last_msg.get("content", ""), project_id
                     )
-                else:
-                    if (
-                        last_msg.get("role") == "assistant"
-                        and is_code_session
-                        and "/expand" in last_msg.get("content", "")
-                    ):
-                        modified_content, did_expand = (
-                            await self._outlet_intercept_expand(
-                                last_msg.get("content", ""), project_id
-                            )
+                    if did_expand:
+                        messages[-1]["content"] = modified_content
+                        body["messages"] = messages
+                        self._log_debug(
+                            "outlet: /expand intercepted — history rewritten with real code"
                         )
-                        if did_expand:
-                            messages[-1]["content"] = modified_content
-                            body["messages"] = messages
-                            self._log_debug(
-                                "outlet: /expand intercepted — history rewritten with real code"
-                            )
 
-                    if last_msg.get("role") in ("user", "assistant"):
-                        if is_code_session:
-                            await self._update_active_code(last_msg, project_id)
+                if last_msg.get("role") in ("user", "assistant"):
+                    if is_code_session:
+                        await self._update_active_code(last_msg, project_id)
+                        async with self._ltm_batch_lock:
+                            self._pending_ltm_messages.append(last_msg)
+                            if (
+                                self._ltm_batch_task is None
+                                or self._ltm_batch_task.done()
+                            ):
+                                self._ltm_batch_task = asyncio.create_task(
+                                    self._flush_ltm_batch(project_id)
+                                )
+                    else:
+                        if not self.valves.ltm_store_only_code_sessions:
                             async with self._ltm_batch_lock:
                                 self._pending_ltm_messages.append(last_msg)
                                 if (
@@ -6893,62 +6886,44 @@ class Filter:
                                     self._ltm_batch_task = asyncio.create_task(
                                         self._flush_ltm_batch(project_id)
                                     )
-                        else:
-                            if not self.valves.ltm_store_only_code_sessions:
-                                async with self._ltm_batch_lock:
-                                    self._pending_ltm_messages.append(last_msg)
-                                    if (
-                                        self._ltm_batch_task is None
-                                        or self._ltm_batch_task.done()
-                                    ):
-                                        self._ltm_batch_task = asyncio.create_task(
-                                            self._flush_ltm_batch(project_id)
-                                        )
 
-            # Response cache storage (with code_state_hash precomputed to avoid extra lock)
-            if (
-                self.valves.enable_response_cache
-                and HAS_SENTENCE
-                and len(messages) >= 2
-            ):
-                last_user = next(
-                    (m for m in reversed(messages) if m.get("role") == "user"), None
+        # Response cache storage (with code_state_hash precomputed to avoid extra lock)
+        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+            last_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            last_assistant = next(
+                (m for m in reversed(messages) if m.get("role") == "assistant"), None
+            )
+            if last_user and last_assistant:
+                context_hash = self._compute_context_hash(messages[:-1])
+                code_state_hash = self._compute_code_state_hash(project_id)
+                await self._store_response_in_cache(
+                    last_user.get("content", ""),
+                    last_assistant.get("content", ""),
+                    context_hash,
+                    state,
+                    code_state_hash,
                 )
-                last_assistant = next(
-                    (m for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
-                if last_user and last_assistant:
-                    context_hash = self._compute_context_hash(messages[:-1])
-                    code_state_hash = self._compute_code_state_hash(project_id)
-                    await self._store_response_in_cache(
-                        last_user.get("content", ""),
-                        last_assistant.get("content", ""),
-                        context_hash,
-                        state,
-                        code_state_hash,
-                    )
 
-            # Purge expired memories only if no purge is already running
-            if self._purge_task is None or self._purge_task.done():
-                self._purge_task = asyncio.create_task(self._purge_expired_memories())
+        # Purge expired memories only if no purge is already running
+        if self._purge_task is None or self._purge_task.done():
+            self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
-            self._write_counter += 1
-            if self._write_counter % 100 == 0:
-                self._purge_task = asyncio.create_task(self._run_db_checkpoints())
-                self._cleanup_completed_tasks()
+        self._write_counter += 1
+        if self._write_counter % 100 == 0:
+            self._purge_task = asyncio.create_task(self._run_db_checkpoints())
+            self._cleanup_completed_tasks()
 
-            # Save state if dirty (debounced)
-            await self._save_state_if_dirty(project_id)
+        # Save state if dirty (debounced)
+        await self._save_state_if_dirty(project_id)
 
-            # Free VRAM for the main model
-            try:
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                self._last_used_model = None
-            except Exception:
-                pass
-        finally:
-            _global_llm_lock.release()
+        # Free VRAM for the main model
+        try:
+            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+            self._last_used_model = None
+        except Exception:
+            pass
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
