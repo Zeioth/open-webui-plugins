@@ -361,6 +361,10 @@ class ReentrantAsyncLock:
         self.release()
 
 
+# instantiate
+_global_llm_lock = ReentrantAsyncLock()
+
+
 # ---------------------------------------------------------------------------
 # In‑memory symbol index
 # ---------------------------------------------------------------------------
@@ -2043,7 +2047,7 @@ class Filter:
         """
         Continuously process pending secondary tasks in the background,
         with a small delay between batches to avoid overwhelming the DB.
-        Pauses when `_secondary_worker_paused` is cleared (e.g. during CoT).
+        Pauses when `_secondary_worker_paused` is cleared (e.g. during inlet).
         """
         while True:
             await self._secondary_worker_paused.wait()  # block if paused
@@ -2063,7 +2067,7 @@ class Filter:
                     batch = tasks[:batch_size]
                     state["pending_secondary_tasks"] = tasks[batch_size:]
 
-                # Process the batch without holding the lock (LLM calls are slow)
+                # Process the batch without holding the project lock (LLM calls are slow)
                 for task_dict in batch:
                     try:
                         task = SecondaryTask(**task_dict)
@@ -2082,8 +2086,11 @@ class Filter:
                                     f"Dropping secondary task {task.task_type} after {task.retries} retries"
                                 )
                     except Exception as e:
+                        import traceback
+
                         self._log_debug(
-                            f"Secondary task {task_dict['task_type']} failed: {e}"
+                            f"Secondary task {task_dict.get('task_type', 'unknown')} "
+                            f"failed: {e}\n{traceback.format_exc()}"
                         )
                         task_dict["retries"] = task_dict.get("retries", 0) + 1
                         if (
@@ -2106,7 +2113,11 @@ class Filter:
                 self._log_debug("Secondary task worker shutting down")
                 break
             except Exception as e:
-                self._log_debug(f"Secondary task worker error: {e}")
+                import traceback
+
+                self._log_debug(
+                    f"Secondary task worker error: {e}\n{traceback.format_exc()}"
+                )
                 await asyncio.sleep(5.0)
 
     def _init_state_db(self):
@@ -2198,19 +2209,19 @@ class Filter:
         self._state_last_saved = now
         self._state_dirty = False
 
-        # Schedule the DB write just like the original _set_state did
+        def _log_save_result(t):
+            if t.exception():
+                self._log_debug(f"Failed to save state: {t.exception()}")
+            elif t.cancelled():
+                self._log_debug("Save state task was cancelled")
+            # success is silent
+
         task = asyncio.create_task(
             self._save_state_to_db_async(
                 project_id, self._conversation_state[project_id]
             )
         )
-        task.add_done_callback(
-            lambda t: (
-                self._log_debug(f"Failed to save state: {t.exception()}")
-                if t.exception()
-                else None
-            )
-        )
+        task.add_done_callback(_log_save_result)
 
     async def _save_state_to_db(self, project_id: str, state: Dict):
         active_blocks_meta = {}
@@ -3390,18 +3401,6 @@ class Filter:
         role = message.get("role", "")
 
         extracted, block_spans = await self._extract_code_blocks(content)
-
-        # ── Filter out self‑referencing code (prevents analysing the filter itself) ──
-        extracted = [
-            b
-            for b in extracted
-            if "Code-Aware Context Manager" not in b.get("code", "")
-            and "FALLBACK_LANGUAGE_QUERIES" not in b.get("code", "")
-        ]
-        if not extracted:
-            return
-        # ─────────────────────────────────────────────────────────────────────────
-
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted):
             blk_file = None
@@ -4835,44 +4834,68 @@ class Filter:
             "cómo implementar",
             "why does",
             "por qué falla",
+            "why is",
+            "por qué es",
             "implement",
             "implementa",
-            "design",
-            "diseña",
+            "system design",
+            "diseño del sistema",
+            "design a",
+            "diseña un",
+            "design the",
+            "diseña el",
             "architecture",
             "arquitectura",
             "build a",
             "construye",
             "create a class",
             "crea una clase",
+            "add support for",
+            "añadir soporte para",
+            "extend the",
+            "extiende el",
             "debug",
             "depura",
             "fix the",
             "corrige el",
+            "not working",
+            "no funciona",
+            "doesn't work",
+            "no me funciona",
+            "keeps failing",
+            "sigue fallando",
+            "throws an error",
+            "lanza un error",
+            "unexpected behavior",
+            "comportamiento inesperado",
+            "memory leak",
+            "fuga de memoria",
+            "bottleneck",
+            "cuello de botella",
             "optimize",
             "optimiza",
             "refactor",
             "refactoriza",
-            "improve",
-            "mejora",
             "migrate",
             "migra",
-            "compare",
-            "compara",
             "code review",
             "revisión de código",
             "audit",
             "audita",
-            "validate",
-            "valida",
             "integrate",
             "integra",
             "deploy",
             "despliega",
             "set up",
             "configura el entorno",
-            "in detail",
-            "en detalle",
+            "step by step",
+            "paso a paso",
+            "full implementation",
+            "implementación completa",
+            "best practices",
+            "buenas prácticas",
+            "comprehensive",
+            "completo y detallado",
         }
 
         complex_keywords_code_only = {
@@ -4887,6 +4910,12 @@ class Filter:
             "revisa",
             "structure",
             "estructura",
+            "compare",
+            "compara",
+            "improve",
+            "mejora",
+            "validate",
+            "valida",
         }
 
         deep_keywords = {
@@ -4895,22 +4924,12 @@ class Filter:
             "check every step",
             "comprueba cada paso",
             "razonamiento exhaustivo",
-            "best practices",
-            "buenas prácticas",
             "production ready",
             "listo para producción",
             "edge cases",
             "casos límite",
-            "step by step",
-            "paso a paso",
             "trade-offs",
             "ventajas y desventajas",
-            "comprehensive",
-            "completo y detallado",
-            "full implementation",
-            "implementación completa",
-            "end to end",
-            "de extremo a extremo",
             "security review",
             "revisión de seguridad",
             "performance analysis",
@@ -4923,6 +4942,10 @@ class Filter:
             "auto-reflexión",
             "auto-evalúa",
             "itera varias veces",
+            "exhaustive",
+            "exhaustivo",
+            "all edge cases",
+            "todos los casos límite",
         }
 
         # ── Optional accent normalisation ───────────────────────────────────
@@ -4952,13 +4975,30 @@ class Filter:
         if is_code_session:
             active_complex |= complex_keywords_code_only
 
+        # ── Negation guard (uses class‑level prefixes) ─────────────────────
+        def _is_negated(text: str, kw: str) -> bool:
+            """Check if *every* occurrence of `kw` is negated (at least one non‑negated → False)."""
+            start = 0
+            while True:
+                idx = text.find(kw, start)
+                if idx == -1:
+                    break
+                before = text[:idx].strip().split()[-3:]
+                if not any(neg in before for neg in self._COT_NEGATION_PREFIXES):
+                    return False  # found an occurrence without negation
+                start = idx + 1
+            return True  # all occurrences were negated
+
         # ── Pre‑sort keyword lists once for efficient compound matching ────
         _sorted_deep = sorted(deep_keywords, key=len, reverse=True)
         _sorted_complex = sorted(active_complex, key=len, reverse=True)
 
         def _contains_any(text: str, sorted_kw: list) -> bool:
-            """Check if text contains any keyword; longer (compound) phrases first."""
-            return any(kw in text for kw in sorted_kw)
+            """Check if text contains any keyword (longest first), respecting negation."""
+            for kw in sorted_kw:
+                if kw in text and not _is_negated(text, kw):
+                    return True
+            return False
 
         # ── Guard: very short messages → inconclusive ──────────────────────
         if too_short and not has_code:
@@ -4977,7 +5017,13 @@ class Filter:
         signals = 0
         if self.ENABLE_KEYWORD_COUNT_WEIGHT:
             # Count how many complex keywords matched (capped at 4)
-            kw_matches = sum(1 for kw in _sorted_complex if kw in content_lower)
+            kw_matches = sum(
+                1
+                for kw in _sorted_complex
+                if kw in content_lower and not _is_negated(content_lower, kw)
+            )
+            # Base offset ensures non‑trivial messages without keywords can still
+            # reach level 1 when combined with other signals.
             signals += min(kw_matches + 2, 4)
         else:
             if has_complex_kw:
@@ -4991,6 +5037,29 @@ class Filter:
             signals += 1
         # Bonus: code session + any complex keyword → higher confidence
         if is_code_session and has_complex_kw:
+            signals += 1
+
+        # ── "in detail" / "en detalle" as a weak independent signal ───────
+        for phrase in ("in detail", "en detalle"):
+            if phrase in content_lower and not _is_negated(content_lower, phrase):
+                signals += 1
+                break
+
+        # ── Stack trace detection (code sessions only) ────────────────────
+        if is_code_session:
+            has_stack_trace = (
+                "traceback (most recent call last)" in content_lower
+                or "traceback:" in content_lower
+                or ("exception" in content_lower and "at line" in content_lower)
+                or bool(re.search(r'file ".+", line \d+', content_lower))
+                or bool(re.search(r"at \w+\.\w+\([\w.]+:\d+\)", content_lower))
+            )
+            if has_stack_trace:
+                signals += 2
+
+        # ── Multiple code blocks → comparison / review → level 2 ──────────
+        code_block_count = user_content.count("```") // 2
+        if code_block_count >= 2:
             signals += 1
 
         # ── Optional: conversation history ─────────────────────────────────
@@ -6328,6 +6397,7 @@ class Filter:
                 else:
                     prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
+                # Generate the initial CoT
                 if not manual_cot_used:
                     if cot_level == 2:
                         reasoning = await self._generate_cot_reasoning(
@@ -6347,7 +6417,19 @@ class Filter:
                             cot_question, prelim_for_cot
                         )
 
-                if reasoning:
+                # Fallback: if auto level 3 failed, try level 2 once
+                _cot_error_msg = "Unable to generate reasoning."
+                if (
+                    not manual_cot_used
+                    and cot_level == 3
+                    and (reasoning is None or reasoning == _cot_error_msg)
+                ):
+                    self._log_debug("Level 3 CoT failed, falling back to level 2")
+                    reasoning = await self._generate_cot_reasoning(
+                        last_user_msg.get("content", ""), prelim_for_cot
+                    )
+
+                if reasoning and reasoning != _cot_error_msg:
                     system_injections.append(("high", reasoning))
                 else:
                     self._log_debug("CoT reasoning generation returned empty or failed")
@@ -6359,14 +6441,13 @@ class Filter:
                     "Use them to enhance your answer, but always prioritise the actual user query."
                 )
                 system_injections.append(("low", cot_note))
-
-                # Unload the CoT model immediately to free VRAM for the main model
+            finally:
+                # Always unload the CoT model to free the slot, even on error
                 try:
                     await _shared_unload_all_models(self.valves.LLM_BASE_URL)
                     self._last_used_model = None
                 except Exception:
                     pass
-            finally:
                 # Resume the secondary task worker
                 if hasattr(self, "_secondary_worker_paused"):
                     self._secondary_worker_paused.set()
@@ -6551,7 +6632,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -6592,6 +6673,9 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INLET – orchestrated entry point
+    # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
@@ -6604,6 +6688,9 @@ class Filter:
 
         self._ensure_cleanup_task()
         project_id = self._get_project_id()
+
+        # ── Acquire global LLM lock so no other instance interferes ──────
+        await _global_llm_lock.acquire()
 
         # Preprocessing (no secondary tasks)
         messages = await self._inlet_preprocess(body, project_id)
@@ -6746,6 +6833,9 @@ class Filter:
                         task.cancel()
             _inlet_background_tasks.reset(token)
 
+            # ── Release the global LLM lock ────────────────────────────
+            _global_llm_lock.release()
+
         return body
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6758,47 +6848,42 @@ class Filter:
 
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
-        messages = body.get("messages", [])
-        project_id = self._get_project_id()
-        state = self._get_state(project_id)
-        is_code_session = await self._classify_session(messages, project_id)
-        last_msg = messages[-1] if messages else None
-        if last_msg:
-            last_idx = len(messages) - 1
-            if last_idx <= self._last_processed_message_idx.get(project_id, -1):
-                self._log_debug(
-                    "outlet: last message already processed in inlet, skipping"
-                )
-            else:
-                if (
-                    last_msg.get("role") == "assistant"
-                    and is_code_session
-                    and "/expand" in last_msg.get("content", "")
-                ):
-                    modified_content, did_expand = await self._outlet_intercept_expand(
-                        last_msg.get("content", ""), project_id
-                    )
-                    if did_expand:
-                        messages[-1]["content"] = modified_content
-                        body["messages"] = messages
-                        self._log_debug(
-                            "outlet: /expand intercepted — history rewritten with real code"
-                        )
 
-                if last_msg.get("role") in ("user", "assistant"):
-                    if is_code_session:
-                        await self._update_active_code(last_msg, project_id)
-                        async with self._ltm_batch_lock:
-                            self._pending_ltm_messages.append(last_msg)
-                            if (
-                                self._ltm_batch_task is None
-                                or self._ltm_batch_task.done()
-                            ):
-                                self._ltm_batch_task = asyncio.create_task(
-                                    self._flush_ltm_batch(project_id)
-                                )
-                    else:
-                        if not self.valves.ltm_store_only_code_sessions:
+        # Acquire global LLM lock – outlet may also use models
+        await _global_llm_lock.acquire()
+        try:
+            messages = body.get("messages", [])
+            project_id = self._get_project_id()
+            state = self._get_state(project_id)
+            is_code_session = await self._classify_session(messages, project_id)
+            last_msg = messages[-1] if messages else None
+            if last_msg:
+                last_idx = len(messages) - 1
+                if last_idx <= self._last_processed_message_idx.get(project_id, -1):
+                    self._log_debug(
+                        "outlet: last message already processed in inlet, skipping"
+                    )
+                else:
+                    if (
+                        last_msg.get("role") == "assistant"
+                        and is_code_session
+                        and "/expand" in last_msg.get("content", "")
+                    ):
+                        modified_content, did_expand = (
+                            await self._outlet_intercept_expand(
+                                last_msg.get("content", ""), project_id
+                            )
+                        )
+                        if did_expand:
+                            messages[-1]["content"] = modified_content
+                            body["messages"] = messages
+                            self._log_debug(
+                                "outlet: /expand intercepted — history rewritten with real code"
+                            )
+
+                    if last_msg.get("role") in ("user", "assistant"):
+                        if is_code_session:
+                            await self._update_active_code(last_msg, project_id)
                             async with self._ltm_batch_lock:
                                 self._pending_ltm_messages.append(last_msg)
                                 if (
@@ -6808,44 +6893,62 @@ class Filter:
                                     self._ltm_batch_task = asyncio.create_task(
                                         self._flush_ltm_batch(project_id)
                                     )
+                        else:
+                            if not self.valves.ltm_store_only_code_sessions:
+                                async with self._ltm_batch_lock:
+                                    self._pending_ltm_messages.append(last_msg)
+                                    if (
+                                        self._ltm_batch_task is None
+                                        or self._ltm_batch_task.done()
+                                    ):
+                                        self._ltm_batch_task = asyncio.create_task(
+                                            self._flush_ltm_batch(project_id)
+                                        )
 
-        # Response cache storage (with code_state_hash precomputed to avoid extra lock)
-        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
-            last_user = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
-            )
-            last_assistant = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"), None
-            )
-            if last_user and last_assistant:
-                context_hash = self._compute_context_hash(messages[:-1])
-                code_state_hash = self._compute_code_state_hash(project_id)
-                await self._store_response_in_cache(
-                    last_user.get("content", ""),
-                    last_assistant.get("content", ""),
-                    context_hash,
-                    state,
-                    code_state_hash,
+            # Response cache storage (with code_state_hash precomputed to avoid extra lock)
+            if (
+                self.valves.enable_response_cache
+                and HAS_SENTENCE
+                and len(messages) >= 2
+            ):
+                last_user = next(
+                    (m for m in reversed(messages) if m.get("role") == "user"), None
                 )
+                last_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                    None,
+                )
+                if last_user and last_assistant:
+                    context_hash = self._compute_context_hash(messages[:-1])
+                    code_state_hash = self._compute_code_state_hash(project_id)
+                    await self._store_response_in_cache(
+                        last_user.get("content", ""),
+                        last_assistant.get("content", ""),
+                        context_hash,
+                        state,
+                        code_state_hash,
+                    )
 
-        # Purge expired memories only if no purge is already running
-        if self._purge_task is None or self._purge_task.done():
-            self._purge_task = asyncio.create_task(self._purge_expired_memories())
+            # Purge expired memories only if no purge is already running
+            if self._purge_task is None or self._purge_task.done():
+                self._purge_task = asyncio.create_task(self._purge_expired_memories())
 
-        self._write_counter += 1
-        if self._write_counter % 100 == 0:
-            self._purge_task = asyncio.create_task(self._run_db_checkpoints())
-            self._cleanup_completed_tasks()
+            self._write_counter += 1
+            if self._write_counter % 100 == 0:
+                self._purge_task = asyncio.create_task(self._run_db_checkpoints())
+                self._cleanup_completed_tasks()
 
-        # Save state if dirty (debounced)
-        await self._save_state_if_dirty(project_id)
+            # Save state if dirty (debounced)
+            await self._save_state_if_dirty(project_id)
 
-        # Free VRAM for the main model
-        try:
-            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-            self._last_used_model = None
-        except Exception:
-            pass
+            # Free VRAM for the main model
+            try:
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                self._last_used_model = None
+            except Exception:
+                pass
+        finally:
+            _global_llm_lock.release()
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
