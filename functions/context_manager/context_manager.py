@@ -959,7 +959,7 @@ class Filter:
         cot_max_tokens: int = Field(default=0)
         cot_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         cot_model_level2: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M",
+            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
             description="Model used for CoT level 2 (auto‑reasoning). Must support large contexts.",
         )
         cot_model_level3: str = Field(
@@ -6226,6 +6226,11 @@ class Filter:
                     f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                 )
 
+            # TODO: Bear in mind here we pass the entire active context
+            #       which can be big enough to overflow 3-9b models.
+            #       This should be auto fixed once we implement
+            #       more advanced techniques of context compression.
+            #       This applies to CoT level 2 and 3.
             _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
