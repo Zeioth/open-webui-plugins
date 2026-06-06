@@ -1034,7 +1034,7 @@ class Filter:
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
-        llm_request_timeout: int = Field(default=600)
+        llm_request_timeout: int = Field(default=450)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
 
