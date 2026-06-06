@@ -106,6 +106,10 @@ _inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
 )
 _db_global_lock = threading.Lock()
 _llm_semaphore = asyncio.Semaphore(1)
+import fcntl
+import tempfile
+
+_llm_lock_path = os.path.join(tempfile.gettempdir(), "openwebui_llm.lock")
 
 
 # ---------------------------------------------------------------------------
@@ -1311,25 +1315,6 @@ class Filter:
         self._symbol_cache_loaded_projects: Set[str] = set()
 
         # Smart pre‑expand prototype phrases
-        self._full_code_intent_phrases = [
-            "show me the complete code",
-            "generate a flowchart",
-            "draw a diagram of the code",
-            "explain the whole architecture",
-            "give me all the functions",
-            "i need to see everything",
-            "overview of all symbols",
-            "full code for review",
-            "muéstrame el código completo",
-            "genera un diagrama de flujo",
-            "diagrama del código",
-            "explícame toda la arquitectura",
-            "dame todas las funciones",
-            "necesito ver todo el código",
-            "visión general de los símbolos",
-            "código completo para revisar",
-        ]
-        self._full_code_intent_embeddings = None
         self._query_embedding_cache: Dict[str, np.ndarray] = {}
         self._query_embedding_cache_max_size = 100
 
@@ -2559,6 +2544,48 @@ class Filter:
                 content = choices[0].get("message", {}).get("content", "")
         return content.strip()
 
+    async def _acquire_llm_lock(self):
+        """Acquire an inter‑process file lock for exclusive LLM access."""
+        loop = asyncio.get_event_loop()
+        fd = open(_llm_lock_path, "w")
+        await loop.run_in_executor(self._db_executor, fcntl.flock, fd, fcntl.LOCK_EX)
+        return fd
+
+    @staticmethod
+    def _release_llm_lock(fd):
+        """Release the inter‑process file lock and close the file descriptor."""
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+    async def _wait_for_empty_slot(self, retries: int = 3, delay: float = 2.0) -> bool:
+        """
+        Check that the LLM server has no loaded models.
+        Retries a few times with a delay between checks.
+        Returns True if the slot is empty, False otherwise.
+        """
+        from shared_resources import get_http_session
+
+        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+
+        for _ in range(retries):
+            await asyncio.sleep(delay)
+            try:
+                session = await get_http_session(timeout=5)
+                async with session.get(f"{base_url}/v1/models") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        loaded = any(
+                            m.get("status", {}).get("value") == "loaded"
+                            for m in data.get("data", [])
+                        )
+                        if not loaded:
+                            return True
+            except Exception:
+                pass
+        return False
+
     async def _call_llm(
         self,
         prompt: str,
@@ -2627,65 +2654,71 @@ class Filter:
                     f"– prompt size: ~{prompt_tokens} tokens"
                 )
 
-            # ── Acquire global LLM semaphore to serialize all server calls ──
-            async with _llm_semaphore:
-                await self._maybe_unload_for_model(model, base_url, is_ollama)
+            # ── Inter‑process lock: only one process can use the LLM at a time ──
+            llm_fd = await self._acquire_llm_lock()
+            try:
+                # ── Acquire global LLM semaphore to serialize all server calls ──
+                async with _llm_semaphore:
+                    await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-                for attempt in range(max_retries + 1):
-                    try:
-                        async with effective_semaphore:
-                            content = await _shared_call_llm(
-                                prompt=prompt,
-                                system=system_prompt,
-                                base_url=self.valves.LLM_BASE_URL,
-                                model=model,
-                                api_token=self.valves.LLM_API_TOKEN,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                timeout=self.valves.llm_request_timeout,
-                                endpoint_type=ep_type,
-                            )
-                        if content:
-                            await self._llm_cache.set(cache_key, content)
-                            future.set_result(content)
-                            # ── Log input and output tokens ──
-                            in_tokens = (
-                                len(self.tokenizer.encode(prompt))
-                                if self.tokenizer
-                                else "?"
-                            )
-                            out_tokens = (
-                                len(self.tokenizer.encode(content))
-                                if self.tokenizer
-                                else "?"
-                            )
+                    for attempt in range(max_retries + 1):
+                        try:
+                            async with effective_semaphore:
+                                content = await _shared_call_llm(
+                                    prompt=prompt,
+                                    system=system_prompt,
+                                    base_url=self.valves.LLM_BASE_URL,
+                                    model=model,
+                                    api_token=self.valves.LLM_API_TOKEN,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    timeout=self.valves.llm_request_timeout,
+                                    endpoint_type=ep_type,
+                                )
+                            if content:
+                                await self._llm_cache.set(cache_key, content)
+                                future.set_result(content)
+                                # ── Log input and output tokens ──
+                                in_tokens = (
+                                    len(self.tokenizer.encode(prompt))
+                                    if self.tokenizer
+                                    else "?"
+                                )
+                                out_tokens = (
+                                    len(self.tokenizer.encode(content))
+                                    if self.tokenizer
+                                    else "?"
+                                )
+                                self._log_debug(
+                                    f"[LLM] {model}"
+                                    + (f" ({label})" if label else "")
+                                    + f" – in:{in_tokens} out:{out_tokens}"
+                                    + f" took {time.monotonic() - t_start:.3f}s"
+                                )
+                                self._last_used_model = model
+                                return content
+                        except asyncio.CancelledError:
+                            raise
+                        except RuntimeError as exc:
                             self._log_debug(
-                                f"[LLM] {model}"
-                                + (f" ({label})" if label else "")
-                                + f" – in:{in_tokens} out:{out_tokens}"
-                                + f" took {time.monotonic() - t_start:.3f}s"
+                                f"[LLM] {model}{f' ({label})' if label else ''} "
+                                f"error: {exc}"
                             )
-                            self._last_used_model = model
-                            return content
-                    except asyncio.CancelledError:
-                        raise
-                    except RuntimeError as exc:
-                        self._log_debug(
-                            f"[LLM] {model}{f' ({label})' if label else ''} "
-                            f"error: {exc}"
-                        )
-                        if any(
-                            c in str(exc) for c in ("429", "500", "502", "503", "504")
-                        ):
+                            if any(
+                                c in str(exc)
+                                for c in ("429", "500", "502", "503", "504")
+                            ):
+                                if attempt < max_retries:
+                                    await asyncio.sleep(base_delay * (2**attempt))
+                                    continue
+                            break
+                        except Exception:
                             if attempt < max_retries:
                                 await asyncio.sleep(base_delay * (2**attempt))
                                 continue
-                        break
-                    except Exception:
-                        if attempt < max_retries:
-                            await asyncio.sleep(base_delay * (2**attempt))
-                            continue
-                        break
+                            break
+            finally:
+                self._release_llm_lock(llm_fd)
 
             logger.warning(
                 f"LLM call failed for model {model}: prompt={prompt[:100]}..."
@@ -4295,37 +4328,7 @@ class Filter:
         directly_mentioned = all_names.intersection(words)
         needed_symbols.update(directly_mentioned)
 
-        # B) Embedding‑based detection
-        if not needed_symbols:
-            await self._ensure_full_code_intent_embeddings()
-            if self._full_code_intent_embeddings is not None:
-                query_hash = hashlib.md5(user_query.encode()).hexdigest()[:12]
-                query_emb = self._query_embedding_cache.get(query_hash)
-                if query_emb is None:
-                    query_emb = await anyio.to_thread.run_sync(
-                        lambda: self.embedder.encode(
-                            [user_query], convert_to_numpy=True
-                        )[0]
-                    )
-                    if (
-                        len(self._query_embedding_cache)
-                        >= self._query_embedding_cache_max_size
-                    ):
-                        self._query_embedding_cache.pop(
-                            next(iter(self._query_embedding_cache))
-                        )
-                    self._query_embedding_cache[query_hash] = query_emb
-
-                similarities = np.dot(self._full_code_intent_embeddings, query_emb) / (
-                    np.linalg.norm(self._full_code_intent_embeddings, axis=1)
-                    * np.linalg.norm(query_emb)
-                    + 1e-10
-                )
-                max_sim = similarities.max()
-                if max_sim >= self.valves.smart_pre_expand_embedding_threshold:
-                    needed_symbols = set(all_names)
-
-        # C) Optional LLM detection
+        # B) Optional LLM detection (embedding‑based detection has been removed)
         if (
             self.valves.smart_pre_expand_use_llm
             and not needed_symbols
@@ -4355,7 +4358,7 @@ class Filter:
                 }
                 needed_symbols.update(detected)
 
-        # D) Minimum expansion fallback
+        # C) Minimum expansion fallback
         if not needed_symbols and self.valves.smart_pre_expand_min_symbols > 0:
             used_minimum_expansion = True
             min_token_budget = self.valves.smart_pre_expand_min_tokens
@@ -5234,33 +5237,6 @@ class Filter:
         }
         query_lower = user_query.lower()
         return any(kw in query_lower for kw in structural_keywords)
-
-    def _is_code_review_request(self, user_content: str) -> bool:
-        review_phrases = {
-            "review",
-            "check my code",
-            "code review",
-            "audit",
-            "inspect",
-            "bug",
-            "error",
-            "syntax",
-            "revisa",
-            "revisión",
-            "analiza",
-            "encuentra",
-            "corrige",
-            "fallo",
-            "fallos",
-            "depura",
-            "depurar",
-            "errores",
-            "error de sintaxis",
-            "lógica",
-            "bugs",
-        }
-        content_lower = user_content.lower()
-        return any(phrase in content_lower for phrase in review_phrases)
 
     # --------------------------------------------------------------------------
     # Feedback context
@@ -6335,6 +6311,33 @@ class Filter:
 
         return system_injections, None, prelim_system
 
+    async def _should_keep_full_code(self, user_question: str) -> bool:
+        """
+        Ask a lightweight LLM whether the full code should be kept in the user message.
+        Returns True if the model responds 'full', False otherwise.
+        """
+        if not user_question.strip():
+            return False
+
+        prompt = (
+            f"The user has provided a large block of code. Their question/message is:\n"
+            f'"{user_question[:500]}"\n\n'
+            "Should the full code be included in the final context, or is it sufficient "
+            "to provide only an analysis summary and relevant code fragments?\n"
+            'Answer with only one word: "full" or "summary".'
+        )
+
+        model = self.valves.symbol_analysis_model or self.valves.llm_model
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a concise classifier. Answer with only one word.",
+            model_override=model,
+            max_tokens=5,
+            temperature=0.0,
+            label="lean_context_check",
+        )
+        return response and response.strip().lower() == "full"
+
     async def _inlet_assemble_final_messages(
         self,
         messages: List[dict],
@@ -6346,6 +6349,7 @@ class Filter:
         __user__: Optional[dict],
         background_tasks: List[asyncio.Task],
         user_question: str,
+        has_code_blocks: bool,
     ) -> List[dict]:
         """Apply CoT, final token budget, trimming, and insert system prompt."""
         # CoT detection
@@ -6386,6 +6390,11 @@ class Filter:
         try:
             await _shared_unload_all_models(self.valves.LLM_BASE_URL)
             self._last_used_model = None
+            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
+            if not slot_empty:
+                self._log_debug("Slot not empty before CoT – forcing extra unload")
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                await self._wait_for_empty_slot(retries=2, delay=3.0)
         except Exception:
             pass
 
@@ -6421,7 +6430,6 @@ class Filter:
 
                 # Generate the initial CoT
                 if not manual_cot_used:
-                    # Use the cleaned user question, not the raw message with code
                     question = user_question
                     if cot_level == 2:
                         reasoning = await self._generate_cot_reasoning(
@@ -6450,7 +6458,7 @@ class Filter:
                 ):
                     self._log_debug("Level 3 CoT failed, falling back to level 2")
                     reasoning = await self._generate_cot_reasoning(
-                        user_question, prelim_for_cot  # use the same cleaned question
+                        user_question, prelim_for_cot
                     )
 
                 if reasoning and reasoning != _cot_error_msg:
@@ -6602,6 +6610,27 @@ class Filter:
                 else:
                     history_msgs = kept_block
 
+        # ── Lean user message: replace full code with relevant fragments ──
+        if has_code_blocks and last_user_msg:
+            analysis_summary = getattr(self, "_last_analysis_summary", None)
+            suggested_blocks = getattr(self, "_last_suggested_blocks", None)
+
+            # Ask the LLM whether to keep the original code
+            keep_original = await self._should_keep_full_code(user_question)
+
+            if not keep_original and (analysis_summary or suggested_blocks):
+                # Build lean user content
+                lean_parts = [user_question.strip()]
+                if suggested_blocks:
+                    lean_parts.append("\n## Relevant code\n")
+                    for blk in suggested_blocks[:5]:
+                        loc = f" (file: {blk.file_path})" if blk.file_path else ""
+                        lean_parts.append(
+                            f"### {blk.hash[:8]}{loc}\n```\n{blk.content[:2000]}\n```"
+                        )
+                # Replace the last user message content
+                last_user_msg["content"] = "\n".join(lean_parts)
+
         # ── Concatenate pending summary to the final system message ──
         if pending_summary:
             final_system = (
@@ -6660,7 +6689,7 @@ class Filter:
 
             self._log_debug("─" * 50)
             self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages, no LLM call):     ~{ltm_tokens}")
+            self._log_debug(f"  LTM (past messages, no LLM call):      ~{ltm_tokens}")
             self._log_debug(
                 f"  Summary (symbol analysis synthesis):   ~{summary_tokens}"
             )
@@ -6701,17 +6730,26 @@ class Filter:
         if hasattr(self, "_secondary_worker_paused"):
             self._secondary_worker_paused.clear()
 
-        # Free VRAM before any LLM call
+        # Free VRAM before any LLM call and verify slot is empty
         try:
             await _shared_unload_all_models(self.valves.LLM_BASE_URL)
             self._last_used_model = None
+            slot_empty = await self._wait_for_empty_slot(retries=3, delay=2.0)
+            if not slot_empty:
+                self._log_debug("Slot not empty after unload – retrying unload")
+                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
+                await self._wait_for_empty_slot(retries=2, delay=3.0)
         except Exception:
             pass
 
-        # Extract user info (with await)
-        last_user_msg, user_query, user_question, is_explicit_command = (
-            await self._inlet_extract_user_info(messages)
-        )
+        # Extract user info (with await) – now returns has_code_blocks too
+        (
+            last_user_msg,
+            user_query,
+            user_question,
+            is_explicit_command,
+            has_code_blocks,
+        ) = await self._inlet_extract_user_info(messages)
 
         # Explicit commands
         handled, handled_messages = await self._inlet_handle_explicit_commands(
@@ -6793,7 +6831,8 @@ class Filter:
                 state,
                 __user__,
                 background_tasks,
-                user_question,  # ← cleaned question without code blocks
+                user_question,
+                has_code_blocks,
             )
 
             body["messages"] = messages
