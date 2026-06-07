@@ -15,8 +15,10 @@ My current system prompt:
 - Para otros lenguajes, sigue las convenciones estándar de la comunidad.
 
 ## Al generar gráficos
-- Asegúrate de que los colores que elijas destaquen bien sobre un fondo de pantalla negro puro.
-- Asegúrate de dejar un poco de margen entre elementos para que no se solapen, no desborden del contenedor.
+Mermaid renderer plugin is available.
+
+1. Asegúrate de que los colores que elijas destaquen bien sobre un fondo de pantalla negro puro.
+2. Asegúrate de dejar un poco de margen entre elementos para que no se solapen, no desborden del contenedor. Pero cuida que el tamaño del contenedor no exceda en exceso.
 ```
 
 ## TODOS
