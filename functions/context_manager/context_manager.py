@@ -823,7 +823,7 @@ class Filter:
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
-        context_window_tokens: int = Field(default=110000)
+        context_window_tokens: int = Field(default=1000000)
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
@@ -870,7 +870,8 @@ class Filter:
         max_code_block_tokens: int = Field(default=0)
         code_block_overflow_action: str = Field(default="warn")
         code_block_summary_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Model for summarizing oversized code blocks. Gemma 4 4B MTP for speed.",
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -920,7 +921,10 @@ class Filter:
         smart_pre_expand_min_tokens: int = Field(default=2000)
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
-        smart_pre_expand_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        smart_pre_expand_model: str = Field(
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Model for smart pre‑expansion of code symbols. Gemma 4 4B MTP.",
+        )
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
             default=0.72, ge=0.0, le=1.0
@@ -957,26 +961,34 @@ class Filter:
         auto_cot_min_chars: int = Field(default=200)
         enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
-        cot_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        cot_model: str = Field(
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="General CoT model. Gemma 4 4B MTP.",
+        )
         cot_model_level2: str = Field(
-            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
-            description="Model used for CoT level 2 (auto‑reasoning). Must support large contexts.",
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Model for auto‑reasoning (CoT level 2). Gemma 4 4B MTP.",
         )
         cot_model_level3: str = Field(
-            default="Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Nano",
-            description="Model used for CoT level 3 (self‑reflection). Must support large contexts.",
+            default="Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-APEX-MTP-I-Nano",
+            description="Model for CoT level 3 (self‑reflection). Qwen3.6 Nano with MTP to fit in VRAM.",
         )
         enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        cot_detection_model: str = Field(
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Model to decide CoT depth. Gemma 4 2B MTP.",
+        )
 
         # ─── Assumptions & Contradictions ───
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Lightweight model for extracting assumptions. Gemma 4 2B MTP.",
         )
         enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Model for contradiction detection. Gemma 4 2B MTP.",
         )
         contradiction_inject_warning: bool = Field(default=True)
 
@@ -1018,12 +1030,18 @@ class Filter:
         general_summary_max_tokens: int = Field(default=200)
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
-        summary_fallback_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        summary_fallback_model: str = Field(
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Fallback model for summaries. Gemma 4 4B MTP.",
+        )
         summary_include_metadata: bool = Field(default=True)
 
         # ─── Summarize Old Messages ───
         summarize_old_messages: bool = Field(default=True)
-        summarization_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        summarization_model: str = Field(
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Model for summarizing code and conversations. Gemma 4 4B MTP.",
+        )
 
         # ─── LLM Configuration ───
         openai_api_base: str = Field(
@@ -1032,9 +1050,9 @@ class Filter:
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-Q4_K_M")
+        llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-128K-Q4_K_M")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
-        llm_request_timeout: int = Field(default=450)
+        llm_request_timeout: int = Field(default=900)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
 
@@ -1074,14 +1092,16 @@ class Filter:
         # ─── Summarize Inactive Code ───
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+            default="gemma-4-E4B-it-qat-q4_0",
+            description="Model for summarizing inactive code blocks. Gemma 4 4B MTP.",
         )
 
         # ─── Forget Commands ───
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Model for parsing natural language intents. Gemma 4 2B MTP.",
         )
 
         # ─── Proactive Cleanup ───
@@ -1104,8 +1124,8 @@ class Filter:
             description="Analyze code symbol by symbol instead of raw chunks. Works reliably even with 7B models.",
         )
         symbol_analysis_model: str = Field(
-            default="llama-3.2-3b-instruct-q4_k_m",
-            description="Fast model used for per‑symbol analysis.",
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Fast model for per‑symbol analysis. Gemma 4 2B MTP for speed.",
         )
         symbol_analysis_max_retries: int = Field(
             default=5,
@@ -1130,8 +1150,8 @@ class Filter:
             description="How many messages between session summaries.",
         )
         session_summary_model: str = Field(
-            default="llama-3.2-3b-instruct-q4_k_m",
-            description="Model used to generate session summaries.",
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Model for generating session summaries. Gemma 4 2B MTP.",
         )
         session_summary_max_tokens: int = Field(
             default=200,
@@ -1148,8 +1168,8 @@ class Filter:
             description="Max retries for deferred secondary tasks before giving up.",
         )
         secondary_task_model: str = Field(
-            default="llama-3.2-3b-instruct-q4_k_m",
-            description="Model to use for secondary tasks (summaries, change logs).",
+            default="gemma-4-E2B-it-qat-q4_0",
+            description="Model for secondary tasks (change summaries, missing summaries). Gemma 4 2B MTP.",
         )
         secondary_llm_max_concurrent: int = Field(
             default=2,
@@ -6971,18 +6991,18 @@ class Filter:
             await self._save_state_if_dirty(project_id)
 
             # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
-            #self._log_debug(
+            # self._log_debug(
             #    "🚀 RESOURCE OPTIMISATION – Freeing VRAM "
             #    "(unloading models so the next request starts with a clean slot)"
-            #)
-            #await self._unload_models_under_lock()
+            # )
+            # await self._unload_models_under_lock()
 
             # NOTE: We do NOT unload models here. The main model may still be needed
             # by OpenWebUI for title generation and other tasks.
             # The inlet already unloads auxiliary models after building the prompt.
             self._log_debug(
                 "🚀 RESOURCE OPTIMISATION – Skipping unload to keep main model available for OpenWebUI"
-            )        
+            )
         finally:
             pass
 
