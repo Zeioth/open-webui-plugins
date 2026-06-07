@@ -870,7 +870,7 @@ class Filter:
         max_code_block_tokens: int = Field(default=0)
         code_block_overflow_action: str = Field(default="warn")
         code_block_summary_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Model for summarizing oversized code blocks. Gemma 4 4B MTP for speed.",
         )
         code_block_truncate_keep_head: int = Field(default=50)
@@ -922,7 +922,7 @@ class Filter:
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
         smart_pre_expand_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Model for smart pre‑expansion of code symbols. Gemma 4 4B MTP.",
         )
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
@@ -962,11 +962,11 @@ class Filter:
         enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
         cot_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="General CoT model. Gemma 4 4B MTP.",
         )
         cot_model_level2: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Model for auto‑reasoning (CoT level 2). Gemma 4 4B MTP.",
         )
         cot_model_level3: str = Field(
@@ -975,19 +975,19 @@ class Filter:
         )
         enable_cot_llm_detection: bool = Field(default=True)
         cot_detection_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Model to decide CoT depth. Gemma 4 2B MTP.",
         )
 
         # ─── Assumptions & Contradictions ───
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Lightweight model for extracting assumptions. Gemma 4 2B MTP.",
         )
         enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Model for contradiction detection. Gemma 4 2B MTP.",
         )
         contradiction_inject_warning: bool = Field(default=True)
@@ -1031,7 +1031,7 @@ class Filter:
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
         summary_fallback_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Fallback model for summaries. Gemma 4 4B MTP.",
         )
         summary_include_metadata: bool = Field(default=True)
@@ -1039,7 +1039,7 @@ class Filter:
         # ─── Summarize Old Messages ───
         summarize_old_messages: bool = Field(default=True)
         summarization_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Model for summarizing code and conversations. Gemma 4 4B MTP.",
         )
 
@@ -1092,7 +1092,7 @@ class Filter:
         # ─── Summarize Inactive Code ───
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="gemma-4-E4B-it-qat-q4_0",
+            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
             description="Model for summarizing inactive code blocks. Gemma 4 4B MTP.",
         )
 
@@ -1100,7 +1100,7 @@ class Filter:
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Model for parsing natural language intents. Gemma 4 2B MTP.",
         )
 
@@ -1124,7 +1124,7 @@ class Filter:
             description="Analyze code symbol by symbol instead of raw chunks. Works reliably even with 7B models.",
         )
         symbol_analysis_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Fast model for per‑symbol analysis. Gemma 4 2B MTP for speed.",
         )
         symbol_analysis_max_retries: int = Field(
@@ -1150,7 +1150,7 @@ class Filter:
             description="How many messages between session summaries.",
         )
         session_summary_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Model for generating session summaries. Gemma 4 2B MTP.",
         )
         session_summary_max_tokens: int = Field(
@@ -1168,7 +1168,7 @@ class Filter:
             description="Max retries for deferred secondary tasks before giving up.",
         )
         secondary_task_model: str = Field(
-            default="gemma-4-E2B-it-qat-q4_0",
+            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
             description="Model for secondary tasks (change summaries, missing summaries). Gemma 4 2B MTP.",
         )
         secondary_llm_max_concurrent: int = Field(
