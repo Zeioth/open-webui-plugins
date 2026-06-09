@@ -1273,7 +1273,7 @@ class Filter:
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Long‑Term Memory (ChromaDB)
         # ═══════════════════════════════════════════════════════════════
@@ -1297,7 +1297,7 @@ class Filter:
         enable_reranking: bool = Field(default=True)
         reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
         reranker_top_k: int = Field(default=5)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Code Awareness & Context
         # ═══════════════════════════════════════════════════════════════
@@ -1359,7 +1359,7 @@ class Filter:
             default=True,
             description="Use AST comparison for Python code deduplication instead of text similarity.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Smart Context Selection
         # ═══════════════════════════════════════════════════════════════
@@ -1367,7 +1367,7 @@ class Filter:
         smart_context_top_k: int = Field(default=15)
         smart_context_min_tokens: int = Field(default=1024)
         smart_context_include_last_user: bool = Field(default=True)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Graph Analysis (paths, LOD, centrality, seeds)
         # ═══════════════════════════════════════════════════════════════
@@ -1487,7 +1487,7 @@ class Filter:
             le=0.99,
             description="Damping factor for Personalized PageRank propagation.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  LLM Configuration
         # ═══════════════════════════════════════════════════════════════
@@ -1514,7 +1514,7 @@ class Filter:
             default=True,
             description="Use LLM as fallback when heuristic intent classification produces a weak signal.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Code Compression (LLMLingua-2)
         # ═══════════════════════════════════════════════════════════════
@@ -1536,7 +1536,7 @@ class Filter:
             default=True,
             description="Pass the current user query to LLMLingua-2 to preserve query-relevant tokens.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Importance & Expiration
         # ═══════════════════════════════════════════════════════════════
@@ -1550,7 +1550,7 @@ class Filter:
         active_code_timeout_minutes: int = Field(default=45)
         recent_activity_window_minutes: int = Field(default=15)
         max_change_summaries: int = Field(default=1000)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Duplicate Blocks & Frequency
         # ═══════════════════════════════════════════════════════════════
@@ -1559,7 +1559,7 @@ class Filter:
         frequency_weight_factor: float = Field(default=0.3)
         min_mentions_for_boost: int = Field(default=3)
         frequency_decay_hours: float = Field(default=12.0)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Confidence Scoring & Chain‑of‑Thought
         # ═══════════════════════════════════════════════════════════════
@@ -1623,7 +1623,7 @@ class Filter:
         assumption_extraction_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Proactive Suggestions & Commands
         # ═══════════════════════════════════════════════════════════════
@@ -1642,19 +1642,21 @@ class Filter:
         )
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
-        cleanup_excluded_content_types: list = Field(default_factory=lambda: ["BASE_CODE"])
+        cleanup_excluded_content_types: list = Field(
+            default_factory=lambda: ["BASE_CODE"]
+        )
         cleanup_status_command_enabled: bool = Field(default=True)
         cleanup_proactive_suggestions: bool = Field(default=True)
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Duplicate Question Detection
         # ═══════════════════════════════════════════════════════════════
         duplicate_question_threshold: float = Field(default=0.92)
         duplicate_question_lookback: int = Field(default=20)
         duplicate_question_lookback_hours: float = Field(default=24.0)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Similar Messages & Obsolete Marking
         # ═══════════════════════════════════════════════════════════════
@@ -1662,7 +1664,7 @@ class Filter:
         similar_message_threshold: float = Field(default=0.92)
         similar_message_check_code_only: bool = Field(default=True)
         enable_obsolete_marking: bool = Field(default=True)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Response Cache
         # ═══════════════════════════════════════════════════════════════
@@ -1671,7 +1673,7 @@ class Filter:
         response_cache_ttl_hours: float = Field(default=24.0)
         response_cache_max_entries: int = Field(default=100)
         response_cache_include_context_hash: bool = Field(default=True)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Selective Summarization
         # ═══════════════════════════════════════════════════════════════
@@ -1690,7 +1692,7 @@ class Filter:
         summarization_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Feedback Tracking
         # ═══════════════════════════════════════════════════════════════
@@ -1705,7 +1707,7 @@ class Filter:
             default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
         )
         commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Inactive Code Summarization
         # ═══════════════════════════════════════════════════════════════
@@ -1713,7 +1715,7 @@ class Filter:
         inactive_code_summary_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Session Summaries & Secondary Tasks
         # ═══════════════════════════════════════════════════════════════
@@ -1735,12 +1737,12 @@ class Filter:
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
         secondary_llm_max_concurrent: int = Field(default=2)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Raw File Priority Boost
         # ═══════════════════════════════════════════════════════════════
         raw_file_priority_boost: float = Field(default=2.0)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Expand Intercept & Default Depth
         # ═══════════════════════════════════════════════════════════════
@@ -1748,7 +1750,7 @@ class Filter:
         outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
         outlet_expand_intercept_depth: int = Field(default=5, ge=0)
         expand_default_depth: int = Field(default=2)
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  RAPTOR Hierarchical LTM
         # ═══════════════════════════════════════════════════════════════
@@ -1757,7 +1759,10 @@ class Filter:
             description="Enable RAPTOR hierarchical summarization of LTM. Requires scikit-learn.",
         )
         raptor_clusters_per_level: int = Field(
-            default=5, ge=2, le=20, description="Number of k-means clusters per RAPTOR level."
+            default=5,
+            ge=2,
+            le=20,
+            description="Number of k-means clusters per RAPTOR level.",
         )
         raptor_summary_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
@@ -1770,7 +1775,7 @@ class Filter:
             default=20,
             description="Rebuild RAPTOR index every N outlet calls.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  KV Cache Stability & Slot Persistence
         # ═══════════════════════════════════════════════════════════════
@@ -1786,8 +1791,10 @@ class Filter:
             default="/tmp/llama_slots",
             description="Directory for slot cache files.",
         )
-        slot_id: int = Field(default=0, ge=0, description="llama.cpp slot ID to save/restore.")
-    
+        slot_id: int = Field(
+            default=0, ge=0, description="llama.cpp slot ID to save/restore."
+        )
+
         # ═══════════════════════════════════════════════════════════════
         #  Retrieval Enhancements
         # ═══════════════════════════════════════════════════════════════
@@ -1804,9 +1811,12 @@ class Filter:
             description="Generate multiple query variants before LTM retrieval and merge results.",
         )
         multi_query_variants: int = Field(
-            default=2, ge=1, le=4, description="Number of alternative query variants to generate."
+            default=2,
+            ge=1,
+            le=4,
+            description="Number of alternative query variants to generate.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Edge Persistence (Cross-Session SymbolGraph)
         # ═══════════════════════════════════════════════════════════════
@@ -1814,7 +1824,7 @@ class Filter:
             default=True,
             description="Persist typed SymbolGraph edges to SQLite for cross-session continuity.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Adaptive LOD Thresholds
         # ═══════════════════════════════════════════════════════════════
@@ -1852,7 +1862,7 @@ class Filter:
             le=10,
             description="Minimum overserved symbols to trigger threshold increase.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Speculative Pre‑fetching
         # ═══════════════════════════════════════════════════════════════
@@ -1866,7 +1876,7 @@ class Filter:
             le=20,
             description="Maximum number of symbols to pre-fetch per response.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Silent Ingestion
         # ═══════════════════════════════════════════════════════════════
@@ -1874,7 +1884,7 @@ class Filter:
             default=True,
             description="Index code silently when the user pastes code without a question.",
         )
-    
+
         # ═══════════════════════════════════════════════════════════════
         #  Data Flow Analysis
         # ═══════════════════════════════════════════════════════════════
