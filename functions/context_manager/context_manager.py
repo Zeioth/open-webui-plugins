@@ -1814,6 +1814,29 @@ class Filter:
             ),
         )
 
+        # ─── KV Cache Slot Persistence ───────────────────────────────────────
+        enable_slot_persistence: bool = Field(
+            default=False,
+            description=(
+                "Persist and restore llama.cpp KV cache slot between sessions "
+                "via POST /slots/{id}/save and /slots/{id}/restore. "
+                "Requires --slot-save-path configured in llama.cpp. "
+                "Eliminates cold-start prefill when code has not changed between sessions."
+            ),
+        )
+        slot_save_path: str = Field(
+            default="/tmp/llama_slots",
+            description=(
+                "Directory for slot cache files. "
+                "Must match --slot-save-path in llama.cpp server arguments."
+            ),
+        )
+        slot_id: int = Field(
+            default=0,
+            ge=0,
+            description="llama.cpp slot ID to save/restore. With --parallel 1, always 0.",
+        )
+
         # ─── Silent ingestion ───────────────────────────────────────────────
         enable_silent_ingestion: bool = Field(
             default=True,
@@ -1980,6 +2003,19 @@ class Filter:
         self._last_static_prefix_hash: Dict[str, str] = (
             {}
         )  # project_id → md5 del bloque estático de la última request
+
+        # ── KV Cache Slot Persistence (v7 – PASO-25) ──
+        self._last_saved_slot_hash: Dict[str, str] = (
+            {}
+        )  # project_id → static_block_hash of the last save to disk
+
+        self._slot_restored: Dict[str, bool] = (
+            {}
+        )  # project_id → True if restore succeeded in this server session
+
+        self._slot_restore_attempted: Dict[str, bool] = (
+            {}
+        )  # project_id → True if restore was already attempted (avoid retries)
 
         # Project tracking
         self._last_processed_message_idx: Dict[str, int] = {}
@@ -6585,6 +6621,149 @@ class Filter:
 
         return static_block
 
+    def _slot_filename(self, project_id: str, static_hash: str) -> str:
+        """
+        Deterministic slot file name.
+        Encodes: project + static block hash + model hash.
+        If any of the three changes → different name → no stale restore.
+        """
+        model_hash = hashlib.md5(self.valves.llm_model.encode()).hexdigest()[:8]
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        return (
+            f"slot{self.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
+        )
+
+    async def _slot_restore_if_available(self, project_id: str) -> bool:
+        """
+        Attempt to restore the llama.cpp slot at session start.
+        Executed only ONCE per project per server startup.
+        Returns True if the restore was successful.
+        """
+        if not self.valves.enable_slot_persistence:
+            return False
+        if self._slot_restore_attempted.get(project_id):
+            return self._slot_restored.get(project_id, False)
+
+        self._slot_restore_attempted[project_id] = True
+
+        # Get the current static block hash
+        cached = self._static_context_block_cache.get(project_id)
+        if not cached:
+            return False  # static block not built yet
+        _, static_text = cached
+        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
+
+        filename = self._slot_filename(project_id, static_hash)
+        slot_dir = self.valves.slot_save_path.rstrip("/")
+        full_path = os.path.join(slot_dir, filename)
+
+        if not os.path.exists(full_path):
+            self._log_debug(f"Slot restore: no file found for {filename}")
+            return False
+
+        # Check if the slot is already warm
+        try:
+            session = await _shared_get_http_session(timeout_seconds=5)
+            base = self.valves.LLM_BASE_URL.rstrip("/")
+            async with session.get(f"{base}/slots") as resp:
+                if resp.status == 200:
+                    slots = await resp.json()
+                    slot = next(
+                        (s for s in slots if s.get("id") == self.valves.slot_id),
+                        None,
+                    )
+                    if slot and slot.get("n_past", 0) > 100:
+                        self._log_debug(
+                            f"Slot {self.valves.slot_id} already warm "
+                            f"(n_past={slot['n_past']}), skipping restore"
+                        )
+                        self._slot_restored[project_id] = True
+                        return True
+        except Exception as e:
+            self._log_debug(f"Slot status check failed: {e}")
+
+        # Perform the restore
+        try:
+            session = await _shared_get_http_session(timeout_seconds=30)
+            base = self.valves.LLM_BASE_URL.rstrip("/")
+            async with session.post(
+                f"{base}/slots/{self.valves.slot_id}/restore",
+                json={"filename": filename},
+            ) as resp:
+                if resp.status == 200:
+                    self._slot_restored[project_id] = True
+                    self._log_debug(
+                        f"✓ Slot restored from {filename} — "
+                        f"Block A pre-loaded, first query warm"
+                    )
+                    return True
+                else:
+                    body_txt = await resp.text()
+                    self._log_debug(
+                        f"Slot restore failed: HTTP {resp.status} — {body_txt}"
+                    )
+                    return False
+        except Exception as e:
+            self._log_debug(f"Slot restore error: {e}")
+            return False
+
+    async def _slot_save_if_needed(self, project_id: str) -> bool:
+        """
+        Save the slot state to disk if the static block hash changed
+        since the last save. Called at the end of the outlet.
+        """
+        if not self.valves.enable_slot_persistence:
+            return False
+
+        cached = self._static_context_block_cache.get(project_id)
+        if not cached:
+            return False
+        _, static_text = cached
+        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
+
+        # Only save if the hash changed
+        if self._last_saved_slot_hash.get(project_id) == static_hash:
+            return False
+
+        filename = self._slot_filename(project_id, static_hash)
+
+        try:
+            session = await _shared_get_http_session(timeout_seconds=30)
+            base = self.valves.LLM_BASE_URL.rstrip("/")
+            async with session.post(
+                f"{base}/slots/{self.valves.slot_id}/save",
+                json={"filename": filename},
+            ) as resp:
+                if resp.status == 200:
+                    self._last_saved_slot_hash[project_id] = static_hash
+                    self._log_debug(f"✓ Slot saved → {filename}")
+                    await self._cleanup_old_slot_files(project_id, filename)
+                    return True
+                else:
+                    body_txt = await resp.text()
+                    self._log_debug(
+                        f"Slot save failed: HTTP {resp.status} — {body_txt}"
+                    )
+                    return False
+        except Exception as e:
+            self._log_debug(f"Slot save error: {e}")
+            return False
+
+    async def _cleanup_old_slot_files(self, project_id: str, keep_filename: str):
+        """Remove obsolete slot files belonging to the same project."""
+        slot_dir = self.valves.slot_save_path.rstrip("/")
+        if not os.path.isdir(slot_dir):
+            return
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        prefix = f"slot{self.valves.slot_id}_{project_slug}_"
+        try:
+            for fname in os.listdir(slot_dir):
+                if fname.startswith(prefix) and fname != keep_filename:
+                    os.remove(os.path.join(slot_dir, fname))
+                    self._log_debug(f"Removed obsolete slot file: {fname}")
+        except Exception as e:
+            self._log_debug(f"Slot cleanup error: {e}")
+
     def _invalidate_static_context_block(self, project_id: str, reason: str = ""):
         """
         Force regeneration of the Static Context Block on the next request.
@@ -8048,6 +8227,17 @@ class Filter:
                 for view in db_views:
                     self._path_index.add(view, project_id)
 
+        # ── v7 (PASO-25): restore KV slot at session start (once per project) ──
+        if (
+            self.valves.enable_slot_persistence
+            and project_id not in self._slot_restore_attempted
+            and project_id in self._static_context_block_cache
+        ):
+            self._background_task(
+                self._slot_restore_if_available(project_id),
+                name="slot_restore",
+            )
+
         return messages
 
     async def _inlet_extract_user_info(self, messages: List[dict]):
@@ -9359,6 +9549,13 @@ class Filter:
                     "(to ensure data durability and prevent WAL buildup)"
                 )
                 self._purge_task = asyncio.create_task(self._run_db_checkpoints())
+
+            # 🚀 RESOURCE OPTIMISATION – Save KV slot if static block changed
+            if self.valves.enable_slot_persistence:
+                self._background_task(
+                    self._slot_save_if_needed(project_id),
+                    name="slot_save",
+                )
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
             self._log_debug(
