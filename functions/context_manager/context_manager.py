@@ -9166,18 +9166,12 @@ class Filter:
         Build the system prompt in two separate blocks:
 
         - static_block (Block A): stable content, placed first.
-          Identical across consecutive requests when code hasn't changed.
-          → Maximises KV cache hits in llama.cpp.
-
         - dynamic_injections (Block B): per-query content, placed after.
-          Varies with each request.
-          → Only this block needs prefill on cache hits.
 
         Returns: (static_block, dynamic_injections, cached_response, prelim_system)
-        prelim_system = static_block + dynamic_block (for CoT usage).
         """
         # ══════════════════════════════════════════════════════════════
-        # BLOCK A — STATIC (cacheable prefix)
+        # BLOCK A — STATIC
         # ══════════════════════════════════════════════════════════════
         self._log_debug("🧱 Block A (static): building / retrieving from cache")
         static_block = await self._get_static_context_block(project_id, is_code_session)
@@ -9264,7 +9258,7 @@ class Filter:
         # ── Step B3: Activated code (per-query, varies each request) ──
         self._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         if is_code_session and self.valves.enable_code_awareness:
-            # ── v7 (PASO-15/21): graph‑based path context ────────────────
+            # ── v7: graph‑based path context ────────────────
             if self.valves.enable_path_analysis:
                 intent_vector = await self._classify_intent(user_query, project_id)
                 active_ctx = await self._get_path_context(
@@ -9317,7 +9311,7 @@ class Filter:
         if cmd_suggestion:
             dynamic_injections.append(("low", cmd_suggestion))
 
-        # ── Step B5: Assemble prelim_system for CoT ─────────────────
+        # ── Step B5: Assemble prelim_system ──────────────────────────
         self._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         budget = self.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -9346,7 +9340,6 @@ class Filter:
         else:
             dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
-        # prelim_system = A + B for CoT usage (needs to see both blocks)
         separator = "\n\n---\n\n" if static_block and dynamic_block else ""
         prelim_system = static_block + separator + dynamic_block
 
@@ -9373,7 +9366,8 @@ class Filter:
             'Answer with only one word: "full" or "summary".'
         )
 
-        model = self.valves.symbol_analysis_model or self.valves.llm_model
+        # Use the secondary task model (or main model as fallback)
+        model = self.valves.secondary_task_model or self.valves.llm_model
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a concise classifier. Answer with only one word.",
