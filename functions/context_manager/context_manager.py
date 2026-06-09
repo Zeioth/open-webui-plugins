@@ -1574,7 +1574,7 @@ class Filter:
         )
         enforce_scientific_method: bool = Field(
             default=False,
-            description="Force Level 3 Scientific CoT regardless of detected complexity.",
+            description="Force Level 3 Scientific CoT regardless of detected complexity. Conditionally enabled, if false.",
         )
         scientific_hypotheses_count: int = Field(
             default=3,
