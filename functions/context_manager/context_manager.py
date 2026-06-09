@@ -3501,6 +3501,26 @@ class Filter:
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
+    async def _warm_up_model_if_needed(self, slot_free: bool) -> None:
+        """
+        If the model is not loaded (cold start), send a trivial prompt and
+        wait for the response. This serialises model loading so that
+        subsequent auxiliary calls do not race.
+        """
+        if not slot_free:
+            return  # model already loaded
+
+        self._log_debug("Cold start detected — warming up auxiliary model...")
+        await self._call_llm(
+            prompt="ping",
+            system_prompt="Reply with exactly the word 'pong'.",
+            model_override=self.valves.secondary_task_model,
+            max_tokens=4,
+            temperature=0.0,
+            label="warm_up",
+        )
+        self._log_debug("Model warm-up complete — auxiliary calls are now safe.")
+
     async def _call_llm(
         self,
         prompt: str,
@@ -4060,7 +4080,7 @@ class Filter:
         )
 
     async def _retrieve_all_memories_unified(
-        self, query: str, project_id: str
+        self, query: str, project_id: str, slot_free: bool = True
     ) -> List[Dict[str, Any]]:
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return []
@@ -4079,7 +4099,9 @@ class Filter:
                 where_filter["$and"].append({"expires_at": {"$gt": now}})
 
             # ── Phase 6 (PASO-34): Multi‑query expansion ─────────
-            query_variants = await self._expand_query_for_retrieval(query)
+            query_variants = await self._expand_query_for_retrieval(
+                query, slot_free=slot_free
+            )
 
             # Retrieve for each variant and merge by best score
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
@@ -4511,16 +4533,23 @@ class Filter:
     # Multi‑Query LTM Expansion (v7 – Phase 6, PASO-34)
     # --------------------------------------------------------------------------
 
-    async def _expand_query_for_retrieval(self, query: str) -> List[str]:
+    async def _expand_query_for_retrieval(
+        self, query: str, slot_free: bool = True
+    ) -> List[str]:
         """
         Generate alternative phrasings of the query for LTM retrieval.
 
         Returns a list starting with the original query, followed by up to
         `multi_query_variants` alternatives.
 
-        If the LLM call fails or the feature is disabled, returns [query].
+        If the LLM call fails, the feature is disabled, or the model slot is
+        occupied (cold start), returns [query].
         """
         if not self.valves.enable_multi_query_retrieval:
+            return [query]
+        # Skip auxiliary LLM call if the model slot is occupied or the model is
+        # in the process of loading (cold start). Avoids 400/timeout race conditions.
+        if not slot_free:
             return [query]
         if len(query.strip()) < 15:
             return [query]
@@ -4541,7 +4570,7 @@ class Filter:
             model_override=self.valves.secondary_task_model,
             max_tokens=80,
             temperature=0.6,
-            timeout=10.0,
+            timeout=30.0,  # Cold start load takes ~4s + queue time
         )
 
         queries = [query]  # always include original
@@ -7023,11 +7052,6 @@ class Filter:
         )
 
     async def _slot_restore_if_available(self, project_id: str) -> bool:
-        """
-        Attempt to restore the llama.cpp slot at session start.
-        Executed only ONCE per project per server startup.
-        Returns True if the restore was successful.
-        """
         if not self.valves.enable_slot_persistence:
             return False
         if self._slot_restore_attempted.get(project_id):
@@ -7035,10 +7059,9 @@ class Filter:
 
         self._slot_restore_attempted[project_id] = True
 
-        # Get the current static block hash
         cached = self._static_context_block_cache.get(project_id)
         if not cached:
-            return False  # static block not built yet
+            return False
         _, static_text = cached
         static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
 
@@ -7050,40 +7073,26 @@ class Filter:
             self._log_debug(f"Slot restore: no file found for {filename}")
             return False
 
-        # Check if the slot is already warm
-        try:
-            session = await _shared_get_http_session(timeout_seconds=5)
-            base = self.valves.LLM_BASE_URL.rstrip("/")
-            async with session.get(f"{base}/slots") as resp:
-                if resp.status == 200:
-                    slots = await resp.json()
-                    slot = next(
-                        (s for s in slots if s.get("id") == self.valves.slot_id),
-                        None,
-                    )
-                    if slot and slot.get("n_past", 0) > 100:
-                        self._log_debug(
-                            f"Slot {self.valves.slot_id} already warm "
-                            f"(n_past={slot['n_past']}), skipping restore"
-                        )
-                        self._slot_restored[project_id] = True
-                        return True
-        except Exception as e:
-            self._log_debug(f"Slot status check failed: {e}")
+        worker_url = await self._discover_worker_url(self.valves.llm_model)
+        if not worker_url:
+            self._log_debug(
+                "Slot restore: worker not yet available. "
+                "Will attempt restore on next request."
+            )
+            self._slot_restore_attempted[project_id] = False
+            return False
 
-        # Perform the restore
         try:
             session = await _shared_get_http_session(timeout_seconds=30)
-            base = self.valves.LLM_BASE_URL.rstrip("/")
             async with session.post(
-                f"{base}/slots/{self.valves.slot_id}/restore",
+                f"{worker_url}/slots/{self.valves.slot_id}/restore",
                 json={"filename": filename},
             ) as resp:
                 if resp.status == 200:
                     self._slot_restored[project_id] = True
                     self._log_debug(
-                        f"✓ Slot restored from {filename} — "
-                        f"Block A pre-loaded, first query warm"
+                        f"✓ Slot restored from {filename} "
+                        f"(worker={worker_url}) — Block A pre-loaded"
                     )
                     return True
                 else:
@@ -7096,11 +7105,83 @@ class Filter:
             self._log_debug(f"Slot restore error: {e}")
             return False
 
+    async def _discover_worker_url(self, model_name: str) -> Optional[str]:
+        """
+        Discover the direct URL of the worker running a specific model by
+        parsing the --port argument from the router's /v1/models response.
+        Returns None if the model is unloaded (port=0) or the router is unreachable.
+        """
+        if not hasattr(self, "_worker_url_cache"):
+            self._worker_url_cache: Dict[str, Tuple[str, str]] = {}
+
+        try:
+            base = self.valves.LLM_BASE_URL.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+
+            session = await _shared_get_http_session(timeout_seconds=5)
+            async with session.get(f"{base}/v1/models") as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+
+            for model in data.get("data", []):
+                if model.get("id") != model_name and model_name not in model.get(
+                    "aliases", []
+                ):
+                    continue
+
+                status = model.get("status", {})
+                status_value = status.get("value", "unloaded")
+
+                if status_value not in ("loaded", "sleeping"):
+                    self._log_debug(
+                        f"Worker discovery: model '{model_name}' is '{status_value}', "
+                        f"no worker URL available."
+                    )
+                    self._worker_url_cache.pop(model_name, None)
+                    return None
+
+                cached = self._worker_url_cache.get(model_name)
+                if cached and cached[0] == status_value:
+                    return cached[1]
+
+                args = status.get("args", [])
+                port = None
+                for i, arg in enumerate(args):
+                    if arg == "--port" and i + 1 < len(args):
+                        try:
+                            port_val = int(args[i + 1])
+                            if port_val > 0:
+                                port = port_val
+                        except (ValueError, IndexError):
+                            pass
+                        break
+
+                if not port:
+                    self._log_debug(
+                        f"Worker discovery: model '{model_name}' has no valid port in args."
+                    )
+                    return None
+
+                from urllib.parse import urlparse
+
+                parsed = urlparse(self.valves.LLM_BASE_URL)
+                worker_url = f"{parsed.scheme}://{parsed.hostname}:{port}"
+
+                self._worker_url_cache[model_name] = (status_value, worker_url)
+                self._log_debug(
+                    f"Worker discovery: '{model_name}' → {worker_url} "
+                    f"(status={status_value})"
+                )
+                return worker_url
+
+        except Exception as e:
+            self._log_debug(f"Worker URL discovery failed: {e}")
+
+        return None
+
     async def _slot_save_if_needed(self, project_id: str) -> bool:
-        """
-        Save the slot state to disk if the static block hash changed
-        since the last save. Called at the end of the outlet.
-        """
         if not self.valves.enable_slot_persistence:
             return False
 
@@ -7110,32 +7191,45 @@ class Filter:
         _, static_text = cached
         static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
 
-        # Only save if the hash changed
         if self._last_saved_slot_hash.get(project_id) == static_hash:
             return False
 
         filename = self._slot_filename(project_id, static_hash)
 
+        worker_url = await self._discover_worker_url(self.valves.llm_model)
+        if not worker_url:
+            self._log_debug(
+                "Slot save: worker not available (model unloaded or router unreachable). "
+                "Will retry on next outlet."
+            )
+            return False
+
         try:
             session = await _shared_get_http_session(timeout_seconds=30)
-            base = self.valves.LLM_BASE_URL.rstrip("/")
             async with session.post(
-                f"{base}/slots/{self.valves.slot_id}/save",
+                f"{worker_url}/slots/{self.valves.slot_id}/save",
                 json={"filename": filename},
             ) as resp:
                 if resp.status == 200:
                     self._last_saved_slot_hash[project_id] = static_hash
-                    self._log_debug(f"✓ Slot saved → {filename}")
+                    self._log_debug(
+                        f"✓ Slot saved → {filename} " f"(worker={worker_url})"
+                    )
                     await self._cleanup_old_slot_files(project_id, filename)
                     return True
                 else:
                     body_txt = await resp.text()
                     self._log_debug(
-                        f"Slot save failed: HTTP {resp.status} — {body_txt}"
+                        f"Slot save failed: HTTP {resp.status} — {body_txt} "
+                        f"(worker={worker_url})"
                     )
+                    if hasattr(self, "_worker_url_cache"):
+                        self._worker_url_cache.pop(self.valves.llm_model, None)
                     return False
         except Exception as e:
             self._log_debug(f"Slot save error: {e}")
+            if hasattr(self, "_worker_url_cache"):
+                self._worker_url_cache.pop(self.valves.llm_model, None)
             return False
 
     async def _cleanup_old_slot_files(self, project_id: str, keep_filename: str):
@@ -9175,6 +9269,9 @@ class Filter:
         # ══════════════════════════════════════════════════════════════
         dynamic_injections: List[Tuple[str, str]] = []
 
+        # ── Cold start: ensure model is loaded before any auxiliary call ──
+        await self._warm_up_model_if_needed(slot_free)
+
         # ── Step B1: LTM per-query retrieval ─────────────────────────
         self._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         if (
@@ -9185,7 +9282,9 @@ class Filter:
             and HAS_CHROMA
             and user_query
         ):
-            all_meta = await self._retrieve_all_memories_unified(user_query, project_id)
+            all_meta = await self._retrieve_all_memories_unified(
+                user_query, project_id, slot_free=slot_free
+            )
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             unique_meta = []
             seen_docs: Set[str] = set()
@@ -9252,7 +9351,6 @@ class Filter:
         # ── Step B3: Activated code (per-query, varies each request) ──
         self._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         if is_code_session and self.valves.enable_code_awareness:
-            # ── v7: graph‑based path context ────────────────
             if self.valves.enable_path_analysis:
                 intent_vector = await self._classify_intent(user_query, project_id)
                 active_ctx = await self._get_path_context(
@@ -9426,8 +9524,15 @@ class Filter:
                             cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                             dynamic_injections.append(("high", cot_prompt))
                 elif not manual_cot_used and slot_free:
+                    # Use user_question (text without code blocks) to avoid false
+                    # positives from architecture/refactor keywords in pasted code.
+                    cot_detection_content = (
+                        user_question
+                        if user_question and len(user_question) >= 10
+                        else user_content
+                    )
                     cot_level = await self._detect_cot_level(
-                        user_content, is_code_session, state
+                        cot_detection_content, is_code_session, state
                     )
                     self._log_debug(
                         f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
