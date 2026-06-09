@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 6.0.0
+version: 7.0.0
 license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
 """
@@ -1631,6 +1631,58 @@ class Filter:
             ),
         )
 
+        # ─── Call Graph Centrality Prior (Phase 6) ───────────────────────
+        enable_centrality_prior: bool = Field(
+            default=True,
+            description=(
+                "Compute static PageRank centrality on the call graph after each "
+                "code change. High-centrality symbols are prioritized as fallback "
+                "seeds and can receive LOD bumps."
+            ),
+        )
+        enable_centrality_lod_bump: bool = Field(
+            default=True,
+            description=(
+                "Boost LOD level for high-centrality symbols even when their "
+                "query‑specific activation score is low. Ensures important hub "
+                "functions are always shown with adequate detail."
+            ),
+        )
+        centrality_lod_bump_threshold: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description="Centrality score above which a symbol receives a LOD bump.",
+        )
+        centrality_lod_bump_weight: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=0.5,
+            description=(
+                "Weight of centrality boost when adjusting effective LOD score. "
+                "effective_score = activation + centrality * weight."
+            ),
+        )
+
+        # ─── Multi-Query LTM Expansion (Phase 6) ─────────────────────────
+        enable_multi_query_retrieval: bool = Field(
+            default=False,
+            description=(
+                "Generate multiple query variants before LTM retrieval and merge results. "
+                "Reduces vocabulary mismatch between user query and stored memories. "
+                "Costs 1 extra LLM call per inlet. Disable if latency is critical."
+            ),
+        )
+        multi_query_variants: int = Field(
+            default=2,
+            ge=1,
+            le=4,
+            description=(
+                "Number of alternative query variants to generate "
+                "(besides the original)."
+            ),
+        )
+
         # ─── LOD Thresholds ──────────────────────────────────────────────────
         lod3_threshold: float = Field(
             default=0.50,
@@ -1704,6 +1756,31 @@ class Filter:
             description="Force Level 3 Scientific CoT regardless of detected complexity.",
         )
 
+        # ─── Step-Back Prompting (Phase 6) ──────────────────────────────
+        enable_step_back_prompting: bool = Field(
+            default=False,
+            description=(
+                "Before generating CoT reasoning, ask an abstract architectural question "
+                "about the code domain and use the answer as additional context. "
+                "Improves hypothesis quality for debugging queries. "
+                "Based on Step-Back Prompting (Zheng et al., ICLR 2024). "
+                "Costs 1 extra LLM call before each CoT."
+            ),
+        )
+        step_back_always: bool = Field(
+            default=False,
+            description=(
+                "If True, generate step-back context for all CoT queries (not just debugging). "
+                "If False (default), only for queries containing error/fail/exception signals."
+            ),
+        )
+        step_back_max_tokens: int = Field(
+            default=150,
+            ge=50,
+            le=400,
+            description="Max tokens for the step-back architectural context.",
+        )
+
         # ─── LLMLingua-2 Code Compression ────────────────────────────────────
         enable_code_compression: bool = Field(
             default=False,
@@ -1727,6 +1804,17 @@ class Filter:
             description=(
                 "Minimum token count for a code block to be compressed. "
                 "Blocks smaller than this are injected as-is."
+            ),
+        )
+
+        # ─── LLMLingua Question-Aware (Phase 6) ─────────────────────────
+        enable_question_aware_compression: bool = Field(
+            default=True,
+            description=(
+                "When compressing code blocks with LLMLingua-2, pass the current "
+                "user query as the 'question' parameter. This preserves tokens "
+                "relevant to the query rather than compressing uniformly. "
+                "Requires enable_code_compression=True. Based on LongLLMLingua (ACL 2023)."
             ),
         )
 
@@ -1934,6 +2022,37 @@ class Filter:
             ),
         )
 
+        # ─── Contextual Retrieval (Phase 6) ──────────────────────────────
+        enable_contextual_retrieval: bool = Field(
+            default=True,
+            description=(
+                "Prepend a context summary to each LTM entry before embedding. "
+                "Makes stored chunks more self-contained, improving retrieval "
+                "when query phrasing differs from stored content. "
+                "Based on Anthropic Contextual Retrieval (2024). "
+                "Reported to reduce retrieval errors by ~49%%."
+            ),
+        )
+        contextual_retrieval_mode: str = Field(
+            default="metadata",
+            description=(
+                "Context generation mode: "
+                "'metadata' = deterministic from file paths/symbols (no LLM, fast). "
+                "'llm' = one sentence generated by secondary_task_model (better, slower)."
+            ),
+        )
+
+    # ─── AST-Based Deduplication (Phase 6) ──────────────────────────
+    enable_ast_deduplication: bool = Field(
+        default=True,
+        description=(
+            "For Python code, use AST comparison instead of text similarity for "
+            "deduplication. Correctly handles same code with different docstrings, "
+            "comments, or whitespace. Falls back to text similarity for non-Python "
+            "code or parse errors."
+        ),
+    )
+
     INTENT_KEYWORDS = {
         "forget",
         "olvida",
@@ -2075,6 +2194,7 @@ class Filter:
         # Symbol index and lightweight context
         self._symbol_index = SymbolIndex()
         self._path_index = PathIndex()  # v7 (PASO-06)
+        self._node_centrality: Dict[str, Dict[str, float]] = {}  # v7 Phase 6 (PASO-33)
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
 
@@ -2890,17 +3010,6 @@ class Filter:
         """)
         self._db_conn.execute("PRAGMA journal_mode=WAL")
         self._db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS symbol_analysis_cache (
-                project_id TEXT NOT NULL,
-                symbol_name TEXT NOT NULL,
-                question_hash TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                PRIMARY KEY (project_id, symbol_name, question_hash)
-            )
-        """)
-        self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS block_change_summaries (
                 block_hash TEXT PRIMARY KEY,
                 summary TEXT NOT NULL,
@@ -3394,6 +3503,8 @@ class Filter:
     def _invalidate_lightweight_cache(self, project_id: str):
         self._cached_lightweight_context.pop(project_id, None)
         self._cached_code_state_hash = None
+        # ── Phase 6 (PASO-33): centrality stale when code changes ──
+        self._node_centrality.pop(project_id, None)
 
     # --------------------------------------------------------------------------
     # Long‑term memory initialization
@@ -3997,53 +4108,90 @@ class Filter:
         ]
         if not valid:
             return
+
         t_start = time.monotonic()
-        contents = [m["content"] for m in valid]
-        embeddings = await anyio.to_thread.run_sync(
-            lambda: self.embedder.encode(contents, convert_to_numpy=True).tolist()
-        )
+
+        # Build contextualized texts for embedding and storage
+        texts_for_embedding: List[str] = []
+        documents_to_store: List[str] = []
         ids = []
-        emb_list = []
         metadatas = []
-        documents = []
         now = time.time()
+
         for i, msg in enumerate(valid):
-            msg_id = f"{project_id}_{int(now)}_{hashlib.md5(msg['content'].encode()).hexdigest()[:8]}"
+            content = msg["content"]
+
+            # Extract code metadata for context
+            extracted, _ = await self._extract_code_blocks(content)
+            content_type = self._classify_content(content, extracted)
+
+            # Collect symbol names from extracted blocks
+            ctx_symbols: List[str] = []
+            for blk in extracted[:3]:
+                try:
+                    syms = await SignatureExtractor.extract_async(
+                        blk["code"], blk.get("language")
+                    )
+                    for sym in syms:
+                        if self._is_symbol_indexable(sym):
+                            ctx_symbols.append(sym.name)
+                            if len(ctx_symbols) >= 10:
+                                break
+                except Exception:
+                    pass
+
+            # File paths
+            ctx_file_paths: List[str] = []
+            if self.valves.track_file_paths:
+                ctx_file_paths = self._extract_file_paths(content)[:3]
+
+            # Build retrieval context prefix
+            context_prefix = await self._build_retrieval_context(
+                content=content,
+                project_id=project_id,
+                role=msg.get("role", "user"),
+                code_symbols=ctx_symbols[:6],
+                file_paths=ctx_file_paths,
+                content_type=content_type.value,
+            )
+
+            # The final text to embed and store includes the prefix.
+            contextual_doc = context_prefix + content
+
+            texts_for_embedding.append(contextual_doc)
+            documents_to_store.append(contextual_doc)
+
+            # Build ID and metadata (existing logic preserved)
+            msg_id = f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
             ids.append(msg_id)
-            emb_list.append(embeddings[i])
-            extracted, _ = await self._extract_code_blocks(msg["content"])
-            content_type = self._classify_content(msg["content"], extracted)
+
             expires_at = (
                 now + (self.valves.long_term_memory_expiration_days * 86400)
                 if self.valves.long_term_memory_expiration_days > 0
                 else None
             )
+
             code_symbols_str = ""
             if self.valves.ltm_index_symbols_enabled:
-                blocks_for_symbols = extracted if extracted else []
-                if not blocks_for_symbols:
-                    blocks_for_symbols, _ = await self._extract_code_blocks(
-                        msg["content"]
-                    )
-                if blocks_for_symbols:
-                    all_symbols = set()
-                    for blk in blocks_for_symbols:
-                        try:
-                            syms = await SignatureExtractor.extract_async(
-                                blk["code"], blk.get("language")
-                            )
-                            for sym in syms:
-                                if self._is_symbol_indexable(sym):
-                                    all_symbols.add(sym.name)
-                                    if (
-                                        len(all_symbols)
-                                        >= self.valves.ltm_symbol_index_max_per_message
-                                    ):
-                                        break
-                        except Exception:
-                            pass
-                    if all_symbols:
-                        code_symbols_str = "," + ",".join(sorted(all_symbols)) + ","
+                all_syms = set()
+                for blk in extracted:
+                    try:
+                        syms = await SignatureExtractor.extract_async(
+                            blk["code"], blk.get("language")
+                        )
+                        for sym in syms:
+                            if self._is_symbol_indexable(sym):
+                                all_syms.add(sym.name)
+                                if (
+                                    len(all_syms)
+                                    >= self.valves.ltm_symbol_index_max_per_message
+                                ):
+                                    break
+                    except Exception:
+                        pass
+                if all_syms:
+                    code_symbols_str = "," + ",".join(sorted(all_syms)) + ","
+
             metadatas.append(
                 {
                     "role": msg.get("role"),
@@ -4056,19 +4204,256 @@ class Filter:
                     "memory_id": msg_id,
                 }
             )
-            documents.append(msg["content"])
+
+        # Embed all contextualized texts
+        embeddings = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(
+                texts_for_embedding, convert_to_numpy=True
+            ).tolist()
+        )
+
         if ids:
             await anyio.to_thread.run_sync(
                 lambda: self.memory_collection.upsert(
                     ids=ids,
-                    embeddings=emb_list,
+                    embeddings=embeddings,
                     metadatas=metadatas,
-                    documents=documents,
+                    documents=documents_to_store,
                 )
             )
         self._log_timing(
             "batch_ltm_total", time.monotonic() - t_start, time.monotonic() - t_start
         )
+
+    async def _retrieve_all_memories_unified(
+        self, query: str, project_id: str
+    ) -> List[Dict[str, Any]]:
+        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
+            return []
+
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
+        if forced_symbol:
+            return await self._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
+            )
+
+        try:
+            t_start = time.monotonic()
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+            if self.valves.long_term_memory_expiration_days > 0:
+                where_filter["$and"].append({"expires_at": {"$gt": now}})
+
+            # ── Phase 6 (PASO-34): Multi‑query expansion ─────────
+            query_variants = await self._expand_query_for_retrieval(query)
+
+            # Retrieve for each variant and merge by best score
+            all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
+            # key = memory_id → (doc, raw_sim, ts, meta)
+
+            for variant_query in query_variants:
+                q_emb = await anyio.to_thread.run_sync(
+                    lambda q=variant_query: self.embedder.encode(q[:1000]).tolist()
+                )
+                try:
+                    variant_results = await anyio.to_thread.run_sync(
+                        lambda emb=q_emb: self.memory_collection.query(
+                            query_embeddings=[emb],
+                            n_results=self.valves.long_term_memory_top_k * 2,
+                            where=where_filter,
+                            include=["documents", "metadatas", "distances"],
+                        )
+                    )
+                except Exception as e:
+                    self._log_debug(f"Multi-query retrieval failed for variant: {e}")
+                    continue
+
+                if not variant_results or not variant_results["documents"]:
+                    continue
+
+                for i, doc in enumerate(variant_results["documents"][0]):
+                    meta = variant_results["metadatas"][0][i]
+                    raw_sim = 1.0 - (variant_results["distances"][0][i] / 2.0)
+                    ts = meta.get("timestamp")
+                    if ts is not None and ts < 1000000000:
+                        ts = None
+
+                    # Dedup by memory_id, keeping max score
+                    mem_id = meta.get(
+                        "memory_id",
+                        hashlib.md5(doc.encode()).hexdigest()[:16],
+                    )
+                    if (
+                        mem_id not in all_raw_results
+                        or raw_sim > all_raw_results[mem_id][1]
+                    ):
+                        all_raw_results[mem_id] = (doc, raw_sim, ts, meta)
+
+            # Convert merged results to list
+            results_list = list(all_raw_results.values())
+
+            # ── Continue with existing scoring / decay / reranking ──
+            docs_with_meta = []
+            if results_list:
+                for doc, raw_sim, ts, meta in results_list:
+                    if self.valves.ltm_time_decay_hours > 0 and ts is not None:
+                        age_hours = (now - ts) / 3600
+                        effective_sim = raw_sim * (
+                            0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
+                        )
+                    else:
+                        effective_sim = raw_sim
+
+                    # ── v7 (PASO-20): boost raptor summaries ──
+                    if meta.get("is_raptor_summary"):
+                        raptor_level = meta.get("raptor_level", 1)
+                        effective_sim *= 1.0 + 0.1 * raptor_level
+
+                    if (
+                        effective_sim
+                        < self.valves.long_term_memory_similarity_threshold
+                    ):
+                        continue
+
+                    docs_with_meta.append((doc, effective_sim, ts, meta, raw_sim))
+
+            if self.valves.preserve_error_context:
+                new_docs = []
+                for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
+                    if meta.get("content_type") == ContentType.ERROR.value:
+                        eff_sim *= 1.1
+                    new_docs.append((doc, eff_sim, ts, meta, raw_sim))
+                docs_with_meta = new_docs
+
+            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+
+            if self.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._extract_query_symbols(query, project_id)
+                if query_symbols:
+                    new_docs = []
+                    for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if (
+                            meta_symbols_str
+                            and eff_sim >= self.valves.ltm_symbol_boost_min_similarity
+                        ):
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                eff_sim *= self.valves.ltm_symbol_boost_factor
+                        new_docs.append((doc, eff_sim, ts, meta, raw_sim))
+                    new_docs.sort(key=lambda x: x[1], reverse=True)
+                    docs_with_meta = new_docs
+
+            if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
+                rerank_k = min(
+                    (
+                        self.valves.reranker_top_k
+                        if self.valves.reranker_top_k > 0
+                        else self.valves.long_term_memory_top_k
+                    ),
+                    50,
+                )
+                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
+                reranked = await self._rerank_results(query, docs_only, rerank_k)
+                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
+                docs_with_meta = [
+                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
+                ]
+
+            docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
+
+            normalized = []
+            for entry in docs_with_meta:
+                if len(entry) == 5:
+                    doc, score, ts, _, _ = entry
+                elif len(entry) == 3:
+                    doc, score, ts = entry
+                else:
+                    doc, score, ts = entry[0], entry[1], entry[2]
+                normalized.append((doc, score, ts))
+
+            return [{"doc": doc, "timestamp": ts} for doc, _, ts in normalized]
+        except Exception as e:
+            logger.warning(f"Unified memory retrieval failed: {e}")
+            return []
+
+    # --------------------------------------------------------------------------
+    # Contextual Retrieval (v7 – Phase 6, PASO-32)
+    # --------------------------------------------------------------------------
+
+    async def _build_retrieval_context(
+        self,
+        content: str,
+        project_id: str,
+        role: str,
+        code_symbols: List[str],
+        file_paths: List[str],
+        content_type: str,
+    ) -> str:
+        """
+        Build a context prefix for a message before embedding it in LTM.
+        Makes stored chunks more self-contained, improving retrieval when
+        query phrasing differs from stored content.
+
+        Mode 'metadata' (default): deterministic, no LLM call.
+        Mode 'llm': generates a sentence via the secondary LLM.
+
+        Returns a 1-3 line string to prepend to the document, or "" if disabled.
+        """
+        if not self.valves.enable_contextual_retrieval:
+            return ""
+
+        if self.valves.contextual_retrieval_mode == "llm":
+            return await self._build_retrieval_context_llm(content, project_id)
+
+        # ── Metadata mode (default) ─────────────────────────────────
+        parts: List[str] = [f"Project: {project_id}"]
+
+        if file_paths:
+            parts.append(f"Files: {', '.join(file_paths[:3])}")
+
+        if code_symbols:
+            parts.append(f"Functions: {', '.join(code_symbols[:6])}")
+
+        if content_type and content_type != "general":
+            parts.append(f"Type: {content_type}")
+
+        role_label = "User question" if role == "user" else "Assistant response"
+        parts.append(f"Role: {role_label}")
+
+        excerpt = content[:120].replace("\n", " ").strip()
+        if len(content) > 120:
+            excerpt += "..."
+        parts.append(f"Excerpt: {excerpt}")
+
+        context_line = " | ".join(parts)
+        return f"[{context_line}]\n\n"
+
+    async def _build_retrieval_context_llm(self, content: str, project_id: str) -> str:
+        """
+        Use a small LLM to generate a semantic retrieval context.
+        Called only when contextual_retrieval_mode='llm'.
+        """
+        prompt = (
+            "In one sentence (10-20 words), describe what the following "
+            "code/conversation excerpt is about, for search retrieval:\n\n"
+            f"{content[:400]}"
+        )
+        context = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt=(
+                "Output only one descriptive sentence. "
+                "Be specific about functions, files, or errors mentioned."
+            ),
+            model_override=self.valves.secondary_task_model,
+            max_tokens=40,
+            temperature=0.2,
+            timeout=8.0,
+        )
+        if context and context.strip():
+            return f"[Context: {context.strip()}]\n\n"
+        return ""
 
     # --------------------------------------------------------------------------
     # RAPTOR Hierarchical LTM (v7 – PASO-20)
@@ -4288,127 +4673,56 @@ class Filter:
             self._ltm_batch_task = None
         await self._batch_store_messages(project_id, messages_to_store)
 
-    async def _retrieve_all_memories_unified(
-        self, query: str, project_id: str
-    ) -> List[Dict[str, Any]]:
-        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
-            return []
+    # --------------------------------------------------------------------------
+    # Multi‑Query LTM Expansion (v7 – Phase 6, PASO-34)
+    # --------------------------------------------------------------------------
 
-        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
-        if forced_symbol:
-            return await self._retrieve_by_symbol(
-                forced_symbol, cleaned_query, project_id
+    async def _expand_query_for_retrieval(self, query: str) -> List[str]:
+        """
+        Generate alternative phrasings of the query for LTM retrieval.
+
+        Returns a list starting with the original query, followed by up to
+        `multi_query_variants` alternatives.
+
+        If the LLM call fails or the feature is disabled, returns [query].
+        """
+        if not self.valves.enable_multi_query_retrieval:
+            return [query]
+        if len(query.strip()) < 15:
+            return [query]
+
+        prompt = (
+            f"Generate {self.valves.multi_query_variants} alternative phrasings "
+            f"of this programming question for document search. "
+            f"Focus on different vocabulary (errors, function names, behaviors).\n\n"
+            f"Original: {query[:250]}\n\n"
+            f"Output only the alternatives, one per line. No numbering."
+        )
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt=(
+                "Output only the alternative phrasings, one per line. "
+                "Be concise and specific to the code context."
+            ),
+            model_override=self.valves.secondary_task_model,
+            max_tokens=80,
+            temperature=0.6,
+            timeout=10.0,
+        )
+
+        queries = [query]  # always include original
+        if response:
+            alternatives = [
+                line.strip()
+                for line in response.strip().split("\n")
+                if line.strip() and len(line.strip()) > 5
+            ]
+            queries.extend(alternatives[: self.valves.multi_query_variants])
+            self._log_debug(
+                f"Multi-query expansion: {len(queries)} queries "
+                f"({[q[:40] for q in queries]})"
             )
-
-        try:
-            t_start = time.monotonic()
-            q_emb = await anyio.to_thread.run_sync(
-                lambda: self.embedder.encode(query[:1000]).tolist()
-            )
-            now = time.time()
-            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
-            if self.valves.long_term_memory_expiration_days > 0:
-                where_filter["$and"].append({"expires_at": {"$gt": now}})
-
-            results = await anyio.to_thread.run_sync(
-                lambda: self.memory_collection.query(
-                    query_embeddings=[q_emb],
-                    n_results=self.valves.long_term_memory_top_k * 3,
-                    where=where_filter,
-                    include=["documents", "metadatas", "distances"],
-                )
-            )
-
-            docs_with_meta = []
-            if results and results["documents"]:
-                for i, doc in enumerate(results["documents"][0]):
-                    meta = results["metadatas"][0][i]
-                    raw_sim = 1.0 - (results["distances"][0][i] / 2.0)
-                    ts = meta.get("timestamp")
-                    if ts is not None and ts < 1000000000:
-                        ts = None
-
-                    if self.valves.ltm_time_decay_hours > 0 and ts is not None:
-                        age_hours = (now - ts) / 3600
-                        effective_sim = raw_sim * (
-                            0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
-                        )
-                    else:
-                        effective_sim = raw_sim
-
-                    # ── v7 (PASO-20): boost raptor summaries ──
-                    if meta.get("is_raptor_summary"):
-                        raptor_level = meta.get("raptor_level", 1)
-                        effective_sim *= 1.0 + 0.1 * raptor_level
-
-                    if (
-                        effective_sim
-                        < self.valves.long_term_memory_similarity_threshold
-                    ):
-                        continue
-
-                    docs_with_meta.append((doc, effective_sim, ts, meta, raw_sim))
-
-            if self.valves.preserve_error_context:
-                new_docs = []
-                for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
-                    if meta.get("content_type") == ContentType.ERROR.value:
-                        eff_sim *= 1.1
-                    new_docs.append((doc, eff_sim, ts, meta, raw_sim))
-                docs_with_meta = new_docs
-
-            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
-
-            if self.valves.ltm_symbol_boost_enabled and query:
-                query_symbols = self._extract_query_symbols(query, project_id)
-                if query_symbols:
-                    new_docs = []
-                    for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
-                        meta_symbols_str = meta.get("code_symbols", "")
-                        if (
-                            meta_symbols_str
-                            and eff_sim >= self.valves.ltm_symbol_boost_min_similarity
-                        ):
-                            meta_symbols = set(meta_symbols_str.split(","))
-                            common = query_symbols.intersection(meta_symbols)
-                            if common:
-                                eff_sim *= self.valves.ltm_symbol_boost_factor
-                        new_docs.append((doc, eff_sim, ts, meta, raw_sim))
-                    new_docs.sort(key=lambda x: x[1], reverse=True)
-                    docs_with_meta = new_docs
-
-            if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
-                rerank_k = min(
-                    (
-                        self.valves.reranker_top_k
-                        if self.valves.reranker_top_k > 0
-                        else self.valves.long_term_memory_top_k
-                    ),
-                    50,
-                )
-                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
-                reranked = await self._rerank_results(query, docs_only, rerank_k)
-                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
-                docs_with_meta = [
-                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
-                ]
-
-            docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
-
-            normalized = []
-            for entry in docs_with_meta:
-                if len(entry) == 5:
-                    doc, score, ts, _, _ = entry
-                elif len(entry) == 3:
-                    doc, score, ts = entry
-                else:
-                    doc, score, ts = entry[0], entry[1], entry[2]
-                normalized.append((doc, score, ts))
-
-            return [{"doc": doc, "timestamp": ts} for doc, _, ts in normalized]
-        except Exception as e:
-            logger.warning(f"Unified memory retrieval failed: {e}")
-            return []
+        return queries
 
     async def _retrieve_historical_messages(
         self, query: str, project_id: str, limit: int
@@ -5782,13 +6096,25 @@ class Filter:
                     )
 
             if not ag._activations:
+                # ── Fallback: entry points ordered by centrality ──
                 entry_points = self._path_index.find_entry_points(
                     self._symbol_index, project_id
                 )
                 if entry_points:
-                    for sym_name in list(entry_points)[:3]:
+                    centrality = self._node_centrality.get(project_id, {})
+                    sorted_eps = sorted(
+                        entry_points,
+                        key=lambda ep: centrality.get(ep, 0.0),
+                        reverse=True,
+                    )
+                    for sym_name in sorted_eps[:3]:
+                        cent_score = centrality.get(sym_name, 0.0)
+                        seed_score = 0.2 + 0.2 * cent_score  # [0.2, 0.4]
                         ag._activations[sym_name] = ActivationState(
-                            node_id=sym_name, score=0.3, depth=0, source="seed"
+                            node_id=sym_name,
+                            score=seed_score,
+                            depth=0,
+                            source="seed",
                         )
 
             ag.propagate(
@@ -5892,14 +6218,25 @@ class Filter:
         ag_final = ActivationGraph()
 
         if not all_activated:
-            # Fallback: entry points with low score
+            # ── Fallback: entry points ordered by centrality ─────────
             entry_points = self._path_index.find_entry_points(
                 self._symbol_index, project_id
             )
             if entry_points:
-                for sym_name in list(entry_points)[:3]:
+                centrality = self._node_centrality.get(project_id, {})
+                sorted_eps = sorted(
+                    entry_points,
+                    key=lambda ep: centrality.get(ep, 0.0),
+                    reverse=True,
+                )
+                for sym_name in sorted_eps[:3]:
+                    cent_score = centrality.get(sym_name, 0.0)
+                    seed_score = 0.2 + 0.2 * cent_score  # [0.2, 0.4]
                     ag_final._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=0.3, depth=0, source="seed"
+                        node_id=sym_name,
+                        score=seed_score,
+                        depth=0,
+                        source="seed",
                     )
         else:
             for node in all_activated:
@@ -5909,7 +6246,6 @@ class Filter:
                     + w_his * ag_his.get_score(node)
                 )
                 if combined >= 0.01:
-                    # Determine source and depth from the contributing graphs
                     source = "seed" if node in lexical_seed_names else "propagation"
                     depth = min(
                         ag_lex._activations.get(
@@ -5942,6 +6278,59 @@ class Filter:
 
         self._store_activation_scores(ag_final, project_id)
         return ag_final
+
+    def _compute_static_centrality(self, project_id: str) -> Dict[str, float]:
+        """
+        Compute static PageRank centrality on the call graph.
+
+        Standard PageRank = PPR with uniform personalization vector.
+        High centrality symbols are hubs: called from many places or
+        calling many others.
+
+        Returns: {symbol_name: score ∈ [0.0, 1.0]} where 1.0 = most central.
+        """
+        if not self.valves.enable_centrality_prior:
+            return {}
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+
+        if not all_names or not edges_out:
+            return {}
+
+        n = len(all_names)
+        initial_score = 1.0 / n if n > 0 else 0.0
+
+        ag = ActivationGraph()
+        for name in all_names:
+            ag._activations[name] = ActivationState(
+                node_id=name,
+                score=initial_score,
+                depth=0,
+                source="seed",
+            )
+
+        ag.propagate(
+            edges_out=edges_out,
+            max_steps=30,  # more iterations for convergence
+            min_score=0.0001,
+            alpha=0.85,
+            tolerance=1e-7,
+        )
+
+        raw_scores = {nid: s.score for nid, s in ag._activations.items()}
+        max_score = max(raw_scores.values()) if raw_scores else 1.0
+        if max_score == 0:
+            return {}
+
+        normalized = {name: score / max_score for name, score in raw_scores.items()}
+
+        top3 = sorted(normalized.items(), key=lambda x: x[1], reverse=True)[:3]
+        self._log_debug(
+            f"Centrality computed for {len(normalized)} symbols. "
+            f"Top-3: {[(n, f'{s:.3f}') for n, s in top3]}"
+        )
+        return normalized
 
     async def _resolve_dangling_edges(self, project_id: str) -> int:
         """
@@ -6136,10 +6525,15 @@ class Filter:
         code: str,
         language: str = "python",
         rate: float = 0.5,
+        query: str = "",  # ← Phase 6 (PASO-31)
     ) -> str:
         """
         Compress a code block using LLMLingua-2.
         Preserves critical language structural tokens.
+
+        If `query` is not empty and enable_question_aware_compression=True,
+        uses LongLLMLingua conditioned on the query: the compressor preserves
+        tokens relevant to the specific question.
 
         rate: fraction of tokens to KEEP (0.5 = keep 50%).
         Recommended range: 0.4 (aggressive) to 0.7 (conservative).
@@ -6244,12 +6638,23 @@ class Filter:
         )
 
         try:
+            compress_kwargs = {
+                "rate": rate,
+                "force_tokens": force_tokens,
+                "force_reserve_digit": True,
+            }
+            # Activate question-aware compression if a query is provided
+            if query and self.valves.enable_question_aware_compression:
+                compress_kwargs["question"] = query[:300]  # cap to avoid overhead
+                self._log_debug(
+                    f"LLMLingua-2: question-aware mode active "
+                    f"(query={query[:60]}...)"
+                )
+
             result = await anyio.to_thread.run_sync(
                 lambda: self._llmlingua_compressor.compress_prompt(
                     code,
-                    rate=rate,
-                    force_tokens=force_tokens,
-                    force_reserve_digit=True,
+                    **compress_kwargs,
                 )
             )
             compressed = result.get("compressed_prompt", code)
@@ -6454,6 +6859,12 @@ class Filter:
         for ep in entry_points:
             ag = self._build_activation_graph(ep, project_id)
             await self._build_view_from_activation(ep, ag, project_id)
+
+        # ── Phase 6 (PASO-33): compute static centrality ──────────
+        if self.valves.enable_centrality_prior:
+            self._node_centrality[project_id] = self._compute_static_centrality(
+                project_id
+            )
 
     async def _speculative_prefetch(
         self,
@@ -6922,7 +7333,7 @@ class Filter:
         project_id: str,
         user_query: str,
         intent_vector: Dict[str, float],
-        messages: Optional[List[dict]] = None,
+        messages: Optional[List[dict]] = None,  # ← PASO-27
     ) -> str:
         """
         Build code context using the graph‑activation system.
@@ -6962,15 +7373,14 @@ class Filter:
         modify_weight = intent_vector.get("modify", 0.3)
         refactor_weight = intent_vector.get("refactor", 0.1)
 
-        # Base thresholds from valves
         lod3 = self.valves.lod3_threshold
         lod2 = self.valves.lod2_threshold
         lod1 = self.valves.lod1_threshold
 
         if debug_weight + modify_weight > 0.6:
-            scale = 0.7  # lower thresholds → more code shown in full
+            scale = 0.7
         elif refactor_weight > 0.4:
-            scale = 0.0  # everything becomes LOD‑3
+            scale = 0.0
         else:
             scale = 1.0
 
@@ -6985,7 +7395,22 @@ class Filter:
 
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
-        # Four separate lists for the four LOD levels
+        # ── Phase 6 (PASO-33): centrality LOD bump ─────────────────
+        if self.valves.enable_centrality_lod_bump:
+            centrality = self._node_centrality.get(project_id, {})
+            threshold = self.valves.centrality_lod_bump_threshold
+            adjusted = []
+            for node_id, score in sorted_nodes:
+                cent = centrality.get(node_id, 0.0)
+                if cent >= threshold:
+                    effective = min(
+                        1.0, score + cent * self.valves.centrality_lod_bump_weight
+                    )
+                else:
+                    effective = score
+                adjusted.append((node_id, effective))
+            sorted_nodes = adjusted  # use effective score for LOD decisions
+
         lod0_parts: List[str] = []  # name only
         lod1_parts: List[str] = []  # signature only
         lod2_parts: List[str] = []  # signature + summary
@@ -6995,13 +7420,12 @@ class Filter:
             if total_tokens >= budget:
                 break
 
-            # LOD‑0: score < lod1 → just the name, no block access
+            # LOD‑0: score < lod1 → just the name
             if score < lod1:
                 lod0_parts.append(f"`{node_id}`")
-                total_tokens += 2  # rough estimate for a symbol name
+                total_tokens += 2
                 continue
 
-            # For LOD‑1, 2, 3 we need the actual block
             block_hashes = self._symbol_index.find_blocks(node_id, project_id)
             for bh in block_hashes:
                 if bh in injected_blocks:
@@ -7011,10 +7435,10 @@ class Filter:
                     continue
 
                 if score < lod2:
-                    # LOD‑1: signature only (from CodeSymbol.signature)
+                    # LOD‑1: signature only
                     sig = next(
                         (sym.signature for sym in block.symbols if sym.name == node_id),
-                        node_id,  # fallback to bare name
+                        node_id,
                     )
                     tok = len(sig) // 4 + 2
                     if total_tokens + tok > budget:
@@ -7064,6 +7488,7 @@ class Filter:
                                 else "unknown"
                             ),
                             rate=self.valves.code_compression_rate,
+                            query=user_query,  # ← Phase 6 (PASO-31)
                         )
                         tok = self._estimate_code_tokens(content_to_inject)
                     if total_tokens + tok > budget:
@@ -7863,63 +8288,288 @@ class Filter:
         effective_max_tokens = (
             self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
         )
-        prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nThink step by step and provide your reasoning:"
+
+        # ── Phase 6 (PASO-35): Step-Back context ──────────────────
+        step_back = await self._generate_step_back_context(question, context)
+
+        # Prepend step-back to context if available
+        enriched_context = step_back + context if step_back else context
+
+        prompt = (
+            f"Context:\n{enriched_context}\n\n"
+            f"Question:\n{question}\n\n"
+            "Think step by step and provide your reasoning:"
+        )
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="You are a helpful assistant that thinks step by step before answering.",
+            system_prompt=(
+                "You are a helpful assistant that thinks step by step before answering."
+            ),
             model_override=self.valves.cot_model_level2,
             max_tokens=effective_max_tokens,
             temperature=0.4,
             label=label,
         )
         if response:
-            return (
-                f"## 🔎 Automated Chain-of-Thought Reasoning (Level 2)\n"
-                f"*This section was generated by {self.valves.cot_model_level2} "
-                f"to assist the main assistant. It is not user input.*\n\n"
-                f"{response}"
+            prefix = (
+                "## 🔎 Automated Chain-of-Thought Reasoning (Level 2)\n"
+                f"*Generated by {self.valves.cot_model_level2}.*"
             )
+            if step_back:
+                prefix += " *Includes step-back architectural context.*"
+            return f"{prefix}\n\n{response}"
         return "Unable to generate reasoning."
 
-    async def _generate_cot_with_self_reflection(
-        self, question: str, context: str, label: str = ""
+    async def _generate_scientific_reasoning_L3(
+        self,
+        question: str,
+        context: str,
+        project_id: str,
+        label: str = "",
     ) -> str:
-        """Generate CoT reasoning with self-reflection, using safe model switching."""
-        # Generate initial reasoning (level 2)
-        reasoning = await self._generate_cot_reasoning(question, context, label=label)
-        if not reasoning or reasoning == "Unable to generate reasoning.":
-            return reasoning
+        """
+        Scientific Chain-of-Thought reasoning with structural validation.
 
-        effective_max_tokens = (
-            self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
-        )
-        reflection_prompt = (
-            f"Context:\n{context}\n\n"
-            f"Question:\n{question}\n\n"
-            f"Initial reasoning:\n{reasoning}\n\n"
-            "Review the above reasoning. Are there any errors, unverified assumptions, or missing steps? "
-            "Provide a corrected and improved reasoning."
-        )
+        Flow:
+        1. Generate N hypotheses about the answer.
+        2. Score each hypothesis using StaticEvidence (deterministic) +
+           LLM-expressed confidence (if available).
+        3. If the best hypothesis passes the confidence threshold, stop.
+        4. Otherwise, feed evidence back to the LLM to refine hypotheses.
+        5. Iterate up to scientific_max_iterations times.
+        6. Synthesize a final reasoning from the best hypothesis + evidence.
 
-        refined = await self._call_llm(
-            prompt=reflection_prompt,
-            system_prompt="You are a critical reviewer. Improve the reasoning provided.",
-            model_override=self.valves.cot_model_level3,
-            max_tokens=effective_max_tokens,
-            temperature=0.3,
-            label=label + "_reflection" if label else "cot_reflection",
-        )
+        This is the Level 3 CoT that replaces the old self-reflection only approach.
+        """
+        max_hypotheses = self.valves.scientific_hypotheses_count
+        threshold = self.valves.scientific_confidence_threshold
+        max_iters = self.valves.scientific_max_iterations
 
-        if refined:
-            return (
-                f"## 🔎🔎 Automated Chain-of-Thought with Self-Reflection (Level 3)\n"
-                f"*Reasoning generated by {self.valves.cot_model_level2}, "
-                f"reflection by {self.valves.cot_model_level3}. "
-                f"This is not user input.*\n\n"
-                f"{reasoning}\n\n"
-                f"### 🔁 Self-Reflection\n{refined}"
+        # ── Helpers ─────────────────────────────────────────────────
+        def _parse_hypotheses_from_response(text: str) -> List[Tuple[str, float]]:
+            """Extract a list of (hypothesis_text, confidence) from LLM output."""
+            results = []
+            # Expected format: Hypothesis: ... Confidence: 0.8
+            pattern = re.compile(
+                r"Hypothesis\s*\d*\s*:\s*(.+?)\s*Confidence\s*:\s*([\d.]+)",
+                re.IGNORECASE | re.DOTALL,
             )
-        return reasoning
+            for match in pattern.finditer(text):
+                hyp_text = match.group(1).strip().rstrip(".")
+                try:
+                    conf = float(match.group(2))
+                    conf = max(0.0, min(1.0, conf))
+                except ValueError:
+                    conf = 0.5
+                results.append((hyp_text, conf))
+            return results
+
+        # ── Step 1: Generate initial hypotheses ────────────────────
+        prompt = (
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question[:500]}\n\n"
+            f"Propose {max_hypotheses} distinct hypotheses that could explain the issue "
+            f"or solve the problem. For each, state:\n"
+            f"Hypothesis: <one concise sentence>\n"
+            f"Confidence: <0.0-1.0>\n\n"
+            f"Be specific: mention function names, files, or data flows if possible."
+        )
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a scientific reasoning engine. Output exactly the requested "
+                "hypotheses with confidence scores. No extra commentary."
+            ),
+            model_override=self.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=0.4,
+            label=label + "_gen_hypotheses" if label else "sci_gen_hypotheses",
+        )
+
+        if not response:
+            return "Unable to generate hypotheses for scientific reasoning."
+
+        hypotheses = _parse_hypotheses_from_response(response)
+        if len(hypotheses) < 2:
+            # Not enough hypotheses → fallback to plain CoT
+            return await self._generate_cot_reasoning(question, context, label)
+
+        best_hypothesis = ""
+        best_combined_score = 0.0
+        iteration = 0
+
+        # ── Iterative refinement loop ──────────────────────────────
+        while iteration < max_iters:
+            iteration += 1
+            scored = []
+            for hyp_text, llm_conf in hypotheses:
+                # Gather deterministic evidence
+                evidence = self._gather_static_evidence(hyp_text, project_id)
+                obj_score = evidence.objective_score
+
+                # Combined score: 50% structural evidence, 50% LLM confidence
+                combined = 0.5 * obj_score + 0.5 * llm_conf
+                scored.append((hyp_text, combined, obj_score, llm_conf, evidence))
+
+            # Sort by combined score descending
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top = scored[0]
+            best_hypothesis, best_combined, best_obj, best_llm_conf, best_evidence = top
+
+            self._log_debug(
+                f"Scientific CoT iter {iteration}: best hypothesis "
+                f"'{best_hypothesis[:80]}...' "
+                f"score={best_combined:.3f} "
+                f"(obj={best_obj:.3f}, llm_conf={best_llm_conf:.3f})"
+            )
+
+            # Stopping condition
+            if best_combined >= threshold or iteration >= max_iters:
+                break
+
+            # ── Refine: ask LLM to improve hypotheses using evidence ──
+            evidence_feedback = (
+                f"Previous best hypothesis (score {best_combined:.2f}):\n"
+                f"{best_hypothesis}\n\n"
+                f"Structural evidence:\n"
+                f"- Symbols found: {best_evidence.symbols_found}\n"
+                f"- Call relations valid: {best_evidence.call_relations_valid}\n"
+                f"- Recent changes: {best_evidence.recent_changes}\n"
+                f"- Data flow upstream: {best_evidence.data_flow_upstream}\n"
+                f"- Objective score: {best_evidence.objective_score:.2f}\n\n"
+                f"Based on this evidence, propose {max_hypotheses} improved hypotheses."
+            )
+
+            refine_prompt = (
+                f"{evidence_feedback}\n\n"
+                f"Output the same format as before: Hypothesis: ... Confidence: ..."
+            )
+            refine_response = await self._call_llm(
+                prompt=refine_prompt,
+                system_prompt="You are a scientific reasoning engine refining hypotheses based on evidence.",
+                model_override=self.valves.cot_model_level3,
+                max_tokens=600,
+                temperature=0.4,
+                label=label + "_refine" if label else "sci_refine",
+            )
+            if refine_response:
+                new_hypotheses = _parse_hypotheses_from_response(refine_response)
+                if len(new_hypotheses) >= 2:
+                    hypotheses = new_hypotheses
+                else:
+                    # If parsing fails, keep old hypotheses and break
+                    break
+            else:
+                break
+
+        # ── Step 6: Synthesize final reasoning ────────────────────
+        final_prompt = (
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question[:500]}\n\n"
+            f"The best validated hypothesis (score {best_combined:.3f}):\n"
+            f"{best_hypothesis}\n\n"
+            f"Structural evidence supporting it:\n"
+            f"- Symbols found: {best_evidence.symbols_found}\n"
+            f"- Call relations valid: {best_evidence.call_relations_valid}\n"
+            f"- Recent changes: {best_evidence.recent_changes}\n"
+            f"- Data flow upstream: {best_evidence.data_flow_upstream}\n\n"
+            f"Provide a step-by-step reasoning to answer the question, "
+            f"grounded in this evidence."
+        )
+        reasoning = await self._call_llm(
+            prompt=final_prompt,
+            system_prompt="You are a helpful assistant that reasons step by step based on verified evidence.",
+            model_override=self.valves.cot_model_level3,
+            max_tokens=(
+                self.valves.cot_max_tokens if self.valves.cot_max_tokens > 0 else None
+            ),
+            temperature=0.3,
+            label=label + "_synthesize" if label else "sci_synthesize",
+        )
+
+        if not reasoning:
+            return "Unable to synthesize scientific reasoning."
+
+        return (
+            f"## 🔬 Scientific Reasoning (Level 3)\n"
+            f"*Validated against code structure. "
+            f"Best hypothesis score: {best_combined:.2f} "
+            f"(obj={best_obj:.2f}, llm_conf={best_llm_conf:.2f})*\n\n"
+            f"{reasoning}"
+        )
+
+    # --------------------------------------------------------------------------
+    # Step-Back Prompting (v7 – Phase 6, PASO-35)
+    # --------------------------------------------------------------------------
+
+    async def _generate_step_back_context(
+        self, question: str, code_context: str
+    ) -> str:
+        """
+        Generate an architectural step-back for better CoT hypothesis quality.
+
+        Asks: "What high-level principle governs this code?" before diving
+        into the specific bug/question.
+
+        Returns a formatted string to prepend to the CoT context,
+        or empty string if disabled or the LLM call fails.
+        """
+        if not self.valves.enable_step_back_prompting:
+            return ""
+        if len(question.strip()) < 15:
+            return ""
+
+        # Step-back is most useful for debugging queries
+        debug_signals = (
+            "error",
+            "fail",
+            "bug",
+            "wrong",
+            "exception",
+            "traceback",
+            "falla",
+            "error",
+            "excepción",
+            "no funciona",
+        )
+        question_lower = question.lower()
+        if not any(signal in question_lower for signal in debug_signals):
+            if not self.valves.step_back_always:
+                return ""
+
+        # Generate the abstract question
+        step_back_prompt = (
+            f"A programmer is debugging this specific issue:\n{question[:300]}\n\n"
+            "What is the underlying architectural principle, design invariant, or "
+            "general concept that governs correct behavior here? "
+            "State it as an abstract question and answer it in 2-3 sentences. "
+            "Focus on system-level understanding, not the specific bug."
+        )
+
+        step_back_response = await self._try_llm_quick(
+            prompt=step_back_prompt,
+            system_prompt=(
+                "You are a senior software architect. "
+                "Answer the abstract question concisely (2-3 sentences). "
+                "Focus on principles, not the specific implementation."
+            ),
+            model_override=self.valves.cot_model_level2,
+            max_tokens=self.valves.step_back_max_tokens,
+            temperature=0.3,
+            timeout=30.0,
+        )
+
+        if step_back_response and step_back_response.strip():
+            self._log_debug(
+                "Step-back context generated "
+                f"({len(step_back_response.split())} words)"
+            )
+            return (
+                "## Architectural Context (Step-Back)\n"
+                f"{step_back_response.strip()}\n\n"
+                "---\n\n"
+            )
+        return ""
 
     # --------------------------------------------------------------------------
     # Feedback context
@@ -8897,6 +9547,7 @@ class Filter:
     async def _inlet_assemble_final_messages(
         self,
         messages: List[dict],
+        project_id: str,
         static_block: str,  # ← v7 (PASO-21)
         dynamic_injections: List[Tuple[str, str]],  # ← v7 (PASO-21)
         prelim_system: str,
@@ -9006,8 +9657,7 @@ class Filter:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-            # TODO (v7 Scientific CoT): replace with _generate_scientific_reasoning_L2/L3
-            # Generate the initial CoT
+            # ── v7 Scientific CoT (Phase 5/6) ──
             if not manual_cot_used:
                 question = user_question
                 if cot_level == 2:
@@ -9015,8 +9665,12 @@ class Filter:
                         question, prelim_for_cot
                     )
                 elif cot_level == 3:
-                    reasoning = await self._generate_cot_with_self_reflection(
-                        question, prelim_for_cot
+                    # Scientific reasoning with structural validation
+                    reasoning = await self._generate_scientific_reasoning_L3(
+                        question,
+                        prelim_for_cot,
+                        project_id,  # needed for evidence gathering
+                        label="scientific_cot",
                     )
             else:
                 if cot_level == 2:
@@ -9024,8 +9678,11 @@ class Filter:
                         cot_question, prelim_for_cot
                     )
                 elif cot_level == 3:
-                    reasoning = await self._generate_cot_with_self_reflection(
-                        cot_question, prelim_for_cot
+                    reasoning = await self._generate_scientific_reasoning_L3(
+                        cot_question,
+                        prelim_for_cot,
+                        project_id,
+                        label="scientific_cot",
                     )
 
             # Fallback: if auto level 3 failed, try level 2 once
@@ -9558,6 +10215,7 @@ class Filter:
             step_start = time.monotonic()
             messages = await self._inlet_assemble_final_messages(
                 messages,
+                project_id,
                 static_block,  # ← v7 (PASO-21)
                 dynamic_injections,  # ← v7 (PASO-21)
                 prelim_system,
@@ -9596,11 +10254,6 @@ class Filter:
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
-
-            # Unload any auxiliary models we may have loaded during enrichment/CoT
-            # so that OpenWebUI has a free slot for the main model.
-            # (disabled for now because it was unloading the mail model too)
-            # await self._unload_models_under_lock(wait_for_tasks=False)
 
             if _inlet_aborted:
                 for task in background_tasks:
@@ -9889,6 +10542,13 @@ class Filter:
     # Miscellaneous helpers
     # --------------------------------------------------------------------------
     def _calculate_code_similarity(self, code1: str, code2: str) -> float:
+        # ── Phase 6 (PASO-36): try AST-based comparison for Python ──
+        if self.valves.enable_ast_deduplication and len(code1) > 30 and len(code2) > 30:
+            ast_sim = self._ast_similarity(code1, code2)
+            if ast_sim is not None:
+                return ast_sim  # reliable structural comparison
+
+        # ── Fallback: text similarity (non-Python or parse error) ──
         if not HAS_FUZZ:
             min_len = min(len(code1), len(code2))
             if min_len == 0:
@@ -9896,6 +10556,84 @@ class Filter:
             common = sum(1 for a, b in zip(code1[:min_len], code2[:min_len]) if a == b)
             return common / max(len(code1), len(code2))
         return fuzz.token_sort_ratio(code1, code2) / 100.0
+
+    def _ast_similarity(self, code1: str, code2: str) -> Optional[float]:
+        """
+        Compute structural similarity between two Python code blocks via AST.
+
+        Process:
+        1. Parse both codes as AST.
+        2. Strip docstrings from function/class bodies.
+        3. Compare AST dumps (exact structural match).
+        4. If not exact, compute Jaccard similarity on AST node type distributions.
+
+        Returns:
+            1.0 if structurally identical (same logic, different docstrings/comments).
+            0.0-1.0 for partial structural similarity.
+            None if either code is not valid Python (caller should use text similarity).
+        """
+        # Quick heuristic: only attempt AST if code looks like Python
+        if not (
+            re.search(r"\bdef\s+\w+\s*\(", code1) or re.search(r"\bclass\s+\w+", code1)
+        ):
+            return None  # not Python-like → use text similarity
+
+        try:
+            tree1 = ast.parse(code1)
+            tree2 = ast.parse(code2)
+        except (SyntaxError, MemoryError, RecursionError, ValueError):
+            return None  # parse error → fall back to text similarity
+
+        # ── Step 1: strip docstrings ──────────────────────────────
+        def _strip_docstrings(tree: ast.AST) -> ast.AST:
+            """Remove docstrings from function/class/module bodies."""
+            for node in ast.walk(tree):
+                if not isinstance(
+                    node,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                        ast.Module,
+                    ),
+                ):
+                    continue
+                if (
+                    node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)
+                ):
+                    node.body = node.body[1:]
+                    if not node.body:
+                        node.body = [ast.Pass()]
+            return tree
+
+        clean1 = _strip_docstrings(tree1)
+        clean2 = _strip_docstrings(tree2)
+
+        # ── Step 2: exact AST comparison ──────────────────────────
+        dump1 = ast.dump(clean1)
+        dump2 = ast.dump(clean2)
+
+        if dump1 == dump2:
+            return 1.0  # structurally identical
+
+        # ── Step 3: Jaccard on node type distribution ─────────────
+        def _node_type_counts(tree: ast.AST) -> Counter:
+            return Counter(type(node).__name__ for node in ast.walk(tree))
+
+        c1 = _node_type_counts(clean1)
+        c2 = _node_type_counts(clean2)
+
+        all_types = set(c1.keys()) | set(c2.keys())
+        if not all_types:
+            return 0.0
+
+        intersection = sum(min(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
+        union = sum(max(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
+
+        return intersection / union if union > 0 else 0.0
 
     def _has_conflicting_proposed_changes(
         self, state: Dict, new_block: CodeBlock
