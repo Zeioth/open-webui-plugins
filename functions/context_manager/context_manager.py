@@ -7079,123 +7079,39 @@ class Filter:
             return False
         _, static_text = cached
         static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
-
         filename = self._slot_filename(project_id, static_hash)
-        slot_dir = self.valves.slot_save_path.rstrip("/")
-        full_path = os.path.join(slot_dir, filename)
 
-        if not os.path.exists(full_path):
+        slot_dir = self.valves.slot_save_path.rstrip("/")
+        if not os.path.exists(os.path.join(slot_dir, filename)):
             self._log_debug(f"Slot restore: no file found for {filename}")
             return False
 
-        worker_url = await self._discover_worker_url(self.valves.llm_model)
-        if not worker_url:
-            self._log_debug(
-                "Slot restore: worker not yet available. "
-                "Will attempt restore on next request."
-            )
-            self._slot_restore_attempted[project_id] = False
-            return False
+        base = self.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
 
         try:
             session = await _shared_get_http_session(timeout_seconds=30)
             async with session.post(
-                f"{worker_url}/slots/{self.valves.slot_id}/restore",
-                json={"filename": filename},
+                f"{base}/slots/{self.valves.slot_id}",
+                params={"action": "restore"},
+                json={"filename": filename, "model": self.valves.llm_model},
             ) as resp:
                 if resp.status == 200:
                     self._slot_restored[project_id] = True
+                    data = await resp.json()
                     self._log_debug(
-                        f"✓ Slot restored from {filename} "
-                        f"(worker={worker_url}) — Block A pre-loaded"
+                        f"✓ Slot restored ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
                     )
                     return True
                 else:
-                    body_txt = await resp.text()
-                    self._log_debug(
-                        f"Slot restore failed: HTTP {resp.status} — {body_txt}"
-                    )
+                    body = await resp.text()
+                    self._log_debug(f"Slot restore failed: HTTP {resp.status} — {body}")
                     return False
         except Exception as e:
             self._log_debug(f"Slot restore error: {e}")
             return False
-
-    async def _discover_worker_url(self, model_name: str) -> Optional[str]:
-        """
-        Discover the direct URL of the worker running a specific model by
-        parsing the --port argument from the router's /v1/models response.
-        Returns None if the model is unloaded (port=0) or the router is unreachable.
-        """
-        if not hasattr(self, "_worker_url_cache"):
-            self._worker_url_cache: Dict[str, Tuple[str, str]] = {}
-
-        try:
-            base = self.valves.LLM_BASE_URL.rstrip("/")
-            if base.endswith("/v1"):
-                base = base[:-3]
-
-            session = await _shared_get_http_session(timeout_seconds=5)
-            async with session.get(f"{base}/v1/models") as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-
-            for model in data.get("data", []):
-                if model.get("id") != model_name and model_name not in model.get(
-                    "aliases", []
-                ):
-                    continue
-
-                status = model.get("status", {})
-                status_value = status.get("value", "unloaded")
-
-                if status_value not in ("loaded", "sleeping"):
-                    self._log_debug(
-                        f"Worker discovery: model '{model_name}' is '{status_value}', "
-                        f"no worker URL available."
-                    )
-                    self._worker_url_cache.pop(model_name, None)
-                    return None
-
-                cached = self._worker_url_cache.get(model_name)
-                if cached and cached[0] == status_value:
-                    return cached[1]
-
-                args = status.get("args", [])
-                port = None
-                for i, arg in enumerate(args):
-                    if arg == "--port" and i + 1 < len(args):
-                        try:
-                            port_val = int(args[i + 1])
-                            if port_val > 0:
-                                port = port_val
-                        except (ValueError, IndexError):
-                            pass
-                        break
-
-                if not port:
-                    self._log_debug(
-                        f"Worker discovery: model '{model_name}' has no valid port in args."
-                    )
-                    return None
-
-                from urllib.parse import urlparse
-
-                parsed = urlparse(self.valves.LLM_BASE_URL)
-                worker_host = parsed.hostname
-                worker_url = f"{parsed.scheme}://{worker_host}:{port}"
-
-                self._worker_url_cache[model_name] = (status_value, worker_url)
-                self._log_debug(
-                    f"Worker discovery: '{model_name}' → {worker_url} "
-                    f"(status={status_value})"
-                )
-                return worker_url
-
-        except Exception as e:
-            self._log_debug(f"Worker URL discovery failed: {e}")
-
-        return None
 
     async def _slot_save_if_needed(self, project_id: str) -> bool:
         if not self.valves.enable_slot_persistence:
@@ -7211,41 +7127,33 @@ class Filter:
             return False
 
         filename = self._slot_filename(project_id, static_hash)
-
-        worker_url = await self._discover_worker_url(self.valves.llm_model)
-        if not worker_url:
-            self._log_debug(
-                "Slot save: worker not available (model unloaded or router unreachable). "
-                "Will retry on next outlet."
-            )
-            return False
+        base = self.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
 
         try:
             session = await _shared_get_http_session(timeout_seconds=30)
             async with session.post(
-                f"{worker_url}/slots/{self.valves.slot_id}/save",
-                json={"filename": filename},
+                f"{base}/slots/{self.valves.slot_id}",
+                params={"action": "save"},
+                json={"filename": filename, "model": self.valves.llm_model},
             ) as resp:
                 if resp.status == 200:
                     self._last_saved_slot_hash[project_id] = static_hash
+                    data = await resp.json()
                     self._log_debug(
-                        f"✓ Slot saved → {filename} " f"(worker={worker_url})"
+                        f"✓ Slot saved → {filename} "
+                        f"({data.get('n_saved', '?')} tokens, "
+                        f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
                     )
                     await self._cleanup_old_slot_files(project_id, filename)
                     return True
                 else:
-                    body_txt = await resp.text()
-                    self._log_debug(
-                        f"Slot save failed: HTTP {resp.status} — {body_txt} "
-                        f"(worker={worker_url})"
-                    )
-                    if hasattr(self, "_worker_url_cache"):
-                        self._worker_url_cache.pop(self.valves.llm_model, None)
+                    body = await resp.text()
+                    self._log_debug(f"Slot save failed: HTTP {resp.status} — {body}")
                     return False
         except Exception as e:
             self._log_debug(f"Slot save error: {e}")
-            if hasattr(self, "_worker_url_cache"):
-                self._worker_url_cache.pop(self.valves.llm_model, None)
             return False
 
     async def _cleanup_old_slot_files(self, project_id: str, keep_filename: str):
