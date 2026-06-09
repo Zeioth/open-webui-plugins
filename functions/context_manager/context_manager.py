@@ -1489,9 +1489,7 @@ class Filter:
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
         )
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
-        LLM_BASE_URL: str = Field(
-            default="http://host.docker.internal:8080"
-        )
+        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
