@@ -1257,11 +1257,8 @@ class Filter:
 
     class Valves(BaseModel):
         # ═══════════════════════════════════════════════════════════════
-        #  MAIN VALVES – all auxiliary tasks use the main model to avoid
-        #  VRAM overflow and keep it always loaded for instant responses.
+        #  Core
         # ═══════════════════════════════════════════════════════════════
-
-        # ─── Core ───
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
@@ -1276,8 +1273,10 @@ class Filter:
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
-
-        # ─── Long‑Term Memory (ChromaDB) ───
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Long‑Term Memory (ChromaDB)
+        # ═══════════════════════════════════════════════════════════════
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
         long_term_memory_expiration_days: int = Field(default=30)
         long_term_memory_top_k: int = Field(default=10)
@@ -1298,8 +1297,10 @@ class Filter:
         enable_reranking: bool = Field(default=True)
         reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
         reranker_top_k: int = Field(default=5)
-
-        # ─── Code Awareness & Context ───
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Code Awareness & Context
+        # ═══════════════════════════════════════════════════════════════
         enable_code_awareness: bool = Field(default=True)
         code_similarity_threshold: float = Field(default=0.85)
         max_base_code_blocks: int = Field(default=3)
@@ -1310,7 +1311,7 @@ class Filter:
         max_active_blocks: int = Field(
             default=0,
             ge=0,
-            description="Maximum number of active code blocks to keep (0 = unlimited). If you limit this value, the remaining symbols will be just inclued without beign enriched.",
+            description="Maximum number of active code blocks to keep (0 = unlimited).",
         )
         track_file_paths: bool = Field(default=True)
         file_path_pattern: str = Field(
@@ -1319,7 +1320,7 @@ class Filter:
         max_code_block_tokens: int = Field(default=0)
         code_block_overflow_action: str = Field(default="warn")
         code_block_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -1332,14 +1333,15 @@ class Filter:
         )
         enable_auto_summaries: bool = Field(
             default=True,
-            description="Automatically generate one-line summaries for code symbols using a small LLM.",
+            description="Automatically generate one-line summaries for code symbols.",
         )
         summary_code_max_chars: int = Field(
             default=8000,
             description="Maximum characters of code to include when summarizing code blocks.",
         )
         oversized_summary_max_tokens: int = Field(
-            default=500, description="Max tokens for summarizing oversized code blocks."
+            default=500,
+            description="Max tokens for summarizing oversized code blocks.",
         )
         active_context_max_tokens: int = Field(
             default=32000,
@@ -1353,337 +1355,44 @@ class Filter:
             default=True,
             description="Exclude symbols from the filter's own source code to prevent self-analysis.",
         )
-
-        # ─── Outlet Expand Intercept ───
-        outlet_expand_intercept_enabled: bool = Field(default=True)
-        outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
-        outlet_expand_intercept_depth: int = Field(default=5, ge=0)
-        expand_default_depth: int = Field(default=2)
-
-        # ─── Smart Context Selection ───
-        smart_context_selection: bool = Field(default=False)
-        smart_context_top_k: int = Field(default=15)
-        smart_context_min_tokens: int = Field(default=1024)
-        smart_context_include_last_user: bool = Field(default=True)
-
-        # ─── Duplicate Blocks & Frequency ───
-        auto_remove_duplicate_blocks: bool = Field(default=True)
-        max_duplicate_age_hours: float = Field(default=6.0)
-        frequency_weight_factor: float = Field(default=0.3)
-        min_mentions_for_boost: int = Field(default=3)
-        frequency_decay_hours: float = Field(default=12.0)
-
-        # ─── Confidence Scoring & Chain‑of‑Thought ───
-        enable_confidence_scoring: bool = Field(default=True)
-        confidence_prompt: str = Field(
-            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help."
-        )
-        enable_cot_on_demand: bool = Field(default=True)
-        auto_cot_enabled: bool = Field(default=False)
-        auto_cot_min_chars: int = Field(default=200)
-        cot_max_tokens: int = Field(default=0)
-        cot_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        cot_model_level2: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        cot_model_level3: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-
-        # ─── Assumptions & Contradictions ───
-        enable_assumption_extraction: bool = Field(default=True)
-        assumption_extraction_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        enable_contradiction_detection: bool = Field(default=True)
-        contradiction_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        contradiction_inject_warning: bool = Field(default=True)
-
-        # ─── Proactive Context Warning ───
-        proactive_context_warning_threshold: float = Field(default=0.85)
-        proactive_context_warning_message: str = Field(
-            default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window ({used_tokens}/{max_tokens} tokens). Consider using `/forget` to remove irrelevant parts, `/remember` to pin important context, or ask me to summarize older parts."
-        )
-
-        # ─── Similar Messages & Obsolete Marking ───
-        similar_message_handling: str = Field(default="replace")
-        similar_message_threshold: float = Field(default=0.92)
-        similar_message_check_code_only: bool = Field(default=True)
-        enable_obsolete_marking: bool = Field(default=True)
-
-        # ─── Proactive Summary & Command Suggestions ───
-        proactive_summary_threshold: float = Field(default=0.75)
-        proactive_summary_growth_window: int = Field(default=3)
-        enable_command_suggestions: bool = Field(default=True)
-        command_suggestion_cooldown_minutes: int = Field(default=10)
-
-        # ─── Duplicate Question Detection ───
-        duplicate_question_threshold: float = Field(default=0.92)
-        duplicate_question_lookback: int = Field(default=20)
-        duplicate_question_lookback_hours: float = Field(default=24.0)
-
-        # ─── Response Cache ───
-        enable_response_cache: bool = Field(default=True)
-        response_cache_similarity_threshold: float = Field(default=0.92)
-        response_cache_ttl_hours: float = Field(default=24.0)
-        response_cache_max_entries: int = Field(default=100)
-        response_cache_include_context_hash: bool = Field(default=True)
-
-        # ─── Selective Summarization ───
-        selective_summarization: bool = Field(default=True)
-        error_preserve_verbatim: bool = Field(default=True)
-        error_max_age_hours: float = Field(default=48.0)
-        code_summary_level: str = Field(default="balanced")
-        general_summary_max_tokens: int = Field(default=200)
-        tool_call_preserve: bool = Field(default=True)
-        code_always_keep_signature: bool = Field(default=True)
-        summary_fallback_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        summary_include_metadata: bool = Field(default=True)
-
-        # ─── Summarize Old Messages ───
-        summarize_old_messages: bool = Field(default=True)
-        summarization_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-
-        # ─── LLM Configuration ───
-        openai_api_base: str = Field(
-            default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
-        )
-        openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
-        LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced")
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
-        llm_request_timeout: int = Field(default=900)
-        LLM_CACHE_TTL: int = Field(default=300)
-        LLM_CACHE_MAX_SIZE: int = Field(default=100)
-
-        # ─── llama.cpp endpoint type ───
-        llamacpp_endpoint_type: str = Field(
-            default="chat",
-            description="Endpoint type for llama.cpp: 'chat' (default) or 'completion'.",
-        )
-
-        # ─── Importance & Expiration ───
-        importance_mention_boost: float = Field(default=0.2)
-        importance_recency_half_life_hours: float = Field(default=2.0)
-        block_expiration_hours: float = Field(default=24.0)
-        proposed_change_retention_turns: int = Field(default=20)
-        preserve_tool_calls: bool = Field(default=True)
-        error_retention_turns: int = Field(default=15)
-        track_active_code_age: bool = Field(default=True)
-        active_code_timeout_minutes: int = Field(default=45)
-        recent_activity_window_minutes: int = Field(default=15)
-        max_change_summaries: int = Field(default=1000)
-
-        # ─── Diff & Patterns ───
-        enable_diff_application: bool = Field(default=True)
-        preserve_error_context: bool = Field(default=True)
-        code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
-        diff_pattern: str = Field(
-            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
-        )
-        commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
-
-        # ─── Feedback Tracking ───
-        enable_feedback_tracking: bool = Field(default=True)
-        feedback_history_limit: int = Field(default=10)
-        inject_feedback_context: bool = Field(default=True)
-        feedback_importance_penalty_for_failure: float = Field(default=2.0)
-
-        # ─── Summarize Inactive Code ───
-        summarize_inactive_code: bool = Field(default=True)
-        inactive_code_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-
-        # ─── Forget Commands ───
-        enable_forget_command: bool = Field(default=True)
-        enable_natural_language_forget: bool = Field(default=True)
-        natural_language_forget_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-
-        # ─── Proactive Cleanup ───
-        cleanup_suggestions_enabled: bool = Field(default=True)
-        cleanup_inactive_threshold_messages: int = Field(default=30)
-        cleanup_excluded_content_types: list = Field(
-            default_factory=lambda: ["BASE_CODE"]
-        )
-        cleanup_status_command_enabled: bool = Field(default=True)
-        cleanup_proactive_suggestions: bool = Field(default=True)
-        cleanup_suggestion_cooldown_messages: int = Field(default=20)
-        cleanup_command_enabled: bool = Field(default=True)
-
-        # ─── Raw File Priority Boost ───
-        raw_file_priority_boost: float = Field(default=2.0)
-
-        # ─── Symbol‑level analysis ───
-        symbol_analysis_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-
-        # ─── Session summaries (autobiographical mini‑memory) ───
-        enable_session_summary: bool = Field(
+        enable_ast_deduplication: bool = Field(
             default=True,
-            description="Generate an autobiographical session summary every N turns and store it in LTM.",
+            description="Use AST comparison for Python code deduplication instead of text similarity.",
         )
-        session_summary_interval_messages: int = Field(
-            default=8,
-            description="How many messages between session summaries.",
-        )
-        session_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        session_summary_max_tokens: int = Field(
-            default=200,
-            description="Max tokens for the session summary.",
-        )
-
-        # ─── Secondary task deferral ───
-        defer_secondary_tasks: bool = Field(
-            default=True,
-            description="Defer secondary LLM tasks to the next inlet to avoid concurrency.",
-        )
-        secondary_task_max_retries: int = Field(
-            default=5,
-            description="Max retries for deferred secondary tasks before giving up.",
-        )
-        secondary_task_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        secondary_llm_max_concurrent: int = Field(
-            default=2,
-            description="Max concurrent LLM calls for deferred secondary tasks.",
-        )
-
-        # ═══════════════════════════════════════════════════════════════════
-        #  GRAPH ANALYSIS (v7) – Phase 1
-        # ═══════════════════════════════════════════════════════════════════
-
-        # ─── Graph-based Path Analysis ───────────────────────────────────────
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Graph Analysis (paths, LOD, centrality, seeds)
+        # ═══════════════════════════════════════════════════════════════
         enable_path_analysis: bool = Field(
             default=True,
-            description=(
-                "Enable graph activation-based context selection. "
-                "If False, falls back to the legacy active code context method."
-            ),
+            description="Enable graph activation-based context selection.",
         )
         path_activation_threshold: float = Field(
             default=0.1,
             ge=0.01,
             le=1.0,
-            description=(
-                "Minimum activation score for a node to be considered for context. "
-                "Lower = more inclusive. Higher = more focused."
-            ),
+            description="Minimum activation score for a node to be considered for context.",
         )
         path_relevance_high_threshold: float = Field(
             default=0.5,
             ge=0.0,
             le=1.0,
-            description=(
-                "Nodes with activation >= this get full code expansion. "
-                "Nodes below get symbol summary only."
-            ),
+            description="Nodes with activation >= this get full code expansion; below get summary.",
         )
         path_propagation_steps: int = Field(
             default=4,
             ge=1,
             le=8,
-            description="Max BFS steps during activation propagation.",
+            description="Max BFS/Power iteration steps during activation propagation.",
         )
         path_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
             description="Model for lazy path summary generation.",
         )
         path_summary_max_tokens: int = Field(
             default=80,
             description="Max tokens for a path summary.",
         )
-        ppr_alpha: float = Field(
-            default=0.85,
-            ge=0.5,
-            le=0.99,
-            description=(
-                "Damping factor for Personalized PageRank propagation. "
-                "Higher = more weight to graph structure vs. seed. "
-                "Standard value: 0.85."
-            ),
-        )
-        enable_data_flow_analysis: bool = Field(
-            default=True,
-            description=(
-                "Extract data flow edges between functions using ast analysis. "
-                "Improves activation propagation for debugging queries. "
-                "Python only (regex fallback for other languages)."
-            ),
-        )
-
-        # ─── Call Graph Centrality Prior (Phase 6) ───────────────────────
-        enable_centrality_prior: bool = Field(
-            default=True,
-            description=(
-                "Compute static PageRank centrality on the call graph after each "
-                "code change. High-centrality symbols are prioritized as fallback "
-                "seeds and can receive LOD bumps."
-            ),
-        )
-        enable_centrality_lod_bump: bool = Field(
-            default=True,
-            description=(
-                "Boost LOD level for high-centrality symbols even when their "
-                "query‑specific activation score is low. Ensures important hub "
-                "functions are always shown with adequate detail."
-            ),
-        )
-        centrality_lod_bump_threshold: float = Field(
-            default=0.7,
-            ge=0.0,
-            le=1.0,
-            description="Centrality score above which a symbol receives a LOD bump.",
-        )
-        centrality_lod_bump_weight: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=0.5,
-            description=(
-                "Weight of centrality boost when adjusting effective LOD score. "
-                "effective_score = activation + centrality * weight."
-            ),
-        )
-
-        # ─── Multi-Query LTM Expansion (Phase 6) ─────────────────────────
-        enable_multi_query_retrieval: bool = Field(
-            default=False,
-            description=(
-                "Generate multiple query variants before LTM retrieval and merge results. "
-                "Reduces vocabulary mismatch between user query and stored memories. "
-                "Costs 1 extra LLM call per inlet. Disable if latency is critical."
-            ),
-        )
-        multi_query_variants: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-            description=(
-                "Number of alternative query variants to generate "
-                "(besides the original)."
-            ),
-        )
-
-        # ─── LOD Thresholds ──────────────────────────────────────────────────
         lod3_threshold: float = Field(
             default=0.50,
             ge=0.0,
@@ -1700,39 +1409,171 @@ class Filter:
             default=0.10,
             ge=0.0,
             le=1.0,
-            description="Activation score above which signature only is injected (LOD-1). "
-            "Symbols below this score only contribute their name (LOD-0).",
+            description="Activation score above which signature only is injected (LOD-1). Symbols below are name only (LOD-0).",
         )
-
-        # ─── Speculative Pre-fetching ─────────────────────────────────────────
-        enable_speculative_prefetch: bool = Field(
+        enable_centrality_prior: bool = Field(
             default=True,
-            description=(
-                "Pre-build CodePathViews for symbols likely needed in the next query, "
-                "running as a background task during LLM decode. Zero added latency."
-            ),
+            description="Compute static PageRank centrality on the call graph after code changes.",
         )
-        speculative_prefetch_max: int = Field(
-            default=5,
-            ge=1,
+        enable_centrality_lod_bump: bool = Field(
+            default=True,
+            description="Boost LOD level for high-centrality symbols even when query-specific activation is low.",
+        )
+        centrality_lod_bump_threshold: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description="Centrality score above which a symbol receives a LOD bump.",
+        )
+        centrality_lod_bump_weight: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=0.5,
+            description="Weight of centrality boost (effective_score = activation + centrality * weight).",
+        )
+        enable_traceback_activation: bool = Field(
+            default=True,
+            description="Seed the ActivationGraph with traceback frame function names when present.",
+        )
+        enable_history_seeds: bool = Field(
+            default=True,
+            description="Boost activation of symbols frequently mentioned in recent conversation messages.",
+        )
+        history_seeds_lookback: int = Field(
+            default=6,
+            ge=2,
             le=20,
-            description="Maximum number of symbols to pre-fetch per response.",
+            description="Number of recent messages to scan for history seeds.",
         )
-
-        # ─── Intent Classification ────────────────────────────────────────────
-        enable_intent_llm_fallback: bool = Field(
+        history_seeds_max_boost: float = Field(
+            default=0.6,
+            ge=0.1,
+            le=0.9,
+            description="Maximum activation score boost from conversation history.",
+        )
+        enable_multi_seed_activation: bool = Field(
             default=True,
-            description=(
-                "Use LLM as fallback when heuristic intent classification "
-                "produces a weak signal."
-            ),
+            description="Run three independent activation passes (lexical, structural, historical) and combine results.",
+        )
+        multi_seed_weight_lexical: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="Weight for lexical seeds.",
+        )
+        multi_seed_weight_structural: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description="Weight for structural seeds.",
+        )
+        multi_seed_weight_historical: float = Field(
+            default=0.2,
+            ge=0.0,
+            le=1.0,
+            description="Weight for historical seeds.",
+        )
+        ppr_alpha: float = Field(
+            default=0.85,
+            ge=0.5,
+            le=0.99,
+            description="Damping factor for Personalized PageRank propagation.",
+        )
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  LLM Configuration
+        # ═══════════════════════════════════════════════════════════════
+        openai_api_base: str = Field(
+            default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
+        )
+        openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
+        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
+        LLM_API_TOKEN: str = Field(default="")
+        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact")
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
+        llm_request_timeout: int = Field(default=900)
+        LLM_CACHE_TTL: int = Field(default=300)
+        LLM_CACHE_MAX_SIZE: int = Field(default=100)
+        llamacpp_endpoint_type: str = Field(
+            default="chat",
+            description="Endpoint type for llama.cpp: 'chat' (default) or 'completion'.",
         )
         intent_classifier_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
             description="Model for intent classification fallback.",
         )
-
-        # ─── Scientific CoT ────────────────────────────────────────────────────
+        enable_intent_llm_fallback: bool = Field(
+            default=True,
+            description="Use LLM as fallback when heuristic intent classification produces a weak signal.",
+        )
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Code Compression (LLMLingua-2)
+        # ═══════════════════════════════════════════════════════════════
+        enable_code_compression: bool = Field(
+            default=False,
+            description="Enable LLMLingua-2 token compression within code blocks. Requires llmlingua>=0.2.0.",
+        )
+        code_compression_rate: float = Field(
+            default=0.5,
+            ge=0.3,
+            le=0.8,
+            description="Fraction of tokens to KEEP after compression.",
+        )
+        code_compression_min_tokens: int = Field(
+            default=150,
+            description="Minimum token count for a code block to be compressed.",
+        )
+        enable_question_aware_compression: bool = Field(
+            default=True,
+            description="Pass the current user query to LLMLingua-2 to preserve query-relevant tokens.",
+        )
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Importance & Expiration
+        # ═══════════════════════════════════════════════════════════════
+        importance_mention_boost: float = Field(default=0.2)
+        importance_recency_half_life_hours: float = Field(default=2.0)
+        block_expiration_hours: float = Field(default=24.0)
+        proposed_change_retention_turns: int = Field(default=20)
+        preserve_tool_calls: bool = Field(default=True)
+        error_retention_turns: int = Field(default=15)
+        track_active_code_age: bool = Field(default=True)
+        active_code_timeout_minutes: int = Field(default=45)
+        recent_activity_window_minutes: int = Field(default=15)
+        max_change_summaries: int = Field(default=1000)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Duplicate Blocks & Frequency
+        # ═══════════════════════════════════════════════════════════════
+        auto_remove_duplicate_blocks: bool = Field(default=True)
+        max_duplicate_age_hours: float = Field(default=6.0)
+        frequency_weight_factor: float = Field(default=0.3)
+        min_mentions_for_boost: int = Field(default=3)
+        frequency_decay_hours: float = Field(default=12.0)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Confidence Scoring & Chain‑of‑Thought
+        # ═══════════════════════════════════════════════════════════════
+        enable_confidence_scoring: bool = Field(default=True)
+        confidence_prompt: str = Field(
+            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
+        )
+        enable_cot_on_demand: bool = Field(default=True)
+        auto_cot_enabled: bool = Field(default=False)
+        auto_cot_min_chars: int = Field(default=200)
+        cot_max_tokens: int = Field(default=0)
+        cot_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact")
+        cot_model_level2: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact")
+        cot_model_level3: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact")
+        enable_cot_llm_detection: bool = Field(default=True)
+        cot_detection_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+        enforce_scientific_method: bool = Field(
+            default=False,
+            description="Force Level 3 Scientific CoT regardless of detected complexity.",
+        )
         scientific_hypotheses_count: int = Field(
             default=3,
             ge=2,
@@ -1751,28 +1592,13 @@ class Filter:
             le=4,
             description="Max refinement iterations in Level 3 Scientific CoT.",
         )
-        enforce_scientific_method: bool = Field(
-            default=False,
-            description="Force Level 3 Scientific CoT regardless of detected complexity.",
-        )
-
-        # ─── Step-Back Prompting (Phase 6) ──────────────────────────────
         enable_step_back_prompting: bool = Field(
             default=False,
-            description=(
-                "Before generating CoT reasoning, ask an abstract architectural question "
-                "about the code domain and use the answer as additional context. "
-                "Improves hypothesis quality for debugging queries. "
-                "Based on Step-Back Prompting (Zheng et al., ICLR 2024). "
-                "Costs 1 extra LLM call before each CoT."
-            ),
+            description="Before CoT, ask an abstract architectural question for better context.",
         )
         step_back_always: bool = Field(
             default=False,
-            description=(
-                "If True, generate step-back context for all CoT queries (not just debugging). "
-                "If False (default), only for queries containing error/fail/exception signals."
-            ),
+            description="If True, generate step-back for all CoT queries (not just debugging).",
         )
         step_back_max_tokens: int = Field(
             default=150,
@@ -1780,278 +1606,260 @@ class Filter:
             le=400,
             description="Max tokens for the step-back architectural context.",
         )
-
-        # ─── LLMLingua-2 Code Compression ────────────────────────────────────
-        enable_code_compression: bool = Field(
-            default=False,
-            description=(
-                "Enable LLMLingua-2 post-selection token compression within code blocks. "
-                "Requires: pip install llmlingua>=0.2.0. Runs on CPU."
-            ),
+        enable_contradiction_detection: bool = Field(default=True)
+        contradiction_detection_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
         )
-        code_compression_rate: float = Field(
-            default=0.5,
-            ge=0.3,
-            le=0.8,
-            description=(
-                "Fraction of tokens to KEEP after compression. "
-                "0.5 = keep 50%% (aggressive). 0.7 = keep 70%% (conservative). "
-                "Values below 0.4 may lose critical code logic."
-            ),
+        contradiction_inject_warning: bool = Field(default=True)
+        enable_assumption_extraction: bool = Field(default=True)
+        assumption_extraction_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
         )
-        code_compression_min_tokens: int = Field(
-            default=150,
-            description=(
-                "Minimum token count for a code block to be compressed. "
-                "Blocks smaller than this are injected as-is."
-            ),
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Proactive Suggestions & Commands
+        # ═══════════════════════════════════════════════════════════════
+        proactive_context_warning_threshold: float = Field(default=0.85)
+        proactive_context_warning_message: str = Field(
+            default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window..."
         )
-
-        # ─── LLMLingua Question-Aware (Phase 6) ─────────────────────────
-        enable_question_aware_compression: bool = Field(
+        proactive_summary_threshold: float = Field(default=0.75)
+        proactive_summary_growth_window: int = Field(default=3)
+        enable_command_suggestions: bool = Field(default=True)
+        command_suggestion_cooldown_minutes: int = Field(default=10)
+        enable_forget_command: bool = Field(default=True)
+        enable_natural_language_forget: bool = Field(default=True)
+        natural_language_forget_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+        cleanup_suggestions_enabled: bool = Field(default=True)
+        cleanup_inactive_threshold_messages: int = Field(default=30)
+        cleanup_excluded_content_types: list = Field(default_factory=lambda: ["BASE_CODE"])
+        cleanup_status_command_enabled: bool = Field(default=True)
+        cleanup_proactive_suggestions: bool = Field(default=True)
+        cleanup_suggestion_cooldown_messages: int = Field(default=20)
+        cleanup_command_enabled: bool = Field(default=True)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Response Cache
+        # ═══════════════════════════════════════════════════════════════
+        enable_response_cache: bool = Field(default=True)
+        response_cache_similarity_threshold: float = Field(default=0.92)
+        response_cache_ttl_hours: float = Field(default=24.0)
+        response_cache_max_entries: int = Field(default=100)
+        response_cache_include_context_hash: bool = Field(default=True)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Selective Summarization
+        # ═══════════════════════════════════════════════════════════════
+        selective_summarization: bool = Field(default=True)
+        error_preserve_verbatim: bool = Field(default=True)
+        error_max_age_hours: float = Field(default=48.0)
+        code_summary_level: str = Field(default="balanced")
+        general_summary_max_tokens: int = Field(default=200)
+        tool_call_preserve: bool = Field(default=True)
+        code_always_keep_signature: bool = Field(default=True)
+        summary_fallback_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+        summary_include_metadata: bool = Field(default=True)
+        summarize_old_messages: bool = Field(default=True)
+        summarization_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Feedback Tracking
+        # ═══════════════════════════════════════════════════════════════
+        enable_feedback_tracking: bool = Field(default=True)
+        feedback_history_limit: int = Field(default=10)
+        inject_feedback_context: bool = Field(default=True)
+        feedback_importance_penalty_for_failure: float = Field(default=2.0)
+        enable_diff_application: bool = Field(default=True)
+        preserve_error_context: bool = Field(default=True)
+        code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
+        diff_pattern: str = Field(
+            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
+        )
+        commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
+        enable_obsolete_marking: bool = Field(default=True)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Inactive Code Summarization
+        # ═══════════════════════════════════════════════════════════════
+        summarize_inactive_code: bool = Field(default=True)
+        inactive_code_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Session Summaries & Secondary Tasks
+        # ═══════════════════════════════════════════════════════════════
+        enable_session_summary: bool = Field(
             default=True,
-            description=(
-                "When compressing code blocks with LLMLingua-2, pass the current "
-                "user query as the 'question' parameter. This preserves tokens "
-                "relevant to the query rather than compressing uniformly. "
-                "Requires enable_code_compression=True. Based on LongLLMLingua (ACL 2023)."
-            ),
+            description="Generate an autobiographical session summary every N turns and store it in LTM.",
         )
-
-        # ─── RAPTOR Hierarchical LTM ──────────────────────────────────────────
+        session_summary_interval_messages: int = Field(default=8)
+        session_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+        session_summary_max_tokens: int = Field(default=200)
+        defer_secondary_tasks: bool = Field(
+            default=True,
+            description="Defer secondary LLM tasks to the next inlet to avoid concurrency.",
+        )
+        secondary_task_max_retries: int = Field(default=5)
+        secondary_task_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
+        )
+        secondary_llm_max_concurrent: int = Field(default=2)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Raw File Priority Boost
+        # ═══════════════════════════════════════════════════════════════
+        raw_file_priority_boost: float = Field(default=2.0)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Smart Pre‑Expand & Expand
+        # ═══════════════════════════════════════════════════════════════
+        outlet_expand_intercept_enabled: bool = Field(default=True)
+        outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
+        outlet_expand_intercept_depth: int = Field(default=5, ge=0)
+        expand_default_depth: int = Field(default=2)
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  RAPTOR Hierarchical LTM
+        # ═══════════════════════════════════════════════════════════════
         enable_raptor: bool = Field(
             default=False,
-            description=(
-                "Enable RAPTOR hierarchical summarization of LTM. "
-                "Requires scikit-learn. Improves retrieval for abstract queries "
-                "over long conversation histories (50+ messages). "
-                "Rebuild runs in background, does not affect inlet latency."
-            ),
+            description="Enable RAPTOR hierarchical summarization of LTM. Requires scikit-learn.",
         )
         raptor_clusters_per_level: int = Field(
-            default=5,
-            ge=2,
-            le=20,
-            description="Number of k-means clusters per RAPTOR level.",
+            default=5, ge=2, le=20, description="Number of k-means clusters per RAPTOR level."
         )
         raptor_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Compact",
             description="Model for RAPTOR cluster summary generation.",
         )
         raptor_summary_max_tokens: int = Field(
-            default=150,
-            description="Max tokens per RAPTOR cluster summary.",
+            default=150, description="Max tokens per RAPTOR cluster summary."
         )
         raptor_rebuild_interval: int = Field(
             default=20,
-            description=(
-                "Rebuild RAPTOR index every N outlet calls. "
-                "Lower = more fresh summaries, more background LLM calls."
-            ),
+            description="Rebuild RAPTOR index every N outlet calls.",
         )
-
-        # ─── KV Cache Stability ───────────────────────────────────────────────
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  KV Cache Stability & Slot Persistence
+        # ═══════════════════════════════════════════════════════════════
         enable_kv_cache_stability: bool = Field(
             default=True,
-            description=(
-                "Separate system prompt into static (Block A) and dynamic (Block B) sections. "
-                "Block A is placed first and remains identical between requests "
-                "when code has not changed, maximising KV cache hits in llama.cpp."
-            ),
+            description="Separate system prompt into static (Block A) and dynamic (Block B) for KV cache stability.",
         )
-
-        # ─── KV Cache Slot Persistence ───────────────────────────────────────
         enable_slot_persistence: bool = Field(
             default=False,
-            description=(
-                "Persist and restore llama.cpp KV cache slot between sessions "
-                "via POST /slots/{id}/save and /slots/{id}/restore. "
-                "Requires --slot-save-path configured in llama.cpp. "
-                "Eliminates cold-start prefill when code has not changed between sessions."
-            ),
+            description="Persist and restore llama.cpp KV cache slot between sessions.",
         )
         slot_save_path: str = Field(
             default="/tmp/llama_slots",
-            description=(
-                "Directory for slot cache files. "
-                "Must match --slot-save-path in llama.cpp server arguments."
-            ),
+            description="Directory for slot cache files.",
         )
-        slot_id: int = Field(
-            default=0,
-            ge=0,
-            description="llama.cpp slot ID to save/restore. With --parallel 1, always 0.",
-        )
-
-        # ─── Silent ingestion ───────────────────────────────────────────────
-        enable_silent_ingestion: bool = Field(
+        slot_id: int = Field(default=0, ge=0, description="llama.cpp slot ID to save/restore.")
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Retrieval Enhancements
+        # ═══════════════════════════════════════════════════════════════
+        enable_contextual_retrieval: bool = Field(
             default=True,
-            description=(
-                "Enable silent ingestion mode: when the user pastes code without a question, "
-                "index it into the SymbolGraph without invoking the main LLM. "
-                "Returns an immediate confirmation. Enables efficient Mode B (chunked paste) workflow."
-            ),
+            description="Prepend a context summary to each LTM entry before embedding.",
         )
-
-        # ─── Stack Trace Activation (v7 Phase 5) ────────────────────────
-        enable_traceback_activation: bool = Field(
-            default=True,
-            description=(
-                "When the user message contains a traceback, extract function names "
-                "from each frame and seed them in the ActivationGraph with scores "
-                "proportional to frame depth. Deeper frames (closer to the crash) "
-                "receive higher scores."
-            ),
+        contextual_retrieval_mode: str = Field(
+            default="metadata",
+            description="Context generation mode: 'metadata' (fast, no LLM) or 'llm' (better, slower).",
         )
-
-        # ─── Conversation History Seeds (v7 Phase 5) ────────────────────
-        enable_history_seeds: bool = Field(
-            default=True,
-            description=(
-                "Boost activation of symbols that appear frequently in recent "
-                "conversation messages, even if not mentioned in the current query. "
-                "Prevents losing session context in follow-up questions."
-            ),
+        enable_multi_query_retrieval: bool = Field(
+            default=False,
+            description="Generate multiple query variants before LTM retrieval and merge results.",
         )
-        history_seeds_lookback: int = Field(
-            default=6,
-            ge=2,
-            le=20,
-            description="Number of recent messages to scan for history seeds.",
+        multi_query_variants: int = Field(
+            default=2, ge=1, le=4, description="Number of alternative query variants to generate."
         )
-        history_seeds_max_boost: float = Field(
-            default=0.6,
-            ge=0.1,
-            le=0.9,
-            description=(
-                "Maximum activation score boost from conversation history. "
-                "This is added on top of the score from the current query seeds."
-            ),
-        )
-
-        # ─── Cross-Session Edge Persistence (v7 Phase 5) ────────────────
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Edge Persistence (Cross-Session SymbolGraph)
+        # ═══════════════════════════════════════════════════════════════
         enable_edge_persistence: bool = Field(
             default=True,
-            description=(
-                "Persist typed SymbolGraph edges to SQLite at end of session. "
-                "On the next session with the same project_id and same code, "
-                "the graph is restored automatically without re-pasting code. "
-                "Guard: edges are invalidated if the code state hash changes."
-            ),
+            description="Persist typed SymbolGraph edges to SQLite for cross-session continuity.",
         )
-
-        # ─── Adaptive LOD Thresholds (v7 Phase 5) ───────────────────────
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Adaptive LOD Thresholds
+        # ═══════════════════════════════════════════════════════════════
         enable_lod_adaptive: bool = Field(
             default=True,
-            description=(
-                "Automatically adjust lod3_threshold based on whether the LLM "
-                "references symbols in its response that only received summary/signature. "
-                "Converges to optimal thresholds for the project over time."
-            ),
+            description="Automatically adjust lod3_threshold based on LLM response references.",
         )
         lod_adapt_rate: float = Field(
             default=0.05,
             ge=0.01,
             le=0.2,
-            description=(
-                "Step size for each LOD threshold adjustment. "
-                "Smaller = more stable but slower convergence."
-            ),
+            description="Step size for each LOD threshold adjustment.",
         )
         lod_adapt_min: float = Field(
             default=0.25,
             ge=0.1,
             le=0.5,
-            description="Minimum value for lod3_threshold (prevents injecting everything).",
+            description="Minimum value for lod3_threshold.",
         )
         lod_adapt_max: float = Field(
             default=0.75,
             ge=0.5,
             le=0.95,
-            description="Maximum value for lod3_threshold (prevents injecting nothing).",
+            description="Maximum value for lod3_threshold.",
         )
         lod_adapt_underserved_min: int = Field(
             default=2,
             ge=1,
             le=10,
-            description=(
-                "Minimum number of underserved symbols to trigger threshold decrease. "
-                "Prevents over-reacting to a single mention."
-            ),
+            description="Minimum underserved symbols to trigger threshold decrease.",
         )
         lod_adapt_overserved_min: int = Field(
             default=3,
             ge=1,
             le=10,
-            description="Minimum number of overserved symbols to trigger threshold increase.",
+            description="Minimum overserved symbols to trigger threshold increase.",
         )
-
-        # ─── Multi-Seed Activation Diversity (v7 Phase 5) ───────────────
-        enable_multi_seed_activation: bool = Field(
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Speculative Pre‑fetching
+        # ═══════════════════════════════════════════════════════════════
+        enable_speculative_prefetch: bool = Field(
             default=True,
-            description=(
-                "Run three independent PPR activation passes (lexical, structural, "
-                "historical) and combine their results. Improves recall for queries "
-                "that don't mention exact symbol names."
-            ),
+            description="Pre-build CodePathViews for symbols likely needed in the next query.",
         )
-        multi_seed_weight_lexical: float = Field(
-            default=0.5,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Weight for lexical seeds (exact/partial symbol name matches in query "
-                "plus traceback frames). Should sum to ~1.0 with structural and historical."
-            ),
+        speculative_prefetch_max: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of symbols to pre-fetch per response.",
         )
-        multi_seed_weight_structural: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Weight for structural seeds (entry points of CodePathViews that "
-                "contain lexically matched symbols)."
-            ),
-        )
-        multi_seed_weight_historical: float = Field(
-            default=0.2,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Weight for historical seeds (symbols from recent conversation history)."
-            ),
-        )
-
-        # ─── Contextual Retrieval (Phase 6) ──────────────────────────────
-        enable_contextual_retrieval: bool = Field(
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Silent Ingestion
+        # ═══════════════════════════════════════════════════════════════
+        enable_silent_ingestion: bool = Field(
             default=True,
-            description=(
-                "Prepend a context summary to each LTM entry before embedding. "
-                "Makes stored chunks more self-contained, improving retrieval "
-                "when query phrasing differs from stored content. "
-                "Based on Anthropic Contextual Retrieval (2024). "
-                "Reported to reduce retrieval errors by ~49%%."
-            ),
+            description="Index code silently when the user pastes code without a question.",
         )
-        contextual_retrieval_mode: str = Field(
-            default="metadata",
-            description=(
-                "Context generation mode: "
-                "'metadata' = deterministic from file paths/symbols (no LLM, fast). "
-                "'llm' = one sentence generated by secondary_task_model (better, slower)."
-            ),
+    
+        # ═══════════════════════════════════════════════════════════════
+        #  Data Flow Analysis
+        # ═══════════════════════════════════════════════════════════════
+        enable_data_flow_analysis: bool = Field(
+            default=True,
+            description="Extract data flow edges between functions using ast analysis.",
         )
-
-    # ─── AST-Based Deduplication (Phase 6) ──────────────────────────
-    enable_ast_deduplication: bool = Field(
-        default=True,
-        description=(
-            "For Python code, use AST comparison instead of text similarity for "
-            "deduplication. Correctly handles same code with different docstrings, "
-            "comments, or whitespace. Falls back to text similarity for non-Python "
-            "code or parse errors."
-        ),
-    )
 
     INTENT_KEYWORDS = {
         "forget",
