@@ -3501,26 +3501,6 @@ class Filter:
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
-    async def _warm_up_model_if_needed(self, slot_free: bool) -> None:
-        """
-        If the model is not loaded (cold start), send a trivial prompt and
-        wait for the response. This serialises model loading so that
-        subsequent auxiliary calls do not race.
-        """
-        if not slot_free:
-            return  # model already loaded
-
-        self._log_debug("Cold start detected — warming up auxiliary model...")
-        await self._call_llm(
-            prompt="ping",
-            system_prompt="Reply with exactly the word 'pong'.",
-            model_override=self.valves.secondary_task_model,
-            max_tokens=4,
-            temperature=0.0,
-            label="warm_up",
-        )
-        self._log_debug("Model warm-up complete — auxiliary calls are now safe.")
-
     async def _call_llm(
         self,
         prompt: str,
@@ -3694,20 +3674,53 @@ class Filter:
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
-        try:
-            return await asyncio.wait_for(
-                self._call_llm(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model_override=model_override,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            self._log_debug(f"LLM call timed out after {timeout}s: {prompt[:80]}...")
-            return None
+        max_cold_start_retries = 5
+        cold_start_delay = 2.0  # seconds between retries
+
+        for attempt in range(max_cold_start_retries):
+            try:
+                return await asyncio.wait_for(
+                    self._call_llm(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model_override=model_override,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                if attempt < max_cold_start_retries - 1:
+                    self._log_debug(
+                        f"LLM call timed out (attempt {attempt+1}/{max_cold_start_retries}), "
+                        f"retrying in {cold_start_delay}s..."
+                    )
+                    await asyncio.sleep(cold_start_delay)
+                    continue
+                self._log_debug(
+                    f"LLM call timed out after {timeout}s: {prompt[:80]}..."
+                )
+                return None
+            except Exception as e:
+                error_msg = str(e).lower()
+                # Recoverable errors: the model is still loading or temporarily unavailable
+                if any(
+                    indicator in error_msg
+                    for indicator in ("model not found", "loading", "400", "502", "503")
+                ):
+                    if attempt < max_cold_start_retries - 1:
+                        self._log_debug(
+                            f"LLM call failed (model may be loading) "
+                            f"(attempt {attempt+1}/{max_cold_start_retries}): "
+                            f"{str(e)[:100]}. Retrying in {cold_start_delay}s..."
+                        )
+                        await asyncio.sleep(cold_start_delay)
+                        continue
+                # Non‑recoverable error or exhausted retries
+                self._log_debug(f"LLM call failed: {str(e)[:100]}")
+                return None
+
+        return None
 
     # --------------------------------------------------------------------------
     # Response cache (ChromaDB) – with thread pool
@@ -9268,9 +9281,6 @@ class Filter:
         # BLOCK B — DYNAMIC (per-query)
         # ══════════════════════════════════════════════════════════════
         dynamic_injections: List[Tuple[str, str]] = []
-
-        # ── Cold start: ensure model is loaded before any auxiliary call ──
-        await self._warm_up_model_if_needed(slot_free)
 
         # ── Step B1: LTM per-query retrieval ─────────────────────────
         self._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
