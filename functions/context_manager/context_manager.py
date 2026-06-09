@@ -1778,7 +1778,7 @@ class Filter:
             description="Separate system prompt into static (Block A) and dynamic (Block B) for KV cache stability.",
         )
         enable_slot_persistence: bool = Field(
-            default=False,
+            default=True,
             description="Persist and restore llama.cpp KV cache slot between sessions.",
         )
         slot_save_path: str = Field(
