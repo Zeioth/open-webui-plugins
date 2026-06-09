@@ -1489,7 +1489,9 @@ class Filter:
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
         )
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
+        LLM_BASE_URL: str = Field(
+            default="http://llama-router:8080"
+        )  # For testing we are using a docker network, so use the container name here.
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
@@ -7180,7 +7182,8 @@ class Filter:
                 from urllib.parse import urlparse
 
                 parsed = urlparse(self.valves.LLM_BASE_URL)
-                worker_url = f"{parsed.scheme}://{parsed.hostname}:{port}"
+                worker_host = parsed.hostname
+                worker_url = f"{parsed.scheme}://{worker_host}:{port}"
 
                 self._worker_url_cache[model_name] = (status_value, worker_url)
                 self._log_debug(
