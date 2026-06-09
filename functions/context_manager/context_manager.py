@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 6.0.0
 license: GPL3
-requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0
+requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
 """
 
 import os
@@ -192,6 +192,395 @@ class CodeBlock(BaseModel):
         )
 
 
+# ---------------------------------------------------------------------------
+# Edge types and base weights
+# ---------------------------------------------------------------------------
+EDGE_WEIGHTS: Dict[str, float] = {
+    "calls": 1.0,  # direct function call
+    "imports": 0.6,  # import / from import
+    "reads": 0.7,  # variable/attribute read
+    "writes": 0.9,  # variable/attribute write
+    "inherits": 0.5,  # class inheritance
+    "references": 0.4,  # reference without a direct call
+    "data_flow": 0.8,  # ← v7 (PASO-19)
+}
+
+
+class Edge(BaseModel):
+    src: str  # source symbol id
+    dst: str  # destination symbol id
+    type: str  # key from EDGE_WEIGHTS
+    weight: float = 1.0  # base weight for the edge type
+    confidence: float = 1.0  # detection confidence (1.0 = detected by tree-sitter)
+
+    def effective_weight(self) -> float:
+        """Effective weight: type weight × confidence."""
+        return self.weight * self.confidence
+
+
+# ---------------------------------------------------------------------------
+# Activation Graph — query‑conditioned node activation
+# ---------------------------------------------------------------------------
+
+
+class ActivationState(BaseModel):
+    node_id: str
+    score: float  # activation score [0.0, 1.0]
+    depth: int  # depth from the nearest seed node
+    source: str  # "seed" | "propagation"
+
+
+class ActivationGraph:
+    """
+    Query‑conditioned activation graph.
+    Created per query — never persisted across requests.
+    """
+
+    DECAY_BASE: float = 0.7
+    # child_score = parent_score × edge.effective_weight × DECAY_BASE^depth
+
+    def __init__(self):
+        self._activations: Dict[str, ActivationState] = {}
+
+    def seed(self, node_ids: List[str], initial_score: float = 1.0):
+        """Activate seed nodes with an initial score."""
+        for nid in node_ids:
+            self._activations[nid] = ActivationState(
+                node_id=nid,
+                score=initial_score,
+                depth=0,
+                source="seed",
+            )
+
+    def propagate(
+        self,
+        edges_out: Dict[str, List[Edge]],
+        max_steps: int = 20,  # PPR uses iterations, not BFS steps
+        min_score: float = 0.05,
+        alpha: float = 0.85,  # standard PageRank damping factor
+        tolerance: float = 1e-6,
+    ):
+        """
+        Personalized PageRank on the call graph.
+
+        Equation: r = α * M * r + (1-α) * e
+        where:
+          M = transition matrix normalized by out-degree
+          e = personalization vector (normalized seeds)
+          α = probability of following an edge (vs. teleporting back to the seed)
+
+        Advantages over BFS-decay:
+        - Out-degree normalization: a node with 10 callees does not activate them
+          10× stronger than one with 1 callee.
+        - Guaranteed mathematical convergence even with cycles.
+        - Teleportation: nodes disconnected from the seed receive a minimal score
+          but not zero, avoiding false negatives.
+        """
+        if not self._activations:
+            return
+
+        # ── Personalization vector (normalized seeds) ───────────────
+        seed_total = sum(
+            s.score for s in self._activations.values() if s.source == "seed"
+        )
+        if seed_total == 0:
+            return
+        personalization: Dict[str, float] = {
+            nid: s.score / seed_total
+            for nid, s in self._activations.items()
+            if s.source == "seed"
+        }
+
+        # ── Out-degree normalization by weight ──────────────────────
+        out_weight_total: Dict[str, float] = {}
+        for src, edges in edges_out.items():
+            total_w = sum(e.effective_weight() for e in edges)
+            out_weight_total[src] = total_w if total_w > 0 else 1.0
+
+        # ── Initialize r from personalization ───────────────────────
+        r: Dict[str, float] = dict(personalization)
+
+        # ── Power iteration ─────────────────────────────────────────
+        for iteration in range(max_steps):
+            r_new: Dict[str, float] = {}
+
+            # Teleportation step: (1-α) * e
+            for node, score in personalization.items():
+                r_new[node] = (1.0 - alpha) * score
+
+            # Propagation step: α * M * r
+            for src, edges in edges_out.items():
+                src_score = r.get(src, 0.0)
+                if src_score < min_score:
+                    continue
+                out_w = out_weight_total.get(src, 1.0)
+                for edge in edges:
+                    contribution = alpha * src_score * edge.effective_weight() / out_w
+                    r_new[edge.dst] = r_new.get(edge.dst, 0.0) + contribution
+
+            # ── Convergence check ───────────────────────────────────
+            all_keys = set(r.keys()) | set(r_new.keys())
+            delta = sum(abs(r_new.get(k, 0.0) - r.get(k, 0.0)) for k in all_keys)
+            r = r_new
+            if delta < tolerance:
+                # self._log_ppr_converged(iteration + 1)  # optional log
+                break
+
+        # ── Update activations with PPR scores ──────────────────────
+        for node_id, score in r.items():
+            if score < min_score:
+                continue
+            existing = self._activations.get(node_id)
+            self._activations[node_id] = ActivationState(
+                node_id=node_id,
+                score=score,
+                depth=existing.depth if existing else 99,
+                source=existing.source if existing else "propagation",
+            )
+
+    def get_score(self, node_id: str) -> float:
+        """Activation score of a node. 0.0 if not activated."""
+        state = self._activations.get(node_id)
+        return state.score if state else 0.0
+
+    def get_activated_nodes(self, threshold: float = 0.1) -> Dict[str, float]:
+        """Return {node_id: score} for nodes with score >= threshold."""
+        return {
+            nid: s.score for nid, s in self._activations.items() if s.score >= threshold
+        }
+
+    def aggregate_path_score(self, symbol_list: List[str]) -> float:
+        """
+        Aggregated score of a path.
+        Average of the scores of the path's activated symbols.
+        """
+        scores = [self.get_score(s) for s in symbol_list]
+        active = [s for s in scores if s > 0]
+        if not active:
+            return 0.0
+        return sum(active) / len(active)  # penalises paths with many inactive symbols
+
+
+# ---------------------------------------------------------------------------
+# Query model and SubgraphExtractor skeleton
+# ---------------------------------------------------------------------------
+
+
+class QueryActivationSeed(BaseModel):
+    symbol_hints: List[str]  # symbols detected in the query
+    intent_vector: Dict[str, float]  # {intent: weight}, values sum ≈ 1.0
+    # Example: {"explain": 0.7, "modify": 0.2, "debug": 0.1}
+
+
+class SubgraphExtractor:
+    """
+    Extracts a relevant subgraph from the SymbolGraph given an ActivationGraph.
+    Full implementation in PASO-08.
+    """
+
+    def __init__(
+        self,
+        activation_threshold: float = 0.1,
+        expand_hops: int = 1,
+    ):
+        self.activation_threshold = activation_threshold
+        self.expand_hops = expand_hops
+
+    def extract(
+        self,
+        activation: ActivationGraph,
+        edges_out: Dict[str, List[Edge]],
+        edges_in: Dict[str, List[Edge]],
+    ) -> Tuple[Set[str], List[Edge]]:
+        """
+        Extract a subgraph from the activation graph.
+
+        Process:
+        1. Include all nodes with score >= threshold.
+        2. Expand 1-hop high-confidence neighbours (only 'calls' edges with weight ≥ 0.8).
+        3. Include edges whose src and dst are both in the subgraph.
+        """
+        # Step 1: nodes above the threshold
+        activated = activation.get_activated_nodes(self.activation_threshold)
+        included_nodes: Set[str] = set(activated.keys())
+
+        # Step 2: expand to 1-hop neighbours (high-confidence calls only)
+        if self.expand_hops > 0:
+            expansion_candidates = []
+            for node_id in list(included_nodes):
+                for edge in edges_out.get(node_id, []):
+                    if (
+                        edge.dst not in included_nodes
+                        and edge.effective_weight() >= 0.8
+                        and edge.type == "calls"
+                    ):
+                        expansion_candidates.append(edge.dst)
+            included_nodes.update(expansion_candidates)
+
+        # Step 3: internal edges (both endpoints inside the subgraph)
+        included_edges: List[Edge] = []
+        for node_id in included_nodes:
+            for edge in edges_out.get(node_id, []):
+                if edge.dst in included_nodes:
+                    included_edges.append(edge)
+
+        return included_nodes, included_edges
+
+
+# ---------------------------------------------------------------------------
+# CodePathView — a cached projection of an activated subgraph (v7)
+# ---------------------------------------------------------------------------
+
+
+class CodePathView(BaseModel):
+    path_id: str
+    # hash(entry_point + "|" + "|".join(sorted(induced_nodes)))
+
+    entry_point: str
+    # Seed symbol that originated this view.
+
+    seed_nodes: List[str]
+    # Seed nodes that activated it (usually 1–3).
+
+    induced_nodes: Dict[str, float]
+    # {symbol_name: activation_score}
+    # KEY CHANGE: each symbol carries its relevance weight.
+
+    induced_edges: List[Edge]
+    # Internal edges of the subgraph (both src and dst are in induced_nodes).
+
+    activation_score: float
+    # Aggregated score of the subgraph (weighted average).
+
+    # ── Lazy semantic cache (populated by LLM when first needed) ──
+    business_label: str = ""
+    summary: str = ""
+    label_confidence: float = 0.0
+
+    # ── Invalidation hashes ──
+    structural_hash: str = ""
+    # hash(sorted(block_hashes of all symbols))
+    # Changes when any symbol's content changes.
+
+    call_graph_hash: str = ""
+    # hash(sorted(edges as "src:type:dst"))
+    # Changes when the call graph structure changes.
+
+    last_built: float = Field(default_factory=time.time)
+
+    def is_stale(
+        self,
+        current_structural: str,
+        current_call_graph: str,
+    ) -> bool:
+        """True if either hash has changed since this view was built."""
+        return (
+            self.structural_hash != current_structural
+            or self.call_graph_hash != current_call_graph
+        )
+
+    def top_symbols(self, n: int = 10) -> List[str]:
+        """The N symbols with the highest activation scores."""
+        return sorted(
+            self.induced_nodes.keys(),
+            key=lambda s: self.induced_nodes[s],
+            reverse=True,
+        )[:n]
+
+
+# ---------------------------------------------------------------------------
+# StaticEvidence – deterministic proof from the SymbolGraph (v7)
+# ---------------------------------------------------------------------------
+
+
+class StaticEvidence(BaseModel):
+    symbols_found: Dict[str, bool]
+    call_relations_valid: Dict[str, bool]
+    recent_changes: List[str]
+    entry_points_mentioned: List[str]
+    path_memberships: Dict[str, List[str]]
+    data_flow_upstream: Dict[str, List[str]] = Field(
+        default_factory=dict
+    )  # ← v7 (PASO-19)
+    objective_score: float
+
+
+# ---------------------------------------------------------------------------
+# PathIndex — index of CodePathViews (v7)
+# ---------------------------------------------------------------------------
+
+
+class PathIndex:
+    """
+    Index of CodePathViews.
+    Analogous to SymbolIndex but for activated subgraph views.
+    """
+
+    def __init__(self):
+        self._views: Dict[str, CodePathView] = {}
+        # key = f"{project_id}:{path_id}"
+
+        self._symbol_to_views: Dict[str, Set[str]] = defaultdict(set)
+        # key = f"{project_id}:{symbol_name}" → {path_ids}
+
+    # ── Basic operations ───────────────────────────────────────────
+
+    def add(self, view: CodePathView, project_id: str):
+        key = f"{project_id}:{view.path_id}"
+        self._views[key] = view
+        for sym_name in view.induced_nodes:
+            self._symbol_to_views[f"{project_id}:{sym_name}"].add(view.path_id)
+
+    def remove(self, path_id: str, project_id: str):
+        key = f"{project_id}:{path_id}"
+        view = self._views.pop(key, None)
+        if view:
+            for sym_name in view.induced_nodes:
+                sym_key = f"{project_id}:{sym_name}"
+                self._symbol_to_views[sym_key].discard(path_id)
+
+    def get(self, path_id: str, project_id: str) -> Optional[CodePathView]:
+        return self._views.get(f"{project_id}:{path_id}")
+
+    def get_all(self, project_id: str) -> List[CodePathView]:
+        prefix = f"{project_id}:"
+        return [v for k, v in self._views.items() if k.startswith(prefix)]
+
+    def clear_project(self, project_id: str):
+        prefix = f"{project_id}:"
+        keys = [k for k in self._views if k.startswith(prefix)]
+        for k in keys:
+            del self._views[k]
+        sym_keys = [k for k in self._symbol_to_views if k.startswith(prefix)]
+        for k in sym_keys:
+            del self._symbol_to_views[k]
+
+    # ── Invalidation ─────────────────────────────────────────────────
+
+    def mark_stale_for_symbol(self, symbol_name: str, project_id: str) -> List[str]:
+        """
+        Return path_ids that contain this symbol.
+        The caller must recompute hashes and clear summary/label if changed.
+        """
+        key = f"{project_id}:{symbol_name}"
+        return list(self._symbol_to_views.get(key, set()))
+
+    # ── Entry points ─────────────────────────────────────────────────
+
+    def find_entry_points(self, symbol_index: SymbolIndex, project_id: str) -> Set[str]:
+        """
+        Symbols present in the index without any callers = potential entry points.
+        """
+        all_names = symbol_index.get_all_names(project_id)
+        return {
+            name for name in all_names if not symbol_index.get_callers(name, project_id)
+        }
+
+
+# DEPRECATED?
+# ================================
+
+
 class AppliedChangeFeedback(BaseModel):
     change_hash: str
     change_description: str
@@ -372,6 +761,12 @@ class SymbolIndex:
         self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         self._callee_to_callers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         self._stats: Counter = Counter()
+        # Outgoing / incoming typed edges (added in v7 – PASO-04)
+        self._edges_out: Dict[str, List[Edge]] = defaultdict(list)
+        # key = f"{project_id}:{symbol_name}"  →  list of outgoing Edge objects
+
+        self._edges_in: Dict[str, List[Edge]] = defaultdict(list)
+        # key = f"{project_id}:{symbol_name}"  →  list of incoming Edge objects
 
     def _evict_if_needed(self):
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
@@ -409,6 +804,7 @@ class SymbolIndex:
     ):
         for sym in symbols:
             self.remove(sym, block_hash, project_id)
+            self.remove_edges_for_symbol(sym.name, project_id)  # ← v7 (PASO-04)
 
     def find_blocks(self, name: str, project_id: str) -> Set[str]:
         return self._name_to_blocks.get((project_id, name), set())
@@ -419,14 +815,75 @@ class SymbolIndex:
     def get_callers(self, callee_name: str, project_id: str) -> Set[str]:
         return self._callee_to_callers.get((project_id, callee_name), set())
 
+    def add_edge(self, edge: Edge, project_id: str):
+        """Register a typed edge in the index. Deduplicates by (src, dst, type)."""
+        src_key = f"{project_id}:{edge.src}"
+        dst_key = f"{project_id}:{edge.dst}"
+        existing = self._edges_out.get(src_key, [])
+        for e in existing:
+            if e.dst == edge.dst and e.type == edge.type:
+                return  # already registered
+        self._edges_out[src_key].append(edge)
+        self._edges_in[dst_key].append(edge)
+
+    def remove_edges_for_symbol(self, symbol_name: str, project_id: str):
+        """Remove all edges where this symbol is source or destination."""
+        src_key = f"{project_id}:{symbol_name}"
+        # Remove outgoing edges
+        for edge in self._edges_out.pop(src_key, []):
+            dst_key = f"{project_id}:{edge.dst}"
+            self._edges_in[dst_key] = [
+                e for e in self._edges_in.get(dst_key, []) if e.src != symbol_name
+            ]
+        # Remove incoming edges
+        dst_key = f"{project_id}:{symbol_name}"
+        for edge in self._edges_in.pop(dst_key, []):
+            src_key_in = f"{project_id}:{edge.src}"
+            self._edges_out[src_key_in] = [
+                e for e in self._edges_out.get(src_key_in, []) if e.dst != symbol_name
+            ]
+
+    def get_edges_out(self, symbol_name: str, project_id: str) -> List[Edge]:
+        """Outgoing edges for a given symbol."""
+        return self._edges_out.get(f"{project_id}:{symbol_name}", [])
+
+    def get_edges_in(self, symbol_name: str, project_id: str) -> List[Edge]:
+        """Incoming edges for a given symbol."""
+        return self._edges_in.get(f"{project_id}:{symbol_name}", [])
+
+    def get_all_edges_out(self, project_id: str) -> Dict[str, List[Edge]]:
+        """
+        Full outgoing edge map for a project.
+        Used by ActivationGraph.propagate().
+        Returns {symbol_name: [Edge, ...]}.
+        """
+        prefix = f"{project_id}:"
+        return {
+            key[len(prefix) :]: edges
+            for key, edges in self._edges_out.items()
+            if key.startswith(prefix)
+        }
+
     def clear_project(self, project_id: str):
+        # Remove name-to-blocks mappings
         keys_to_remove = [key for key in self._name_to_blocks if key[0] == project_id]
         for key in keys_to_remove:
             del self._name_to_blocks[key]
             del self._stats[key]
+
+        # Remove callee-to-callers mappings
         inv_keys = [key for key in self._callee_to_callers if key[0] == project_id]
         for key in inv_keys:
             del self._callee_to_callers[key]
+
+        # ── v7 (PASO-04): clean typed edges for this project ──
+        prefix = f"{project_id}:"
+        for k in list(self._edges_out.keys()):
+            if k.startswith(prefix):
+                del self._edges_out[k]
+        for k in list(self._edges_in.keys()):
+            if k.startswith(prefix):
+                del self._edges_in[k]
 
     def clear(self):
         self._name_to_blocks.clear()
@@ -800,16 +1257,8 @@ class Filter:
 
     class Valves(BaseModel):
         # ═══════════════════════════════════════════════════════════════
-        #  MAIN VALVES – most commonly adjusted
-        # ═══════════════════════════════════════════════════════════════
-        # use_symbol_level_analysis – enable per‑symbol analysis (recommended)
-        # symbol_analysis_model      – fast model for per‑symbol analysis
-        # active_context_max_tokens  – max tokens for injected code context
-        # global_injection_token_budget – overall limit for all injections
-        # ltm_retrieval_max_tokens   – max LTM tokens to inject
-        # defer_secondary_tasks      – delay summaries / change logs
-        # secondary_task_model       – model for those secondary tasks
-        # synthesis_max_tokens       – max tokens for the final summary
+        #  MAIN VALVES – all auxiliary tasks use the main model to avoid
+        #  VRAM overflow and keep it always loaded for instant responses.
         # ═══════════════════════════════════════════════════════════════
 
         # ─── Core ───
@@ -870,8 +1319,7 @@ class Filter:
         max_code_block_tokens: int = Field(default=0)
         code_block_overflow_action: str = Field(default="warn")
         code_block_summary_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Model for summarizing oversized code blocks. Gemma 4 4B MTP for speed.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
@@ -913,7 +1361,7 @@ class Filter:
         )
         exclude_filter_internals: bool = Field(
             default=True,
-            description="Exclude symbols from the filter's own source code to prevent self-analysis. This prevent openwebui from analyzing its own code.",
+            description="Exclude symbols from the filter's own source code to prevent self-analysis.",
         )
 
         # ─── Smart Pre‑Expand ───
@@ -922,8 +1370,7 @@ class Filter:
         smart_pre_expand_max_tokens: int = Field(default=0)
         smart_pre_expand_use_llm: bool = Field(default=True)
         smart_pre_expand_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Model for smart pre‑expansion of code symbols. Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         smart_pre_expand_full_if_no_match: bool = Field(default=True)
         smart_pre_expand_embedding_threshold: float = Field(
@@ -962,33 +1409,27 @@ class Filter:
         enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
         cot_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="General CoT model. Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         cot_model_level2: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Model for auto‑reasoning (CoT level 2). Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         cot_model_level3: str = Field(
-            default="Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-APEX-MTP-I-Nano",
-            description="Model for CoT level 3 (self‑reflection). Qwen3.6 Nano with MTP to fit in VRAM.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         enable_cot_llm_detection: bool = Field(default=True)
         cot_detection_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Model to decide CoT depth. Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
 
         # ─── Assumptions & Contradictions ───
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Lightweight model for extracting assumptions. Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Model for contradiction detection. Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         contradiction_inject_warning: bool = Field(default=True)
 
@@ -1031,16 +1472,14 @@ class Filter:
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
         summary_fallback_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Fallback model for summaries. Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         summary_include_metadata: bool = Field(default=True)
 
         # ─── Summarize Old Messages ───
         summarize_old_messages: bool = Field(default=True)
         summarization_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Model for summarizing code and conversations. Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
 
         # ─── LLM Configuration ───
@@ -1050,7 +1489,7 @@ class Filter:
         openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="Qwen2.5-Coder-7B-Instruct-128K-Q4_K_M")
+        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced")
         LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
         llm_request_timeout: int = Field(default=900)
         LLM_CACHE_TTL: int = Field(default=300)
@@ -1092,16 +1531,14 @@ class Filter:
         # ─── Summarize Inactive Code ───
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="gemma-4-E4B-it-qat-UD-Q4_K_XL",
-            description="Model for summarizing inactive code blocks. Gemma 4 4B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
 
         # ─── Forget Commands ───
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Model for parsing natural language intents. Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
 
         # ─── Proactive Cleanup ───
@@ -1124,8 +1561,7 @@ class Filter:
             description="Analyze code symbol by symbol instead of raw chunks. Works reliably even with 7B models.",
         )
         symbol_analysis_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Fast model for per‑symbol analysis. Gemma 4 2B MTP for speed.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         symbol_analysis_max_retries: int = Field(
             default=5,
@@ -1150,8 +1586,7 @@ class Filter:
             description="How many messages between session summaries.",
         )
         session_summary_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Model for generating session summaries. Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         session_summary_max_tokens: int = Field(
             default=200,
@@ -1168,12 +1603,225 @@ class Filter:
             description="Max retries for deferred secondary tasks before giving up.",
         )
         secondary_task_model: str = Field(
-            default="gemma-4-E2B-it-qat-UD-Q4_K_XL",
-            description="Model for secondary tasks (change summaries, missing summaries). Gemma 4 2B MTP.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
         )
         secondary_llm_max_concurrent: int = Field(
             default=2,
             description="Max concurrent LLM calls for deferred secondary tasks.",
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        #  GRAPH ANALYSIS (v7) – Phase 1
+        # ═══════════════════════════════════════════════════════════════════
+
+        # ─── Graph-based Path Analysis ───────────────────────────────────────
+        enable_path_analysis: bool = Field(
+            default=True,
+            description=(
+                "Enable graph activation-based context selection. "
+                "If False, falls back to the legacy active code context method."
+            ),
+        )
+        path_activation_threshold: float = Field(
+            default=0.1,
+            ge=0.01,
+            le=1.0,
+            description=(
+                "Minimum activation score for a node to be considered for context. "
+                "Lower = more inclusive. Higher = more focused."
+            ),
+        )
+        path_relevance_high_threshold: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Nodes with activation >= this get full code expansion. "
+                "Nodes below get symbol summary only."
+            ),
+        )
+        path_propagation_steps: int = Field(
+            default=4,
+            ge=1,
+            le=8,
+            description="Max BFS steps during activation propagation.",
+        )
+        path_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            description="Model for lazy path summary generation.",
+        )
+        path_summary_max_tokens: int = Field(
+            default=80,
+            description="Max tokens for a path summary.",
+        )
+        ppr_alpha: float = Field(
+            default=0.85,
+            ge=0.5,
+            le=0.99,
+            description=(
+                "Damping factor for Personalized PageRank propagation. "
+                "Higher = more weight to graph structure vs. seed. "
+                "Standard value: 0.85."
+            ),
+        )
+        enable_data_flow_analysis: bool = Field(
+            default=True,
+            description=(
+                "Extract data flow edges between functions using ast analysis. "
+                "Improves activation propagation for debugging queries. "
+                "Python only (regex fallback for other languages)."
+            ),
+        )
+
+        # ─── LOD Thresholds ──────────────────────────────────────────────────
+        lod3_threshold: float = Field(
+            default=0.50,
+            ge=0.0,
+            le=1.0,
+            description="Activation score above which full code body is injected (LOD-3).",
+        )
+        lod2_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Activation score above which signature + summary is injected (LOD-2).",
+        )
+        lod1_threshold: float = Field(
+            default=0.10,
+            ge=0.0,
+            le=1.0,
+            description="Activation score above which signature only is injected (LOD-1). "
+            "Symbols below this score only contribute their name (LOD-0).",
+        )
+
+        # ─── Speculative Pre-fetching ─────────────────────────────────────────
+        enable_speculative_prefetch: bool = Field(
+            default=True,
+            description=(
+                "Pre-build CodePathViews for symbols likely needed in the next query, "
+                "running as a background task during LLM decode. Zero added latency."
+            ),
+        )
+        speculative_prefetch_max: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of symbols to pre-fetch per response.",
+        )
+
+        # ─── Intent Classification ────────────────────────────────────────────
+        enable_intent_llm_fallback: bool = Field(
+            default=True,
+            description=(
+                "Use LLM as fallback when heuristic intent classification "
+                "produces a weak signal."
+            ),
+        )
+        intent_classifier_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            description="Model for intent classification fallback.",
+        )
+
+        # ─── Scientific CoT ────────────────────────────────────────────────────
+        scientific_hypotheses_count: int = Field(
+            default=3,
+            ge=2,
+            le=6,
+            description="Number of hypotheses per round in Scientific CoT.",
+        )
+        scientific_confidence_threshold: float = Field(
+            default=0.75,
+            ge=0.0,
+            le=1.0,
+            description="Stop iterating when best hypothesis reaches this score.",
+        )
+        scientific_max_iterations: int = Field(
+            default=2,
+            ge=1,
+            le=4,
+            description="Max refinement iterations in Level 3 Scientific CoT.",
+        )
+        enforce_scientific_method: bool = Field(
+            default=False,
+            description="Force Level 3 Scientific CoT regardless of detected complexity.",
+        )
+
+        # ─── LLMLingua-2 Code Compression ────────────────────────────────────
+        enable_code_compression: bool = Field(
+            default=False,
+            description=(
+                "Enable LLMLingua-2 post-selection token compression within code blocks. "
+                "Requires: pip install llmlingua>=0.2.0. Runs on CPU."
+            ),
+        )
+        code_compression_rate: float = Field(
+            default=0.5,
+            ge=0.3,
+            le=0.8,
+            description=(
+                "Fraction of tokens to KEEP after compression. "
+                "0.5 = keep 50%% (aggressive). 0.7 = keep 70%% (conservative). "
+                "Values below 0.4 may lose critical code logic."
+            ),
+        )
+        code_compression_min_tokens: int = Field(
+            default=150,
+            description=(
+                "Minimum token count for a code block to be compressed. "
+                "Blocks smaller than this are injected as-is."
+            ),
+        )
+
+        # ─── RAPTOR Hierarchical LTM ──────────────────────────────────────────
+        enable_raptor: bool = Field(
+            default=False,
+            description=(
+                "Enable RAPTOR hierarchical summarization of LTM. "
+                "Requires scikit-learn. Improves retrieval for abstract queries "
+                "over long conversation histories (50+ messages). "
+                "Rebuild runs in background, does not affect inlet latency."
+            ),
+        )
+        raptor_clusters_per_level: int = Field(
+            default=5,
+            ge=2,
+            le=20,
+            description="Number of k-means clusters per RAPTOR level.",
+        )
+        raptor_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
+            description="Model for RAPTOR cluster summary generation.",
+        )
+        raptor_summary_max_tokens: int = Field(
+            default=150,
+            description="Max tokens per RAPTOR cluster summary.",
+        )
+        raptor_rebuild_interval: int = Field(
+            default=20,
+            description=(
+                "Rebuild RAPTOR index every N outlet calls. "
+                "Lower = more fresh summaries, more background LLM calls."
+            ),
+        )
+
+        # ─── KV Cache Stability ───────────────────────────────────────────────
+        enable_kv_cache_stability: bool = Field(
+            default=True,
+            description=(
+                "Separate system prompt into static (Block A) and dynamic (Block B) sections. "
+                "Block A is placed first and remains identical between requests "
+                "when code has not changed, maximising KV cache hits in llama.cpp."
+            ),
+        )
+
+        # ─── Silent ingestion ───────────────────────────────────────────────
+        enable_silent_ingestion: bool = Field(
+            default=True,
+            description=(
+                "Enable silent ingestion mode: when the user pastes code without a question, "
+                "index it into the SymbolGraph without invoking the main LLM. "
+                "Returns an immediate confirmation. Enables efficient Mode B (chunked paste) workflow."
+            ),
         )
 
     INTENT_KEYWORDS = {
@@ -1228,6 +1876,11 @@ class Filter:
         self.tokenizer = None
         self._db_conn = None
         self._cross_encoder = None
+
+        # ── LLMLingua-2 compressor (optional) ──
+        self._llmlingua_compressor = None
+        if self.valves.enable_code_compression:
+            self._init_llmlingua()
 
         # Conversation state
         self._conversation_state: OrderedDict = OrderedDict()
@@ -1316,8 +1969,17 @@ class Filter:
 
         # Symbol index and lightweight context
         self._symbol_index = SymbolIndex()
+        self._path_index = PathIndex()  # v7 (PASO-06)
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
+
+        # ── KV Cache Stability (v7 – PASO-21) ──
+        self._static_context_block_cache: Dict[str, Tuple[str, str]] = (
+            {}
+        )  # project_id → (code_state_hash, static_block_text)
+        self._last_static_prefix_hash: Dict[str, str] = (
+            {}
+        )  # project_id → md5 del bloque estático de la última request
 
         # Project tracking
         self._last_processed_message_idx: Dict[str, int] = {}
@@ -1358,6 +2020,24 @@ class Filter:
         # ── State debounce (to reduce DB writes) ──
         self._state_dirty = False
         self._state_last_saved = 0.0
+        path_activation_threshold: float = Field(
+            default=0.1,
+            ge=0.01,
+            le=1.0,
+            description="Minimum activation score to consider a node for context.",
+        )
+        path_relevance_high_threshold: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="Nodes with activation >= this get full code; below get summary.",
+        )
+        path_propagation_steps: int = Field(
+            default=4,
+            ge=1,
+            le=8,
+            description="Max BFS steps during activation propagation.",
+        )
 
         print("[CodeAware] Filter loaded")
 
@@ -1667,6 +2347,35 @@ class Filter:
         ):
             return True
         return False
+
+    async def _is_code_only_message(self, content: str) -> bool:
+        """
+        Detect messages that contain only code without a question.
+        Heuristic: if the text outside fenced code blocks is < 30 chars,
+        treat as pure ingestion.
+
+        Returns True for:
+          ```python\ndef foo(): pass\n```
+        Returns False for:
+          What does this function do?\n```python\ndef foo(): pass\n```
+        """
+        if not content or len(content.strip()) < 20:
+            return False
+
+        # Must contain at least one code block
+        code_blocks, _ = await self._extract_code_blocks(content)
+        if not code_blocks:
+            return False
+
+        # Calculate text outside code blocks
+        spans = await self._get_code_spans(content)
+        if not spans:
+            # No tree-sitter spans: use regex to remove fenced blocks
+            text_outside = re.sub(r"```[\s\S]*?```", "", content).strip()
+        else:
+            text_outside = self._remove_code_spans(content, spans).strip()
+
+        return len(text_outside) < 30
 
     async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
         last_user = next(
@@ -2099,6 +2808,60 @@ class Filter:
                 created_at REAL NOT NULL
             )
         """)
+        # ── v7 (PASO-13): tables for CodePathView and typed edges ──
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_path_views (
+                path_id             TEXT NOT NULL,
+                project_id          TEXT NOT NULL,
+                entry_point         TEXT NOT NULL,
+                seed_nodes_json     TEXT NOT NULL DEFAULT '[]',
+                induced_nodes_json  TEXT NOT NULL DEFAULT '{}',
+                induced_edges_json  TEXT NOT NULL DEFAULT '[]',
+                activation_score    REAL NOT NULL DEFAULT 0.0,
+                business_label      TEXT NOT NULL DEFAULT '',
+                summary             TEXT NOT NULL DEFAULT '',
+                label_confidence    REAL NOT NULL DEFAULT 0.0,
+                structural_hash     TEXT NOT NULL DEFAULT '',
+                call_graph_hash     TEXT NOT NULL DEFAULT '',
+                last_built          REAL NOT NULL,
+                PRIMARY KEY (path_id, project_id)
+            )
+        """)
+        self._db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cpv_project "
+            "ON code_path_views(project_id)"
+        )
+
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_edges (
+                project_id  TEXT NOT NULL,
+                src         TEXT NOT NULL,
+                dst         TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                weight      REAL NOT NULL DEFAULT 1.0,
+                confidence  REAL NOT NULL DEFAULT 1.0,
+                PRIMARY KEY (project_id, src, dst, type)
+            )
+        """)
+        self._db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_project_src "
+            "ON symbol_edges(project_id, src)"
+        )
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS raptor_clusters (
+                cluster_id      TEXT PRIMARY KEY,
+                project_id      TEXT NOT NULL,
+                level           INTEGER NOT NULL,
+                member_ids_json TEXT NOT NULL,
+                summary         TEXT NOT NULL,
+                centroid_json   TEXT,
+                created_at      REAL NOT NULL
+            )
+        """)
+        self._db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raptor_project_level "
+            "ON raptor_clusters(project_id, level)"
+        )
         self._db_conn.commit()
 
     def _get_project_id(self) -> str:
@@ -2312,6 +3075,70 @@ class Filter:
                 blk._cached_token_count = len(blk.content) // 4
         return state
 
+    # ── v7 (PASO-13): CodePathView persistence ─────────────────────
+
+    async def _save_path_views_to_db(self, project_id: str, views: List[CodePathView]):
+        def _write():
+            self._db_conn.execute(
+                "DELETE FROM code_path_views WHERE project_id = ?", (project_id,)
+            )
+            for v in views:
+                self._db_conn.execute(
+                    "INSERT INTO code_path_views VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        v.path_id,
+                        project_id,
+                        v.entry_point,
+                        json.dumps(v.seed_nodes),
+                        json.dumps(v.induced_nodes),
+                        json.dumps([e.dict() for e in v.induced_edges]),
+                        v.activation_score,
+                        v.business_label,
+                        v.summary,
+                        v.label_confidence,
+                        v.structural_hash,
+                        v.call_graph_hash,
+                        v.last_built,
+                    ),
+                )
+            self._db_conn.commit()
+
+        await self._db_write_queue.put((_write, (), {}))
+
+    async def _load_path_views_from_db(self, project_id: str) -> List[CodePathView]:
+        rows = await anyio.to_thread.run_sync(
+            lambda: self._db_conn.execute(
+                "SELECT path_id, entry_point, seed_nodes_json, induced_nodes_json, "
+                "induced_edges_json, activation_score, business_label, summary, "
+                "label_confidence, structural_hash, call_graph_hash, last_built "
+                "FROM code_path_views WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        )
+        views = []
+        for row in rows:
+            try:
+                induced_edges = [Edge(**e) for e in json.loads(row[4])]
+                views.append(
+                    CodePathView(
+                        path_id=row[0],
+                        entry_point=row[1],
+                        seed_nodes=json.loads(row[2]),
+                        induced_nodes=json.loads(row[3]),
+                        induced_edges=induced_edges,
+                        activation_score=row[5],
+                        business_label=row[6],
+                        summary=row[7],
+                        label_confidence=row[8],
+                        structural_hash=row[9],
+                        call_graph_hash=row[10],
+                        last_built=row[11],
+                    )
+                )
+            except Exception as e:
+                self._log_debug(f"Skipping corrupt CodePathView: {e}")
+        return views
+
     # --------------------------------------------------------------------------
     # Symbol index helpers
     # --------------------------------------------------------------------------
@@ -2396,25 +3223,47 @@ class Filter:
         self, model_name: str, base_url: str, is_ollama: bool
     ) -> None:
         """
-        Unload all models if switching to a *different* model.
-        Skips unloading if the target model is the same as the last used one.
+        Unload models only if switching to a *different* auxiliary model.
+        The main model (self.valves.llm_model) is NEVER unloaded to preserve its KV cache.
         """
         if is_ollama:
             return
+
+        main_model = self.valves.llm_model
+
+        # If the target is the main model, never unload anything – it must stay in VRAM.
+        if model_name == main_model:
+            if self._last_used_model is None:
+                self._log_debug(f"Loading main model '{model_name}' for the first time")
+            else:
+                self._log_debug(f"Keeping main model '{model_name}' loaded (no unload)")
+            return
+
+        # Target is an auxiliary model.
+        # If the currently loaded model is the main model, do NOT unload it.
+        if self._last_used_model == main_model:
+            self._log_debug(
+                f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
+            )
+            return
+
+        # If we are switching between two different auxiliary models, unload the old one.
         if self._last_used_model is not None and model_name != self._last_used_model:
             self._log_debug(
-                f"Switching model from '{self._last_used_model}' to '{model_name}'"
+                f"Switching auxiliary model from '{self._last_used_model}' to '{model_name}'"
             )
             try:
                 await _shared_unload_all_models(base_url)
-                self._log_debug("All loaded models unloaded before switching")
+                self._log_debug("Auxiliary model unloaded before switching")
                 self._last_used_model = None
             except Exception as e:
                 self._log_debug(f"Unload via shared_resources failed: {e}")
         elif self._last_used_model is None:
-            self._log_debug(f"Loading first model '{model_name}'")
+            self._log_debug(
+                f"Loading auxiliary model '{model_name}' (no model was loaded)"
+            )
         else:
-            self._log_debug(f"Reusing model '{model_name}' (already loaded)")
+            self._log_debug(f"Reusing auxiliary model '{model_name}' (already loaded)")
 
     async def _acquire_llm_lock(self):
         """Acquire an inter‑process file lock for exclusive LLM access."""
@@ -3009,6 +3858,214 @@ class Filter:
             "batch_ltm_total", time.monotonic() - t_start, time.monotonic() - t_start
         )
 
+    # --------------------------------------------------------------------------
+    # RAPTOR Hierarchical LTM (v7 – PASO-20)
+    # --------------------------------------------------------------------------
+
+    async def _build_raptor_layer(
+        self,
+        project_id: str,
+        level: int = 1,
+        n_clusters: int = 5,
+        min_cluster_size: int = 3,
+    ) -> int:
+        """
+        Build one layer of the RAPTOR tree:
+        1. Retrieve embeddings from ChromaDB for the previous level.
+        2. Cluster with k-means.
+        3. Generate a summary per cluster via LLM.
+        4. Store the summary in ChromaDB and SQLite.
+        Returns number of clusters created. Runs asynchronously in background.
+        """
+        if not HAS_CHROMA or self.memory_collection is None:
+            return 0
+        if not HAS_SENTENCE:
+            return 0
+
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import normalize
+            import numpy as np
+        except ImportError:
+            self._log_debug("scikit-learn not installed — RAPTOR disabled")
+            return 0
+
+        # ── Get entries from previous level ─────────────────────────
+        where_filter: Dict = {"project_id": {"$eq": project_id}}
+        if level == 1:
+            where_filter["is_raptor_summary"] = {"$ne": True}
+        else:
+            where_filter["raptor_level"] = {"$eq": level - 1}
+
+        results = await anyio.to_thread.run_sync(
+            lambda: self.memory_collection.get(
+                where=where_filter,
+                include=["embeddings", "documents", "metadatas", "ids"],
+                limit=500,
+            )
+        )
+
+        if not results or not results["ids"] or len(results["ids"]) < min_cluster_size:
+            self._log_debug(
+                f"RAPTOR level {level}: not enough entries "
+                f"({len(results['ids']) if results else 0} < {min_cluster_size})"
+            )
+            return 0
+
+        ids = results["ids"]
+        docs = results["documents"]
+        embeddings = np.array(results["embeddings"])
+        embeddings_normalized = normalize(embeddings)
+
+        # Adjust n_clusters if fewer entries than desired clusters
+        actual_clusters = min(n_clusters, len(ids) // min_cluster_size)
+        if actual_clusters < 2:
+            return 0
+
+        # ── k-means clustering ──────────────────────────────────────
+        kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
+        labels = await anyio.to_thread.run_sync(
+            lambda: kmeans.fit_predict(embeddings_normalized)
+        )
+
+        # ── Generate summary per cluster ────────────────────────────
+        clusters_created = 0
+        for cluster_idx in range(actual_clusters):
+            member_indices = [i for i, lbl in enumerate(labels) if lbl == cluster_idx]
+            if len(member_indices) < min_cluster_size:
+                continue
+
+            member_ids = [ids[i] for i in member_indices]
+            member_docs = [docs[i] for i in member_indices]
+
+            # Combine documents for the LLM (respect token limits)
+            combined = "\n\n---\n\n".join(doc[:500] for doc in member_docs[:10])
+
+            prompt = (
+                f"Summarize the following {len(member_docs)} related code/conversation "
+                f"fragments into 2-3 sentences capturing their common theme, "
+                f"key functions involved, and main purpose:\n\n{combined}"
+            )
+
+            summary = await self._try_llm_quick(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a technical summarizer. "
+                    "Output 2-3 concise sentences. No bullet points."
+                ),
+                model_override=self.valves.raptor_summary_model,
+                max_tokens=self.valves.raptor_summary_max_tokens,
+                temperature=0.2,
+            )
+
+            if not summary:
+                continue
+
+            # ── Embed the summary and store in ChromaDB ──────────────
+            summary_embedding = await anyio.to_thread.run_sync(
+                lambda: self.embedder.encode(summary).tolist()
+            )
+
+            cluster_id = (
+                f"{project_id}_raptor_L{level}_C{cluster_idx}_{int(time.time())}"
+            )
+            centroid = kmeans.cluster_centers_[cluster_idx].tolist()
+
+            await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.upsert(
+                    ids=[cluster_id],
+                    embeddings=[summary_embedding],
+                    documents=[f"[RAPTOR L{level} Summary]\n{summary}"],
+                    metadatas=[
+                        {
+                            "project_id": project_id,
+                            "is_raptor_summary": True,
+                            "raptor_level": level,
+                            "cluster_id": cluster_id,
+                            "member_count": len(member_ids),
+                            "timestamp": time.time(),
+                            "content_type": "raptor_summary",
+                        }
+                    ],
+                )
+            )
+
+            # ── Persist to SQLite for traceability ─────────────────
+            def _write_cluster():
+                self._db_conn.execute(
+                    "INSERT OR REPLACE INTO raptor_clusters VALUES (?,?,?,?,?,?,?)",
+                    (
+                        cluster_id,
+                        project_id,
+                        level,
+                        json.dumps(member_ids),
+                        summary,
+                        json.dumps(centroid),
+                        time.time(),
+                    ),
+                )
+                self._db_conn.commit()
+
+            await self._db_write_queue.put((_write_cluster, (), {}))
+
+            clusters_created += 1
+            self._log_debug(
+                f"RAPTOR L{level} cluster {cluster_idx}: "
+                f"{len(member_ids)} members → summary stored"
+            )
+
+        return clusters_created
+
+    async def _rebuild_raptor_index(self, project_id: str):
+        """
+        Rebuild the full RAPTOR tree for a project. Background task.
+        Process:
+        1. Delete old RAPTOR summaries for the project.
+        2. Build level 1 (clusters of raw entries).
+        3. If enough level-1 clusters, build level 2 (clusters of clusters).
+        """
+        if not self.valves.enable_raptor:
+            return
+
+        self._log_debug(f"RAPTOR: rebuilding index for project {project_id}")
+
+        # Clean old summaries
+        try:
+            old = await anyio.to_thread.run_sync(
+                lambda: self.memory_collection.get(
+                    where={
+                        "$and": [
+                            {"project_id": {"$eq": project_id}},
+                            {"is_raptor_summary": {"$eq": True}},
+                        ]
+                    },
+                    include=["ids"],
+                )
+            )
+            if old and old["ids"]:
+                await anyio.to_thread.run_sync(
+                    lambda: self.memory_collection.delete(ids=old["ids"])
+                )
+                self._log_debug(f"RAPTOR: deleted {len(old['ids'])} old summaries")
+        except Exception as e:
+            self._log_debug(f"RAPTOR: cleanup failed: {e}")
+
+        # Build levels
+        l1_clusters = await self._build_raptor_layer(
+            project_id,
+            level=1,
+            n_clusters=self.valves.raptor_clusters_per_level,
+        )
+        self._log_debug(f"RAPTOR: level 1 = {l1_clusters} clusters")
+
+        if l1_clusters >= 4:
+            l2_clusters = await self._build_raptor_layer(
+                project_id,
+                level=2,
+                n_clusters=max(2, l1_clusters // 2),
+            )
+            self._log_debug(f"RAPTOR: level 2 = {l2_clusters} clusters")
+
     async def _flush_ltm_batch(self, project_id: str):
         await asyncio.sleep(0.5)
         async with self._ltm_batch_lock:
@@ -3066,6 +4123,11 @@ class Filter:
                         )
                     else:
                         effective_sim = raw_sim
+
+                    # ── v7 (PASO-20): boost raptor summaries ──
+                    if meta.get("is_raptor_summary"):
+                        raptor_level = meta.get("raptor_level", 1)
+                        effective_sim *= 1.0 + 0.1 * raptor_level
 
                     if (
                         effective_sim
@@ -3461,6 +4523,32 @@ class Filter:
                         for s in existing.symbols:
                             s.parent_block_hash = existing.hash
                             self._symbol_index.add(s, existing.hash, project_id)
+                            # ── v7 (PASO-09): register typed edges ──
+                            for callee_name in s.calls:
+                                edge = Edge(
+                                    src=s.name,
+                                    dst=callee_name,
+                                    type="calls",
+                                    weight=EDGE_WEIGHTS["calls"],
+                                    confidence=1.0,
+                                )
+                                self._symbol_index.add_edge(edge, project_id)
+                            # ── v7 (PASO-19): register data flow edges ──
+                            if (
+                                self.valves.enable_data_flow_analysis
+                                and existing.file_path
+                            ):
+                                df_edges = self._extract_data_flow_edges(
+                                    existing.content,
+                                    existing.file_path,
+                                    project_id,
+                                )
+                                for df_edge in df_edges:
+                                    self._symbol_index.add_edge(df_edge, project_id)
+                                if df_edges:
+                                    self._log_debug(
+                                        f"Data flow: {len(df_edges)} edge(s) extracted from {existing.file_path}"
+                                    )
                         if self.tokenizer:
                             existing._cached_token_count = len(
                                 self.tokenizer.encode(existing.content)
@@ -3505,6 +4593,32 @@ class Filter:
                         for s in existing.symbols:
                             s.parent_block_hash = existing.hash
                             self._symbol_index.add(s, existing.hash, project_id)
+                            # ── v7 (PASO-09): register typed edges ──
+                            for callee_name in s.calls:
+                                edge = Edge(
+                                    src=s.name,
+                                    dst=callee_name,
+                                    type="calls",
+                                    weight=EDGE_WEIGHTS["calls"],
+                                    confidence=1.0,
+                                )
+                                self._symbol_index.add_edge(edge, project_id)
+                            # ── v7 (PASO-19): register data flow edges ──
+                            if (
+                                self.valves.enable_data_flow_analysis
+                                and existing.file_path
+                            ):
+                                df_edges = self._extract_data_flow_edges(
+                                    existing.content,
+                                    existing.file_path,
+                                    project_id,
+                                )
+                                for df_edge in df_edges:
+                                    self._symbol_index.add_edge(df_edge, project_id)
+                                if df_edges:
+                                    self._log_debug(
+                                        f"Data flow: {len(df_edges)} edge(s) extracted from {existing.file_path}"
+                                    )
                         if self.tokenizer:
                             existing._cached_token_count = len(
                                 self.tokenizer.encode(existing.content)
@@ -3529,6 +4643,29 @@ class Filter:
                 new_block.last_mentioned_msg_idx = state["message_count"]
                 for sym in syms:
                     self._symbol_index.add(sym, new_block.hash, project_id)
+                    # ── v7 (PASO-09): register typed edges from call relationships ──
+                    for callee_name in sym.calls:
+                        edge = Edge(
+                            src=sym.name,
+                            dst=callee_name,
+                            type="calls",
+                            weight=EDGE_WEIGHTS["calls"],
+                            confidence=1.0,
+                        )
+                        self._symbol_index.add_edge(edge, project_id)
+                    # ── v7 (PASO-19): register data flow edges ──
+                    if self.valves.enable_data_flow_analysis and new_block.file_path:
+                        df_edges = self._extract_data_flow_edges(
+                            new_block.content,
+                            new_block.file_path,
+                            project_id,
+                        )
+                        for df_edge in df_edges:
+                            self._symbol_index.add_edge(df_edge, project_id)
+                        if df_edges:
+                            self._log_debug(
+                                f"Data flow: {len(df_edges)} edge(s) extracted from {new_block.file_path}"
+                            )
                 if any(s.calls for s in syms):
                     state["has_any_calls"] = True
 
@@ -3639,6 +4776,32 @@ class Filter:
                         for s in best_base.symbols:
                             s.parent_block_hash = best_base.hash
                             self._symbol_index.add(s, best_base.hash, project_id)
+                            # ── v7 (PASO-09): register typed edges ──
+                            for callee_name in s.calls:
+                                edge = Edge(
+                                    src=s.name,
+                                    dst=callee_name,
+                                    type="calls",
+                                    weight=EDGE_WEIGHTS["calls"],
+                                    confidence=1.0,
+                                )
+                                self._symbol_index.add_edge(edge, project_id)
+                            # ── v7 (PASO-19): register data flow edges ──
+                            if (
+                                self.valves.enable_data_flow_analysis
+                                and best_base.file_path
+                            ):
+                                df_edges = self._extract_data_flow_edges(
+                                    best_base.content,
+                                    best_base.file_path,
+                                    project_id,
+                                )
+                                for df_edge in df_edges:
+                                    self._symbol_index.add_edge(df_edge, project_id)
+                                if df_edges:
+                                    self._log_debug(
+                                        f"Data flow: {len(df_edges)} edge(s) extracted from {best_base.file_path}"
+                                    )
                         if self.tokenizer:
                             best_base._cached_token_count = len(
                                 self.tokenizer.encode(best_base.content)
@@ -3671,7 +4834,6 @@ class Filter:
                 if block.obsolete:
                     continue
 
-                # Auto‑summaries for symbols missing summaries
                 if self.valves.enable_auto_summaries:
                     syms_without_summary = [
                         s
@@ -3710,7 +4872,7 @@ class Filter:
                 async with sem_enrich:
                     await asyncio.gather(*[_run_one(t, p) for t, p in tasks_to_run])
 
-            # ── Eviction by max_active_blocks (only if limit > 0) ──
+            # ── Eviction by max_active_blocks ──
             if (
                 self.valves.max_active_blocks > 0
                 and len(state["active_blocks"]) > self.valves.max_active_blocks
@@ -3726,7 +4888,6 @@ class Filter:
                 }
                 to_remove = [h for h in state["active_blocks"] if h not in keep_hashes]
                 for h in to_remove:
-                    # Do NOT remove symbols from the index – they may still be needed for context
                     del state["active_blocks"][h]
                 if to_remove:
                     self._log_debug(
@@ -3734,7 +4895,7 @@ class Filter:
                         f"Their symbols remain in the index for lightweight context."
                     )
 
-            # ── Session summary (still deferred because not needed for current prompt) ──
+            # Session summary
             if self.valves.enable_session_summary:
                 interval = self.valves.session_summary_interval_messages
                 if (
@@ -3755,6 +4916,44 @@ class Filter:
                     state.setdefault("pending_secondary_tasks", []).append(task.dict())
 
             self._invalidate_lightweight_cache(project_id)
+
+            # ── v7 (PASO-09): invalidate affected CodePathViews ──────────
+            if self.valves.enable_path_analysis:
+                changed_symbols: Set[str] = set()
+                for blk in new_blocks_pending:
+                    for sym in blk.symbols:
+                        changed_symbols.add(sym.name)
+
+                stale_path_ids: Set[str] = set()
+                for sym_name in changed_symbols:
+                    for pid in self._path_index.mark_stale_for_symbol(
+                        sym_name, project_id
+                    ):
+                        stale_path_ids.add(pid)
+
+                for pid in stale_path_ids:
+                    view = self._path_index.get(pid, project_id)
+                    if not view:
+                        continue
+                    new_structural = self._compute_structural_hash(
+                        view.induced_nodes.keys(), project_id
+                    )
+                    new_call_graph = self._compute_call_graph_hash(
+                        view.induced_nodes.keys(), project_id
+                    )
+                    if view.is_stale(new_structural, new_call_graph):
+                        view.structural_hash = new_structural
+                        view.call_graph_hash = new_call_graph
+                        view.summary = ""
+                        view.business_label = ""
+                        view.label_confidence = 0.0
+
+                if stale_path_ids:
+                    self._log_debug(
+                        f"Invalidated {len(stale_path_ids)} CodePathView(s) "
+                        f"due to changes in {len(changed_symbols)} symbol(s)"
+                    )
+
             self._set_state(project_id, state)
 
     async def _summarize_inactive_blocks_safely(self, project_id: str):
@@ -4428,6 +5627,1264 @@ class Filter:
         return "\n".join(parts) if parts else ""
 
     # --------------------------------------------------------------------------
+    # Path analysis (v7) – graph activation and seed extraction
+    # --------------------------------------------------------------------------
+
+    def _extract_query_seeds(
+        self, query: str, project_id: str
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Extract seed symbols from the query.
+        Returns (exact_matches, partial_matches).
+
+        exact_matches: words that are exact symbol names.
+        partial_matches: words that are substrings of symbol names (used when few exact matches).
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        query_words = set(re.findall(r"\b\w+\b", query))
+
+        exact = list(all_names.intersection(query_words))
+
+        partial = []
+        if len(exact) < 3:  # only look for partials if few exact matches
+            for word in query_words:
+                if len(word) < 4:  # ignore very short words
+                    continue
+                for name in all_names:
+                    if word.lower() in name.lower() and name not in exact:
+                        partial.append(name)
+                        break
+            partial = partial[:5]  # cap partial matches
+
+        return exact, partial
+
+    def _compute_node_specificity(self, symbol_name: str, project_id: str) -> float:
+        """
+        IDF-like specificity of a symbol.
+        Symbols appearing in many blocks are less specific (like stop-words).
+        Returns a multiplier in [0.1, 3.0] to adjust its weight as a seed.
+
+        Examples:
+        - '__init__' appears in 20 blocks → specificity ~0.3
+        - 'validate_credit_card' appears in 1 block → specificity ~2.5
+        """
+        import math
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        total = max(len(all_names), 1)
+        n_blocks = len(self._symbol_index.find_blocks(symbol_name, project_id))
+        if n_blocks == 0:
+            return 1.0
+        # IDF: log(total / n_blocks) + 1, clipped to [0.1, 3.0]
+        specificity = math.log(total / n_blocks) + 1.0
+        return max(0.1, min(3.0, specificity))
+
+    def _build_activation_graph(
+        self,
+        query: str,
+        project_id: str,
+        max_propagation_steps: int = 4,
+    ) -> ActivationGraph:
+        """
+        Build an ActivationGraph for the given query.
+
+        Process:
+        1. Extract seeds (symbols mentioned in the query)
+        2. Activate exact seeds with score adjusted by specificity,
+           partial seeds similarly but with lower base.
+        3. Propagate activation through the call graph using Personalized PageRank.
+        """
+        exact_seeds, partial_seeds = self._extract_query_seeds(query, project_id)
+
+        ag = ActivationGraph()
+
+        # Activate seeds with specificity-adjusted scores
+        if exact_seeds:
+            for sym_name in exact_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                adjusted_score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name,
+                    score=adjusted_score,
+                    depth=0,
+                    source="seed",
+                )
+        if partial_seeds:
+            for sym_name in partial_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                adjusted_score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name,
+                    score=adjusted_score,
+                    depth=0,
+                    source="seed",
+                )
+
+        # If no seeds, activate entry points with a low score as a fallback
+        if not exact_seeds and not partial_seeds:
+            entry_points = self._path_index.find_entry_points(
+                self._symbol_index, project_id
+            )
+            if entry_points:
+                top_entries = list(entry_points)[:3]
+                for sym_name in top_entries:
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name,
+                        score=0.3,
+                        depth=0,
+                        source="seed",
+                    )
+
+        # Propagate using Personalized PageRank
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+        ag.propagate(
+            edges_out=edges_out,
+            max_steps=20,
+            min_score=0.05,
+            alpha=self.valves.ppr_alpha,  # ← use the valve
+        )
+
+        # ── v7 (PASO-24): save activation scores for speculative prefetch ──
+        activated_nodes = ag.get_activated_nodes(
+            threshold=self.valves.path_activation_threshold
+        )
+        if not hasattr(self, "_last_activation_scores"):
+            self._last_activation_scores: Dict[str, Dict[str, float]] = {}
+        self._last_activation_scores[project_id] = activated_nodes
+
+        self._log_debug(
+            f"ActivationGraph: {len(ag.get_activated_nodes(threshold=0.05))} nodes activated "
+            f"from {len(exact_seeds)} exact + {len(partial_seeds)} partial seeds"
+        )
+        return ag
+
+    async def _resolve_dangling_edges(self, project_id: str) -> int:
+        """
+        Resolve cross-chunk symbol references.
+
+        A 'dangling edge' is an edge whose destination is referenced in the
+        call graph but has no code block yet. When a new chunk defines that
+        symbol, the edge confidence is raised from 0.3 (provisional) to 1.0.
+
+        Conversely, edges pointing to symbols that are referenced but not
+        defined are marked with confidence 0.3.
+
+        Returns the number of edges resolved.
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        resolved = 0
+
+        for sym_name in all_names:
+            has_definition = bool(self._symbol_index.find_blocks(sym_name, project_id))
+            edges_in = self._symbol_index.get_edges_in(sym_name, project_id)
+
+            for edge in edges_in:
+                if has_definition and edge.confidence < 1.0:
+                    # Symbol now defined → restore confidence
+                    edge.confidence = 1.0
+                    resolved += 1
+                elif not has_definition and edge.confidence == 1.0:
+                    # Symbol referenced but not defined → mark provisional
+                    edge.confidence = 0.3
+
+        if resolved > 0:
+            self._log_debug(
+                f"Cross-chunk resolution: {resolved} edge(s) resolved "
+                f"(references confirmed with definitions)"
+            )
+        return resolved
+
+    # --------------------------------------------------------------------------
+    # LLMLingua-2 code compression (v7 – PASO-18)
+    # --------------------------------------------------------------------------
+
+    def _init_llmlingua(self):
+        """Initialise the LLMLingua-2 compressor. Runs on CPU, no GPU needed."""
+        try:
+            from llmlingua import PromptCompressor
+
+            self._llmlingua_compressor = PromptCompressor(
+                model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+                use_llmlingua2=True,
+                device_map="cpu",
+            )
+            self._log_debug("LLMLingua-2 compressor initialized (CPU)")
+        except ImportError:
+            self._log_debug("llmlingua not installed — code compression disabled")
+            self.valves.enable_code_compression = False
+        except Exception as e:
+            self._log_debug(f"LLMLingua-2 init failed: {e} — compression disabled")
+            self.valves.enable_code_compression = False
+
+    async def _compress_code_block(
+        self,
+        code: str,
+        language: str = "python",
+        rate: float = 0.5,
+    ) -> str:
+        """
+        Compress a code block using LLMLingua-2.
+        Preserves critical language structural tokens.
+
+        rate: fraction of tokens to KEEP (0.5 = keep 50%).
+        Recommended range: 0.4 (aggressive) to 0.7 (conservative).
+
+        Returns the original code if the compressor is unavailable
+        or the block is below the minimum token threshold.
+        """
+        if not self._llmlingua_compressor:
+            return code
+
+        # Don't compress small blocks (overhead > benefit)
+        estimated_tokens = self._estimate_code_tokens(code)
+        if estimated_tokens < self.valves.code_compression_min_tokens:
+            return code
+
+        # Structural tokens that are NEVER removed
+        FORCE_TOKENS_BY_LANG = {
+            "python": [
+                "\n",
+                ":",
+                "def ",
+                "class ",
+                "return ",
+                "import ",
+                "from ",
+                "if ",
+                "else:",
+                "elif ",
+                "for ",
+                "while ",
+                "try:",
+                "except",
+                "with ",
+                "async ",
+                "await ",
+            ],
+            "javascript": [
+                "\n",
+                ":",
+                "function ",
+                "const ",
+                "let ",
+                "var ",
+                "return ",
+                "class ",
+                "import ",
+                "export ",
+                "=>",
+                "if ",
+                "else ",
+                "for ",
+                "while ",
+            ],
+            "typescript": [
+                "\n",
+                ":",
+                "function ",
+                "const ",
+                "let ",
+                "var ",
+                "return ",
+                "class ",
+                "import ",
+                "export ",
+                "=>",
+                "interface ",
+                "type ",
+                "if ",
+                "else ",
+                "for ",
+            ],
+            "go": [
+                "\n",
+                ":",
+                "func ",
+                "type ",
+                "struct ",
+                "import ",
+                "return ",
+                "if ",
+                "else ",
+                "for ",
+                "package ",
+            ],
+            "rust": [
+                "\n",
+                ":",
+                "fn ",
+                "struct ",
+                "impl ",
+                "use ",
+                "return ",
+                "if ",
+                "else ",
+                "for ",
+                "let ",
+                "pub ",
+            ],
+        }
+        force_tokens = FORCE_TOKENS_BY_LANG.get(
+            language.lower(), ["\n", ":", "return "]
+        )
+
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: self._llmlingua_compressor.compress_prompt(
+                    code,
+                    rate=rate,
+                    force_tokens=force_tokens,
+                    force_reserve_digit=True,
+                )
+            )
+            compressed = result.get("compressed_prompt", code)
+            compressed_tokens = self._estimate_code_tokens(compressed)
+            self._log_debug(
+                f"LLMLingua-2: {estimated_tokens} → {compressed_tokens} tokens "
+                f"({100*(1-compressed_tokens/max(estimated_tokens,1)):.0f}% reduction)"
+            )
+            return compressed
+        except Exception as e:
+            self._log_debug(f"LLMLingua-2 compression failed: {e} — using original")
+            return code
+
+    # --------------------------------------------------------------------------
+    # Data flow edge extraction (v7 – PASO-19)
+    # --------------------------------------------------------------------------
+
+    def _extract_data_flow_edges(
+        self,
+        code: str,
+        file_path: Optional[str],
+        project_id: str,
+    ) -> List[Edge]:
+        """
+        Extract data flow edges from Python code using ast.
+
+        Detects calls to known project functions where arguments come from
+        local variables → edge type 'data_flow' from caller to callee.
+
+        Falls back to regex for non‑Python languages.
+        """
+        if not file_path or not file_path.endswith(".py"):
+            return self._extract_data_flow_edges_regex(code, project_id)
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return []
+
+        edges: List[Edge] = []
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+
+        for func_node in ast.walk(tree):
+            if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+
+            caller_name = func_node.name
+            if caller_name not in all_names:
+                continue
+
+            # Collect variables assigned within this function
+            assigned_vars: Set[str] = set()
+            for child in ast.walk(func_node):
+                if isinstance(child, ast.Assign):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name):
+                            assigned_vars.add(target.id)
+
+            # Detect calls to other project functions with local variables as arguments
+            for child in ast.walk(func_node):
+                if not isinstance(child, ast.Call):
+                    continue
+
+                callee_name = None
+                if isinstance(child.func, ast.Name):
+                    callee_name = child.func.id
+                elif isinstance(child.func, ast.Attribute):
+                    callee_name = child.func.attr
+
+                if callee_name not in all_names or callee_name == caller_name:
+                    continue
+
+                args_are_local_vars = any(
+                    isinstance(arg, ast.Name) and arg.id in assigned_vars
+                    for arg in child.args
+                )
+
+                if args_are_local_vars or child.args:
+                    edges.append(
+                        Edge(
+                            src=caller_name,
+                            dst=callee_name,
+                            type="data_flow",
+                            weight=EDGE_WEIGHTS["data_flow"],
+                            confidence=0.7,  # lower confidence than tree-sitter
+                        )
+                    )
+
+        return edges
+
+    def _extract_data_flow_edges_regex(self, code: str, project_id: str) -> List[Edge]:
+        """
+        Fallback data flow extraction for non‑Python languages.
+        Detects assignments whose right-hand side is a call to a known function.
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        edges: List[Edge] = []
+
+        # Pattern: var = known_function(...)
+        pattern = re.compile(
+            r"\b(\w+)\s*=\s*(" + "|".join(re.escape(n) for n in all_names) + r")\s*\("
+        )
+        for match in pattern.finditer(code):
+            callee = match.group(2)
+            var_name = match.group(1)
+            # Look for functions that use this variable as argument
+            use_pattern = re.compile(
+                r"\b("
+                + "|".join(re.escape(n) for n in all_names)
+                + r")\s*\([^)]*\b"
+                + re.escape(var_name)
+                + r"\b"
+            )
+            for use_match in use_pattern.finditer(code):
+                consumer = use_match.group(1)
+                if consumer != callee:
+                    edges.append(
+                        Edge(
+                            src=callee,
+                            dst=consumer,
+                            type="data_flow",
+                            weight=EDGE_WEIGHTS["data_flow"],
+                            confidence=0.5,
+                        )
+                    )
+
+        return edges
+
+    async def _build_view_from_activation(
+        self,
+        entry_point: str,
+        activation: ActivationGraph,
+        project_id: str,
+    ) -> Optional[CodePathView]:
+        """
+        Build a CodePathView from an ActivationGraph and cache it in PathIndex.
+        """
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+        edges_in_map: Dict[str, List[Edge]] = defaultdict(list)
+        for sym, edge_list in edges_out.items():
+            for e in edge_list:
+                edges_in_map[e.dst].append(e)
+
+        extractor = SubgraphExtractor(
+            activation_threshold=self.valves.path_activation_threshold,
+            expand_hops=1,
+        )
+        induced_nodes_set, induced_edges = extractor.extract(
+            activation, edges_out, edges_in_map
+        )
+
+        if not induced_nodes_set:
+            return None
+
+        # Scores for the induced nodes
+        induced_nodes_scored = {
+            node: activation.get_score(node) for node in induced_nodes_set
+        }
+
+        path_id = hashlib.md5(
+            f"{entry_point}|{'|'.join(sorted(induced_nodes_set))}".encode()
+        ).hexdigest()[:16]
+
+        # Try to reuse summary/label if the subgraph hasn't changed
+        existing = self._path_index.get(path_id, project_id)
+        structural_hash = self._compute_structural_hash(induced_nodes_set, project_id)
+        call_graph_hash = self._compute_call_graph_hash(induced_nodes_set, project_id)
+
+        view = CodePathView(
+            path_id=path_id,
+            entry_point=entry_point,
+            seed_nodes=[entry_point],
+            induced_nodes=induced_nodes_scored,
+            induced_edges=induced_edges,
+            activation_score=activation.aggregate_path_score(list(induced_nodes_set)),
+            structural_hash=structural_hash,
+            call_graph_hash=call_graph_hash,
+        )
+
+        if (
+            existing
+            and not existing.is_stale(structural_hash, call_graph_hash)
+            and existing.business_label
+        ):
+            view.business_label = existing.business_label
+            view.summary = existing.summary
+            view.label_confidence = existing.label_confidence
+
+        self._path_index.add(view, project_id)
+        return view
+
+    async def _rebuild_path_index(self, project_id: str):
+        """Reconstruct PathIndex from SymbolIndex for all entry points."""
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return
+        entry_points = self._path_index.find_entry_points(
+            self._symbol_index, project_id
+        )
+        for ep in entry_points:
+            ag = self._build_activation_graph(ep, project_id)
+            await self._build_view_from_activation(ep, ag, project_id)
+
+    async def _speculative_prefetch(
+        self,
+        project_id: str,
+        last_activated: Dict[str, float],
+    ):
+        """
+        Pre‑build CodePathViews for symbols likely to be relevant in the
+        next query. Runs as a background task during LLM decode.
+
+        Prediction: high‑confidence direct callees of the top‑N activated symbols.
+        """
+        if not self.valves.enable_speculative_prefetch:
+            return
+        if not last_activated:
+            return
+
+        # Top symbols from the current query
+        top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
+
+        prefetch_candidates: Set[str] = set()
+        for sym in top_syms:
+            for edge in self._symbol_index.get_edges_out(sym, project_id):
+                if (
+                    edge.type == "calls"
+                    and edge.effective_weight() >= 0.7
+                    and edge.dst not in last_activated  # not already activated
+                ):
+                    prefetch_candidates.add(edge.dst)
+
+        if not prefetch_candidates:
+            return
+
+        candidates = list(prefetch_candidates)[: self.valves.speculative_prefetch_max]
+        self._log_debug(
+            f"Speculative prefetch: pre-building {len(candidates)} CodePathView(s) "
+            f"for next likely query"
+        )
+
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+        for sym_name in candidates:
+            if not self._symbol_index.find_blocks(sym_name, project_id):
+                continue  # symbol referenced but not defined
+            ag = ActivationGraph()
+            ag.seed([sym_name], initial_score=1.0)
+            ag.propagate(edges_out, max_steps=2, min_score=0.1)
+            await self._build_view_from_activation(sym_name, ag, project_id)
+
+    # ── Hash helpers for structural / call‑graph invalidation ─────────
+
+    def _compute_structural_hash(
+        self, symbol_names: Iterable[str], project_id: str
+    ) -> str:
+        """Hash of the symbols' content blocks (changes when code changes)."""
+        state = self._get_state(project_id)
+        hashes = []
+        for name in sorted(symbol_names):
+            for bh in sorted(self._symbol_index.find_blocks(name, project_id)):
+                hashes.append(bh)
+        return hashlib.md5("|".join(hashes).encode()).hexdigest()[:16] if hashes else ""
+
+    def _compute_call_graph_hash(
+        self, symbol_names: Iterable[str], project_id: str
+    ) -> str:
+        """Hash of the call relationships (changes when the graph changes)."""
+        edge_strs = []
+        for name in sorted(symbol_names):
+            for edge in self._symbol_index.get_edges_out(name, project_id):
+                edge_strs.append(f"{edge.src}:{edge.type}:{edge.dst}")
+        return (
+            hashlib.md5("|".join(sorted(edge_strs)).encode()).hexdigest()[:16]
+            if edge_strs
+            else ""
+        )
+
+    # ── Intent classification (v7) ──────────────────────────────────
+
+    async def _classify_intent(
+        self, user_query: str, project_id: str
+    ) -> Dict[str, float]:
+        """
+        Classify the user's intent into a continuous weight vector.
+
+        Returns a dict where values sum to ~1.0.
+        Keys: "explain" | "modify" | "debug" | "refactor"
+
+        Process:
+        1. Fast deterministic heuristic (no LLM).
+        2. LLM fallback only when the heuristic signal is weak.
+        """
+        query_lower = user_query.lower()
+        query_words = set(re.findall(r"\b\w+\b", query_lower))
+
+        # ── Heuristic: count signals per intent ──────────────────────
+
+        EXPLAIN_KW = {
+            "explain",
+            "how",
+            "what",
+            "describe",
+            "show",
+            "diagram",
+            "explica",
+            "cómo",
+            "qué",
+            "describe",
+            "muestra",
+        }
+        MODIFY_KW = {
+            "fix",
+            "add",
+            "change",
+            "implement",
+            "update",
+            "create",
+            "make",
+            "corrige",
+            "añade",
+            "cambia",
+            "implementa",
+            "actualiza",
+            "crea",
+        }
+        DEBUG_KW = {
+            "error",
+            "bug",
+            "fail",
+            "crash",
+            "wrong",
+            "broken",
+            "exception",
+            "traceback",
+            "not working",
+            "falla",
+            "error",
+            "excepción",
+        }
+        REFACTOR_KW = {
+            "refactor",
+            "restructure",
+            "reorganize",
+            "redesign",
+            "architecture",
+            "refactoriza",
+            "reestructura",
+            "arquitectura",
+            "reorganiza",
+        }
+
+        scores = {
+            "explain": len(EXPLAIN_KW.intersection(query_words)) * 1.0,
+            "modify": len(MODIFY_KW.intersection(query_words)) * 1.0,
+            "debug": len(DEBUG_KW.intersection(query_words)) * 1.5,  # debug weighs more
+            "refactor": len(REFACTOR_KW.intersection(query_words))
+            * 2.0,  # refactor even more
+        }
+
+        # Additional signals
+        if "traceback" in query_lower or "exception" in query_lower:
+            scores["debug"] += 2.0
+        if "```" in user_query:
+            scores["modify"] += 0.5
+        if len(user_query) > 500:
+            scores["explain"] += 0.3
+
+        total = sum(scores.values())
+
+        # If the signal is clear, normalise and return without LLM
+        if total > 1.5:
+            normalized = {k: v / total for k, v in scores.items()}
+            self._log_debug(
+                f"Intent (heuristic): {max(normalized, key=normalized.get)}="
+                f"{max(normalized.values()):.2f}"
+            )
+            return normalized
+
+        # ── LLM fallback when heuristic signal is weak ────────────────
+        if not self.valves.enable_intent_llm_fallback:
+            return {"explain": 0.3, "modify": 0.4, "debug": 0.2, "refactor": 0.1}
+
+        prompt = (
+            f'User message: "{user_query[:300]}"\n\n'
+            "Score the user intent from 0.0 to 1.0 for each category "
+            "(total should sum to 1.0):\n"
+            "explain: (wants to understand)\n"
+            "modify: (wants to change/add/fix code)\n"
+            "debug: (is debugging an error)\n"
+            "refactor: (wants architectural changes)\n\n"
+            "Output only: explain=X.X modify=X.X debug=X.X refactor=X.X"
+        )
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt="Output only scores in the format: explain=X.X modify=X.X debug=X.X refactor=X.X",
+            model_override=self.valves.intent_classifier_model,
+            max_tokens=20,
+            temperature=0.0,
+        )
+
+        if response:
+            result = {}
+            for match in re.finditer(r"(\w+)=([\d.]+)", response):
+                key, val = match.group(1), float(match.group(2))
+                if key in ("explain", "modify", "debug", "refactor"):
+                    result[key] = val
+            if len(result) == 4:
+                total_r = sum(result.values())
+                if total_r > 0:
+                    return {k: v / total_r for k, v in result.items()}
+
+        # Default fallback
+        return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
+
+    async def _classify_intent(
+        self, user_query: str, project_id: str
+    ) -> Dict[str, float]:
+        """
+        Classify the user's intent into a continuous weight vector.
+
+        Returns a dict where values sum to ~1.0.
+        Keys: "explain" | "modify" | "debug" | "refactor"
+
+        Process:
+        1. Fast deterministic heuristic (no LLM).
+        2. LLM fallback only when the heuristic signal is weak.
+        """
+        query_lower = user_query.lower()
+        query_words = set(re.findall(r"\b\w+\b", query_lower))
+
+        # ── Heuristic: count signals per intent ──────────────────────
+
+        EXPLAIN_KW = {
+            "explain",
+            "how",
+            "what",
+            "describe",
+            "show",
+            "diagram",
+            "explica",
+            "cómo",
+            "qué",
+            "describe",
+            "muestra",
+        }
+        MODIFY_KW = {
+            "fix",
+            "add",
+            "change",
+            "implement",
+            "update",
+            "create",
+            "make",
+            "corrige",
+            "añade",
+            "cambia",
+            "implementa",
+            "actualiza",
+            "crea",
+        }
+        DEBUG_KW = {
+            "error",
+            "bug",
+            "fail",
+            "crash",
+            "wrong",
+            "broken",
+            "exception",
+            "traceback",
+            "not working",
+            "falla",
+            "error",
+            "excepción",
+        }
+        REFACTOR_KW = {
+            "refactor",
+            "restructure",
+            "reorganize",
+            "redesign",
+            "architecture",
+            "refactoriza",
+            "reestructura",
+            "arquitectura",
+            "reorganiza",
+        }
+
+        scores = {
+            "explain": len(EXPLAIN_KW.intersection(query_words)) * 1.0,
+            "modify": len(MODIFY_KW.intersection(query_words)) * 1.0,
+            "debug": len(DEBUG_KW.intersection(query_words)) * 1.5,  # debug weighs more
+            "refactor": len(REFACTOR_KW.intersection(query_words))
+            * 2.0,  # refactor even more
+        }
+
+        # Additional signals
+        if "traceback" in query_lower or "exception" in query_lower:
+            scores["debug"] += 2.0
+        if "```" in user_query:
+            scores["modify"] += 0.5
+        if len(user_query) > 500:
+            scores["explain"] += 0.3
+
+        total = sum(scores.values())
+
+        # If the signal is clear, normalise and return without LLM
+        if total > 1.5:
+            normalized = {k: v / total for k, v in scores.items()}
+            self._log_debug(
+                f"Intent (heuristic): {max(normalized, key=normalized.get)}="
+                f"{max(normalized.values()):.2f}"
+            )
+            return normalized
+
+        # ── LLM fallback when heuristic signal is weak ────────────────
+        if not self.valves.enable_intent_llm_fallback:
+            return {"explain": 0.3, "modify": 0.4, "debug": 0.2, "refactor": 0.1}
+
+        prompt = (
+            f'User message: "{user_query[:300]}"\n\n'
+            "Score the user intent from 0.0 to 1.0 for each category "
+            "(total should sum to 1.0):\n"
+            "explain: (wants to understand)\n"
+            "modify: (wants to change/add/fix code)\n"
+            "debug: (is debugging an error)\n"
+            "refactor: (wants architectural changes)\n\n"
+            "Output only: explain=X.X modify=X.X debug=X.X refactor=X.X"
+        )
+        response = await self._try_llm_quick(
+            prompt=prompt,
+            system_prompt="Output only scores in the format: explain=X.X modify=X.X debug=X.X refactor=X.X",
+            model_override=self.valves.intent_classifier_model,
+            max_tokens=20,
+            temperature=0.0,
+        )
+
+        if response:
+            result = {}
+            for match in re.finditer(r"(\w+)=([\d.]+)", response):
+                key, val = match.group(1), float(match.group(2))
+                if key in ("explain", "modify", "debug", "refactor"):
+                    result[key] = val
+            if len(result) == 4:
+                total_r = sum(result.values())
+                if total_r > 0:
+                    return {k: v / total_r for k, v in result.items()}
+
+        # Default fallback
+        return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
+
+    async def _get_static_context_block(
+        self,
+        project_id: str,
+        is_code_session: bool,
+    ) -> str:
+        """
+        Build or retrieve from cache the static block of the system prompt.
+
+        This block is IDENTICAL across consecutive requests as long as the
+        code has not changed. It serves as the KV cache anchor for llama.cpp.
+
+        Contents:
+        1. Base behavioural instructions (always the same)
+        2. Symbol index / lightweight context (stable until code changes)
+        3. Feedback context (stable until new feedback arrives)
+
+        Invalidation: regenerated when _compute_code_state_hash() returns a
+        different hash.
+        """
+        current_code_hash = self._compute_code_state_hash(project_id)
+        cached = self._static_context_block_cache.get(project_id)
+
+        if cached:
+            cached_hash, cached_text = cached
+            if cached_hash == current_code_hash:
+                return cached_text  # ✓ Hit: same code → same block
+
+        # ── Build the static block ──────────────────────────────────
+        parts: List[str] = []
+
+        # 1. Base instructions (completely static)
+        if self.valves.enable_confidence_scoring and is_code_session:
+            parts.append(self.valves.confidence_prompt.strip())
+
+        if is_code_session and self.valves.enable_code_awareness:
+            checklist = (
+                "## Code review checklist (apply when reviewing or fixing code):\n"
+                "1. Execute mentally with 3 different inputs including edge cases.\n"
+                "2. Identify every assumption and verify each one.\n"
+                "3. Test every regex or string match against 5 counter-examples.\n"
+                "4. Test collections with empty, single-element, and large inputs.\n"
+                "5. Consider the worst-case scenario.\n"
+                "6. Reason step by step, then provide the corrected code."
+            )
+            parts.append(checklist)
+
+        # 2. Symbol index (lightweight context — stable while code unchanged)
+        if is_code_session and self.valves.enable_code_awareness:
+            state = self._get_state(project_id)
+            if state and state["active_blocks"]:
+                lightweight = await self._build_lightweight_context(project_id)
+                if lightweight:
+                    parts.append(lightweight)
+
+        # 3. Feedback context (stable between requests barring new feedback)
+        if (
+            is_code_session
+            and self.valves.enable_feedback_tracking
+            and self.valves.inject_feedback_context
+        ):
+            feedback_ctx = self._get_feedback_context(project_id)
+            if feedback_ctx:
+                parts.append(feedback_ctx)
+
+        static_block = "\n\n".join(p for p in parts if p.strip())
+
+        # ── Cache and track ─────────────────────────────────────────
+        self._static_context_block_cache[project_id] = (current_code_hash, static_block)
+
+        # Detect and log prefix changes (= cache miss in llama.cpp)
+        new_prefix_hash = hashlib.md5(static_block.encode()).hexdigest()[:16]
+        last_hash = self._last_static_prefix_hash.get(project_id)
+        if last_hash and last_hash != new_prefix_hash:
+            self._log_debug(
+                f"⚠️  KV CACHE MISS detected: static block changed "
+                f"({last_hash} → {new_prefix_hash}). "
+                f"llama.cpp will do a full prefill on this request."
+            )
+        elif not last_hash:
+            self._log_debug(
+                f"KV Cache: first request for project, "
+                f"static prefix established ({new_prefix_hash})."
+            )
+        else:
+            self._log_debug(
+                f"✓ KV Cache: static prefix stable ({new_prefix_hash}). "
+                f"llama.cpp will reuse KV states for Block A."
+            )
+        self._last_static_prefix_hash[project_id] = new_prefix_hash
+
+        tokens = (
+            len(self.tokenizer.encode(static_block))
+            if self.tokenizer
+            else len(static_block) // 4
+        )
+        self._log_debug(f"Static Context Block: ~{tokens} tokens")
+
+        return static_block
+
+    def _invalidate_static_context_block(self, project_id: str, reason: str = ""):
+        """
+        Force regeneration of the Static Context Block on the next request.
+        Call when content that belongs to Block A changes.
+        """
+        self._static_context_block_cache.pop(project_id, None)
+        if reason:
+            self._log_debug(f"SCB invalidated: {reason}")
+
+    async def _get_path_context(
+        self,
+        project_id: str,
+        user_query: str,
+        intent_vector: Dict[str, float],
+    ) -> str:
+        """
+        Build code context using the graph‑activation system.
+
+        Flow:
+        1. Build an ActivationGraph from the query.
+        2. Extract the activated subgraph.
+        3. Assign each node a LOD level (0‑3) based on activation score
+           and the intent vector.
+        4. Inject:
+           LOD‑3 (high): full code → placed last (Lost in the Middle)
+           LOD‑2 (medium): signature + summary
+           LOD‑1 (low): signature only
+           LOD‑0 (minimal): name only → placed first (background)
+        """
+        if not self.valves.enable_path_analysis:
+            return self._get_active_code_context(project_id, user_query)
+
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+
+        # Step 1: ActivationGraph
+        ag = self._build_activation_graph(user_query, project_id)
+        activated = ag.get_activated_nodes(
+            threshold=self.valves.path_activation_threshold
+        )
+
+        if not activated:
+            self._log_debug(
+                "_get_path_context: no activated nodes, falling back to full context"
+            )
+            return self._get_active_code_context(project_id, user_query)
+
+        # Step 2: Adjust LOD thresholds according to intent.
+        debug_weight = intent_vector.get("debug", 0.2)
+        modify_weight = intent_vector.get("modify", 0.3)
+        refactor_weight = intent_vector.get("refactor", 0.1)
+
+        # Base thresholds from valves
+        lod3 = self.valves.lod3_threshold
+        lod2 = self.valves.lod2_threshold
+        lod1 = self.valves.lod1_threshold
+
+        if debug_weight + modify_weight > 0.6:
+            scale = 0.7  # lower thresholds → more code shown in full
+        elif refactor_weight > 0.4:
+            scale = 0.0  # everything becomes LOD‑3
+        else:
+            scale = 1.0
+
+        lod3 *= scale
+        lod2 *= scale
+        lod1 *= scale
+
+        # Step 3: Build context text with Lost in the Middle ordering
+        total_tokens = 0
+        budget = self.valves.active_context_max_tokens or 32000
+        injected_blocks: Set[str] = set()
+
+        sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
+
+        # Four separate lists for the four LOD levels
+        lod0_parts: List[str] = []  # name only
+        lod1_parts: List[str] = []  # signature only
+        lod2_parts: List[str] = []  # signature + summary
+        lod3_parts: List[str] = []  # full code
+
+        for node_id, score in sorted_nodes:
+            if total_tokens >= budget:
+                break
+
+            # LOD‑0: score < lod1 → just the name, no block access
+            if score < lod1:
+                lod0_parts.append(f"`{node_id}`")
+                total_tokens += 2  # rough estimate for a symbol name
+                continue
+
+            # For LOD‑1, 2, 3 we need the actual block
+            block_hashes = self._symbol_index.find_blocks(node_id, project_id)
+            for bh in block_hashes:
+                if bh in injected_blocks:
+                    continue
+                block = state["active_blocks"].get(bh)
+                if not block or block.obsolete:
+                    continue
+
+                if score < lod2:
+                    # LOD‑1: signature only (from CodeSymbol.signature)
+                    sig = next(
+                        (sym.signature for sym in block.symbols if sym.name == node_id),
+                        node_id,  # fallback to bare name
+                    )
+                    tok = len(sig) // 4 + 2
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    lod1_parts.append(f"- `{sig}`{loc} _(score: {score:.2f})_")
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                elif score < lod3:
+                    # LOD‑2: signature + summary
+                    sig = next(
+                        (sym.signature for sym in block.symbols if sym.name == node_id),
+                        node_id,
+                    )
+                    summary = next(
+                        (
+                            sym.summary
+                            for sym in block.symbols
+                            if sym.name == node_id and sym.summary
+                        ),
+                        "",
+                    )
+                    text = f"- `{sig}`: {summary}" if summary else f"- `{sig}`"
+                    tok = len(text) // 4 + 2
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                else:
+                    # LOD‑3: full code (with optional compression)
+                    content_to_inject = block.content
+                    tok = block._cached_token_count or (len(block.content) // 4)
+                    if (
+                        self.valves.enable_code_compression
+                        and self._llmlingua_compressor
+                        and tok > self.valves.code_compression_min_tokens
+                    ):
+                        content_to_inject = await self._compress_code_block(
+                            block.content,
+                            language=(
+                                block.symbols[0].language
+                                if block.symbols
+                                else "unknown"
+                            ),
+                            rate=self.valves.code_compression_rate,
+                        )
+                        tok = self._estimate_code_tokens(content_to_inject)
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    lod3_parts.append(
+                        f"### `{node_id}`{loc} [activation: {score:.2f}]\n"
+                        f"```\n{content_to_inject}\n```\n"
+                    )
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                break  # use the first non‑obsolete block per symbol
+
+        # Assemble respecting Lost in the Middle:
+        # LOD‑0 + LOD‑1 (background), LOD‑2 (medium), LOD‑3 (most relevant, last)
+        parts = ["## Code Context (activation-based LOD)\n"]
+        if lod0_parts:
+            parts.append(
+                "**Known symbols** (minimal activation):\n" + ", ".join(lod0_parts)
+            )
+        if lod1_parts:
+            parts.append("\n**Signatures** (low activation):\n" + "\n".join(lod1_parts))
+        if lod2_parts:
+            parts.append(
+                "\n**Signatures + summaries** (medium activation):\n"
+                + "\n".join(lod2_parts)
+            )
+        if lod3_parts:
+            parts.append("\n### Directly relevant code (high activation)\n")
+            parts.extend(lod3_parts)
+
+        if len(parts) == 1:  # only header, no content
+            return ""
+
+        summary_line = (
+            f"\n_(Context: {len(injected_blocks)} symbols, "
+            f"~{total_tokens} tokens, "
+            f"{len(activated)} nodes activated)_\n"
+        )
+        parts.append(summary_line)
+        return "\n".join(parts)
+
+    # ── Scientific CoT (v7) ──
+    def _gather_static_evidence(
+        self, hypothesis_text: str, project_id: str
+    ) -> StaticEvidence:
+        """
+        Gather deterministic evidence about the structural claims in a hypothesis.
+        No LLM. No GPU. Instant.
+
+        v2: uses SymbolIndex with typed edges for more precise validation.
+        v7 (PASO-19): includes data flow upstream information.
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        state = self._get_state(project_id)
+
+        # ── 1. Symbols mentioned in the hypothesis ──────────────────────
+        words = set(re.findall(r"\b\w+\b", hypothesis_text))
+        mentioned = all_names.intersection(words)
+
+        symbols_found = {
+            name: bool(self._symbol_index.find_blocks(name, project_id))
+            for name in mentioned
+        }
+
+        # ── 2. Claimed call relationships ───────────────────────────────
+        # Detects patterns: "A calls B", "A uses B", "A invokes B"
+        call_patterns = re.findall(
+            r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+            hypothesis_text,
+            re.IGNORECASE,
+        )
+        call_relations_valid = {}
+        for caller, callee in call_patterns:
+            if caller not in all_names or callee not in all_names:
+                continue
+            key = f"{caller}_calls_{callee}"
+            # Verify using typed edges (more precise than symbol.calls)
+            caller_edges = self._symbol_index.get_edges_out(caller, project_id)
+            verified = any(
+                e.dst == callee and e.type in ("calls", "reads", "writes")
+                for e in caller_edges
+            )
+            call_relations_valid[key] = verified
+
+        # ── 3. Recent changes (last hour) ───────────────────────────────
+        now = time.time()
+        recent_window = 3600
+        recent_changes = [
+            name
+            for name in mentioned
+            if any(
+                state["active_blocks"].get(bh) is not None
+                and (now - state["active_blocks"][bh].timestamp) < recent_window
+                for bh in self._symbol_index.find_blocks(name, project_id)
+            )
+        ]
+
+        # ── 4. Entry points mentioned ───────────────────────────────────
+        all_views = self._path_index.get_all(project_id)
+        entry_points_mentioned = [
+            v.entry_point for v in all_views if v.entry_point in mentioned
+        ]
+
+        # ── 5. Path memberships (using PathIndex) ───────────────────────
+        path_memberships: Dict[str, List[str]] = {}
+        for name in mentioned:
+            path_memberships[name] = self._path_index.mark_stale_for_symbol(
+                name, project_id
+            )
+            # Note: mark_stale_for_symbol only reads; it's safe here.
+
+        # ── 6. Data flow upstream (backward slicing) ────────────────────
+        data_flow_upstream: Dict[str, List[str]] = {}
+        if mentioned:
+            for sym_name in mentioned:
+                incoming_edges = self._symbol_index.get_edges_in(sym_name, project_id)
+                data_flow_sources = [
+                    e.src for e in incoming_edges if e.type == "data_flow"
+                ]
+                if data_flow_sources:
+                    data_flow_upstream[sym_name] = data_flow_sources
+
+        # ── 7. Objective score ─────────────────────────────────────────
+        verifiable = len(symbols_found) + len(call_relations_valid)
+        if verifiable == 0:
+            objective_score = 0.5
+        else:
+            verified_true = sum(1 for v in symbols_found.values() if v) + sum(
+                1 for v in call_relations_valid.values() if v
+            )
+            objective_score = verified_true / verifiable
+
+        return StaticEvidence(
+            symbols_found=symbols_found,
+            call_relations_valid=call_relations_valid,
+            recent_changes=recent_changes,
+            entry_points_mentioned=entry_points_mentioned,
+            path_memberships=path_memberships,
+            data_flow_upstream=data_flow_upstream,  # ← v7 (PASO-19)
+            objective_score=objective_score,
+        )
+
+    # --------------------------------------------------------------------------
     # Intent detection (natural language)
     # --------------------------------------------------------------------------
     async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
@@ -4647,6 +7104,11 @@ class Filter:
         """Determine CoT depth, optionally storing it in conversation state."""
         if not user_content:
             return 0
+
+        # ── v7 (PASO-15): force Level 3 Scientific CoT if valve is enabled ──
+        if self.valves.enforce_scientific_method:
+            self._log_debug("CoT: enforce_scientific_method=True → forcing Level 3")
+            return 3
 
         if self.valves.enable_cot_llm_detection:
             level = await self._detect_cot_level_via_llm(
@@ -5576,6 +8038,16 @@ class Filter:
             await self._load_symbol_cache_from_db(project_id)
             self._symbol_cache_loaded_projects.add(project_id)
 
+        # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
+        if self.valves.enable_path_analysis and HAS_TREE_SITTER:
+            existing_views = self._path_index.get_all(project_id)
+            all_names = self._symbol_index.get_all_names(project_id)
+            if all_names and not existing_views:
+                self._log_debug("PathIndex empty but symbols exist — loading from DB")
+                db_views = await self._load_path_views_from_db(project_id)
+                for view in db_views:
+                    self._path_index.add(view, project_id)
+
         return messages
 
     async def _inlet_extract_user_info(self, messages: List[dict]):
@@ -5780,119 +8252,126 @@ class Filter:
         last_user_msg: Optional[dict],
         state: dict,
         slot_free: bool = True,
-    ) -> Tuple[List[Tuple[str, str]], Optional[dict], str]:
-        """Build all system injections: LTM, code context, confidence, etc.
-        Returns (system_injections, cached_response, prelim_system).
+    ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
         """
-        self._log_debug(
-            "Building system injections (LTM, code context, symbol analysis, etc.)"
-        )
-        system_injections: List[Tuple[str, str]] = []
+        Build the system prompt in two separate blocks:
 
-        # ── 🧠 ENRICHMENT – Step 1/6: Retrieve Long‑Term Memory (LTM) ──
-        self._log_debug("🧠 ENRICHMENT – Step 1/6: Retrieve Long‑Term Memory (LTM)")
-        ltm_future = None
+        - static_block (Block A): stable content, placed first.
+          Identical across consecutive requests when code hasn't changed.
+          → Maximises KV cache hits in llama.cpp.
+
+        - dynamic_injections (Block B): per-query content, placed after.
+          Varies with each request.
+          → Only this block needs prefill on cache hits.
+
+        Returns: (static_block, dynamic_injections, cached_response, prelim_system)
+        prelim_system = static_block + dynamic_block (for CoT usage).
+        """
+        # ══════════════════════════════════════════════════════════════
+        # BLOCK A — STATIC (cacheable prefix)
+        # ══════════════════════════════════════════════════════════════
+        self._log_debug("🧱 Block A (static): building / retrieving from cache")
+        static_block = await self._get_static_context_block(project_id, is_code_session)
+
+        # ══════════════════════════════════════════════════════════════
+        # BLOCK B — DYNAMIC (per-query)
+        # ══════════════════════════════════════════════════════════════
+        dynamic_injections: List[Tuple[str, str]] = []
+
+        # ── Step B1: LTM per-query retrieval ─────────────────────────
+        self._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         if (
             self.valves.enable_code_awareness
             and is_code_session
             and not self.valves.smart_context_selection
             and HAS_SENTENCE
             and HAS_CHROMA
+            and user_query
         ):
-            if user_query:
-                ltm_future = asyncio.create_task(
-                    self._retrieve_all_memories_unified(user_query, project_id)
-                )
-
-        # Parallel checks – skip contradiction detection if no free slot
-        context_hash = self._compute_context_hash(messages)
-        contradiction_warning = None
-        cached_response = None
-        duplicate_match = None
-
-        if last_user_msg:
-            # We'll still run parallel checks, but contradiction detection uses LLM
-            if slot_free or not self.valves.enable_contradiction_detection:
-                parallel_checks_task = asyncio.create_task(
-                    self._parallel_context_checks(
-                        messages,
-                        user_query,
-                        context_hash,
-                        project_id,
-                        state,
-                        skip_contradiction=not slot_free,
-                    )
-                )
-                contradiction_warning, cached_response, duplicate_match = (
-                    await parallel_checks_task
-                )
-            else:
-                # Still check cache and duplicate questions (no LLM needed)
-                cached_response = await self._find_cached_response(
-                    user_query, context_hash, state
-                )
-                duplicate_match = await self._find_duplicate_question(
-                    user_query, project_id
-                )
-
-        if cached_response:
-            return [], cached_response, ""
-
-        if contradiction_warning and self.valves.contradiction_inject_warning:
-            system_injections.append(("high", contradiction_warning))
-        if duplicate_match:
-            warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate_match['sim']:.2f})."
-            system_injections.append(("medium", warn_msg))
-
-        # Wait for LTM and format
-        if ltm_future is not None:
-            all_meta = await ltm_future
+            all_meta = await self._retrieve_all_memories_unified(user_query, project_id)
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             unique_meta = []
-            seen = set()
+            seen_docs: Set[str] = set()
             for m in all_meta:
-                if m["doc"] not in seen:
-                    seen.add(m["doc"])
+                if m["doc"] not in seen_docs:
+                    seen_docs.add(m["doc"])
                     unique_meta.append(m)
 
-            max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
-            parts = []
+            max_ltm = self.valves.ltm_retrieval_max_tokens
+            parts: List[str] = []
             current_tokens = 0
-            header = "## Relevant Past Context (with timestamps)\n\n"
-            if max_ltm_tokens > 0 and self.tokenizer:
-                current_tokens += len(self.tokenizer.encode(header))
+            header = "## Relevant Past Context\n\n"
             for mem in unique_meta:
                 ts = mem.get("timestamp")
-                if ts and ts > 1000000000:
+                if ts and ts > 1_000_000_000:
                     time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
                         "%Y-%m-%d %H:%M:%SZ"
                     )
                     text = f"[{time_str}] {mem['doc']}"
                 else:
                     text = f"[unknown date] {mem['doc']}"
-                frag_tokens = (
+                frag_tok = (
                     len(self.tokenizer.encode(text))
                     if self.tokenizer
-                    else (len(text) // 4)
+                    else len(text) // 4
                 )
-                if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
+                if max_ltm > 0 and current_tokens + frag_tok > max_ltm:
                     continue
                 parts.append(text)
-                current_tokens += frag_tokens
+                current_tokens += frag_tok
             if parts:
-                ctx = header + "\n---\n".join(parts)
-                if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
-                    ctx += "\n[Some older fragments omitted to fit token budget]"
-                system_injections.append(("high", ctx))
-                self._log_debug("🧠 ENRICHMENT – Step 1/6: LTM injected")
-            else:
-                self._log_debug("🧠 ENRICHMENT – Step 1/6: No LTM fragments matched")
-        else:
-            self._log_debug(
-                "🧠 ENRICHMENT – Step 1/6: LTM retrieval skipped (no query or disabled)"
+                ltm_text = header + "\n---\n".join(parts)
+                dynamic_injections.append(("high", ltm_text))
+                self._log_debug("🔄 Block B – Step 1/5: LTM injected")
+
+        # ── Step B2: Parallel checks (contradiction, cache, duplicate) ─
+        self._log_debug("🔄 Block B – Step 2/5: Parallel checks")
+        context_hash = self._compute_context_hash(messages)
+        contradiction_warning = None
+        cached_response = None
+        duplicate_match = None
+
+        if last_user_msg:
+            contradiction_warning, cached_response, duplicate_match = (
+                await self._parallel_context_checks(
+                    messages, user_query, context_hash, project_id, state
+                )
             )
 
-        # Proactive cleanup suggestion (no LLM)
+        if cached_response:
+            return static_block, [], cached_response, ""
+
+        if contradiction_warning and self.valves.contradiction_inject_warning:
+            dynamic_injections.append(("medium", contradiction_warning))
+        if duplicate_match:
+            dynamic_injections.append(
+                (
+                    "medium",
+                    f"⚠️ **Note**: Similar question asked before "
+                    f"(similarity {duplicate_match['sim']:.2f}).",
+                )
+            )
+
+        # ── Step B3: Activated code (per-query, varies each request) ──
+        self._log_debug("🔄 Block B – Step 3/5: Code activated by query")
+        if is_code_session and self.valves.enable_code_awareness:
+            # ── v7 (PASO-15/21): graph‑based path context ────────────────
+            if self.valves.enable_path_analysis:
+                intent_vector = await self._classify_intent(user_query, project_id)
+                active_ctx = await self._get_path_context(
+                    project_id, user_query, intent_vector
+                )
+                if not active_ctx:
+                    active_ctx = self._get_active_code_context(project_id, user_query)
+                if active_ctx:
+                    dynamic_injections.append(("critical", active_ctx))
+            else:
+                active_ctx = self._get_active_code_context(project_id, user_query)
+                if active_ctx:
+                    dynamic_injections.append(("critical", active_ctx))
+
+        # ── Step B4: Proactive suggestions ───────────────────────────
+        self._log_debug("🔄 Block B – Step 4/5: Proactive suggestions")
         if (
             self.valves.cleanup_suggestions_enabled
             and self.valves.cleanup_proactive_suggestions
@@ -5905,226 +8384,69 @@ class Filter:
                     state["message_count"] - last_sugg_idx
                     >= self.valves.cleanup_suggestion_cooldown_messages
                 ):
-                    suggestion = (
-                        f"[CodeAware SUGGESTION] You have {len(candidates)} inactive code blocks. "
-                        f"Type `/status` to review or `/clean` to forget them. "
-                        f"(This note is not part of the conversation with the model.)"
+                    dynamic_injections.append(
+                        (
+                            "low",
+                            f"[CodeAware] {len(candidates)} inactive block(s). "
+                            f"Use `/status` or `/clean`.",
+                        )
                     )
-                    system_injections.append(("medium", suggestion))
                     state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
                     self._set_state(project_id, state)
 
-        # ── 🧠 ENRICHMENT – Step 2/6: Active code context ──
-        self._log_debug(
-            "🧠 ENRICHMENT – Step 2/6: Active code context (full or lightweight)"
-        )
-        if is_code_session and self.valves.enable_code_awareness:
-            code_blocks_for_injection = [
-                b
-                for b in state["active_blocks"].values()
-                if b.content_type
-                in (
-                    ContentType.BASE_CODE,
-                    ContentType.COMMITTED_CHANGE,
-                    ContentType.PROPOSED_CHANGE,
-                )
-                and not b.obsolete
-            ]
-            total_code_tokens = sum(
-                b._cached_token_count for b in code_blocks_for_injection
-            )
-
-            if self.valves.use_symbol_level_analysis and slot_free:
-                summary, suggested = await self._analyze_code_via_symbols(
-                    user_question, project_id
-                )
-                if summary:
-                    system_injections.append(("critical", summary))
-                    self._log_debug(
-                        "🧠 ENRICHMENT – Step 2/6: Symbol analysis summary injected"
-                    )
-                if suggested:
-                    suggested_blocks = self._get_blocks_for_symbols(
-                        list(suggested), project_id
-                    )
-                    if suggested_blocks:
-                        extra_lines = []
-                        tokens_used = 0
-                        max_sugg_tokens = min(
-                            self.valves.active_context_max_tokens or 3000,
-                            3000,
-                        )
-                        for blk in suggested_blocks[:5]:
-                            bt = blk._cached_token_count
-                            if (
-                                max_sugg_tokens > 0
-                                and tokens_used + bt > max_sugg_tokens
-                            ):
-                                break
-                            loc = f" (file: {blk.file_path})" if blk.file_path else ""
-                            extra_lines.append(
-                                f"**{blk.hash[:8]}**{loc}\n```\n{blk.content[:3000]}\n```"
-                            )
-                            tokens_used += bt
-                        if extra_lines:
-                            system_injections.append(
-                                (
-                                    "high",
-                                    "## Additional suggested code\n\n"
-                                    + "\n".join(extra_lines),
-                                )
-                            )
-                            self._log_debug(
-                                "🧠 ENRICHMENT – Step 2/6: Suggested code blocks injected"
-                            )
-            else:
-                # Fallback to structural task check or normal context (no LLM needed)
-                is_structural = (
-                    await self._is_structural_task(user_question)
-                    if user_question
-                    else False
-                )
-                if total_code_tokens > self.valves.huge_injection_threshold_tokens > 0:
-                    active_ctx = await self._build_lightweight_context(project_id)
-                    injected_hashes: Set[str] = set()
-                    if user_question:
-                        pre_expanded = await self._smart_pre_expand(
-                            user_query=user_question,
-                            project_id=project_id,
-                            token_budget=self.valves.smart_pre_expand_max_tokens,
-                            seen_hashes=injected_hashes,
-                        )
-                        if pre_expanded:
-                            active_ctx += "\n" + pre_expanded
-                        else:
-                            expanded = self._expand_referenced_symbols(
-                                project_id, user_question, seen_hashes=injected_hashes
-                            )
-                            if expanded:
-                                active_ctx += "\n" + expanded
-                    if is_structural:
-                        active_ctx += (
-                            "\n\n[Note: Structural analysis requested. "
-                            "Full code bodies have been pre-expanded above where available.]"
-                        )
-                else:
-                    active_ctx = self._get_active_code_context(
-                        project_id, user_query=user_query
-                    )
-                    if user_question and not is_structural:
-                        expanded = self._expand_referenced_symbols(
-                            project_id, user_question
-                        )
-                        if expanded:
-                            active_ctx += "\n" + expanded
-
-                if active_ctx:
-                    checklist = (
-                        "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                        "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                        "2. Identify every assumption the code makes and verify each one.\n"
-                        "3. For every regex or string match, test it against 5 counter-examples.\n"
-                        "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                        "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                        "6. Output your reasoning step by step, then provide the corrected code.\n"
-                    )
-                    active_ctx = checklist + "\n\n" + active_ctx
-                    system_injections.append(("critical", active_ctx))
-                    self._log_debug(
-                        "🧠 ENRICHMENT – Step 2/6: Active code context injected"
-                    )
-            if not slot_free:
-                self._log_debug(
-                    "🧠 ENRICHMENT – Step 2/6: Symbol analysis skipped (no free slot)"
-                )
-        else:
-            self._log_debug(
-                "🧠 ENRICHMENT – Step 2/6: Active code context skipped (not a code session or disabled)"
-            )
-
-        # ── 🧠 ENRICHMENT – Step 3/6: Confidence scoring ──
-        self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence scoring")
-        if self.valves.enable_confidence_scoring and is_code_session:
-            system_injections.append(("high", self.valves.confidence_prompt))
-            self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence prompt injected")
-        else:
-            self._log_debug("🧠 ENRICHMENT – Step 3/6: Confidence scoring skipped")
-
-        # ── 🧠 ENRICHMENT – Step 4/6: Feedback context ──
-        self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context")
-        if (
-            is_code_session
-            and self.valves.enable_feedback_tracking
-            and self.valves.inject_feedback_context
-        ):
-            feedback_ctx = self._get_feedback_context(project_id)
-            if feedback_ctx:
-                system_injections.append(("high", feedback_ctx))
-                self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context injected")
-            else:
-                self._log_debug(
-                    "🧠 ENRICHMENT – Step 4/6: No feedback history to inject"
-                )
-        else:
-            self._log_debug("🧠 ENRICHMENT – Step 4/6: Feedback context skipped")
-
-        # ── 🧠 ENRICHMENT – Step 5/6: Proactive suggestions (cleanup, command, summary) ──
-        self._log_debug("🧠 ENRICHMENT – Step 5/6: Proactive suggestions")
-        system_msgs = [m for m in messages if m.get("role") == "system"]
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
-        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+        total_tokens = self._estimate_tokens(sys_msgs + history_msgs)
         if self.valves.context_window_tokens > 0:
             suggestion = await self._check_and_suggest_summarization(
                 project_id, total_tokens, self.valves.context_window_tokens
             )
             if suggestion:
-                system_injections.append(("medium", suggestion))
+                dynamic_injections.append(("low", suggestion))
+
         cmd_suggestion = await self._suggest_commands(project_id, state)
         if cmd_suggestion:
-            system_injections.append(("medium", cmd_suggestion))
-        if suggestion or cmd_suggestion:
-            self._log_debug("🧠 ENRICHMENT – Step 5/6: Suggestions injected")
-        else:
-            self._log_debug("🧠 ENRICHMENT – Step 5/6: No suggestions needed")
+            dynamic_injections.append(("low", cmd_suggestion))
 
-        # ── 🧠 ENRICHMENT – Step 6/6: Assemble preliminary system prompt ──
-        self._log_debug("🧠 ENRICHMENT – Step 6/6: Assemble preliminary system prompt")
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        base_content = ""
-        if sys_msgs:
-            base_content = sys_msgs[0].get("content", "")
-
+        # ── Step B5: Assemble prelim_system for CoT ─────────────────
+        self._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         budget = self.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
         if budget > 0 and self.tokenizer:
-            system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
-            selected_texts = []
-            total_inj_tokens = 0
-            for prio, text in system_injections:
+            dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected: List[str] = []
+            used = 0
+            static_tokens = (
+                len(self.tokenizer.encode(static_block)) if static_block else 0
+            )
+            remaining_budget = max(0, budget - static_tokens)
+            for prio, text in dynamic_injections:
                 if not text:
                     continue
-                tokens = len(self.tokenizer.encode(text))
-                if total_inj_tokens + tokens <= budget:
-                    selected_texts.append(text)
-                    total_inj_tokens += tokens
-                else:
-                    if prio in ("critical", "high"):
-                        available = budget - total_inj_tokens
-                        if available > 20:
-                            truncated = text[: available * 4] + "\n[truncated]"
-                            selected_texts.append(truncated)
-                            total_inj_tokens += len(self.tokenizer.encode(truncated))
-                            break
-            prelim_system = "\n\n".join(selected_texts)
+                tok = len(self.tokenizer.encode(text))
+                if used + tok <= remaining_budget:
+                    selected.append(text)
+                    used += tok
+                elif prio in ("critical", "high"):
+                    avail = remaining_budget - used
+                    if avail > 20:
+                        selected.append(text[: avail * 4] + "\n[truncated]")
+                        break
+            dynamic_block = "\n\n".join(selected)
         else:
-            prelim_system = "\n\n".join(text for _, text in system_injections if text)
+            dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
+        # prelim_system = A + B for CoT usage (needs to see both blocks)
+        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
+        prelim_system = static_block + separator + dynamic_block
+
+        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
         if base_content.strip():
             prelim_system = prelim_system + "\n\n" + base_content
 
-        self._log_debug("🧠 ENRICHMENT – Step 6/6: Preliminary system prompt ready")
-        return system_injections, None, prelim_system
+        self._log_debug("🔄 Block B: complete")
+        return static_block, dynamic_injections, None, prelim_system
 
     async def _should_keep_full_code(self, user_question: str) -> bool:
         """
@@ -6156,7 +8478,8 @@ class Filter:
     async def _inlet_assemble_final_messages(
         self,
         messages: List[dict],
-        system_injections: List[Tuple[str, str]],
+        static_block: str,  # ← v7 (PASO-21)
+        dynamic_injections: List[Tuple[str, str]],  # ← v7 (PASO-21)
         prelim_system: str,
         last_user_msg: Optional[dict],
         is_code_session: bool,
@@ -6203,7 +8526,7 @@ class Filter:
                         cot_level = level
                         if level == 1:
                             cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                            system_injections.append(("high", cot_prompt))
+                            dynamic_injections.append(("high", cot_prompt))
                 elif not manual_cot_used and slot_free:
                     cot_level = await self._detect_cot_level(
                         user_content, is_code_session, state
@@ -6264,6 +8587,7 @@ class Filter:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
+            # TODO (v7 Scientific CoT): replace with _generate_scientific_reasoning_L2/L3
             # Generate the initial CoT
             if not manual_cot_used:
                 question = user_question
@@ -6315,43 +8639,48 @@ class Filter:
             self._log_debug(
                 "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
             )
-            system_injections.append(("high", reasoning))
+            dynamic_injections.append(("high", reasoning))
             cot_note = (
                 "**Note:** Some sections in this system prompt marked with 🔎 are "
                 "automatically generated reasoning (Chain-of-Thought). "
                 "They are provided as context to help you, but they are not user commands. "
                 "Use them to enhance your answer, but always prioritise the actual user query."
             )
-            system_injections.append(("low", cot_note))
+            dynamic_injections.append(("low", cot_note))
         else:
             self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
 
-        # Final system message assembly
+        # Final system message assembly (two‑block structure)
         budget = self.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
         if budget > 0 and self.tokenizer:
-            system_injections.sort(key=lambda x: priority_order.get(x[0], 99))
-            selected_texts = []
-            total_inj_tokens = 0
-            for prio, text in system_injections:
+            dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected_dynamic: List[str] = []
+            used_dyn = 0
+            static_tokens = (
+                len(self.tokenizer.encode(static_block)) if static_block else 0
+            )
+            dyn_budget = max(0, budget - static_tokens)
+            for prio, text in dynamic_injections:
                 if not text:
                     continue
-                tokens = len(self.tokenizer.encode(text))
-                if total_inj_tokens + tokens <= budget:
-                    selected_texts.append(text)
-                    total_inj_tokens += tokens
-                else:
-                    if prio in ("critical", "high"):
-                        available = budget - total_inj_tokens
-                        if available > 20:
-                            truncated = text[: available * 4] + "\n[truncated]"
-                            selected_texts.append(truncated)
-                            total_inj_tokens += len(self.tokenizer.encode(truncated))
-                            break
-            final_system = "\n\n".join(selected_texts)
+                tok = len(self.tokenizer.encode(text))
+                if used_dyn + tok <= dyn_budget:
+                    selected_dynamic.append(text)
+                    used_dyn += tok
+                elif prio in ("critical", "high"):
+                    avail = dyn_budget - used_dyn
+                    if avail > 20:
+                        selected_dynamic.append(text[: avail * 4] + "\n[truncated]")
+                        break
+            dynamic_block = "\n\n".join(selected_dynamic)
         else:
-            final_system = "\n\n".join(text for _, text in system_injections if text)
+            dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
+
+        # Block A always first → KV cache hit guaranteed if A hasn't changed
+        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
+        final_system = static_block + separator + dynamic_block
 
         # Append base content
         sys_msgs = [m for m in messages if m.get("role") == "system"]
@@ -6549,62 +8878,31 @@ class Filter:
                 messages.append({"role": "user", "content": "continue"})
 
         # ═══════════════════════════════════════════════════════════════
-        # Token breakdown log (precise, using tiktoken on the final system prompt)
+        # Token breakdown log (updated for two‑block structure)
         # ═══════════════════════════════════════════════════════════════
         if self.valves.debug and self.tokenizer and final_system.strip():
-            total_system_tokens = len(self.tokenizer.encode(final_system))
-
-            injection_texts = [text for _, text in system_injections if text]
-            combined_injections = "\n\n".join(injection_texts)
-            base_content_tokens = 0
-            if base_content.strip():
-                base_content_tokens = len(self.tokenizer.encode(base_content))
-                inj_only_tokens = total_system_tokens - base_content_tokens
-                if combined_injections:
-                    inj_only_tokens = len(self.tokenizer.encode(combined_injections))
-                else:
-                    inj_only_tokens = 0
-            else:
-                inj_only_tokens = total_system_tokens if combined_injections else 0
-
-            ltm_tokens = 0
-            code_context_tokens = 0
-            cot_tokens = 0
-            other_instructions = 0
-
-            for inj_text in injection_texts:
-                t = len(self.tokenizer.encode(inj_text))
-                if "Relevant Past Context" in inj_text:
-                    ltm_tokens += t
-                elif "synthesized" in inj_text.lower() or "Synthesize" in inj_text:
-                    code_context_tokens += t
-                elif "Additional suggested code" in inj_text:
-                    code_context_tokens += t
-                elif reasoning and inj_text == reasoning:
-                    cot_tokens += t
-                else:
-                    other_instructions += t
-
-            diff = inj_only_tokens - (
-                ltm_tokens + code_context_tokens + cot_tokens + other_instructions
+            static_tok = len(self.tokenizer.encode(static_block)) if static_block else 0
+            dynamic_tok = (
+                len(self.tokenizer.encode(dynamic_block)) if dynamic_block else 0
             )
-            if diff != 0:
-                other_instructions += diff
+            total_system_tok = len(self.tokenizer.encode(final_system))
 
-            self._log_debug("─" * 50)
-            self._log_debug("TOKEN BREAKDOWN – injected into system prompt")
-            self._log_debug(f"  LTM (past messages):                  ~{ltm_tokens}")
+            prefix_hash = self._last_static_prefix_hash.get(project_id, "N/A")
+            self._log_debug("─" * 60)
+            self._log_debug("TOKEN BREAKDOWN — system prompt")
+            self._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
+            self._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
             self._log_debug(
-                f"  Code context (active code, symbols):  ~{code_context_tokens}"
+                f"  TOTAL system tokens:          ~{total_system_tok} tokens"
             )
-            self._log_debug(f"  CoT reasoning (LLM generated):        ~{cot_tokens}")
+            self._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
             self._log_debug(
-                f"  System instructions (confidence, cleanup, etc.): ~{other_instructions}"
+                f"  → If hash matches previous:   KV cache HIT in llama.cpp"
             )
             self._log_debug(
-                f"  TOTAL injected system tokens:         ~{total_system_tokens}"
+                f"  → If hash changed:            KV cache MISS, full prefill"
             )
-            self._log_debug("─" * 50)
+            self._log_debug("─" * 60)
         elif self.valves.debug:
             self._log_debug("No system prompt injected (token breakdown skipped).")
 
@@ -6717,6 +9015,57 @@ class Filter:
             )
             return body
 
+        # ── Silent Ingestion (Modo B: chunked paste) ────────────────────
+        # v7 (PASO-22)
+        if (
+            self.valves.enable_silent_ingestion
+            and last_user_msg is not None
+            and not is_explicit_command
+            and is_code_session  # only in code sessions
+        ):
+            if await self._is_code_only_message(user_query):
+                self._log_section("SILENT INGESTION MODE")
+
+                # Process code into SymbolGraph without invoking main LLM
+                await self._update_active_code(last_user_msg, project_id)
+
+                # Resolve cross‑references with previous chunks
+                resolved = await self._resolve_dangling_edges(project_id)
+
+                # Rebuild PathIndex with new symbols
+                if self.valves.enable_path_analysis:
+                    await self._rebuild_path_index(project_id)
+
+                # Invalidate static block (new code → new Block A)
+                self._invalidate_static_context_block(project_id, "new chunk ingested")
+
+                # Statistics for the user
+                state = self._get_state(project_id)
+                n_blocks = len(state.get("active_blocks", {}))
+                n_symbols = len(self._symbol_index.get_all_names(project_id))
+                n_paths = len(self._path_index.get_all(project_id))
+                cross_note = (
+                    f", {resolved} cross-references resolved" if resolved > 0 else ""
+                )
+
+                confirmation = (
+                    f"✓ **Code indexed**: {n_blocks} blocks · "
+                    f"{n_symbols} symbols · {n_paths} paths{cross_note}\n"
+                    f"Ready for queries."
+                )
+
+                # Replace the user message with the confirmation
+                # (it never reaches the main LLM, no conversation context consumed)
+                messages[-1]["content"] = confirmation
+                body["messages"] = messages
+                body["messages"].append({"role": "assistant", "content": confirmation})
+
+                await self._save_state_if_dirty(project_id)
+                self._log_section(
+                    "SILENT INGESTION END", duration=time.monotonic() - inlet_start
+                )
+                return body
+
         # Per‑request tracking for graceful STOP cancellation
         background_tasks: list[asyncio.Task] = []
         token = _inlet_background_tasks.set(background_tasks)
@@ -6760,9 +9109,10 @@ class Filter:
             #      - Feedback context, cleanup suggestions, confidence
             #      - Parallel checks: contradictions, duplicate questions,
             #        response cache lookup
+            #      - Now separates into static_block (Block A) and dynamic_injections (Block B)
             # ─────────────────────────────────────────────────────────────
             step_start = time.monotonic()
-            system_injections, cached_response, prelim_system = (
+            static_block, dynamic_injections, cached_response, prelim_system = (
                 await self._inlet_build_system_injections(
                     messages,
                     project_id,
@@ -6803,11 +9153,13 @@ class Filter:
             #      - Summarise trimmed messages if enabled
             #      - Inject final system prompt respecting token budget
             #      - Display token breakdown (debug)
+            #      - Now uses static_block + dynamic_injections for KV cache stability
             # ─────────────────────────────────────────────────────────────
             step_start = time.monotonic()
             messages = await self._inlet_assemble_final_messages(
                 messages,
-                system_injections,
+                static_block,  # ← v7 (PASO-21)
+                dynamic_injections,  # ← v7 (PASO-21)
                 prelim_system,
                 last_user_msg,
                 is_code_session,
@@ -6847,7 +9199,8 @@ class Filter:
 
             # Unload any auxiliary models we may have loaded during enrichment/CoT
             # so that OpenWebUI has a free slot for the main model.
-            await self._unload_models_under_lock(wait_for_tasks=False)
+            # (disabled for now because it was unloading the mail model too)
+            # await self._unload_models_under_lock(wait_for_tasks=False)
 
             if _inlet_aborted:
                 for task in background_tasks:
@@ -6908,6 +9261,7 @@ class Filter:
 
                     # ── 🔥 STATE MANAGEMENT: update active code blocks & LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
+                        await self._wait_for_llm_tasks()
                         if is_code_session:
                             self._log_debug(
                                 "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM "
@@ -6966,6 +9320,17 @@ class Filter:
                         code_state_hash,
                     )
 
+            # 🚀 RESOURCE OPTIMISATION – Speculative prefetch
+            if self.valves.enable_speculative_prefetch and is_code_session:
+                last_activated = getattr(self, "_last_activation_scores", {}).get(
+                    project_id, {}
+                )
+                if last_activated:
+                    self._background_task(
+                        self._speculative_prefetch(project_id, last_activated),
+                        name="speculative_prefetch",
+                    )
+
             # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
             if self._purge_task is None or self._purge_task.done():
                 self._log_debug(
@@ -6976,6 +9341,18 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
+
+            # ── v7 (PASO-20): RAPTOR periodic rebuild ──
+            if (
+                self.valves.enable_raptor
+                and self._write_counter % self.valves.raptor_rebuild_interval == 0
+            ):
+                self._log_debug("RAPTOR: triggering background index rebuild")
+                self._background_task(
+                    self._rebuild_raptor_index(project_id),
+                    name="raptor_rebuild",
+                )
+
             if self._write_counter % 100 == 0:
                 self._log_debug(
                     "🚀 RESOURCE OPTIMISATION – Running DB checkpoints "
@@ -6990,18 +9367,9 @@ class Filter:
             )
             await self._save_state_if_dirty(project_id)
 
-            # 🚀 RESOURCE OPTIMISATION: free VRAM for the main model
-            # self._log_debug(
-            #    "🚀 RESOURCE OPTIMISATION – Freeing VRAM "
-            #    "(unloading models so the next request starts with a clean slot)"
-            # )
-            # await self._unload_models_under_lock()
-
-            # NOTE: We do NOT unload models here. The main model may still be needed
-            # by OpenWebUI for title generation and other tasks.
-            # The inlet already unloads auxiliary models after building the prompt.
+            # 🚀 RESOURCE OPTIMISATION: Skipping unload to keep main model loaded
             self._log_debug(
-                "🚀 RESOURCE OPTIMISATION – Skipping unload to keep main model available for OpenWebUI"
+                "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
             )
         finally:
             pass
