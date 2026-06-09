@@ -366,12 +366,6 @@ class ActivationGraph:
 # ---------------------------------------------------------------------------
 
 
-class QueryActivationSeed(BaseModel):
-    symbol_hints: List[str]  # symbols detected in the query
-    intent_vector: Dict[str, float]  # {intent: weight}, values sum ≈ 1.0
-    # Example: {"explain": 0.7, "modify": 0.2, "debug": 0.1}
-
-
 class SubgraphExtractor:
     """
     Extracts a relevant subgraph from the SymbolGraph given an ActivationGraph.
