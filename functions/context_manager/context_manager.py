@@ -1513,8 +1513,8 @@ class Filter:
         #  Code Compression (LLMLingua-2)
         # ═══════════════════════════════════════════════════════════════
         enable_code_compression: bool = Field(
-            default=False,
-            description="Enable LLMLingua-2 token compression within code blocks. Requires llmlingua>=0.2.0.",
+            default=True,
+            description="Enable LLMLingua-2 token compression within code blocks. Requires llmlingua>=0.2.0. Self-disables itfelt if the dependency is not found.",
         )
         code_compression_rate: float = Field(
             default=0.5,
@@ -1595,7 +1595,7 @@ class Filter:
             description="Max refinement iterations in Level 3 Scientific CoT.",
         )
         enable_step_back_prompting: bool = Field(
-            default=False,
+            default=True,
             description="Before CoT, ask an abstract architectural question for better context.",
         )
         step_back_always: bool = Field(
@@ -1801,7 +1801,7 @@ class Filter:
             description="Context generation mode: 'metadata' (fast, no LLM) or 'llm' (better, slower).",
         )
         enable_multi_query_retrieval: bool = Field(
-            default=False,
+            default=True,
             description="Generate multiple query variants before LTM retrieval and merge results.",
         )
         multi_query_variants: int = Field(
