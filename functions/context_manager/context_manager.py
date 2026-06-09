@@ -7111,6 +7111,56 @@ class Filter:
             self._log_debug(f"Slot restore error: {e}")
             return False
 
+    async def _slot_restore_for_continuity(self, project_id: str) -> bool:
+        """
+        Restore KV cache after auxiliary LLM calls (multi-query, CoT, contradiction)
+        have trashed the slot due to SWA architecture.
+
+        Uses the same filename as _slot_save_if_needed — no extra files created.
+        Called at the END of every inlet when slot_free=True.
+        """
+        if not self.valves.enable_slot_persistence:
+            return False
+
+        cached = self._static_context_block_cache.get(project_id)
+        if not cached:
+            return False
+        _, static_text = cached
+        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
+        filename = self._slot_filename(project_id, static_hash)
+
+        # Only restore if the file exists (i.e., a previous turn was saved)
+        slot_dir = self.valves.slot_save_path.rstrip("/")
+        if not os.path.exists(os.path.join(slot_dir, filename)):
+            return False
+
+        base = self.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            session = await _shared_get_http_session(timeout_seconds=30)
+            async with session.post(
+                f"{base}/slots/{self.valves.slot_id}",
+                params={"action": "restore"},
+                json={"filename": filename, "model": self.valves.llm_model},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._log_debug(
+                        f"✓ KV cache restored post-aux ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
+                    )
+                    return True
+                body = await resp.text()
+                self._log_debug(
+                    f"KV cache continuity restore failed: HTTP {resp.status} — {body}"
+                )
+                return False
+        except Exception as e:
+            self._log_debug(f"KV cache continuity restore error: {e}")
+            return False
+
     async def _slot_save_if_needed(self, project_id: str) -> bool:
         if not self.valves.enable_slot_persistence:
             return False
@@ -9247,9 +9297,15 @@ class Filter:
         duplicate_match = None
 
         if last_user_msg:
+            # --- Fix 1: pasar skip_contradiction=not slot_free ---
             contradiction_warning, cached_response, duplicate_match = (
                 await self._parallel_context_checks(
-                    messages, user_query, context_hash, project_id, state
+                    messages,
+                    user_query,
+                    context_hash,
+                    project_id,
+                    state,
+                    skip_contradiction=not slot_free,
                 )
             )
 
@@ -9846,6 +9902,16 @@ class Filter:
         # We will avoid loading any auxiliary model while the slot is occupied.
         # ─────────────────────────────────────────────────────────────────
         slot_free = await self._wait_for_empty_slot(retries=1, delay=0.5)
+
+        # --- Cold start guard ---
+        if slot_free and self._last_used_model is None:
+            self._log_debug(
+                "Cold start detected — model not yet warmed up, "
+                "auxiliary calls will be skipped for this inlet"
+            )
+            slot_free = False
+        # --------------------------------
+
         if not slot_free:
             self._log_debug(
                 "Main model slot occupied – auxiliary model calls will be skipped"
@@ -10030,7 +10096,7 @@ class Filter:
                     is_code_session,
                     last_user_msg,
                     state,
-                    slot_free=slot_free,  # <-- pass the flag
+                    slot_free=slot_free,
                 )
             )
             _inlet_timing("Step 8/9: Build system injections", step_start)
@@ -10068,8 +10134,8 @@ class Filter:
             messages = await self._inlet_assemble_final_messages(
                 messages,
                 project_id,
-                static_block,  # ← v7 (PASO-21)
-                dynamic_injections,  # ← v7 (PASO-21)
+                static_block,
+                dynamic_injections,
                 prelim_system,
                 last_user_msg,
                 is_code_session,
@@ -10078,7 +10144,7 @@ class Filter:
                 background_tasks,
                 user_question,
                 has_code_blocks,
-                slot_free=slot_free,  # <-- pass the flag
+                slot_free=slot_free,
             )
             _inlet_timing(
                 "Step 9/9: Assemble final messages (CoT, trim, system prompt)",
@@ -10112,6 +10178,17 @@ class Filter:
                     if not task.done():
                         task.cancel()
             _inlet_background_tasks.reset(token)
+
+            # ── 🚀 RESOURCE OPTIMISATION: restore KV cache post-auxiliary-calls ──
+            # Multi-query, CoT and contradiction detection use the main model slot,
+            # which invalidates conversation checkpoints (SWA architecture).
+            # Restoring here costs ~3s but avoids a 95s full prefill on next turn.
+            if (
+                slot_free
+                and self.valves.enable_slot_persistence
+                and self._last_used_model == self.valves.llm_model
+            ):
+                await self._slot_restore_for_continuity(project_id)
 
         return body
 
@@ -10287,11 +10364,20 @@ class Filter:
                     name="slot_save",
                 )
 
-            # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
+            # 🔥 STATE MANAGEMENT – Persist edges del SymbolGraph
             if self.valves.enable_edge_persistence:
                 self._background_task(
                     self._save_symbol_edges_to_db(project_id),
                     name="save_symbol_edges",
+                )
+
+            # 🔥 STATE MANAGEMENT - Persist CodePathViews
+            if self.valves.enable_path_analysis:
+                self._background_task(
+                    self._save_path_views_to_db(
+                        project_id, self._path_index.get_all(project_id)
+                    ),
+                    name="save_path_views",
                 )
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
