@@ -24,7 +24,7 @@ import textwrap
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple, Union, Set
+from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable
 from enum import Enum
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -1805,6 +1805,135 @@ class Filter:
             ),
         )
 
+        # ─── Stack Trace Activation (v7 Phase 5) ────────────────────────
+        enable_traceback_activation: bool = Field(
+            default=True,
+            description=(
+                "When the user message contains a traceback, extract function names "
+                "from each frame and seed them in the ActivationGraph with scores "
+                "proportional to frame depth. Deeper frames (closer to the crash) "
+                "receive higher scores."
+            ),
+        )
+
+        # ─── Conversation History Seeds (v7 Phase 5) ────────────────────
+        enable_history_seeds: bool = Field(
+            default=True,
+            description=(
+                "Boost activation of symbols that appear frequently in recent "
+                "conversation messages, even if not mentioned in the current query. "
+                "Prevents losing session context in follow-up questions."
+            ),
+        )
+        history_seeds_lookback: int = Field(
+            default=6,
+            ge=2,
+            le=20,
+            description="Number of recent messages to scan for history seeds.",
+        )
+        history_seeds_max_boost: float = Field(
+            default=0.6,
+            ge=0.1,
+            le=0.9,
+            description=(
+                "Maximum activation score boost from conversation history. "
+                "This is added on top of the score from the current query seeds."
+            ),
+        )
+
+        # ─── Cross-Session Edge Persistence (v7 Phase 5) ────────────────
+        enable_edge_persistence: bool = Field(
+            default=True,
+            description=(
+                "Persist typed SymbolGraph edges to SQLite at end of session. "
+                "On the next session with the same project_id and same code, "
+                "the graph is restored automatically without re-pasting code. "
+                "Guard: edges are invalidated if the code state hash changes."
+            ),
+        )
+
+        # ─── Adaptive LOD Thresholds (v7 Phase 5) ───────────────────────
+        enable_lod_adaptive: bool = Field(
+            default=True,
+            description=(
+                "Automatically adjust lod3_threshold based on whether the LLM "
+                "references symbols in its response that only received summary/signature. "
+                "Converges to optimal thresholds for the project over time."
+            ),
+        )
+        lod_adapt_rate: float = Field(
+            default=0.05,
+            ge=0.01,
+            le=0.2,
+            description=(
+                "Step size for each LOD threshold adjustment. "
+                "Smaller = more stable but slower convergence."
+            ),
+        )
+        lod_adapt_min: float = Field(
+            default=0.25,
+            ge=0.1,
+            le=0.5,
+            description="Minimum value for lod3_threshold (prevents injecting everything).",
+        )
+        lod_adapt_max: float = Field(
+            default=0.75,
+            ge=0.5,
+            le=0.95,
+            description="Maximum value for lod3_threshold (prevents injecting nothing).",
+        )
+        lod_adapt_underserved_min: int = Field(
+            default=2,
+            ge=1,
+            le=10,
+            description=(
+                "Minimum number of underserved symbols to trigger threshold decrease. "
+                "Prevents over-reacting to a single mention."
+            ),
+        )
+        lod_adapt_overserved_min: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="Minimum number of overserved symbols to trigger threshold increase.",
+        )
+
+        # ─── Multi-Seed Activation Diversity (v7 Phase 5) ───────────────
+        enable_multi_seed_activation: bool = Field(
+            default=True,
+            description=(
+                "Run three independent PPR activation passes (lexical, structural, "
+                "historical) and combine their results. Improves recall for queries "
+                "that don't mention exact symbol names."
+            ),
+        )
+        multi_seed_weight_lexical: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Weight for lexical seeds (exact/partial symbol name matches in query "
+                "plus traceback frames). Should sum to ~1.0 with structural and historical."
+            ),
+        )
+        multi_seed_weight_structural: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Weight for structural seeds (entry points of CodePathViews that "
+                "contain lexically matched symbols)."
+            ),
+        )
+        multi_seed_weight_historical: float = Field(
+            default=0.2,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Weight for historical seeds (symbols from recent conversation history)."
+            ),
+        )
+
     INTENT_KEYWORDS = {
         "forget",
         "olvida",
@@ -2832,6 +2961,14 @@ class Filter:
             "CREATE INDEX IF NOT EXISTS idx_raptor_project_level "
             "ON raptor_clusters(project_id, level)"
         )
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_edges_meta (
+                project_id      TEXT PRIMARY KEY,
+                code_state_hash TEXT NOT NULL,
+                edge_count      INTEGER NOT NULL DEFAULT 0,
+                saved_at        REAL NOT NULL
+            )
+        """)
         self._db_conn.commit()
 
     def _get_project_id(self) -> str:
@@ -3108,6 +3245,132 @@ class Filter:
             except Exception as e:
                 self._log_debug(f"Skipping corrupt CodePathView: {e}")
         return views
+
+    # --------------------------------------------------------------------------
+    # SymbolGraph edge persistence (v7 – Phase 5, PASO-28)
+    # --------------------------------------------------------------------------
+
+    async def _save_symbol_edges_to_db(self, project_id: str) -> int:
+        """
+        Persist the typed edges from the SymbolIndex to SQLite.
+        Saves alongside the current code_state_hash for invalidation detection.
+        Returns the number of edges saved.
+        """
+        if not self.valves.enable_edge_persistence:
+            return 0
+
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+        if not edges_out:
+            return 0
+
+        code_hash = self._compute_code_state_hash(project_id)
+        if not code_hash:
+            return 0  # no active code, nothing to persist
+
+        total_edges = sum(len(edges) for edges in edges_out.values())
+
+        def _write():
+            # Clear previous edges for this project
+            self._db_conn.execute(
+                "DELETE FROM symbol_edges WHERE project_id = ?", (project_id,)
+            )
+            # Insert all current edges
+            for src, edges in edges_out.items():
+                for edge in edges:
+                    self._db_conn.execute(
+                        "INSERT OR REPLACE INTO symbol_edges "
+                        "(project_id, src, dst, type, weight, confidence) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            project_id,
+                            edge.src,
+                            edge.dst,
+                            edge.type,
+                            edge.weight,
+                            edge.confidence,
+                        ),
+                    )
+            # Update metadata
+            self._db_conn.execute(
+                "INSERT OR REPLACE INTO symbol_edges_meta "
+                "(project_id, code_state_hash, edge_count, saved_at) "
+                "VALUES (?,?,?,?)",
+                (project_id, code_hash, total_edges, time.time()),
+            )
+            self._db_conn.commit()
+
+        await self._db_write_queue.put((_write, (), {}))
+        self._log_debug(
+            f"Edge persistence: saved {total_edges} edges " f"(code_hash={code_hash})"
+        )
+        return total_edges
+
+    async def _load_symbol_edges_from_db(self, project_id: str) -> int:
+        """
+        Restore typed edges from SQLite.
+        Only restores if the saved code_state_hash matches the current state.
+        Returns the number of edges restored (0 if stale or no data).
+        """
+        if not self.valves.enable_edge_persistence:
+            return 0
+
+        # Skip if edges are already loaded in memory
+        existing = self._symbol_index.get_all_edges_out(project_id)
+        if existing:
+            return 0
+
+        current_code_hash = self._compute_code_state_hash(project_id)
+        if not current_code_hash:
+            return 0  # no active code
+
+        # Check if the saved hash matches
+        meta_row = await anyio.to_thread.run_sync(
+            lambda: self._db_conn.execute(
+                "SELECT code_state_hash, edge_count FROM symbol_edges_meta "
+                "WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        )
+
+        if not meta_row:
+            self._log_debug("Edge persistence: no saved edges for this project")
+            return 0
+
+        saved_hash, saved_count = meta_row
+        if saved_hash != current_code_hash:
+            self._log_debug(
+                f"Edge persistence: stale edges detected "
+                f"(saved={saved_hash}, current={current_code_hash}). "
+                f"Edges will be rebuilt when code is processed."
+            )
+            return 0
+
+        # Hash matches → restore edges
+        rows = await anyio.to_thread.run_sync(
+            lambda: self._db_conn.execute(
+                "SELECT src, dst, type, weight, confidence "
+                "FROM symbol_edges WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        )
+
+        count = 0
+        for src, dst, etype, weight, confidence in rows:
+            edge = Edge(
+                src=src,
+                dst=dst,
+                type=etype,
+                weight=weight,
+                confidence=confidence,
+            )
+            self._symbol_index.add_edge(edge, project_id)
+            count += 1
+
+        self._log_debug(
+            f"✓ Edge persistence: restored {count} edges "
+            f"(code_hash={current_code_hash})"
+        )
+        return count
 
     # --------------------------------------------------------------------------
     # Symbol index helpers
@@ -5418,84 +5681,267 @@ class Filter:
         specificity = math.log(total / n_blocks) + 1.0
         return max(0.1, min(3.0, specificity))
 
+    def _store_activation_scores(self, ag: ActivationGraph, project_id: str):
+        """Save activation scores for speculative prefetch and LOD tracking."""
+        activated = ag.get_activated_nodes(
+            threshold=self.valves.path_activation_threshold
+        )
+        if not hasattr(self, "_last_activation_scores"):
+            self._last_activation_scores: Dict[str, Dict[str, float]] = {}
+        self._last_activation_scores[project_id] = activated
+
     def _build_activation_graph(
         self,
         query: str,
         project_id: str,
         max_propagation_steps: int = 4,
+        messages: Optional[List[dict]] = None,
     ) -> ActivationGraph:
         """
-        Build an ActivationGraph for the given query.
+        Build an ActivationGraph combining up to three independent seed vectors.
 
-        Process:
-        1. Extract seeds (symbols mentioned in the query)
-        2. Activate exact seeds with score adjusted by specificity,
-           partial seeds similarly but with lower base.
-        3. Propagate activation through the call graph using Personalized PageRank.
+        Vector 1 — Lexical:
+          Exact/partial symbol name matches in the query, enriched with
+          traceback frame seeds if present.
+          Weight: multi_seed_weight_lexical (default 0.5)
+
+        Vector 2 — Structural:
+          Entry points of CodePathViews that contain the lexically matched
+          symbols. Captures the "where it comes from" context.
+          Weight: multi_seed_weight_structural (default 0.3)
+
+        Vector 3 — Historical:
+          Symbols with high mention frequency in recent conversation messages.
+          Weight: multi_seed_weight_historical (default 0.2)
+
+        If enable_multi_seed_activation is False, falls back to the previous
+        single‑graph behaviour (lexical + traceback + history combined in one pass).
         """
+        edges_out = self._symbol_index.get_all_edges_out(project_id)
+        all_names = self._symbol_index.get_all_names(project_id)
+
         exact_seeds, partial_seeds = self._extract_query_seeds(query, project_id)
+        tb_seeds = (
+            self._extract_traceback_seeds(query, project_id)
+            if self.valves.enable_traceback_activation
+            else []
+        )
+        history_boosts = (
+            self._extract_history_seeds(
+                messages, project_id, lookback=self.valves.history_seeds_lookback
+            )
+            if (self.valves.enable_history_seeds and messages)
+            else {}
+        )
 
-        ag = ActivationGraph()
+        # ──────────────────────────────────────────────────────────────
+        # SINGLE‑GRAPH MODE (backward compatible)
+        # ──────────────────────────────────────────────────────────────
+        if not self.valves.enable_multi_seed_activation:
+            ag = ActivationGraph()
 
-        # Activate seeds with specificity-adjusted scores
+            if exact_seeds:
+                for sym_name in exact_seeds:
+                    specificity = self._compute_node_specificity(sym_name, project_id)
+                    score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=score, depth=0, source="seed"
+                    )
+            if partial_seeds:
+                for sym_name in partial_seeds:
+                    specificity = self._compute_node_specificity(sym_name, project_id)
+                    score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=score, depth=0, source="seed"
+                    )
+            for sym_name, tb_score in tb_seeds:
+                existing = ag._activations.get(sym_name)
+                if existing:
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name,
+                        score=min(1.0, existing.score + tb_score * 0.4),
+                        depth=0,
+                        source="seed",
+                    )
+                else:
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=tb_score, depth=0, source="seed"
+                    )
+            for sym_name, boost in history_boosts.items():
+                existing = ag._activations.get(sym_name)
+                if existing:
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name,
+                        score=min(1.0, existing.score + boost),
+                        depth=0,
+                        source=existing.source,
+                    )
+                else:
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=boost, depth=0, source="seed"
+                    )
+
+            if not ag._activations:
+                entry_points = self._path_index.find_entry_points(
+                    self._symbol_index, project_id
+                )
+                if entry_points:
+                    for sym_name in list(entry_points)[:3]:
+                        ag._activations[sym_name] = ActivationState(
+                            node_id=sym_name, score=0.3, depth=0, source="seed"
+                        )
+
+            ag.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.05,
+                alpha=self.valves.ppr_alpha,
+            )
+            self._store_activation_scores(ag, project_id)
+            return ag
+
+        # ──────────────────────────────────────────────────────────────
+        # MULTI‑SEED MODE (three independent vectors)
+        # ──────────────────────────────────────────────────────────────
+
+        # ── Vector 1: Lexical + Traceback ──────────────────────────
+        ag_lex = ActivationGraph()
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
-                adjusted_score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name,
-                    score=adjusted_score,
-                    depth=0,
-                    source="seed",
+                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                ag_lex._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=score, depth=0, source="seed"
                 )
         if partial_seeds:
             for sym_name in partial_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
-                adjusted_score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                ag._activations[sym_name] = ActivationState(
+                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                ag_lex._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=score, depth=0, source="seed"
+                )
+        for sym_name, tb_score in tb_seeds:
+            existing = ag_lex._activations.get(sym_name)
+            if existing:
+                ag_lex._activations[sym_name] = ActivationState(
                     node_id=sym_name,
-                    score=adjusted_score,
+                    score=min(1.0, existing.score + tb_score * 0.4),
                     depth=0,
                     source="seed",
                 )
+            else:
+                ag_lex._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=tb_score, depth=0, source="seed"
+                )
+        if ag_lex._activations:
+            ag_lex.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.03,
+                alpha=self.valves.ppr_alpha,
+            )
 
-        # If no seeds, activate entry points with a low score as a fallback
-        if not exact_seeds and not partial_seeds:
+        # ── Vector 2: Structural (entry points of views containing lexical seeds) ──
+        ag_str = ActivationGraph()
+        lexical_seed_names = set(exact_seeds) | {s for s, _ in tb_seeds}
+        structural_seeds: Set[str] = set()
+        for view in self._path_index.get_all(project_id):
+            for lex_seed in lexical_seed_names:
+                if lex_seed in view.induced_nodes:
+                    structural_seeds.add(view.entry_point)
+                    break
+        if structural_seeds:
+            for sym_name in structural_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                score = min(0.8, 0.5 * min(specificity, 1.4))
+                ag_str._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=score, depth=0, source="seed"
+                )
+            ag_str.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.03,
+                alpha=self.valves.ppr_alpha,
+            )
+
+        # ── Vector 3: Historical ───────────────────────────────────
+        ag_his = ActivationGraph()
+        if history_boosts:
+            for sym_name, boost in history_boosts.items():
+                ag_his._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=boost, depth=0, source="seed"
+                )
+            ag_his.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.03,
+                alpha=self.valves.ppr_alpha,
+            )
+
+        # ── Combine the three vectors ──────────────────────────────
+        w_lex = self.valves.multi_seed_weight_lexical
+        w_str = self.valves.multi_seed_weight_structural
+        w_his = self.valves.multi_seed_weight_historical
+
+        all_activated = (
+            set(ag_lex.get_activated_nodes(0.01).keys())
+            | set(ag_str.get_activated_nodes(0.01).keys())
+            | set(ag_his.get_activated_nodes(0.01).keys())
+        )
+
+        ag_final = ActivationGraph()
+
+        if not all_activated:
+            # Fallback: entry points with low score
             entry_points = self._path_index.find_entry_points(
                 self._symbol_index, project_id
             )
             if entry_points:
-                top_entries = list(entry_points)[:3]
-                for sym_name in top_entries:
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name,
-                        score=0.3,
-                        depth=0,
-                        source="seed",
+                for sym_name in list(entry_points)[:3]:
+                    ag_final._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=0.3, depth=0, source="seed"
+                    )
+        else:
+            for node in all_activated:
+                combined = (
+                    w_lex * ag_lex.get_score(node)
+                    + w_str * ag_str.get_score(node)
+                    + w_his * ag_his.get_score(node)
+                )
+                if combined >= 0.01:
+                    # Determine source and depth from the contributing graphs
+                    source = "seed" if node in lexical_seed_names else "propagation"
+                    depth = min(
+                        ag_lex._activations.get(
+                            node,
+                            ActivationState(
+                                node_id=node, score=0, depth=99, source="propagation"
+                            ),
+                        ).depth,
+                        ag_str._activations.get(
+                            node,
+                            ActivationState(
+                                node_id=node, score=0, depth=99, source="propagation"
+                            ),
+                        ).depth,
+                    )
+                    ag_final._activations[node] = ActivationState(
+                        node_id=node,
+                        score=min(1.0, combined),
+                        depth=depth,
+                        source=source,
                     )
 
-        # Propagate using Personalized PageRank
-        edges_out = self._symbol_index.get_all_edges_out(project_id)
-        ag.propagate(
-            edges_out=edges_out,
-            max_steps=20,
-            min_score=0.05,
-            alpha=self.valves.ppr_alpha,  # ← use the valve
-        )
-
-        # ── v7 (PASO-24): save activation scores for speculative prefetch ──
-        activated_nodes = ag.get_activated_nodes(
-            threshold=self.valves.path_activation_threshold
-        )
-        if not hasattr(self, "_last_activation_scores"):
-            self._last_activation_scores: Dict[str, Dict[str, float]] = {}
-        self._last_activation_scores[project_id] = activated_nodes
-
+        activated_count = len(ag_final.get_activated_nodes(threshold=0.05))
         self._log_debug(
-            f"ActivationGraph: {len(ag.get_activated_nodes(threshold=0.05))} nodes activated "
-            f"from {len(exact_seeds)} exact + {len(partial_seeds)} partial seeds"
+            f"Multi-seed ActivationGraph: {activated_count} nodes activated "
+            f"(lex={len(ag_lex.get_activated_nodes(0.01))}, "
+            f"str={len(ag_str.get_activated_nodes(0.01))}, "
+            f"his={len(ag_his.get_activated_nodes(0.01))})"
         )
-        return ag
+
+        self._store_activation_scores(ag_final, project_id)
+        return ag_final
 
     async def _resolve_dangling_edges(self, project_id: str) -> int:
         """
@@ -5532,6 +5978,136 @@ class Filter:
                 f"(references confirmed with definitions)"
             )
         return resolved
+
+    # --------------------------------------------------------------------------
+    # Traceback seed extraction (v7 – Phase 5, PASO-26)
+    # --------------------------------------------------------------------------
+
+    def _extract_traceback_seeds(
+        self, content: str, project_id: str
+    ) -> List[Tuple[str, float]]:
+        """
+        Extract function names from a traceback with scores proportional
+        to their depth in the call stack.
+
+        Supports:
+        - Python: File "path", line N, in function_name
+        - JavaScript/TypeScript: at function_name (file:line:col)
+        - Java: at package.Class.method(File.java:line)
+
+        Returns: [(symbol_name, seed_score), ...]
+        The last frame (deepest) receives score 1.0.
+        The first frame receives score 0.5.
+        Only symbols present in the project's SymbolIndex are included.
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return []
+
+        frames: List[str] = []
+
+        # ── Python traceback ─────────────────────────────────────────
+        py_pattern = re.compile(
+            r'File\s+"[^"]+",\s+line\s+\d+,\s+in\s+(\w+)',
+            re.MULTILINE,
+        )
+        for match in py_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names and func != "<module>":
+                frames.append(func)
+
+        # ── JavaScript / TypeScript ──────────────────────────────────
+        js_pattern = re.compile(
+            r"\bat\s+(\w+)\s*\([^)]*:\d+:\d+\)",
+            re.MULTILINE,
+        )
+        for match in js_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names:
+                frames.append(func)
+
+        # ── Java / Kotlin ────────────────────────────────────────────
+        java_pattern = re.compile(
+            r"\bat\s+[\w.]+\.(\w+)\(\w+\.(?:java|kt):\d+\)",
+            re.MULTILINE,
+        )
+        for match in java_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names:
+                frames.append(func)
+
+        if not frames:
+            return []
+
+        # Deduplicate while preserving order (last = deepest = most relevant)
+        seen: Set[str] = set()
+        unique_frames: List[str] = []
+        for f in frames:
+            if f not in seen:
+                seen.add(f)
+                unique_frames.append(f)
+
+        n = len(unique_frames)
+        results = []
+        for i, func_name in enumerate(unique_frames):
+            # Linear interpolation: 0.5 for the first frame, 1.0 for the last
+            score = 0.5 + 0.5 * (i / max(n - 1, 1))
+            # Adjust by symbol specificity
+            specificity = self._compute_node_specificity(func_name, project_id)
+            adjusted = min(1.0, score * min(specificity, 1.5))
+            results.append((func_name, adjusted))
+
+        self._log_debug(
+            f"Traceback seeds: {len(results)} frame(s) detected "
+            f"({[r[0] for r in results]})"
+        )
+        return results
+
+    # --------------------------------------------------------------------------
+    # History seed extraction (v7 – Phase 5, PASO-27)
+    # --------------------------------------------------------------------------
+
+    def _extract_history_seeds(
+        self,
+        messages: List[dict],
+        project_id: str,
+        lookback: int = 6,
+    ) -> Dict[str, float]:
+        """
+        Extract symbols with high mention frequency in recent messages.
+
+        Returns {symbol_name: boost_score} where boost_score ∈ (0.0, 0.6].
+        The boost is proportional to the relative mention frequency.
+
+        Only considers the last `lookback` messages to avoid stale context.
+        """
+        all_names = self._symbol_index.get_all_names(project_id)
+        if not all_names or not messages:
+            return {}
+
+        recent = messages[-lookback:] if len(messages) > lookback else messages
+        mention_counts: Counter = Counter()
+
+        for msg in recent:
+            content = msg.get("content", "")
+            if not content:
+                continue
+            words = set(re.findall(r"\b\w+\b", content))
+            for sym in all_names.intersection(words):
+                mention_counts[sym] += 1
+
+        if not mention_counts:
+            return {}
+
+        max_count = max(mention_counts.values())
+        return {
+            sym: min(
+                self.valves.history_seeds_max_boost,
+                self.valves.history_seeds_max_boost * (count / max_count),
+            )
+            for sym, count in mention_counts.items()
+            if count > 0
+        }
 
     # --------------------------------------------------------------------------
     # LLMLingua-2 code compression (v7 – PASO-18)
@@ -6346,6 +6922,7 @@ class Filter:
         project_id: str,
         user_query: str,
         intent_vector: Dict[str, float],
+        messages: Optional[List[dict]] = None,
     ) -> str:
         """
         Build code context using the graph‑activation system.
@@ -6369,7 +6946,7 @@ class Filter:
             return ""
 
         # Step 1: ActivationGraph
-        ag = self._build_activation_graph(user_query, project_id)
+        ag = self._build_activation_graph(user_query, project_id, messages=messages)
         activated = ag.get_activated_nodes(
             threshold=self.valves.path_activation_threshold
         )
@@ -6528,7 +7105,104 @@ class Filter:
             f"{len(activated)} nodes activated)_\n"
         )
         parts.append(summary_line)
+
+        # ── v7 Phase 5 (PASO-29): LOD tracking for adaptive feedback ──
+        if self.valves.enable_lod_adaptive:
+            if not hasattr(self, "_last_lod_levels"):
+                self._last_lod_levels: Dict[str, Dict[str, int]] = {}
+            lod_map: Dict[str, int] = {}
+            for node_id, score in activated.items():
+                if score < lod1:
+                    lod_map[node_id] = 0
+                elif score < lod2:
+                    lod_map[node_id] = 1
+                elif score < lod3:
+                    lod_map[node_id] = 2
+                else:
+                    lod_map[node_id] = 3
+            self._last_lod_levels[project_id] = lod_map
+            self._log_debug(
+                f"LOD tracking: {sum(1 for v in lod_map.values() if v == 3)} LOD-3, "
+                f"{sum(1 for v in lod_map.values() if v == 2)} LOD-2, "
+                f"{sum(1 for v in lod_map.values() if v <= 1)} LOD-0/1"
+            )
+
         return "\n".join(parts)
+
+    # --------------------------------------------------------------------------
+    # Adaptive LOD feedback (v7 – Phase 5, PASO-29)
+    # --------------------------------------------------------------------------
+
+    async def _update_lod_thresholds_from_response(
+        self, project_id: str, response_text: str
+    ):
+        """
+        Adjust lod3_threshold based on which symbols appear in the LLM's
+        response compared to the LOD level they received.
+
+        Logic:
+        - If the LLM mentions symbols that only got LOD ≤ 2 (summary/signature):
+          → Lower lod3_threshold: give more full code next time.
+        - If the LLM does NOT mention symbols that got LOD 3 (full code):
+          → Raise lod3_threshold slightly: those expansions were unnecessary.
+
+        Adjustments are small (lod_adapt_rate) and bounded [min, max].
+        Threshold state is NOT persisted across server restarts.
+        """
+        if not self.valves.enable_lod_adaptive:
+            return
+
+        last_lod_map = getattr(self, "_last_lod_levels", {}).get(project_id, {})
+        if not last_lod_map:
+            return
+
+        all_names = self._symbol_index.get_all_names(project_id)
+        response_words = set(re.findall(r"\b\w+\b", response_text))
+        referenced = all_names.intersection(response_words)
+
+        # Symbols mentioned in the response that only received summary/signature
+        underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
+
+        # Symbols that got full code but do not appear in the response
+        overserved = [
+            sym
+            for sym in last_lod_map
+            if last_lod_map[sym] == 3 and sym not in referenced
+        ]
+
+        old_threshold = self.valves.lod3_threshold
+        changed = False
+
+        if len(underserved) >= self.valves.lod_adapt_underserved_min:
+            # Lower threshold → more full code next time
+            self.valves.lod3_threshold = max(
+                self.valves.lod_adapt_min,
+                self.valves.lod3_threshold - self.valves.lod_adapt_rate,
+            )
+            changed = True
+            self._log_debug(
+                f"LOD adaptive ↓: threshold {old_threshold:.2f} → "
+                f"{self.valves.lod3_threshold:.2f} "
+                f"({len(underserved)} underserved: {underserved[:3]})"
+            )
+        elif len(overserved) >= self.valves.lod_adapt_overserved_min:
+            # Raise threshold → fewer unnecessary expansions
+            self.valves.lod3_threshold = min(
+                self.valves.lod_adapt_max,
+                self.valves.lod3_threshold + self.valves.lod_adapt_rate * 0.5,
+            )
+            changed = True
+            self._log_debug(
+                f"LOD adaptive ↑: threshold {old_threshold:.2f} → "
+                f"{self.valves.lod3_threshold:.2f} "
+                f"({len(overserved)} overserved symbols)"
+            )
+
+        if not changed:
+            self._log_debug(
+                f"LOD adaptive: no adjustment needed "
+                f"(threshold={self.valves.lod3_threshold:.2f})"
+            )
 
     # ── Scientific CoT (v7) ──
     def _gather_static_evidence(
@@ -7748,7 +8422,6 @@ class Filter:
     # --------------------------------------------------------------------------
     # Inlet helper methods
     # --------------------------------------------------------------------------
-
     async def _inlet_preprocess(self, body: dict, project_id: str) -> dict:
         """Handle project switching, symbol cache loading. No secondary tasks here."""
         messages = body.get("messages", [])
@@ -7762,7 +8435,6 @@ class Filter:
                 self._remove_project_from_index_by_id(self._last_project_id, old_state)
             self._cached_lightweight_context.pop(self._last_project_id, None)
             self._block_change_summaries.clear()
-            self._symbol_analysis_cache.clear()
         self._last_project_id = project_id
 
         # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
@@ -7774,6 +8446,15 @@ class Filter:
                 db_views = await self._load_path_views_from_db(project_id)
                 for view in db_views:
                     self._path_index.add(view, project_id)
+
+        # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
+        if self.valves.enable_edge_persistence:
+            restored = await self._load_symbol_edges_from_db(project_id)
+            if restored > 0:
+                self._log_debug(
+                    f"Cross-session: {restored} symbol edges restored from DB. "
+                    f"No need to re-paste code."
+                )
 
         # ── v7 (PASO-25): restore KV slot at session start (once per project) ──
         if (
@@ -8097,7 +8778,7 @@ class Filter:
             if self.valves.enable_path_analysis:
                 intent_vector = await self._classify_intent(user_query, project_id)
                 active_ctx = await self._get_path_context(
-                    project_id, user_query, intent_vector
+                    project_id, user_query, intent_vector, messages=messages
                 )
                 if not active_ctx:
                     active_ctx = self._get_active_code_context(project_id, user_query)
@@ -9039,6 +9720,21 @@ class Filter:
                         code_state_hash,
                     )
 
+            # 🔄 LOD ADAPTIVE FEEDBACK (v7 Phase 5)
+            if self.valves.enable_lod_adaptive and is_code_session:
+                last_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                    None,
+                )
+                if last_assistant and last_assistant.get("content"):
+                    self._background_task(
+                        self._update_lod_thresholds_from_response(
+                            project_id,
+                            last_assistant["content"],
+                        ),
+                        name="lod_adaptive_feedback",
+                    )
+
             # 🚀 RESOURCE OPTIMISATION – Speculative prefetch
             if self.valves.enable_speculative_prefetch and is_code_session:
                 last_activated = getattr(self, "_last_activation_scores", {}).get(
@@ -9084,6 +9780,13 @@ class Filter:
                 self._background_task(
                     self._slot_save_if_needed(project_id),
                     name="slot_save",
+                )
+
+            # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
+            if self.valves.enable_edge_persistence:
+                self._background_task(
+                    self._save_symbol_edges_to_db(project_id),
+                    name="save_symbol_edges",
                 )
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
