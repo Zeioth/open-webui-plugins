@@ -1326,10 +1326,6 @@ class Filter:
         code_block_warn_message: str = Field(
             default="[Code block too large - truncated by system]"
         )
-        huge_injection_threshold_tokens: int = Field(
-            default=25000,
-            description="Threshold of active code tokens above which lightweight context (signatures only) is used. 0 = never.",
-        )
         enable_call_graph_extraction: bool = Field(
             default=True,
             description="Extract call relationships (who calls whom) for code symbols.",
@@ -1345,12 +1341,6 @@ class Filter:
         oversized_summary_max_tokens: int = Field(
             default=500, description="Max tokens for summarizing oversized code blocks."
         )
-        full_code_injection_budget_percent: float = Field(
-            default=0.7,
-            ge=0.0,
-            le=1.0,
-            description="Percentage of the global injection token budget to use for full-code injection when a code review is requested.",
-        )
         active_context_max_tokens: int = Field(
             default=32000,
             description="Maximum tokens for the injected active code context. 0 = unlimited.",
@@ -1363,21 +1353,6 @@ class Filter:
             default=True,
             description="Exclude symbols from the filter's own source code to prevent self-analysis.",
         )
-
-        # ─── Smart Pre‑Expand ───
-        smart_pre_expand_enabled: bool = Field(default=True)
-        smart_pre_expand_min_tokens: int = Field(default=2000)
-        smart_pre_expand_max_tokens: int = Field(default=0)
-        smart_pre_expand_use_llm: bool = Field(default=True)
-        smart_pre_expand_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        smart_pre_expand_full_if_no_match: bool = Field(default=True)
-        smart_pre_expand_embedding_threshold: float = Field(
-            default=0.72, ge=0.0, le=1.0
-        )
-        smart_pre_expand_min_symbols: int = Field(default=3)
-        enable_raw_code_detection: bool = Field(default=True)
 
         # ─── Outlet Expand Intercept ───
         outlet_expand_intercept_enabled: bool = Field(default=True)
@@ -1406,7 +1381,6 @@ class Filter:
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
         auto_cot_min_chars: int = Field(default=200)
-        enable_code_review_mode: bool = Field(default=True)
         cot_max_tokens: int = Field(default=0)
         cot_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
@@ -1556,24 +1530,8 @@ class Filter:
         raw_file_priority_boost: float = Field(default=2.0)
 
         # ─── Symbol‑level analysis ───
-        use_symbol_level_analysis: bool = Field(
-            default=True,
-            description="Analyze code symbol by symbol instead of raw chunks. Works reliably even with 7B models.",
-        )
         symbol_analysis_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-Balanced",
-        )
-        symbol_analysis_max_retries: int = Field(
-            default=5,
-            description="Max attempts per symbol before giving up.",
-        )
-        synthesis_max_tokens: int = Field(
-            default=1500,
-            description="Max tokens for the synthesized summary of symbol analysis.",
-        )
-        symbol_batch_size: int = Field(
-            default=20,
-            description="Number of symbols to analyze in parallel per batch (lower = less RAM).",
         )
 
         # ─── Session summaries (autobiographical mini‑memory) ───
@@ -1956,11 +1914,6 @@ class Filter:
         self._project_locks: Dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
 
-        # ── Caches ──
-        self._symbol_analysis_cache: OrderedDict = OrderedDict()
-        self._MAX_SYMBOL_ANALYSIS_CACHE = 1000
-        self._symbol_analysis_generic_cache: OrderedDict = OrderedDict()
-
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
         self._low_priority_llm_semaphore = asyncio.Semaphore(1)
@@ -2021,7 +1974,6 @@ class Filter:
         self._last_processed_message_idx: Dict[str, int] = {}
         self._last_project_id: str = ""
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
-        self._symbol_cache_loaded_projects: Set[str] = set()
 
         # Response cache counter
         self._response_cache_count: Dict[str, int] = {}
@@ -2056,24 +2008,6 @@ class Filter:
         # ── State debounce (to reduce DB writes) ──
         self._state_dirty = False
         self._state_last_saved = 0.0
-        path_activation_threshold: float = Field(
-            default=0.1,
-            ge=0.01,
-            le=1.0,
-            description="Minimum activation score to consider a node for context.",
-        )
-        path_relevance_high_threshold: float = Field(
-            default=0.5,
-            ge=0.0,
-            le=1.0,
-            description="Nodes with activation >= this get full code; below get summary.",
-        )
-        path_propagation_steps: int = Field(
-            default=4,
-            ge=1,
-            le=8,
-            description="Max BFS steps during activation propagation.",
-        )
 
         print("[CodeAware] Filter loaded")
 
@@ -3358,27 +3292,6 @@ class Filter:
 
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
-
-    async def _unload_models_under_lock(self, wait_for_tasks: bool = True):
-        """
-        Unload all models from the LLM server while holding the global file lock.
-        If wait_for_tasks is True, it ensures no LLM tasks are active first.
-        """
-        if wait_for_tasks:
-            await self._wait_for_llm_tasks()
-        llm_fd = await self._acquire_llm_lock()
-        try:
-            await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-            self._last_used_model = None
-            slot_empty = await self._wait_for_empty_slot(retries=5, delay=3.0)
-            if not slot_empty:
-                self._log_debug("Slot not empty after unload – forcing extra unload")
-                await _shared_unload_all_models(self.valves.LLM_BASE_URL)
-                await self._wait_for_empty_slot(retries=3, delay=4.0)
-            # Additional breathing room for the server to fully release resources
-            await asyncio.sleep(5.0)
-        finally:
-            self._release_llm_lock(llm_fd)
 
     async def _call_llm(
         self,
@@ -5388,190 +5301,6 @@ class Filter:
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Smart pre‑expand
-    # --------------------------------------------------------------------------
-    async def _smart_pre_expand(
-        self,
-        user_query: str,
-        project_id: str,
-        token_budget: int = 0,
-        seen_hashes: Optional[Set[str]] = None,
-    ) -> str:
-        if not self.valves.smart_pre_expand_enabled:
-            return ""
-
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return ""
-
-        all_names = self._symbol_index.get_all_names(project_id)
-        if not all_names:
-            return ""
-
-        effective_budget = token_budget or self.valves.smart_pre_expand_max_tokens
-        needed_symbols: Set[str] = set()
-        used_minimum_expansion = False
-
-        # A) Direct mention
-        words = set(re.findall(r"\b\w+\b", user_query))
-        directly_mentioned = all_names.intersection(words)
-        needed_symbols.update(directly_mentioned)
-
-        # B) Optional LLM detection (embedding‑based detection has been removed)
-        if (
-            self.valves.smart_pre_expand_use_llm
-            and not needed_symbols
-            and len(user_query) > 20
-        ):
-            lightweight_ctx = await self._build_lightweight_context(project_id)
-            available_list = ", ".join(sorted(all_names)[:60])
-            prompt = (
-                f"Symbol index:\n{lightweight_ctx[:2000]}\n\n"
-                f'User query: "{user_query[:300]}"\n\n'
-                f"Available symbols: {available_list}\n\n"
-                f"Which symbols need their full source code to answer this query? "
-                f"Output only a comma-separated list of names, or 'none'."
-            )
-            response = await self._try_llm_quick(
-                prompt=prompt,
-                system_prompt="You are a code context manager. Output only a comma-separated list of symbol names or 'none'.",
-                model_override=self.valves.smart_pre_expand_model,
-                max_tokens=100,
-                temperature=0.0,
-            )
-            if response and response.strip().lower() != "none":
-                detected = {
-                    name.strip()
-                    for name in response.split(",")
-                    if name.strip() in all_names
-                }
-                needed_symbols.update(detected)
-
-        # C) Minimum expansion fallback
-        if not needed_symbols and self.valves.smart_pre_expand_min_symbols > 0:
-            used_minimum_expansion = True
-            min_token_budget = self.valves.smart_pre_expand_min_tokens
-            top_blocks = sorted(
-                state["active_blocks"].values(),
-                key=lambda b: b.importance_score,
-                reverse=True,
-            )
-            tokens_added = 0
-            for block in top_blocks:
-                if min_token_budget > 0 and tokens_added >= min_token_budget:
-                    break
-                block_tokens = block._cached_token_count or (len(block.content) // 4)
-                for sym in block.symbols:
-                    if sym.name in all_names:
-                        needed_symbols.add(sym.name)
-                tokens_added += block_tokens
-
-        if not needed_symbols:
-            return ""
-
-        if used_minimum_expansion and self.valves.smart_pre_expand_min_tokens > 0:
-            if effective_budget == 0:
-                effective_budget = self.valves.smart_pre_expand_min_tokens
-            else:
-                effective_budget = min(
-                    effective_budget, self.valves.smart_pre_expand_min_tokens
-                )
-
-        symbol_priority: List[Tuple[str, "CodeBlock", float]] = []
-        for sym_name in needed_symbols:
-            block_hashes = self._symbol_index.find_blocks(sym_name, project_id)
-            for h in block_hashes:
-                block = state["active_blocks"].get(h)
-                if block and not block.obsolete:
-                    symbol_priority.append((sym_name, block, block.importance_score))
-                    break
-        symbol_priority.sort(key=lambda x: x[2], reverse=True)
-
-        parts = ["\n## Auto-Expanded Code (retrieved for your query)\n"]
-        tokens_used = 0
-        expanded_count = 0
-        local_seen: Set[str] = set()
-
-        for sym_name, block, _ in symbol_priority:
-            if seen_hashes is not None and block.hash in seen_hashes:
-                continue
-            if block.hash in local_seen:
-                continue
-            local_seen.add(block.hash)
-            if seen_hashes is not None:
-                seen_hashes.add(block.hash)
-
-            tok_count = (
-                len(self.tokenizer.encode(block.content))
-                if self.tokenizer
-                else len(block.content) // 4
-            )
-            if effective_budget > 0 and tokens_used + tok_count > effective_budget:
-                remaining = len(symbol_priority) - expanded_count
-                if remaining > 0:
-                    parts.append(
-                        f"[{remaining} more symbol(s) omitted — token budget ({effective_budget}) reached]"
-                    )
-                break
-
-            loc = f" (file: {block.file_path})" if block.file_path else ""
-            parts.append(f"### `{sym_name}`{loc}\n```\n{block.content}\n```")
-            tokens_used += tok_count
-            expanded_count += 1
-
-            if self.valves.enable_call_graph_extraction:
-                for sym in block.symbols:
-                    if sym.name != sym_name:
-                        continue
-                    for callee_name in sym.calls[:3]:
-                        if callee_name in self._SYMBOL_BLACKLIST:
-                            continue
-                        callee_hashes = self._symbol_index.find_blocks(
-                            callee_name, project_id
-                        )
-                        for ch in callee_hashes:
-                            callee_block = state["active_blocks"].get(ch)
-                            if not callee_block or callee_block.obsolete:
-                                continue
-                            if (
-                                seen_hashes is not None
-                                and callee_block.hash in seen_hashes
-                            ):
-                                break
-                            if callee_block.hash in local_seen:
-                                break
-                            ctok = (
-                                len(self.tokenizer.encode(callee_block.content))
-                                if self.tokenizer
-                                else len(callee_block.content) // 4
-                            )
-                            if (
-                                effective_budget > 0
-                                and tokens_used + ctok > effective_budget
-                            ):
-                                break
-                            local_seen.add(callee_block.hash)
-                            if seen_hashes is not None:
-                                seen_hashes.add(callee_block.hash)
-                            callee_loc = (
-                                f" (file: {callee_block.file_path})"
-                                if callee_block.file_path
-                                else ""
-                            )
-                            parts.append(
-                                f"### `{callee_name}` (callee of `{sym_name}`)"
-                                f"{callee_loc}\n```\n{callee_block.content}\n```"
-                            )
-                            tokens_used += ctok
-                            break
-                    break
-
-        if expanded_count == 0:
-            return ""
-
-        return "\n".join(parts)
-
-    # --------------------------------------------------------------------------
     # Outlet expand intercept
     # --------------------------------------------------------------------------
     async def _outlet_intercept_expand(
@@ -5635,32 +5364,6 @@ class Filter:
                 self._set_state(project_id, state)
 
         return replaced_content, did_any
-
-    def _expand_referenced_symbols(
-        self, project_id: str, user_query: str, seen_hashes: Optional[Set[str]] = None
-    ) -> str:
-        """Expand symbols mentioned directly or via file paths in the query."""
-        state = self._get_state(project_id)
-        if not state:
-            return ""
-        all_names = self._symbol_index.get_all_names(project_id)
-        words = set(re.findall(r"\b\w+\b", user_query))
-        mentioned = all_names.intersection(words)
-
-        parts = []
-        for name in sorted(mentioned):
-            blocks = self._symbol_index.find_blocks(name, project_id)
-            for h in blocks:
-                block = state["active_blocks"].get(h)
-                if block and not block.obsolete:
-                    if seen_hashes is not None:
-                        if block.hash in seen_hashes:
-                            continue
-                        seen_hashes.add(block.hash)
-                    loc = f" (file: {block.file_path})" if block.file_path else ""
-                    parts.append(f"### `{name}`{loc}\n```\n{block.content[:2000]}\n```")
-                    break
-        return "\n".join(parts) if parts else ""
 
     # --------------------------------------------------------------------------
     # Path analysis (v7) – graph activation and seed extraction
@@ -6251,141 +5954,6 @@ class Filter:
         )
 
     # ── Intent classification (v7) ──────────────────────────────────
-
-    async def _classify_intent(
-        self, user_query: str, project_id: str
-    ) -> Dict[str, float]:
-        """
-        Classify the user's intent into a continuous weight vector.
-
-        Returns a dict where values sum to ~1.0.
-        Keys: "explain" | "modify" | "debug" | "refactor"
-
-        Process:
-        1. Fast deterministic heuristic (no LLM).
-        2. LLM fallback only when the heuristic signal is weak.
-        """
-        query_lower = user_query.lower()
-        query_words = set(re.findall(r"\b\w+\b", query_lower))
-
-        # ── Heuristic: count signals per intent ──────────────────────
-
-        EXPLAIN_KW = {
-            "explain",
-            "how",
-            "what",
-            "describe",
-            "show",
-            "diagram",
-            "explica",
-            "cómo",
-            "qué",
-            "describe",
-            "muestra",
-        }
-        MODIFY_KW = {
-            "fix",
-            "add",
-            "change",
-            "implement",
-            "update",
-            "create",
-            "make",
-            "corrige",
-            "añade",
-            "cambia",
-            "implementa",
-            "actualiza",
-            "crea",
-        }
-        DEBUG_KW = {
-            "error",
-            "bug",
-            "fail",
-            "crash",
-            "wrong",
-            "broken",
-            "exception",
-            "traceback",
-            "not working",
-            "falla",
-            "error",
-            "excepción",
-        }
-        REFACTOR_KW = {
-            "refactor",
-            "restructure",
-            "reorganize",
-            "redesign",
-            "architecture",
-            "refactoriza",
-            "reestructura",
-            "arquitectura",
-            "reorganiza",
-        }
-
-        scores = {
-            "explain": len(EXPLAIN_KW.intersection(query_words)) * 1.0,
-            "modify": len(MODIFY_KW.intersection(query_words)) * 1.0,
-            "debug": len(DEBUG_KW.intersection(query_words)) * 1.5,  # debug weighs more
-            "refactor": len(REFACTOR_KW.intersection(query_words))
-            * 2.0,  # refactor even more
-        }
-
-        # Additional signals
-        if "traceback" in query_lower or "exception" in query_lower:
-            scores["debug"] += 2.0
-        if "```" in user_query:
-            scores["modify"] += 0.5
-        if len(user_query) > 500:
-            scores["explain"] += 0.3
-
-        total = sum(scores.values())
-
-        # If the signal is clear, normalise and return without LLM
-        if total > 1.5:
-            normalized = {k: v / total for k, v in scores.items()}
-            self._log_debug(
-                f"Intent (heuristic): {max(normalized, key=normalized.get)}="
-                f"{max(normalized.values()):.2f}"
-            )
-            return normalized
-
-        # ── LLM fallback when heuristic signal is weak ────────────────
-        if not self.valves.enable_intent_llm_fallback:
-            return {"explain": 0.3, "modify": 0.4, "debug": 0.2, "refactor": 0.1}
-
-        prompt = (
-            f'User message: "{user_query[:300]}"\n\n'
-            "Score the user intent from 0.0 to 1.0 for each category "
-            "(total should sum to 1.0):\n"
-            "explain: (wants to understand)\n"
-            "modify: (wants to change/add/fix code)\n"
-            "debug: (is debugging an error)\n"
-            "refactor: (wants architectural changes)\n\n"
-            "Output only: explain=X.X modify=X.X debug=X.X refactor=X.X"
-        )
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="Output only scores in the format: explain=X.X modify=X.X debug=X.X refactor=X.X",
-            model_override=self.valves.intent_classifier_model,
-            max_tokens=20,
-            temperature=0.0,
-        )
-
-        if response:
-            result = {}
-            for match in re.finditer(r"(\w+)=([\d.]+)", response):
-                key, val = match.group(1), float(match.group(2))
-                if key in ("explain", "modify", "debug", "refactor"):
-                    result[key] = val
-            if len(result) == 4:
-                total_r = sum(result.values())
-                if total_r > 0:
-                    return {k: v / total_r for k, v in result.items()}
-
-        # Default fallback
-        return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
     async def _classify_intent(
         self, user_query: str, project_id: str
@@ -7680,22 +7248,6 @@ class Filter:
         return reasoning
 
     # --------------------------------------------------------------------------
-    # Structural / code review helpers
-    # --------------------------------------------------------------------------
-    async def _is_structural_task(self, user_query: str) -> bool:
-        structural_keywords = {
-            "diagram",
-            "architecture",
-            "call graph",
-            "uml",
-            "flowchart",
-            "dependency graph",
-            "structure",
-        }
-        query_lower = user_query.lower()
-        return any(kw in query_lower for kw in structural_keywords)
-
-    # --------------------------------------------------------------------------
     # Feedback context
     # --------------------------------------------------------------------------
     def _get_feedback_context(self, project_id: str) -> str:
@@ -8212,10 +7764,6 @@ class Filter:
             self._block_change_summaries.clear()
             self._symbol_analysis_cache.clear()
         self._last_project_id = project_id
-
-        if project_id not in self._symbol_cache_loaded_projects:
-            await self._load_symbol_cache_from_db(project_id)
-            self._symbol_cache_loaded_projects.add(project_id)
 
         # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
         if self.valves.enable_path_analysis and HAS_TREE_SITTER:
@@ -9015,27 +8563,9 @@ class Filter:
             "📦 COMPRESSION – Step 2/2: Lean context (replace full code with relevant fragments)"
         )
         if has_code_blocks and last_user_msg:
-            analysis_summary = getattr(self, "_last_analysis_summary", None)
-            suggested_blocks = getattr(self, "_last_suggested_blocks", None)
-            keep_original = self._user_intent_full_code
-
-            if not keep_original and (analysis_summary or suggested_blocks):
-                lean_parts = [user_question.strip()]
-                if suggested_blocks:
-                    lean_parts.append("\n## Relevant code\n")
-                    for blk in suggested_blocks[:5]:
-                        loc = f" (file: {blk.file_path})" if blk.file_path else ""
-                        lean_parts.append(
-                            f"### {blk.hash[:8]}{loc}\n```\n{blk.content[:2000]}\n```"
-                        )
-                last_user_msg["content"] = "\n".join(lean_parts)
-                self._log_debug(
-                    "📦 COMPRESSION – Lean user message applied (full code replaced by fragments)"
-                )
-            else:
-                self._log_debug(
-                    "📦 COMPRESSION – Lean user message not applied (full code kept)"
-                )
+            self._log_debug(
+                "📦 COMPRESSION – Lean user message: full code kept (path-aware context active)"
+            )
         else:
             self._log_debug(
                 "📦 COMPRESSION – Lean user message not applied (no code blocks or no user message)"
@@ -9194,7 +8724,7 @@ class Filter:
             project_id,
             is_explicit_command,
             last_user_msg,
-            slot_free=slot_free,  # <-- pass the flag
+            slot_free=slot_free,
         )
         _inlet_timing("Step 6/9: Handle natural language intents", step_start)
         if handled:
@@ -9211,7 +8741,6 @@ class Filter:
             self.valves.enable_silent_ingestion
             and last_user_msg is not None
             and not is_explicit_command
-            and is_code_session  # only in code sessions
         ):
             if await self._is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
@@ -9938,7 +9467,7 @@ class Filter:
                 self._set_state(self.valves.project_id, state)
             return
 
-        model = self.valves.secondary_task_model or self.valves.smart_pre_expand_model
+        model = self.valves.secondary_task_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
             f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
@@ -9973,474 +9502,6 @@ class Filter:
                 self._db_conn.commit()
 
             await self._db_write_queue.put((_write, (), {}))
-
-    # --------------------------------------------------------------------------
-    # Symbol-level analysis
-    # --------------------------------------------------------------------------
-    def _build_symbol_context(
-        self,
-        sym: CodeSymbol,
-        block: CodeBlock,
-        project_id: str,
-        max_tokens: int = 800,
-        max_body_lines: int = 20,
-    ) -> Optional[str]:
-        sig = self._sanitize_signature(sym.signature or sym.name)
-        if not sig.strip():
-            return None
-        ctx = f"Symbol: `{sig}` [{sym.kind}]"
-        if sym.file_path:
-            ctx += f" in {sym.file_path}"
-        if sym.summary:
-            ctx += f"\nSummary: {sym.summary}"
-
-        clean_body = self._sanitize_text(block.content)
-        lines = clean_body.splitlines()
-        preview_lines = []
-        for line in lines[1:]:
-            line = line.strip()
-            if not line:
-                continue
-            if len(line) > 200:
-                line = line[:200] + "…"
-            preview_lines.append(line)
-            if len(preview_lines) >= max_body_lines:
-                break
-        if preview_lines:
-            body = "\n".join(preview_lines)
-            body = textwrap.shorten(body, width=2000, placeholder="...")
-            ctx += f"\nBody preview:\n```\n{body}\n```"
-
-        callers = self._symbol_index.get_callers(sym.name, project_id)
-        if callers:
-            ctx += f"\nCalled by: {', '.join(sorted(callers)[:5])}"
-        if sym.calls:
-            ctx += f"\nCalls: {', '.join(sym.calls[:5])}"
-
-        if self.tokenizer:
-            tokens = len(self.tokenizer.encode(ctx))
-            if tokens > max_tokens:
-                if "\nBody preview:\n" in ctx:
-                    header, body = ctx.split("\nBody preview:\n", 1)
-                    ctx_no_body = header + "\nBody preview omitted (too large)."
-                    if (
-                        self.tokenizer
-                        and len(self.tokenizer.encode(ctx_no_body)) > max_tokens
-                    ):
-                        ctx = header
-                    else:
-                        ctx = ctx_no_body
-                if self.tokenizer and len(self.tokenizer.encode(ctx)) > max_tokens:
-                    ctx = self._truncate_text_to_tokens(ctx, max_tokens)
-        return ctx
-
-    async def _analyze_code_via_symbols(
-        self, question: str, project_id: str
-    ) -> Tuple[str, List[str]]:
-        """
-        Analyze code symbols in batches to keep RAM usage low.
-        Each batch produces an intermediate summary; a final summary
-        is synthesized from those intermediates.
-        Returns (final_summary, list_of_suggested_symbols).
-        """
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return "", []
-
-        question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
-
-        # ── Collect symbol contexts (lazy, no LLM calls yet) ────────────
-        symbol_entries = []  # (name, importance_score, block_hash, ctx_or_cached)
-        seen_symbols = set()
-        for block in state["active_blocks"].values():
-            if block.obsolete or block.content_type not in (
-                ContentType.BASE_CODE,
-                ContentType.COMMITTED_CHANGE,
-                ContentType.PROPOSED_CHANGE,
-            ):
-                continue
-            for sym in block.symbols:
-                if sym.name in seen_symbols:
-                    continue
-                seen_symbols.add(sym.name)
-
-                cached = self._get_cached_symbol_analysis(
-                    sym.name, question_hash, content_hash=block.hash
-                )
-                if cached is not None:
-                    cached["symbol_name"] = sym.name
-                    symbol_entries.append(
-                        (sym.name, block.importance_score, block.hash, cached)
-                    )
-                    continue
-
-                ctx = self._build_symbol_context(sym, block, project_id)
-                if ctx is None:
-                    continue
-                symbol_entries.append(
-                    (sym.name, block.importance_score, block.hash, ctx)
-                )
-
-        if not symbol_entries:
-            return "", []
-
-        # Sort by importance descending so that the most relevant blocks are processed first
-        symbol_entries.sort(key=lambda x: x[1], reverse=True)
-
-        total_symbols = len(symbol_entries)
-        batch_size = self.valves.symbol_batch_size
-        intermediate_summaries = []
-        all_suggested = set()
-
-        # ── Process in batches ─────────────────────────────────────────
-        for batch_start in range(0, total_symbols, batch_size):
-            batch_num = batch_start // batch_size + 1
-            total_batches = (total_symbols + batch_size - 1) // batch_size
-            batch = symbol_entries[batch_start : batch_start + batch_size]
-            self._log_debug(
-                f"Symbol analysis batch {batch_num}/{total_batches} "
-                f"({len(batch)} symbols)"
-            )
-
-            # Separate fresh vs cached
-            fresh_entries = []
-            cached_results = []
-            for name, _, block_hash, ctx_or_cached in batch:
-                if isinstance(ctx_or_cached, dict):
-                    cached_results.append(ctx_or_cached)
-                else:
-                    fresh_entries.append((name, block_hash, ctx_or_cached))
-
-            # Analyze fresh symbols in parallel
-            if fresh_entries:
-                prompt_template_full = (
-                    "You are a code analysis assistant. "
-                    "For the given symbol, provide:\n"
-                    "FUNCTIONS: <comma separated list of relevant function/class names>\n"
-                    "FINDINGS: <one key finding>\n"
-                    "ISSUES: <any potential issue, or 'none'>\n"
-                    "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
-                    "CONFIDENCE: <float 0.0-1.0>\n\n"
-                    "EXAMPLE:\n"
-                    "Symbol: `def calculate(x, y)` in math_utils.py\n"
-                    "Body preview:\n```\nreturn x / y\n```\n"
-                    "FUNCTIONS: calculate\n"
-                    "FINDINGS: Performs division\n"
-                    "ISSUES: Division by zero\n"
-                    "SUGGEST: validate_input\n"
-                    "CONFIDENCE: 0.9\n\n"
-                    "Now analyze:\n{context}\n"
-                    "OUTPUT:"
-                )
-                prompt_template_no_body = (
-                    "You are a code analysis assistant. "
-                    "For the given symbol, provide:\n"
-                    "FUNCTIONS: <comma separated list of relevant function/class names>\n"
-                    "FINDINGS: <one key finding>\n"
-                    "ISSUES: <any potential issue, or 'none'>\n"
-                    "SUGGEST: <suggested next symbol to explore, or 'none'>\n"
-                    "CONFIDENCE: <float 0.0-1.0>\n\n"
-                    "Now analyze (only signature and call info available):\n{context}\n"
-                    "OUTPUT:"
-                )
-
-                model = self.valves.symbol_analysis_model or self.valves.llm_model
-                semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
-                max_retries = self.valves.symbol_analysis_max_retries
-
-                parsed_fresh = []
-                for name, block_hash, ctx in fresh_entries:
-                    success = False
-                    for attempt in range(max_retries):
-                        if attempt == 0:
-                            prompt = prompt_template_full.format(context=ctx)
-                        elif attempt == 1:
-                            ctx_clean = ctx.split("\nBody preview:\n")[0]
-                            prompt = prompt_template_no_body.format(context=ctx_clean)
-                        else:
-                            ctx_sig = ctx.split("\n")[0]
-                            prompt = prompt_template_no_body.format(context=ctx_sig)
-
-                        try:
-                            res = await self._analyze_single_symbol(
-                                prompt, model, semaphore, label=f"symbol:{name}"
-                            )
-                        except Exception:
-                            continue
-
-                        if not res:
-                            continue
-
-                        parsed = self._parse_symbol_output(res)
-                        if parsed:
-                            parsed["symbol_name"] = name
-                            parsed_fresh.append(parsed)
-                            self._set_cached_symbol_analysis(
-                                name, question_hash, parsed, content_hash=block_hash
-                            )
-                            success = True
-                            break
-
-                    if not success:
-                        self._log_debug(f"Symbol analysis failed for {name}")
-
-                # Combine with cached for this batch
-                batch_analyses = cached_results + parsed_fresh
-            else:
-                batch_analyses = cached_results
-
-            if batch_analyses:
-                # Collect suggested symbols
-                for r in batch_analyses:
-                    if r.get("suggested_next") and r["suggested_next"] != "none":
-                        all_suggested.add(r["suggested_next"])
-
-                # Generate an intermediate summary for this batch
-                batch_summary = await self._synthesize_from_symbol_results(
-                    batch_analyses, question
-                )
-                if batch_summary:
-                    intermediate_summaries.append(batch_summary)
-
-            self._log_debug(
-                f"Symbol analysis batch {batch_num}/{total_batches} complete"
-            )
-
-        if not intermediate_summaries:
-            return "Symbol analysis produced no results.", []
-
-        # ── Synthesize final summary from intermediate summaries ──────
-        if len(intermediate_summaries) == 1:
-            final_summary = intermediate_summaries[0]
-        else:
-            combined = "\n\n".join(
-                f"Batch {i+1}:\n{s}" for i, s in enumerate(intermediate_summaries)
-            )
-            prompt = (
-                f"Question: {question}\n\n"
-                f"Intermediate batch summaries:\n{combined}\n\n"
-                "Combine these into a single concise summary of the codebase. "
-                "Include relevant functions, key findings, issues, and suggestions. "
-                "Keep the response under {max_tokens} tokens. No code snippets."
-            )
-            model = self.valves.symbol_analysis_model or self.valves.llm_model
-            final_summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a senior software architect summarizing code analysis.",
-                model_override=model,
-                max_tokens=self.valves.synthesis_max_tokens,
-                temperature=0.2,
-            )
-            final_summary = final_summary or "\n".join(intermediate_summaries)
-
-        return final_summary, list(all_suggested)
-
-    async def _analyze_single_symbol(
-        self, prompt: str, model: str, semaphore: asyncio.Semaphore, label: str = ""
-    ) -> Optional[str]:
-        async with semaphore:
-            return await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code analysis engine. Output only the structured text as requested.",
-                model_override=model,
-                max_tokens=200,
-                temperature=0.0,
-                label=label,
-            )
-
-    def _parse_symbol_output(self, text: str) -> Optional[Dict]:
-        if not text:
-            return None
-        try:
-            result = {}
-            lines = text.strip().splitlines()
-            for line in lines:
-                line = line.strip()
-                if line.startswith("FUNCTIONS:"):
-                    result["relevant_functions"] = [
-                        f.strip() for f in line[10:].split(",") if f.strip()
-                    ]
-                elif line.startswith("FINDINGS:"):
-                    result["key_findings"] = [line[9:].strip()]
-                elif line.startswith("ISSUES:"):
-                    issues = line[7:].strip()
-                    if issues.lower() != "none":
-                        result["potential_issues"] = [issues]
-                    else:
-                        result["potential_issues"] = []
-                elif line.startswith("SUGGEST:"):
-                    suggest = line[8:].strip()
-                    if suggest.lower() != "none":
-                        result["suggested_next"] = suggest
-                elif line.startswith("CONFIDENCE:"):
-                    try:
-                        result["confidence"] = float(line[11:].strip())
-                    except ValueError:
-                        result["confidence"] = 0.5
-            result.setdefault("relevant_functions", [])
-            result.setdefault("key_findings", [])
-            result.setdefault("potential_issues", [])
-            result.setdefault("confidence", 0.5)
-            return result
-        except Exception:
-            return None
-
-    async def _synthesize_from_symbol_results(
-        self, symbol_analyses: List[Dict], question: str
-    ) -> str:
-        if not symbol_analyses:
-            return "No symbol analyses to synthesize."
-
-        lines = []
-        for sa in symbol_analyses:
-            lines.append(
-                f"`{sa.get('symbol_name', 'unknown')}`: "
-                f"functions={sa.get('relevant_functions', [])}, "
-                f"findings={sa.get('key_findings', [])}, "
-                f"issues={sa.get('potential_issues', [])}"
-            )
-
-        combined = "\n".join(lines)
-        if self.tokenizer:
-            tokens = len(self.tokenizer.encode(combined))
-            if tokens > 8000:
-                combined = self._truncate_text_to_tokens(combined, 8000)
-
-        prompt = (
-            f"Question: {question}\n\n"
-            f"Individual symbol analyses:\n{combined}\n\n"
-            "Synthesize the above into a concise summary of the codebase. "
-            "Include relevant functions, key findings, issues, and suggestions. "
-            "Keep the response under 1500 tokens. No code snippets."
-        )
-
-        model = self.valves.symbol_analysis_model or self.valves.llm_model
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a senior software architect summarizing code analysis.",
-            model_override=model,
-            max_tokens=self.valves.synthesis_max_tokens,
-            temperature=0.2,
-        )
-        return response if response else "Failed to synthesize summary."
-
-    def _get_blocks_for_symbols(
-        self, symbol_names: List[str], project_id: str
-    ) -> List[CodeBlock]:
-        state = self._get_state(project_id)
-        blocks = []
-        seen = set()
-        for name in symbol_names:
-            for h in self._symbol_index.find_blocks(name, project_id):
-                if h not in seen:
-                    blk = state["active_blocks"].get(h)
-                    if blk and not blk.obsolete:
-                        blocks.append(blk)
-                        seen.add(h)
-        return sorted(blocks, key=lambda b: b.importance_score, reverse=True)
-
-    # --------------------------------------------------------------------------
-    # Symbol-level analysis
-    # --------------------------------------------------------------------------
-    def _get_cached_symbol_analysis(
-        self, symbol_name: str, question_hash: str, content_hash: str = ""
-    ) -> Optional[Dict]:
-        key = (symbol_name, question_hash)
-        if key in self._symbol_analysis_cache:
-            if content_hash:
-                row = self._db_conn.execute(
-                    "SELECT content_hash FROM symbol_analysis_cache "
-                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                    (self.valves.project_id, symbol_name, question_hash),
-                ).fetchone()
-                if row and row[0] != content_hash:
-                    del self._symbol_analysis_cache[key]
-                    self._db_conn.execute(
-                        "DELETE FROM symbol_analysis_cache "
-                        "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                        (self.valves.project_id, symbol_name, question_hash),
-                    )
-                    self._db_conn.commit()
-                    return None
-            # Refresh LRU order
-            self._symbol_analysis_cache.move_to_end(key)
-            return self._symbol_analysis_cache[key]
-
-        generic_key = (symbol_name, content_hash) if content_hash else None
-        if generic_key and generic_key in self._symbol_analysis_generic_cache:
-            return self._symbol_analysis_generic_cache[generic_key]
-
-        row = self._db_conn.execute(
-            "SELECT result_json, content_hash FROM symbol_analysis_cache "
-            "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-            (self.valves.project_id, symbol_name, question_hash),
-        ).fetchone()
-        if row:
-            result_json, stored_content_hash = row
-            if content_hash and stored_content_hash != content_hash:
-                self._db_conn.execute(
-                    "DELETE FROM symbol_analysis_cache "
-                    "WHERE project_id = ? AND symbol_name = ? AND question_hash = ?",
-                    (self.valves.project_id, symbol_name, question_hash),
-                )
-                self._db_conn.commit()
-                return None
-            try:
-                result = json.loads(result_json)
-                if len(self._symbol_analysis_cache) < self._MAX_SYMBOL_ANALYSIS_CACHE:
-                    self._symbol_analysis_cache[key] = result
-                    self._symbol_analysis_cache.move_to_end(key)
-                return result
-            except Exception:
-                pass
-        return None
-
-    def _set_cached_symbol_analysis(
-        self, symbol_name: str, question_hash: str, result: Dict, content_hash: str = ""
-    ):
-        key = (symbol_name, question_hash)
-        if len(self._symbol_analysis_cache) >= self._MAX_SYMBOL_ANALYSIS_CACHE:
-            self._symbol_analysis_cache.popitem(last=False)
-        self._symbol_analysis_cache[key] = result
-        self._symbol_analysis_cache.move_to_end(key)
-
-        if content_hash:
-            generic_key = (symbol_name, content_hash)
-            if len(self._symbol_analysis_generic_cache) >= 2000:
-                self._symbol_analysis_generic_cache.popitem(last=False)
-            self._symbol_analysis_generic_cache[generic_key] = result
-            self._symbol_analysis_generic_cache.move_to_end(generic_key)
-
-        project_id = self.valves.project_id
-        result_json = json.dumps(result)
-
-        def _write():
-            self._db_conn.execute(
-                "REPLACE INTO symbol_analysis_cache "
-                "(project_id, symbol_name, question_hash, content_hash, result_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    project_id,
-                    symbol_name,
-                    question_hash,
-                    content_hash,
-                    result_json,
-                    time.time(),
-                ),
-            )
-            self._db_conn.commit()
-            self._db_conn.execute(
-                "DELETE FROM symbol_analysis_cache "
-                "WHERE project_id = ? AND (symbol_name, question_hash) NOT IN ("
-                "  SELECT symbol_name, question_hash FROM symbol_analysis_cache "
-                "  WHERE project_id = ? "
-                "  ORDER BY created_at DESC "
-                "  LIMIT 1000"
-                ")",
-                (project_id, project_id),
-            )
-
-        asyncio.create_task(self._db_write_queue.put((_write, (), {})))
 
     # --------------------------------------------------------------------------
     # Deferred secondary task execution
@@ -10495,29 +9556,3 @@ class Filter:
         except Exception as e:
             self._log_debug(f"Secondary task {task.task_type} failed: {e}")
             return False
-
-    async def _load_symbol_cache_from_db(self, project_id: str, limit: int = 500):
-        """Pre‑load the most recent symbol analyses from DB into memory."""
-        rows = await anyio.to_thread.run_sync(
-            lambda: self._db_conn.execute(
-                "SELECT symbol_name, question_hash, content_hash, result_json "
-                "FROM symbol_analysis_cache "
-                "WHERE project_id = ? "
-                "ORDER BY created_at DESC "
-                "LIMIT ?",
-                (project_id, limit),
-            ).fetchall()
-        )
-        loaded = 0
-        for symbol_name, question_hash, content_hash, result_json in rows:
-            try:
-                result = json.loads(result_json)
-                key = (symbol_name, question_hash)
-                self._symbol_analysis_cache[key] = result
-                loaded += 1
-            except Exception:
-                pass
-        if loaded:
-            self._log_debug(
-                f"Loaded {loaded} symbol analyses from DB cache for project {project_id}"
-            )
