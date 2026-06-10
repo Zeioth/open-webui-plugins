@@ -1260,7 +1260,7 @@ class Filter:
             description="Timeout (seconds) for a single LLM call attempt.",
         )
         llm_retry_total_timeout: int = Field(
-            default=60,
+            default=450,
             ge=10,
             le=300,
             description="Total time budget for retrying failed LLM calls.",
@@ -3779,17 +3779,13 @@ class Filter:
         self,
         prompt: str,
         system_prompt: str,
-        timeout: Optional[float] = None,  # per‑call timeout (overrides valve)
-        total_timeout: Optional[float] = None,  # total retry budget (overrides valve)
+        timeout: Optional[float] = None,
+        total_timeout: Optional[float] = None,
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
+        label: str = "",  # <-- NUEVO
     ) -> Optional[str]:
-        """
-        LLM call with automatic retries on any failure.
-        Uses self.valves.llm_per_call_timeout and llm_retry_total_timeout
-        as default time budgets.
-        """
         per_call_timeout = (
             timeout if timeout is not None else self.valves.llm_per_call_timeout
         )
@@ -3798,14 +3794,14 @@ class Filter:
             if total_timeout is not None
             else self.valves.llm_retry_total_timeout
         )
-
         deadline = time.monotonic() + total_budget
         attempt = 0
+
+        label_prefix = f"[{label}] " if label else ""
 
         while time.monotonic() < deadline:
             attempt += 1
             remaining_total = deadline - time.monotonic()
-            # El intento individual no debe exceder lo que queda del total
             this_timeout = min(per_call_timeout, remaining_total)
 
             try:
@@ -3816,23 +3812,25 @@ class Filter:
                         model_override=model_override,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        label=label,  # reenviamos la etiqueta a _call_llm
                     ),
                     timeout=this_timeout,
                 )
             except asyncio.TimeoutError:
                 self._log_debug(
-                    f"LLM call timed out (attempt {attempt}, "
+                    f"{label_prefix}LLM call timed out (attempt {attempt}, "
                     f"per-call timeout={this_timeout:.1f}s, "
                     f"total remaining {remaining_total:.0f}s)"
                 )
             except Exception as e:
-                self._log_debug(f"LLM call failed (attempt {attempt}): {str(e)[:100]}")
+                self._log_debug(
+                    f"{label_prefix}LLM call failed (attempt {attempt}): {str(e)[:100]}"
+                )
 
-            # Pequeña pausa antes de reintentar
             await asyncio.sleep(2.0)
 
         self._log_debug(
-            f"LLM call retries exhausted after {total_budget}s: {prompt[:80]}..."
+            f"{label_prefix}LLM call retries exhausted after {total_budget}s: {prompt[:80]}..."
         )
         return None
 
@@ -4697,6 +4695,7 @@ class Filter:
             model_override=self.valves.secondary_task_model,
             max_tokens=80,
             temperature=0.6,
+            label="multi_query_expand",
         )
 
         queries = [query]  # always include original
@@ -7050,6 +7049,7 @@ class Filter:
             model_override=self.valves.intent_classifier_model,
             max_tokens=20,
             temperature=0.0,
+            label="intent_classify",
         )
 
         if response:
@@ -8318,6 +8318,7 @@ class Filter:
             model_override=model,
             max_tokens=200,
             temperature=0.0,
+            label="parse_intents",
         )
         dur = time.monotonic() - t0
         self._log_timing("parse_intents_llm", dur, dur)
@@ -8416,6 +8417,7 @@ class Filter:
             model_override=model,
             max_tokens=3,
             temperature=0.0,
+            label="contradiction",
         )
         dur = time.monotonic() - t0
         self._log_timing("detect_contradictions_llm", dur, dur)
@@ -8814,6 +8816,7 @@ class Filter:
                 model_override=self.valves.cot_detection_model,
                 max_tokens=2,
                 temperature=0.0,
+                label="cot_detect",
             )
             if response and response.strip().isdigit():
                 level = int(response.strip())
