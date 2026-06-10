@@ -1509,6 +1509,99 @@ class Filter:
             description="Use LLM as fallback when heuristic intent classification produces a weak signal.",
         )
 
+        # ═══════════════════════════════════════════════════════════════════
+        #  Multi-Phase Response
+        # ═══════════════════════════════════════════════════════════════════
+        # IMPORTANT:
+        # - Budget is measured from the REMAINING free context window space.
+        # - Protocol activates when effective budget < threshold.
+        # - effective_max_tokens acts as a cap on the budget (it is NOT the
+        #   number of tokens already generated).
+        enable_multi_phase_response: bool = Field(
+            default=True,
+            description="Master on/off for multi‑phase splitting.",
+        )
+        multi_phase_response_threshold: int = Field(
+            default=85000,
+            ge=0,
+            le=200000,
+            description=(
+                "Protocol activates when the REMAINING response token budget "
+                "(min(free_context_tokens, effective_max_tokens)) "
+                "falls BELOW this number. "
+                "Set > effective_max_tokens → always split responses. "
+                "Set to 0 → disable splitting."
+            ),
+        )
+        multi_phase_response_budget_warn: int = Field(
+            default=8000,
+            ge=500,
+            le=40000,
+            description=(
+                "When REMAINING budget drops below this, a short wrap‑up hint "
+                "is appended to the user message (no system tokens spent)."
+            ),
+        )
+        multi_phase_effective_max_tokens: int = Field(
+            default=80000,
+            ge=1000,
+            le=200000,
+            description=(
+                "Max tokens allowed per response (set = LLM server max_tokens). "
+                "Used to cap the remaining budget: "
+                "effective budget = min(free context space, this number). "
+                "If that budget < threshold, the model splits the answer into phases."
+            ),
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        #  Code History Compression
+        # ═══════════════════════════════════════════════════════════════════
+        enable_code_history_compression: bool = Field(
+            default=True,
+            description=(
+                "Compress assistant messages containing multi-phase code parts after "
+                "their symbols are verified in the SymbolGraph. Prevents context "
+                "explosion in multi-part refactors. Keeps last N parts in full."
+            ),
+        )
+        code_history_keep_last_n_parts: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description=(
+                "Number of most recent code parts to keep in full. "
+                "Older parts are replaced with commit summaries."
+            ),
+        )
+        code_history_symbol_index_threshold: float = Field(
+            default=0.75,
+            ge=0.5,
+            le=1.0,
+            description=(
+                "Minimum ratio of top-level symbols (classes/functions) that must be "
+                "indexed in the SymbolGraph before a message can be compressed. "
+                "Prevents compression of partially-parsed code."
+            ),
+        )
+        enable_lean_user_code: bool = Field(
+            default=True,
+            description=(
+                "Replace large code blocks in user messages with SymbolGraph references "
+                "once code generation has started (phases 1-4 of multi-phase protocol "
+                "are complete and symbols are indexed). The instruction text is preserved."
+            ),
+        )
+        lean_user_code_min_tokens: int = Field(
+            default=8000,
+            ge=2000,
+            le=60000,
+            description=(
+                "Minimum tokens in a code block to qualify for lean replacement. "
+                "Blocks below this size are kept in full."
+            ),
+        )
+
         # ═══════════════════════════════════════════════════════════════
         #  Code Compression (LLMLingua-2)
         # ═══════════════════════════════════════════════════════════════
@@ -1924,6 +2017,13 @@ class Filter:
             "sin",
             "no hace falta",
             "no es necesario",
+        }
+    )
+
+    _MULTI_PHASE_MARKERS: frozenset = frozenset(
+        {
+            "▶ CONTINÚA:",
+            "▶ CONTINÚA EN LA SIGUIENTE PARTE",
         }
     )
 
@@ -7052,6 +7152,518 @@ class Filter:
 
         return static_block
 
+    def _build_multi_phase_instructions(
+        self,
+        available_tokens: int,
+        user_query: str,
+        cot_degraded_to_l1: bool = False,
+    ) -> str:
+        """
+        Build system instructions for structured multi-phase responses.
+
+        Called only in normal multi-phase mode:
+            multi_phase_response_budget_warn <= available_tokens
+                                              < multi_phase_response_threshold
+
+        Critical mode (available_tokens < budget_warn) is handled separately
+        by _append_critical_wrap_up_hint, which appends to the user message
+        so it does not consume response tokens.
+
+        NOTE: available_tokens must already be discounted for the overhead of
+        these instructions themselves (see _INSTRUCTION_OVERHEAD in the caller).
+        This ensures the token count reported here is what the model actually has.
+
+        Protocol (code tasks):
+            Fase 1  Análisis        understand, dependencies, what changes
+            Fase 2  Arquitectura    design decisions (optional)
+            Fase 3  Contrato        all class/method signatures, no bodies
+            Fase 4  Plan            numbered blocks + estimated token sizes
+            Fase 5+ Código K/M      code, always ends at natural boundaries
+            Fase F  Verificación    completeness checklist
+
+        Args:
+            available_tokens:    Accurate response budget after instruction
+                                 overhead has already been subtracted.
+            user_query:          Current user message (detects code tasks).
+            cot_degraded_to_l1:  True when the pre-check forced CoT from
+                                 L2/L3 down to L1. Fase 1 absorbs the
+                                 step-by-step reasoning in that case.
+        """
+        _CODE_SIGNALS = {
+            "refactor",
+            "refactoriza",
+            "implement",
+            "implementa",
+            "escribe",
+            "write",
+            "genera",
+            "generate",
+            "crea",
+            "create",
+            "código",
+            "code",
+            "clase",
+            "class",
+            "función",
+            "function",
+            "método",
+            "method",
+            "módulo",
+            "module",
+            "reescribe",
+            "rewrite",
+        }
+        is_code_task = any(sig in user_query.lower() for sig in _CODE_SIGNALS)
+
+        # Per-part budget: leave ~200 tokens for markers and overhead.
+        # min 500 so the value scales correctly when available_tokens is small.
+        part_budget = max(500, available_tokens - 200)
+
+        fase1_suffix = (
+            " *(razona paso a paso aquí — análisis de dependencias incluido)*"
+            if cot_degraded_to_l1
+            else ""
+        )
+
+        if is_code_task:
+            header = (
+                f"## 📋 PROTOCOLO MULTI-FASE — {available_tokens} tokens disponibles\n\n"
+                "Tu tarea genera más código del que cabe en un mensaje. "
+                "Sigue **exactamente** este protocolo:"
+            )
+            phases = textwrap.dedent(f"""
+                **FASE 1 — Análisis{fase1_suffix}** (~300-400 tokens)
+                Qué existe, qué cambia, dependencias críticas. Sin código todavía.
+
+                **FASE 2 — Arquitectura** (~400-600 tokens) *(solo si el diseño es complejo)*
+                Decisiones de estructura: clases, inyección de dependencias, patrones.
+                Omite esta fase si el Plan la cubre suficientemente.
+
+                **FASE 3 — Contrato** (~300-500 tokens)
+                Firmas completas de todas las clases y métodos públicos, sin cuerpo.
+                Compromiso firme: no cambies estas firmas en fases posteriores.
+
+                **FASE 4 — Plan de Acción** (~300-400 tokens)
+                Lista numerada: bloque | tokens estimados | dependencias previas.
+                Última línea obligatoria:
+                "Total: ~X tokens → N partes de ≤ {part_budget} tokens c/u"
+
+                **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
+                Escribe los bloques del plan en orden. REGLAS CRÍTICAS:
+                  · Encabeza cada parte: `## Código — Parte K/M: [nombre del bloque]`
+                  · NUNCA cortes dentro de una función, clase o método.
+                  · Antes de alcanzar el límite, cierra el bloque actual limpiamente
+                    y escribe el marcador obligatorio:
+                    `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
+                    `# Pendiente: [lista de lo que falta]`
+                  · Una clase puede partirse entre partes; un método, nunca.
+
+                **FASE FINAL — Verificación** (~150 tokens)
+                Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
+            """).strip()
+
+        else:
+            cot_note = (
+                "\nRazona paso a paso antes de continuar." if cot_degraded_to_l1 else ""
+            )
+            header = (
+                f"## 📋 RESPUESTA LARGA — {available_tokens} tokens disponibles\n\n"
+                "Tu respuesta probablemente excede el espacio en un mensaje. "
+                "Divídela en partes lógicas:"
+            )
+            phases = textwrap.dedent(f"""
+                **Parte 1 — Resumen y plan** (~300 tokens)
+                Enumera los puntos que vas a desarrollar.{cot_note}
+
+                **Partes 2...N — Desarrollo** (≤ {part_budget} tokens por parte)
+                Al final de cada parte que no sea la última escribe:
+                `▶ CONTINÚA — [título de lo que sigue]`
+
+                **Parte Final — Conclusión** (~150 tokens)
+                Verifica que cubriste todos los puntos del plan.
+            """).strip()
+
+        return f"{header}\n\n{phases}"
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Code History Compression helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _verify_code_symbols_indexed(
+        self, content: str, project_id: str
+    ) -> Tuple[bool, float]:
+        """
+        Check that top-level symbols (class/function definitions at column 0)
+        from a code-containing message are present in the SymbolGraph.
+
+        Uses a simple regex instead of full tree-sitter reparse to avoid overhead.
+        Top-level class names are the primary structural indicator; if they are
+        indexed, the whole module was successfully parsed.
+
+        Returns (safe_to_compress, indexed_ratio).
+        safe_to_compress = True when ratio >= code_history_symbol_index_threshold
+        or when no top-level symbols are found (pure prose response).
+        """
+        _TOP_LEVEL = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+        expected = set(_TOP_LEVEL.findall(content))
+        if not expected:
+            # No class definitions → prose or function-only file
+            # Fall back to top-level functions
+            _TOP_FN = re.compile(
+                r"^(?:async )?def\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+            )
+            expected = set(_TOP_FN.findall(content))
+        if not expected:
+            return True, 1.0  # Nothing to verify → safe
+
+        try:
+            graph_symbols = {
+                node.name
+                for node in (self._symbol_graph.get_all_nodes(project_id) or [])
+            }
+            ratio = len(expected & graph_symbols) / len(expected)
+            return ratio >= self.valves.code_history_symbol_index_threshold, ratio
+        except Exception as exc:
+            self._log_debug(f"Symbol index check failed: {exc}")
+            return False, 0.0
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_code_commit_summary(
+        self,
+        content: str,
+        project_id: str,
+        part_num: int,
+        total_parts: int,
+    ) -> str:
+        """
+        Generate a compact commit summary for a compressed code message.
+
+        The summary preserves enough structural information so the model can:
+          - Know which classes/functions exist (for dependency tracking)
+          - Know what is done vs pending (for multi-part continuity)
+          - Recover any specific implementation via LOD or /expand
+
+        Does NOT include any code bodies — those are in the SymbolGraph.
+        """
+        # Structural extraction
+        classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        methods = re.findall(
+            r"^\s{4,}(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE
+        )
+
+        # Code volume
+        code_bodies = re.findall(r"```(?:\w*)\n(.*?)```", content, re.DOTALL)
+        code_lines = sum(b.count("\n") for b in code_bodies)
+        code_tokens = (
+            self._estimate_tokens("\n".join(code_bodies)) if code_bodies else 0
+        )
+
+        # Part label from header
+        header_m = re.search(
+            r"##\s*Código\s*[—\-]\s*Parte\s*\d+/\d+[:\s]+(.+?)(?:\n|$)", content
+        )
+        part_label = header_m.group(1).strip() if header_m else ""
+
+        # Infer dependencies from import lines (simple heuristic)
+        imports = re.findall(r"^from\s+\S+\s+import\s+(.+)$", content, re.MULTILINE)
+        dep_symbols: List[str] = []
+        for imp in imports[:3]:
+            dep_symbols.extend(s.strip() for s in imp.split(","))
+        dep_symbols = dep_symbols[:6]
+
+        # Assemble summary
+        title = f"[🗜️ PARTE {part_num}/{total_parts}"
+        if part_label:
+            title += f": {part_label}"
+        title += " — COMPRIMIDO]"
+
+        lines = [title]
+        if classes:
+            lines.append(f"Clases:    {', '.join(classes)}")
+        if top_fns:
+            lines.append(f"Funciones: {', '.join(top_fns[:6])}")
+        if methods:
+            lines.append(f"Métodos:   {len(methods)} implementados")
+        lines.append(f"Volumen:   ~{code_lines} líneas / ~{code_tokens} tokens")
+        if dep_symbols:
+            lines.append(f"Deps usadas: {', '.join(dep_symbols)}")
+        if classes:
+            lines.append(f"Recuperar: /expand {classes[0]}")
+        lines.append(
+            "[Todos los símbolos indexados en SymbolGraph — accesibles via LOD]"
+        )
+
+        return "\n".join(lines)
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _compress_code_history(
+        self,
+        messages: List[dict],
+        project_id: str,
+    ) -> List[dict]:
+        """
+        Replace old assistant code-part messages with compact commit summaries.
+
+        Compression pipeline:
+          1. Find all assistant messages with multi-phase code part headers.
+          2. Keep the last `code_history_keep_last_n_parts` in full.
+          3. For each older part, verify symbols are indexed in the SymbolGraph.
+          4. If indexed (ratio >= threshold): replace with commit summary.
+          5. If NOT indexed: log warning and keep full (defensive — never
+             lose code that isn't safely retrievable from the graph).
+
+        This is intentionally stateless: re-scanning history on each request
+        means the compression is self-healing after restarts.
+        """
+        if not self.valves.enable_code_history_compression:
+            return messages
+
+        _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
+        _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
+        keep = self.valves.code_history_keep_last_n_parts
+
+        # Collect indices of uncompressed code-part messages
+        code_part_indices: List[Tuple[int, int, int]] = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if _ALREADY_COMPRESSED.search(content):
+                continue  # already compressed, skip
+            m = _PART_HEADER.search(content)
+            if m:
+                code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
+
+        if len(code_part_indices) <= keep:
+            return messages  # Nothing old enough to compress
+
+        to_compress = code_part_indices[:-keep]
+        new_messages = list(messages)
+        compressed_n = 0
+
+        for msg_idx, part_num, total_parts in to_compress:
+            msg = new_messages[msg_idx]
+            content = msg.get("content", "")
+
+            safe, ratio = self._verify_code_symbols_indexed(content, project_id)
+            if not safe:
+                self._log_debug(
+                    f"Code history: skipping compression of Part {part_num}/{total_parts} "
+                    f"(symbol ratio {ratio:.0%} < threshold "
+                    f"{self.valves.code_history_symbol_index_threshold:.0%})"
+                )
+                continue
+
+            summary = self._build_code_commit_summary(
+                content, project_id, part_num, total_parts
+            )
+            tokens_before = self._estimate_tokens(content)
+            tokens_after = self._estimate_tokens(summary)
+            new_messages[msg_idx] = {**msg, "content": summary}
+            compressed_n += 1
+            self._log_debug(
+                f"Code history: compressed Part {part_num}/{total_parts} — "
+                f"{tokens_before:,} → {tokens_after:,} tokens "
+                f"(ratio {ratio:.0%})"
+            )
+
+        if compressed_n:
+            self._log_debug(
+                f"Code history: {compressed_n} part(s) compressed, "
+                f"last {keep} kept in full."
+            )
+
+        return new_messages
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _lean_user_code_messages(
+        self,
+        messages: List[dict],
+        project_id: str,
+    ) -> List[dict]:
+        """
+        Replace large code blocks in user messages with SymbolGraph references,
+        once it is safe to do so.
+
+        Trigger condition (both must be true):
+          1. An assistant message contains "## Código — Parte 1/" — meaning phases
+             1-4 are complete and the model has extracted what it needs from the
+             original code.
+          2. The SymbolGraph has at least 20 symbols for this project — confirming
+             the code was successfully indexed.
+
+        Safety rules:
+          - Only blocks >= lean_user_code_min_tokens are replaced.
+          - Already-leaned blocks are skipped.
+          - The instruction text (non-code parts) is ALWAYS preserved.
+          - The replacement includes the token count and symbol count so the model
+            knows what was there.
+
+        Rationale: once code generation starts, the model has already analysed the
+        original code in phases 1-3. It no longer needs the raw text — the LOD
+        system can recover any specific implementation on demand. Lean is safe.
+        """
+        if not self.valves.enable_lean_user_code:
+            return messages
+
+        # Check trigger: first code part must have started
+        trigger_fired = any(
+            "## Código — Parte 1/" in msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "assistant"
+        )
+        if not trigger_fired:
+            return messages
+
+        # Verify symbol graph has meaningful content
+        try:
+            symbol_count = sum(
+                1 for _ in (self._symbol_graph.get_all_nodes(project_id) or [])
+            )
+        except Exception:
+            symbol_count = 0
+
+        if symbol_count < 20:
+            self._log_debug(
+                "Lean user code: trigger fired but SymbolGraph too sparse "
+                f"({symbol_count} symbols) — skipping."
+            )
+            return messages
+
+        _CODE_BLOCK = re.compile(r"```(?P<lang>\w*)\n(?P<body>.*?)```", re.DOTALL)
+        _ALREADY_LEAN = "[CÓDIGO COMPRIMIDO"
+        min_tokens = self.valves.lean_user_code_min_tokens
+
+        new_messages = list(messages)
+        lean_n = 0
+
+        for i, msg in enumerate(new_messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if _ALREADY_LEAN in content:
+                continue
+
+            # Only target messages with substantial code
+            total_code_tokens = sum(
+                self._estimate_tokens(m.group("body"))
+                for m in _CODE_BLOCK.finditer(content)
+            )
+            if total_code_tokens < min_tokens:
+                continue
+
+            def _replace(match: re.Match) -> str:
+                body = match.group("body")
+                lang = match.group("lang") or "code"
+                blk_tokens = self._estimate_tokens(body)
+                if blk_tokens < min_tokens:
+                    return match.group(0)
+                return (
+                    f"```{lang}\n"
+                    f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens — "
+                    f"{symbol_count} símbolos indexados en SymbolGraph. "
+                    f"Recuperar implementaciones con /expand <nombre> o via LOD.]\n"
+                    f"```"
+                )
+
+            new_content = _CODE_BLOCK.sub(_replace, content)
+            if new_content != content:
+                new_messages[i] = {**msg, "content": new_content}
+                lean_n += 1
+                self._log_debug(
+                    f"Lean user code: message {i} — replaced ~{total_code_tokens:,} tokens "
+                    f"({symbol_count} symbols available via LOD)"
+                )
+
+        if lean_n:
+            self._log_debug(f"Lean user code: applied to {lean_n} message(s).")
+
+        return new_messages
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_refactor_state_injection(self, messages: List[dict]) -> str:
+        """
+        Build a compact "Estado del Refactor" block from compressed code parts
+        in conversation history.
+
+        Injected into Block B when active multi-phase compression is detected.
+        Gives the model awareness of what has been written without reading full messages.
+
+        Returns empty string if no compressed parts found (no injection needed).
+        """
+        _COMPRESSED = re.compile(r"\[🗜️ PARTE (\d+)/(\d+)(?:: (.+?))? — COMPRIMIDO\]")
+
+        completed: List[Tuple[int, str]] = []
+        total_parts: Optional[int] = None
+
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            m = _COMPRESSED.search(msg.get("content", ""))
+            if m:
+                num = int(m.group(1))
+                total = int(m.group(2))
+                label = m.group(3) or f"Parte {num}"
+                completed.append((num, label))
+                total_parts = total
+
+        if not completed or not total_parts:
+            return ""
+
+        done_nums = {n for n, _ in completed}
+        pending = [i for i in range(1, total_parts + 1) if i not in done_nums]
+
+        lines = ["## 📊 Estado del Refactor en Progreso"]
+        for num, label in sorted(completed):
+            lines.append(
+                f"  ✓ Parte {num}/{total_parts}: {label} [indexado en SymbolGraph]"
+            )
+        for num in pending:
+            lines.append(f"  ⏳ Parte {num}/{total_parts}: [pendiente]")
+        lines.append(
+            "Los símbolos de las partes completadas están disponibles via LOD "
+            "(firmas en este prompt) o /expand para implementación completa."
+        )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _append_critical_wrap_up_hint(messages: List[dict]) -> List[dict]:
+        """
+        Append a short (~25-token) wrap-up reminder to the last user message
+        when the response token budget is critically low.
+
+        Appended to the user message (not system) so it is not deducted
+        from the model's generation budget.
+        """
+        last_user_idx = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].get("role") == "user"
+            ),
+            None,
+        )
+        if last_user_idx is None:
+            return messages
+
+        hint = (
+            "\n\n⚠️ Tokens críticos. Cierra el bloque actual sin cortarlo, "
+            "escribe el marcador de continuación y para."
+        )
+        messages[last_user_idx] = {
+            **messages[last_user_idx],
+            "content": messages[last_user_idx].get("content", "") + hint,
+        }
+        return messages
+
     def _slot_filename(self, project_id: str, static_hash: str) -> str:
         """
         Deterministic slot file name.
@@ -9466,15 +10078,67 @@ class Filter:
             "Assembling final messages (CoT, trimming, system prompt injection)"
         )
 
-        # Determine user intent for context reduction (only if slot is free, otherwise keep full code)
-        if slot_free:
+        # ── Multi-phase: one-time baseline computation ─────────────────────
+        # Reused by all three insertion points (0, A, B) to avoid triple
+        # tokenization of prelim_system.
+        #
+        # _dyn_injections_base_count: index into dynamic_injections at entry.
+        # Items added AFTER this index (CoT reasoning, CoT note, etc.) are
+        # counted in INSERT B via a list slice — no per-item tracking needed,
+        # CoT note is captured automatically.
+        #
+        # _mp_available: Optional sentinel, set by INSERT B.
+        # Stays None if multi-phase is disabled or prelim_system is empty.
+        # Used by the TOKEN BREAKDOWN log at the end of this function.
+        _dyn_injections_base_count: int = len(dynamic_injections)
+        _mp_available: Optional[int] = None
+
+        if self.valves.enable_multi_phase_response and self.tokenizer and prelim_system:
+            _prelim_tok_mp: int = len(self.tokenizer.encode(prelim_system))
+            _hist_tok_mp: int = self._estimate_tokens(
+                [m for m in messages if m.get("role") != "system"]
+            )
+            _available_mp_pre: int = max(
+                0,
+                self.valves.context_window_tokens - _prelim_tok_mp - _hist_tok_mp,
+            )
+            if (
+                self.valves.multi_phase_response_budget_warn
+                >= self.valves.multi_phase_response_threshold
+            ):
+                self._log_debug(
+                    "⚠️ Multi-phase misconfiguration: budget_warn "
+                    f"({self.valves.multi_phase_response_budget_warn}) >= threshold "
+                    f"({self.valves.multi_phase_response_threshold}). "
+                    "Critical path will always activate when multi-phase triggers."
+                )
+        else:
+            _prelim_tok_mp = 0
+            _hist_tok_mp = 0
+            _available_mp_pre = (
+                self.valves.context_window_tokens
+            )  # large → no activation
+        # ── End preamble ──────────────────────────────────────────────────
+
+        # Determine user intent for context reduction.
+        # Skip the LLM call when context is already tight: multi-phase activates
+        # regardless, and full code is always preserved in that mode.
+        _skip_intent_llm: bool = (
+            self.valves.enable_multi_phase_response
+            and _available_mp_pre < self.valves.multi_phase_response_threshold
+        )
+        if _skip_intent_llm:
+            self._log_debug(
+                f"Multi-phase pre-check: skipping _should_keep_full_code "
+                f"({_available_mp_pre} tokens < threshold "
+                f"{self.valves.multi_phase_response_threshold})."
+            )
+        if slot_free and not _skip_intent_llm:
             self._user_intent_full_code = await self._should_keep_full_code(
                 user_question
             )
         else:
-            self._user_intent_full_code = (
-                True  # keep full code to avoid degrading response
-            )
+            self._user_intent_full_code = True
 
         # ── 🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level ──
         self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
@@ -9520,6 +10184,37 @@ class Filter:
             self._log_debug(
                 "🧠 ENRICHMENT – CoT Step 1/3: CoT detection skipped (no free slot)"
             )
+
+        # ── Multi-phase pre-check: degrade CoT if context is tight ────────
+        # Decision: should we lower CoT from L2/L3 to L1 to preserve response
+        # tokens for the multi-phase protocol?
+        #
+        # Conditions:
+        #   · multi-phase enabled AND context already tight (pre-CoT estimate)
+        #   · CoT was going to run at L2 or L3 (would consume ~1500-3000 tokens)
+        #   · slot_free=True: CoT will actually execute. If False, CoT gets
+        #     disabled entirely later — flagging degradation would be misleading.
+        #
+        # Effect: cot_level → 1. At L1 auto-CoT, no reasoning is generated
+        # (the existing code has no L1 auto handler). Fase 1 of the multi-phase
+        # protocol absorbs the analysis/reasoning role instead.
+        _mp_cot_degraded: bool = False
+        if (
+            self.valves.enable_multi_phase_response
+            and _available_mp_pre < self.valves.multi_phase_response_threshold
+            and cot_any_used
+            and cot_level >= 2
+            and slot_free
+        ):
+            self._log_debug(
+                f"🧠 Multi-phase pre-check: {_available_mp_pre} tokens available "
+                f"< threshold {self.valves.multi_phase_response_threshold}. "
+                f"Degrading CoT Level {cot_level} → 1 "
+                f"(Fase 1 of the protocol absorbs the reasoning)."
+            )
+            cot_level = 1
+            _mp_cot_degraded = True
+        # ── End multi-phase pre-check ──────────────────────────────────────
 
         # Wait for background tasks before heavy LLM calls
         if background_tasks:
@@ -9633,6 +10328,84 @@ class Filter:
             dynamic_injections.append(("low", cot_note))
         else:
             self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
+
+        # ── Multi-phase final injection ────────────────────────────────────
+        # Runs AFTER CoT reasoning has been added to dynamic_injections.
+        #
+        # Token calculation:
+        #   prelim_system  → already includes static block, all Step-B5 injections,
+        #                    and base_content. Single source of truth for committed
+        #                    tokens at the start of _inlet_assemble_final_messages.
+        #   post_prelim    → items added to dynamic_injections AFTER the preamble
+        #                    baseline (CoT reasoning + CoT note + any future items).
+        #                    Counted via list slice: no constants needed, CoT note
+        #                    is captured automatically.
+        #   history        → reused from preamble (no retokenization).
+        #
+        # _INSTRUCTION_OVERHEAD:
+        #   The multi-phase instruction text itself (~400 tokens actual, 450 budgeted
+        #   conservatively). Subtracted before reporting available_tokens to the model
+        #   so the number we tell it matches what it actually has after the instructions
+        #   are committed to the context.
+        if self.valves.enable_multi_phase_response and self.tokenizer and prelim_system:
+            _post_prelim_items = dynamic_injections[_dyn_injections_base_count:]
+            _post_prelim_text = "\n\n".join(t for _, t in _post_prelim_items if t)
+            _post_prelim_tok: int = (
+                len(self.tokenizer.encode(_post_prelim_text))
+                if _post_prelim_text
+                else 0
+            )
+            _mp_available = max(
+                0,
+                self.valves.context_window_tokens
+                - _prelim_tok_mp
+                - _post_prelim_tok
+                - _hist_tok_mp,
+            )
+            self._log_debug(
+                f"Multi-phase final: "
+                f"prelim={_prelim_tok_mp} + post_prelim={_post_prelim_tok} "
+                f"+ history={_hist_tok_mp} "
+                f"= {_prelim_tok_mp + _post_prelim_tok + _hist_tok_mp} committed "
+                f"→ {_mp_available} tokens for response"
+            )
+
+            if _mp_available < self.valves.multi_phase_response_budget_warn:
+                # Critical mode: append inline hint to user message.
+                # Costs 0 system tokens → does not reduce the response budget.
+                messages = self._append_critical_wrap_up_hint(messages)
+                self._log_debug(
+                    f"Multi-phase CRITICAL ({_mp_available} tokens): "
+                    "wrap-up hint appended to user message (0 system tokens used)."
+                )
+
+            elif _mp_available < self.valves.multi_phase_response_threshold:
+                # Normal mode: inject structured protocol into system prompt.
+                # Priority "critical" prevents budget trimming in the final assembly
+                # (a truncated protocol is worse than no protocol at all).
+                _INSTRUCTION_OVERHEAD = 450  # conservative upper bound (~400 actual)
+                _mp_budget_reported = max(500, _mp_available - _INSTRUCTION_OVERHEAD)
+                _mp_instructions = self._build_multi_phase_instructions(
+                    available_tokens=_mp_budget_reported,
+                    user_query=user_question,
+                    cot_degraded_to_l1=_mp_cot_degraded,
+                )
+                dynamic_injections.append(("critical", _mp_instructions))
+                self._log_debug(
+                    f"Multi-phase injected (priority=critical): "
+                    f"{_mp_available} available, "
+                    f"reporting {_mp_budget_reported} to model "
+                    f"(overhead={_INSTRUCTION_OVERHEAD}), "
+                    f"cot_degraded={_mp_cot_degraded}."
+                )
+
+            else:
+                self._log_debug(
+                    f"Multi-phase: not needed "
+                    f"({_mp_available} tokens > threshold "
+                    f"{self.valves.multi_phase_response_threshold})."
+                )
+        # ── End multi-phase final injection ───────────────────────────────
 
         # Final system message assembly (two‑block structure)
         budget = self.valves.global_injection_token_budget
@@ -9804,6 +10577,34 @@ class Filter:
                     "no trimming needed"
                 )
 
+        # ── 📦 COMPRESSION – Step 1b/2: Code history compression ──────────
+        # Must run AFTER adaptive_trim (history is already sized) but BEFORE
+        # final assembly. Compresses old code parts and leans user code messages.
+        # The refactor state injection is added to dynamic_injections so it
+        # appears in Block B for the model's awareness.
+
+        if (
+            self.valves.enable_code_history_compression
+            or self.valves.enable_lean_user_code
+        ):
+            # Apply compression FIRST (reduces assistant messages)
+            if self.valves.enable_code_history_compression:
+                messages = self._compress_code_history(messages, project_id)
+
+            # Apply lean SECOND (reduces user messages, requires trigger check)
+            if self.valves.enable_lean_user_code:
+                messages = self._lean_user_code_messages(messages, project_id)
+
+            # Inject refactor state into Block B if there are compressed parts
+            _refactor_state = self._build_refactor_state_injection(messages)
+            if _refactor_state:
+                dynamic_injections.append(("medium", _refactor_state))
+                self._log_debug(
+                    "Code history: injected refactor state into Block B "
+                    f"({self._estimate_tokens(_refactor_state)} tokens)."
+                )
+        # ── End code history compression ──────────────────────────────────
+
         # ── 📦 COMPRESSION – Step 2/2: Lean user message ──
         self._log_debug(
             "📦 COMPRESSION – Step 2/2: Lean context (replace full code with relevant fragments)"
@@ -9868,6 +10669,42 @@ class Filter:
             self._log_debug(
                 f"  → If hash changed:            KV cache MISS, full prefill"
             )
+            if self.valves.enable_multi_phase_response:
+                if _mp_available is None:
+                    _mp_status = "disabled (no prelim_system)"
+                elif _mp_available < self.valves.multi_phase_response_budget_warn:
+                    _mp_status = (
+                        f"CRÍTICO — hint en mensaje usuario ({_mp_available} tokens)"
+                    )
+                elif _mp_available < self.valves.multi_phase_response_threshold:
+                    _mp_status = (
+                        f"activo — protocolo inyectado ({_mp_available} tokens, "
+                        f"reportado {max(500, _mp_available - 450)} al modelo)"
+                    )
+                else:
+                    _mp_status = f"no activo ({_mp_available} tokens disponibles)"
+                self._log_debug(f"  Multi-phase:                  {_mp_status}")
+            if (
+                self.valves.enable_code_history_compression
+                or self.valves.enable_lean_user_code
+            ):
+                _compressed_parts = sum(
+                    1
+                    for m in messages
+                    if m.get("role") == "assistant"
+                    and re.search(r"\[🗜️ PARTE \d+/\d+", m.get("content", ""))
+                )
+                _leaned_msgs = sum(
+                    1
+                    for m in messages
+                    if m.get("role") == "user"
+                    and "[CÓDIGO COMPRIMIDO" in m.get("content", "")
+                )
+                self._log_debug(
+                    f"  Code history:                 "
+                    f"{_compressed_parts} part(s) compressed, "
+                    f"{_leaned_msgs} user msg(s) leaned"
+                )
             self._log_debug("─" * 60)
         elif self.valves.debug:
             self._log_debug("No system prompt injected (token breakdown skipped).")
@@ -10292,15 +11129,28 @@ class Filter:
                     None,
                 )
                 if last_user and last_assistant:
-                    context_hash = self._compute_context_hash(messages[:-1])
-                    code_state_hash = self._compute_code_state_hash(project_id)
-                    await self._store_response_in_cache(
-                        last_user.get("content", ""),
-                        last_assistant.get("content", ""),
-                        context_hash,
-                        state,
-                        code_state_hash,
+                    # Don't cache partial multi-phase responses (contain continuation
+                    # markers). Serving them to future similar queries would return
+                    # incomplete output with protocol markers.
+                    _is_partial_mp = self.valves.enable_multi_phase_response and any(
+                        marker in last_assistant.get("content", "")
+                        for marker in self._MULTI_PHASE_MARKERS
                     )
+                    if _is_partial_mp:
+                        self._log_debug(
+                            "Response cache: skipping storage for partial "
+                            "multi-phase response (continuation marker detected)."
+                        )
+                    else:
+                        context_hash = self._compute_context_hash(messages[:-1])
+                        code_state_hash = self._compute_code_state_hash(project_id)
+                        await self._store_response_in_cache(
+                            last_user.get("content", ""),
+                            last_assistant.get("content", ""),
+                            context_hash,
+                            state,
+                            code_state_hash,
+                        )
 
             # 🔄 LOD ADAPTIVE FEEDBACK (v7 Phase 5)
             if self.valves.enable_lod_adaptive and is_code_session:
@@ -10309,13 +11159,31 @@ class Filter:
                     None,
                 )
                 if last_assistant and last_assistant.get("content"):
-                    self._background_task(
-                        self._update_lod_thresholds_from_response(
-                            project_id,
-                            last_assistant["content"],
-                        ),
-                        name="lod_adaptive_feedback",
+                    # Skip LOD adaptation for partial multi-phase responses.
+                    # A partial answer (e.g. "Fase 1 analysis" or "Código Parte 2/5")
+                    # does not reference all relevant symbols. Adapting LOD here would
+                    # incorrectly mark as overserved blocks that ARE needed in subsequent
+                    # parts, causing the next query to receive less code than it needs.
+                    _is_partial_mp_lod = (
+                        self.valves.enable_multi_phase_response
+                        and any(
+                            marker in last_assistant["content"]
+                            for marker in self._MULTI_PHASE_MARKERS
+                        )
                     )
+                    if _is_partial_mp_lod:
+                        self._log_debug(
+                            "LOD adaptive: skipping feedback for partial "
+                            "multi-phase response (continuation marker detected)."
+                        )
+                    else:
+                        self._background_task(
+                            self._update_lod_thresholds_from_response(
+                                project_id,
+                                last_assistant["content"],
+                            ),
+                            name="lod_adaptive_feedback",
+                        )
 
             # 🚀 RESOURCE OPTIMISATION – Speculative prefetch
             if self.valves.enable_speculative_prefetch and is_code_session:
@@ -10364,14 +11232,14 @@ class Filter:
                     name="slot_save",
                 )
 
-            # 🔥 STATE MANAGEMENT – Persist edges del SymbolGraph
+            # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
             if self.valves.enable_edge_persistence:
                 self._background_task(
                     self._save_symbol_edges_to_db(project_id),
                     name="save_symbol_edges",
                 )
 
-            # 🔥 STATE MANAGEMENT - Persist CodePathViews
+            # ── Fix 4: Persistir CodePathViews ──
             if self.valves.enable_path_analysis:
                 self._background_task(
                     self._save_path_views_to_db(
