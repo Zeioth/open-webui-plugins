@@ -1253,8 +1253,17 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  Core
         # ═══════════════════════════════════════════════════════════════
-        llm_timeout: int = Field(
-            default=450, description="Default timeout for LLM calls in seconds."
+        llm_per_call_timeout: int = Field(
+            default=5,
+            ge=1,
+            le=30,
+            description="Timeout (seconds) for a single LLM call attempt.",
+        )
+        llm_retry_total_timeout: int = Field(
+            default=60,
+            ge=10,
+            le=300,
+            description="Total time budget for retrying failed LLM calls.",
         )
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
@@ -3770,32 +3779,36 @@ class Filter:
         self,
         prompt: str,
         system_prompt: str,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # per‑call timeout (overrides valve)
+        total_timeout: Optional[float] = None,  # total retry budget (overrides valve)
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
         """
-        LLM call with automatic retries on any failure until timeout expires.
-        Uses self.valves.llm_timeout as total time budget.
+        LLM call with automatic retries on any failure.
+        Uses self.valves.llm_per_call_timeout and llm_retry_total_timeout
+        as default time budgets.
         """
-        effective_timeout = timeout if timeout is not None else self.valves.llm_timeout
-        deadline = time.monotonic() + effective_timeout
-        retry_delay = 2.0  # seconds between attempts
+        per_call_timeout = (
+            timeout if timeout is not None else self.valves.llm_per_call_timeout
+        )
+        total_budget = (
+            total_timeout
+            if total_timeout is not None
+            else self.valves.llm_retry_total_timeout
+        )
+
+        deadline = time.monotonic() + total_budget
         attempt = 0
 
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._log_debug(
-                    f"----- LLM BUSY, GIVING UP after {effective_timeout}s -----\n"
-                    f"Prompt: {prompt[:80]}..."
-                )
-                return None
-
+        while time.monotonic() < deadline:
             attempt += 1
+            remaining_total = deadline - time.monotonic()
+            # El intento individual no debe exceder lo que queda del total
+            this_timeout = min(per_call_timeout, remaining_total)
+
             try:
-                single_timeout = min(remaining, 60.0)
                 return await asyncio.wait_for(
                     self._call_llm(
                         prompt=prompt,
@@ -3804,20 +3817,24 @@ class Filter:
                         max_tokens=max_tokens,
                         temperature=temperature,
                     ),
-                    timeout=single_timeout,
+                    timeout=this_timeout,
                 )
             except asyncio.TimeoutError:
                 self._log_debug(
-                    f"----- LLM BUSY (attempt {attempt}), timed out. "
-                    f"Retrying in {retry_delay}s ({remaining:.0f}s/{effective_timeout}s remaining) -----"
+                    f"LLM call timed out (attempt {attempt}, "
+                    f"per-call timeout={this_timeout:.1f}s, "
+                    f"total remaining {remaining_total:.0f}s)"
                 )
             except Exception as e:
-                self._log_debug(
-                    f"----- LLM BUSY (attempt {attempt}), error: {str(e)[:100]}. "
-                    f"Retrying in {retry_delay}s ({remaining:.0f}s/{effective_timeout}s remaining) -----"
-                )
+                self._log_debug(f"LLM call failed (attempt {attempt}): {str(e)[:100]}")
 
-            await asyncio.sleep(min(retry_delay, remaining))
+            # Pequeña pausa antes de reintentar
+            await asyncio.sleep(2.0)
+
+        self._log_debug(
+            f"LLM call retries exhausted after {total_budget}s: {prompt[:80]}..."
+        )
+        return None
 
     # --------------------------------------------------------------------------
     # Response cache (ChromaDB) – with thread pool
