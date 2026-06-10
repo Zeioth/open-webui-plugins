@@ -1253,7 +1253,9 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  Core
         # ═══════════════════════════════════════════════════════════════
-        llm_timeout: int = Field(default=450)
+        llm_timeout: int = Field(
+            default=450, description="Default timeout for LLM calls in seconds."
+        )
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
@@ -3768,31 +3770,54 @@ class Filter:
         self,
         prompt: str,
         system_prompt: str,
-        timeout: Optional[float] = None,  # None → usa el valve
+        timeout: Optional[float] = None,
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
+        """
+        LLM call with automatic retries on any failure until timeout expires.
+        Uses self.valves.llm_timeout as total time budget.
+        """
         effective_timeout = timeout if timeout is not None else self.valves.llm_timeout
-        try:
-            return await asyncio.wait_for(
-                self._call_llm(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model_override=model_override,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ),
-                timeout=effective_timeout,
-            )
-        except asyncio.TimeoutError:
-            self._log_debug(
-                f"LLM call timed out after {effective_timeout}s: {prompt[:80]}..."
-            )
-            return None
-        except Exception as e:
-            self._log_debug(f"LLM call failed: {str(e)[:100]}")
-            return None
+        deadline = time.monotonic() + effective_timeout
+        retry_delay = 2.0  # seconds between attempts
+        attempt = 0
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._log_debug(
+                    f"----- LLM BUSY, GIVING UP after {effective_timeout}s -----\n"
+                    f"Prompt: {prompt[:80]}..."
+                )
+                return None
+
+            attempt += 1
+            try:
+                single_timeout = min(remaining, 60.0)
+                return await asyncio.wait_for(
+                    self._call_llm(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model_override=model_override,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                    timeout=single_timeout,
+                )
+            except asyncio.TimeoutError:
+                self._log_debug(
+                    f"----- LLM BUSY (attempt {attempt}), timed out. "
+                    f"Retrying in {retry_delay}s ({remaining:.0f}s/{effective_timeout}s remaining) -----"
+                )
+            except Exception as e:
+                self._log_debug(
+                    f"----- LLM BUSY (attempt {attempt}), error: {str(e)[:100]}. "
+                    f"Retrying in {retry_delay}s ({remaining:.0f}s/{effective_timeout}s remaining) -----"
+                )
+
+            await asyncio.sleep(min(retry_delay, remaining))
 
     # --------------------------------------------------------------------------
     # Response cache (ChromaDB) – with thread pool
