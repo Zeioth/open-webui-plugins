@@ -26,6 +26,7 @@ Given context size increases inference time quadratically, even after context co
 per message.
 
 ### 📊 Results Considering Context Degradation
+Given an example where we want to refactor 7.000 lines of code.
 
 | Chunk Size (P) | Chunks (N) | Steady-State Context (C) | MTP Throughput (t/s) | Time per Chunk (s) | Total Time (min) |
 |---------------:|-----------:|-------------------------|---------------------:|-------------------:|-----------------:|
