@@ -3629,56 +3629,171 @@ class Filter:
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
-    async def _maybe_unload_for_model(
-        self, model_name: str, base_url: str, is_ollama: bool
-    ) -> None:
-        """
-        Unload models only if switching to a *different* auxiliary model.
-        The main model (self.valves.llm_model) is NEVER unloaded to preserve its KV cache.
-        """
-        if is_ollama:
-            return
-
-        main_model = self.valves.llm_model
-
-        # Leer el modelo actual bajo lock
-        async with self._model_lock:
-            current_model = self._last_used_model
-
-        # If the target is the main model, never unload anything – it must stay in VRAM.
-        if model_name == main_model:
-            if current_model is None:
-                self._log_debug(f"Loading main model '{model_name}' for the first time")
+    async def _call_llm(
+        self,
+        prompt: str,
+        system_prompt: str,
+        model_override: str = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.3,
+        semaphore: asyncio.Semaphore = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        label: str = "",
+    ) -> Optional[str]:
+        dedup_key = hashlib.md5(
+            f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
+        ).hexdigest()
+        async with self._pending_llm_lock:
+            if dedup_key in self._pending_llm:
+                future = self._pending_llm[dedup_key]
+                is_producer = False
             else:
-                self._log_debug(f"Keeping main model '{model_name}' loaded (no unload)")
-            return
+                future = asyncio.Future()
+                self._pending_llm[dedup_key] = future
+                is_producer = True
+        if not is_producer:
+            return await future
 
-        # Target is an auxiliary model.
-        # If the currently loaded model is the main model, do NOT unload it.
-        if current_model == main_model:
-            self._log_debug(
-                f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
-            )
-            return
+        t_start = time.monotonic()
+        try:
+            base_url = self.valves.LLM_BASE_URL.rstrip("/")
+            if base_url.endswith("/v1"):
+                base_url = base_url[:-3].rstrip("/")
 
-        # If we are switching between two different auxiliary models, unload the old one.
-        if current_model is not None and model_name != current_model:
-            self._log_debug(
-                f"Switching auxiliary model from '{current_model}' to '{model_name}'"
-            )
+            is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+
+            model = model_override or self.valves.llm_model
+            if not model:
+                logger.warning("No model available for LLM call")
+                future.set_result(None)
+                return None
+
+            cache_key = hashlib.md5(
+                f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
+            ).hexdigest()
+            cached = await self._llm_cache.get(cache_key)
+            if cached is not None:
+                future.set_result(cached)
+                self._log_debug(
+                    f"[LLM] {model}"
+                    + (f" ({label})" if label else "")
+                    + f" (cached) took {time.monotonic() - t_start:.3f}s"
+                )
+                return cached
+
+            ep_type = "chat"
+            if model.startswith("llamacpp/"):
+                ep_type = self.valves.llamacpp_endpoint_type
+
+            effective_semaphore = semaphore or self._llm_semaphore
+            max_retries = 2
+            base_delay = 1.0
+
+            # ── Log prompt size for diagnostics ──
+            if self.tokenizer:
+                prompt_tokens = len(self.tokenizer.encode(prompt))
+                self._log_debug(
+                    f"LLM call to {model}{f' ({label})' if label else ''} "
+                    f"– prompt size: ~{prompt_tokens} tokens"
+                )
+
+            # ── Register this task as an active LLM user ──
+            task = asyncio.current_task()
+            async with self._active_llm_tasks_lock:
+                self._active_llm_tasks.add(task)
             try:
-                await _shared_unload_all_models(base_url)
-                self._log_debug("Auxiliary model unloaded before switching")
-                async with self._model_lock:
-                    self._last_used_model = None
-            except Exception as e:
-                self._log_debug(f"Unload via shared_resources failed: {e}")
-        elif current_model is None:
-            self._log_debug(
-                f"Loading auxiliary model '{model_name}' (no model was loaded)"
+                # ── Inter‑process lock: only one process can use the LLM at a time ──
+                llm_fd = await self._acquire_llm_lock()
+                try:
+                    # ── Acquire global LLM semaphore to serialize all server calls ──
+                    async with _llm_semaphore:
+                        await self._maybe_unload_for_model(model, base_url, is_ollama)
+
+                        for attempt in range(max_retries + 1):
+                            try:
+                                async with effective_semaphore:
+                                    content = await _shared_call_llm(
+                                        prompt=prompt,
+                                        system=system_prompt,
+                                        base_url=self.valves.LLM_BASE_URL,
+                                        model=model,
+                                        api_token=self.valves.LLM_API_TOKEN,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens,
+                                        timeout=self.valves.llm_request_timeout,
+                                        endpoint_type=ep_type,
+                                    )
+                                if content:
+                                    await self._llm_cache.set(cache_key, content)
+                                    future.set_result(content)
+                                    # ── Actualizar last_used_model bajo lock ──
+                                    async with self._model_lock:
+                                        self._last_used_model = model
+                                    # ── Log input and output tokens ──
+                                    in_tokens = (
+                                        len(self.tokenizer.encode(prompt))
+                                        if self.tokenizer
+                                        else "?"
+                                    )
+                                    out_tokens = (
+                                        len(self.tokenizer.encode(content))
+                                        if self.tokenizer
+                                        else "?"
+                                    )
+                                    self._log_debug(
+                                        f"[LLM] {model}"
+                                        + (f" ({label})" if label else "")
+                                        + f" – in:{in_tokens} out:{out_tokens}"
+                                        + f" took {time.monotonic() - t_start:.3f}s"
+                                    )
+                                    return content
+                            except asyncio.CancelledError:
+                                raise
+                            except RuntimeError as exc:
+                                self._log_debug(
+                                    f"[LLM] {model}{f' ({label})' if label else ''} "
+                                    f"error: {exc}"
+                                )
+                                if any(
+                                    c in str(exc)
+                                    for c in ("429", "500", "502", "503", "504")
+                                ):
+                                    if attempt < max_retries:
+                                        await asyncio.sleep(base_delay * (2**attempt))
+                                        continue
+                                break
+                            except Exception:
+                                if attempt < max_retries:
+                                    await asyncio.sleep(base_delay * (2**attempt))
+                                    continue
+                                break
+                finally:
+                    self._release_llm_lock(llm_fd)
+            finally:
+                # Remove task from active set
+                async with self._active_llm_tasks_lock:
+                    self._active_llm_tasks.discard(task)
+
+            logger.warning(
+                f"LLM call failed for model {model}: prompt={prompt[:100]}..."
             )
-        else:
-            self._log_debug(f"Reusing auxiliary model '{model_name}' (already loaded)")
+            future.set_result(None)
+            self._log_debug(
+                f"[LLM] {model}"
+                + (f" ({label})" if label else "")
+                + f" (failed) after {time.monotonic() - t_start:.3f}s"
+            )
+            return None
+
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            async with self._pending_llm_lock:
+                self._pending_llm.pop(dedup_key, None)
 
     async def _try_llm_quick(
         self,
