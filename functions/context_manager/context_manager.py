@@ -1263,7 +1263,10 @@ class Filter:
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
-        context_window_tokens: int = Field(default=1000000)
+        context_window_tokens: int = Field(
+            default=262000,
+            description="It's crucial this has the same value as the llama server to prevent uncontrolled errors.",
+        )
         use_tiktoken: bool = Field(default=True)
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
