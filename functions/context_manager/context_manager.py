@@ -2116,6 +2116,7 @@ class Filter:
         # HTTP session and locks
         self._project_locks: Dict[str, ReentrantAsyncLock] = {}
         self._lock_lock = asyncio.Lock()
+        self._model_lock = asyncio.Lock()
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
@@ -2913,36 +2914,37 @@ class Filter:
     # State database
     # --------------------------------------------------------------------------
     async def _db_worker(self):
-        """Serialize all database writes through a single task with global lock and retry."""
-        try:
-            while True:
-                try:
-                    job = await asyncio.wait_for(
-                        self._db_write_queue.get(), timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
+        """Database write worker with automatic restart on failure."""
+        while True:
+            try:
+                await self._db_worker_loop()
+            except asyncio.CancelledError:
+                self._log_debug("DB worker cancelled — shutting down.")
+                break
+            except Exception as e:
+                self._log_debug(f"DB worker crashed: {e} — restarting in 2s")
+                await asyncio.sleep(2)  # Pequeña pausa para no hacer busy-loop
 
-                func, args, kwargs = job
-                # Acquire global lock to ensure only one write at a time across all workers
-                with _db_global_lock:
-                    for attempt in range(5):
-                        try:
-                            await anyio.to_thread.run_sync(
-                                lambda: func(*args, **kwargs)
-                            )
-                            break
-                        except sqlite3.OperationalError as e:
-                            if "locked" in str(e).lower() and attempt < 4:
-                                await asyncio.sleep(0.5 * (attempt + 1))
-                            else:
-                                raise
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._log_debug("DB worker exiting")
+    async def _db_worker_loop(self):
+        """Single run of the DB write loop. Exits on CancelledError."""
+        while True:
+            try:
+                job = await asyncio.wait_for(self._db_write_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            func, args, kwargs = job
+            with _db_global_lock:
+                for attempt in range(5):
+                    try:
+                        await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() and attempt < 4:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                        else:
+                            raise
 
     def _init_state_db(self):
         db_path = self.valves.state_db_path
@@ -3530,9 +3532,13 @@ class Filter:
 
         main_model = self.valves.llm_model
 
+        # Leer el modelo actual bajo lock
+        async with self._model_lock:
+            current_model = self._last_used_model
+
         # If the target is the main model, never unload anything – it must stay in VRAM.
         if model_name == main_model:
-            if self._last_used_model is None:
+            if current_model is None:
                 self._log_debug(f"Loading main model '{model_name}' for the first time")
             else:
                 self._log_debug(f"Keeping main model '{model_name}' loaded (no unload)")
@@ -3540,24 +3546,25 @@ class Filter:
 
         # Target is an auxiliary model.
         # If the currently loaded model is the main model, do NOT unload it.
-        if self._last_used_model == main_model:
+        if current_model == main_model:
             self._log_debug(
                 f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
             )
             return
 
         # If we are switching between two different auxiliary models, unload the old one.
-        if self._last_used_model is not None and model_name != self._last_used_model:
+        if current_model is not None and model_name != current_model:
             self._log_debug(
-                f"Switching auxiliary model from '{self._last_used_model}' to '{model_name}'"
+                f"Switching auxiliary model from '{current_model}' to '{model_name}'"
             )
             try:
                 await _shared_unload_all_models(base_url)
                 self._log_debug("Auxiliary model unloaded before switching")
-                self._last_used_model = None
+                async with self._model_lock:
+                    self._last_used_model = None
             except Exception as e:
                 self._log_debug(f"Unload via shared_resources failed: {e}")
-        elif self._last_used_model is None:
+        elif current_model is None:
             self._log_debug(
                 f"Loading auxiliary model '{model_name}' (no model was loaded)"
             )
@@ -3622,169 +3629,56 @@ class Filter:
         self._log_debug(f"Slot still occupied after {retries} retries")
         return False
 
-    async def _call_llm(
-        self,
-        prompt: str,
-        system_prompt: str,
-        model_override: str = None,
-        max_tokens: Optional[int] = None,
-        temperature: float = 0.3,
-        semaphore: asyncio.Semaphore = None,
-        response_format: Optional[Dict[str, Any]] = None,
-        label: str = "",
-    ) -> Optional[str]:
-        dedup_key = hashlib.md5(
-            f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
-        ).hexdigest()
-        async with self._pending_llm_lock:
-            if dedup_key in self._pending_llm:
-                future = self._pending_llm[dedup_key]
-                is_producer = False
+    async def _maybe_unload_for_model(
+        self, model_name: str, base_url: str, is_ollama: bool
+    ) -> None:
+        """
+        Unload models only if switching to a *different* auxiliary model.
+        The main model (self.valves.llm_model) is NEVER unloaded to preserve its KV cache.
+        """
+        if is_ollama:
+            return
+
+        main_model = self.valves.llm_model
+
+        # Leer el modelo actual bajo lock
+        async with self._model_lock:
+            current_model = self._last_used_model
+
+        # If the target is the main model, never unload anything – it must stay in VRAM.
+        if model_name == main_model:
+            if current_model is None:
+                self._log_debug(f"Loading main model '{model_name}' for the first time")
             else:
-                future = asyncio.Future()
-                self._pending_llm[dedup_key] = future
-                is_producer = True
-        if not is_producer:
-            return await future
+                self._log_debug(f"Keeping main model '{model_name}' loaded (no unload)")
+            return
 
-        t_start = time.monotonic()
-        try:
-            base_url = self.valves.LLM_BASE_URL.rstrip("/")
-            if base_url.endswith("/v1"):
-                base_url = base_url[:-3].rstrip("/")
-
-            is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-
-            model = model_override or self.valves.llm_model
-            if not model:
-                logger.warning("No model available for LLM call")
-                future.set_result(None)
-                return None
-
-            cache_key = hashlib.md5(
-                f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
-            ).hexdigest()
-            cached = await self._llm_cache.get(cache_key)
-            if cached is not None:
-                future.set_result(cached)
-                self._log_debug(
-                    f"[LLM] {model}"
-                    + (f" ({label})" if label else "")
-                    + f" (cached) took {time.monotonic() - t_start:.3f}s"
-                )
-                return cached
-
-            ep_type = "chat"
-            if model.startswith("llamacpp/"):
-                ep_type = self.valves.llamacpp_endpoint_type
-
-            effective_semaphore = semaphore or self._llm_semaphore
-            max_retries = 2
-            base_delay = 1.0
-
-            # ── Log prompt size for diagnostics ──
-            if self.tokenizer:
-                prompt_tokens = len(self.tokenizer.encode(prompt))
-                self._log_debug(
-                    f"LLM call to {model}{f' ({label})' if label else ''} "
-                    f"– prompt size: ~{prompt_tokens} tokens"
-                )
-
-            # ── Register this task as an active LLM user ──
-            task = asyncio.current_task()
-            async with self._active_llm_tasks_lock:
-                self._active_llm_tasks.add(task)
-            try:
-                # ── Inter‑process lock: only one process can use the LLM at a time ──
-                llm_fd = await self._acquire_llm_lock()
-                try:
-                    # ── Acquire global LLM semaphore to serialize all server calls ──
-                    async with _llm_semaphore:
-                        await self._maybe_unload_for_model(model, base_url, is_ollama)
-
-                        for attempt in range(max_retries + 1):
-                            try:
-                                async with effective_semaphore:
-                                    content = await _shared_call_llm(
-                                        prompt=prompt,
-                                        system=system_prompt,
-                                        base_url=self.valves.LLM_BASE_URL,
-                                        model=model,
-                                        api_token=self.valves.LLM_API_TOKEN,
-                                        temperature=temperature,
-                                        max_tokens=max_tokens,
-                                        timeout=self.valves.llm_request_timeout,
-                                        endpoint_type=ep_type,
-                                    )
-                                if content:
-                                    await self._llm_cache.set(cache_key, content)
-                                    future.set_result(content)
-                                    # ── Log input and output tokens ──
-                                    in_tokens = (
-                                        len(self.tokenizer.encode(prompt))
-                                        if self.tokenizer
-                                        else "?"
-                                    )
-                                    out_tokens = (
-                                        len(self.tokenizer.encode(content))
-                                        if self.tokenizer
-                                        else "?"
-                                    )
-                                    self._log_debug(
-                                        f"[LLM] {model}"
-                                        + (f" ({label})" if label else "")
-                                        + f" – in:{in_tokens} out:{out_tokens}"
-                                        + f" took {time.monotonic() - t_start:.3f}s"
-                                    )
-                                    self._last_used_model = model
-                                    return content
-                            except asyncio.CancelledError:
-                                raise
-                            except RuntimeError as exc:
-                                self._log_debug(
-                                    f"[LLM] {model}{f' ({label})' if label else ''} "
-                                    f"error: {exc}"
-                                )
-                                if any(
-                                    c in str(exc)
-                                    for c in ("429", "500", "502", "503", "504")
-                                ):
-                                    if attempt < max_retries:
-                                        await asyncio.sleep(base_delay * (2**attempt))
-                                        continue
-                                break
-                            except Exception:
-                                if attempt < max_retries:
-                                    await asyncio.sleep(base_delay * (2**attempt))
-                                    continue
-                                break
-                finally:
-                    self._release_llm_lock(llm_fd)
-            finally:
-                # Remove task from active set
-                async with self._active_llm_tasks_lock:
-                    self._active_llm_tasks.discard(task)
-
-            logger.warning(
-                f"LLM call failed for model {model}: prompt={prompt[:100]}..."
-            )
-            future.set_result(None)
+        # Target is an auxiliary model.
+        # If the currently loaded model is the main model, do NOT unload it.
+        if current_model == main_model:
             self._log_debug(
-                f"[LLM] {model}"
-                + (f" ({label})" if label else "")
-                + f" (failed) after {time.monotonic() - t_start:.3f}s"
+                f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
             )
-            return None
+            return
 
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
-        except Exception as e:
-            future.set_exception(e)
-            raise
-        finally:
-            async with self._pending_llm_lock:
-                self._pending_llm.pop(dedup_key, None)
+        # If we are switching between two different auxiliary models, unload the old one.
+        if current_model is not None and model_name != current_model:
+            self._log_debug(
+                f"Switching auxiliary model from '{current_model}' to '{model_name}'"
+            )
+            try:
+                await _shared_unload_all_models(base_url)
+                self._log_debug("Auxiliary model unloaded before switching")
+                async with self._model_lock:
+                    self._last_used_model = None
+            except Exception as e:
+                self._log_debug(f"Unload via shared_resources failed: {e}")
+        elif current_model is None:
+            self._log_debug(
+                f"Loading auxiliary model '{model_name}' (no model was loaded)"
+            )
+        else:
+            self._log_debug(f"Reusing auxiliary model '{model_name}' (already loaded)")
 
     async def _try_llm_quick(
         self,
@@ -7928,11 +7822,14 @@ class Filter:
         # ─── NUEVO: auto_budget_context_for_parts ──────────────────────────
         if (
             self.valves.auto_budget_context_for_parts
-            and (self.valves.enable_multi_phase_response or self.valves.force_multi_phase_response)
+            and (
+                self.valves.enable_multi_phase_response
+                or self.valves.force_multi_phase_response
+            )
             and self.valves.context_window_tokens > 0
         ):
             # Reserva espacio para la respuesta + overhead del sistema
-            _SYSTEM_OVERHEAD = 2000   # margen conservador para system prompt + markers
+            _SYSTEM_OVERHEAD = 2000  # margen conservador para system prompt + markers
             _available_for_context = (
                 self.valves.context_window_tokens
                 - self.valves.multi_phase_effective_max_tokens
@@ -10789,15 +10686,6 @@ class Filter:
         # We will avoid loading any auxiliary model while the slot is occupied.
         # ─────────────────────────────────────────────────────────────────
         slot_free = await self._wait_for_empty_slot(retries=1, delay=0.5)
-
-        # --- Cold start guard ---
-        if slot_free and self._last_used_model is None:
-            self._log_debug(
-                "Cold start detected — model not yet warmed up, "
-                "auxiliary calls will be skipped for this inlet"
-            )
-            slot_free = False
-        # --------------------------------
 
         if not slot_free:
             self._log_debug(
