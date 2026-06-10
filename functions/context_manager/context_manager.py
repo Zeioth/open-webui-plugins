@@ -1517,12 +1517,35 @@ class Filter:
         # - Protocol activates when effective budget < threshold.
         # - effective_max_tokens acts as a cap on the budget (it is NOT the
         #   number of tokens already generated).
+        #
+        # EXAMPLE:
+        # Given 80k tokens of code (~7000 lines), these values
+        # can return a full refactor in 12 messages, in 15 minutes.
         enable_multi_phase_response: bool = Field(
             default=True,
             description="Master on/off for multi‑phase splitting.",
         )
+        force_multi_phase_response: bool = Field(
+            default=False,
+            description=(
+                "Always inject the multi-phase protocol, regardless of remaining "
+                "token budget. Use when context_window_tokens does not match the "
+                "actual llama.cpp --ctx-size (e.g. llama.cpp is 262k but valve is 1M)."
+            ),
+        )
+        multi_phase_effective_max_tokens: int = Field(
+            default=4500,
+            ge=1000,
+            le=200000,
+            description=(
+                "Max tokens allowed per response (set = LLM server max_tokens). "
+                "Used to cap the remaining budget: "
+                "effective budget = min(free context space, this number). "
+                "If that budget < threshold, the model splits the answer into phases."
+            ),
+        )
         multi_phase_response_threshold: int = Field(
-            default=85000,
+            default=7000,
             ge=0,
             le=200000,
             description=(
@@ -1534,7 +1557,7 @@ class Filter:
             ),
         )
         multi_phase_response_budget_warn: int = Field(
-            default=8000,
+            default=800,
             ge=500,
             le=40000,
             description=(
@@ -1542,15 +1565,13 @@ class Filter:
                 "is appended to the user message (no system tokens spent)."
             ),
         )
-        multi_phase_effective_max_tokens: int = Field(
-            default=80000,
-            ge=1000,
-            le=200000,
+
+        auto_budget_context_for_parts: bool = Field(
+            default=True,
             description=(
-                "Max tokens allowed per response (set = LLM server max_tokens). "
-                "Used to cap the remaining budget: "
-                "effective budget = min(free context space, this number). "
-                "If that budget < threshold, the model splits the answer into phases."
+                "When multi-phase is active, cap active_context_max_tokens to "
+                "leave exactly multi_phase_effective_max_tokens free for the response. "
+                "Requires context_window_tokens to match actual llama.cpp --ctx-size."
             ),
         )
 
@@ -7903,6 +7924,27 @@ class Filter:
         # Step 3: Build context text with Lost in the Middle ordering
         total_tokens = 0
         budget = self.valves.active_context_max_tokens or 32000
+
+        # ─── NUEVO: auto_budget_context_for_parts ──────────────────────────
+        if (
+            self.valves.auto_budget_context_for_parts
+            and (self.valves.enable_multi_phase_response or self.valves.force_multi_phase_response)
+            and self.valves.context_window_tokens > 0
+        ):
+            # Reserva espacio para la respuesta + overhead del sistema
+            _SYSTEM_OVERHEAD = 2000   # margen conservador para system prompt + markers
+            _available_for_context = (
+                self.valves.context_window_tokens
+                - self.valves.multi_phase_effective_max_tokens
+                - _SYSTEM_OVERHEAD
+            )
+            budget = min(budget, max(8000, _available_for_context))
+            self._log_debug(
+                f"auto_budget_context: capped active context to {budget} tokens "
+                f"(reserving {self.valves.multi_phase_effective_max_tokens} for response)"
+            )
+        # ─── Fin del bloque nuevo ──────────────────────────────────────────
+
         injected_blocks: Set[str] = set()
 
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
@@ -10370,7 +10412,11 @@ class Filter:
                 f"→ {_mp_available} tokens for response"
             )
 
-            if _mp_available < self.valves.multi_phase_response_budget_warn:
+            # ─── CAMBIO: condiciones con force_multi_phase_response ──────────
+            if (
+                _mp_available < self.valves.multi_phase_response_budget_warn
+                and not self.valves.force_multi_phase_response
+            ):
                 # Critical mode: append inline hint to user message.
                 # Costs 0 system tokens → does not reduce the response budget.
                 messages = self._append_critical_wrap_up_hint(messages)
@@ -10379,7 +10425,10 @@ class Filter:
                     "wrap-up hint appended to user message (0 system tokens used)."
                 )
 
-            elif _mp_available < self.valves.multi_phase_response_threshold:
+            elif (
+                _mp_available < self.valves.multi_phase_response_threshold
+                or self.valves.force_multi_phase_response
+            ):
                 # Normal mode: inject structured protocol into system prompt.
                 # Priority "critical" prevents budget trimming in the final assembly
                 # (a truncated protocol is worse than no protocol at all).
@@ -10405,6 +10454,7 @@ class Filter:
                     f"({_mp_available} tokens > threshold "
                     f"{self.valves.multi_phase_response_threshold})."
                 )
+            # ─── Fin del cambio ─────────────────────────────────────────────
         # ── End multi-phase final injection ───────────────────────────────
 
         # Final system message assembly (two‑block structure)
