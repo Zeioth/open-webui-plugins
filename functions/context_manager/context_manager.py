@@ -1495,7 +1495,7 @@ class Filter:
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
         llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=1, ge=1, le=10)
         llm_request_timeout: int = Field(default=900)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
@@ -3596,41 +3596,6 @@ class Filter:
                 tasks = list(self._active_llm_tasks)
             if tasks:
                 await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-    async def _wait_for_empty_slot(self, retries: int = 3, delay: float = 2.0) -> bool:
-        """
-        Check that the LLM server has no loaded models.
-        Retries a few times with a delay between checks.
-        Returns True if the slot is empty, False otherwise.
-        """
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-
-        for attempt in range(retries):
-            await asyncio.sleep(delay)
-            try:
-                session = await _shared_get_http_session(timeout_seconds=5)
-                async with session.get(f"{base_url}/v1/models") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        loaded = any(
-                            m.get("status", {}).get("value") == "loaded"
-                            for m in data.get("data", [])
-                        )
-                        if not loaded:
-                            return True
-                        else:
-                            self._log_debug(
-                                f"Models still loaded: {[m['id'] for m in data.get('data', []) if m.get('status', {}).get('value') == 'loaded']}"
-                            )
-                    else:
-                        self._log_debug(f"Model list returned status {resp.status}")
-            except Exception as e:
-                self._log_debug(f"Error checking models (attempt {attempt+1}): {e}")
-
-        self._log_debug(f"Slot still occupied after {retries} retries")
-        return False
 
     async def _call_llm(
         self,
@@ -10799,16 +10764,7 @@ class Filter:
         self._ensure_cleanup_task()
         project_id = self._get_project_id()
 
-        # ─────────────────────────────────────────────────────────────────
-        # 🚀 RESOURCE OPTIMISATION – Check if the main model is loaded
-        # We will avoid loading any auxiliary model while the slot is occupied.
-        # ─────────────────────────────────────────────────────────────────
-        slot_free = await self._wait_for_empty_slot(retries=1, delay=0.5)
-
-        if not slot_free:
-            self._log_debug(
-                "Main model slot occupied – auxiliary model calls will be skipped"
-            )
+        slot_free = True
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
@@ -11077,8 +11033,7 @@ class Filter:
             # which invalidates conversation checkpoints (SWA architecture).
             # Restoring here costs ~3s but avoids a 95s full prefill on next turn.
             if (
-                slot_free
-                and self.valves.enable_slot_persistence
+                self.valves.enable_slot_persistence
                 and self._last_used_model == self.valves.llm_model
             ):
                 await self._slot_restore_for_continuity(project_id)
