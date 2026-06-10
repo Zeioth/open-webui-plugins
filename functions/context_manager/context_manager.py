@@ -1253,6 +1253,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  Core
         # ═══════════════════════════════════════════════════════════════
+        llm_timeout: int = Field(default=450)
         priority: int = Field(default=0)
         max_turns: int = Field(default=15)
         debug: bool = Field(default=True)
@@ -3767,58 +3768,31 @@ class Filter:
         self,
         prompt: str,
         system_prompt: str,
-        timeout: float = 300,
+        timeout: Optional[float] = None,  # None → usa el valve
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
-        max_cold_start_retries = 5
-        cold_start_delay = 2.0  # seconds between retries
-
-        for attempt in range(max_cold_start_retries):
-            try:
-                return await asyncio.wait_for(
-                    self._call_llm(
-                        prompt=prompt,
-                        system_prompt=system_prompt,
-                        model_override=model_override,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                    ),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                if attempt < max_cold_start_retries - 1:
-                    self._log_debug(
-                        f"LLM call timed out (attempt {attempt+1}/{max_cold_start_retries}), "
-                        f"retrying in {cold_start_delay}s..."
-                    )
-                    await asyncio.sleep(cold_start_delay)
-                    continue
-                self._log_debug(
-                    f"LLM call timed out after {timeout}s: {prompt[:80]}..."
-                )
-                return None
-            except Exception as e:
-                error_msg = str(e).lower()
-                # Recoverable errors: the model is still loading or temporarily unavailable
-                if any(
-                    indicator in error_msg
-                    for indicator in ("model not found", "loading", "400", "502", "503")
-                ):
-                    if attempt < max_cold_start_retries - 1:
-                        self._log_debug(
-                            f"LLM call failed (model may be loading) "
-                            f"(attempt {attempt+1}/{max_cold_start_retries}): "
-                            f"{str(e)[:100]}. Retrying in {cold_start_delay}s..."
-                        )
-                        await asyncio.sleep(cold_start_delay)
-                        continue
-                # Non‑recoverable error or exhausted retries
-                self._log_debug(f"LLM call failed: {str(e)[:100]}")
-                return None
-
-        return None
+        effective_timeout = timeout if timeout is not None else self.valves.llm_timeout
+        try:
+            return await asyncio.wait_for(
+                self._call_llm(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model_override=model_override,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            self._log_debug(
+                f"LLM call timed out after {effective_timeout}s: {prompt[:80]}..."
+            )
+            return None
+        except Exception as e:
+            self._log_debug(f"LLM call failed: {str(e)[:100]}")
+            return None
 
     # --------------------------------------------------------------------------
     # Response cache (ChromaDB) – with thread pool
@@ -4681,7 +4655,6 @@ class Filter:
             model_override=self.valves.secondary_task_model,
             max_tokens=80,
             temperature=0.6,
-            timeout=30.0,  # Cold start load takes ~4s + queue time
         )
 
         queries = [query]  # always include original
@@ -8303,7 +8276,6 @@ class Filter:
             model_override=model,
             max_tokens=200,
             temperature=0.0,
-            timeout=8.0,
         )
         dur = time.monotonic() - t0
         self._log_timing("parse_intents_llm", dur, dur)
