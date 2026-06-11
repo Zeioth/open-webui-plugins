@@ -2252,6 +2252,34 @@ class Filter:
         if not content or len(content.strip()) < 20:
             return False
 
+        # ── Fast path: raw code paste without fences (e.g. entire Python file) ──
+        estimated_tokens = self._estimate_code_tokens(content)
+        if estimated_tokens >= self.valves.lean_user_code_min_tokens:
+            # Guard: if there's a real question, do NOT silently ingest
+            has_question = any(
+                line.strip().endswith("?")
+                for line in content.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            )
+            if not has_question:
+                non_blank = [l for l in content.splitlines() if l.strip()]
+                if non_blank:
+                    _PY_STRUCTURAL = re.compile(
+                        r"^\s*(?:def |async def |class |import |from |@\w|"
+                        r"if |elif |else:|for |while |try:|except|with |"
+                        r"return |yield |raise |pass\b|break\b|continue\b|#)"
+                    )
+                    code_ratio = sum(
+                        1 for l in non_blank if _PY_STRUCTURAL.match(l)
+                    ) / len(non_blank)
+                    if code_ratio > 0.07:
+                        self._log_debug(
+                            f"_is_code_only_message: fast path triggered "
+                            f"(tokens={estimated_tokens}, code_ratio={code_ratio:.2f})"
+                        )
+                        return True
+        # ── End fast path ──
+
         # Must contain at least one code block
         code_blocks, _ = await self._extract_code_blocks(content)
         if not code_blocks:
@@ -7181,14 +7209,7 @@ class Filter:
         if not self.valves.enable_lean_user_code:
             return messages
 
-        trigger_fired = any(
-            "## Código — Parte 1/" in msg.get("content", "")
-            for msg in messages
-            if msg.get("role") == "assistant"
-        )
-        if not trigger_fired:
-            return messages
-
+        # ── New trigger: enough symbols already indexed ───────────
         try:
             symbol_count = len(self._symbol_index.get_all_names(project_id))
         except Exception:
@@ -7196,10 +7217,10 @@ class Filter:
 
         if symbol_count < 20:
             self._log_debug(
-                "Lean user code: trigger fired but SymbolGraph too sparse "
-                f"({symbol_count} symbols) — skipping."
+                f"Lean user code: SymbolGraph too sparse ({symbol_count} symbols) — skipping."
             )
             return messages
+        # ───────────────────────────────────────────────────────────
 
         _CODE_BLOCK = re.compile(r"```(?P<lang>\w*)\n(?P<body>.*?)```", re.DOTALL)
         _ALREADY_LEAN = "[CÓDIGO COMPRIMIDO"
@@ -10400,6 +10421,7 @@ class Filter:
             return body
 
         # ── Silent Ingestion (Modo B: chunked paste) ────────────────────
+        # v7 (PASO-22) – enhanced with raw-code detection (Fix B)
         if (
             self.valves.enable_silent_ingestion
             and last_user_msg is not None
@@ -10407,15 +10429,41 @@ class Filter:
         ):
             if await self._is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
-                await self._update_active_code(last_user_msg, project_id)
+
+                # ── Fix: raw code without fences won't be found by _extract_code_blocks ──
+                # Wrap it so SignatureExtractor and the symbol indexer can process it.
+                _msg_to_index = last_user_msg
+                if "```" not in user_query and self._has_code_indicators(user_query):
+                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
+                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                    _msg_to_index = {
+                        **last_user_msg,
+                        "content": f"```{_lang}\n{user_query}\n```",
+                    }
+                    self._log_debug(
+                        f"Silent ingestion: wrapping raw code as {_lang} "
+                        f"({self._estimate_code_tokens(user_query)} tokens)"
+                    )
+                # ── End fix ──
+
+                # Process code into SymbolGraph without invoking main LLM
+                await self._update_active_code(_msg_to_index, project_id)
+
+                # Resolve cross‑references with previous chunks
                 resolved = await self._resolve_dangling_edges(project_id)
+
+                # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._rebuild_path_index(project_id)
+
+                # Invalidate static block (new code → new Block A)
                 self._invalidate_static_context_block(project_id, "new chunk ingested")
 
+                # Statistics for the user
                 state = self._get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
+
                 response = (
                     f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
                     "El código está disponible en el SymbolGraph para futuras consultas. "
