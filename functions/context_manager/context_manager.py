@@ -149,6 +149,7 @@ class CodeBlock(BaseModel):
     pinned: bool = False
     obsolete: bool = False
     is_raw: bool = False
+    block_summary: str = ""  # ← NUEVO
     symbols: List[CodeSymbol] = Field(default_factory=list)
     _cached_token_count: int = 0
     last_mentioned_msg_idx: Optional[int] = None
@@ -2024,7 +2025,6 @@ class Filter:
                     else:
                         code = raw
                         block_type = "indented"
-                    code = await self._handle_oversized_code_block(code, lang)
                     blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
                 if blocks:
@@ -2088,9 +2088,8 @@ class Filter:
                     continue  # skip this block entirely
             # ================================================================
 
-            block["code"] = await self._handle_oversized_code_block(
-                block["code"], block["language"]
-            )
+            # NOTE: _handle_oversized_code_block call REMOVED per Fix 2.
+            # The original code is always preserved for indexing.
             block["file_path"] = blk_file
             processed_blocks.append(block)
             processed_spans.append(spans[idx])
@@ -5104,7 +5103,7 @@ class Filter:
                     if task_type == "missing_summaries":
                         await self._run_missing_summaries_task(
                             params,
-                            self.valves.llm_model,  # main model
+                            self.valves.llm_model,
                         )
                 except Exception as e:
                     self._log_debug(
@@ -5149,8 +5148,17 @@ class Filter:
                                 project_id
                             ),
                         },
-                        self.valves.llm_model,  # main model
+                        self.valves.llm_model,
                     )
+
+            # ── Oversized block summaries (action="summarize") ──
+            if (
+                self.valves.max_code_block_tokens > 0
+                and self.valves.code_block_overflow_action == "summarize"
+            ):
+                for block in state["active_blocks"].values():
+                    if not block.obsolete:
+                        await self._maybe_generate_block_summary(block)
 
             self._invalidate_lightweight_cache(project_id)
 
@@ -5273,6 +5281,47 @@ class Filter:
             max_tokens=200,
             temperature=0.2,
         )
+
+    async def _maybe_generate_block_summary(self, block: CodeBlock) -> None:
+        """
+        Generate a block‑level summary if:
+        - max_code_block_tokens > 0
+        - code_block_overflow_action == "summarize"
+        - block exceeds the token limit
+        - summary not already generated
+        """
+        if not (
+            self.valves.max_code_block_tokens > 0
+            and self.valves.code_block_overflow_action == "summarize"
+        ):
+            return
+        tok = block._cached_token_count or (len(block.content) // 4)
+        if tok <= self.valves.max_code_block_tokens:
+            return
+        if block.block_summary:
+            return  # already generated
+
+        sig = self._extract_signature(block.content)
+        prompt = (
+            f"Summarize the following code block in 3-5 sentences. "
+            f"Cover: main purpose, key classes/functions, and important dependencies.\n\n"
+            f"{'Signature: ' + sig + chr(10) if sig else ''}"
+            f"```\n{block.content[:self.valves.summary_code_max_chars]}\n```"
+        )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a code summarization assistant. Be concise and technical.",
+            model_override=self.valves.code_block_summary_model,
+            max_tokens=self.valves.oversized_summary_max_tokens,
+            temperature=0.2,
+            label="block_summary",
+        )
+        if summary:
+            block.block_summary = summary.strip()
+            self._log_debug(
+                f"Block {block.hash[:8]}: summary generated "
+                f"({tok} tokens > {self.valves.max_code_block_tokens} limit)"
+            )
 
     def _extract_signature(self, code: str) -> str:
         func_match = re.search(
