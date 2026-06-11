@@ -7712,7 +7712,9 @@ class Filter:
             base = base[:-3]
 
         try:
-            session = await _shared_get_http_session(timeout_seconds=30)
+            session = await _shared_get_http_session(
+                timeout_seconds=self.valves.llm_per_call_timeout
+            )
             async with session.post(
                 f"{base}/slots/{self.valves.slot_id}",
                 params={"action": "restore"},
@@ -7762,7 +7764,9 @@ class Filter:
             base = base[:-3]
 
         try:
-            session = await _shared_get_http_session(timeout_seconds=30)
+            session = await _shared_get_http_session(
+                timeout_seconds=self.valves.llm_per_call_timeout
+            )
             async with session.post(
                 f"{base}/slots/{self.valves.slot_id}",
                 params={"action": "restore"},
@@ -7803,7 +7807,9 @@ class Filter:
             base = base[:-3]
 
         try:
-            session = await _shared_get_http_session(timeout_seconds=30)
+            session = await _shared_get_http_session(
+                timeout_seconds=self.valves.llm_per_call_timeout
+            )
             async with session.post(
                 f"{base}/slots/{self.valves.slot_id}",
                 params={"action": "save"},
@@ -9105,7 +9111,7 @@ class Filter:
             model_override=self.valves.cot_model_level2,
             max_tokens=self.valves.step_back_max_tokens,
             temperature=0.3,
-            timeout=30.0,
+            timeout=self.valves.llm_per_call_timeout,
         )
 
         if step_back_response and step_back_response.strip():
