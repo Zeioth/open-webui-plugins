@@ -3633,6 +3633,7 @@ class Filter:
             return await future
 
         t_start = time.monotonic()
+        label_str = f" ({label})" if label else ""
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
             if base_url.endswith("/v1"):
@@ -3642,7 +3643,7 @@ class Filter:
 
             model = model_override or self.valves.llm_model
             if not model:
-                logger.warning("No model available for LLM call")
+                logger.warning(f"[LLM]{label_str} No model available")
                 future.set_result(None)
                 return None
 
@@ -3653,9 +3654,7 @@ class Filter:
             if cached is not None:
                 future.set_result(cached)
                 self._log_debug(
-                    f"[LLM] {model}"
-                    + (f" ({label})" if label else "")
-                    + f" (cached) took {time.monotonic() - t_start:.3f}s"
+                    f"[LLM] {model}{label_str} (cached) took {time.monotonic() - t_start:.3f}s"
                 )
                 return cached
 
@@ -3667,12 +3666,10 @@ class Filter:
             max_retries = 2
             base_delay = 1.0
 
-            # ── Log prompt size for diagnostics ──
             if self.tokenizer:
                 prompt_tokens = len(self.tokenizer.encode(prompt))
                 self._log_debug(
-                    f"LLM call to {model}{f' ({label})' if label else ''} "
-                    f"– prompt size: ~{prompt_tokens} tokens"
+                    f"LLM call to {model}{label_str} – prompt size: ~{prompt_tokens} tokens"
                 )
 
             # ── Register this task as an active LLM user ──
@@ -3680,10 +3677,8 @@ class Filter:
             async with self._active_llm_tasks_lock:
                 self._active_llm_tasks.add(task)
             try:
-                # ── Inter‑process lock: only one process can use the LLM at a time ──
                 llm_fd = await self._acquire_llm_lock()
                 try:
-                    # ── Acquire global LLM semaphore to serialize all server calls ──
                     async with _llm_semaphore:
                         await self._maybe_unload_for_model(model, base_url, is_ollama)
 
@@ -3704,10 +3699,8 @@ class Filter:
                                 if content:
                                     await self._llm_cache.set(cache_key, content)
                                     future.set_result(content)
-                                    # ── Actualizar last_used_model bajo lock ──
                                     async with self._model_lock:
                                         self._last_used_model = model
-                                    # ── Log input and output tokens ──
                                     in_tokens = (
                                         len(self.tokenizer.encode(prompt))
                                         if self.tokenizer
@@ -3719,18 +3712,15 @@ class Filter:
                                         else "?"
                                     )
                                     self._log_debug(
-                                        f"[LLM] {model}"
-                                        + (f" ({label})" if label else "")
-                                        + f" – in:{in_tokens} out:{out_tokens}"
-                                        + f" took {time.monotonic() - t_start:.3f}s"
+                                        f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
+                                        f" took {time.monotonic() - t_start:.3f}s"
                                     )
                                     return content
                             except asyncio.CancelledError:
                                 raise
                             except RuntimeError as exc:
                                 self._log_debug(
-                                    f"[LLM] {model}{f' ({label})' if label else ''} "
-                                    f"error: {exc}"
+                                    f"[LLM] {model}{label_str} error: {exc}"
                                 )
                                 if any(
                                     c in str(exc)
@@ -3748,18 +3738,15 @@ class Filter:
                 finally:
                     self._release_llm_lock(llm_fd)
             finally:
-                # Remove task from active set
                 async with self._active_llm_tasks_lock:
                     self._active_llm_tasks.discard(task)
 
             logger.warning(
-                f"LLM call failed for model {model}: prompt={prompt[:100]}..."
+                f"[LLM] {model}{label_str} failed: {prompt[:100]}..."
             )
             future.set_result(None)
             self._log_debug(
-                f"[LLM] {model}"
-                + (f" ({label})" if label else "")
-                + f" (failed) after {time.monotonic() - t_start:.3f}s"
+                f"[LLM] {model}{label_str} (failed) after {time.monotonic() - t_start:.3f}s"
             )
             return None
 
