@@ -3285,7 +3285,7 @@ class Filter:
     def _init_long_term_memory(self):
         os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
         self.embedder = _shared_get_embedder()
-        self._log_debug("Embedder: using shared singleton")
+        self._log_debug("Embedder: using multilingual-e5-large")
 
         self.chroma_client = _shared_get_chroma_client(self.valves.long_term_memory_dir)
         self._log_debug("ChromaDB: using shared singleton")
@@ -3297,6 +3297,10 @@ class Filter:
         self.memory_collection = self.chroma_client.get_or_create_collection(
             name="conversation_memory", metadata={"hnsw:space": "cosine"}
         )
+        self._log_debug(
+            f"LTM collection ready – vector size = {self.memory_collection.metadata.get('dimension', '?')}"
+        )
+
         self._response_cache_collection = self.chroma_client.get_or_create_collection(
             name=f"response_cache_{self.valves.project_id or 'default'}",
             metadata={"hnsw:space": "cosine"},
