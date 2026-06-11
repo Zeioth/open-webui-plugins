@@ -1834,6 +1834,7 @@ class Filter:
         self.tokenizer = None
         self._db_conn = None
         self._cross_encoder = None
+        self._cross_encoder_unavailable_logged = False
         self._cross_encoder_lock = asyncio.Lock()
 
         # ── LLMLingua-2 compressor (optional) ──
@@ -2279,7 +2280,6 @@ class Filter:
                 )
                 if code_ratio > 0.07:
                     return True
-                # ratio too low for clear Python code
                 return False
 
             # 3. Cheap guard: line ending with '?' → explicit question
@@ -2290,22 +2290,14 @@ class Filter:
                 )
                 return False
 
-            # 4. CrossEncoder on prose_text only (not on the code)
-            if self._cross_encoder:
-                pairs = [
-                    (prose_text, "The user is asking a question or making a request."),
-                    (prose_text, "This text contains no user question or request."),
-                ]
-                scores = await self._predict_cross_encoder(pairs)
-                has_intent = scores[0] > scores[1]
-                if has_intent:
-                    self._log_debug(
-                        f"_is_code_only_message: intent detected "
-                        f"('{prose_text[:60]}') → not silent"
-                    )
-                    return False
-            else:
-                # Fallback if CrossEncoder not loaded – log and use keyword regex
+            # 4. CrossEncoder on prose_text only (handles None gracefully)
+            pairs = [
+                (prose_text, "The user is asking a question or making a request."),
+                (prose_text, "This text contains no user question or request."),
+            ]
+            scores = await self._predict_cross_encoder(pairs)
+            if scores is None:
+                # CrossEncoder not loaded – fall back to keyword regex
                 self._log_debug(
                     "_is_code_only_message: CrossEncoder not available, "
                     "falling back to keyword intent detection"
@@ -2320,6 +2312,14 @@ class Filter:
                 )
                 if _INTENT_RE.search(prose_text):
                     return False
+            else:
+                has_intent = scores[0] > scores[1]
+                if has_intent:
+                    self._log_debug(
+                        f"_is_code_only_message: intent detected "
+                        f"('{prose_text[:60]}') → not silent"
+                    )
+                    return False
 
             # Reached here: there is residual text but no intent detected
             # (e.g. a file path, a loose comment)
@@ -2329,7 +2329,7 @@ class Filter:
             return code_ratio > 0.07
         # ── End fast path ────────────────────────────────────────────────
 
-        # Original logic (unchanged) for fenced blocks or smaller messages
+        # Original logic for fenced blocks or smaller messages
         code_blocks, _ = await self._extract_code_blocks(content)
         if not code_blocks:
             return False
@@ -2392,19 +2392,16 @@ class Filter:
         if not last_user or len(last_user.get("content", "")) < 20:
             result = False
         else:
-            # Use CrossEncoder – no LLM fallback needed
-            if self._cross_encoder:
-                user_text = last_user.get("content", "")[:300]
-                pairs = [
-                    (
-                        user_text,
-                        "This message is about programming, code, or software development.",
-                    ),
-                    (user_text, "This message is not about programming or code."),
-                ]
-                scores = await self._predict_cross_encoder(pairs)
-                result = scores[0] > scores[1]
-            else:
+            user_text = last_user.get("content", "")[:300]
+            pairs = [
+                (
+                    user_text,
+                    "This message is about programming, code, or software development.",
+                ),
+                (user_text, "This message is not about programming or code."),
+            ]
+            scores = await self._predict_cross_encoder(pairs)
+            if scores is None:
                 # CrossEncoder not available – log and use simple keyword fallback
                 self._log_debug(
                     "_classify_session: CrossEncoder not loaded, "
@@ -2422,6 +2419,8 @@ class Filter:
                         "traceback",
                     )
                 )
+            else:
+                result = scores[0] > scores[1]
         if cache_key:
             self._session_classify_cache[cache_key] = (result, time.time())
             if len(self._session_classify_cache) >= 500:
@@ -4665,15 +4664,25 @@ class Filter:
             logger.warning(f"Historical message retrieval failed: {e}")
             return []
 
-    async def _predict_cross_encoder(self, pairs: list) -> list:
+    async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
         """
-        Wrapper thread‑safe para CrossEncoder.predict().
+        Thread‑safe wrapper for CrossEncoder.predict().
 
-        PyTorch libera el GIL durante cómputo C++, por lo que dos hilos
-        pueden ejecutar la forward‑pass simultáneamente sobre el mismo
-        objeto modelo y corromper su estado interno.
-        El Lock asyncio serializa las llamadas sin bloquear el event loop.
+        PyTorch releases the GIL during C++ compute, so two threads could
+        run the forward pass simultaneously on the same model object,
+        corrupting its internal state.
+        The asyncio Lock serialises calls without blocking the event loop.
+
+        If the CrossEncoder model is not loaded, returns None and logs a
+        warning only once per session.
         """
+        if self._cross_encoder is None:
+            if not self._cross_encoder_unavailable_logged:
+                self._log_debug(
+                    "CrossEncoder not loaded – predictions will return None."
+                )
+                self._cross_encoder_unavailable_logged = True
+            return None
         async with self._cross_encoder_lock:
             return await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
 
@@ -4691,14 +4700,15 @@ class Filter:
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
     ) -> List[str]:
-        if not self.valves.enable_reranking or not self._cross_encoder:
-            if not self._cross_encoder:
-                self._log_debug(
-                    "_rerank_results: CrossEncoder not loaded, skipping reranking."
-                )
+        if not self.valves.enable_reranking:
             return documents[:top_k]
         pairs = [(query, doc) for doc in documents]
         scores = await self._predict_cross_encoder(pairs)
+        if scores is None:
+            self._log_debug(
+                "_rerank_results: CrossEncoder not loaded, skipping reranking."
+            )
+            return documents[:top_k]
         scored = list(zip(documents, scores))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
@@ -6836,34 +6846,38 @@ class Filter:
         Returns a dict with keys "explain", "modify", "debug", "refactor"
         that sum to ~1.0.
         """
-        if self._cross_encoder:
-            # One pair per intent – the CrossEncoder scores each pair quickly
-            pairs = [
-                (user_query[:500], "The user wants to understand or explain code."),
-                (user_query[:500], "The user wants to modify, fix, or create code."),
-                (user_query[:500], "The user is debugging an error or exception."),
-                (user_query[:500], "The user wants to refactor or restructure code."),
-            ]
-            raw = await self._predict_cross_encoder(pairs)
-            # Softmax over the raw scores to get a probability distribution
-            exp_scores = [2.71828**s for s in raw]
-            total_exp = sum(exp_scores)
-            if total_exp > 0:
-                result = {
-                    "explain": exp_scores[0] / total_exp,
-                    "modify": exp_scores[1] / total_exp,
-                    "debug": exp_scores[2] / total_exp,
-                    "refactor": exp_scores[3] / total_exp,
-                }
-                self._log_debug(
-                    f"Intent (CrossEncoder): {max(result, key=result.get)}="
-                    f"{max(result.values()):.2f}"
-                )
-                return result
-
-        # Fallback if CrossEncoder is not loaded (should be extremely rare)
+        # One pair per intent – the CrossEncoder scores each pair quickly
+        pairs = [
+            (user_query[:500], "The user wants to understand or explain code."),
+            (user_query[:500], "The user wants to modify, fix, or create code."),
+            (user_query[:500], "The user is debugging an error or exception."),
+            (user_query[:500], "The user wants to refactor or restructure code."),
+        ]
+        raw = await self._predict_cross_encoder(pairs)
+        if raw is None:
+            # CrossEncoder not available – log and return default distribution
+            self._log_debug(
+                "Intent: CrossEncoder not available, using default distribution."
+            )
+            return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
+        # Softmax over the raw scores to get a probability distribution
+        exp_scores = [2.71828**s for s in raw]
+        total_exp = sum(exp_scores)
+        if total_exp > 0:
+            result = {
+                "explain": exp_scores[0] / total_exp,
+                "modify": exp_scores[1] / total_exp,
+                "debug": exp_scores[2] / total_exp,
+                "refactor": exp_scores[3] / total_exp,
+            }
+            self._log_debug(
+                f"Intent (CrossEncoder): {max(result, key=result.get)}="
+                f"{max(result.values()):.2f}"
+            )
+            return result
+        # Fallback if softmax fails (should never happen)
         self._log_debug(
-            "Intent: CrossEncoder not available, using default distribution."
+            "Intent: softmax failed, using default distribution."
         )
         return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
@@ -8187,31 +8201,30 @@ class Filter:
         if not history_text.strip():
             return None
 
-        # Use CrossEncoder – no LLM fallback
-        if self._cross_encoder:
-            new_msg = last_user["content"][:500]
-            hist = history_text[-2000:]
-            pairs = [
-                (
-                    f"History: {hist}\n\nNew message: {new_msg}",
-                    "The new message contradicts a previous statement or decision.",
-                ),
-                (
-                    f"History: {hist}\n\nNew message: {new_msg}",
-                    "The new message is consistent with the history.",
-                ),
-            ]
-            scores = await self._predict_cross_encoder(pairs)
-            if scores[0] > scores[1]:
-                return (
-                    "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
-                    "Please review and clarify if needed."
-                )
+        new_msg = last_user["content"][:500]
+        hist = history_text[-2000:]
+        pairs = [
+            (
+                f"History: {hist}\n\nNew message: {new_msg}",
+                "The new message contradicts a previous statement or decision.",
+            ),
+            (
+                f"History: {hist}\n\nNew message: {new_msg}",
+                "The new message is consistent with the history.",
+            ),
+        ]
+        scores = await self._predict_cross_encoder(pairs)
+        if scores is None:
+            self._log_debug(
+                "_detect_contradictions: CrossEncoder not loaded, "
+                "skipping contradiction detection."
+            )
             return None
-        # If CrossEncoder not loaded, log and skip detection gracefully
-        self._log_debug(
-            "_detect_contradictions: CrossEncoder not loaded, skipping contradiction detection."
-        )
+        if scores[0] > scores[1]:
+            return (
+                "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
+                "Please review and clarify if needed."
+            )
         return None
 
     # --------------------------------------------------------------------------
@@ -8258,21 +8271,20 @@ class Filter:
                 dist = results["distances"][0][i]
                 sim = 1.0 - (dist / 2.0)
                 if sim >= self.valves.duplicate_question_threshold and doc != query:
-                    # Use CrossEncoder for final verification if available
-                    if self._cross_encoder:
-                        pairs = [(query[:500], doc[:500])]
-                        ce_score = await self._predict_cross_encoder(pairs)
-                        if ce_score[0] > 0.85:  # high confidence of duplication
-                            best_candidate = (sim, doc, ce_score[0])
-                            break
-                    else:
-                        # CrossEncoder not available – log and use cosine similarity alone
+                    # Use CrossEncoder for final verification
+                    pairs = [(query[:500], doc[:500])]
+                    ce_score = await self._predict_cross_encoder(pairs)
+                    if ce_score is None:
+                        # CrossEncoder not available – log and use cosine only
                         self._log_debug(
                             "_find_duplicate_question: CrossEncoder not loaded, "
                             "using cosine similarity only (higher false positive risk)."
                         )
                         best_candidate = (sim, doc, None)
-                        break  # take first above threshold
+                        break
+                    if ce_score[0] > 0.85:  # high confidence of duplication
+                        best_candidate = (sim, doc, ce_score[0])
+                        break
 
             if best_candidate:
                 sim, doc, ce = best_candidate
@@ -8602,51 +8614,40 @@ class Filter:
         Determine CoT depth using the CrossEncoder (instant CPU inference).
         Falls back to heuristic if CrossEncoder is not available.
         """
-        if self._cross_encoder:
-            # Build a single query that captures session type and user intent
-            session_type = "code" if is_code_session else "general"
-            intent_hint = ""
-            if (
-                hasattr(self, "_user_intent_full_code")
-                and self._user_intent_full_code is not None
-            ):
-                intent_hint = (
-                    "The user likely needs the full code."
-                    if self._user_intent_full_code
-                    else "The user likely needs only a summary of the code."
-                )
-            query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+        # Build a single query that captures session type and user intent
+        session_type = "code" if is_code_session else "general"
+        intent_hint = ""
+        if hasattr(self, "_user_intent_full_code") and self._user_intent_full_code is not None:
+            intent_hint = (
+                "The user likely needs the full code."
+                if self._user_intent_full_code
+                else "The user likely needs only a summary of the code."
+            )
+        query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
 
-            # One pair per CoT level – the CrossEncoder scores each instantly
-            pairs = [
-                (query, "The user wants a simple, direct answer without reasoning."),
-                (
-                    query,
-                    "The user asks a moderately complex question that requires step-by-step thinking.",
-                ),
-                (query, "The user asks a complex question that needs deep reasoning."),
-                (
-                    query,
-                    "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
-                ),
-            ]
-            scores = await self._predict_cross_encoder(pairs)
-            # scores is a numpy array; use argmax to get the index of the highest score
-            import numpy as np
-
-            best_level = int(np.argmax(scores))
-            if best_level == 0:
-                return 0
-            elif best_level == 1:
-                return 1
-            elif best_level == 2:
-                return 2
-            else:
-                return 3
-
-        # CrossEncoder not available – log and fall back to heuristic
-        self._log_debug("CoT detection via CrossEncoder unavailable, using heuristic.")
-        return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+        # One pair per CoT level – the CrossEncoder scores each instantly
+        pairs = [
+            (query, "The user wants a simple, direct answer without reasoning."),
+            (query, "The user asks a moderately complex question that requires step-by-step thinking."),
+            (query, "The user asks a complex question that needs deep reasoning."),
+            (query, "The user asks an extremely complex or open-ended question requiring exhaustive analysis."),
+        ]
+        scores = await self._predict_cross_encoder(pairs)
+        if scores is None:
+            # CrossEncoder not available – log and fall back to heuristic
+            self._log_debug("CoT detection via CrossEncoder unavailable, using heuristic.")
+            return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+        # scores is a numpy array; use argmax to get the index of the highest score
+        import numpy as np
+        best_level = int(np.argmax(scores))
+        if best_level == 0:
+            return 0
+        elif best_level == 1:
+            return 1
+        elif best_level == 2:
+            return 2
+        else:
+            return 3
 
     async def _generate_cot_reasoning(
         self, question: str, context: str, label: str = ""
