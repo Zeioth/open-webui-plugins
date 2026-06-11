@@ -9775,12 +9775,6 @@ class Filter:
                 f"({_available_mp_pre} tokens < threshold "
                 f"{self.valves.multi_phase_response_threshold})."
             )
-        if slot_free and not _skip_intent_llm:
-            self._user_intent_full_code = await self._should_keep_full_code(
-                user_question
-            )
-        else:
-            self._user_intent_full_code = True
 
         # ── 🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level ──
         self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
@@ -9804,20 +9798,72 @@ class Filter:
                         if level == 1:
                             cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                             dynamic_injections.append(("high", cot_prompt))
-                elif not manual_cot_used and slot_free:
-                    cot_detection_content = (
-                        user_question
-                        if user_question and len(user_question) >= 10
-                        else user_content
-                    )
-                    cot_level = await self._detect_cot_level(
+
+        # ── Parallel CrossEncoder tasks (keep_full_code + auto CoT detection) ─
+        if slot_free and not manual_cot_used:
+            parallel_tasks = []
+            # Task 1: _should_keep_full_code (if not skipped)
+            if not _skip_intent_llm:
+                parallel_tasks.append(self._should_keep_full_code(user_question))
+            else:
+                parallel_tasks.append(
+                    asyncio.sleep(0, result=True)
+                )  # dummy, will be ignored
+
+            # Task 2: CoT level detection (if auto detection is enabled)
+            if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+                cot_detection_content = (
+                    user_question
+                    if user_question and len(user_question) >= 10
+                    else user_content
+                )
+                parallel_tasks.append(
+                    self._detect_cot_level(
                         cot_detection_content, is_code_session, state
                     )
+                )
+            else:
+                parallel_tasks.append(asyncio.sleep(0, result=0))  # dummy
+
+            results = await asyncio.gather(*parallel_tasks)
+            # results[0] = keep_full_code (bool) or dummy True
+            # results[1] = cot_level (int) or dummy 0
+            self._user_intent_full_code = results[0] if not _skip_intent_llm else True
+            detected_level = (
+                results[1]
+                if (self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled)
+                else 0
+            )
+            if detected_level > 0:
+                cot_any_used = True
+                cot_level = detected_level
+                self._log_debug(
+                    f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
+                )
+        else:
+            # Sequential fallback when slot not free or manual CoT used
+            if slot_free and not _skip_intent_llm:
+                self._user_intent_full_code = await self._should_keep_full_code(
+                    user_question
+                )
+            else:
+                self._user_intent_full_code = True
+
+            if not manual_cot_used and slot_free:
+                cot_detection_content = (
+                    user_question
+                    if user_question and len(user_question) >= 10
+                    else user_content
+                )
+                cot_level = await self._detect_cot_level(
+                    cot_detection_content, is_code_session, state
+                )
+                if cot_level > 0:
+                    cot_any_used = True
                     self._log_debug(
                         f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
                     )
-                    if cot_level > 0:
-                        cot_any_used = True
+
         if not cot_any_used:
             self._log_debug("🧠 ENRICHMENT – CoT Step 1/3: No CoT needed")
         elif not slot_free:
