@@ -756,6 +756,9 @@ class SymbolIndex:
     def _evict_if_needed(self):
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
             least_common = self._stats.most_common()[-1][0]
+            # least_common es una tupla (project_id, symbol_name)
+            project_id, symbol_name = least_common
+            self.remove_edges_for_symbol(symbol_name, project_id)  # ← Fix 2
             del self._name_to_blocks[least_common]
             del self._callee_to_callers[least_common]
             del self._stats[least_common]
@@ -1831,6 +1834,7 @@ class Filter:
         self.tokenizer = None
         self._db_conn = None
         self._cross_encoder = None
+        self._cross_encoder_lock = asyncio.Lock()
 
         # ── LLMLingua-2 compressor (optional) ──
         self._llmlingua_compressor = None
@@ -1901,7 +1905,7 @@ class Filter:
         self._active_llm_tasks_lock = asyncio.Lock()
 
         # ── Database write queue (prevents "database is locked") ──
-        self._db_write_queue: asyncio.Queue = asyncio.Queue()
+        self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._db_worker_task = asyncio.create_task(self._db_worker())
 
         # Session classification cache
@@ -2292,9 +2296,7 @@ class Filter:
                     (prose_text, "The user is asking a question or making a request."),
                     (prose_text, "This text contains no user question or request."),
                 ]
-                scores = await anyio.to_thread.run_sync(
-                    self._cross_encoder.predict, pairs
-                )
+                scores = await self._predict_cross_encoder(pairs)
                 has_intent = scores[0] > scores[1]
                 if has_intent:
                     self._log_debug(
@@ -2400,12 +2402,14 @@ class Filter:
                     ),
                     (user_text, "This message is not about programming or code."),
                 ]
-                scores = await anyio.to_thread.run_sync(
-                    self._cross_encoder.predict, pairs
-                )
+                scores = await self._predict_cross_encoder(pairs)
                 result = scores[0] > scores[1]
             else:
-                # Extremely unlikely – simple keyword fallback
+                # CrossEncoder not available – log and use simple keyword fallback
+                self._log_debug(
+                    "_classify_session: CrossEncoder not loaded, "
+                    "falling back to keyword detection."
+                )
                 result = any(
                     kw in last_user.get("content", "").lower()
                     for kw in (
@@ -2770,6 +2774,19 @@ class Filter:
                         else:
                             raise
 
+    async def _db_enqueue(self, func, args=(), kwargs={}):
+        """
+        Enqueue a database write operation, logging a warning if the queue
+        is near its capacity.  This provides visibility into potential DB
+        contention before the queue fills up completely.
+        """
+        if self._db_write_queue.qsize() > 150:
+            self._log_debug(
+                "⚠️ DB write queue high watermark: "
+                f"{self._db_write_queue.qsize()} items pending"
+            )
+        await self._db_write_queue.put((func, args, kwargs))
+
     def _init_state_db(self):
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -2873,23 +2890,55 @@ class Filter:
             return self._project_locks[project_id]
 
     def _get_state(self, project_id: str) -> Dict:
+        """Return the conversation state for the given project, loading from DB if needed.
+        Evicts the oldest cached project when the cache exceeds max_cached_projects,
+        cleaning up all associated data structures to prevent memory leaks.
+        """
         if project_id in self._conversation_state:
             self._conversation_state.move_to_end(project_id)
             return self._conversation_state[project_id]
+
+        # Load from database or create a fresh state
         state = self._load_state_from_db(project_id)
         if not state:
             state = self._state_factory()
+
         self._conversation_state[project_id] = state
         self._conversation_state.move_to_end(project_id)
+
+        # ── Evict oldest projects when cache is full ─────────────────────
         while len(self._conversation_state) > self.valves.max_cached_projects:
             oldest_pid = next(iter(self._conversation_state))
             oldest_state = self._conversation_state[oldest_pid]
+
+            # Remove symbols from the index
             self._remove_project_from_index_by_id(oldest_pid, oldest_state)
             del self._conversation_state[oldest_pid]
+
+            # Clean lightweight caches
             self._cached_lightweight_context.pop(oldest_pid, None)
             self._project_locks.pop(oldest_pid, None)
+
+            # ── Fix-3: purge all per‑project dictionaries ────────────────
+            self._path_index.clear_project(oldest_pid)
+            self._static_context_block_cache.pop(oldest_pid, None)
+            self._node_centrality.pop(oldest_pid, None)
+            self._last_static_prefix_hash.pop(oldest_pid, None)
+            self._last_saved_slot_hash.pop(oldest_pid, None)
+            self._slot_restored.pop(oldest_pid, None)
+            self._slot_restore_attempted.pop(oldest_pid, None)
+            self._last_processed_message_idx.pop(oldest_pid, None)
+            self._response_cache_count.pop(oldest_pid, None)
+            self._summarize_inactive_in_progress.pop(oldest_pid, None)
+            # The next two are created lazily; use getattr for safety
+            getattr(self, "_last_activation_scores", {}).pop(oldest_pid, None)
+            getattr(self, "_last_lod_levels", {}).pop(oldest_pid, None)
+            # ─────────────────────────────────────────────────────────────
+
+        # Rebuild the symbol index if there are active blocks
         if state["active_blocks"]:
             self._rebuild_symbol_index(state, project_id)
+
         return state
 
     def _set_state(self, project_id: str, state: Dict):
@@ -2922,11 +2971,13 @@ class Filter:
             self._log_debug(f"Failed to save state: {e}\n{traceback.format_exc()}")
 
     async def _save_state_to_db(self, project_id: str, state: Dict):
+        # Serialize active blocks metadata
         active_blocks_meta = {}
         for k, v in state["active_blocks"].items():
             d = v.dict()
             d["content_type"] = v.content_type.value
             content_hash = v.hash
+            # Persist the raw content separately
             await anyio.to_thread.run_sync(
                 lambda: self._db_conn.execute(
                     "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
@@ -2959,7 +3010,8 @@ class Filter:
             )
             self._db_conn.commit()
 
-        await self._db_write_queue.put((_write, (), {}))
+        # ── Use the helper that warns on high queue usage ────────────
+        await self._db_enqueue(_write)
 
     async def _save_state_to_db_async(self, project_id: str, state: Dict):
         """Acquire the project lock, then persist the state to DB."""
@@ -3098,6 +3150,8 @@ class Filter:
     # ── v7 (PASO-13): CodePathView persistence ─────────────────────
 
     async def _save_path_views_to_db(self, project_id: str, views: List[CodePathView]):
+        """Persist CodePathViews to SQLite, replacing any existing views for the project."""
+
         def _write():
             self._db_conn.execute(
                 "DELETE FROM code_path_views WHERE project_id = ?", (project_id,)
@@ -3123,7 +3177,8 @@ class Filter:
                 )
             self._db_conn.commit()
 
-        await self._db_write_queue.put((_write, (), {}))
+        # ── Enqueue with queue‑usage warning ─────────────────────────
+        await self._db_enqueue(_write)
 
     async def _load_path_views_from_db(self, project_id: str) -> List[CodePathView]:
         rows = await anyio.to_thread.run_sync(
@@ -3212,9 +3267,10 @@ class Filter:
             )
             self._db_conn.commit()
 
-        await self._db_write_queue.put((_write, (), {}))
+        # ── Enqueue with queue‑usage warning ─────────────────────────
+        await self._db_enqueue(_write)
         self._log_debug(
-            f"Edge persistence: saved {total_edges} edges " f"(code_hash={code_hash})"
+            f"Edge persistence: saved {total_edges} edges (code_hash={code_hash})"
         )
         return total_edges
 
@@ -4406,7 +4462,8 @@ class Filter:
                 )
                 self._db_conn.commit()
 
-            await self._db_write_queue.put((_write_cluster, (), {}))
+            # ── Enqueue with queue‑usage warning ────────────────────
+            await self._db_enqueue(_write_cluster)
 
             clusters_created += 1
             self._log_debug(
@@ -4608,6 +4665,18 @@ class Filter:
             logger.warning(f"Historical message retrieval failed: {e}")
             return []
 
+    async def _predict_cross_encoder(self, pairs: list) -> list:
+        """
+        Wrapper thread‑safe para CrossEncoder.predict().
+
+        PyTorch libera el GIL durante cómputo C++, por lo que dos hilos
+        pueden ejecutar la forward‑pass simultáneamente sobre el mismo
+        objeto modelo y corromper su estado interno.
+        El Lock asyncio serializa las llamadas sin bloquear el event loop.
+        """
+        async with self._cross_encoder_lock:
+            return await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+
     def _load_reranker(self):
         if not self.valves.enable_reranking or not HAS_CROSS_ENCODER:
             return
@@ -4622,10 +4691,14 @@ class Filter:
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
     ) -> List[str]:
-        if not self.valves.enable_reranking or not self._cross_encoder or not documents:
+        if not self.valves.enable_reranking or not self._cross_encoder:
+            if not self._cross_encoder:
+                self._log_debug(
+                    "_rerank_results: CrossEncoder not loaded, skipping reranking."
+                )
             return documents[:top_k]
         pairs = [(query, doc) for doc in documents]
-        scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+        scores = await self._predict_cross_encoder(pairs)
         scored = list(zip(documents, scores))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
@@ -6771,7 +6844,7 @@ class Filter:
                 (user_query[:500], "The user is debugging an error or exception."),
                 (user_query[:500], "The user wants to refactor or restructure code."),
             ]
-            raw = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            raw = await self._predict_cross_encoder(pairs)
             # Softmax over the raw scores to get a probability distribution
             exp_scores = [2.71828**s for s in raw]
             total_exp = sum(exp_scores)
@@ -8128,14 +8201,17 @@ class Filter:
                     "The new message is consistent with the history.",
                 ),
             ]
-            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            scores = await self._predict_cross_encoder(pairs)
             if scores[0] > scores[1]:
                 return (
                     "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
                     "Please review and clarify if needed."
                 )
             return None
-        # If CrossEncoder not loaded, skip detection gracefully
+        # If CrossEncoder not loaded, log and skip detection gracefully
+        self._log_debug(
+            "_detect_contradictions: CrossEncoder not loaded, skipping contradiction detection."
+        )
         return None
 
     # --------------------------------------------------------------------------
@@ -8185,14 +8261,16 @@ class Filter:
                     # Use CrossEncoder for final verification if available
                     if self._cross_encoder:
                         pairs = [(query[:500], doc[:500])]
-                        ce_score = await anyio.to_thread.run_sync(
-                            self._cross_encoder.predict, pairs
-                        )
+                        ce_score = await self._predict_cross_encoder(pairs)
                         if ce_score[0] > 0.85:  # high confidence of duplication
                             best_candidate = (sim, doc, ce_score[0])
                             break
                     else:
-                        # Fallback to cosine similarity alone
+                        # CrossEncoder not available – log and use cosine similarity alone
+                        self._log_debug(
+                            "_find_duplicate_question: CrossEncoder not loaded, "
+                            "using cosine similarity only (higher false positive risk)."
+                        )
                         best_candidate = (sim, doc, None)
                         break  # take first above threshold
 
@@ -8528,7 +8606,10 @@ class Filter:
             # Build a single query that captures session type and user intent
             session_type = "code" if is_code_session else "general"
             intent_hint = ""
-            if hasattr(self, "_user_intent_full_code") and self._user_intent_full_code is not None:
+            if (
+                hasattr(self, "_user_intent_full_code")
+                and self._user_intent_full_code is not None
+            ):
                 intent_hint = (
                     "The user likely needs the full code."
                     if self._user_intent_full_code
@@ -8539,13 +8620,20 @@ class Filter:
             # One pair per CoT level – the CrossEncoder scores each instantly
             pairs = [
                 (query, "The user wants a simple, direct answer without reasoning."),
-                (query, "The user asks a moderately complex question that requires step-by-step thinking."),
+                (
+                    query,
+                    "The user asks a moderately complex question that requires step-by-step thinking.",
+                ),
                 (query, "The user asks a complex question that needs deep reasoning."),
-                (query, "The user asks an extremely complex or open-ended question requiring exhaustive analysis."),
+                (
+                    query,
+                    "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
+                ),
             ]
-            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            scores = await self._predict_cross_encoder(pairs)
             # scores is a numpy array; use argmax to get the index of the highest score
             import numpy as np
+
             best_level = int(np.argmax(scores))
             if best_level == 0:
                 return 0
@@ -10358,7 +10446,6 @@ class Filter:
                 end = time.monotonic()
             self._log_timing(step_name, start - inlet_start, end - start)
 
-        # no longer needed: self._ensure_cleanup_task()
         project_id = self._get_project_id()
 
         slot_free = True
@@ -10366,25 +10453,18 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   1. Preprocess (project switch, cache load)
-        #   4. Extract user info (last message, question, code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         messages = await self._inlet_preprocess(body, project_id)
-        _inlet_timing("Step 1/8: Preprocess (project switch, cache load)", step_start)
+        _inlet_timing("Step 1/7: Preprocess (project switch, cache load)", step_start)
         if not messages:
             return body
 
-        # NOTE: Steps 2 and 3 have been removed (no unload, no secondary tasks).
-        step_start = time.monotonic()
-        _inlet_timing("Step 2/8: Process pending secondary tasks – SKIPPED", step_start)
-        step_start = time.monotonic()
-        _inlet_timing(
-            "Step 3/8: Unload models safely (free VRAM) – SKIPPED", step_start
-        )
+        # NOTE: Old steps 2 and 3 (secondary tasks, unload models) have been removed.
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
-        #   4. Extract user info
+        #   2. Extract user info
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         (
@@ -10394,7 +10474,7 @@ class Filter:
             is_explicit_command,
             has_code_blocks,
         ) = await self._inlet_extract_user_info(messages)
-        _inlet_timing("Step 4/8: Extract user info", step_start)
+        _inlet_timing("Step 2/7: Extract user info", step_start)
 
         # ── Detect AutoContinue continuation ──────────────────────────────
         _last_assistant = next(
@@ -10427,13 +10507,13 @@ class Filter:
 
         # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
-        #   5. Explicit commands (/forget, /status, /clean, /expand)
+        #   3. Explicit commands (/forget, /status, /clean, /expand)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
-        _inlet_timing("Step 5/8: Handle explicit commands", step_start)
+        _inlet_timing("Step 3/7: Handle explicit commands", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -10443,7 +10523,7 @@ class Filter:
             return body
 
         # ⚡ COMMAND HANDLING (High value)
-        #   6. Natural language intents (forget, remember, obsolete)
+        #   4. Natural language intents (forget, remember, obsolete)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         handled, handled_messages = await self._inlet_handle_natural_intents(
@@ -10453,7 +10533,7 @@ class Filter:
             last_user_msg,
             slot_free=slot_free,
         )
-        _inlet_timing("Step 6/8: Handle natural language intents", step_start)
+        _inlet_timing("Step 4/7: Handle natural language intents", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -10473,7 +10553,6 @@ class Filter:
                 self._log_section("SILENT INGESTION MODE")
 
                 # ── Fix: raw code without fences won't be found by _extract_code_blocks ──
-                # Wrap it so SignatureExtractor and the symbol indexer can process it.
                 _msg_to_index = last_user_msg
                 if "```" not in user_query and self._has_code_indicators(user_query):
                     _guessed_lang = SignatureExtractor._guess_language(None, user_query)
@@ -10486,38 +10565,24 @@ class Filter:
                         f"Silent ingestion: wrapping raw code as {_lang} "
                         f"({self._estimate_code_tokens(user_query)} tokens)"
                     )
-                # ── End fix ──
 
-                # Process code into SymbolGraph without invoking main LLM
                 await self._update_active_code(_msg_to_index, project_id)
-
-                # Resolve cross‑references with previous chunks
                 resolved = await self._resolve_dangling_edges(project_id)
-
-                # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._rebuild_path_index(project_id)
-
-                # Invalidate static block (new code → new Block A)
                 self._invalidate_static_context_block(project_id, "new chunk ingested")
 
-                # Statistics for the user
                 state = self._get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
-
                 response = (
                     f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
                     "El código está disponible en el SymbolGraph para futuras consultas. "
                     "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
-
-                # Replace the last user message with assistant response + "continue"
-                messages.pop()  # remove user code message
+                messages.pop()
                 messages.append({"role": "assistant", "content": response})
-                messages.append(
-                    {"role": "user", "content": "continue"}
-                )  # satisfy chat template
+                messages.append({"role": "user", "content": "continue"})
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
@@ -10528,17 +10593,17 @@ class Filter:
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
-        #   7. Prepare code session (classify, update code blocks)
+        #   5. Prepare code session (classify, update code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         is_code_session, user_question = await self._inlet_prepare_code_session(
             messages, project_id, user_query, is_continuation=_is_continuation
         )
-        _inlet_timing("Step 7/8: Prepare code session", step_start)
+        _inlet_timing("Step 5/7: Prepare code session", step_start)
 
         # ─────────────────────────────────────────────────────────────────
         # 🧠 ENRICHMENT (High value)
-        #   8. Build system injections and assemble final messages
+        #   6. Build system injections and assemble final messages
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         state = self._get_state(project_id)
@@ -10554,7 +10619,7 @@ class Filter:
                 slot_free=slot_free,
             )
         )
-        _inlet_timing("Step 8/8: Build system injections", step_start)
+        _inlet_timing("Step 6/7: Build system injections", step_start)
 
         if cached_response:
             messages.pop()
@@ -10570,7 +10635,7 @@ class Filter:
 
         # ─────────────────────────────────────────────────────────────────
         # 📦 COMPRESSION + ASSEMBLY (High value)
-        #   9. Assemble final messages with CoT, multi-phase, trimming
+        #   7. Assemble final messages with CoT, multi-phase, trimming
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         messages = await self._inlet_assemble_final_messages(
@@ -10587,7 +10652,7 @@ class Filter:
             has_code_blocks,
             slot_free=slot_free,
         )
-        _inlet_timing("Step 9/8: Assemble final messages", step_start)
+        _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
         body["messages"] = messages
 
@@ -11215,7 +11280,7 @@ class Filter:
         self, block_hash: str, prev_content: str, new_content: str
     ):
         """Generate and persist a change summary immediately (no deferral)."""
-        model = self.valves.llm_model  # <-- antes era self.valves.secondary_task_model
+        model = self.valves.llm_model  # main model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
             f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
@@ -11248,4 +11313,5 @@ class Filter:
                 )
                 self._db_conn.commit()
 
-            await self._db_write_queue.put((_write, (), {}))
+            # ── Enqueue with queue‑usage warning ─────────────────────
+            await self._db_enqueue(_write)
