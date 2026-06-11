@@ -9346,6 +9346,64 @@ class Filter:
             return True
         return False
 
+    async def _run_session_summary_task(self, params: dict, model: str) -> bool:
+        """Generate an autobiographical session summary and store it in LTM."""
+        project_id = params["project_id"]
+        code_state_hash = params.get("code_state_hash", "")
+
+        recent = await self._retrieve_historical_messages(
+            query="recent conversation summary",
+            project_id=project_id,
+            limit=self.valves.session_summary_interval_messages,
+        )
+        if not recent:
+            return False
+
+        conversation_text = "\n".join(
+            f"{m['role']}: {m['content'][:300]}" for m in recent
+        )
+        prompt = (
+            "Summarise the following conversation segment in 2-3 sentences, "
+            "capturing the main task, decisions made, files modified, "
+            "and architectural changes:\n\n"
+            f"{conversation_text[:3000]}"
+        )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
+            model_override=model,
+            max_tokens=self.valves.session_summary_max_tokens,
+            temperature=0.2,
+            label="session_summary",
+        )
+        if not summary:
+            return False
+
+        msg_id = f"{project_id}_session_summary_{int(time.time())}"
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self.embedder.encode(summary).tolist()
+        )
+        await anyio.to_thread.run_sync(
+            lambda: self.memory_collection.upsert(
+                ids=[msg_id],
+                embeddings=[embedding],
+                metadatas=[
+                    {
+                        "role": "assistant",
+                        "project_id": project_id,
+                        "timestamp": time.time(),
+                        "is_session_summary": True,
+                        "code_state_hash": code_state_hash,
+                        "content_type": ContentType.GENERAL.value,
+                        "has_code": False,
+                    }
+                ],
+                documents=[f"[Session summary]\n{summary}"],
+            )
+        )
+        self._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
+        return True
+
     # --------------------------------------------------------------------------
     # Inlet helper methods
     # --------------------------------------------------------------------------
@@ -10595,6 +10653,7 @@ class Filter:
                 self._log_section("SILENT INGESTION MODE")
 
                 # ── Fix: raw code without fences won't be found by _extract_code_blocks ──
+                # Wrap it so SignatureExtractor and the symbol indexer can process it.
                 _msg_to_index = last_user_msg
                 if "```" not in user_query and self._has_code_indicators(user_query):
                     _guessed_lang = SignatureExtractor._guess_language(None, user_query)
@@ -10607,24 +10666,38 @@ class Filter:
                         f"Silent ingestion: wrapping raw code as {_lang} "
                         f"({self._estimate_code_tokens(user_query)} tokens)"
                     )
+                # ── End fix ──
 
+                # Process code into SymbolGraph without invoking main LLM
                 await self._update_active_code(_msg_to_index, project_id)
+
+                # Resolve cross‑references with previous chunks
                 resolved = await self._resolve_dangling_edges(project_id)
+
+                # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._rebuild_path_index(project_id)
+
+                # Invalidate static block (new code → new Block A)
                 self._invalidate_static_context_block(project_id, "new chunk ingested")
 
+                # Statistics for the user
                 state = self._get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
+
                 response = (
                     f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
                     "El código está disponible en el SymbolGraph para futuras consultas. "
                     "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
-                messages.pop()
+
+                # Replace the last user message with assistant response + "continue"
+                messages.pop()  # remove user code message
                 messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "user", "content": "continue"})
+                messages.append(
+                    {"role": "user", "content": "continue"}
+                )  # satisfy chat template
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
@@ -10668,6 +10741,8 @@ class Filter:
             messages.append(
                 {"role": "assistant", "content": cached_response["response"]}
             )
+            # Ensure the last message is a user message to pass API validation
+            messages = self._ensure_last_message_is_user(messages)
             body["messages"] = messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
