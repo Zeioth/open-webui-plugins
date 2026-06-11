@@ -6767,6 +6767,18 @@ class Filter:
         )
         return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
+    def _get_feedback_context(self, project_id: str) -> str:
+        state = self._get_state(project_id)
+        feedback = state.get("feedback_history", [])
+        if not feedback:
+            return ""
+        recent = feedback[-self.valves.feedback_history_limit :]
+        lines = ["## Previous Feedback"]
+        for fb in recent:
+            success = "✅" if fb.success else "❌"
+            lines.append(f"- {success} {fb.change_description[:100]}")
+        return "\n".join(lines)
+
     async def _get_static_context_block(
         self,
         project_id: str,
