@@ -2240,58 +2240,102 @@ class Filter:
     async def _is_code_only_message(self, content: str) -> bool:
         """
         Detect messages that contain only code without a question.
-        Heuristic: if the text outside fenced code blocks is < 30 chars,
-        treat as pure ingestion.
-
-        Returns True for:
-          ```python\ndef foo(): pass\n```
-        Returns False for:
-          What does this function do?\n```python\ndef foo(): pass\n```
+        Uses a fast path for large raw code pastes (no fences) based on
+        Python structural line ratio and optional CrossEncoder intent check
+        on the non‑code prose.
         """
         if not content or len(content.strip()) < 20:
             return False
 
-        # ── Fast path: raw code paste without fences (e.g. entire Python file) ──
+        # ── Fast path: large raw code paste without fences ──────────────
         estimated_tokens = self._estimate_code_tokens(content)
         if estimated_tokens >= self.valves.lean_user_code_min_tokens:
-            # Guard: if there's a real question, do NOT silently ingest
-            has_question = any(
-                line.strip().endswith("?")
-                for line in content.splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            )
-            if not has_question:
-                non_blank = [l for l in content.splitlines() if l.strip()]
-                if non_blank:
-                    _PY_STRUCTURAL = re.compile(
-                        r"^\s*(?:def |async def |class |import |from |@\w|"
-                        r"if |elif |else:|for |while |try:|except|with |"
-                        r"return |yield |raise |pass\b|break\b|continue\b|#)"
-                    )
-                    code_ratio = sum(
-                        1 for l in non_blank if _PY_STRUCTURAL.match(l)
-                    ) / len(non_blank)
-                    if code_ratio > 0.07:
-                        self._log_debug(
-                            f"_is_code_only_message: fast path triggered "
-                            f"(tokens={estimated_tokens}, code_ratio={code_ratio:.2f})"
-                        )
-                        return True
-        # ── End fast path ──
 
-        # Must contain at least one code block
+            # 1. Extract only the non‑code prose (what the transformer will see)
+            _PY_STRUCTURAL = re.compile(
+                r"^\s*(?:def |async def |class |import |from |@\w|"
+                r"if |elif |else:|for |while |try:|except|with |"
+                r"return |yield |raise |pass\b|break\b|continue\b|#)"
+            )
+            non_blank = [l for l in content.splitlines() if l.strip()]
+            prose_lines = [
+                l
+                for l in non_blank
+                if not _PY_STRUCTURAL.match(l)
+                and not re.match(r'^\s*[\w.]+\s*[=({"\']', l)
+                and not re.match(r'^\s*"""', l)
+                and not re.match(r"^\s*'''", l)
+            ]
+            prose_text = " ".join(prose_lines).strip()
+
+            # 2. If no residual text outside code → pure code
+            if not prose_text or len(prose_text) < 3:
+                code_ratio = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l)) / len(
+                    non_blank
+                )
+                if code_ratio > 0.07:
+                    return True
+                # ratio too low for clear Python code
+                return False
+
+            # 3. Cheap guard: line ending with '?' → explicit question
+            has_question = any(l.strip().endswith("?") for l in prose_lines)
+            if has_question:
+                self._log_debug(
+                    "_is_code_only_message: explicit question detected → not silent"
+                )
+                return False
+
+            # 4. CrossEncoder on prose_text only (not on the code)
+            if self._cross_encoder:
+                pairs = [
+                    (prose_text, "The user is asking a question or making a request."),
+                    (prose_text, "This text contains no user question or request."),
+                ]
+                scores = await anyio.to_thread.run_sync(
+                    self._cross_encoder.predict, pairs
+                )
+                has_intent = scores[0] > scores[1]
+                if has_intent:
+                    self._log_debug(
+                        f"_is_code_only_message: intent detected "
+                        f"('{prose_text[:60]}') → not silent"
+                    )
+                    return False
+            else:
+                # Fallback if CrossEncoder not loaded – log and use keyword regex
+                self._log_debug(
+                    "_is_code_only_message: CrossEncoder not available, "
+                    "falling back to keyword intent detection"
+                )
+                _INTENT_RE = re.compile(
+                    r"\b(?:explain|describe|analyze|review|fix|refactor|optimize|"
+                    r"improve|rewrite|check|summarize|show|tell|what|how|why|"
+                    r"explica|analiza|revisa|corrige|refactoriza|optimiza|mejora|"
+                    r"reescribe|comprueba|resume|muestra|dime|qu[eé]|c[oó]mo|"
+                    r"por qu[eé])\b",
+                    re.IGNORECASE,
+                )
+                if _INTENT_RE.search(prose_text):
+                    return False
+
+            # Reached here: there is residual text but no intent detected
+            # (e.g. a file path, a loose comment)
+            code_ratio = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l)) / len(
+                non_blank
+            )
+            return code_ratio > 0.07
+        # ── End fast path ────────────────────────────────────────────────
+
+        # Original logic (unchanged) for fenced blocks or smaller messages
         code_blocks, _ = await self._extract_code_blocks(content)
         if not code_blocks:
             return False
-
-        # Calculate text outside code blocks
         spans = await self._get_code_spans(content)
         if not spans:
-            # No tree-sitter spans: use regex to remove fenced blocks
             text_outside = re.sub(r"```[\s\S]*?```", "", content).strip()
         else:
             text_outside = self._remove_code_spans(content, spans).strip()
-
         return len(text_outside) < 30
 
     async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
@@ -10518,8 +10562,13 @@ class Filter:
                     "El código está disponible en el SymbolGraph para futuras consultas. "
                     "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
-                messages.pop()
+
+                # Replace the last user message with assistant response + "continue"
+                messages.pop()  # remove user code message
                 messages.append({"role": "assistant", "content": response})
+                messages.append(
+                    {"role": "user", "content": "continue"}
+                )  # satisfy chat template
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
