@@ -26,7 +26,7 @@ _EMBEDDER_INSTANCE = None
 _EMBEDDER_LOCK = threading.Lock()
 
 
-def get_embedder(model_name: str = "all-MiniLM-L6-v2"):
+def get_embedder(model_name: str = "intfloat/multilingual-e5-large"):
     """Return (or create) the SentenceTransformer singleton. Thread-safe."""
     global _EMBEDDER_INSTANCE
     if _EMBEDDER_INSTANCE is None:
