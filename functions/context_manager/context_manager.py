@@ -8528,10 +8528,7 @@ class Filter:
             # Build a single query that captures session type and user intent
             session_type = "code" if is_code_session else "general"
             intent_hint = ""
-            if (
-                hasattr(self, "_user_intent_full_code")
-                and self._user_intent_full_code is not None
-            ):
+            if hasattr(self, "_user_intent_full_code") and self._user_intent_full_code is not None:
                 intent_hint = (
                     "The user likely needs the full code."
                     if self._user_intent_full_code
@@ -8542,19 +8539,14 @@ class Filter:
             # One pair per CoT level – the CrossEncoder scores each instantly
             pairs = [
                 (query, "The user wants a simple, direct answer without reasoning."),
-                (
-                    query,
-                    "The user asks a moderately complex question that requires step-by-step thinking.",
-                ),
+                (query, "The user asks a moderately complex question that requires step-by-step thinking."),
                 (query, "The user asks a complex question that needs deep reasoning."),
-                (
-                    query,
-                    "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
-                ),
+                (query, "The user asks an extremely complex or open-ended question requiring exhaustive analysis."),
             ]
             scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
-            # scores is a list of 4 floats; the highest index wins
-            best_level = scores.index(max(scores))
+            # scores is a numpy array; use argmax to get the index of the highest score
+            import numpy as np
+            best_level = int(np.argmax(scores))
             if best_level == 0:
                 return 0
             elif best_level == 1:
