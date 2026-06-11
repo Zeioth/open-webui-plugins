@@ -2318,16 +2318,34 @@ class Filter:
         if not last_user or len(last_user.get("content", "")) < 20:
             result = False
         else:
-            model = self.valves.natural_language_forget_model or self.valves.llm_model
-            prompt = f"Is this message about programming or code? Answer only 'yes' or 'no'.\n\nMessage: {last_user.get('content','')[:300]}"
-            response = await self._try_llm_quick(
-                prompt=prompt,
-                system_prompt="You are a classifier. Answer only 'yes' or 'no'.",
-                model_override=model,
-                max_tokens=3,
-                temperature=0.0,
-            )
-            result = bool(response and response.strip().lower().startswith("yes"))
+            # Use CrossEncoder – no LLM fallback needed
+            if self._cross_encoder:
+                user_text = last_user.get("content", "")[:300]
+                pairs = [
+                    (
+                        user_text,
+                        "This message is about programming, code, or software development.",
+                    ),
+                    (user_text, "This message is not about programming or code."),
+                ]
+                scores = await anyio.to_thread.run_sync(
+                    self._cross_encoder.predict, pairs
+                )
+                result = scores[0] > scores[1]
+            else:
+                # Extremely unlikely – simple keyword fallback
+                result = any(
+                    kw in last_user.get("content", "").lower()
+                    for kw in (
+                        "code",
+                        "function",
+                        "def",
+                        "class",
+                        "error",
+                        "bug",
+                        "traceback",
+                    )
+                )
         if cache_key:
             self._session_classify_cache[cache_key] = (result, time.time())
             if len(self._session_classify_cache) >= 500:
@@ -2643,7 +2661,9 @@ class Filter:
         """Single run of the DB write loop. Exits on CancelledError."""
         while True:
             try:
-                job = await asyncio.wait_for(self._db_write_queue.get(), timeout=1.0)
+                job = await asyncio.wait_for(
+                    self._db_write_queue.get(), timeout=1.0
+                )  # poll interval
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -8033,29 +8053,28 @@ class Filter:
         if not history_text.strip():
             return None
 
-        prompt = (
-            f"Conversation history:\n{history_text[-2000:]}\n\n"
-            f"New user message:\n{last_user['content'][:500]}\n\n"
-            "Does the new message contradict any previously established fact or decision in the history? "
-            "Answer only 'yes' or 'no'."
-        )
-        model = self.valves.contradiction_detection_model or self.valves.llm_model
-        t0 = time.monotonic()
-        response = await self._try_llm_quick(
-            prompt=prompt,
-            system_prompt="You are a contradiction detector. Answer only 'yes' or 'no'.",
-            model_override=model,
-            max_tokens=3,
-            temperature=0.0,
-            label="contradiction",
-        )
-        dur = time.monotonic() - t0
-        self._log_timing("detect_contradictions_llm", dur, dur)
-        if response and response.strip().lower().startswith("yes"):
-            return (
-                "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
-                "Please review and clarify if needed."
-            )
+        # Use CrossEncoder – no LLM fallback
+        if self._cross_encoder:
+            new_msg = last_user["content"][:500]
+            hist = history_text[-2000:]
+            pairs = [
+                (
+                    f"History: {hist}\n\nNew message: {new_msg}",
+                    "The new message contradicts a previous statement or decision.",
+                ),
+                (
+                    f"History: {hist}\n\nNew message: {new_msg}",
+                    "The new message is consistent with the history.",
+                ),
+            ]
+            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            if scores[0] > scores[1]:
+                return (
+                    "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
+                    "Please review and clarify if needed."
+                )
+            return None
+        # If CrossEncoder not loaded, skip detection gracefully
         return None
 
     # --------------------------------------------------------------------------
@@ -9646,33 +9665,29 @@ class Filter:
 
     async def _should_keep_full_code(self, user_question: str) -> bool:
         """
-        Ask a lightweight LLM whether the full code should be kept in the user message.
-        Returns True if the model responds 'full', False otherwise.
+        Decide whether to keep the full code in context or provide only a summary.
+        Uses the CrossEncoder to avoid an LLM call.
+        Returns True if full code should be kept.
         """
         if not user_question.strip():
             return False
 
-        prompt = (
-            f"The user has provided a large block of code. Their question/message is:\n"
-            f'"{user_question[:500]}"\n\n'
-            "Should the full code be included in the final context, or is it sufficient "
-            "to provide only an analysis summary and relevant code fragments?\n"
-            'Answer with only one word: "full" or "summary".'
-        )
-
-        # Use the main model directly
-        model = (
-            self.valves.llm_model
-        )  # <-- antes era secondary_task_model or self.valves.llm_model
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="You are a concise classifier. Answer with only one word.",
-            model_override=model,
-            max_tokens=5,
-            temperature=0.0,
-            label="lean_context_check",
-        )
-        return response and response.strip().lower() == "full"
+        # Use CrossEncoder – no LLM fallback
+        if self._cross_encoder:
+            pairs = [
+                (
+                    user_question[:500],
+                    "The user wants the full code, complete implementation, or exact details.",
+                ),
+                (
+                    user_question[:500],
+                    "The user only needs a summary, brief explanation, or high-level overview.",
+                ),
+            ]
+            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            return scores[0] > scores[1]
+        # If CrossEncoder unavailable (should not happen), keep full code as safe default
+        return True
 
     async def _inlet_assemble_final_messages(
         self,
