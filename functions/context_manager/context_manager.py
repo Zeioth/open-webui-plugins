@@ -2446,7 +2446,25 @@ class Filter:
         pin = " [PINNED]" if block.pinned else ""
         raw = " [RAW]" if block.is_raw else ""
         show_full = full_body or block.is_raw or block.pinned
-        content = block.content if show_full else block.content[:600]
+
+        # ── Overflow protection ──────────────────────────────────────
+        _tok = block._cached_token_count or (len(block.content) // 4)
+        _is_oversized = (
+            self.valves.max_code_block_tokens > 0
+            and _tok > self.valves.max_code_block_tokens
+        )
+        if _is_oversized and self.valves.code_block_overflow_action == "warn":
+            content = self.valves.code_block_warn_message
+        elif (
+            _is_oversized
+            and self.valves.code_block_overflow_action == "summarize"
+            and block.block_summary
+        ):
+            content = f"[Summary of {_tok}-token block]\n{block.block_summary}"
+        else:
+            content = block.content if show_full else block.content[:600]
+        # ─────────────────────────────────────────────────────────────
+
         return (
             f"```\n{content}\n```{loc}{latest}  "
             f"(importance: {block.importance_score:.1f}, modified: {timestamp_str})"
@@ -7686,13 +7704,31 @@ class Filter:
 
                 else:
                     # LOD‑3: full code (with optional compression)
-                    # Compression is skipped during AutoContinue continuations
-                    # (slot_free=False): the query is the hint ("Módulo X"), which
-                    # would bias LLMLingua-2 to preserve only tokens relevant to
-                    # that module, destroying context the model needs to maintain
-                    # coherence with already-written interfaces.
                     content_to_inject = block.content
                     tok = block._cached_token_count or (len(block.content) // 4)
+
+                    # ── Overflow action at injection time ───────────────
+                    _is_oversized = (
+                        self.valves.max_code_block_tokens > 0
+                        and tok > self.valves.max_code_block_tokens
+                    )
+                    if (
+                        _is_oversized
+                        and self.valves.code_block_overflow_action == "warn"
+                    ):
+                        content_to_inject = self.valves.code_block_warn_message
+                        tok = self._estimate_code_tokens(content_to_inject)
+                    elif (
+                        _is_oversized
+                        and self.valves.code_block_overflow_action == "summarize"
+                        and block.block_summary
+                    ):
+                        content_to_inject = (
+                            f"[Summary of {tok}-token block]\n{block.block_summary}"
+                        )
+                        tok = self._estimate_code_tokens(content_to_inject)
+                    # ── End overflow ───────────────────────────────────
+
                     if (
                         slot_free
                         and self.valves.enable_code_compression
@@ -8484,51 +8520,52 @@ class Filter:
     async def _detect_cot_level_via_llm(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
-        t0 = time.monotonic()
-        prompt = (
-            f"The user is working on a {'code' if is_code_session else 'general'} task.\n"
-            f"User message:\n{user_content[:500]}\n\n"
-            "Decide the depth of Chain-of-Thought reasoning needed:\n"
-            "0 = none (simple fact, greeting, trivial)\n"
-            "1 = basic (ask to think step by step internally)\n"
-            "2 = moderate (generate reasoning automatically)\n"
-            "3 = deep (generate reasoning + self-critique)\n\n"
-        )
-        # Include user intent regarding code completeness
-        if (
-            hasattr(self, "_user_intent_full_code")
-            and self._user_intent_full_code is not None
-        ):
-            intent_note = (
-                "The user likely needs the full code."
-                if self._user_intent_full_code
-                else "The user likely needs only a summary of the code."
-            )
-            prompt += f"{intent_note}\n"
-        prompt += "Respond with only the digit 0, 1, 2, or 3."
+        """
+        Determine CoT depth using the CrossEncoder (instant CPU inference).
+        Falls back to heuristic if CrossEncoder is not available.
+        """
+        if self._cross_encoder:
+            # Build a single query that captures session type and user intent
+            session_type = "code" if is_code_session else "general"
+            intent_hint = ""
+            if (
+                hasattr(self, "_user_intent_full_code")
+                and self._user_intent_full_code is not None
+            ):
+                intent_hint = (
+                    "The user likely needs the full code."
+                    if self._user_intent_full_code
+                    else "The user likely needs only a summary of the code."
+                )
+            query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
 
-        try:
-            response = await self._try_llm_quick(
-                prompt=prompt,
-                system_prompt="You are a classifier. Output only a single digit.",
-                model_override=self.valves.cot_detection_model,
-                max_tokens=2,
-                temperature=0.0,
-                label="cot_detect",
-            )
-            if response and response.strip().isdigit():
-                level = int(response.strip())
-                if 0 <= level <= 3:
-                    dur = time.monotonic() - t0
-                    self._log_timing("cot_detection_llm", dur, dur)
-                    return level
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log_debug(f"LLM CoT detection failed, falling back to heuristic: {e}")
+            # One pair per CoT level – the CrossEncoder scores each instantly
+            pairs = [
+                (query, "The user wants a simple, direct answer without reasoning."),
+                (
+                    query,
+                    "The user asks a moderately complex question that requires step-by-step thinking.",
+                ),
+                (query, "The user asks a complex question that needs deep reasoning."),
+                (
+                    query,
+                    "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
+                ),
+            ]
+            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
+            # scores is a list of 4 floats; the highest index wins
+            best_level = scores.index(max(scores))
+            if best_level == 0:
+                return 0
+            elif best_level == 1:
+                return 1
+            elif best_level == 2:
+                return 2
+            else:
+                return 3
 
-        dur = time.monotonic() - t0
-        self._log_timing("cot_detection_llm_fallback", dur, dur)
+        # CrossEncoder not available – log and fall back to heuristic
+        self._log_debug("CoT detection via CrossEncoder unavailable, using heuristic.")
         return self._detect_cot_level_heuristic(user_content, is_code_session, state)
 
     async def _generate_cot_reasoning(
