@@ -6876,9 +6876,7 @@ class Filter:
             )
             return result
         # Fallback if softmax fails (should never happen)
-        self._log_debug(
-            "Intent: softmax failed, using default distribution."
-        )
+        self._log_debug("Intent: softmax failed, using default distribution.")
         return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
     async def _get_static_context_block(
@@ -8617,7 +8615,10 @@ class Filter:
         # Build a single query that captures session type and user intent
         session_type = "code" if is_code_session else "general"
         intent_hint = ""
-        if hasattr(self, "_user_intent_full_code") and self._user_intent_full_code is not None:
+        if (
+            hasattr(self, "_user_intent_full_code")
+            and self._user_intent_full_code is not None
+        ):
             intent_hint = (
                 "The user likely needs the full code."
                 if self._user_intent_full_code
@@ -8628,17 +8629,28 @@ class Filter:
         # One pair per CoT level – the CrossEncoder scores each instantly
         pairs = [
             (query, "The user wants a simple, direct answer without reasoning."),
-            (query, "The user asks a moderately complex question that requires step-by-step thinking."),
+            (
+                query,
+                "The user asks a moderately complex question that requires step-by-step thinking.",
+            ),
             (query, "The user asks a complex question that needs deep reasoning."),
-            (query, "The user asks an extremely complex or open-ended question requiring exhaustive analysis."),
+            (
+                query,
+                "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
+            ),
         ]
         scores = await self._predict_cross_encoder(pairs)
         if scores is None:
             # CrossEncoder not available – log and fall back to heuristic
-            self._log_debug("CoT detection via CrossEncoder unavailable, using heuristic.")
-            return self._detect_cot_level_heuristic(user_content, is_code_session, state)
+            self._log_debug(
+                "CoT detection via CrossEncoder unavailable, using heuristic."
+            )
+            return self._detect_cot_level_heuristic(
+                user_content, is_code_session, state
+            )
         # scores is a numpy array; use argmax to get the index of the highest score
         import numpy as np
+
         best_level = int(np.argmax(scores))
         if best_level == 0:
             return 0
@@ -9775,28 +9787,30 @@ class Filter:
     async def _should_keep_full_code(self, user_question: str) -> bool:
         """
         Decide whether to keep the full code in context or provide only a summary.
-        Uses the CrossEncoder to avoid an LLM call.
+        Uses the CrossEncoder for fast CPU inference.
         Returns True if full code should be kept.
         """
         if not user_question.strip():
             return False
 
-        # Use CrossEncoder – no LLM fallback
-        if self._cross_encoder:
-            pairs = [
-                (
-                    user_question[:500],
-                    "The user wants the full code, complete implementation, or exact details.",
-                ),
-                (
-                    user_question[:500],
-                    "The user only needs a summary, brief explanation, or high-level overview.",
-                ),
-            ]
-            scores = await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
-            return scores[0] > scores[1]
-        # If CrossEncoder unavailable (should not happen), keep full code as safe default
-        return True
+        pairs = [
+            (
+                user_question[:500],
+                "The user wants the full code, complete implementation, or exact details.",
+            ),
+            (
+                user_question[:500],
+                "The user only needs a summary, brief explanation, or high-level overview.",
+            ),
+        ]
+        scores = await self._predict_cross_encoder(pairs)
+        if scores is None:
+            # CrossEncoder not loaded – safe default: keep full code
+            self._log_debug(
+                "_should_keep_full_code: CrossEncoder not loaded, keeping full code by default."
+            )
+            return True
+        return scores[0] > scores[1]
 
     async def _inlet_assemble_final_messages(
         self,
