@@ -3164,6 +3164,8 @@ class Filter:
         if not row:
             return None
         data = json.loads(row[0])
+
+        # Ensure all expected keys exist with sensible defaults
         for key in [
             "feedback_history",
             "last_compression_timestamp",
@@ -3183,8 +3185,27 @@ class Filter:
                 ),
             )
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
+
+        # --- CORRUPTION DETECTION: active_blocks must be a dict -----------------
+        raw_active = data.get("active_blocks")
+        if raw_active is None:
+            self._log_debug(
+                "⚠️  CORRUPT STATE: 'active_blocks' is missing or null in DB. "
+                "This usually happens when the DB file was manually edited or interrupted during a write. "
+                "To fix, delete the database file: %s and restart."
+                % self.valves.state_db_path
+            )
+            raw_active = {}
+        elif not isinstance(raw_active, dict):
+            self._log_debug(
+                "⚠️  CORRUPT STATE: 'active_blocks' is not a dict (type=%s). "
+                "Resetting to empty. If problems persist, delete the DB file: %s"
+                % (type(raw_active).__name__, self.valves.state_db_path)
+            )
+            raw_active = {}
+
         active = {}
-        for k, v in data.get("active_blocks", {}).items():
+        for k, v in raw_active.items():
             try:
                 content_field = v.get("content", "")
                 if content_field.startswith("@@hash:"):
@@ -3208,7 +3229,9 @@ class Filter:
                     blk.last_mentioned_msg_idx = data.get("message_count", 0)
                 active[k] = blk
             except Exception:
-                self._log_debug(f"Skipping corrupted block {k} in state DB")
+                self._log_debug("Skipping corrupted block %s in state DB" % k)
+
+        # Restore other collections
         recent = []
         for b in data.get("recent_changes", []):
             try:
@@ -3220,6 +3243,7 @@ class Filter:
                 recent.append(CodeBlock(**b))
             except Exception:
                 pass
+
         committed = []
         for b in data.get("committed_changes", []):
             try:
@@ -3231,9 +3255,11 @@ class Filter:
                 committed.append(CodeBlock(**b))
             except Exception:
                 pass
+
         feedback = [
             AppliedChangeFeedback(**fb) for fb in data.get("feedback_history", [])
         ]
+
         state = {
             "active_blocks": active,
             "recent_changes": recent,
@@ -3250,6 +3276,8 @@ class Filter:
             "pending_secondary_tasks": data.get("pending_secondary_tasks", []),
             "last_cot_level": data.get("last_cot_level", 0),
         }
+
+        # Recalculate cached token counts
         for blk in (
             list(state["active_blocks"].values())
             + state["recent_changes"]
@@ -3259,6 +3287,7 @@ class Filter:
                 blk._cached_token_count = len(self.tokenizer.encode(blk.content))
             else:
                 blk._cached_token_count = len(blk.content) // 4
+
         return state
 
     # ── v7 (PASO-13): CodePathView persistence ─────────────────────
@@ -3741,9 +3770,7 @@ class Filter:
                 async with self._active_llm_tasks_lock:
                     self._active_llm_tasks.discard(task)
 
-            logger.warning(
-                f"[LLM] {model}{label_str} failed: {prompt[:100]}..."
-            )
+            logger.warning(f"[LLM] {model}{label_str} failed: {prompt[:100]}...")
             future.set_result(None)
             self._log_debug(
                 f"[LLM] {model}{label_str} (failed) after {time.monotonic() - t_start:.3f}s"
@@ -4872,7 +4899,9 @@ class Filter:
                 block.last_mentioned_msg_idx = state["message_count"]
                 block._update_importance()
 
-    async def _update_active_code(self, message: dict, project_id: str):
+    async def _update_active_code(
+        self, message: dict, project_id: str, is_continuation: bool = False
+    ):
         if not self.valves.enable_code_awareness:
             return
 
@@ -5022,7 +5051,6 @@ class Filter:
                         for s in existing.symbols:
                             s.parent_block_hash = existing.hash
                             self._symbol_index.add(s, existing.hash, project_id)
-                            # ── v7 (PASO-09): register typed edges ──
                             for callee_name in s.calls:
                                 edge = Edge(
                                     src=s.name,
@@ -5032,7 +5060,6 @@ class Filter:
                                     confidence=1.0,
                                 )
                                 self._symbol_index.add_edge(edge, project_id)
-                            # ── v7 (PASO-19): register data flow edges ──
                             if (
                                 self.valves.enable_data_flow_analysis
                                 and existing.file_path
@@ -5092,7 +5119,6 @@ class Filter:
                         for s in existing.symbols:
                             s.parent_block_hash = existing.hash
                             self._symbol_index.add(s, existing.hash, project_id)
-                            # ── v7 (PASO-09): register typed edges ──
                             for callee_name in s.calls:
                                 edge = Edge(
                                     src=s.name,
@@ -5102,7 +5128,6 @@ class Filter:
                                     confidence=1.0,
                                 )
                                 self._symbol_index.add_edge(edge, project_id)
-                            # ── v7 (PASO-19): register data flow edges ──
                             if (
                                 self.valves.enable_data_flow_analysis
                                 and existing.file_path
@@ -5135,14 +5160,12 @@ class Filter:
                             )
                     continue
 
-                # New non‑duplicate block
                 for sym in syms:
                     sym.parent_block_hash = new_block.hash
                 new_block.symbols = syms
                 new_block.last_mentioned_msg_idx = state["message_count"]
                 for sym in syms:
                     self._symbol_index.add(sym, new_block.hash, project_id)
-                    # ── v7 (PASO-09): register typed edges from call relationships ──
                     for callee_name in sym.calls:
                         edge = Edge(
                             src=sym.name,
@@ -5152,7 +5175,6 @@ class Filter:
                             confidence=1.0,
                         )
                         self._symbol_index.add_edge(edge, project_id)
-                    # ── v7 (PASO-19): register data flow edges ──
                     if self.valves.enable_data_flow_analysis and new_block.file_path:
                         df_edges = self._extract_data_flow_edges(
                             new_block.content,
@@ -5234,7 +5256,6 @@ class Filter:
                     keep = sorted_blocks[: self.valves.max_active_blocks]
                     state["active_blocks"] = {b.hash: b for b in keep}
 
-            # Assistant implicit modifications
             if role == "assistant" and len(extracted) > 0:
                 for block_info in extracted:
                     best_base = None
@@ -5275,7 +5296,6 @@ class Filter:
                         for s in best_base.symbols:
                             s.parent_block_hash = best_base.hash
                             self._symbol_index.add(s, best_base.hash, project_id)
-                            # ── v7 (PASO-09): register typed edges ──
                             for callee_name in s.calls:
                                 edge = Edge(
                                     src=s.name,
@@ -5285,7 +5305,6 @@ class Filter:
                                     confidence=1.0,
                                 )
                                 self._symbol_index.add_edge(edge, project_id)
-                            # ── v7 (PASO-19): register data flow edges ──
                             if (
                                 self.valves.enable_data_flow_analysis
                                 and best_base.file_path
@@ -5318,14 +5337,14 @@ class Filter:
                                 is_llm_task=True,
                             )
 
-            state["message_count"] += 1
+            if not is_continuation:
+                state["message_count"] += 1
             if self.valves.auto_remove_duplicate_blocks:
                 self._remove_duplicate_blocks(state, project_id)
             self._background_task(
                 self._expire_blocks_by_time(project_id), name="expire_blocks"
             )
 
-            # ── Enrichment tasks (run immediately with limited concurrency) ──
             tasks_to_run = []
             max_tasks_per_type = 5
 
@@ -5371,7 +5390,6 @@ class Filter:
                 async with sem_enrich:
                     await asyncio.gather(*[_run_one(t, p) for t, p in tasks_to_run])
 
-            # ── Eviction by max_active_blocks ──
             if (
                 self.valves.max_active_blocks > 0
                 and len(state["active_blocks"]) > self.valves.max_active_blocks
@@ -5394,8 +5412,7 @@ class Filter:
                         f"Their symbols remain in the index for lightweight context."
                     )
 
-            # Session summary
-            if self.valves.enable_session_summary:
+            if self.valves.enable_session_summary and not is_continuation:
                 interval = self.valves.session_summary_interval_messages
                 if (
                     interval > 0
@@ -5416,7 +5433,6 @@ class Filter:
 
             self._invalidate_lightweight_cache(project_id)
 
-            # ── v7 (PASO-09): invalidate affected CodePathViews ──────────
             if self.valves.enable_path_analysis:
                 changed_symbols: Set[str] = set()
                 for blk in new_blocks_pending:
@@ -7055,21 +7071,8 @@ class Filter:
         self,
         project_id: str,
         is_code_session: bool,
+        is_continuation: bool = False,
     ) -> str:
-        """
-        Build or retrieve from cache the static block of the system prompt.
-
-        This block is IDENTICAL across consecutive requests as long as the
-        code has not changed. It serves as the KV cache anchor for llama.cpp.
-
-        Contents:
-        1. Base behavioural instructions (always the same)
-        2. Symbol index / lightweight context (stable until code changes)
-        3. Feedback context (stable until new feedback arrives)
-
-        Invalidation: regenerated when _compute_code_state_hash() returns a
-        different hash.
-        """
         current_code_hash = self._compute_code_state_hash(project_id)
         cached = self._static_context_block_cache.get(project_id)
 
@@ -7077,8 +7080,18 @@ class Filter:
             cached_hash, cached_text = cached
             if cached_hash == current_code_hash:
                 return cached_text  # ✓ Hit: same code → same block
+            # ── Continuation: freeze Block A to prevent KV cache misses ──────
+            # New symbols indexed by the outlet after each part would change the
+            # hash every turn, forcing a full prefill on every continuation
+            # request. Keep the block stable until the user sends a new manual
+            # message (slot_free=True), at which point it rebuilds naturally.
+            if is_continuation:
+                self._log_debug(
+                    "🧱 Block A: frozen for AutoContinue (KV cache stability)"
+                )
+                return cached_text
 
-        # ── Build the static block ──────────────────────────────────
+        # ── Build the static block ──────────────────────────────────────
         parts: List[str] = []
 
         # 1. Base instructions (completely static)
@@ -7117,7 +7130,7 @@ class Filter:
 
         static_block = "\n\n".join(p for p in parts if p.strip())
 
-        # ── Cache and track ─────────────────────────────────────────
+        # ── Cache and track ─────────────────────────────────────────────
         self._static_context_block_cache[project_id] = (current_code_hash, static_block)
 
         # Detect and log prefix changes (= cache miss in llama.cpp)
@@ -7155,38 +7168,8 @@ class Filter:
         available_tokens: int,
         user_query: str,
         cot_degraded_to_l1: bool = False,
+        is_continuation: bool = False,
     ) -> str:
-        """
-        Build system instructions for structured multi-phase responses.
-
-        Called only in normal multi-phase mode:
-            multi_phase_response_budget_warn <= available_tokens
-                                              < multi_phase_response_threshold
-
-        Critical mode (available_tokens < budget_warn) is handled separately
-        by _append_critical_wrap_up_hint, which appends to the user message
-        so it does not consume response tokens.
-
-        NOTE: available_tokens must already be discounted for the overhead of
-        these instructions themselves (see _INSTRUCTION_OVERHEAD in the caller).
-        This ensures the token count reported here is what the model actually has.
-
-        Protocol (code tasks):
-            Fase 1  Análisis        understand, dependencies, what changes
-            Fase 2  Arquitectura    design decisions (optional)
-            Fase 3  Contrato        all class/method signatures, no bodies
-            Fase 4  Plan            numbered blocks + estimated token sizes
-            Fase 5+ Código K/M      code, always ends at natural boundaries
-            Fase F  Verificación    completeness checklist
-
-        Args:
-            available_tokens:    Accurate response budget after instruction
-                                 overhead has already been subtracted.
-            user_query:          Current user message (detects code tasks).
-            cot_degraded_to_l1:  True when the pre-check forced CoT from
-                                 L2/L3 down to L1. Fase 1 absorbs the
-                                 step-by-step reasoning in that case.
-        """
         _CODE_SIGNALS = {
             "refactor",
             "refactoriza",
@@ -7213,9 +7196,15 @@ class Filter:
         }
         is_code_task = any(sig in user_query.lower() for sig in _CODE_SIGNALS)
 
-        # Per-part budget: leave ~200 tokens for markers and overhead.
-        # min 500 so the value scales correctly when available_tokens is small.
-        part_budget = max(500, available_tokens - 200)
+        # Per-part budget: capped to the server's actual max_tokens limit so the
+        # model always splits regardless of how much context space is available.
+        # Without this cap, a focused LOD context (few tokens used) would report
+        # a huge available_tokens and the model would generate everything in one
+        # shot, truncating abruptly instead of emitting the ▶ CONTINÚA: marker.
+        part_budget = min(
+            self.valves.multi_phase_effective_max_tokens,
+            max(500, available_tokens - 200),
+        )
 
         fase1_suffix = (
             " *(razona paso a paso aquí — análisis de dependencias incluido)*"
@@ -7223,42 +7212,67 @@ class Filter:
             else ""
         )
 
+        # ── Continuation variant: Fases 1-4 already done, skip them ──────────
+        # The model has already produced analysis, architecture, contract and plan
+        # in the first response. Re-injecting those phases on every continuation
+        # turn causes the model to rehash analysis instead of writing code.
+        if is_continuation and is_code_task:
+            header = (
+                f"## 📋 CONTINUACIÓN MULTI-FASE — {part_budget} tokens por parte\n\n"
+                "Fases 1-4 completadas. Continúa con el siguiente bloque del Plan."
+            )
+            phases = textwrap.dedent(f"""
+                    **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
+                    Escribe el siguiente bloque del plan. REGLAS CRÍTICAS:
+                      · Encabeza la parte: `## Código — Parte K/M: [nombre del bloque]`
+                      · NUNCA cortes dentro de una función, clase o método.
+                      · Antes de alcanzar el límite, cierra el bloque actual limpiamente
+                        y escribe el marcador obligatorio:
+                        `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
+                        `# Pendiente: [lista de lo que falta]`
+                      · Una clase puede partirse entre partes; un método, nunca.
+    
+                    **FASE FINAL — Verificación** (~150 tokens)
+                    Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
+                """).strip()
+            return f"{header}\n\n{phases}"
+
         if is_code_task:
             header = (
-                f"## 📋 PROTOCOLO MULTI-FASE — {available_tokens} tokens disponibles\n\n"
+                f"## 📋 PROTOCOLO MULTI-FASE — {part_budget} tokens por parte\n\n"
                 "Tu tarea genera más código del que cabe en un mensaje. "
                 "Sigue **exactamente** este protocolo:"
             )
             phases = textwrap.dedent(f"""
-                **FASE 1 — Análisis{fase1_suffix}** (~300-400 tokens)
-                Qué existe, qué cambia, dependencias críticas. Sin código todavía.
-
-                **FASE 2 — Arquitectura** (~400-600 tokens) *(solo si el diseño es complejo)*
-                Decisiones de estructura: clases, inyección de dependencias, patrones.
-                Omite esta fase si el Plan la cubre suficientemente.
-
-                **FASE 3 — Contrato** (~300-500 tokens)
-                Firmas completas de todas las clases y métodos públicos, sin cuerpo.
-                Compromiso firme: no cambies estas firmas en fases posteriores.
-
-                **FASE 4 — Plan de Acción** (~300-400 tokens)
-                Lista numerada: bloque | tokens estimados | dependencias previas.
-                Última línea obligatoria:
-                "Total: ~X tokens → N partes de ≤ {part_budget} tokens c/u"
-
-                **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
-                Escribe los bloques del plan en orden. REGLAS CRÍTICAS:
-                  · Encabeza cada parte: `## Código — Parte K/M: [nombre del bloque]`
-                  · NUNCA cortes dentro de una función, clase o método.
-                  · Antes de alcanzar el límite, cierra el bloque actual limpiamente
-                    y escribe el marcador obligatorio:
-                    `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
-                    `# Pendiente: [lista de lo que falta]`
-                  · Una clase puede partirse entre partes; un método, nunca.
-
-                **FASE FINAL — Verificación** (~150 tokens)
-                Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
-            """).strip()
+                    **FASE 1 — Análisis{fase1_suffix}** (~300-400 tokens)
+                    Qué existe, qué cambia, dependencias críticas. Sin código todavía.
+    
+                    **FASE 2 — Arquitectura** (~400-600 tokens) *(solo si el diseño es complejo)*
+                    Decisiones de estructura: clases, inyección de dependencias, patrones.
+                    Omite esta fase si el Plan la cubre suficientemente.
+    
+                    **FASE 3 — Contrato** (~300-500 tokens)
+                    Firmas completas de todas las clases y métodos públicos, sin cuerpo.
+                    Compromiso firme: no cambies estas firmas en fases posteriores.
+    
+                    **FASE 4 — Plan de Acción** (~300-400 tokens)
+                    Lista numerada: bloque | tokens estimados | dependencias previas.
+                    Última línea obligatoria:
+                    "Total: ~X tokens → N partes de ≤ {part_budget} tokens c/u"
+    
+                    **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
+                    Escribe los bloques del plan en orden. REGLAS CRÍTICAS:
+                      · Encabeza cada parte: `## Código — Parte K/M: [nombre del bloque]`
+                      · NUNCA cortes dentro de una función, clase o método.
+                      · Antes de alcanzar el límite, cierra el bloque actual limpiamente
+                        y escribe el marcador obligatorio:
+                        `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
+                        `# Pendiente: [lista de lo que falta]`
+                      · Una clase puede partirse entre partes; un método, nunca.
+    
+                    **FASE FINAL — Verificación** (~150 tokens)
+                    Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
+                """).strip()
 
         else:
             cot_note = (
@@ -7270,16 +7284,16 @@ class Filter:
                 "Divídela en partes lógicas:"
             )
             phases = textwrap.dedent(f"""
-                **Parte 1 — Resumen y plan** (~300 tokens)
-                Enumera los puntos que vas a desarrollar.{cot_note}
-
-                **Partes 2...N — Desarrollo** (≤ {part_budget} tokens por parte)
-                Al final de cada parte que no sea la última escribe:
-                `▶ CONTINÚA — [título de lo que sigue]`
-
-                **Parte Final — Conclusión** (~150 tokens)
-                Verifica que cubriste todos los puntos del plan.
-            """).strip()
+                    **Parte 1 — Resumen y plan** (~300 tokens)
+                    Enumera los puntos que vas a desarrollar.{cot_note}
+    
+                    **Partes 2...N — Desarrollo** (≤ {part_budget} tokens por parte)
+                    Al final de cada parte que no sea la última escribe:
+                    `▶ CONTINÚA — [título de lo que sigue]`
+    
+                    **Parte Final — Conclusión** (~150 tokens)
+                    Verifica que cubriste todos los puntos del plan.
+                """).strip()
 
         return f"{header}\n\n{phases}"
 
@@ -7292,35 +7306,18 @@ class Filter:
     def _verify_code_symbols_indexed(
         self, content: str, project_id: str
     ) -> Tuple[bool, float]:
-        """
-        Check that top-level symbols (class/function definitions at column 0)
-        from a code-containing message are present in the SymbolGraph.
-
-        Uses a simple regex instead of full tree-sitter reparse to avoid overhead.
-        Top-level class names are the primary structural indicator; if they are
-        indexed, the whole module was successfully parsed.
-
-        Returns (safe_to_compress, indexed_ratio).
-        safe_to_compress = True when ratio >= code_history_symbol_index_threshold
-        or when no top-level symbols are found (pure prose response).
-        """
         _TOP_LEVEL = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
         expected = set(_TOP_LEVEL.findall(content))
         if not expected:
-            # No class definitions → prose or function-only file
-            # Fall back to top-level functions
             _TOP_FN = re.compile(
                 r"^(?:async )?def\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
             )
             expected = set(_TOP_FN.findall(content))
         if not expected:
-            return True, 1.0  # Nothing to verify → safe
+            return True, 1.0
 
         try:
-            graph_symbols = {
-                node.name
-                for node in (self._symbol_graph.get_all_nodes(project_id) or [])
-            }
+            graph_symbols = self._symbol_index.get_all_names(project_id)
             ratio = len(expected & graph_symbols) / len(expected)
             return ratio >= self.valves.code_history_symbol_index_threshold, ratio
         except Exception as exc:
@@ -7485,32 +7482,9 @@ class Filter:
         messages: List[dict],
         project_id: str,
     ) -> List[dict]:
-        """
-        Replace large code blocks in user messages with SymbolGraph references,
-        once it is safe to do so.
-
-        Trigger condition (both must be true):
-          1. An assistant message contains "## Código — Parte 1/" — meaning phases
-             1-4 are complete and the model has extracted what it needs from the
-             original code.
-          2. The SymbolGraph has at least 20 symbols for this project — confirming
-             the code was successfully indexed.
-
-        Safety rules:
-          - Only blocks >= lean_user_code_min_tokens are replaced.
-          - Already-leaned blocks are skipped.
-          - The instruction text (non-code parts) is ALWAYS preserved.
-          - The replacement includes the token count and symbol count so the model
-            knows what was there.
-
-        Rationale: once code generation starts, the model has already analysed the
-        original code in phases 1-3. It no longer needs the raw text — the LOD
-        system can recover any specific implementation on demand. Lean is safe.
-        """
         if not self.valves.enable_lean_user_code:
             return messages
 
-        # Check trigger: first code part must have started
         trigger_fired = any(
             "## Código — Parte 1/" in msg.get("content", "")
             for msg in messages
@@ -7519,11 +7493,8 @@ class Filter:
         if not trigger_fired:
             return messages
 
-        # Verify symbol graph has meaningful content
         try:
-            symbol_count = sum(
-                1 for _ in (self._symbol_graph.get_all_nodes(project_id) or [])
-            )
+            symbol_count = len(self._symbol_index.get_all_names(project_id))
         except Exception:
             symbol_count = 0
 
@@ -7548,7 +7519,6 @@ class Filter:
             if _ALREADY_LEAN in content:
                 continue
 
-            # Only target messages with substantial code
             total_code_tokens = sum(
                 self._estimate_tokens(m.group("body"))
                 for m in _CODE_BLOCK.finditer(content)
@@ -7849,22 +7819,9 @@ class Filter:
         project_id: str,
         user_query: str,
         intent_vector: Dict[str, float],
-        messages: Optional[List[dict]] = None,  # ← PASO-27
+        messages: Optional[List[dict]] = None,
+        slot_free: bool = True,
     ) -> str:
-        """
-        Build code context using the graph‑activation system.
-
-        Flow:
-        1. Build an ActivationGraph from the query.
-        2. Extract the activated subgraph.
-        3. Assign each node a LOD level (0‑3) based on activation score
-           and the intent vector.
-        4. Inject:
-           LOD‑3 (high): full code → placed last (Lost in the Middle)
-           LOD‑2 (medium): signature + summary
-           LOD‑1 (low): signature only
-           LOD‑0 (minimal): name only → placed first (background)
-        """
         if not self.valves.enable_path_analysis:
             return self._get_active_code_context(project_id, user_query)
 
@@ -7908,7 +7865,7 @@ class Filter:
         total_tokens = 0
         budget = self.valves.active_context_max_tokens or 32000
 
-        # ─── NUEVO: auto_budget_context_for_parts ──────────────────────────
+        # ─── auto_budget_context_for_parts ────────────────────────────────────
         if (
             self.valves.auto_budget_context_for_parts
             and (
@@ -7917,8 +7874,7 @@ class Filter:
             )
             and self.valves.context_window_tokens > 0
         ):
-            # Reserva espacio para la respuesta + overhead del sistema
-            _SYSTEM_OVERHEAD = 2000  # margen conservador para system prompt + markers
+            _SYSTEM_OVERHEAD = 2000
             _available_for_context = (
                 self.valves.context_window_tokens
                 - self.valves.multi_phase_effective_max_tokens
@@ -7929,7 +7885,7 @@ class Filter:
                 f"auto_budget_context: capped active context to {budget} tokens "
                 f"(reserving {self.valves.multi_phase_effective_max_tokens} for response)"
             )
-        # ─── Fin del bloque nuevo ──────────────────────────────────────────
+        # ─── Fin del bloque ────────────────────────────────────────────────────
 
         injected_blocks: Set[str] = set()
 
@@ -7949,18 +7905,17 @@ class Filter:
                 else:
                     effective = score
                 adjusted.append((node_id, effective))
-            sorted_nodes = adjusted  # use effective score for LOD decisions
+            sorted_nodes = adjusted
 
-        lod0_parts: List[str] = []  # name only
-        lod1_parts: List[str] = []  # signature only
-        lod2_parts: List[str] = []  # signature + summary
-        lod3_parts: List[str] = []  # full code
+        lod0_parts: List[str] = []
+        lod1_parts: List[str] = []
+        lod2_parts: List[str] = []
+        lod3_parts: List[str] = []
 
         for node_id, score in sorted_nodes:
             if total_tokens >= budget:
                 break
 
-            # LOD‑0: score < lod1 → just the name
             if score < lod1:
                 lod0_parts.append(f"`{node_id}`")
                 total_tokens += 2
@@ -8013,10 +7968,16 @@ class Filter:
 
                 else:
                     # LOD‑3: full code (with optional compression)
+                    # Compression is skipped during AutoContinue continuations
+                    # (slot_free=False): the query is the hint ("Módulo X"), which
+                    # would bias LLMLingua-2 to preserve only tokens relevant to
+                    # that module, destroying context the model needs to maintain
+                    # coherence with already-written interfaces.
                     content_to_inject = block.content
                     tok = block._cached_token_count or (len(block.content) // 4)
                     if (
-                        self.valves.enable_code_compression
+                        slot_free
+                        and self.valves.enable_code_compression
                         and self._llmlingua_compressor
                         and tok > self.valves.code_compression_min_tokens
                     ):
@@ -8028,7 +7989,7 @@ class Filter:
                                 else "unknown"
                             ),
                             rate=self.valves.code_compression_rate,
-                            query=user_query,  # ← Phase 6 (PASO-31)
+                            query=user_query,
                         )
                         tok = self._estimate_code_tokens(content_to_inject)
                     if total_tokens + tok > budget:
@@ -8041,7 +8002,7 @@ class Filter:
                     total_tokens += tok
                     injected_blocks.add(bh)
 
-                break  # use the first non‑obsolete block per symbol
+                break
 
         # Assemble respecting Lost in the Middle:
         # LOD‑0 + LOD‑1 (background), LOD‑2 (medium), LOD‑3 (most relevant, last)
@@ -8061,7 +8022,7 @@ class Filter:
             parts.append("\n### Directly relevant code (high activation)\n")
             parts.extend(lod3_parts)
 
-        if len(parts) == 1:  # only header, no content
+        if len(parts) == 1:
             return ""
 
         summary_line = (
@@ -8347,6 +8308,7 @@ class Filter:
         project_id: str,
         state: dict,
         skip_contradiction: bool = False,
+        skip_cache: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
         tasks = [
             (
@@ -8359,7 +8321,11 @@ class Filter:
             ),
             (
                 self._find_cached_response(query, context_hash, state)
-                if (self.valves.enable_response_cache and HAS_SENTENCE)
+                if (
+                    self.valves.enable_response_cache
+                    and HAS_SENTENCE
+                    and not skip_cache
+                )
                 else self._noop()
             ),
             (
@@ -9831,15 +9797,15 @@ class Filter:
         messages: List[dict],
         project_id: str,
         user_query: str,
+        is_continuation: bool = False,
     ) -> Tuple[bool, str]:
-        """Classify session, update active code, clean user question.
-        Returns (is_code_session, user_question).
-        """
         is_code_session = await self._classify_session(messages, project_id)
 
         if self.valves.enable_code_awareness and is_code_session:
             last_idx = len(messages) - 1
-            await self._update_active_code(messages[last_idx], project_id)
+            await self._update_active_code(
+                messages[last_idx], project_id, is_continuation=is_continuation
+            )
             extracted_blocks, block_spans = await self._extract_code_blocks(user_query)
             if block_spans:
                 user_question = self._remove_code_spans(user_query, block_spans).strip()
@@ -9850,6 +9816,16 @@ class Filter:
             self._last_processed_message_idx[project_id] = last_idx
         else:
             user_question = user_query
+
+        # ── Ensure active_blocks is never None after loading ──
+        state = self._get_state(project_id)
+        if not isinstance(state.get("active_blocks"), dict):
+            self._log_debug(
+                "CRITICAL: active_blocks corrupted even after load; resetting to empty. "
+                "Delete %s if this recurs." % self.valves.state_db_path
+            )
+            state["active_blocks"] = {}
+            self._set_state(project_id, state)
 
         return is_code_session, user_question
 
@@ -9876,7 +9852,9 @@ class Filter:
         # BLOCK A — STATIC
         # ══════════════════════════════════════════════════════════════
         self._log_debug("🧱 Block A (static): building / retrieving from cache")
-        static_block = await self._get_static_context_block(project_id, is_code_session)
+        static_block = await self._get_static_context_block(
+            project_id, is_code_session, is_continuation=not slot_free
+        )
 
         # ══════════════════════════════════════════════════════════════
         # BLOCK B — DYNAMIC (per-query)
@@ -9893,8 +9871,12 @@ class Filter:
             and HAS_CHROMA
             and user_query
         ):
+            # Use user_question for retrieval: during AutoContinue it contains
+            # the specific block name (hint), which retrieves relevant memories.
+            # user_query contains the generic continuation prompt + " código".
+            _ltm_query = user_question if user_question else user_query
             all_meta = await self._retrieve_all_memories_unified(
-                user_query, project_id, slot_free=slot_free
+                _ltm_query, project_id, slot_free=slot_free
             )
             all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
             unique_meta = []
@@ -9939,7 +9921,6 @@ class Filter:
         duplicate_match = None
 
         if last_user_msg:
-            # --- Fix 1: pasar skip_contradiction=not slot_free ---
             contradiction_warning, cached_response, duplicate_match = (
                 await self._parallel_context_checks(
                     messages,
@@ -9948,6 +9929,7 @@ class Filter:
                     project_id,
                     state,
                     skip_contradiction=not slot_free,
+                    skip_cache=not slot_free,
                 )
             )
 
@@ -9971,7 +9953,11 @@ class Filter:
             if self.valves.enable_path_analysis:
                 intent_vector = await self._classify_intent(user_query, project_id)
                 active_ctx = await self._get_path_context(
-                    project_id, user_query, intent_vector, messages=messages
+                    project_id,
+                    user_query,
+                    intent_vector,
+                    messages=messages,
+                    slot_free=slot_free,
                 )
                 if not active_ctx:
                     active_ctx = self._get_active_code_context(project_id, user_query)
@@ -10091,8 +10077,8 @@ class Filter:
         self,
         messages: List[dict],
         project_id: str,
-        static_block: str,  # ← v7 (PASO-21)
-        dynamic_injections: List[Tuple[str, str]],  # ← v7 (PASO-21)
+        static_block: str,
+        dynamic_injections: List[Tuple[str, str]],
         prelim_system: str,
         last_user_msg: Optional[dict],
         is_code_session: bool,
@@ -10109,17 +10095,6 @@ class Filter:
         )
 
         # ── Multi-phase: one-time baseline computation ─────────────────────
-        # Reused by all three insertion points (0, A, B) to avoid triple
-        # tokenization of prelim_system.
-        #
-        # _dyn_injections_base_count: index into dynamic_injections at entry.
-        # Items added AFTER this index (CoT reasoning, CoT note, etc.) are
-        # counted in INSERT B via a list slice — no per-item tracking needed,
-        # CoT note is captured automatically.
-        #
-        # _mp_available: Optional sentinel, set by INSERT B.
-        # Stays None if multi-phase is disabled or prelim_system is empty.
-        # Used by the TOKEN BREAKDOWN log at the end of this function.
         _dyn_injections_base_count: int = len(dynamic_injections)
         _mp_available: Optional[int] = None
 
@@ -10145,14 +10120,9 @@ class Filter:
         else:
             _prelim_tok_mp = 0
             _hist_tok_mp = 0
-            _available_mp_pre = (
-                self.valves.context_window_tokens
-            )  # large → no activation
+            _available_mp_pre = self.valves.context_window_tokens
         # ── End preamble ──────────────────────────────────────────────────
 
-        # Determine user intent for context reduction.
-        # Skip the LLM call when context is already tight: multi-phase activates
-        # regardless, and full code is always preserved in that mode.
         _skip_intent_llm: bool = (
             self.valves.enable_multi_phase_response
             and _available_mp_pre < self.valves.multi_phase_response_threshold
@@ -10193,8 +10163,6 @@ class Filter:
                             cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
                             dynamic_injections.append(("high", cot_prompt))
                 elif not manual_cot_used and slot_free:
-                    # Use user_question (text without code blocks) to avoid false
-                    # positives from architecture/refactor keywords in pasted code.
                     cot_detection_content = (
                         user_question
                         if user_question and len(user_question) >= 10
@@ -10216,18 +10184,6 @@ class Filter:
             )
 
         # ── Multi-phase pre-check: degrade CoT if context is tight ────────
-        # Decision: should we lower CoT from L2/L3 to L1 to preserve response
-        # tokens for the multi-phase protocol?
-        #
-        # Conditions:
-        #   · multi-phase enabled AND context already tight (pre-CoT estimate)
-        #   · CoT was going to run at L2 or L3 (would consume ~1500-3000 tokens)
-        #   · slot_free=True: CoT will actually execute. If False, CoT gets
-        #     disabled entirely later — flagging degradation would be misleading.
-        #
-        # Effect: cot_level → 1. At L1 auto-CoT, no reasoning is generated
-        # (the existing code has no L1 auto handler). Fase 1 of the multi-phase
-        # protocol absorbs the analysis/reasoning role instead.
         _mp_cot_degraded: bool = False
         if (
             self.valves.enable_multi_phase_response
@@ -10246,12 +10202,10 @@ class Filter:
             _mp_cot_degraded = True
         # ── End multi-phase pre-check ──────────────────────────────────────
 
-        # Wait for background tasks before heavy LLM calls
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
             background_tasks.clear()
 
-        # If the main model is loaded, disable CoT entirely
         if cot_any_used and not slot_free:
             self._log_debug(
                 "🧠 ENRICHMENT – CoT skipped because main model is still loaded (no free slot)"
@@ -10272,11 +10226,6 @@ class Filter:
                     f"{self.valves.cot_model_level2 if cot_level == 2 else self.valves.cot_model_level3}"
                 )
 
-            # TODO: Bear in mind here we pass the entire active context
-            #       which can be big enough to overflow 3-9b models.
-            #       This should be auto fixed once we implement
-            #       more advanced techniques of context compression.
-            #       This applies to CoT level 2 and 3.
             _model_ctx = self.valves.active_context_max_tokens or 28000
             _cot_context_limit = _model_ctx // 3
             if self.tokenizer:
@@ -10290,7 +10239,6 @@ class Filter:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-            # ── v7 Scientific CoT (Phase 5/6) ──
             if not manual_cot_used:
                 question = user_question
                 if cot_level == 2:
@@ -10298,11 +10246,10 @@ class Filter:
                         question, prelim_for_cot
                     )
                 elif cot_level == 3:
-                    # Scientific reasoning with structural validation
                     reasoning = await self._generate_scientific_reasoning_L3(
                         question,
                         prelim_for_cot,
-                        project_id,  # needed for evidence gathering
+                        project_id,
                         label="scientific_cot",
                     )
             else:
@@ -10318,7 +10265,6 @@ class Filter:
                         label="scientific_cot",
                     )
 
-            # Fallback: if auto level 3 failed, try level 2 once
             _cot_error_msg = "Unable to generate reasoning."
             if (
                 not manual_cot_used
@@ -10360,23 +10306,6 @@ class Filter:
             self._log_debug("🧠 ENRICHMENT – CoT Step 3/3: No reasoning to inject")
 
         # ── Multi-phase final injection ────────────────────────────────────
-        # Runs AFTER CoT reasoning has been added to dynamic_injections.
-        #
-        # Token calculation:
-        #   prelim_system  → already includes static block, all Step-B5 injections,
-        #                    and base_content. Single source of truth for committed
-        #                    tokens at the start of _inlet_assemble_final_messages.
-        #   post_prelim    → items added to dynamic_injections AFTER the preamble
-        #                    baseline (CoT reasoning + CoT note + any future items).
-        #                    Counted via list slice: no constants needed, CoT note
-        #                    is captured automatically.
-        #   history        → reused from preamble (no retokenization).
-        #
-        # _INSTRUCTION_OVERHEAD:
-        #   The multi-phase instruction text itself (~400 tokens actual, 450 budgeted
-        #   conservatively). Subtracted before reporting available_tokens to the model
-        #   so the number we tell it matches what it actually has after the instructions
-        #   are committed to the context.
         if self.valves.enable_multi_phase_response and self.tokenizer and prelim_system:
             _post_prelim_items = dynamic_injections[_dyn_injections_base_count:]
             _post_prelim_text = "\n\n".join(t for _, t in _post_prelim_items if t)
@@ -10400,13 +10329,10 @@ class Filter:
                 f"→ {_mp_available} tokens for response"
             )
 
-            # ─── CAMBIO: condiciones con force_multi_phase_response ──────────
             if (
                 _mp_available < self.valves.multi_phase_response_budget_warn
                 and not self.valves.force_multi_phase_response
             ):
-                # Critical mode: append inline hint to user message.
-                # Costs 0 system tokens → does not reduce the response budget.
                 messages = self._append_critical_wrap_up_hint(messages)
                 self._log_debug(
                     f"Multi-phase CRITICAL ({_mp_available} tokens): "
@@ -10417,15 +10343,13 @@ class Filter:
                 _mp_available < self.valves.multi_phase_response_threshold
                 or self.valves.force_multi_phase_response
             ):
-                # Normal mode: inject structured protocol into system prompt.
-                # Priority "critical" prevents budget trimming in the final assembly
-                # (a truncated protocol is worse than no protocol at all).
-                _INSTRUCTION_OVERHEAD = 450  # conservative upper bound (~400 actual)
+                _INSTRUCTION_OVERHEAD = 450
                 _mp_budget_reported = max(500, _mp_available - _INSTRUCTION_OVERHEAD)
                 _mp_instructions = self._build_multi_phase_instructions(
                     available_tokens=_mp_budget_reported,
                     user_query=user_question,
                     cot_degraded_to_l1=_mp_cot_degraded,
+                    is_continuation=not slot_free,
                 )
                 dynamic_injections.append(("critical", _mp_instructions))
                 self._log_debug(
@@ -10442,7 +10366,6 @@ class Filter:
                     f"({_mp_available} tokens > threshold "
                     f"{self.valves.multi_phase_response_threshold})."
                 )
-            # ─── Fin del cambio ─────────────────────────────────────────────
         # ── End multi-phase final injection ───────────────────────────────
 
         # Final system message assembly (two‑block structure)
@@ -10616,24 +10539,16 @@ class Filter:
                 )
 
         # ── 📦 COMPRESSION – Step 1b/2: Code history compression ──────────
-        # Must run AFTER adaptive_trim (history is already sized) but BEFORE
-        # final assembly. Compresses old code parts and leans user code messages.
-        # The refactor state injection is added to dynamic_injections so it
-        # appears in Block B for the model's awareness.
-
         if (
             self.valves.enable_code_history_compression
             or self.valves.enable_lean_user_code
         ):
-            # Apply compression FIRST (reduces assistant messages)
             if self.valves.enable_code_history_compression:
                 messages = self._compress_code_history(messages, project_id)
 
-            # Apply lean SECOND (reduces user messages, requires trigger check)
             if self.valves.enable_lean_user_code:
                 messages = self._lean_user_code_messages(messages, project_id)
 
-            # Inject refactor state into Block B if there are compressed parts
             _refactor_state = self._build_refactor_state_injection(messages)
             if _refactor_state:
                 dynamic_injections.append(("medium", _refactor_state))
@@ -10670,7 +10585,6 @@ class Filter:
 
         messages = system_msgs + history_msgs
 
-        # Ensure last message is user
         if messages and messages[-1].get("role") != "user":
             last_user_idx = -1
             for i in range(len(messages) - 1, -1, -1):
@@ -10811,6 +10725,37 @@ class Filter:
         ) = await self._inlet_extract_user_info(messages)
         _inlet_timing("Step 4/9: Extract user info", step_start)
 
+        # ── Detect AutoContinue continuation ──────────────────────────────
+        _last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        _hint = ""
+        _is_continuation = False
+        if _last_assistant:
+            _ac = _last_assistant.get("content", "")
+            for _marker in self._MULTI_PHASE_MARKERS:
+                if _marker in _ac:
+                    _is_continuation = True
+                    _idx = _ac.find(_marker)
+                    _hint_line = _ac[_idx:].split("\n")[0]
+                    _hint = re.sub(
+                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
+                        "",
+                        _hint_line,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    if _hint:
+                        user_question = _hint
+                        self._log_debug(
+                            f"AutoContinue detected — LOD query: '{user_question}'"
+                        )
+                    break
+        if _is_continuation:
+            slot_free = False
+            # Force code signals to be present so _build_multi_phase_instructions
+            # uses the code protocol instead of the generic long-response protocol.
+            user_query = user_query + " código"
+
         # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
         #   5. Explicit commands (/forget, /status, /clean, /expand)
@@ -10873,179 +10818,96 @@ class Filter:
 
                 # Statistics for the user
                 state = self._get_state(project_id)
-                n_blocks = len(state.get("active_blocks", {}))
-                n_symbols = len(self._symbol_index.get_all_names(project_id))
-                n_paths = len(self._path_index.get_all(project_id))
-                cross_note = (
-                    f", {resolved} cross-references resolved" if resolved > 0 else ""
+                num_blocks = len(state.get("active_blocks", {}))
+                num_symbols = len(self._symbol_index.get_all_names(project_id))
+
+                response = (
+                    f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
+                    "El código está disponible en el SymbolGraph para futuras consultas. "
+                    "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
-
-                confirmation = (
-                    f"✓ **Code indexed**: {n_blocks} blocks · "
-                    f"{n_symbols} symbols · {n_paths} paths{cross_note}\n"
-                    f"Ready for queries."
-                )
-
-                # Replace the user message with the confirmation
-                # (it never reaches the main LLM, no conversation context consumed)
-                messages[-1]["content"] = confirmation
-                body["messages"] = messages
-                body["messages"].append({"role": "assistant", "content": confirmation})
-
-                await self._save_state_if_dirty(project_id)
-                self._log_section(
-                    "SILENT INGESTION END", duration=time.monotonic() - inlet_start
-                )
-                return body
-
-        # Per‑request tracking for graceful STOP cancellation
-        background_tasks: list[asyncio.Task] = []
-        token = _inlet_background_tasks.set(background_tasks)
-        _inlet_aborted = True
-
-        try:
-            state = self._get_state(project_id)
-
-            # ─────────────────────────────────────────────────────────────
-            # 🔥 STATE MANAGEMENT + 🧠 ENRICHMENT (Critical)
-            #   7. Prepare code session:
-            #      - classify if session is about code
-            #      - update active blocks (extract code, detect duplicates)
-            #      - run immediate enrichment tasks (auto‑summaries)
-            #      - evict blocks if max_active_blocks > 0
-            # ─────────────────────────────────────────────────────────────
-            step_start = time.monotonic()
-            is_code_session, user_question = await self._inlet_prepare_code_session(
-                messages, project_id, user_query
-            )
-            _inlet_timing(
-                "Step 7/9: Prepare code session (classify, update blocks, enrich)",
-                step_start,
-            )
-
-            # Wait for any background tasks launched by _update_active_code
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
-                background_tasks.clear()
-
-            # Ensure all LLM-related work from this step is complete
-            await self._wait_for_llm_tasks()
-
-            # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT (Critical)
-            #   8. Build system injections:
-            #      - LTM retrieval
-            #      - Active code context (full or lightweight)
-            #      - Symbol analysis summary
-            #      - Chain‑of‑Thought detection (level computed here)
-            #      - Feedback context, cleanup suggestions, confidence
-            #      - Parallel checks: contradictions, duplicate questions,
-            #        response cache lookup
-            #      - Now separates into static_block (Block A) and dynamic_injections (Block B)
-            # ─────────────────────────────────────────────────────────────
-            step_start = time.monotonic()
-            static_block, dynamic_injections, cached_response, prelim_system = (
-                await self._inlet_build_system_injections(
-                    messages,
-                    project_id,
-                    user_query,
-                    user_question,
-                    is_code_session,
-                    last_user_msg,
-                    state,
-                    slot_free=slot_free,
-                )
-            )
-            _inlet_timing("Step 8/9: Build system injections", step_start)
-
-            # 🚀 RESOURCE OPTIMISATION (High value)
-            #    Return cached response immediately if found
-            if isinstance(cached_response, dict):
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Returning cached response (no further processing)"
-                )
-                messages.append(
-                    {"role": "assistant", "content": cached_response["response"]}
-                )
-                messages = self._ensure_last_message_is_user(messages)
+                messages.pop()
+                messages.append({"role": "assistant", "content": response})
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
                     duration=time.monotonic() - inlet_start,
                 )
-                _inlet_aborted = False
                 return body
 
-            # ─────────────────────────────────────────────────────────────
-            # 🧠 ENRICHMENT + 📦 COMPRESSION (Critical)
-            #   9. Assemble final messages:
-            #      - Apply Chain‑of‑Thought reasoning
-            #      - Trim old history (adaptive or max_turns)
-            #      - Summarise trimmed messages if enabled
-            #      - Inject final system prompt respecting token budget
-            #      - Display token breakdown (debug)
-            #      - Now uses static_block + dynamic_injections for KV cache stability
-            # ─────────────────────────────────────────────────────────────
-            step_start = time.monotonic()
-            messages = await self._inlet_assemble_final_messages(
+        # ─────────────────────────────────────────────────────────────────
+        # 🔥 STATE MANAGEMENT (Critical)
+        #   7. Prepare code session (classify, update code blocks)
+        # ─────────────────────────────────────────────────────────────────
+        step_start = time.monotonic()
+        is_code_session, user_question = await self._inlet_prepare_code_session(
+            messages, project_id, user_query, is_continuation=_is_continuation
+        )
+        _inlet_timing("Step 7/9: Prepare code session", step_start)
+
+        # ─────────────────────────────────────────────────────────────────
+        # 🧠 ENRICHMENT (High value)
+        #   8. Build system injections and assemble final messages
+        # ─────────────────────────────────────────────────────────────────
+        step_start = time.monotonic()
+        state = self._get_state(project_id)  # obtain state (may have been updated)
+        static_block, dynamic_injections, cached_response, prelim_system = (
+            await self._inlet_build_system_injections(
                 messages,
                 project_id,
-                static_block,
-                dynamic_injections,
-                prelim_system,
-                last_user_msg,
-                is_code_session,
-                state,
-                __user__,
-                background_tasks,
+                user_query,
                 user_question,
-                has_code_blocks,
+                is_code_session,
+                last_user_msg,
+                state,
                 slot_free=slot_free,
             )
-            _inlet_timing(
-                "Step 9/9: Assemble final messages (CoT, trim, system prompt)",
-                step_start,
-            )
+        )
+        _inlet_timing("Step 8/9: Build system injections", step_start)
 
+        # If a cached response was found, return it immediately
+        if cached_response:
+            messages.pop()
+            messages.append(
+                {"role": "assistant", "content": cached_response["response"]}
+            )
             body["messages"] = messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
-            _inlet_aborted = False
+            return body
 
-        finally:
-            # 🔥 STATE MANAGEMENT (Medium)
-            #   - Save state if dirty (debounced write)
-            #   - Process remaining secondary tasks (session summaries, etc.)
-            await self._save_state_if_dirty(project_id)
-            lock = await self._get_project_lock(project_id)
-            async with lock:
-                await self._process_pending_secondary_tasks(project_id)
+        # ─────────────────────────────────────────────────────────────────
+        # 📦 COMPRESSION + ASSEMBLY (High value)
+        #   9. Assemble final messages with CoT, multi-phase, trimming
+        # ─────────────────────────────────────────────────────────────────
+        step_start = time.monotonic()
+        background_tasks = []  # (no background tasks pending from this path)
+        messages = await self._inlet_assemble_final_messages(
+            messages,
+            project_id,
+            static_block,
+            dynamic_injections,
+            prelim_system,
+            last_user_msg,
+            is_code_session,
+            state,
+            __user__,
+            background_tasks,
+            user_question,
+            has_code_blocks,
+            slot_free=slot_free,
+        )
+        _inlet_timing("Step 9/9: Assemble final messages", step_start)
 
-            # 🚀 RESOURCE OPTIMISATION (Critical)
-            #   - Wait for any unfinished background tasks
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
-                background_tasks.clear()
+        body["messages"] = messages
 
-            if _inlet_aborted:
-                for task in background_tasks:
-                    if not task.done():
-                        task.cancel()
-            _inlet_background_tasks.reset(token)
-
-            # ── 🚀 RESOURCE OPTIMISATION: restore KV cache post-auxiliary-calls ──
-            # Multi-query, CoT and contradiction detection use the main model slot,
-            # which invalidates conversation checkpoints (SWA architecture).
-            # Restoring here costs ~3s but avoids a 95s full prefill on next turn.
-            if (
-                self.valves.enable_slot_persistence
-                and self._last_used_model == self.valves.llm_model
-            ):
-                await self._slot_restore_for_continuity(project_id)
-
+        _inlet_timing("total_inlet (end-to-end)", inlet_start)
+        self._log_section(
+            "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+        )
         return body
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -11178,16 +11040,22 @@ class Filter:
                     None,
                 )
                 if last_assistant and last_assistant.get("content"):
-                    # Skip LOD adaptation for partial multi-phase responses.
-                    # A partial answer (e.g. "Fase 1 analysis" or "Código Parte 2/5")
-                    # does not reference all relevant symbols. Adapting LOD here would
-                    # incorrectly mark as overserved blocks that ARE needed in subsequent
-                    # parts, causing the next query to receive less code than it needs.
-                    _is_partial_mp_lod = (
-                        self.valves.enable_multi_phase_response
-                        and any(
+                    # Skip LOD adaptation for ALL multi-phase responses, not only
+                    # those with a continuation marker. Fases 1-4 (analysis, contract,
+                    # plan) are text-only and would incorrectly raise the threshold
+                    # if checked: the model doesn't reference most code symbols when
+                    # writing prose analysis, making them appear overserved.
+                    _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
+                        any(
                             marker in last_assistant["content"]
                             for marker in self._MULTI_PHASE_MARKERS
+                        )
+                        or bool(
+                            re.search(
+                                r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
+                                last_assistant["content"],
+                                re.IGNORECASE,
+                            )
                         )
                     )
                     if _is_partial_mp_lod:
