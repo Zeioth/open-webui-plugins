@@ -142,11 +142,11 @@ async def call_llm(
     prompt: str,
     *,
     system: str = "",
-    base_url: str = "http://localhost:8080",          # sensible default for llama.cpp
-    model: str = "llamacpp/llama3.2:3b",              # placeholder model
+    base_url: str = "http://localhost:8080",
+    model: Optional[str] = None,                        # No default model – must be provided
     api_token: str = "",
     temperature: float = 0.3,
-    max_tokens: Optional[int] = None,                 # None = no explicit limit
+    max_tokens: Optional[int] = None,
     timeout: int = 120,
     endpoint_type: str = "chat",
 ) -> str:
@@ -154,10 +154,17 @@ async def call_llm(
     Async LLM call. Reuses the shared HTTP session.
     Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
     - base_url: may be given with or without trailing /v1 (it is normalized).
-    - model: if it starts with 'llamacpp/', the provider is forced to OpenAI-compatible.
+    - model: must be provided (e.g. 'llamacpp/llama3.2:3b' or 'gpt-4'). No default.
     - endpoint_type: 'chat' (default) or 'completion' for llama.cpp.
     - max_tokens: if None, no explicit limit is sent (server default used).
     """
+    # Fail early if no model is supplied
+    if model is None:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error("LLM call requested but no model was provided. Please specify a model.")
+        raise RuntimeError("No model provided for LLM call.")
+
     session = await get_http_session(timeout)
 
     # Normalise the base URL: strip trailing slash and remove any /v1 suffix
@@ -238,6 +245,19 @@ async def call_llm(
             content = choices[0].get("text", "")
         else:
             content = choices[0].get("message", {}).get("content", "")
+
+            # ── Fallback for models that use thinking/chain-of-thought ──
+            if not content:
+                reasoning = choices[0].get("message", {}).get("reasoning_content", "")
+                if reasoning:
+                    content = reasoning.strip()
+            # ─────────────────────────────────────────────────────────────
+
+    # Diagnostic log – remove after fixing the empty content issue
+    if not content:
+        import logging
+        log = logging.getLogger(__name__)
+        log.warning("LLM response with empty content. Full response: %s", data)
 
     return content.strip()
 
