@@ -1238,6 +1238,60 @@ class SignatureExtractor:
         return symbols
 
 
+# ── Module‑level singletons for heavy CPU models ───────────────────────
+_LLMLINGUA_COMPRESSOR = None
+_LLMLINGUA_LOCK = threading.Lock()
+
+
+def _get_llmlingua() -> Optional[Any]:
+    """Return the LLMLingua‑2 compressor singleton, loading it once."""
+    global _LLMLINGUA_COMPRESSOR
+    if _LLMLINGUA_COMPRESSOR is None:
+        with _LLMLINGUA_LOCK:
+            if _LLMLINGUA_COMPRESSOR is None:
+                try:
+                    from llmlingua import PromptCompressor
+
+                    _LLMLINGUA_COMPRESSOR = PromptCompressor(
+                        model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+                        use_llmlingua2=True,
+                        device_map="cpu",
+                    )
+                    logger.info("LLMLingua‑2 compressor initialized (CPU)")
+                except ImportError:
+                    logger.warning(
+                        "llmlingua not installed — code compression disabled"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"LLMLingua‑2 init failed: {e} — compression disabled"
+                    )
+    return _LLMLINGUA_COMPRESSOR
+
+
+_CROSS_ENCODER = None
+_CROSS_ENCODER_LOCK = threading.Lock()
+
+
+def _get_cross_encoder(
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+) -> Optional[Any]:
+    """Return the CrossEncoder singleton, loading it once."""
+    global _CROSS_ENCODER
+    if _CROSS_ENCODER is None:
+        with _CROSS_ENCODER_LOCK:
+            if _CROSS_ENCODER is None:
+                try:
+                    from sentence_transformers import CrossEncoder
+
+                    _CROSS_ENCODER = CrossEncoder(model_name)
+                    logger.info(f"Loaded reranker model {model_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to load reranker model: {e}")
+                    return None
+    return _CROSS_ENCODER
+
+
 # ---------------------------------------------------------------------------
 # Main Filter class
 # ---------------------------------------------------------------------------
@@ -1837,10 +1891,10 @@ class Filter:
         self._cross_encoder_unavailable_logged = False
         self._cross_encoder_lock = asyncio.Lock()
 
-        # ── LLMLingua-2 compressor (optional) ──
-        self._llmlingua_compressor = None
-        if self.valves.enable_code_compression:
-            self._init_llmlingua()
+        # ── LLMLingua-2 compressor (module‑level singleton) ──
+        self._llmlingua_compressor = (
+            _get_llmlingua() if self.valves.enable_code_compression else None
+        )
 
         # Conversation state
         self._conversation_state: OrderedDict = OrderedDict()
@@ -1884,9 +1938,11 @@ class Filter:
         else:
             logger.warning("Long‑term memory or code awareness disabled")
 
-        # Reranker
+        # Reranker (module‑level singleton)
         if self.valves.enable_reranking and HAS_CROSS_ENCODER:
-            self._load_reranker()
+            self._cross_encoder = _get_cross_encoder(self.valves.reranker_model)
+        else:
+            self._cross_encoder = None
 
         # HTTP session and locks
         self._project_locks: Dict[str, ReentrantAsyncLock] = {}
@@ -4686,17 +4742,6 @@ class Filter:
         async with self._cross_encoder_lock:
             return await anyio.to_thread.run_sync(self._cross_encoder.predict, pairs)
 
-    def _load_reranker(self):
-        if not self.valves.enable_reranking or not HAS_CROSS_ENCODER:
-            return
-        if self._cross_encoder is None:
-            try:
-                self._cross_encoder = CrossEncoder(self.valves.reranker_model)
-                self._log_debug(f"Loaded reranker model {self.valves.reranker_model}")
-            except Exception as e:
-                logger.warning(f"Failed to load reranker model: {e}")
-                self.valves.enable_reranking = False
-
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
     ) -> List[str]:
@@ -6396,24 +6441,6 @@ class Filter:
     # --------------------------------------------------------------------------
     # LLMLingua-2 code compression (v7 – PASO-18)
     # --------------------------------------------------------------------------
-
-    def _init_llmlingua(self):
-        """Initialise the LLMLingua-2 compressor. Runs on CPU, no GPU needed."""
-        try:
-            from llmlingua import PromptCompressor
-
-            self._llmlingua_compressor = PromptCompressor(
-                model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
-                use_llmlingua2=True,
-                device_map="cpu",
-            )
-            self._log_debug("LLMLingua-2 compressor initialized (CPU)")
-        except ImportError:
-            self._log_debug("llmlingua not installed — code compression disabled")
-            self.valves.enable_code_compression = False
-        except Exception as e:
-            self._log_debug(f"LLMLingua-2 init failed: {e} — compression disabled")
-            self.valves.enable_code_compression = False
 
     async def _compress_code_block(
         self,
