@@ -101,9 +101,6 @@ from shared_resources import (
     unload_all_models as _shared_unload_all_models,
 )
 
-_inlet_background_tasks: contextvars.ContextVar[list] = contextvars.ContextVar(
-    "_inlet_background_tasks", default=None
-)
 _db_global_lock = threading.Lock()
 _llm_semaphore = asyncio.Semaphore(1)
 import fcntl
@@ -583,13 +580,6 @@ class AppliedChangeFeedback(BaseModel):
     success: bool = True
     user_comment: str = ""
     resolved: bool = False
-
-
-class SecondaryTask(BaseModel):
-    task_type: str
-    params: Dict[str, Any]
-    retries: int = 0
-    created_at: float = Field(default_factory=time.time)
 
 
 # ---------------------------------------------------------------------------
@@ -1525,138 +1515,29 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════════
         #  Multi-Phase Response
         # ═══════════════════════════════════════════════════════════════════
-        # IMPORTANT:
-        # - Budget is measured from the REMAINING free context window space.
-        # - Protocol activates when effective budget < threshold.
-        # - effective_max_tokens acts as a cap on the budget (it is NOT the
-        #   number of tokens already generated).
-        #
-        # EXAMPLE:
-        # Given 80k tokens of code (~7000 lines), these values
-        # can return a full refactor in 12 messages, in 15 minutes.
-        enable_multi_phase_response: bool = Field(
-            default=True,
-            description="Master on/off for multi‑phase splitting.",
-        )
-        force_multi_phase_response: bool = Field(
-            default=True,
-            description=(
-                "Always inject the multi-phase protocol, regardless of remaining "
-                "token budget. Use when context_window_tokens does not match the "
-                "actual llama.cpp --ctx-size (e.g. llama.cpp is 262k but valve is 1M)."
-            ),
-        )
-        multi_phase_effective_max_tokens: int = Field(
-            default=4500,
-            ge=1000,
-            le=200000,
-            description=(
-                "Max tokens allowed per response (set = LLM server max_tokens). "
-                "Used to cap the remaining budget: "
-                "effective budget = min(free context space, this number). "
-                "If that budget < threshold, the model splits the answer into phases."
-            ),
-        )
-        multi_phase_response_threshold: int = Field(
-            default=7000,
-            ge=0,
-            le=200000,
-            description=(
-                "Protocol activates when the REMAINING response token budget "
-                "(min(free_context_tokens, effective_max_tokens)) "
-                "falls BELOW this number. "
-                "Set > effective_max_tokens → always split responses. "
-                "Set to 0 → disable splitting."
-            ),
-        )
-        multi_phase_response_budget_warn: int = Field(
-            default=800,
-            ge=500,
-            le=40000,
-            description=(
-                "When REMAINING budget drops below this, a short wrap‑up hint "
-                "is appended to the user message (no system tokens spent)."
-            ),
-        )
-
-        auto_budget_context_for_parts: bool = Field(
-            default=True,
-            description=(
-                "When multi-phase is active, cap active_context_max_tokens to "
-                "leave exactly multi_phase_effective_max_tokens free for the response. "
-                "Requires context_window_tokens to match actual llama.cpp --ctx-size."
-            ),
-        )
+        enable_multi_phase_response: bool = Field(default=True)
+        force_multi_phase_response: bool = Field(default=True)
+        multi_phase_effective_max_tokens: int = Field(default=4500, ge=1000, le=200000)
+        multi_phase_response_threshold: int = Field(default=7000, ge=0, le=200000)
+        multi_phase_response_budget_warn: int = Field(default=800, ge=500, le=40000)
+        auto_budget_context_for_parts: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════════
         #  Code History Compression
         # ═══════════════════════════════════════════════════════════════════
-        enable_code_history_compression: bool = Field(
-            default=True,
-            description=(
-                "Compress assistant messages containing multi-phase code parts after "
-                "their symbols are verified in the SymbolGraph. Prevents context "
-                "explosion in multi-part refactors. Keeps last N parts in full."
-            ),
-        )
-        code_history_keep_last_n_parts: int = Field(
-            default=2,
-            ge=1,
-            le=5,
-            description=(
-                "Number of most recent code parts to keep in full. "
-                "Older parts are replaced with commit summaries."
-            ),
-        )
-        code_history_symbol_index_threshold: float = Field(
-            default=0.75,
-            ge=0.5,
-            le=1.0,
-            description=(
-                "Minimum ratio of top-level symbols (classes/functions) that must be "
-                "indexed in the SymbolGraph before a message can be compressed. "
-                "Prevents compression of partially-parsed code."
-            ),
-        )
-        enable_lean_user_code: bool = Field(
-            default=True,
-            description=(
-                "Replace large code blocks in user messages with SymbolGraph references "
-                "once code generation has started (phases 1-4 of multi-phase protocol "
-                "are complete and symbols are indexed). The instruction text is preserved."
-            ),
-        )
-        lean_user_code_min_tokens: int = Field(
-            default=8000,
-            ge=2000,
-            le=60000,
-            description=(
-                "Minimum tokens in a code block to qualify for lean replacement. "
-                "Blocks below this size are kept in full."
-            ),
-        )
+        enable_code_history_compression: bool = Field(default=True)
+        code_history_keep_last_n_parts: int = Field(default=2, ge=1, le=5)
+        code_history_symbol_index_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
+        enable_lean_user_code: bool = Field(default=True)
+        lean_user_code_min_tokens: int = Field(default=8000, ge=2000, le=60000)
 
         # ═══════════════════════════════════════════════════════════════
         #  Code Compression (LLMLingua-2)
         # ═══════════════════════════════════════════════════════════════
-        enable_code_compression: bool = Field(
-            default=True,
-            description="Enable LLMLingua-2 token compression within code blocks. Requires llmlingua>=0.2.0. Self-disables itfelt if the dependency is not found.",
-        )
-        code_compression_rate: float = Field(
-            default=0.5,
-            ge=0.3,
-            le=0.8,
-            description="Fraction of tokens to KEEP after compression.",
-        )
-        code_compression_min_tokens: int = Field(
-            default=150,
-            description="Minimum token count for a code block to be compressed.",
-        )
-        enable_question_aware_compression: bool = Field(
-            default=True,
-            description="Pass the current user query to LLMLingua-2 to preserve query-relevant tokens.",
-        )
+        enable_code_compression: bool = Field(default=True)
+        code_compression_rate: float = Field(default=0.5, ge=0.3, le=0.8)
+        code_compression_min_tokens: int = Field(default=150)
+        enable_question_aware_compression: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════
         #  Importance & Expiration
@@ -1686,7 +1567,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         enable_confidence_scoring: bool = Field(default=True)
         confidence_prompt: str = Field(
-            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
+            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'..."
         )
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
@@ -1697,52 +1578,23 @@ class Filter:
         cot_model_level3: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         enable_cot_llm_detection: bool = Field(default=True)
         cot_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
-        enforce_scientific_method: bool = Field(
-            default=False,
-            description="Force Level 3 Scientific CoT regardless of detected complexity. Conditionally enabled, if false.",
-        )
-        scientific_hypotheses_count: int = Field(
-            default=3,
-            ge=2,
-            le=6,
-            description="Number of hypotheses per round in Scientific CoT.",
-        )
-        scientific_confidence_threshold: float = Field(
-            default=0.75,
-            ge=0.0,
-            le=1.0,
-            description="Stop iterating when best hypothesis reaches this score.",
-        )
-        scientific_max_iterations: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-            description="Max refinement iterations in Level 3 Scientific CoT.",
-        )
-        enable_step_back_prompting: bool = Field(
-            default=True,
-            description="Before CoT, ask an abstract architectural question for better context.",
-        )
-        step_back_always: bool = Field(
-            default=False,
-            description="If True, generate step-back for all CoT queries (not just debugging).",
-        )
-        step_back_max_tokens: int = Field(
-            default=150,
-            ge=50,
-            le=400,
-            description="Max tokens for the step-back architectural context.",
-        )
+        enforce_scientific_method: bool = Field(default=False)
+        scientific_hypotheses_count: int = Field(default=3, ge=2, le=6)
+        scientific_confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+        scientific_max_iterations: int = Field(default=2, ge=1, le=4)
+        enable_step_back_prompting: bool = Field(default=True)
+        step_back_always: bool = Field(default=False)
+        step_back_max_tokens: int = Field(default=150, ge=50, le=400)
         enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         contradiction_inject_warning: bool = Field(default=True)
         enable_assumption_extraction: bool = Field(default=True)
         assumption_extraction_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
 
         # ═══════════════════════════════════════════════════════════════
@@ -1750,7 +1602,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         proactive_context_warning_threshold: float = Field(default=0.85)
         proactive_context_warning_message: str = Field(
-            default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window..."
+            default="\n\n⚠️ **Context Warning**: ..."
         )
         proactive_summary_threshold: float = Field(default=0.75)
         proactive_summary_growth_window: int = Field(default=3)
@@ -1759,7 +1611,7 @@ class Filter:
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         natural_language_forget_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
@@ -1806,12 +1658,12 @@ class Filter:
         tool_call_preserve: bool = Field(default=True)
         code_always_keep_signature: bool = Field(default=True)
         summary_fallback_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         summary_include_metadata: bool = Field(default=True)
         summarize_old_messages: bool = Field(default=True)
         summarization_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
 
         # ═══════════════════════════════════════════════════════════════
@@ -1834,7 +1686,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         summarize_inactive_code: bool = Field(default=True)
         inactive_code_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
 
         # ═══════════════════════════════════════════════════════════════
@@ -1849,15 +1701,6 @@ class Filter:
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
         session_summary_max_tokens: int = Field(default=200)
-        defer_secondary_tasks: bool = Field(
-            default=True,
-            description="Defer secondary LLM tasks to the next inlet to avoid concurrency.",
-        )
-        secondary_task_max_retries: int = Field(default=5)
-        secondary_task_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-        )
-        secondary_llm_max_concurrent: int = Field(default=2)
 
         # ═══════════════════════════════════════════════════════════════
         #  Raw File Priority Boost
@@ -1875,144 +1718,60 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  RAPTOR Hierarchical LTM
         # ═══════════════════════════════════════════════════════════════
-        enable_raptor: bool = Field(
-            default=False,
-            description="Enable RAPTOR hierarchical summarization of LTM. Requires scikit-learn.",
-        )
-        raptor_clusters_per_level: int = Field(
-            default=5,
-            ge=2,
-            le=20,
-            description="Number of k-means clusters per RAPTOR level.",
-        )
+        enable_raptor: bool = Field(default=False)
+        raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model for RAPTOR cluster summary generation.",
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
-        raptor_summary_max_tokens: int = Field(
-            default=150, description="Max tokens per RAPTOR cluster summary."
-        )
-        raptor_rebuild_interval: int = Field(
-            default=20,
-            description="Rebuild RAPTOR index every N outlet calls.",
-        )
+        raptor_summary_max_tokens: int = Field(default=150)
+        raptor_rebuild_interval: int = Field(default=20)
 
         # ═══════════════════════════════════════════════════════════════
         #  KV Cache Stability & Slot Persistence
         # ═══════════════════════════════════════════════════════════════
-        enable_kv_cache_stability: bool = Field(
-            default=True,
-            description="Separate system prompt into static (Block A) and dynamic (Block B) for KV cache stability.",
-        )
-        enable_slot_persistence: bool = Field(
-            default=True,
-            description="Persist and restore llama.cpp KV cache slot between sessions.",
-        )
-        slot_save_path: str = Field(
-            default="/tmp/llama_slots",
-            description="Directory for slot cache files.",
-        )
-        slot_id: int = Field(
-            default=0, ge=0, description="llama.cpp slot ID to save/restore."
-        )
+        enable_kv_cache_stability: bool = Field(default=True)
+        enable_slot_persistence: bool = Field(default=True)
+        slot_save_path: str = Field(default="/tmp/llama_slots")
+        slot_id: int = Field(default=0, ge=0)
 
         # ═══════════════════════════════════════════════════════════════
         #  Retrieval Enhancements
         # ═══════════════════════════════════════════════════════════════
-        enable_contextual_retrieval: bool = Field(
-            default=True,
-            description="Prepend a context summary to each LTM entry before embedding.",
-        )
-        contextual_retrieval_mode: str = Field(
-            default="metadata",
-            description="Context generation mode: 'metadata' (fast, no LLM) or 'llm' (better, slower).",
-        )
-        enable_multi_query_retrieval: bool = Field(
-            default=True,
-            description="Generate multiple query variants before LTM retrieval and merge results.",
-        )
-        multi_query_variants: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-            description="Number of alternative query variants to generate.",
-        )
+        enable_contextual_retrieval: bool = Field(default=True)
+        contextual_retrieval_mode: str = Field(default="metadata")
+        enable_multi_query_retrieval: bool = Field(default=True)
+        multi_query_variants: int = Field(default=2, ge=1, le=4)
 
         # ═══════════════════════════════════════════════════════════════
         #  Edge Persistence (Cross-Session SymbolGraph)
         # ═══════════════════════════════════════════════════════════════
-        enable_edge_persistence: bool = Field(
-            default=True,
-            description="Persist typed SymbolGraph edges to SQLite for cross-session continuity.",
-        )
+        enable_edge_persistence: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════
         #  Adaptive LOD Thresholds
         # ═══════════════════════════════════════════════════════════════
-        enable_lod_adaptive: bool = Field(
-            default=True,
-            description="Automatically adjust lod3_threshold based on LLM response references.",
-        )
-        lod_adapt_rate: float = Field(
-            default=0.05,
-            ge=0.01,
-            le=0.2,
-            description="Step size for each LOD threshold adjustment.",
-        )
-        lod_adapt_min: float = Field(
-            default=0.25,
-            ge=0.1,
-            le=0.5,
-            description="Minimum value for lod3_threshold.",
-        )
-        lod_adapt_max: float = Field(
-            default=0.75,
-            ge=0.5,
-            le=0.95,
-            description="Maximum value for lod3_threshold.",
-        )
-        lod_adapt_underserved_min: int = Field(
-            default=2,
-            ge=1,
-            le=10,
-            description="Minimum underserved symbols to trigger threshold decrease.",
-        )
-        lod_adapt_overserved_min: int = Field(
-            default=3,
-            ge=1,
-            le=10,
-            description="Minimum overserved symbols to trigger threshold increase.",
-        )
+        enable_lod_adaptive: bool = Field(default=True)
+        lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
+        lod_adapt_min: float = Field(default=0.25, ge=0.1, le=0.5)
+        lod_adapt_max: float = Field(default=0.75, ge=0.5, le=0.95)
+        lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
+        lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
 
         # ═══════════════════════════════════════════════════════════════
         #  Speculative Pre‑fetching
         # ═══════════════════════════════════════════════════════════════
-        enable_speculative_prefetch: bool = Field(
-            default=True,
-            description="Pre-build CodePathViews for symbols likely needed in the next query.",
-        )
-        speculative_prefetch_max: int = Field(
-            default=5,
-            ge=1,
-            le=20,
-            description="Maximum number of symbols to pre-fetch per response.",
-        )
+        enable_speculative_prefetch: bool = Field(default=True)
+        speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
 
         # ═══════════════════════════════════════════════════════════════
         #  Silent Ingestion
         # ═══════════════════════════════════════════════════════════════
-        enable_silent_ingestion: bool = Field(
-            default=True,
-            description="Index code silently when the user pastes code without a question.",
-        )
+        enable_silent_ingestion: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════
         #  Data Flow Analysis
         # ═══════════════════════════════════════════════════════════════
-        enable_data_flow_analysis: bool = Field(
-            default=True,
-            description="Extract data flow edges between functions using ast analysis.",
-        )
+        enable_data_flow_analysis: bool = Field(default=True)
 
     INTENT_KEYWORDS = {
         "forget",
@@ -2067,8 +1826,6 @@ class Filter:
     def __init__(self):
         # Valves and basic objects
         self.valves = self.Valves()
-        # ── Purge task tracker MUST be before _init_long_term_memory ──
-        self._purge_task: Optional[asyncio.Task] = None
 
         self.tokenizer = None
         self._db_conn = None
@@ -2092,7 +1849,6 @@ class Filter:
             "response_cache": [],
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
-            "pending_secondary_tasks": [],
             "last_cot_level": 0,
         }
 
@@ -2133,13 +1889,8 @@ class Filter:
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(self.valves.LLM_MAX_CONCURRENT_CALLS)
-        self._low_priority_llm_semaphore = asyncio.Semaphore(1)
-        self._secondary_llm_semaphore = asyncio.Semaphore(
-            self.valves.secondary_llm_max_concurrent
-        )
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
-        self._db_write_lock = asyncio.Lock()  # kept for extra safety, optional
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
 
@@ -2151,42 +1902,25 @@ class Filter:
         self._db_write_queue: asyncio.Queue = asyncio.Queue()
         self._db_worker_task = asyncio.create_task(self._db_worker())
 
-        # Background tasks tracking
-        self._summarize_inactive_in_progress: Dict[str, bool] = {}
-        self._write_counter = 0
-        self._response_cache_cleanup_task: Optional[asyncio.Task] = None
-
         # Session classification cache
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
         self._session_classify_ttl: float = 1800.0
 
         # Symbol index and lightweight context
         self._symbol_index = SymbolIndex()
-        self._path_index = PathIndex()  # v7 (PASO-06)
-        self._node_centrality: Dict[str, Dict[str, float]] = {}  # v7 Phase 6 (PASO-33)
+        self._path_index = PathIndex()
+        self._node_centrality: Dict[str, Dict[str, float]] = {}
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
 
-        # ── KV Cache Stability (v7 – PASO-21) ──
-        self._static_context_block_cache: Dict[str, Tuple[str, str]] = (
-            {}
-        )  # project_id → (code_state_hash, static_block_text)
-        self._last_static_prefix_hash: Dict[str, str] = (
-            {}
-        )  # project_id → md5 del bloque estático de la última request
+        # ── KV Cache Stability ──
+        self._static_context_block_cache: Dict[str, Tuple[str, str]] = {}
+        self._last_static_prefix_hash: Dict[str, str] = {}
 
-        # ── KV Cache Slot Persistence (v7 – PASO-25) ──
-        self._last_saved_slot_hash: Dict[str, str] = (
-            {}
-        )  # project_id → static_block_hash of the last save to disk
-
-        self._slot_restored: Dict[str, bool] = (
-            {}
-        )  # project_id → True if restore succeeded in this server session
-
-        self._slot_restore_attempted: Dict[str, bool] = (
-            {}
-        )  # project_id → True if restore was already attempted (avoid retries)
+        # ── KV Cache Slot Persistence ──
+        self._last_saved_slot_hash: Dict[str, str] = {}
+        self._slot_restored: Dict[str, bool] = {}
+        self._slot_restore_attempted: Dict[str, bool] = {}
 
         # Project tracking
         self._last_processed_message_idx: Dict[str, int] = {}
@@ -2195,20 +1929,14 @@ class Filter:
 
         # Response cache counter
         self._response_cache_count: Dict[str, int] = {}
+        self._summarize_inactive_in_progress: Dict[str, bool] = {}
+        self._write_counter = 0
 
-        # Batch LTM
-        self._pending_ltm_messages: List[dict] = []
-        self._ltm_batch_lock = asyncio.Lock()
-        self._ltm_batch_task: Optional[asyncio.Task] = None
-
-        # ── New: Symbol blacklist (empty by default) ──
-        self._SYMBOL_BLACKLIST: Set[str] = set()
-
-        # ── New: LRU-ordered cache for block change summaries (max size from valves) ──
+        # Block change summaries LRU
         self._block_change_summaries: OrderedDict = OrderedDict()
         self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
 
-        # ── New: Dedicated thread pools for blocking DB and ChromaDB operations ──
+        # Thread pools for blocking operations
         import concurrent.futures
 
         self._db_executor = concurrent.futures.ThreadPoolExecutor(
@@ -2218,12 +1946,12 @@ class Filter:
             max_workers=2, thread_name_prefix="codeaware_chroma"
         )
 
-        # ── CoT heuristic feature flags ──
-        self.ENABLE_ACCENT_NORMALIZATION = True  # normalize Spanish accents in keywords
-        self.ENABLE_KEYWORD_COUNT_WEIGHT = True  # multiple keywords increase signals
-        self.ENABLE_COT_STICKY = False  # keep last CoT level in conversation state
+        # CoT heuristic feature flags
+        self.ENABLE_ACCENT_NORMALIZATION = True
+        self.ENABLE_KEYWORD_COUNT_WEIGHT = True
+        self.ENABLE_COT_STICKY = False
 
-        # ── State debounce (to reduce DB writes) ──
+        # State debounce
         self._state_dirty = False
         self._state_last_saved = 0.0
 
@@ -2257,33 +1985,6 @@ class Filter:
         right = remaining - left
         line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
-
-    def _background_task(self, coro, name: str = "task", is_llm_task: bool = False):
-        """Create a background task that logs errors, optionally tracking for cancellation."""
-        task = asyncio.create_task(coro)
-
-        def _on_done_log(t):
-            if t.cancelled():
-                return
-            if t.exception():
-                self._log_debug(f"Background task '{name}' failed: {t.exception()}")
-
-        task.add_done_callback(_on_done_log)
-
-        if is_llm_task:
-            tasks_list = _inlet_background_tasks.get(None)
-            if tasks_list is not None:
-                tasks_list.append(task)
-
-                def _remove_from_list(t):
-                    try:
-                        tasks_list.remove(t)
-                    except ValueError:
-                        pass
-
-                task.add_done_callback(_remove_from_list)
-
-        return task
 
     # --------------------------------------------------------------------------
     # Code extraction and classification
@@ -2963,7 +2664,9 @@ class Filter:
         db_path = self.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db_conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._db_conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds wait on lock
+        self._db_conn.execute(
+            f"PRAGMA busy_timeout = {self.valves.llm_per_call_timeout * 1000}"
+        )
         self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 project_id TEXT PRIMARY KEY,
@@ -3136,7 +2839,6 @@ class Filter:
                 "last_cleanup_suggestion_msg_idx", 0
             ),
             "has_any_calls": state.get("has_any_calls", False),
-            "pending_secondary_tasks": state.get("pending_secondary_tasks", []),
             "last_cot_level": state.get("last_cot_level", 0),
         }
 
@@ -3172,17 +2874,11 @@ class Filter:
             "last_suggestion_timestamp",
             "response_cache",
             "has_any_calls",
-            "pending_secondary_tasks",
             "last_cot_level",
         ]:
             data.setdefault(
                 key,
-                (
-                    []
-                    if key
-                    in ("feedback_history", "response_cache", "pending_secondary_tasks")
-                    else 0
-                ),
+                ([] if key in ("feedback_history", "response_cache") else 0),
             )
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
 
@@ -3273,7 +2969,6 @@ class Filter:
             "last_cleanup_suggestion_msg_idx": data.get(
                 "last_cleanup_suggestion_msg_idx", 0
             ),
-            "pending_secondary_tasks": data.get("pending_secondary_tasks", []),
             "last_cot_level": data.get("last_cot_level", 0),
         }
 
@@ -3527,11 +3222,6 @@ class Filter:
             name=f"response_cache_{self.valves.project_id or 'default'}",
             metadata={"hnsw:space": "cosine"},
         )
-        # ── Only launch purge task if not already active ──
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            if self._purge_task is None or self._purge_task.done():
-                self._purge_task = asyncio.create_task(self._purge_expired_memories())
         self._log_debug("LTM ready")
 
     async def _purge_expired_memories(self):
@@ -3643,10 +3333,18 @@ class Filter:
         model_override: str = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.3,
-        semaphore: asyncio.Semaphore = None,
         response_format: Optional[Dict[str, Any]] = None,
         label: str = "",
+        total_timeout: Optional[float] = None,
     ) -> Optional[str]:
+        """
+        Call the LLM with automatic retries for transient errors.
+        Retries continue until *total_timeout* seconds have passed since the
+        first attempt.  If *total_timeout* is None, the valve default
+        ``llm_retry_total_timeout`` is used.
+        Exponential backoff is applied between retries, capped by a fraction
+        of the remaining budget.
+        """
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -3663,6 +3361,14 @@ class Filter:
 
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
+
+        effective_total_timeout = (
+            total_timeout
+            if total_timeout is not None
+            else self.valves.llm_retry_total_timeout
+        )
+        deadline = t_start + effective_total_timeout
+
         try:
             base_url = self.valves.LLM_BASE_URL.rstrip("/")
             if base_url.endswith("/v1"):
@@ -3691,9 +3397,8 @@ class Filter:
             if model.startswith("llamacpp/"):
                 ep_type = self.valves.llamacpp_endpoint_type
 
-            effective_semaphore = semaphore or self._llm_semaphore
-            max_retries = 2
             base_delay = 1.0
+            max_delay = min(30.0, effective_total_timeout * 0.1)
 
             if self.tokenizer:
                 prompt_tokens = len(self.tokenizer.encode(prompt))
@@ -3711,9 +3416,12 @@ class Filter:
                     async with _llm_semaphore:
                         await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-                        for attempt in range(max_retries + 1):
+                        attempt = 0
+                        while time.monotonic() < deadline:
+                            attempt += 1
                             try:
-                                async with effective_semaphore:
+                                # Use class-level semaphore for concurrency safety
+                                async with self._llm_semaphore:
                                     content = await _shared_call_llm(
                                         prompt=prompt,
                                         system=system_prompt,
@@ -3748,22 +3456,26 @@ class Filter:
                             except asyncio.CancelledError:
                                 raise
                             except RuntimeError as exc:
-                                self._log_debug(
-                                    f"[LLM] {model}{label_str} error: {exc}"
-                                )
                                 if any(
                                     c in str(exc)
                                     for c in ("429", "500", "502", "503", "504")
                                 ):
-                                    if attempt < max_retries:
-                                        await asyncio.sleep(base_delay * (2**attempt))
-                                        continue
-                                break
+                                    pass
+                                else:
+                                    break
                             except Exception:
-                                if attempt < max_retries:
-                                    await asyncio.sleep(base_delay * (2**attempt))
-                                    continue
+                                pass
+
+                            wait = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
                                 break
+                            wait = min(wait, remaining)
+                            self._log_debug(
+                                f"[LLM] {model}{label_str} attempt {attempt} failed, "
+                                f"retrying in {wait:.1f}s (deadline in {remaining:.0f}s)"
+                            )
+                            await asyncio.sleep(wait)
                 finally:
                     self._release_llm_lock(llm_fd)
             finally:
@@ -3796,8 +3508,14 @@ class Filter:
         model_override: str = None,
         max_tokens: int = 500,
         temperature: float = 0.3,
-        label: str = "",  # <-- NUEVO
+        label: str = "",
     ) -> Optional[str]:
+        """
+        Call the LLM through ``_call_llm``, giving it a per‑attempt timeout
+        sliced from the total budget.  Retries until the total budget is
+        exhausted.  Timeouts and budgets are taken from the corresponding
+        valves unless overridden.
+        """
         per_call_timeout = (
             timeout if timeout is not None else self.valves.llm_per_call_timeout
         )
@@ -3814,61 +3532,37 @@ class Filter:
         while time.monotonic() < deadline:
             attempt += 1
             remaining_total = deadline - time.monotonic()
-            this_timeout = min(per_call_timeout, remaining_total)
+            this_attempt_budget = min(per_call_timeout, remaining_total)
 
-            try:
-                return await asyncio.wait_for(
-                    self._call_llm(
-                        prompt=prompt,
-                        system_prompt=system_prompt,
-                        model_override=model_override,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        label=label,  # reenviamos la etiqueta a _call_llm
-                    ),
-                    timeout=this_timeout,
-                )
-            except asyncio.TimeoutError:
-                self._log_debug(
-                    f"{label_prefix}LLM call timed out (attempt {attempt}, "
-                    f"per-call timeout={this_timeout:.1f}s, "
-                    f"total remaining {remaining_total:.0f}s)"
-                )
-            except Exception as e:
-                self._log_debug(
-                    f"{label_prefix}LLM call failed (attempt {attempt}): {str(e)[:100]}"
-                )
+            result = await self._call_llm(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model_override=model_override,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                label=label,
+                total_timeout=this_attempt_budget,  # <-- pass sliced budget
+            )
+            if result is not None:
+                return result
 
+            # If we still have time, brief pause before next slice
+            if time.monotonic() >= deadline:
+                break
+            self._log_debug(
+                f"{label_prefix}attempt {attempt} returned None, "
+                f"waiting 2 s before next slice (remaining {deadline - time.monotonic():.0f}s)"
+            )
             await asyncio.sleep(2.0)
 
         self._log_debug(
-            f"{label_prefix}LLM call retries exhausted after {total_budget}s: {prompt[:80]}..."
+            f"{label_prefix}all retries exhausted after {total_budget}s: {prompt[:80]}..."
         )
         return None
 
     # --------------------------------------------------------------------------
     # Response cache (ChromaDB) – with thread pool
     # --------------------------------------------------------------------------
-    def _ensure_cleanup_task(self) -> None:
-        if (
-            not self.valves.enable_response_cache
-            or not HAS_CHROMA
-            or self._response_cache_cleanup_task is not None
-        ):
-            return
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            self._response_cache_cleanup_task = asyncio.create_task(
-                self._periodic_response_cache_cleanup()
-            )
-
-    async def _periodic_response_cache_cleanup(self):
-        while True:
-            await asyncio.sleep(3600)
-            try:
-                await self._purge_expired_response_cache()
-            except Exception as e:
-                self._log_debug(f"Response cache cleanup error: {e}")
 
     async def _purge_expired_response_cache(self):
         if (
@@ -4089,7 +3783,7 @@ class Filter:
             return await self._retrieve_all_memories_unified(cleaned_query, project_id)
         return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
 
-    async def _batch_store_messages(self, project_id: str, messages: List[dict]):
+    async def _store_ltm_messages(self, project_id: str, messages: List[dict]):
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return
         valid = [
@@ -4152,7 +3846,7 @@ class Filter:
             texts_for_embedding.append(contextual_doc)
             documents_to_store.append(contextual_doc)
 
-            # Build ID and metadata (existing logic preserved)
+            # Build ID and metadata
             msg_id = f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
             ids.append(msg_id)
 
@@ -4213,7 +3907,7 @@ class Filter:
                 )
             )
         self._log_timing(
-            "batch_ltm_total", time.monotonic() - t_start, time.monotonic() - t_start
+            "ltm_store_total", time.monotonic() - t_start, time.monotonic() - t_start
         )
 
     async def _retrieve_all_memories_unified(
@@ -4439,7 +4133,7 @@ class Filter:
                 "Output only one descriptive sentence. "
                 "Be specific about functions, files, or errors mentioned."
             ),
-            model_override=self.valves.secondary_task_model,
+            model_override=self.valves.llm_model,  # <-- antes secondary_task_model
             max_tokens=40,
             temperature=0.2,
             timeout=self.valves.llm_per_call_timeout,
@@ -4465,7 +4159,7 @@ class Filter:
         2. Cluster with k-means.
         3. Generate a summary per cluster via LLM.
         4. Store the summary in ChromaDB and SQLite.
-        Returns number of clusters created. Runs asynchronously in background.
+        Returns number of clusters created.
         """
         if not HAS_CHROMA or self.memory_collection is None:
             return 0
@@ -4608,7 +4302,7 @@ class Filter:
 
     async def _rebuild_raptor_index(self, project_id: str):
         """
-        Rebuild the full RAPTOR tree for a project. Background task.
+        Rebuild the full RAPTOR tree for a project.
         Process:
         1. Delete old RAPTOR summaries for the project.
         2. Build level 1 (clusters of raw entries).
@@ -4656,16 +4350,6 @@ class Filter:
             )
             self._log_debug(f"RAPTOR: level 2 = {l2_clusters} clusters")
 
-    async def _flush_ltm_batch(self, project_id: str):
-        await asyncio.sleep(0.5)
-        async with self._ltm_batch_lock:
-            if not self._pending_ltm_messages:
-                return
-            messages_to_store = self._pending_ltm_messages.copy()
-            self._pending_ltm_messages.clear()
-            self._ltm_batch_task = None
-        await self._batch_store_messages(project_id, messages_to_store)
-
     # --------------------------------------------------------------------------
     # Multi‑Query LTM Expansion (v7 – Phase 6, PASO-34)
     # --------------------------------------------------------------------------
@@ -4704,7 +4388,7 @@ class Filter:
                 "Output only the alternative phrasings, one per line. "
                 "Be concise and specific to the code context."
             ),
-            model_override=self.valves.secondary_task_model,
+            model_override=self.valves.llm_model,  # <-- antes era secondary_task_model
             max_tokens=80,
             temperature=0.6,
             label="multi_query_expand",
@@ -4978,11 +4662,10 @@ class Filter:
 
         async with lock:
             state = self._get_state(project_id)
-            self._background_task(
-                self._summarize_inactive_blocks_safely(project_id),
-                name="summarize_inactive",
-                is_llm_task=True,
-            )
+
+            # ── Inline summarisation of inactive blocks ──
+            await self._summarize_inactive_blocks_safely(project_id)
+
             self._update_mentions_from_message(state, content, project_id)
             for block in state["active_blocks"].values():
                 if (
@@ -5083,12 +4766,9 @@ class Filter:
                             existing._cached_token_count = len(existing.content) // 4
                         existing._update_importance()
                         if prev_content != new_block.content:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    existing.hash, prev_content, new_block.content
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
+                            # ── Inline change summary generation ──
+                            await self._generate_change_summary(
+                                existing.hash, prev_content, new_block.content
                             )
                         continue
 
@@ -5151,12 +4831,9 @@ class Filter:
                             existing._cached_token_count = len(existing.content) // 4
                         existing._update_importance()
                         if prev_content != new_block.content:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    existing.hash, prev_content, new_block.content
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
+                            # ── Inline change summary generation ──
+                            await self._generate_change_summary(
+                                existing.hash, prev_content, new_block.content
                             )
                     continue
 
@@ -5329,22 +5006,20 @@ class Filter:
                         if any(s.calls for s in best_base.symbols):
                             state["has_any_calls"] = True
                         if prev_content != block_info["code"]:
-                            self._background_task(
-                                self._generate_change_summary(
-                                    best_base.hash, prev_content, block_info["code"]
-                                ),
-                                name="change_summary",
-                                is_llm_task=True,
+                            # ── Inline change summary generation ──
+                            await self._generate_change_summary(
+                                best_base.hash, prev_content, block_info["code"]
                             )
 
             if not is_continuation:
                 state["message_count"] += 1
             if self.valves.auto_remove_duplicate_blocks:
                 self._remove_duplicate_blocks(state, project_id)
-            self._background_task(
-                self._expire_blocks_by_time(project_id), name="expire_blocks"
-            )
 
+            # ── Inline block expiration ──
+            await self._expire_blocks_by_time(project_id)
+
+            # ── Enrichment tasks – run sequentially ──
             tasks_to_run = []
             max_tasks_per_type = 5
 
@@ -5372,23 +5047,18 @@ class Filter:
                         if len(tasks_to_run) >= max_tasks_per_type:
                             break
 
-            if tasks_to_run:
-                sem = self._secondary_llm_semaphore
-
-                async def _run_one(task_type, params):
-                    try:
-                        if task_type == "missing_summaries":
-                            await self._run_missing_summaries_task(
-                                params, self.valves.secondary_task_model, sem
-                            )
-                    except Exception as e:
-                        self._log_debug(
-                            f"Immediate enrichment task {task_type} failed: {e}"
+            # Execute enrichment tasks sequentially using main model
+            for task_type, params in tasks_to_run:
+                try:
+                    if task_type == "missing_summaries":
+                        await self._run_missing_summaries_task(
+                            params,
+                            self.valves.llm_model,  # main model
                         )
-
-                sem_enrich = asyncio.Semaphore(4)
-                async with sem_enrich:
-                    await asyncio.gather(*[_run_one(t, p) for t, p in tasks_to_run])
+                except Exception as e:
+                    self._log_debug(
+                        f"Immediate enrichment task {task_type} failed: {e}"
+                    )
 
             if (
                 self.valves.max_active_blocks > 0
@@ -5419,17 +5089,17 @@ class Filter:
                     and state["message_count"] % interval == 0
                     and state["message_count"] > 0
                 ):
-                    task = SecondaryTask(
-                        task_type="session_summary",
-                        params={
+                    # Execute session summary inline
+                    await self._run_session_summary_task(
+                        {
                             "project_id": project_id,
                             "message_count": state["message_count"],
                             "code_state_hash": self._compute_code_state_hash(
                                 project_id
                             ),
                         },
+                        self.valves.llm_model,  # main model
                     )
-                    state.setdefault("pending_secondary_tasks", []).append(task.dict())
 
             self._invalidate_lightweight_cache(project_id)
 
@@ -5496,11 +5166,7 @@ class Filter:
             if not to_summarize:
                 return
 
-            async def _summarize_with_semaphore(block):
-                async with self._low_priority_llm_semaphore:
-                    return await self._summarize_code_block(block)
-
-            tasks = [_summarize_with_semaphore(block) for _, block in to_summarize]
+            tasks = [self._summarize_code_block(block) for _, block in to_summarize]
             summaries = await asyncio.gather(*tasks)
 
             for (h, block), summary in zip(to_summarize, summaries):
@@ -5534,29 +5200,20 @@ class Filter:
             self._summarize_inactive_in_progress[project_id] = False
 
     async def _summarize_code_block(self, block: CodeBlock) -> Optional[str]:
+        """Generate a concise summary of the given code block."""
         if not self.valves.summarize_inactive_code:
             return None
-        if self.valves.defer_secondary_tasks:
-            task = SecondaryTask(
-                task_type="inactive_code_summary",
-                params={
-                    "signature": self._extract_signature(block.content),
-                    "content": block.content,
-                    "project_id": self.valves.project_id,
-                    "block_hash": block.hash,
-                },
-            )
-            state = self._get_state(self.valves.project_id)
-            if state is not None:
-                state.setdefault("pending_secondary_tasks", []).append(task.dict())
-                self._set_state(self.valves.project_id, state)
-            return None
+
         sig = self._extract_signature(block.content)
         if sig:
-            prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{block.content[:1000]}```"
+            prompt = (
+                f"The code block has signature: {sig}\n"
+                f"Provide a very brief description of what this code does.\n"
+                f"Code:\n```{block.content[:1000]}```"
+            )
         else:
             prompt = (
-                f"Summarise the following code block.\n```{block.content[:1500]}```"
+                f"Summarise the following code block.\n" f"```{block.content[:1500]}```"
             )
         return await self._call_llm(
             prompt=prompt,
@@ -6862,7 +6519,7 @@ class Filter:
     ):
         """
         Pre‑build CodePathViews for symbols likely to be relevant in the
-        next query. Runs as a background task during LLM decode.
+        next query.
 
         Prediction: high‑confidence direct callees of the top‑N activated symbols.
         """
@@ -7109,6 +6766,22 @@ class Filter:
                 "6. Reason step by step, then provide the corrected code."
             )
             parts.append(checklist)
+
+            # ── Critical reasoning guidelines (v7 – PASO-36) ─────────────
+            critical_guidelines = (
+                "## Critical reasoning guidelines\n"
+                "- Before diagnosing a bug, verify if the observed behavior matches the "
+                "expected behavior defined in the specification or codebase. "
+                "Do not confuse expected behavior with a bug.\n"
+                "- When you propose a fix, explicitly explain **why** the change resolves "
+                "the root cause and how it prevents the issue from recurring.\n"
+                "- When you propose a change (refactor, addition), explain **why** "
+                "the change is needed: what problem it solves, what benefits it brings, "
+                "and any trade-offs involved.\n"
+                "- Avoid magic numbers; define named constants with meaningful names "
+                "and derive them from a single source of truth whenever possible."
+            )
+            parts.append(critical_guidelines)
 
         # 2. Symbol index (lightweight context — stable while code unchanged)
         if is_code_session and self.valves.enable_code_awareness:
@@ -8005,7 +7678,7 @@ class Filter:
                 break
 
         # Assemble respecting Lost in the Middle:
-        # LOD‑0 + LOD‑1 (background), LOD‑2 (medium), LOD‑3 (most relevant, last)
+        # LOD‑0 + LOD‑1, LOD‑2 (medium), LOD‑3 (most relevant, last)
         parts = ["## Code Context (activation-based LOD)\n"]
         if lod0_parts:
             parts.append(
@@ -9422,52 +9095,19 @@ class Filter:
             else:
                 return "Unrecognized obsolete action."
 
-    async def _run_change_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred change summary generation."""
-        block_hash = params["block_hash"]
-        prev_content = params["prev_content"]
-        new_content = params["new_content"]
-        prompt = (
-            f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
-            f"Previous:\n```\n{prev_content[:500]}\n```\n\n"
-            f"New:\n```\n{new_content[:500]}\n```\n\n"
-            f"Change summary:"
-        )
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code change summariser. Output only one short sentence.",
-                model_override=model,
-                max_tokens=40,
-                temperature=0.1,
-                label="change_summary",
-            )
-        if summary:
-            now = time.time()
-            self._block_change_summaries[block_hash] = (summary.strip(), now)
-            if len(self._block_change_summaries) > self._MAX_CHANGE_SUMMARIES:
-                self._block_change_summaries.popitem(last=False)
-            return True
-        return False
-
-    async def _run_missing_summaries_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred missing summary generation for one symbol."""
+    async def _run_missing_summaries_task(self, params: dict, model: str) -> bool:
+        """Generate a missing summary for one symbol."""
         signature = params["signature"]
         code_snippet = params["code_snippet"]
         prompt = f"Summarize in one short sentence what this code does:\n\n```{signature}\n{code_snippet}```"
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                model_override=model,
-                max_tokens=50,
-                temperature=0.1,
-                label="missing_summaries",
-            )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+            model_override=model,
+            max_tokens=50,
+            temperature=0.1,
+            label="missing_summaries",
+        )
         if summary and summary.strip():
             project_id = params["project_id"]
             lock = await self._get_project_lock(project_id)
@@ -9481,44 +9121,7 @@ class Filter:
             return True
         return False
 
-    async def _run_inactive_code_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
-        """Execute a deferred summarisation of an inactive code block."""
-        sig = params.get("signature", "")
-        content = params["content"]
-        if sig:
-            prompt = f"The code block has signature: {sig}\nProvide a very brief description of what this code does.\nCode:\n```{content[:1000]}```"
-        else:
-            prompt = f"Summarise the following code block.\n```{content[:1500]}```"
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a code summarization assistant.",
-                model_override=model,
-                max_tokens=200,
-                temperature=0.2,
-                label="inactive_code_summary",
-            )
-        if summary and summary.strip():
-            project_id = params["project_id"]
-            block_hash = params["block_hash"]
-            lock = await self._get_project_lock(project_id)
-            async with lock:
-                state = self._get_state(project_id)
-                if block_hash in state["active_blocks"]:
-                    blk = state["active_blocks"][block_hash]
-                    summary_content = f"[Summary of inactive code]\n{summary.strip()}"
-                    blk.content = summary_content
-                    blk.importance_score *= 0.5
-                    self._invalidate_lightweight_cache(project_id)
-                    self._set_state(project_id, state)
-            return True
-        return False
-
-    async def _run_session_summary_task(
-        self, params: dict, model: str, sem: asyncio.Semaphore
-    ) -> bool:
+    async def _run_session_summary_task(self, params: dict, model: str) -> bool:
         """Generate an autobiographical session summary and store it in LTM."""
         project_id = params["project_id"]
         code_state_hash = params.get("code_state_hash", "")
@@ -9540,15 +9143,14 @@ class Filter:
             "and architectural changes:\n\n"
             f"{conversation_text[:3000]}"
         )
-        async with sem:
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
-                model_override=model,
-                max_tokens=self.valves.session_summary_max_tokens,
-                temperature=0.2,
-                label="session_summary",
-            )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
+            model_override=model,
+            max_tokens=self.valves.session_summary_max_tokens,
+            temperature=0.2,
+            label="session_summary",
+        )
         if not summary:
             return False
 
@@ -9620,10 +9222,7 @@ class Filter:
             and project_id not in self._slot_restore_attempted
             and project_id in self._static_context_block_cache
         ):
-            self._background_task(
-                self._slot_restore_if_available(project_id),
-                name="slot_restore",
-            )
+            await self._slot_restore_if_available(project_id)
 
         return messages
 
@@ -10061,8 +9660,10 @@ class Filter:
             'Answer with only one word: "full" or "summary".'
         )
 
-        # Use the secondary task model (or main model as fallback)
-        model = self.valves.secondary_task_model or self.valves.llm_model
+        # Use the main model directly
+        model = (
+            self.valves.llm_model
+        )  # <-- antes era secondary_task_model or self.valves.llm_model
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a concise classifier. Answer with only one word.",
@@ -10084,7 +9685,6 @@ class Filter:
         is_code_session: bool,
         state: dict,
         __user__: Optional[dict],
-        background_tasks: List[asyncio.Task],
         user_question: str,
         has_code_blocks: bool,
         slot_free: bool = True,
@@ -10121,7 +9721,6 @@ class Filter:
             _prelim_tok_mp = 0
             _hist_tok_mp = 0
             _available_mp_pre = self.valves.context_window_tokens
-        # ── End preamble ──────────────────────────────────────────────────
 
         _skip_intent_llm: bool = (
             self.valves.enable_multi_phase_response
@@ -10200,11 +9799,6 @@ class Filter:
             )
             cot_level = 1
             _mp_cot_degraded = True
-        # ── End multi-phase pre-check ──────────────────────────────────────
-
-        if background_tasks:
-            await asyncio.gather(*background_tasks, return_exceptions=True)
-            background_tasks.clear()
 
         if cot_any_used and not slot_free:
             self._log_debug(
@@ -10683,7 +10277,7 @@ class Filter:
                 end = time.monotonic()
             self._log_timing(step_name, start - inlet_start, end - start)
 
-        self._ensure_cleanup_task()
+        # no longer needed: self._ensure_cleanup_task()
         project_id = self._get_project_id()
 
         slot_free = True
@@ -10691,29 +10285,25 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   1. Preprocess (project switch, cache load)
-        #   2. Process pending secondary tasks (session summaries, etc.)
         #   4. Extract user info (last message, question, code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         messages = await self._inlet_preprocess(body, project_id)
-        _inlet_timing("Step 1/9: Preprocess (project switch, cache load)", step_start)
+        _inlet_timing("Step 1/8: Preprocess (project switch, cache load)", step_start)
         if not messages:
             return body
 
+        # NOTE: Steps 2 and 3 have been removed (no unload, no secondary tasks).
         step_start = time.monotonic()
-        await self._process_pending_secondary_tasks(project_id)
-        _inlet_timing("Step 2/9: Process pending secondary tasks", step_start)
-
-        # NOTE: We no longer unload models at the start; the outlet handles cleanup.
-        # Step 3 is now a no‑op for resource optimisation.
+        _inlet_timing("Step 2/8: Process pending secondary tasks – SKIPPED", step_start)
         step_start = time.monotonic()
         _inlet_timing(
-            "Step 3/9: Unload models safely (free VRAM) – SKIPPED", step_start
+            "Step 3/8: Unload models safely (free VRAM) – SKIPPED", step_start
         )
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
-        #   (continued) 4. Extract user info
+        #   4. Extract user info
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         (
@@ -10723,7 +10313,7 @@ class Filter:
             is_explicit_command,
             has_code_blocks,
         ) = await self._inlet_extract_user_info(messages)
-        _inlet_timing("Step 4/9: Extract user info", step_start)
+        _inlet_timing("Step 4/8: Extract user info", step_start)
 
         # ── Detect AutoContinue continuation ──────────────────────────────
         _last_assistant = next(
@@ -10752,8 +10342,6 @@ class Filter:
                     break
         if _is_continuation:
             slot_free = False
-            # Force code signals to be present so _build_multi_phase_instructions
-            # uses the code protocol instead of the generic long-response protocol.
             user_query = user_query + " código"
 
         # ─────────────────────────────────────────────────────────────────
@@ -10764,7 +10352,7 @@ class Filter:
         handled, handled_messages = await self._inlet_handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
-        _inlet_timing("Step 5/9: Handle explicit commands", step_start)
+        _inlet_timing("Step 5/8: Handle explicit commands", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -10784,7 +10372,7 @@ class Filter:
             last_user_msg,
             slot_free=slot_free,
         )
-        _inlet_timing("Step 6/9: Handle natural language intents", step_start)
+        _inlet_timing("Step 6/8: Handle natural language intents", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -10794,7 +10382,6 @@ class Filter:
             return body
 
         # ── Silent Ingestion (Modo B: chunked paste) ────────────────────
-        # v7 (PASO-22)
         if (
             self.valves.enable_silent_ingestion
             and last_user_msg is not None
@@ -10802,25 +10389,15 @@ class Filter:
         ):
             if await self._is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
-
-                # Process code into SymbolGraph without invoking main LLM
                 await self._update_active_code(last_user_msg, project_id)
-
-                # Resolve cross‑references with previous chunks
                 resolved = await self._resolve_dangling_edges(project_id)
-
-                # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._rebuild_path_index(project_id)
-
-                # Invalidate static block (new code → new Block A)
                 self._invalidate_static_context_block(project_id, "new chunk ingested")
 
-                # Statistics for the user
                 state = self._get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
-
                 response = (
                     f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
                     "El código está disponible en el SymbolGraph para futuras consultas. "
@@ -10844,14 +10421,14 @@ class Filter:
         is_code_session, user_question = await self._inlet_prepare_code_session(
             messages, project_id, user_query, is_continuation=_is_continuation
         )
-        _inlet_timing("Step 7/9: Prepare code session", step_start)
+        _inlet_timing("Step 7/8: Prepare code session", step_start)
 
         # ─────────────────────────────────────────────────────────────────
         # 🧠 ENRICHMENT (High value)
         #   8. Build system injections and assemble final messages
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        state = self._get_state(project_id)  # obtain state (may have been updated)
+        state = self._get_state(project_id)
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
                 messages,
@@ -10864,9 +10441,8 @@ class Filter:
                 slot_free=slot_free,
             )
         )
-        _inlet_timing("Step 8/9: Build system injections", step_start)
+        _inlet_timing("Step 8/8: Build system injections", step_start)
 
-        # If a cached response was found, return it immediately
         if cached_response:
             messages.pop()
             messages.append(
@@ -10884,7 +10460,6 @@ class Filter:
         #   9. Assemble final messages with CoT, multi-phase, trimming
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        background_tasks = []  # (no background tasks pending from this path)
         messages = await self._inlet_assemble_final_messages(
             messages,
             project_id,
@@ -10895,12 +10470,11 @@ class Filter:
             is_code_session,
             state,
             __user__,
-            background_tasks,
             user_question,
             has_code_blocks,
             slot_free=slot_free,
         )
-        _inlet_timing("Step 9/9: Assemble final messages", step_start)
+        _inlet_timing("Step 9/8: Assemble final messages", step_start)
 
         body["messages"] = messages
 
@@ -10959,7 +10533,7 @@ class Filter:
                                 "outlet: /expand intercepted — history rewritten with real code"
                             )
 
-                    # ── 🔥 STATE MANAGEMENT: update active code blocks & LTM ──
+                    # ── 🔥 STATE MANAGEMENT: update active code blocks & store in LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
                         await self._wait_for_llm_tasks()
                         if is_code_session:
@@ -10968,29 +10542,14 @@ class Filter:
                                 "(new code detected)"
                             )
                             await self._update_active_code(last_msg, project_id)
-                            async with self._ltm_batch_lock:
-                                self._pending_ltm_messages.append(last_msg)
-                                if (
-                                    self._ltm_batch_task is None
-                                    or self._ltm_batch_task.done()
-                                ):
-                                    self._ltm_batch_task = asyncio.create_task(
-                                        self._flush_ltm_batch(project_id)
-                                    )
+                            # Store immediately in LTM
+                            await self._store_ltm_messages(project_id, [last_msg])
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 self._log_debug(
                                     "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
                                 )
-                                async with self._ltm_batch_lock:
-                                    self._pending_ltm_messages.append(last_msg)
-                                    if (
-                                        self._ltm_batch_task is None
-                                        or self._ltm_batch_task.done()
-                                    ):
-                                        self._ltm_batch_task = asyncio.create_task(
-                                            self._flush_ltm_batch(project_id)
-                                        )
+                                await self._store_ltm_messages(project_id, [last_msg])
 
             # 🚀 RESOURCE OPTIMISATION: response cache storage
             if (
@@ -11010,9 +10569,6 @@ class Filter:
                     None,
                 )
                 if last_user and last_assistant:
-                    # Don't cache partial multi-phase responses (contain continuation
-                    # markers). Serving them to future similar queries would return
-                    # incomplete output with protocol markers.
                     _is_partial_mp = self.valves.enable_multi_phase_response and any(
                         marker in last_assistant.get("content", "")
                         for marker in self._MULTI_PHASE_MARKERS
@@ -11040,11 +10596,6 @@ class Filter:
                     None,
                 )
                 if last_assistant and last_assistant.get("content"):
-                    # Skip LOD adaptation for ALL multi-phase responses, not only
-                    # those with a continuation marker. Fases 1-4 (analysis, contract,
-                    # plan) are text-only and would incorrectly raise the threshold
-                    # if checked: the model doesn't reference most code symbols when
-                    # writing prose analysis, making them appear overserved.
                     _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
                         any(
                             marker in last_assistant["content"]
@@ -11064,75 +10615,53 @@ class Filter:
                             "multi-phase response (continuation marker detected)."
                         )
                     else:
-                        self._background_task(
-                            self._update_lod_thresholds_from_response(
-                                project_id,
-                                last_assistant["content"],
-                            ),
-                            name="lod_adaptive_feedback",
+                        await self._update_lod_thresholds_from_response(
+                            project_id,
+                            last_assistant["content"],
                         )
 
-            # 🚀 RESOURCE OPTIMISATION – Speculative prefetch
+            # 🚀 RESOURCE OPTIMISATION – Speculative prefetch (inline)
             if self.valves.enable_speculative_prefetch and is_code_session:
                 last_activated = getattr(self, "_last_activation_scores", {}).get(
                     project_id, {}
                 )
                 if last_activated:
-                    self._background_task(
-                        self._speculative_prefetch(project_id, last_activated),
-                        name="speculative_prefetch",
-                    )
+                    await self._speculative_prefetch(project_id, last_activated)
 
             # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
-            if self._purge_task is None or self._purge_task.done():
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Purging expired memories "
-                    "(reclaiming disk space and keeping LTM fresh)"
-                )
-                self._purge_task = asyncio.create_task(self._purge_expired_memories())
+            await self._purge_expired_memories()
 
             # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
 
-            # ── v7 (PASO-20): RAPTOR periodic rebuild ──
             if (
                 self.valves.enable_raptor
                 and self._write_counter % self.valves.raptor_rebuild_interval == 0
             ):
-                self._log_debug("RAPTOR: triggering background index rebuild")
-                self._background_task(
-                    self._rebuild_raptor_index(project_id),
-                    name="raptor_rebuild",
-                )
+                self._log_debug("RAPTOR: triggering index rebuild")
+                # Converted to sequential
+                await self._rebuild_raptor_index(project_id)
 
             if self._write_counter % 100 == 0:
                 self._log_debug(
                     "🚀 RESOURCE OPTIMISATION – Running DB checkpoints "
                     "(to ensure data durability and prevent WAL buildup)"
                 )
-                self._purge_task = asyncio.create_task(self._run_db_checkpoints())
+                await self._run_db_checkpoints()
 
             # 🚀 RESOURCE OPTIMISATION – Save KV slot if static block changed
             if self.valves.enable_slot_persistence:
-                self._background_task(
-                    self._slot_save_if_needed(project_id),
-                    name="slot_save",
-                )
+                # Sequential
+                await self._slot_save_if_needed(project_id)
 
             # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
             if self.valves.enable_edge_persistence:
-                self._background_task(
-                    self._save_symbol_edges_to_db(project_id),
-                    name="save_symbol_edges",
-                )
+                await self._save_symbol_edges_to_db(project_id)
 
             # ── Fix 4: Persistir CodePathViews ──
             if self.valves.enable_path_analysis:
-                self._background_task(
-                    self._save_path_views_to_db(
-                        project_id, self._path_index.get_all(project_id)
-                    ),
-                    name="save_path_views",
+                await self._save_path_views_to_db(
+                    project_id, self._path_index.get_all(project_id)
                 )
 
             # 🔥 STATE MANAGEMENT: persist conversation state if dirty
@@ -11199,19 +10728,6 @@ class Filter:
     # Shutdown and cleanup
     # --------------------------------------------------------------------------
     def shutdown(self):
-        # Flush pending LTM batch synchronously with a short timeout
-        if self._pending_ltm_messages:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    task = asyncio.create_task(
-                        self._flush_ltm_batch(self._get_project_id())
-                    )
-                    # Give it up to 2 seconds to complete
-                    loop.run_until_complete(asyncio.wait_for(task, timeout=2.0))
-            except Exception:
-                pass
-
         # Cancel response cache cleanup task if it exists
         if (
             hasattr(self, "_response_cache_cleanup_task")
@@ -11585,23 +11101,8 @@ class Filter:
     async def _generate_change_summary(
         self, block_hash: str, prev_content: str, new_content: str
     ):
-        """Enqueue a change summary task (or run immediately if deferral disabled)."""
-        if self.valves.defer_secondary_tasks:
-            task = SecondaryTask(
-                task_type="change_summary",
-                params={
-                    "block_hash": block_hash,
-                    "prev_content": prev_content,
-                    "new_content": new_content,
-                },
-            )
-            state = self._get_state(self.valves.project_id)
-            if state is not None:
-                state.setdefault("pending_secondary_tasks", []).append(task.dict())
-                self._set_state(self.valves.project_id, state)
-            return
-
-        model = self.valves.secondary_task_model
+        """Generate and persist a change summary immediately (no deferral)."""
+        model = self.valves.llm_model  # <-- antes era self.valves.secondary_task_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
             f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
@@ -11617,7 +11118,7 @@ class Filter:
         )
         if summary:
             now = time.time()
-            # LRU in memory
+            # In-memory LRU
             self._block_change_summaries[block_hash] = (summary.strip(), now)
             if len(self._block_change_summaries) > self._MAX_CHANGE_SUMMARIES:
                 self._block_change_summaries.popitem(last=False)
@@ -11628,7 +11129,6 @@ class Filter:
                     "INSERT OR REPLACE INTO block_change_summaries (block_hash, summary, created_at) VALUES (?, ?, ?)",
                     (block_hash, summary.strip(), now),
                 )
-                # Enforce max entries
                 self._db_conn.execute(
                     "DELETE FROM block_change_summaries WHERE block_hash NOT IN (SELECT block_hash FROM block_change_summaries ORDER BY created_at DESC LIMIT ?)",
                     (self._MAX_CHANGE_SUMMARIES,),
@@ -11636,57 +11136,3 @@ class Filter:
                 self._db_conn.commit()
 
             await self._db_write_queue.put((_write, (), {}))
-
-    # --------------------------------------------------------------------------
-    # Deferred secondary task execution
-    # --------------------------------------------------------------------------
-
-    async def _process_pending_secondary_tasks(self, project_id: str):
-        """Execute all pending secondary tasks at the start of an inlet (MUST be called under project lock)."""
-        state = self._get_state(project_id)
-        if not state or not state.get("pending_secondary_tasks"):
-            return
-
-        tasks = state["pending_secondary_tasks"]
-        self._log_debug(f"Processing {len(tasks)} pending secondary task(s)...")
-
-        remaining = []
-        for task_dict in tasks:
-            task = SecondaryTask(**task_dict)
-            success = await self._execute_secondary_task(task, project_id)
-            if not success:
-                task.retries += 1
-                if task.retries < self.valves.secondary_task_max_retries:
-                    remaining.append(task.dict())
-                else:
-                    self._log_debug(
-                        f"Dropping secondary task {task.task_type} after {task.retries} retries"
-                    )
-
-        state["pending_secondary_tasks"] = remaining
-        self._set_state(project_id, state)
-
-    async def _execute_secondary_task(
-        self, task: SecondaryTask, project_id: str
-    ) -> bool:
-        """Dispatch a secondary task to the appropriate handler (dependency_refresh removed)."""
-        model = self.valves.secondary_task_model
-        sem = self._secondary_llm_semaphore
-        try:
-            if task.task_type == "change_summary":
-                return await self._run_change_summary_task(task.params, model, sem)
-            elif task.task_type == "missing_summaries":
-                return await self._run_missing_summaries_task(task.params, model, sem)
-            elif task.task_type == "inactive_code_summary":
-                return await self._run_inactive_code_summary_task(
-                    task.params, model, sem
-                )
-            elif task.task_type == "session_summary":
-                return await self._run_session_summary_task(task.params, model, sem)
-            else:
-                return False
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log_debug(f"Secondary task {task.task_type} failed: {e}")
-            return False
