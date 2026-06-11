@@ -1254,15 +1254,13 @@ class Filter:
         #  Core
         # ═══════════════════════════════════════════════════════════════
         llm_per_call_timeout: int = Field(
-            default=5,
+            default=900,
             ge=1,
-            le=30,
             description="Timeout (seconds) for a single LLM call attempt.",
         )
         llm_retry_total_timeout: int = Field(
-            default=450,
+            default=950,
             ge=10,
-            le=300,
             description="Total time budget for retrying failed LLM calls.",
         )
         priority: int = Field(default=0)
@@ -1541,7 +1539,7 @@ class Filter:
             description="Master on/off for multi‑phase splitting.",
         )
         force_multi_phase_response: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Always inject the multi-phase protocol, regardless of remaining "
                 "token budget. Use when context_window_tokens does not match the "
@@ -4430,7 +4428,7 @@ class Filter:
             model_override=self.valves.secondary_task_model,
             max_tokens=40,
             temperature=0.2,
-            timeout=8.0,
+            timeout=self.valves.llm_per_call_timeout,
         )
         if context and context.strip():
             return f"[Context: {context.strip()}]\n\n"
