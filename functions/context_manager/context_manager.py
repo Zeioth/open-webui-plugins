@@ -1893,6 +1893,7 @@ class Filter:
         self._pending_llm_lock = asyncio.Lock()
         self._llm_cache = self._init_llm_cache()
         self._last_used_model: Optional[str] = None
+        self._main_model_ready = False
 
         # ── Tracking of active LLM tasks (prevents model switching conflicts) ──
         self._active_llm_tasks: Set[asyncio.Task] = set()
@@ -3362,8 +3363,7 @@ class Filter:
         Retries continue until *total_timeout* seconds have passed since the
         first attempt.  If *total_timeout* is None, the valve default
         ``llm_retry_total_timeout`` is used.
-        Exponential backoff is applied between retries, capped by a fraction
-        of the remaining budget.
+        Between retries, a fixed 1‑second pause is applied.
         """
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
@@ -3417,8 +3417,9 @@ class Filter:
             if model.startswith("llamacpp/"):
                 ep_type = self.valves.llamacpp_endpoint_type
 
-            base_delay = 1.0
-            max_delay = min(30.0, effective_total_timeout * 0.1)
+            # ── Fixed retry delay: 1 second ─────────────────────────
+            RETRY_DELAY = 1.0
+            # ─────────────────────────────────────────────────────────
 
             if self.tokenizer:
                 prompt_tokens = len(self.tokenizer.encode(prompt))
@@ -3426,7 +3427,6 @@ class Filter:
                     f"LLM call to {model}{label_str} – prompt size: ~{prompt_tokens} tokens"
                 )
 
-            # ── Register this task as an active LLM user ──
             task = asyncio.current_task()
             async with self._active_llm_tasks_lock:
                 self._active_llm_tasks.add(task)
@@ -3440,7 +3440,6 @@ class Filter:
                         while time.monotonic() < deadline:
                             attempt += 1
                             try:
-                                # Use class-level semaphore for concurrency safety
                                 async with self._llm_semaphore:
                                     content = await _shared_call_llm(
                                         prompt=prompt,
@@ -3473,26 +3472,30 @@ class Filter:
                                         f" took {time.monotonic() - t_start:.3f}s"
                                     )
                                     return content
+                                else:
+                                    reason = "empty response"
                             except asyncio.CancelledError:
                                 raise
                             except RuntimeError as exc:
-                                if any(
+                                reason = f"RuntimeError: {exc}"
+                                if not any(
                                     c in str(exc)
                                     for c in ("429", "500", "502", "503", "504")
                                 ):
-                                    pass
-                                else:
+                                    self._log_debug(
+                                        f"[LLM] {model}{label_str} attempt {attempt} failed "
+                                        f"with non-retryable error: {exc}"
+                                    )
                                     break
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                reason = f"{type(exc).__name__}: {exc}"
 
-                            wait = min(base_delay * (2 ** (attempt - 1)), max_delay)
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 break
-                            wait = min(wait, remaining)
+                            wait = min(RETRY_DELAY, remaining)
                             self._log_debug(
-                                f"[LLM] {model}{label_str} attempt {attempt} failed, "
+                                f"[LLM] {model}{label_str} attempt {attempt} failed ({reason}), "
                                 f"retrying in {wait:.1f}s (deadline in {remaining:.0f}s)"
                             )
                             await asyncio.sleep(wait)
