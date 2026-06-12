@@ -25,18 +25,21 @@ Mermaid renderer plugin is available.
 Given context size increases inference time quadratically, even after context compression we need to process the right amount of context
 per message.
 
-### 📊 Results Considering Context Degradation
-Given an example where we want to refactor 7.000 lines of code.
+## Current complexity
+Our performance and complexity are state of the art right now.
 
-| Chunk Size (P) | Chunks (N) | Steady-State Context (C) | MTP Throughput (t/s) | Time per Chunk (s) | Total Time (min) |
-|---------------:|-----------:|-------------------------|---------------------:|-------------------:|-----------------:|
-| 2,000 | 40 | 15,000 + 4,000 + 38×150 = 24,700 | ~100 (interpolated) | 20 s | 13.3 min + 120 s overhead ≈ 15.3 min |
-| 4,000 | 20 | 15,000 + 8,000 + 18×150 = 25,700 | ~97 | 41 s | 13.7 min + 60 s overhead ≈ 14.7 min |
-| 6,000 | 14 | 15,000 + 12,000 + 12×150 = 28,800 | ~87 | 69 s | 15.3 min + 42 s overhead ≈ 16.0 min |
-| 8,000 | 10 | 15,000 + 16,000 + 8×150 = 32,200 | ~80 | 100 s | 16.7 min + 30 s overhead ≈ 17.2 min |
-| 10,000 | 8 | 15,000 + 20,000 + 6×150 = 35,900 | ~72 | 139 s | 18.5 min + 24 s overhead ≈ 18.9 min |
-| 12,000 | 7 | 15,000 + 24,000 + 5×150 = 39,750 | ~64 | 188 s | 20.8 min + 21 s overhead ≈ 21.2 min |
-| 16,000 | 5 | 15,000 + 32,000 + 3×150 = 47,450 | ~50 | 320 s | 26.7 min + 15 s overhead ≈ 27.0 min |
+| Component | Complexity |
+|-----------|------------|
+| Turn 1 prefill (cold) | O(K²), where K ≈ initial tokens (full symbol index + instructions) → ~400M ops for 20k tokens |
+| Turn N prefill (warm) | O(Δ²), where Δ ≈ newly added tokens in the turn (question + newly activated LOD code) → constant cost per turn (~9M ops) thanks to persistent KV cache |
+| Total KV cache | O(n), growing with session length, because Block A remains stable but conversation history and active blocks accumulate without aggressive eviction |
+| Conversation history in context | O(T), linear with the number of turns (even when compressed with placeholders, it is not completely removed) |
+| Code injection | O(k_activated × LOD) → bounded by design (active blocks remain below a threshold) |
+| LTM retrieval | O(log m) with HNSW, and O(levels) with RAPTOR |
+| Total session cost over T turns | O(T³) in the worst case, because: |
+|  | - The prefill of each turn grows linearly with accumulated history (n ≈ T), while prefill itself is O(n²). |
+|  | - Summing across T turns: Σ(i²) = O(T³). |
+|  | - In practice, a warm KV cache reduces each prefill to O(Δ²), but the KV cache itself still grows as O(n), eventually causing hard eviction or generation slowdown. |
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
