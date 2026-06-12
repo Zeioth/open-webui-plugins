@@ -28,15 +28,16 @@ per message.
 ## Current complexity
 Our performance and complexity are state of the art right now. As close to linear complexity as humanly possible in 2026.
 
-| Component | ~v1.9.0 | >v2.0.0 | True O(1) | What Is Still Needed for O(1)? |
-|-----------|-------------------|---------------|-----------|-------------------------------|
-| Prefill per turn | O((n·T)²) | O(K²) = O(1) ✓ | O(1) ✓ | Already solved (fixed K ≈ 11k) |
-| KV cache | O(n·T) | O(K) = O(1) ✓ | O(1) ✓ | Already solved (paging + reduced Block A) |
-| Conversation history in context | O(T) | O(K) = O(1) ✓ | O(1) ✓ | Already solved (LLMLingua + placeholders) |
-| Graph activation (PPR) | O(V + E) | O(V + E) unchanged | O(1) | Precompute static centrality or use a GNN |
-| LTM retrieval | O(log M) | O(log log M) with RAPTOR | Expected O(1) | Use LSH instead of HNSW |
-| Token generation | O(K) | O(K) unchanged | O(1) | Switch to a recurrent architecture (Mamba, RWKV) |
-| Total session cost | O(T³) | O(T) | O(1) | Combine all of the above + a recurrent model |
+| Component | ~v1.9.0 (Current State) | ≥ v2.0.0 (After Applying the 5 Techniques) | Notes |
+|------------|-------------------------|--------------------------------------------|-------|
+| Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops | O(K₂²) with K₂ ≈ 11k → ~121M ops | Reduced through a smaller Block A (hub symbols only). |
+| Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) | No change (slot persistence was already implemented). |
+| Total KV cache | O(n) growth → eventually OOM in long sessions | O(K) constant → ~11k fixed tokens | Achieved through paging + reduced Block A. |
+| Conversation history in context | O(T) linear → grows without bound | O(K) constant → ~4k compressed tokens | Achieved with LLMLingua-2 applied to the entire conversation history. |
+| Graph activation (PPR) | O(V + E) → microseconds (negligible) | O(V + E) → unchanged (microseconds) | No optimization required; the cost is already insignificant. |
+| LTM retrieval | O(log M) with HNSW | O(log log M) with RAPTOR + HNSW | Practical improvement without recall loss. |
+| Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token | Improvement comes from a smaller constant factor (reduced Block A). |
+| Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) | O(T) linear | Qualitative leap: each turn now has constant cost. |
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
