@@ -26,7 +26,7 @@ Given context size increases inference time quadratically, even after context co
 per message.
 
 ## Current complexity
-Our performance and complexity are state of the art right now.
+Our performance and complexity are state of the art right now. As close to linear complexity as humanly possible in 2026.
 
 | Component | Complexity |
 |-----------|------------|
