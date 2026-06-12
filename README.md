@@ -43,3 +43,7 @@ Given an example where we want to refactor 7.000 lines of code.
 
 ## CRITICAL TODOS
 - Even though it's true web content is quickly outdated, it would be interesting at lest generating an interactive knowledge of a certain size. For example, if we use search to search for papers about AI context compression techniques, it would be valuable to create a knoledge base (at last in sqlite). For single user it's unlikely to hit in a meaningful way, but it's ok to consider this feature.
+
+## Future techniques
+* State space models like mamba or nanotron: They actually perform worse for coding tasks atm, but very likely this tech will allow 1m context models in the future, once they solve the performance issues.
+* H20: Once implemented on llama (if ever) it should provide x4 filling performance.
