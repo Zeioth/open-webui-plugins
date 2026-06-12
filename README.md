@@ -39,6 +39,8 @@ Our performance and complexity are state of the art right now. As close to linea
 | Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token | 
 | Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) | O(T) linear |
 
+That's a x1.5 - x1.9 performance increase overall on 1-10 messages sessions , and 13x in 30+ message sessions!
+
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
 
