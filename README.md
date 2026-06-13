@@ -53,9 +53,9 @@ The value of log log M grows extremely slowly. For example:
 
 As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of the system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudo-constant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
 
-### Why it's constant time in practice
+### Techlically lineal complexity, but constant complexity in real life
 
-The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal]. This is the best we can do. And no new technology or techniques can improve it as far as we know, as this is unavoidable in an interactive chat.
+The average cost of each turn is **[constant]**. In order to be mathematically precise, we say it's **[linear]** because a chat session is technically infinite, and given the initial prompt we will iterate n times. But in practice our system has **[constant]** complexity. This is the best we can do. And no new technology or techniques can improve it as far as we know, as this is unavoidable in an interactive chat.
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
