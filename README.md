@@ -41,7 +41,7 @@ Our performance and complexity are state of the art right now. As close to linea
 
 > That's a **x1.5 - x1.9** performance on 1-10 message sessions , and **13x** in 30+ message sessions!
 
-### 🧠 Why is it considered pseudoconstant?
+### 🧠 What is considered pseudo-constant?
 
 The value of log log M grows extremely slowly. For example:
 
@@ -52,6 +52,8 @@ The value of log log M grows extremely slowly. For example:
     With M = 10¹² (one trillion), log₂(log₂(10¹²)) ≈ log₂(40) ≈ 5.3.
 
 As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of your system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudoconstant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
+
+### Why it's constant time in practice
 
 The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal]. This is the best we can do. And no new technology or techniques can improve it as far as we know, as this is unavoidable in an interactive chat.
 
