@@ -55,7 +55,7 @@ As you can see, even if M grows by a factor of one trillion, the search cost onl
 
 The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal].
 
-This is the best we can do. In order to go [sub-lineal], we would need to process all turns only once, which is not possible with the current technology (until mamba models are a thing).
+This is the best we can do. In order to go [sub-lineal], we would need to process all turns only once, which is not possible with the current technology (until state space models like mamba actually perform well).
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
