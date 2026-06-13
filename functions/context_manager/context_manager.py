@@ -3567,6 +3567,124 @@ class LongTermMemory:
         )
         self._f._log_debug("LTM ready")
 
+    async def find_cached_response(
+        self, query: str, context_hash: str, state: dict
+    ) -> Optional[dict]:
+        if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
+            return None
+        col = getattr(self._f, "_response_cache_collection", None)
+        if col is None:
+            return None
+
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
+        )
+        results = await anyio.to_thread.run_sync(
+            lambda: col.query(
+                query_embeddings=[query_vec],
+                n_results=1,
+                where={"project_id": self._f.valves.project_id},
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        if not results or not results["ids"] or not results["ids"][0]:
+            return None
+
+        dist = results["distances"][0][0]
+        similarity = 1.0 - (dist / 2.0)
+        if similarity < self._f.valves.response_cache_similarity_threshold:
+            return None
+
+        meta = results["metadatas"][0][0]
+        stored_code_state = meta.get("code_state_hash", "")
+        if (
+            stored_code_state
+            and stored_code_state
+            != self._f._activation.compute_code_state_hash(self._f.valves.project_id)
+        ):
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        ttl = self._f.valves.response_cache_ttl_hours * 3600
+        ts = meta.get("timestamp", 0)
+        if ttl > 0 and time.time() - ts > ttl:
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        doc = results["documents"][0][0]
+        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
+
+    async def find_duplicate_question(
+        self, query: str, project_id: str
+    ) -> Optional[dict]:
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
+            return None
+        if not query or len(query.strip()) < 15:
+            return None
+        try:
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(query[:1000]).tolist()
+            )
+            now = time.time()
+            where = {
+                "$and": [
+                    {"project_id": {"$eq": project_id}},
+                    {"role": {"$eq": "user"}},
+                    {
+                        "timestamp": {
+                            "$gt": time.time()
+                            - self._f.valves.duplicate_question_lookback_hours * 3600
+                        }
+                    },
+                ]
+            }
+            results = await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=self._f.valves.duplicate_question_lookback,
+                    where=where,
+                    include=["documents", "metadatas", "distances"],
+                )
+            )
+            if not results or not results["ids"] or not results["ids"][0]:
+                return None
+
+            best_candidate = None
+            best_sim = 0.0
+            for i, doc in enumerate(results["documents"][0]):
+                dist = results["distances"][0][i]
+                sim = 1.0 - (dist / 2.0)
+                if sim >= self._f.valves.duplicate_question_threshold and doc != query:
+                    pairs = [(query[:500], doc[:500])]
+                    ce_score = await self._f._commands._predict_cross_encoder(pairs)
+                    if ce_score is None:
+                        self._f._log_debug(
+                            "_find_duplicate_question: CrossEncoder not loaded, "
+                            "using cosine similarity only (higher false positive risk)."
+                        )
+                        best_candidate = (sim, doc, None)
+                        break
+                    if ce_score[0] > 0.85:
+                        best_candidate = (sim, doc, ce_score[0])
+                        break
+
+            if best_candidate:
+                sim, doc, ce = best_candidate
+                log_msg = f"Duplicate question found (cosine={sim:.3f}"
+                if ce is not None:
+                    log_msg += f", crossencoder={ce:.3f}"
+                log_msg += ")"
+                self._f._log_debug(log_msg)
+                return {"sim": sim, "doc": doc}
+
+        except Exception as e:
+            self._f._log_debug(f"Error in duplicate question detection: {e}")
+        return None
+
     async def retrieve_memories_unified(
         self, query: str, project_id: str, slot_free: bool = True
     ) -> list:
@@ -4010,6 +4128,71 @@ class LLMOrchestrator:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    async def _maybe_unload_for_model(
+        self, model_name: str, base_url: str, is_ollama: bool
+    ) -> None:
+        """
+        Unload models only if switching to a *different* auxiliary model.
+        The main model (self._f.valves.llm_model) is NEVER unloaded to preserve its KV cache.
+        """
+        if is_ollama:
+            return
+
+        main_model = self._f.valves.llm_model
+
+        async with self._f._model_lock:
+            current_model = self._f._last_used_model
+
+        if model_name == main_model:
+            if current_model is None:
+                self._f._log_debug(
+                    f"Loading main model '{model_name}' for the first time"
+                )
+            else:
+                self._f._log_debug(
+                    f"Keeping main model '{model_name}' loaded (no unload)"
+                )
+            return
+
+        if current_model == main_model:
+            self._f._log_debug(
+                f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
+            )
+            return
+
+        if current_model is not None and model_name != current_model:
+            self._f._log_debug(
+                f"Switching auxiliary model from '{current_model}' to '{model_name}'"
+            )
+            try:
+                await _shared_unload_all_models(base_url)
+                self._f._log_debug("Auxiliary model unloaded before switching")
+                async with self._f._model_lock:
+                    self._f._last_used_model = None
+            except Exception as e:
+                self._f._log_debug(f"Unload via shared_resources failed: {e}")
+        elif current_model is None:
+            self._f._log_debug(
+                f"Loading auxiliary model '{model_name}' (no model was loaded)"
+            )
+        else:
+            self._f._log_debug(
+                f"Reusing auxiliary model '{model_name}' (already loaded)"
+            )
+
+    async def _acquire_llm_lock(self):
+        """Acquire an inter‑process file lock for exclusive LLM access."""
+        loop = asyncio.get_event_loop()
+        fd = open(_llm_lock_path, "w")
+        await loop.run_in_executor(self._f._db_executor, fcntl.flock, fd, fcntl.LOCK_EX)
+        return fd
+
+    @staticmethod
+    def _release_llm_lock(fd):
+        """Release the inter‑process file lock and close the file descriptor."""
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
     def init_cache(self) -> None:
         """Return the shared AsyncLRUCache instance for LLM response caching."""
         self._f._llm_cache = _AsyncLRUCache(
@@ -4209,7 +4392,7 @@ class LLMOrchestrator:
                 "The user only needs a summary, brief explanation, or high-level overview.",
             ),
         ]
-        scores = await self._f._predict_cross_encoder(pairs)
+        scores = await self._f._commands._predict_cross_encoder(pairs)
         if scores is None:
             self._f._log_debug(
                 "_should_keep_full_code: CrossEncoder not loaded, keeping full code by default."
@@ -4912,20 +5095,68 @@ class CommandRouter:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
+        if self._f._cross_encoder is None:
+            if not self._f._cross_encoder_unavailable_logged:
+                self._f._log_debug(
+                    "CrossEncoder not loaded – predictions will return None."
+                )
+                self._f._cross_encoder_unavailable_logged = True
+            return None
+        async with self._f._cross_encoder_lock:
+            return await anyio.to_thread.run_sync(self._f._cross_encoder.predict, pairs)
+
+    async def _detect_contradictions(self, messages: list) -> Optional[str]:
+        if not self._f.valves.enable_contradiction_detection or len(messages) < 3:
+            return None
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if not last_user:
+            return None
+        history = messages[:-1]
+        if not history:
+            return None
+        history_text = "\n".join(
+            [f"{m['role']}: {m['content']}" for m in history if m.get("content")]
+        )
+        if not history_text.strip():
+            return None
+
+        new_msg = last_user["content"][:500]
+        hist = history_text[-2000:]
+        pairs = [
+            (
+                f"History: {hist}\n\nNew message: {new_msg}",
+                "The new message contradicts a previous statement or decision.",
+            ),
+            (
+                f"History: {hist}\n\nNew message: {new_msg}",
+                "The new message is consistent with the history.",
+            ),
+        ]
+        scores = await self._predict_cross_encoder(pairs)
+        if scores is None:
+            self._f._log_debug(
+                "_detect_contradictions: CrossEncoder not loaded, "
+                "skipping contradiction detection."
+            )
+            return None
+        if scores[0] > scores[1]:
+            return (
+                "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
+                "Please review and clarify if needed."
+            )
+        return None
+
     async def classify_intent(self, user_query: str, project_id: str) -> dict:
-        """
-        Classify the user's intent into a continuous weight vector.
-        Uses the CrossEncoder exclusively (instant CPU inference, no LLM call).
-        Returns a dict with keys "explain", "modify", "debug", "refactor"
-        that sum to ~1.0.
-        """
         pairs = [
             (user_query[:500], "The user wants to understand or explain code."),
             (user_query[:500], "The user wants to modify, fix, or create code."),
             (user_query[:500], "The user is debugging an error or exception."),
             (user_query[:500], "The user wants to refactor or restructure code."),
         ]
-        raw = await self._f._predict_cross_encoder(pairs)
+        raw = await self._predict_cross_encoder(pairs)
         if raw is None:
             self._f._log_debug(
                 "Intent: CrossEncoder not available, using default distribution."
@@ -5044,7 +5275,7 @@ class CommandRouter:
             )
             return False, None
 
-        intents = await self._f._parse_all_intents(last_user_msg.get("content", ""))
+        intents = await self._parse_all_intents(last_user_msg.get("content", ""))
         for intent_type in ("forget", "remember", "obsolete"):
             fi = intents.get(intent_type, {})
             if fi.get("action") in (None, "none"):
@@ -5065,6 +5296,60 @@ class CommandRouter:
             return True, self._f._ensure_last_message_is_user(messages)
 
         return False, None
+
+    async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
+        if not self._f.valves.enable_natural_language_forget:
+            none = {"action": "none"}
+            return {"forget": none, "remember": none, "obsolete": none}
+
+        code_spans = await self._f._code_blocks.get_code_spans(user_message)
+        cleaned = CodeBlockManager.remove_code_spans(user_message, code_spans).strip()
+
+        model = (
+            self._f.valves.natural_language_forget_model
+            or self._f.valves.llm_model
+            or self._f.valves.summarization_model
+        )
+        prompt = (
+            "You are a command parser for a code assistant. Analyze the user message and detect "
+            "ALL of these intents simultaneously.\n\n"
+            "FORGET actions: forget_last, forget_n (n=int), forget_file (file=str), "
+            "forget_block (hash=str), forget_all\n"
+            "REMEMBER/PIN actions: pin_last, pin_n (n=int), pin_file (file=str), "
+            "pin_block (description=str), pin_all, unpin_last, unpin_file, unpin_all\n"
+            "OBSOLETE actions: obsolete_last, obsolete_n (n=int), obsolete_file (file=str), "
+            "obsolete_block (hash=str), obsolete_all, revive_last, revive_file, revive_all\n\n"
+            f'User message (code removed): "{cleaned[:400]}"\n\n'
+            "Output JSON with exactly three keys. Use action='none' when not detected:\n"
+            '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
+            "Output only JSON."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You output JSON only.",
+            model_override=model,
+            max_tokens=200,
+            temperature=0.0,
+            label="parse_intents",
+        )
+
+        none = {"action": "none"}
+        if not response:
+            return {"forget": none, "remember": none, "obsolete": none}
+        try:
+            text = response.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            data = json.loads(text)
+            return {
+                "forget": data.get("forget", none),
+                "remember": data.get("remember", none),
+                "obsolete": data.get("obsolete", none),
+            }
+        except Exception:
+            return {"forget": none, "remember": none, "obsolete": none}
 
     async def outlet_intercept_expand(
         self,
@@ -5150,17 +5435,10 @@ class CommandRouter:
         return None
 
     async def is_code_only_message(self, content: str) -> bool:
-        """
-        Detect messages that contain only code without a question.
-        Uses a fast path for large raw code pastes (no fences) based on
-        Python structural line ratio and optional CrossEncoder intent check
-        on the non‑code prose.
-        """
         if not content or len(content.strip()) < 20:
             return False
 
-        # ── Fast path: large raw code paste without fences ──────────────
-        estimated_tokens = self._f._estimate_code_tokens(content)
+        estimated_tokens = self._f._tokens.estimate_code_tokens(content)
         if estimated_tokens >= self._f.valves.lean_user_code_min_tokens:
 
             _PY_STRUCTURAL = re.compile(
@@ -5198,7 +5476,7 @@ class CommandRouter:
                 (prose_text, "The user is asking a question or making a request."),
                 (prose_text, "This text contains no user question or request."),
             ]
-            scores = await self._f._predict_cross_encoder(pairs)
+            scores = await self._predict_cross_encoder(pairs)
             if scores is None:
                 self._f._log_debug(
                     "_is_code_only_message: CrossEncoder not available, "
@@ -5228,8 +5506,7 @@ class CommandRouter:
             )
             return code_ratio > 0.07
 
-        # ── Original logic for fenced blocks or smaller messages ──
-        code_blocks, _ = await self._f._extract_code_blocks(content)
+        code_blocks, _ = await self._f._code_blocks.extract_code_blocks(content)
         if not code_blocks:
             return False
         spans = await self._f._get_code_spans(content)
@@ -5261,7 +5538,39 @@ class CodeBlockManager:
     """Extraction, classification, deduplication, and diff application."""
 
     def __init__(self, filter_ref: "Filter") -> None:
+        self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
         self._f = filter_ref
+
+    # ── Block extraction ─────────────────────────────────────────────────
+
+    async def get_code_spans(self, content: str) -> List[Tuple[int, int]]:
+        """Return tree‑sitter code spans for the given content (cached)."""
+        if not HAS_TREE_SITTER:
+            return []
+        cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
+        if cache_key in self._code_spans_cache:
+            return self._code_spans_cache[cache_key]
+        try:
+            config = ProcessConfig()
+            blocks = process(content, config)
+            spans = [(b.start_byte, b.end_byte) for b in blocks]
+        except Exception:
+            spans = []
+        if len(self._code_spans_cache) >= 200:
+            keys_to_evict = list(self._code_spans_cache.keys())[:50]
+            for key in keys_to_evict:
+                del self._code_spans_cache[key]
+        self._code_spans_cache[cache_key] = spans
+        return spans
+
+    @staticmethod
+    def remove_code_spans(content: str, spans: List[Tuple[int, int]]) -> str:
+        """Replace code regions with spaces."""
+        chars = list(content)
+        for start, end in spans:
+            for i in range(start, min(end, len(chars))):
+                chars[i] = " "
+        return "".join(chars)
 
     async def extract_code_blocks(
         self, content: str
@@ -5374,6 +5683,47 @@ class CodeBlockManager:
             return "javascript"
         return "unknown"
 
+    # ── Content classification ───────────────────────────────────────────
+
+    def classify_content(self, content: str, extracted_blocks: list) -> "ContentType":
+        """Classify a user/assistant message into one of the ContentType categories."""
+        cl = content.lower()
+        if self._f.diff_pattern.search(content) or "diff --git" in content:
+            return ContentType.PROPOSED_CHANGE
+        if self._f.commit_pattern.search(content):
+            return (
+                ContentType.COMMITTED_CHANGE
+                if ("applied" in cl or "committed" in cl or "merged" in cl)
+                else ContentType.PROPOSED_CHANGE
+            )
+        if (
+            "traceback" in cl
+            or ('file "' in cl and "line " in cl)
+            or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
+        ):
+            return ContentType.ERROR
+        if '"tool_calls"' in content or '"function"' in content:
+            return ContentType.TOOL_CALL
+        for blk in extracted_blocks:
+            if blk["language"] in [
+                "python",
+                "javascript",
+                "typescript",
+                "go",
+                "rust",
+                "java",
+                "cpp",
+            ]:
+                if (
+                    "def " in blk["code"]
+                    or "class " in blk["code"]
+                    or "function " in blk["code"]
+                ):
+                    return ContentType.BASE_CODE
+        return ContentType.GENERAL
+
+    # ── Similarity & deduplication ───────────────────────────────────────
+
     def calculate_code_similarity(self, code1: str, code2: str) -> float:
         """Compute structural (AST) similarity for Python, fallback to token-sort ratio."""
         if (
@@ -5440,41 +5790,6 @@ class CodeBlockManager:
         union = sum(max(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
         return intersection / union if union > 0 else 0.0
 
-    def extract_file_paths(self, content: str) -> list:
-        """Extract all file paths matching the configured pattern from content."""
-        if not self._f.valves.track_file_paths:
-            return []
-        matches = re.findall(self._f.valves.file_path_pattern, content)
-        return [m[0] if isinstance(m, tuple) else m for m in matches]
-
-    def extract_file_paths(self, content: str) -> list:
-        """Extract all file paths matching the configured pattern from content."""
-        if not self._f.valves.track_file_paths:
-            return []
-        matches = re.findall(self._f.valves.file_path_pattern, content)
-        return [m[0] if isinstance(m, tuple) else m for m in matches]
-
-    def extract_file_path_for_block(
-        self, content: str, block_start: int
-    ) -> Optional[str]:
-        """Try to find a file path associated with a code block by scanning backwards."""
-        if block_start <= 0:
-            return None
-        before = content[:block_start]
-        lines = before.splitlines()
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            match = re.search(self._f.valves.file_path_pattern, line)
-            if match:
-                return match.group(1) if match.lastindex else match.group(0)
-            file_path, _, _ = self._f._extract_line_range(line)
-            if file_path:
-                return file_path
-            break
-        return None
-
     def remove_duplicate_blocks(self, state: dict, project_id: str) -> None:
         """Remove duplicate or near‑duplicate code blocks from the active set."""
         if not self._f.valves.auto_remove_duplicate_blocks:
@@ -5538,7 +5853,54 @@ class CodeBlockManager:
             state["has_any_calls"] = any(
                 any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
             )
-            self._f._invalidate_lightweight_cache(project_id)
+            self._f._activation.invalidate_lightweight_cache(project_id)
+
+    # ── File path extraction ─────────────────────────────────────────────
+
+    def extract_file_paths(self, content: str) -> list:
+        """Extract all file paths matching the configured pattern from content."""
+        if not self._f.valves.track_file_paths:
+            return []
+        matches = re.findall(self._f.valves.file_path_pattern, content)
+        return [m[0] if isinstance(m, tuple) else m for m in matches]
+
+    def extract_file_path_for_block(
+        self, content: str, block_start: int
+    ) -> Optional[str]:
+        """Try to find a file path associated with a code block by scanning backwards."""
+        if block_start <= 0:
+            return None
+        before = content[:block_start]
+        lines = before.splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(self._f.valves.file_path_pattern, line)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+            file_path, _, _ = self._extract_line_range(line)
+            if file_path:
+                return file_path
+            break
+        return None
+
+    def _extract_line_range(
+        self, content: str
+    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        if not self._f.valves.track_line_numbers:
+            return None, None, None
+        pattern = r"(?:^|\s)([^\s:]+\.\w+):(\d+)(?:-(\d+))?"
+        match = re.search(pattern, content)
+        if match:
+            return (
+                match.group(1),
+                int(match.group(2)),
+                int(match.group(3)) if match.group(3) else int(match.group(2)),
+            )
+        return None, None, None
+
+    # ── Utilities ────────────────────────────────────────────────────────
 
     @staticmethod
     def sanitize_text(text: str) -> str:
@@ -5546,6 +5908,8 @@ class CodeBlockManager:
         cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
         cleaned = cleaned.replace("`", "'")
         return cleaned
+
+    # ── Proposed changes & diffs ─────────────────────────────────────────
 
     def has_conflicting_proposed_changes(
         self, state: dict, new_block: "CodeBlock"
@@ -5602,7 +5966,7 @@ class CodeBlockManager:
             base_block.is_active = True
             base_block.potentially_affected = False
             base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
-            self._f._invalidate_lightweight_cache(project_id)
+            self._f._activation.invalidate_lightweight_cache(project_id)
             return True
         return False
 
@@ -5663,6 +6027,8 @@ class CodeBlockManager:
             logger.warning("No hunks were applied from the unified diff")
             return None
         return "\n".join(result_lines)
+
+    # ── Data flow edges ──────────────────────────────────────────────────
 
     def extract_data_flow_edges(
         self, code: str, file_path: Optional[str], project_id: str
@@ -5919,18 +6285,161 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Activation graph building
     # ═══════════════════════════════════════════════════════════════════════════
+    def _extract_query_seeds(
+        self, query: str, project_id: str
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Extract seed symbols from the query.
+        Returns (exact_matches, partial_matches).
+        """
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        query_words = set(re.findall(r"\b\w+\b", query))
+
+        exact = list(all_names.intersection(query_words))
+
+        partial = []
+        if len(exact) < 3:
+            for word in query_words:
+                if len(word) < 4:
+                    continue
+                for name in all_names:
+                    if word.lower() in name.lower() and name not in exact:
+                        partial.append(name)
+                        break
+            partial = partial[:5]
+
+        return exact, partial
+
+    def _extract_traceback_seeds(
+        self, content: str, project_id: str
+    ) -> List[Tuple[str, float]]:
+        """
+        Extract function names from a traceback with scores proportional
+        to their depth in the call stack.
+        """
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return []
+
+        frames: List[str] = []
+
+        # Python traceback
+        py_pattern = re.compile(
+            r'File\s+"[^"]+",\s+line\s+\d+,\s+in\s+(\w+)',
+            re.MULTILINE,
+        )
+        for match in py_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names and func != "<module>":
+                frames.append(func)
+
+        # JavaScript / TypeScript
+        js_pattern = re.compile(
+            r"\bat\s+(\w+)\s*\([^)]*:\d+:\d+\)",
+            re.MULTILINE,
+        )
+        for match in js_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names:
+                frames.append(func)
+
+        # Java / Kotlin
+        java_pattern = re.compile(
+            r"\bat\s+[\w.]+\.(\w+)\(\w+\.(?:java|kt):\d+\)",
+            re.MULTILINE,
+        )
+        for match in java_pattern.finditer(content):
+            func = match.group(1)
+            if func in all_names:
+                frames.append(func)
+
+        if not frames:
+            return []
+
+        seen: Set[str] = set()
+        unique_frames: List[str] = []
+        for f in frames:
+            if f not in seen:
+                seen.add(f)
+                unique_frames.append(f)
+
+        n = len(unique_frames)
+        results = []
+        for i, func_name in enumerate(unique_frames):
+            score = 0.5 + 0.5 * (i / max(n - 1, 1))
+            specificity = self._f._compute_node_specificity(func_name, project_id)
+            adjusted = min(1.0, score * min(specificity, 1.5))
+            results.append((func_name, adjusted))
+
+        self._f._log_debug(
+            f"Traceback seeds: {len(results)} frame(s) detected "
+            f"({[r[0] for r in results]})"
+        )
+        return results
+
+    def _compute_node_specificity(self, symbol_name: str, project_id: str) -> float:
+        """
+        IDF-like specificity of a symbol.
+        Symbols appearing in many blocks are less specific (like stop-words).
+        Returns a multiplier in [0.1, 3.0] to adjust its weight as a seed.
+        """
+        import math
+
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        total = max(len(all_names), 1)
+        n_blocks = len(self._f._symbol_index.find_blocks(symbol_name, project_id))
+        if n_blocks == 0:
+            return 1.0
+        specificity = math.log(total / n_blocks) + 1.0
+        return max(0.1, min(3.0, specificity))
+
+    def _extract_history_seeds(
+        self, messages: Optional[List[dict]], project_id: str, lookback: int = 6
+    ) -> Dict[str, float]:
+        """
+        Extract symbols with high mention frequency in recent messages.
+        Returns {symbol_name: boost_score} where boost_score ∈ (0.0, 0.6].
+        """
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_names or not messages:
+            return {}
+
+        recent = messages[-lookback:] if len(messages) > lookback else messages
+        mention_counts: Counter = Counter()
+
+        for msg in recent:
+            content = msg.get("content", "")
+            if not content:
+                continue
+            words = set(re.findall(r"\b\w+\b", content))
+            for sym in all_names.intersection(words):
+                mention_counts[sym] += 1
+
+        if not mention_counts:
+            return {}
+
+        max_count = max(mention_counts.values())
+        return {
+            sym: min(
+                self._f.valves.history_seeds_max_boost,
+                self._f.valves.history_seeds_max_boost * (count / max_count),
+            )
+            for sym, count in mention_counts.items()
+            if count > 0
+        }
+
     def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
     ) -> Tuple[List[str], List[str], List[Tuple[str, float]], Dict[str, float]]:
         """Extract exact, partial, traceback and historical seed symbols from the query."""
-        exact_seeds, partial_seeds = self._f._extract_query_seeds(query, project_id)
+        exact_seeds, partial_seeds = self._extract_query_seeds(query, project_id)
         tb_seeds = (
-            self._f._extract_traceback_seeds(query, project_id)
+            self._extract_traceback_seeds(query, project_id)
             if self._f.valves.enable_traceback_activation
             else []
         )
         history_boosts = (
-            self._f._extract_history_seeds(
+            self._extract_history_seeds(
                 messages, project_id, lookback=self._f.valves.history_seeds_lookback
             )
             if (self._f.valves.enable_history_seeds and messages)
@@ -5950,25 +6459,20 @@ class ActivationEngine:
         """Build activation graph when multi‑seed activation is disabled."""
         ag = ActivationGraph()
 
-        # Score exact seeds
         if exact_seeds:
             for sym_name in exact_seeds:
-                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 ag._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=score, depth=0, source="seed"
                 )
-
-        # Score partial seeds
         if partial_seeds:
             for sym_name in partial_seeds:
-                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 ag._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=score, depth=0, source="seed"
                 )
-
-        # Score traceback seeds
         for sym_name, tb_score in tb_seeds:
             existing = ag._activations.get(sym_name)
             if existing:
@@ -5982,8 +6486,6 @@ class ActivationEngine:
                 ag._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=tb_score, depth=0, source="seed"
                 )
-
-        # Score history boosts
         for sym_name, boost in history_boosts.items():
             existing = ag._activations.get(sym_name)
             if existing:
@@ -5998,7 +6500,6 @@ class ActivationEngine:
                     node_id=sym_name, score=boost, depth=0, source="seed"
                 )
 
-        # Fallback to entry points if no seeds activated
         if not ag._activations:
             entry_points = self._f._path_index.find_entry_points(
                 self._f._symbol_index, project_id
@@ -6043,14 +6544,14 @@ class ActivationEngine:
         ag_lex = ActivationGraph()
         if exact_seeds:
             for sym_name in exact_seeds:
-                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 ag_lex._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=score, depth=0, source="seed"
                 )
         if partial_seeds:
             for sym_name in partial_seeds:
-                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 ag_lex._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=score, depth=0, source="seed"
@@ -6087,7 +6588,7 @@ class ActivationEngine:
                     break
         if structural_seeds:
             for sym_name in structural_seeds:
-                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.8, 0.5 * min(specificity, 1.4))
                 ag_str._activations[sym_name] = ActivationState(
                     node_id=sym_name, score=score, depth=0, source="seed"
@@ -6178,6 +6679,15 @@ class ActivationEngine:
 
         return ag_final
 
+    def _store_activation_scores(self, ag: ActivationGraph, project_id: str) -> None:
+        """Save activation scores for speculative prefetch and LOD tracking."""
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
+        )
+        if not hasattr(self._f, "_last_activation_scores"):
+            self._f._last_activation_scores: Dict[str, Dict[str, float]] = {}
+        self._f._last_activation_scores[project_id] = activated
+
     def build_activation_graph(
         self,
         query: str,
@@ -6219,7 +6729,7 @@ class ActivationEngine:
             )
 
         # 3. Store scores for downstream consumers (LOD, prefetch, pager)
-        self._f._store_activation_scores(ag, project_id)
+        self._store_activation_scores(ag, project_id)
         return ag
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6480,8 +6990,8 @@ class HistoryCompressor:
             summary = self._f._build_code_commit_summary(
                 content, project_id, part_num, total_parts
             )
-            tokens_before = self._f._estimate_tokens(content)
-            tokens_after = self._f._estimate_tokens(summary)
+            tokens_before = self._f._tokens.estimate_tokens(content)
+            tokens_after = self._f._tokens.estimate_tokens(summary)
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
             self._f._log_debug(
@@ -6533,7 +7043,7 @@ class HistoryCompressor:
                 continue
 
             total_code_tokens = sum(
-                self._f._estimate_tokens(m.group("body"))
+                self._f._tokens.estimate_tokens(m.group("body"))
                 for m in _CODE_BLOCK.finditer(content)
             )
             if total_code_tokens < min_tokens:
@@ -6542,7 +7052,7 @@ class HistoryCompressor:
             def _replace(match: re.Match) -> str:
                 body = match.group("body")
                 lang = match.group("lang") or "code"
-                blk_tokens = self._f._estimate_tokens(body)
+                blk_tokens = self._f._tokens.estimate_tokens(body)
                 if blk_tokens < min_tokens:
                     return match.group(0)
                 return (
@@ -7192,7 +7702,7 @@ class EnrichmentTasks:
         """
         tasks = [
             (
-                self._f._detect_contradictions(messages)
+                self._f._commands._detect_contradictions(messages)
                 if (
                     self._f.valves.enable_contradiction_detection
                     and not skip_contradiction
@@ -7200,7 +7710,7 @@ class EnrichmentTasks:
                 else self._noop()
             ),
             (
-                self._f._find_cached_response(query, context_hash, state)
+                self._f._ltm.find_cached_response(query, context_hash, state)
                 if (
                     self._f.valves.enable_response_cache
                     and HAS_SENTENCE
@@ -7209,7 +7719,7 @@ class EnrichmentTasks:
                 else self._noop()
             ),
             (
-                self._f._find_duplicate_question(query, project_id)
+                self._f._ltm.find_duplicate_question(query, project_id)
                 if (self._f.valves.duplicate_question_threshold and HAS_SENTENCE)
                 else self._noop()
             ),
@@ -7890,20 +8400,17 @@ class InletOrchestrator:
         )
         user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
-        # Extract real question and determine if there are code blocks
         has_code_blocks = False
         user_question = user_query
         if last_user_msg and user_query:
             try:
-                spans = await self._f._get_code_spans(user_query)
+                spans = await self._f._code_blocks.get_code_spans(user_query)
                 if spans:
-                    user_question = self._f._remove_code_spans(
+                    user_question = CodeBlockManager.remove_code_spans(
                         user_query, spans
                     ).strip()
-                # Check for fenced code blocks independently of tree‑sitter
                 if "```" in user_query:
                     has_code_blocks = True
-                # If spans were found, code blocks exist
                 if spans:
                     has_code_blocks = True
             except Exception:
@@ -7940,8 +8447,8 @@ class InletOrchestrator:
         user_query: str,
         is_continuation: bool = False,
     ) -> Tuple[bool, str]:
-        """Classify the session and update active code blocks, returning (is_code_session, user_question)."""
-        is_code_session = await self._f._classify_session(messages, project_id)
+        """Classify the session and update active code blocks."""
+        is_code_session = await self.classify_session(messages, project_id)
 
         if self._f.valves.enable_code_awareness and is_code_session:
             last_idx = len(messages) - 1
@@ -7952,7 +8459,7 @@ class InletOrchestrator:
                 await self._f._code_blocks.extract_code_blocks(user_query)
             )
             if block_spans:
-                user_question = self._f._remove_code_spans(
+                user_question = CodeBlockManager.remove_code_spans(
                     user_query, block_spans
                 ).strip()
                 if not user_question or len(user_question) < 10:
@@ -7975,7 +8482,7 @@ class InletOrchestrator:
         return is_code_session, user_question
 
     def ensure_last_message_is_user(self, messages: list) -> list:
-        """Ensure the last message in the list is from the user, adding a 'continue' message if needed."""
+        """Ensure the last message in the list is from the user."""
         if not messages:
             messages.append({"role": "user", "content": "continue"})
             return messages
@@ -8015,7 +8522,7 @@ class InletOrchestrator:
                     return result
                 del self._f._session_classify_cache[cache_key]
 
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if state and state.get("active_blocks"):
             if cache_key:
                 self._f._session_classify_cache[cache_key] = (True, time.time())
@@ -8024,7 +8531,7 @@ class InletOrchestrator:
         for msg in reversed(messages[-10:]):
             if msg.get("role") != "user":
                 continue
-            if self._f._has_code_indicators(msg.get("content", "")):
+            if self._f._commands.has_code_indicators(msg.get("content", "")):
                 if cache_key:
                     self._f._session_classify_cache[cache_key] = (True, time.time())
                 return True
@@ -8042,10 +8549,10 @@ class InletOrchestrator:
         if (
             last_user
             and not state.get("active_blocks")
-            and not self._f._has_code_indicators(last_user.get("content", ""))
+            and not self._f._commands.has_code_indicators(last_user.get("content", ""))
         ):
             if len(last_user.get("content", "")) > 200:
-                blocks, _ = await self._f._extract_code_blocks(
+                blocks, _ = await self._f._code_blocks.extract_code_blocks(
                     last_user.get("content", "")
                 )
                 if blocks:
@@ -8067,7 +8574,7 @@ class InletOrchestrator:
                     "This message is not about programming or code.",
                 ),
             ]
-            scores = await self._f._predict_cross_encoder(pairs)
+            scores = await self._f._commands._predict_cross_encoder(pairs)
             if scores is None:
                 self._f._log_debug(
                     "_classify_session: CrossEncoder not loaded, "
