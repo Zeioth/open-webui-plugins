@@ -53,9 +53,7 @@ The value of log log M grows extremely slowly. For example:
 
 As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of your system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudoconstant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
 
-The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal].
-
-This is the best we can do. In order to go [sub-lineal], we would need to process all turns only once, which is not possible with the current technology (until state space models like mamba actually perform well).
+The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal]. This is the best we can do. And no new technology or techniques can improve it as far as we know, as this is unavoidable in an interactive chat.
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
@@ -64,5 +62,5 @@ This is the best we can do. In order to go [sub-lineal], we would need to proces
 - Even though it's true web content is quickly outdated, it would be interesting at lest generating an interactive knowledge of a certain size. For example, if we use search to search for papers about AI context compression techniques, it would be valuable to create a knoledge base (at last in sqlite). For single user it's unlikely to hit in a meaningful way, but it's ok to consider this feature.
 
 ## Future techniques
-* State space models like mamba or nanotron: They actually perform worse for coding tasks atm, but very likely this tech will allow 1m context models in the future, once they solve the performance issues.
-* H20: Once implemented on llama (if ever) it should provide x4 filling performance.
+* State space models like mamba or nanotron: Once they perform well, they will be allow bigger context sizes. 1m+ with sub quadratic performance degradation. Allowing more complex inferences. This tech already exists, but still do not perform as well as the alternatives.
+* H20: Models implementing this technique will have x4 filling performance. This is lab science atm.
