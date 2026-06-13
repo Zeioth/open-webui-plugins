@@ -41,7 +41,7 @@ Our performance and complexity are state of the art right now. As close to linea
 
 > That's a **x1.5 - x1.9** performance on 1-10 message sessions , and **13x** in 30+ message sessions!
 
-### 🧠 What is considered pseudo-constant?
+### 🧠 What is considered pseudo-constant time?
 
 The value of log log M grows extremely slowly. For example:
 
