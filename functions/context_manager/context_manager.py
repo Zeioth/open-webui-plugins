@@ -1626,7 +1626,7 @@ class ContextBuilder:
         if not is_code_session:
             return ""
 
-        current_code_hash = self._f._compute_code_state_hash(project_id)
+        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
         cached = self._block_a_cache.get(project_id)
 
         if cached:
@@ -1676,7 +1676,7 @@ class ContextBuilder:
 
         # 2. Symbol index (hub symbols only — stable while code unchanged)
         if is_code_session and self._f.valves.enable_code_awareness:
-            state = self._f._get_state(project_id)
+            state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
                 centrality = self._f._node_centrality.get(project_id, {})
                 symbol_section = self._f._hub_index.build(
@@ -1694,7 +1694,7 @@ class ContextBuilder:
             and self._f.valves.enable_feedback_tracking
             and self._f.valves.inject_feedback_context
         ):
-            feedback_ctx = self._f._get_feedback_context(project_id)
+            feedback_ctx = self._f._enrichment.get_feedback_context(project_id)
             if feedback_ctx:
                 parts.append(feedback_ctx)
 
@@ -1786,15 +1786,17 @@ class ContextBuilder:
         Returns "" if there is nothing to inject.
         """
         if not self._f.valves.enable_path_analysis:
-            active_ctx = self._f._get_active_code_context(project_id, query)
+            active_ctx = self._f._activation.get_active_code_context(project_id, query)
             return active_ctx if active_ctx else ""
 
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if not state or not state.get("active_blocks"):
             return ""
 
         # ── Step 1: ActivationGraph ──────────────────────────────────────
-        ag = self._f._build_activation_graph(query, project_id, messages=messages)
+        ag = self._f._activation.build_activation_graph(
+            query, project_id, messages=messages
+        )
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
         )
@@ -1802,7 +1804,7 @@ class ContextBuilder:
             self._f._log_debug(
                 "build_block_b: no activated nodes, falling back to full context"
             )
-            return self._f._get_active_code_context(project_id, query)
+            return self._f._activation.get_active_code_context(project_id, query)
 
         # ── Step 2: Adjust LOD thresholds by intent ───────────────────────
         debug_weight = intent_vector.get("debug", 0.2)
@@ -1950,7 +1952,7 @@ class ContextBuilder:
                         and self._f.valves.code_block_overflow_action == "warn"
                     ):
                         content_to_inject = self._f.valves.code_block_warn_message
-                        tok = self._f._estimate_code_tokens(content_to_inject)
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
                     elif (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "summarize"
@@ -1959,7 +1961,7 @@ class ContextBuilder:
                         content_to_inject = (
                             f"[Summary of {tok}-token block]\n{block.block_summary}"
                         )
-                        tok = self._f._estimate_code_tokens(content_to_inject)
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
                     if (
                         slot_free
@@ -1967,17 +1969,19 @@ class ContextBuilder:
                         and self._f._llmlingua_compressor
                         and tok > self._f.valves.code_compression_min_tokens
                     ):
-                        content_to_inject = await self._f._compress_code_block(
-                            block.content,
-                            language=(
-                                block.symbols[0].language
-                                if block.symbols
-                                else "unknown"
-                            ),
-                            rate=self._f.valves.code_compression_rate,
-                            query=query,
+                        content_to_inject = (
+                            await self._f._history_compressor.compress_code_block(
+                                block.content,
+                                language=(
+                                    block.symbols[0].language
+                                    if block.symbols
+                                    else "unknown"
+                                ),
+                                rate=self._f.valves.code_compression_rate,
+                                query=query,
+                            )
                         )
-                        tok = self._f._estimate_code_tokens(content_to_inject)
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
                     if total_tokens + tok > budget:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
@@ -3010,6 +3014,55 @@ class StateStore:
 
             self._f._log_debug(f"Failed to save state: {e}\n{traceback.format_exc()}")
 
+    async def _save_state_to_db_async(self, project_id: str, state: dict) -> None:
+        """Acquire the project lock, then persist the state to DB."""
+        lock = await self.get_project_lock(project_id)
+        async with lock:
+            await self._save_state_to_db(project_id, state)
+
+    async def _save_state_to_db(self, project_id: str, state: dict) -> None:
+        """Serialize active blocks metadata and persist to SQLite."""
+        # Serialize active blocks metadata
+        active_blocks_meta = {}
+        for k, v in state["active_blocks"].items():
+            d = v.dict()
+            d["content_type"] = v.content_type.value
+            content_hash = v.hash
+            # Persist the raw content separately
+            await anyio.to_thread.run_sync(
+                lambda: self._f._db_conn.execute(
+                    "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
+                    (content_hash, v.content, time.time()),
+                )
+            )
+            d["content"] = f"@@hash:{content_hash}"
+            active_blocks_meta[k] = d
+
+        serializable = {
+            "active_blocks": active_blocks_meta,
+            "recent_changes": [b.dict() for b in state["recent_changes"]],
+            "committed_changes": [b.dict() for b in state["committed_changes"]],
+            "feedback_history": [fb.dict() for fb in state["feedback_history"]],
+            "message_count": state["message_count"],
+            "last_compression_timestamp": state.get("last_compression_timestamp", 0),
+            "response_cache": state.get("response_cache", []),
+            "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
+            "last_cleanup_suggestion_msg_idx": state.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            "has_any_calls": state.get("has_any_calls", False),
+            "last_cot_level": state.get("last_cot_level", 0),
+        }
+
+        def _write():
+            self._f._db_conn.execute(
+                "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
+                (project_id, json.dumps(serializable), time.time()),
+            )
+            self._f._db_conn.commit()
+
+        await self._f._db_enqueue(_write)
+
     # ── DB lifecycle ──────────────────────────────────────────────────
     def init_db(self) -> None:
         """Create tables and indexes (idempotent)."""
@@ -3102,6 +3155,133 @@ class StateStore:
             )
         """)
         self._f._db_conn.commit()
+
+    def _load_state_from_db(self, project_id: str) -> Optional[dict]:
+        """Carga el estado de conversación desde SQLite. Devuelve None si no existe."""
+        cur = self._f._db_conn.execute(
+            "SELECT state_json FROM conversation_state WHERE project_id = ?",
+            (project_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        data = json.loads(row[0])
+
+        # Asegurar claves esperadas con valores por defecto
+        for key in [
+            "feedback_history",
+            "last_compression_timestamp",
+            "last_suggestion_timestamp",
+            "response_cache",
+            "has_any_calls",
+            "last_cot_level",
+        ]:
+            data.setdefault(
+                key, [] if key in ("feedback_history", "response_cache") else 0
+            )
+        data.setdefault("last_cleanup_suggestion_msg_idx", 0)
+
+        # Detección de corrupción en active_blocks
+        raw_active = data.get("active_blocks")
+        if raw_active is None:
+            self._f._log_debug(
+                "⚠️  CORRUPT STATE: 'active_blocks' is missing or null in DB. "
+                "To fix, delete the database file: %s and restart."
+                % self._f.valves.state_db_path
+            )
+            raw_active = {}
+        elif not isinstance(raw_active, dict):
+            self._f._log_debug(
+                "⚠️  CORRUPT STATE: 'active_blocks' is not a dict (type=%s). "
+                "Resetting to empty. If problems persist, delete the DB file: %s"
+                % (type(raw_active).__name__, self._f.valves.state_db_path)
+            )
+            raw_active = {}
+
+        active = {}
+        for k, v in raw_active.items():
+            try:
+                content_field = v.get("content", "")
+                if content_field.startswith("@@hash:"):
+                    content_hash = content_field[7:]
+                    cur2 = self._f._db_conn.execute(
+                        "SELECT content FROM code_contents WHERE hash = ?",
+                        (content_hash,),
+                    )
+                    row2 = cur2.fetchone()
+                    if row2:
+                        v["content"] = row2[0]
+                    else:
+                        v["content"] = f"[Content not found for hash {content_hash}]"
+                v["content_type"] = (
+                    ContentType(v["content_type"])
+                    if "content_type" in v
+                    else ContentType.GENERAL
+                )
+                blk = CodeBlock(**v)
+                if blk.last_mentioned_msg_idx is None:
+                    blk.last_mentioned_msg_idx = data.get("message_count", 0)
+                active[k] = blk
+            except Exception:
+                self._f._log_debug("Skipping corrupted block %s in state DB" % k)
+
+        # Restaurar otras colecciones
+        recent = []
+        for b in data.get("recent_changes", []):
+            try:
+                b["content_type"] = (
+                    ContentType(b["content_type"])
+                    if "content_type" in b
+                    else ContentType.GENERAL
+                )
+                recent.append(CodeBlock(**b))
+            except Exception:
+                pass
+
+        committed = []
+        for b in data.get("committed_changes", []):
+            try:
+                b["content_type"] = (
+                    ContentType(b["content_type"])
+                    if "content_type" in b
+                    else ContentType.GENERAL
+                )
+                committed.append(CodeBlock(**b))
+            except Exception:
+                pass
+
+        feedback = [
+            AppliedChangeFeedback(**fb) for fb in data.get("feedback_history", [])
+        ]
+
+        state = {
+            "active_blocks": active,
+            "recent_changes": recent,
+            "committed_changes": committed,
+            "feedback_history": feedback,
+            "message_count": data.get("message_count", 0),
+            "last_compression_timestamp": data.get("last_compression_timestamp", 0),
+            "response_cache": data.get("response_cache", []),
+            "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
+            "has_any_calls": data.get("has_any_calls", False),
+            "last_cleanup_suggestion_msg_idx": data.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            "last_cot_level": data.get("last_cot_level", 0),
+        }
+
+        # Recalculate cached token counts
+        for blk in (
+            list(state["active_blocks"].values())
+            + state["recent_changes"]
+            + state["committed_changes"]
+        ):
+            if self._f.tokenizer:
+                blk._cached_token_count = len(self._f.tokenizer.encode(blk.content))
+            else:
+                blk._cached_token_count = len(blk.content) // 4
+
+        return state
 
     async def db_worker(self) -> None:
         """Database write worker with automatic restart on failure."""
@@ -3205,6 +3385,75 @@ class StateStore:
         )
         return total_edges
 
+    async def load_symbol_edges_from_db(self, project_id: str) -> int:
+        """
+        Restore typed edges from SQLite.
+        Only restores if the saved code_state_hash matches the current state.
+        Returns the number of edges restored (0 if stale or no data).
+        """
+        if not self._f.valves.enable_edge_persistence:
+            return 0
+
+        # Skip if edges are already loaded in memory
+        existing = self._f._symbol_index.get_all_edges_out(project_id)
+        if existing:
+            return 0
+
+        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
+        if not current_code_hash:
+            return 0  # no active code
+
+        # Check if the saved hash matches
+        import anyio
+
+        meta_row = await anyio.to_thread.run_sync(
+            lambda: self._f._db_conn.execute(
+                "SELECT code_state_hash, edge_count FROM symbol_edges_meta "
+                "WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        )
+
+        if not meta_row:
+            self._f._log_debug("Edge persistence: no saved edges for this project")
+            return 0
+
+        saved_hash, saved_count = meta_row
+        if saved_hash != current_code_hash:
+            self._f._log_debug(
+                f"Edge persistence: stale edges detected "
+                f"(saved={saved_hash}, current={current_code_hash}). "
+                f"Edges will be rebuilt when code is processed."
+            )
+            return 0
+
+        # Hash matches → restore edges
+        rows = await anyio.to_thread.run_sync(
+            lambda: self._f._db_conn.execute(
+                "SELECT src, dst, type, weight, confidence "
+                "FROM symbol_edges WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        )
+
+        count = 0
+        for src, dst, etype, weight, confidence in rows:
+            edge = Edge(
+                src=src,
+                dst=dst,
+                type=etype,
+                weight=weight,
+                confidence=confidence,
+            )
+            self._f._symbol_index.add_edge(edge, project_id)
+            count += 1
+
+        self._f._log_debug(
+            f"✓ Edge persistence: restored {count} edges "
+            f"(code_hash={current_code_hash})"
+        )
+        return count
+
     async def save_path_views_to_db(self, project_id: str, views: list) -> None:
         """Persist CodePathViews to SQLite, replacing any existing views for the project."""
 
@@ -3234,6 +3483,43 @@ class StateStore:
             self._f._db_conn.commit()
 
         await self._f._db_enqueue(_write)
+
+    async def load_path_views_from_db(self, project_id: str) -> list:
+        """Carga las CodePathViews almacenadas en SQLite para un proyecto."""
+        import anyio
+
+        rows = await anyio.to_thread.run_sync(
+            lambda: self._f._db_conn.execute(
+                "SELECT path_id, entry_point, seed_nodes_json, induced_nodes_json, "
+                "induced_edges_json, activation_score, business_label, summary, "
+                "label_confidence, structural_hash, call_graph_hash, last_built "
+                "FROM code_path_views WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        )
+        views = []
+        for row in rows:
+            try:
+                induced_edges = [Edge(**e) for e in json.loads(row[4])]
+                views.append(
+                    CodePathView(
+                        path_id=row[0],
+                        entry_point=row[1],
+                        seed_nodes=json.loads(row[2]),
+                        induced_nodes=json.loads(row[3]),
+                        induced_edges=induced_edges,
+                        activation_score=row[5],
+                        business_label=row[6],
+                        summary=row[7],
+                        label_confidence=row[8],
+                        structural_hash=row[9],
+                        call_graph_hash=row[10],
+                        last_built=row[11],
+                    )
+                )
+            except Exception as e:
+                self._f._log_debug(f"Skipping corrupt CodePathView: {e}")
+        return views
 
     # ── Project locks ─────────────────────────────────────────────────
     async def get_project_lock(self, project_id: str) -> "ReentrantAsyncLock":
@@ -3435,6 +3721,91 @@ class LongTermMemory:
             logger.warning(f"Unified memory retrieval failed: {e}")
             return []
 
+    async def retrieve_historical_messages(
+        self, query: str, project_id: str, limit: int
+    ) -> list:
+        """Retrieve historically relevant messages from ChromaDB LTM."""
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
+            return []
+
+        forced_symbol, cleaned_query = self._f._parse_forced_symbol_query(query)
+        if forced_symbol:
+            memories = await self._f._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
+            )
+            return [{"role": "user", "content": m["doc"]} for m in memories]
+
+        try:
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(query[:1000]).tolist()
+            )
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+            if self._f.valves.long_term_memory_expiration_days > 0:
+                where_filter["$and"].append({"expires_at": {"$gt": now}})
+
+            results = await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=limit * 3,
+                    where=where_filter,
+                    include=["documents", "metadatas", "distances"],
+                )
+            )
+
+            query_symbols = set()
+            if self._f.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._f._extract_query_symbols(query, project_id)
+
+            scored_regular = []
+            scored_summaries = []
+            if results and results["documents"]:
+                for i, doc in enumerate(results["documents"][0]):
+                    meta = results["metadatas"][0][i]
+                    dist = results["distances"][0][i]
+                    sim = 1.0 - (dist / 2.0)
+                    if (
+                        query_symbols
+                        and sim >= self._f.valves.ltm_symbol_boost_min_similarity
+                    ):
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if meta_symbols_str:
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                sim *= self._f.valves.ltm_symbol_boost_factor
+                    role = meta.get("role", "user")
+                    is_summary = meta.get("is_hierarchical_summary", False) or meta.get(
+                        "is_session_summary", False
+                    )
+                    entry = (sim, {"role": role, "content": doc})
+                    if is_summary:
+                        scored_summaries.append(entry)
+                    else:
+                        scored_regular.append(entry)
+
+            scored_summaries.sort(key=lambda x: x[0], reverse=True)
+            scored_regular.sort(key=lambda x: x[0], reverse=True)
+
+            messages = [msg for _, msg in scored_summaries] + [
+                msg for _, msg in scored_regular
+            ]
+
+            if (
+                self._f.valves.enable_reranking
+                and self._f._cross_encoder
+                and len(messages) > 1
+            ):
+                docs = [m["content"] for m in messages]
+                reranked = await self._f._rerank_results(query, docs, limit)
+                doc_to_msg = {m["content"]: m for m in messages}
+                messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
+
+            return messages[:limit]
+        except Exception as e:
+            logger.warning(f"Historical message retrieval failed: {e}")
+            return []
+
     async def store_messages(self, project_id: str, messages: list) -> None:
         """Store user/assistant messages in the LTM ChromaDB collection."""
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
@@ -3456,8 +3827,8 @@ class LongTermMemory:
         for i, msg in enumerate(valid):
             content = msg["content"]
 
-            extracted, _ = await self._f._extract_code_blocks(content)
-            content_type = self._f._classify_content(content, extracted)
+            extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
+            content_type = self._f._code_blocks.classify_content(content, extracted)
 
             ctx_symbols: List[str] = []
             for blk in extracted[:3]:
@@ -3475,7 +3846,7 @@ class LongTermMemory:
 
             ctx_file_paths: List[str] = []
             if self._f.valves.track_file_paths:
-                ctx_file_paths = self._f._extract_file_paths(content)[:3]
+                ctx_file_paths = self._f._code_blocks.extract_file_paths(content)[:3]
 
             context_prefix = await self._f._build_retrieval_context(
                 content=content,
@@ -4607,7 +4978,7 @@ class CommandRouter:
             and self._f.valves.cleanup_status_command_enabled
             and self._f.valves.cleanup_suggestions_enabled
         ):
-            candidates = self._f._get_inactive_block_candidates(project_id)
+            candidates = self._f._activation.get_inactive_block_candidates(project_id)
             if not candidates:
                 response = "✅ No inactive blocks detected."
             else:
@@ -4615,7 +4986,7 @@ class CommandRouter:
                     f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last "
                     f"{self._f.valves.cleanup_inactive_threshold_messages} messages):"
                 ]
-                state = self._f._get_state(project_id)
+                state = self._f._state_store.get_state(project_id)
                 for h in candidates:
                     blk = state["active_blocks"].get(h)
                     if blk:
@@ -4662,7 +5033,7 @@ class CommandRouter:
             not self._f.valves.enable_natural_language_forget
             or not last_user_msg
             or is_explicit_command
-            or self._f._has_code_indicators(last_user_msg.get("content", ""))
+            or self.has_code_indicators(last_user_msg.get("content", ""))  # ← Corregido
         ):
             return False, None
 
@@ -4716,7 +5087,7 @@ class CommandRouter:
         all_names = self._f._symbol_index.get_all_names(project_id)
         replaced_content = assistant_content
         did_any = False
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
 
         max_syms = self._f.valves.outlet_expand_intercept_max_symbols
         matches_to_process = matches if max_syms == 0 else matches[:max_syms]
@@ -4745,7 +5116,7 @@ class CommandRouter:
             replacement = f"[Retrieved `{func_name}`]\n{expanded}"
             replaced_content = replaced_content.replace(match.group(0), replacement, 1)
 
-            lock = await self._f._get_project_lock(project_id)
+            lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
                 block_hashes = self._f._symbol_index.find_blocks(func_name, project_id)
                 for h in block_hashes:
@@ -4757,8 +5128,8 @@ class CommandRouter:
                         block.last_mentioned = time.time()
                         block.last_mentioned_msg_idx = state["message_count"]
                         break
-                self._f._invalidate_lightweight_cache(project_id)
-                self._f._set_state(project_id, state)
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
 
         return replaced_content, did_any
 
@@ -5388,9 +5759,12 @@ class ActivationEngine:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Active code context
+    # ═══════════════════════════════════════════════════════════════════════════
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
         now = time.time()
@@ -5542,19 +5916,13 @@ class ActivationEngine:
                 parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
         return "\n".join(parts)
 
-    def build_activation_graph(
-        self,
-        query: str,
-        project_id: str,
-        max_propagation_steps: int = 4,
-        messages: Optional[List[dict]] = None,
-    ) -> "ActivationGraph":
-        """
-        Build an ActivationGraph combining up to three independent seed vectors.
-        """
-        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-        all_names = self._f._symbol_index.get_all_names(project_id)
-
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Activation graph building
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _prepare_seed_symbols(
+        self, query: str, project_id: str, messages: Optional[List[dict]]
+    ) -> Tuple[List[str], List[str], List[Tuple[str, float]], Dict[str, float]]:
+        """Extract exact, partial, traceback and historical seed symbols from the query."""
         exact_seeds, partial_seeds = self._f._extract_query_seeds(query, project_id)
         tb_seeds = (
             self._f._extract_traceback_seeds(query, project_id)
@@ -5568,80 +5936,110 @@ class ActivationEngine:
             if (self._f.valves.enable_history_seeds and messages)
             else {}
         )
+        return exact_seeds, partial_seeds, tb_seeds, history_boosts
 
-        if not self._f.valves.enable_multi_seed_activation:
-            ag = ActivationGraph()
-            if exact_seeds:
-                for sym_name in exact_seeds:
-                    specificity = self._f._compute_node_specificity(
-                        sym_name, project_id
-                    )
-                    score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=score, depth=0, source="seed"
-                    )
-            if partial_seeds:
-                for sym_name in partial_seeds:
-                    specificity = self._f._compute_node_specificity(
-                        sym_name, project_id
-                    )
-                    score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=score, depth=0, source="seed"
-                    )
-            for sym_name, tb_score in tb_seeds:
-                existing = ag._activations.get(sym_name)
-                if existing:
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name,
-                        score=min(1.0, existing.score + tb_score * 0.4),
-                        depth=0,
-                        source="seed",
-                    )
-                else:
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=tb_score, depth=0, source="seed"
-                    )
-            for sym_name, boost in history_boosts.items():
-                existing = ag._activations.get(sym_name)
-                if existing:
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name,
-                        score=min(1.0, existing.score + boost),
-                        depth=0,
-                        source=existing.source,
-                    )
-                else:
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=boost, depth=0, source="seed"
-                    )
-            if not ag._activations:
-                entry_points = self._f._path_index.find_entry_points(
-                    self._f._symbol_index, project_id
+    def _build_single_seed_graph(
+        self,
+        exact_seeds: List[str],
+        partial_seeds: List[str],
+        tb_seeds: List[Tuple[str, float]],
+        history_boosts: Dict[str, float],
+        edges_out: dict,
+        project_id: str,
+    ) -> "ActivationGraph":
+        """Build activation graph when multi‑seed activation is disabled."""
+        ag = ActivationGraph()
+
+        # Score exact seeds
+        if exact_seeds:
+            for sym_name in exact_seeds:
+                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=score, depth=0, source="seed"
                 )
-                if entry_points:
-                    centrality = self._f._node_centrality.get(project_id, {})
-                    sorted_eps = sorted(
-                        entry_points,
-                        key=lambda ep: centrality.get(ep, 0.0),
-                        reverse=True,
-                    )
-                    for sym_name in sorted_eps[:3]:
-                        cent_score = centrality.get(sym_name, 0.0)
-                        seed_score = 0.2 + 0.2 * cent_score
-                        ag._activations[sym_name] = ActivationState(
-                            node_id=sym_name, score=seed_score, depth=0, source="seed"
-                        )
-            ag.propagate(
-                edges_out=edges_out,
-                max_steps=20,
-                min_score=0.05,
-                alpha=self._f.valves.ppr_alpha,
-            )
-            self._f._store_activation_scores(ag, project_id)
-            return ag
 
-        # Multi‑seed mode
+        # Score partial seeds
+        if partial_seeds:
+            for sym_name in partial_seeds:
+                specificity = self._f._compute_node_specificity(sym_name, project_id)
+                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=score, depth=0, source="seed"
+                )
+
+        # Score traceback seeds
+        for sym_name, tb_score in tb_seeds:
+            existing = ag._activations.get(sym_name)
+            if existing:
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name,
+                    score=min(1.0, existing.score + tb_score * 0.4),
+                    depth=0,
+                    source="seed",
+                )
+            else:
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=tb_score, depth=0, source="seed"
+                )
+
+        # Score history boosts
+        for sym_name, boost in history_boosts.items():
+            existing = ag._activations.get(sym_name)
+            if existing:
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name,
+                    score=min(1.0, existing.score + boost),
+                    depth=0,
+                    source=existing.source,
+                )
+            else:
+                ag._activations[sym_name] = ActivationState(
+                    node_id=sym_name, score=boost, depth=0, source="seed"
+                )
+
+        # Fallback to entry points if no seeds activated
+        if not ag._activations:
+            entry_points = self._f._path_index.find_entry_points(
+                self._f._symbol_index, project_id
+            )
+            if entry_points:
+                centrality = self._f._node_centrality.get(project_id, {})
+                sorted_eps = sorted(
+                    entry_points,
+                    key=lambda ep: centrality.get(ep, 0.0),
+                    reverse=True,
+                )
+                for sym_name in sorted_eps[:3]:
+                    cent_score = centrality.get(sym_name, 0.0)
+                    seed_score = 0.2 + 0.2 * cent_score
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=seed_score, depth=0, source="seed"
+                    )
+
+        ag.propagate(
+            edges_out=edges_out,
+            max_steps=20,
+            min_score=0.05,
+            alpha=self._f.valves.ppr_alpha,
+        )
+        return ag
+
+    def _build_multi_seed_graph(
+        self,
+        exact_seeds: List[str],
+        partial_seeds: List[str],
+        tb_seeds: List[Tuple[str, float]],
+        history_boosts: Dict[str, float],
+        edges_out: dict,
+        project_id: str,
+    ) -> "ActivationGraph":
+        """Build activation graph combining lexical, structural and historical seed vectors."""
+        w_lex = self._f.valves.multi_seed_weight_lexical
+        w_str = self._f.valves.multi_seed_weight_structural
+        w_his = self._f.valves.multi_seed_weight_historical
+
+        # ── Vector 1: Lexical ──────────────────────────────────────────
         ag_lex = ActivationGraph()
         if exact_seeds:
             for sym_name in exact_seeds:
@@ -5678,6 +6076,7 @@ class ActivationEngine:
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # ── Vector 2: Structural ───────────────────────────────────────
         ag_str = ActivationGraph()
         lexical_seed_names = set(exact_seeds) | {s for s, _ in tb_seeds}
         structural_seeds: Set[str] = set()
@@ -5700,6 +6099,7 @@ class ActivationEngine:
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # ── Vector 3: Historical ───────────────────────────────────────
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -5713,10 +6113,7 @@ class ActivationEngine:
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        w_lex = self._f.valves.multi_seed_weight_lexical
-        w_str = self._f.valves.multi_seed_weight_structural
-        w_his = self._f.valves.multi_seed_weight_historical
-
+        # ── Combine the three vectors ──────────────────────────────────
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -5779,12 +6176,58 @@ class ActivationEngine:
             f"his={len(ag_his.get_activated_nodes(0.01))})"
         )
 
-        self._f._store_activation_scores(ag_final, project_id)
         return ag_final
 
+    def build_activation_graph(
+        self,
+        query: str,
+        project_id: str,
+        max_propagation_steps: int = 4,
+        messages: Optional[List[dict]] = None,
+    ) -> "ActivationGraph":
+        """
+        Build an ActivationGraph combining up to three independent seed vectors.
+
+        Delegates seed extraction and the single‑seed / multi‑seed construction
+        to private helpers, keeping the top‑level logic easy to read.
+        """
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+
+        # 1. Extract all seed symbols from the query and history
+        exact_seeds, partial_seeds, tb_seeds, history_boosts = (
+            self._prepare_seed_symbols(query, project_id, messages)
+        )
+
+        # 2. Build the activation graph in the appropriate mode
+        if not self._f.valves.enable_multi_seed_activation:
+            ag = self._build_single_seed_graph(
+                exact_seeds,
+                partial_seeds,
+                tb_seeds,
+                history_boosts,
+                edges_out,
+                project_id,
+            )
+        else:
+            ag = self._build_multi_seed_graph(
+                exact_seeds,
+                partial_seeds,
+                tb_seeds,
+                history_boosts,
+                edges_out,
+                project_id,
+            )
+
+        # 3. Store scores for downstream consumers (LOD, prefetch, pager)
+        self._f._store_activation_scores(ag, project_id)
+        return ag
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Path index & cross‑chunk edges
+    # ═══════════════════════════════════════════════════════════════════════════
     async def rebuild_path_index(self, project_id: str) -> None:
         """Reconstruct PathIndex from SymbolIndex for all entry points."""
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if not state or not state.get("active_blocks"):
             return
         entry_points = self._f._path_index.find_entry_points(
@@ -5837,6 +6280,9 @@ class ActivationEngine:
             )
         return resolved
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Speculative prefetch
+    # ═══════════════════════════════════════════════════════════════════════════
     async def speculative_prefetch(
         self,
         project_id: str,
@@ -5885,11 +6331,14 @@ class ActivationEngine:
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
             await self._f._build_view_from_activation(sym_name, ag, project_id)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Hash utilities
+    # ═══════════════════════════════════════════════════════════════════════════
     def compute_structural_hash(
         self, symbol_names: Iterable[str], project_id: str
     ) -> str:
         """Hash of the symbols' content blocks (changes when code changes)."""
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         hashes = []
         for name in sorted(symbol_names):
             for bh in sorted(self._f._symbol_index.find_blocks(name, project_id)):
@@ -5910,13 +6359,41 @@ class ActivationEngine:
             else ""
         )
 
+    def compute_code_state_hash(self, project_id: str) -> str:
+        """Return a hash that changes when the set of active blocks changes."""
+        if self._f._cached_code_state_hash is not None:
+            return self._f._cached_code_state_hash
+        state = self._f._state_store.get_state(project_id)
+        h = self._compute_code_state_hash_from_state(state)
+        self._f._cached_code_state_hash = h
+        return h
+
+    def _compute_code_state_hash_from_state(self, state: dict) -> str:
+        if not state or not state.get("active_blocks"):
+            return ""
+        sorted_hashes = sorted(
+            h for h, b in state["active_blocks"].items() if not b.obsolete
+        )
+        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
+
+    def compute_context_hash(self, messages: list) -> str:
+        """Hash of system message content, used for response cache keying."""
+        if not self._f.valves.response_cache_include_context_hash:
+            return ""
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        context_str = "\n".join([m.get("content", "") for m in sys_msgs])
+        return hashlib.md5(context_str.encode()).hexdigest()[:16]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Inactive block candidates & cache invalidation
+    # ═══════════════════════════════════════════════════════════════════════════
     def get_inactive_block_candidates(self, project_id: str) -> list:
         """
         Return block hashes that haven't been mentioned in the last
         `cleanup_inactive_threshold_messages` messages, excluding pinned,
         obsolete, and content types listed in `cleanup_excluded_content_types`.
         """
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if not state or not state.get("active_blocks"):
             return []
         threshold = self._f.valves.cleanup_inactive_threshold_messages
@@ -5941,31 +6418,6 @@ class ActivationEngine:
         self._f._cached_code_state_hash = None
         self._f._node_centrality.pop(project_id, None)
 
-    def compute_code_state_hash(self, project_id: str) -> str:
-        """Return a hash that changes when the set of active blocks changes."""
-        if self._f._cached_code_state_hash is not None:
-            return self._f._cached_code_state_hash
-        state = self._f._get_state(project_id)
-        h = self._compute_code_state_hash_from_state(state)
-        self._f._cached_code_state_hash = h
-        return h
-
-    def _compute_code_state_hash_from_state(self, state: dict) -> str:
-        if not state or not state.get("active_blocks"):
-            return ""
-        sorted_hashes = sorted(
-            h for h, b in state["active_blocks"].items() if not b.obsolete
-        )
-        return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
-
-    def compute_context_hash(self, messages: list) -> str:
-        """Hash of system message content, used for response cache keying."""
-        if not self._f.valves.response_cache_include_context_hash:
-            return ""
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        context_str = "\n".join([m.get("content", "") for m in sys_msgs])
-        return hashlib.md5(context_str.encode()).hexdigest()[:16]
-
 
 class HistoryCompressor:
     """Code history compression, message summarisation, and block summaries."""
@@ -5973,6 +6425,7 @@ class HistoryCompressor:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ── Public API ────────────────────────────────────────────────────────
     def compress_code_history(self, messages: list, project_id: str) -> list:
         """
         Replace old assistant code-part messages with compact commit summaries.
@@ -6185,7 +6638,7 @@ class HistoryCompressor:
         if not _raw:
             return code
 
-        estimated_tokens = self._f._estimate_code_tokens(code)
+        estimated_tokens = self._f._tokens.estimate_code_tokens(code)
         if estimated_tokens < self._f.valves.code_compression_min_tokens:
             return code
 
@@ -6293,7 +6746,7 @@ class HistoryCompressor:
                 lambda: _raw.compress_prompt(code, **compress_kwargs)
             )
             compressed = result.get("compressed_prompt", code)
-            compressed_tokens = self._f._estimate_code_tokens(compressed)
+            compressed_tokens = self._f._tokens.estimate_code_tokens(compressed)
             self._f._log_debug(
                 f"LLMLingua-2: {estimated_tokens} → {compressed_tokens} tokens "
                 f"({100*(1-compressed_tokens/max(estimated_tokens,1)):.0f}% reduction)"
@@ -6440,14 +6893,14 @@ class EnrichmentTasks:
         new_content: str,
     ) -> None:
         """Generate and persist a change summary immediately (no deferral)."""
-        model = self._f.valves.llm_model  # main model
+        model = self._f.valves.llm_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
             f"Previous:\n```\n{prev_content[:1000]}\n```\n\n"
             f"New:\n```\n{new_content[:1000]}\n```\n\n"
             f"Change summary:"
         )
-        summary = await self._f._call_llm(
+        summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code change summariser. Output only one short sentence.",
             model_override=model,
@@ -6456,12 +6909,10 @@ class EnrichmentTasks:
         )
         if summary:
             now = time.time()
-            # In-memory LRU
             self._f._block_change_summaries[block_hash] = (summary.strip(), now)
             if len(self._f._block_change_summaries) > self._f._MAX_CHANGE_SUMMARIES:
                 self._f._block_change_summaries.popitem(last=False)
 
-            # Persist to SQLite
             def _write():
                 self._f._db_conn.execute(
                     "INSERT OR REPLACE INTO block_change_summaries "
@@ -6485,7 +6936,7 @@ class EnrichmentTasks:
             f"Summarize in one short sentence what this code does:\n\n"
             f"```{signature}\n{code_snippet}```"
         )
-        summary = await self._f._call_llm(
+        summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Output only one concise sentence.",
             model_override=model,
@@ -6495,14 +6946,14 @@ class EnrichmentTasks:
         )
         if summary and summary.strip():
             project_id = params["project_id"]
-            lock = await self._f._get_project_lock(project_id)
+            lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
-                state = self._f._get_state(project_id)
+                state = self._f._state_store.get_state(project_id)
                 for blk in state["active_blocks"].values():
                     for sym in blk.symbols:
                         if sym.signature == signature:
                             sym.summary = summary.strip()
-                self._f._set_state(project_id, state)
+                self._f._state_store.set_state(project_id, state)
             return True
         return False
 
@@ -6511,7 +6962,7 @@ class EnrichmentTasks:
         project_id = params["project_id"]
         code_state_hash = params.get("code_state_hash", "")
 
-        recent = await self._f._retrieve_historical_messages(
+        recent = await self._f._ltm.retrieve_historical_messages(
             query="recent conversation summary",
             project_id=project_id,
             limit=self._f.valves.session_summary_interval_messages,
@@ -6528,7 +6979,7 @@ class EnrichmentTasks:
             "and architectural changes:\n\n"
             f"{conversation_text[:3000]}"
         )
-        summary = await self._f._call_llm(
+        summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
             model_override=model,
@@ -6594,9 +7045,9 @@ class EnrichmentTasks:
 
     async def expire_blocks_by_time(self, project_id: str) -> None:
         """Remove blocks that have not been mentioned recently, based on configured timeouts."""
-        lock = await self._f._get_project_lock(project_id)
+        lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._get_state(project_id)
+            state = self._f._state_store.get_state(project_id)
             if not state:
                 return
             now = time.time()
@@ -6635,8 +7086,8 @@ class EnrichmentTasks:
                     any(s.calls for s in b.symbols)
                     for b in state["active_blocks"].values()
                 )
-                self._f._invalidate_lightweight_cache(project_id)
-                self._f._set_state(project_id, state)
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
 
     async def update_lod_thresholds_from_response(
         self,
@@ -6713,7 +7164,7 @@ class EnrichmentTasks:
 
     def get_feedback_context(self, project_id: str) -> str:
         """Return a formatted string of recent feedback for the given project."""
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         feedback = state.get("feedback_history", [])
         if not feedback:
             return ""
@@ -7404,13 +7855,15 @@ class InletOrchestrator:
                 self._f._log_debug(
                     "PathIndex empty but symbols exist — loading from DB"
                 )
-                db_views = await self._f._load_path_views_from_db(project_id)
+                db_views = await self._f._state_store.load_path_views_from_db(
+                    project_id
+                )
                 for view in db_views:
                     self._f._path_index.add(view, project_id)
 
         # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
         if self._f.valves.enable_edge_persistence:
-            restored = await self._f._load_symbol_edges_from_db(project_id)
+            restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
             if restored > 0:
                 self._f._log_debug(
                     f"Cross-session: {restored} symbol edges restored from DB. "
@@ -7495,8 +7948,8 @@ class InletOrchestrator:
             await self._f._update_active_code(
                 messages[last_idx], project_id, is_continuation=is_continuation
             )
-            extracted_blocks, block_spans = await self._f._extract_code_blocks(
-                user_query
+            extracted_blocks, block_spans = (
+                await self._f._code_blocks.extract_code_blocks(user_query)
             )
             if block_spans:
                 user_question = self._f._remove_code_spans(
@@ -7510,15 +7963,14 @@ class InletOrchestrator:
         else:
             user_question = user_query
 
-        # ── Ensure active_blocks is never None after loading ──
-        state = self._f._get_state(project_id)
+        state = self._f._state_store.get_state(project_id)
         if not isinstance(state.get("active_blocks"), dict):
             self._f._log_debug(
                 "CRITICAL: active_blocks corrupted even after load; resetting to empty. "
                 "Delete %s if this recurs." % self._f.valves.state_db_path
             )
             state["active_blocks"] = {}
-            self._f._set_state(project_id, state)
+            self._f._state_store.set_state(project_id, state)
 
         return is_code_session, user_question
 
@@ -8503,7 +8955,6 @@ class MessageAssembler:
                 else:
                     history_msgs = kept_block
 
-        # Put history back into messages (system messages stay first)
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         return sys_msgs + history_msgs, pending_summary
 
