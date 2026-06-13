@@ -30,16 +30,32 @@ Our performance and complexity are state of the art right now. As close to linea
 
 | Component | ~v1.9.0 (Current State) | ≥ v2.0.0 |
 |------------|-------------------------|--------------------------------------------|
-| Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops | O(K₂²) with K₂ ≈ 11k → ~121M ops |
-| Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) |
-| Total KV cache | O(n) growth → eventually OOM in long sessions | O(K) constant → ~11k fixed tokens |
-| Conversation history in context | O(T) linear → grows without bound | O(K) constant → ~4k compressed tokens |
-| Graph activation (PPR) | O(V + E) → microseconds (negligible) | O(V + E) → unchanged (microseconds) |
-| LTM retrieval | O(log M) with HNSW | O(log log M) with RAPTOR + HNSW |
-| Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token | 
-| Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) | O(T) linear |
+| Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops | O(K₂²) with K₂ ≈ 11k → ~121M ops [constant] |
+| Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] |
+| Total KV cache | O(n) growth → eventually OOM in long sessions | O(K) [constant] → ~11k fixed tokens |
+| Conversation history in context | O(T) linear → grows without bound | O(K) [constant] → ~4k compressed tokens |
+| Graph activation (PPR) | O(V + E) → microseconds, negligible | O(V + E) → microseconds, negligible |
+| LTM retrieval | O(log M) with HNSW | O(log log M) with RAPTOR + HNSW [pseudo-constant] |
+| Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token [constant] | 
+| Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) | O(T) [linear] |
 
-That's a **x1.5 - x1.9** performance on 1-10 message sessions , and **13x** in 30+ message sessions!
+> That's a **x1.5 - x1.9** performance on 1-10 message sessions , and **13x** in 30+ message sessions!
+
+### 🧠 Why is it considered pseudoconstant?
+
+The value of log log M grows extremely slowly. For example:
+
+    With M = 10³ (one thousand), log₂(log₂(10³)) ≈ log₂(10) ≈ 3.3.
+
+    With M = 10⁶ (one million), log₂(log₂(10⁶)) ≈ log₂(20) ≈ 4.3.
+
+    With M = 10¹² (one trillion), log₂(log₂(10¹²)) ≈ log₂(40) ≈ 5.3.
+
+As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of your system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudoconstant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
+
+The average cost of each turn is [constant]. But because we need to recalculate every turn, we say the system complexity is [lineal].
+
+This is the best we can do. In order to go [sub-lineal], we would need to process all turns only once, which is not possible with the current technology (until mamba models are a thing).
 
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
