@@ -51,7 +51,7 @@ The value of log log M grows extremely slowly. For example:
 
     With M = 10¹² (one trillion), log₂(log₂(10¹²)) ≈ log₂(40) ≈ 5.3.
 
-As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of your system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudoconstant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
+As you can see, even if M grows by a factor of one trillion, the search cost only goes from 3 to 5 "steps". In the context of the system, where the number of turns (T) is the dominant variable, this additional cost is indistinguishable from a constant, hence it is called "pseudo-constant". A step of O(log log M) is, in fact, even more stable than a standard O(log M).
 
 ### Why it's constant time in practice
 
