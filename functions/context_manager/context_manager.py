@@ -4471,6 +4471,58 @@ class ReasoningEngine:
 
         return level
 
+    async def _detect_cot_level_via_llm(
+        self, user_content: str, is_code_session: bool, state: dict
+    ) -> int:
+        """
+        Determine CoT depth using the CrossEncoder (instant CPU inference).
+        Falls back to heuristic if CrossEncoder is not available.
+        """
+        session_type = "code" if is_code_session else "general"
+        intent_hint = ""
+        if (
+            hasattr(self._f, "_user_intent_full_code")
+            and self._f._user_intent_full_code is not None
+        ):
+            intent_hint = (
+                "The user likely needs the full code."
+                if self._f._user_intent_full_code
+                else "The user likely needs only a summary of the code."
+            )
+        query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+
+        pairs = [
+            (query, "The user wants a simple, direct answer without reasoning."),
+            (
+                query,
+                "The user asks a moderately complex question that requires step-by-step thinking.",
+            ),
+            (query, "The user asks a complex question that needs deep reasoning."),
+            (
+                query,
+                "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
+            ),
+        ]
+        scores = await self._f._commands._predict_cross_encoder(pairs)
+        if scores is None:
+            self._f._log_debug(
+                "CoT detection via CrossEncoder unavailable, using heuristic."
+            )
+            return self._detect_cot_level_heuristic(
+                user_content, is_code_session, state
+            )
+        import numpy as np
+
+        best_level = int(np.argmax(scores))
+        if best_level == 0:
+            return 0
+        elif best_level == 1:
+            return 1
+        elif best_level == 2:
+            return 2
+        else:
+            return 3
+
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
