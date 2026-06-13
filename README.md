@@ -30,14 +30,14 @@ Our performance and complexity are state of the art right now. As close to linea
 
 | Component | ~v1.9.0 (Current State) | ≥ v2.0.0 |
 |------------|-------------------------|--------------------------------------------|
-| Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops | O(K₂²) with K₂ ≈ 11k → ~121M ops [constant] |
+| Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops [constant] | O(K₂²) with K₂ ≈ 11k → ~121M ops [constant] |
 | Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] |
-| Total KV cache | O(n) growth (eventually OOM in long sessions) | O(K)  → ~11k fixed tokens [constant] |
+| Total KV cache | O(n) growth (eventually OOM in long sessions) [linear] | O(K)  → ~11k fixed tokens [constant] |
 | Conversation history in context | O(T) [linear] (grows without bound) | O(K) → ~4k compressed tokens [constant] |
 | Graph activation (PPR) | O(V + E) → microseconds, negligible | O(V + E) → microseconds, negligible |
-| LTM retrieval | O(log M) with HNSW | O(log log M) with RAPTOR + HNSW [pseudo-constant] |
-| Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token [constant] | 
-| Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) | O(T) [linear] |
+| LTM retrieval | O(log M) with HNSW [logarithmic]| O(log log M) with RAPTOR + HNSW [pseudo-constant] |
+| Token generation | O(K) with K ≈ 20k → ~20k ops/token [constant] | O(K) with K ≈ 11k → ~11k ops/token [constant] | 
+| Total session cost (T turns) | O(T³) in the worst case (due to context accumulation) [quadratic] | O(T) [linear] |
 
 > That's a **x1.5 - x1.9** performance on 1-10 message sessions , and **13x** in 30+ message sessions!
 
