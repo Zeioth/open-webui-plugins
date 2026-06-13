@@ -32,8 +32,8 @@ Our performance and complexity are state of the art right now. As close to linea
 |------------|-------------------------|--------------------------------------------|
 | Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops | O(K₂²) with K₂ ≈ 11k → ~121M ops [constant] |
 | Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops (constant) | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] |
-| Total KV cache | O(n) growth → eventually OOM in long sessions | O(K) [constant] → ~11k fixed tokens |
-| Conversation history in context | O(T) linear → grows without bound | O(K) [constant] → ~4k compressed tokens |
+| Total KV cache | O(n) growth → eventually OOM in long sessions | O(K)  → ~11k fixed tokens [constant] |
+| Conversation history in context | O(T) linear → grows without bound | O(K) → ~4k compressed tokens [constant] |
 | Graph activation (PPR) | O(V + E) → microseconds, negligible | O(V + E) → microseconds, negligible |
 | LTM retrieval | O(log M) with HNSW | O(log log M) with RAPTOR + HNSW [pseudo-constant] |
 | Token generation | O(K) with K ≈ 20k → ~20k ops/token | O(K) with K ≈ 11k → ~11k ops/token [constant] | 
