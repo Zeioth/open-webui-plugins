@@ -2981,7 +2981,7 @@ class StateStore:
             getattr(self._f, "_last_lod_levels", {}).pop(oldest_pid, None)
 
         if state.get("active_blocks"):
-            self._f._rebuild_symbol_index(state, project_id)
+            self._rebuild_symbol_index(state, project_id)
 
         return state
 
@@ -3061,7 +3061,7 @@ class StateStore:
             )
             self._f._db_conn.commit()
 
-        await self._f._db_enqueue(_write)
+        await self._db_enqueue(_write)
 
     # ── DB lifecycle ──────────────────────────────────────────────────
     def init_db(self) -> None:
@@ -3283,6 +3283,28 @@ class StateStore:
 
         return state
 
+    def _rebuild_symbol_index(self, state: dict, project_id: str) -> None:
+        """Reconstruye el SymbolIndex al cargar un estado en frío."""
+        for block in state.get("active_blocks", {}).values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                self._f._symbol_index.add(sym, block.hash, project_id)
+                for callee in sym.calls:
+                    edge = Edge(
+                        src=sym.name,
+                        dst=callee,
+                        type="calls",
+                        weight=EDGE_WEIGHTS["calls"],
+                    )
+                    self._f._symbol_index.add_edge(edge, project_id)
+
+    async def _db_enqueue(self, fn, args=(), kwargs=None) -> None:
+        """Encola una operación de escritura en la cola del worker de BD."""
+        if kwargs is None:
+            kwargs = {}
+        await self._f._db_write_queue.put((fn, args, kwargs))
+
     async def db_worker(self) -> None:
         """Database write worker with automatic restart on failure."""
         while True:
@@ -3346,7 +3368,7 @@ class StateStore:
         if not edges_out:
             return 0
 
-        code_hash = self._f._compute_code_state_hash(project_id)
+        code_hash = self._f._activation.compute_code_state_hash(project_id)
         if not code_hash:
             return 0
 
@@ -3379,7 +3401,7 @@ class StateStore:
             )
             self._f._db_conn.commit()
 
-        await self._f._db_enqueue(_write)
+        await self._db_enqueue(_write)
         self._f._log_debug(
             f"Edge persistence: saved {total_edges} edges (code_hash={code_hash})"
         )
@@ -3482,7 +3504,7 @@ class StateStore:
                 )
             self._f._db_conn.commit()
 
-        await self._f._db_enqueue(_write)
+        await self._db_enqueue(_write)
 
     async def load_path_views_from_db(self, project_id: str) -> list:
         """Carga las CodePathViews almacenadas en SQLite para un proyecto."""
@@ -3685,6 +3707,131 @@ class LongTermMemory:
             self._f._log_debug(f"Error in duplicate question detection: {e}")
         return None
 
+    # ── Query helpers ────────────────────────────────────────────────────
+
+    def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
+        """Extract forced symbol from query (?symbol:Name). Returns (symbol, cleaned_query)."""
+        if not self._f.valves.ltm_symbol_force_mode_enabled:
+            return None, query
+        match = re.match(r"\?symbol:(\S+)", query)
+        if match:
+            symbol = match.group(1)
+            cleaned = query[match.end() :].strip()
+            return symbol, cleaned if cleaned else symbol
+        return None, query
+
+    async def _retrieve_by_symbol(
+        self, symbol: str, cleaned_query: str, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """Retrieve memories filtered by a specific code symbol."""
+        now = time.time()
+        where = {
+            "$and": [
+                {"project_id": {"$eq": project_id}},
+                {"code_symbols": {"$contains": f",{symbol},"}},
+            ]
+        }
+        if self._f.valves.long_term_memory_expiration_days > 0:
+            where["$and"].append({"expires_at": {"$gt": now}})
+        q_emb = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode(cleaned_query[:1000]).tolist()
+        )
+        results = await anyio.to_thread.run_sync(
+            lambda: self._f.memory_collection.query(
+                query_embeddings=[q_emb],
+                n_results=self._f.valves.long_term_memory_top_k * 2,
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        docs_with_meta = []
+        if results and results["documents"]:
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i]
+                sim = 1.0 - (results["distances"][0][i] / 2.0)
+                ts = meta.get("timestamp")
+                if ts is not None and ts < 1000000000:
+                    ts = None
+                if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
+                    age_hours = (now - ts) / 3600
+                    sim *= 0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
+                if sim >= self._f.valves.long_term_memory_similarity_threshold:
+                    docs_with_meta.append((doc, sim, ts, meta))
+        docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+        docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
+        if not docs_with_meta and self._f.valves.ltm_symbol_force_fallback_to_semantic:
+            return await self.retrieve_memories_unified(cleaned_query, project_id)
+        return [{"doc": doc, "timestamp": ts} for doc, _, ts, _ in docs_with_meta]
+
+    async def _expand_query_for_retrieval(
+        self, query: str, slot_free: bool = True
+    ) -> List[str]:
+        """Generate alternative phrasings of the query for LTM retrieval."""
+        if not self._f.valves.enable_multi_query_retrieval:
+            return [query]
+        if not slot_free:
+            return [query]
+        if len(query.strip()) < 15:
+            return [query]
+
+        prompt = (
+            f"Generate {self._f.valves.multi_query_variants} alternative phrasings "
+            f"of this programming question for document search. "
+            f"Focus on different vocabulary (errors, function names, behaviors).\n\n"
+            f"Original: {query[:250]}\n\n"
+            f"Output only the alternatives, one per line. No numbering."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "Output only the alternative phrasings, one per line. "
+                "Be concise and specific to the code context."
+            ),
+            model_override=self._f.valves.llm_model,
+            max_tokens=80,
+            temperature=0.6,
+            label="multi_query_expand",
+        )
+
+        queries = [query]
+        if response:
+            alternatives = [
+                line.strip()
+                for line in response.strip().split("\n")
+                if line.strip() and len(line.strip()) > 5
+            ]
+            queries.extend(alternatives[: self._f.valves.multi_query_variants])
+            self._f._log_debug(
+                f"Multi-query expansion: {len(queries)} queries "
+                f"({[q[:40] for q in queries]})"
+            )
+        return queries
+
+    def _extract_query_symbols(self, query: str, project_id: str) -> Set[str]:
+        """Return symbol names from the query that exist in the SymbolIndex."""
+        if not query or not project_id:
+            return set()
+        words = set(re.findall(r"\b\w+\b", query))
+        project_symbols = self._f._symbol_index.get_all_names(project_id)
+        return words.intersection(project_symbols)
+
+    async def _rerank_results(
+        self, query: str, documents: List[str], top_k: int
+    ) -> List[str]:
+        """Rerank documents using CrossEncoder and return top_k results."""
+        if not self._f.valves.enable_reranking:
+            return documents[:top_k]
+        pairs = [(query, doc) for doc in documents]
+        scores = await self._f._commands._predict_cross_encoder(pairs)
+        if scores is None:
+            self._f._log_debug(
+                "_rerank_results: CrossEncoder not loaded, skipping reranking."
+            )
+            return documents[:top_k]
+        scored = list(zip(documents, scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [doc for doc, _ in scored[:top_k]]
+
     async def retrieve_memories_unified(
         self, query: str, project_id: str, slot_free: bool = True
     ) -> list:
@@ -3692,9 +3839,9 @@ class LongTermMemory:
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
-        forced_symbol, cleaned_query = self._f._parse_forced_symbol_query(query)
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
         if forced_symbol:
-            return await self._f._retrieve_by_symbol(
+            return await self._retrieve_by_symbol(
                 forced_symbol, cleaned_query, project_id
             )
 
@@ -3704,8 +3851,7 @@ class LongTermMemory:
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append({"expires_at": {"$gt": now}})
 
-            # Multi‑query expansion
-            query_variants = await self._f._expand_query_for_retrieval(
+            query_variants = await self._expand_query_for_retrieval(
                 query, slot_free=slot_free
             )
 
@@ -3784,7 +3930,7 @@ class LongTermMemory:
             docs_with_meta.sort(key=lambda x: x[1], reverse=True)
 
             if self._f.valves.ltm_symbol_boost_enabled and query:
-                query_symbols = self._f._extract_query_symbols(query, project_id)
+                query_symbols = self._extract_query_symbols(query, project_id)
                 if query_symbols:
                     new_docs = []
                     for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
@@ -3816,7 +3962,7 @@ class LongTermMemory:
                     50,
                 )
                 docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
-                reranked = await self._f._rerank_results(query, docs_only, rerank_k)
+                reranked = await self._rerank_results(query, docs_only, rerank_k)
                 doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
                 docs_with_meta = [
                     (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
@@ -3846,9 +3992,9 @@ class LongTermMemory:
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
-        forced_symbol, cleaned_query = self._f._parse_forced_symbol_query(query)
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
         if forced_symbol:
-            memories = await self._f._retrieve_by_symbol(
+            memories = await self._retrieve_by_symbol(
                 forced_symbol, cleaned_query, project_id
             )
             return [{"role": "user", "content": m["doc"]} for m in memories]
@@ -3873,7 +4019,7 @@ class LongTermMemory:
 
             query_symbols = set()
             if self._f.valves.ltm_symbol_boost_enabled and query:
-                query_symbols = self._f._extract_query_symbols(query, project_id)
+                query_symbols = self._extract_query_symbols(query, project_id)
 
             scored_regular = []
             scored_summaries = []
@@ -3915,7 +4061,7 @@ class LongTermMemory:
                 and len(messages) > 1
             ):
                 docs = [m["content"] for m in messages]
-                reranked = await self._f._rerank_results(query, docs, limit)
+                reranked = await self._rerank_results(query, docs, limit)
                 doc_to_msg = {m["content"]: m for m in messages}
                 messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
 
@@ -4120,6 +4266,246 @@ class LongTermMemory:
         self._f._response_cache_count[project] = (
             self._f._response_cache_count.get(project, 0) + 1
         )
+
+    async def _handle_forget_command(
+        self, messages: list, project_id: str, __user__: Optional[dict]
+    ) -> Tuple[list, bool]:
+        """Handle /forget command. Returns (messages, handled)."""
+        if not self._f.valves.enable_forget_command:
+            return messages, False
+        if not messages:
+            return messages, False
+        last_msg = messages[-1]
+        if last_msg.get("role") != "user":
+            return messages, False
+        content = last_msg.get("content", "").strip()
+        if not content.startswith("/forget"):
+            return messages, False
+
+        parts = content.split(maxsplit=1)
+        target = parts[1] if len(parts) > 1 else ""
+        state = self._f._state_store.get_state(project_id)
+        if not state:
+            return messages, False
+
+        if target == "all":
+            for block in state["active_blocks"].values():
+                self._f._symbol_index.remove_all_for_block(
+                    block.hash, block.symbols, project_id
+                )
+            state["active_blocks"].clear()
+            state["recent_changes"].clear()
+            state["committed_changes"].clear()
+            state["has_any_calls"] = False
+            self._f._activation.invalidate_lightweight_cache(project_id)
+            confirmation = "Forgotten all context."
+        elif target == "last":
+            if state["active_blocks"]:
+                last_hash = max(
+                    state["active_blocks"].keys(),
+                    key=lambda h: state["active_blocks"][h].timestamp,
+                )
+                block = state["active_blocks"].get(last_hash)
+                if block:
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                del state["active_blocks"][last_hash]
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                confirmation = "Forgotten the last context block."
+            else:
+                confirmation = "No blocks to forget."
+        else:
+            to_remove = [
+                h
+                for h, blk in state["active_blocks"].items()
+                if (blk.file_path and target in blk.file_path) or target in h
+            ]
+            for h in to_remove:
+                block = state["active_blocks"].get(h)
+                if block:
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                del state["active_blocks"][h]
+            self._f._activation.invalidate_lightweight_cache(project_id)
+            confirmation = f"Forgotten {len(to_remove)} block(s) matching '{target}'."
+
+        self._f._state_store.set_state(project_id, state)
+        messages.pop()
+        messages.append({"role": "assistant", "content": confirmation})
+        return messages, True
+
+    async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
+        """Handle /clean command. Returns a response string."""
+        if (
+            not self._f.valves.cleanup_suggestions_enabled
+            or not self._f.valves.cleanup_command_enabled
+        ):
+            return "Cleanup is disabled."
+
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            candidates = self._f._activation.get_inactive_block_candidates(project_id)
+            parts = command_text.split(maxsplit=1)
+            subcommand = parts[1].strip() if len(parts) > 1 else ""
+
+            if not subcommand:
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                lines = [
+                    f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last "
+                    f"{self._f.valves.cleanup_inactive_threshold_messages} messages):"
+                ]
+                for h in candidates:
+                    blk = state["active_blocks"].get(h)
+                    if blk:
+                        snippet = blk.content[:80].replace("\n", " ")
+                        file_info = f" ({blk.file_path})" if blk.file_path else ""
+                        lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
+                lines.append(
+                    "\nUse `/clean all` to remove all, or `/clean <hash>` for a specific block."
+                )
+                return "\n".join(lines)
+
+            if subcommand.lower() == "all":
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                for h in candidates:
+                    block = state["active_blocks"].pop(h, None)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                state["recent_changes"] = [
+                    c for c in state["recent_changes"] if c.hash not in candidates
+                ]
+                state["committed_changes"] = [
+                    c for c in state["committed_changes"] if c.hash not in candidates
+                ]
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned {len(candidates)} inactive block(s)."
+
+            target_hash = subcommand.strip()
+            if target_hash in candidates:
+                block = state["active_blocks"].pop(target_hash, None)
+                if block:
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned block `{target_hash[:8]}...`."
+            else:
+                matched = [h for h in state["active_blocks"] if target_hash in h]
+                for h in matched:
+                    if h in candidates:
+                        block = state["active_blocks"].pop(h, None)
+                        if block:
+                            self._f._symbol_index.remove_all_for_block(
+                                block.hash, block.symbols, project_id
+                            )
+                        self._f._activation.invalidate_lightweight_cache(project_id)
+                        self._f._state_store.set_state(project_id, state)
+                        return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
+                return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
+
+    async def _handle_expand_command(self, text: str, project_id: str) -> str:
+        """Handle /expand command. Returns a response string."""
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return (
+                "Usage: `/expand [depth] <function_name>`\n"
+                "Example: `/expand 3 calcularImpuesto`"
+            )
+        depth = self._f.valves.expand_default_depth
+        if parts[1].isdigit():
+            depth = int(parts[1])
+            func_name = parts[2] if len(parts) > 2 else None
+        else:
+            func_name = parts[1]
+        if not func_name:
+            return "Missing function name."
+
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_names:
+            state = self._f._state_store.get_state(project_id)
+            if state and state.get("active_blocks"):
+                self._f._rebuild_symbol_index(state, project_id)
+                all_names = self._f._symbol_index.get_all_names(project_id)
+
+        if not all_names:
+            return (
+                "❌ The symbol index is empty.\n\n"
+                "No code has been processed in this session yet. "
+                "Paste the code you want to analyze first, then use `/expand` again."
+            )
+
+        if func_name not in all_names:
+            lower_name = func_name.lower()
+            suggestions = sorted(
+                [n for n in all_names if lower_name in n.lower()],
+                key=lambda n: (not n.startswith(func_name[0]), n),
+            )[:8]
+            hint = ""
+            if suggestions:
+                hint = "\n\nDid you mean one of these?\n" + "\n".join(
+                    f"- `{s}`" for s in suggestions
+                )
+            else:
+                sample = sorted(all_names)[:10]
+                hint = (
+                    f"\n\nThe index contains {len(all_names)} symbol(s). Sample:\n"
+                    + "\n".join(f"- `{s}`" for s in sample)
+                )
+            return f"❌ Symbol `{func_name}` not found in the index." + hint
+
+        expanded = await self._expand_symbol_dependencies(func_name, depth, project_id)
+        if not expanded:
+            return (
+                f"❌ Symbol `{func_name}` is indexed but its code body could not be retrieved. "
+                "Try pasting the code again."
+            )
+
+        if expanded.count("### ") <= 1:
+            return f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}\n\n> No further call dependencies found."
+
+        return f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}"
+
+    async def _expand_symbol_dependencies(
+        self, name: str, max_depth: int, project_id: str
+    ) -> str:
+        """Expand a symbol by following its call graph up to max_depth."""
+        state = self._f._state_store.get_state(project_id)
+        if not state:
+            return ""
+        visited = set()
+        lines = []
+
+        async def recurse(current_name, current_depth):
+            if current_depth > max_depth or current_name in visited:
+                return
+            visited.add(current_name)
+            blocks = self._f._symbol_index.find_blocks(current_name, project_id)
+            for h in blocks:
+                block = state["active_blocks"].get(h)
+                if block and not block.obsolete:
+                    loc = f" (file: {block.file_path})" if block.file_path else ""
+                    lines.append(
+                        f"### `{current_name}` (depth {current_depth}){loc}\n"
+                        f"```\n{block.content[:2000]}\n```"
+                    )
+                    for sym in block.symbols:
+                        if sym.name == current_name:
+                            for callee in sym.calls:
+                                await recurse(callee, current_depth + 1)
+                            break
+                    break
+
+        await recurse(name, 1)
+        return "\n".join(lines)
 
 
 class LLMOrchestrator:
@@ -4523,6 +4909,73 @@ class ReasoningEngine:
         else:
             return 3
 
+    async def _generate_step_back_context(
+        self, question: str, code_context: str
+    ) -> str:
+        """
+        Generate an architectural step-back for better CoT hypothesis quality.
+
+        Asks: "What high-level principle governs this code?" before diving
+        into the specific bug/question.
+
+        Returns a formatted string to prepend to the CoT context,
+        or empty string if disabled or the LLM call fails.
+        """
+        if not self._f.valves.enable_step_back_prompting:
+            return ""
+        if len(question.strip()) < 15:
+            return ""
+
+        debug_signals = (
+            "error",
+            "fail",
+            "bug",
+            "wrong",
+            "exception",
+            "traceback",
+            "falla",
+            "error",
+            "excepción",
+            "no funciona",
+        )
+        question_lower = question.lower()
+        if not any(signal in question_lower for signal in debug_signals):
+            if not self._f.valves.step_back_always:
+                return ""
+
+        step_back_prompt = (
+            f"A programmer is debugging this specific issue:\n{question[:300]}\n\n"
+            "What is the underlying architectural principle, design invariant, or "
+            "general concept that governs correct behavior here? "
+            "State it as an abstract question and answer it in 2-3 sentences. "
+            "Focus on system-level understanding, not the specific bug."
+        )
+
+        step_back_response = await self._f._llm_orchestrator.call_llm(
+            prompt=step_back_prompt,
+            system_prompt=(
+                "You are a senior software architect. "
+                "Answer the abstract question concisely (2-3 sentences). "
+                "Focus on principles, not the specific implementation."
+            ),
+            model_override=self._f.valves.cot_model_level2,
+            max_tokens=self._f.valves.step_back_max_tokens,
+            temperature=0.3,
+            label="step_back",
+        )
+
+        if step_back_response and step_back_response.strip():
+            self._f._log_debug(
+                "Step-back context generated "
+                f"({len(step_back_response.split())} words)"
+            )
+            return (
+                "## Architectural Context (Step-Back)\n"
+                f"{step_back_response.strip()}\n\n"
+                "---\n\n"
+            )
+        return ""
+
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
     ) -> int:
@@ -4787,7 +5240,7 @@ class ReasoningEngine:
             f"Question:\n{question}\n\n"
             "Think step by step and provide your reasoning:"
         )
-        response = await self._f._call_llm(
+        response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
                 "You are a helpful assistant that thinks step by step before answering."
@@ -4853,7 +5306,7 @@ class ReasoningEngine:
             f"Confidence: <0.0-1.0>\n\n"
             f"Be specific: mention function names, files, or data flows if possible."
         )
-        response = await self._f._call_llm(
+        response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
                 "You are a scientific reasoning engine. Output exactly the requested "
@@ -4881,7 +5334,9 @@ class ReasoningEngine:
             iteration += 1
             scored = []
             for hyp_text, llm_conf in hypotheses:
-                evidence = self._f._gather_static_evidence(hyp_text, project_id)
+                evidence = self._f._activation._gather_static_evidence(
+                    hyp_text, project_id
+                )
                 obj_score = evidence.objective_score
                 combined = 0.5 * obj_score + 0.5 * llm_conf
                 scored.append((hyp_text, combined, obj_score, llm_conf, evidence))
@@ -4917,7 +5372,7 @@ class ReasoningEngine:
                 f"{evidence_feedback}\n\n"
                 f"Output the same format as before: Hypothesis: ... Confidence: ..."
             )
-            refine_response = await self._f._call_llm(
+            refine_response = await self._f._llm_orchestrator.call_llm(
                 prompt=refine_prompt,
                 system_prompt=(
                     "You are a scientific reasoning engine refining hypotheses "
@@ -4951,7 +5406,7 @@ class ReasoningEngine:
             f"Provide a step-by-step reasoning to answer the question, "
             f"grounded in this evidence."
         )
-        reasoning = await self._f._call_llm(
+        reasoning = await self._f._llm_orchestrator.call_llm(
             prompt=final_prompt,
             system_prompt=(
                 "You are a helpful assistant that reasons step by step "
@@ -5249,11 +5704,13 @@ class CommandRouter:
 
         # /forget
         if self._f.valves.enable_forget_command and is_explicit_command:
-            new_messages, handled = await self._f._handle_forget_command(
+            new_messages, handled = await self._handle_forget_command(
                 messages, project_id, __user__
             )
             if handled:
-                return True, self._f._ensure_last_message_is_user(new_messages)
+                return True, self._f._inlet_orch.ensure_last_message_is_user(
+                    new_messages
+                )
 
         # /status
         if (
@@ -5279,7 +5736,7 @@ class CommandRouter:
                 response = "\n".join(lines)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
-            return True, self._f._ensure_last_message_is_user(messages)
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         # /clean
         if (
@@ -5287,19 +5744,86 @@ class CommandRouter:
             and self._f.valves.cleanup_command_enabled
             and self._f.valves.cleanup_suggestions_enabled
         ):
-            response = await self._f._handle_clean_command(content, project_id)
+            response = await self._handle_clean_command(content, project_id)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
-            return True, self._f._ensure_last_message_is_user(messages)
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         # /expand
         if content.startswith("/expand"):
-            response = await self._f._handle_expand_command(content, project_id)
+            response = await self._handle_expand_command(content, project_id)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
-            return True, self._f._ensure_last_message_is_user(messages)
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         return False, None
+
+    async def outlet_intercept_expand(
+        self,
+        assistant_content: str,
+        project_id: str,
+    ) -> Tuple[str, bool]:
+        """
+        Intercept /expand commands in the assistant's response and replace them
+        with the actual expanded symbol code from the SymbolIndex.
+        Returns (modified_content, did_expand).
+        """
+        if not self._f.valves.outlet_expand_intercept_enabled:
+            return assistant_content, False
+
+        EXPAND_RE = re.compile(r"/expand\s+(?:(\d+)\s+)?(\w+)", re.IGNORECASE)
+        matches = list(EXPAND_RE.finditer(assistant_content))
+        if not matches:
+            return assistant_content, False
+
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        replaced_content = assistant_content
+        did_any = False
+        state = self._f._state_store.get_state(project_id)
+
+        max_syms = self._f.valves.outlet_expand_intercept_max_symbols
+        matches_to_process = matches if max_syms == 0 else matches[:max_syms]
+
+        for match in matches_to_process:
+            depth_str = match.group(1)
+            func_name = match.group(2)
+            depth = (
+                int(depth_str)
+                if depth_str
+                else self._f.valves.outlet_expand_intercept_depth
+            )
+            if depth == 0:
+                depth = 9999
+
+            if func_name not in all_names:
+                continue
+
+            expanded = await self._expand_symbol_dependencies(
+                func_name, depth, project_id
+            )
+            if not expanded:
+                continue
+
+            did_any = True
+            replacement = f"[Retrieved `{func_name}`]\n{expanded}"
+            replaced_content = replaced_content.replace(match.group(0), replacement, 1)
+
+            lock = await self._f._state_store.get_project_lock(project_id)
+            async with lock:
+                block_hashes = self._f._symbol_index.find_blocks(func_name, project_id)
+                for h in block_hashes:
+                    block = state["active_blocks"].get(h)
+                    if block and not block.obsolete:
+                        block.is_raw = True
+                        block.pinned = True
+                        block.importance_score = 10.0
+                        block.last_mentioned = time.time()
+                        block.last_mentioned_msg_idx = state["message_count"]
+                        break
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+
+        return replaced_content, did_any
 
     async def handle_natural_intents(
         self,
@@ -5443,7 +5967,7 @@ class CommandRouter:
             if func_name not in all_names:
                 continue
 
-            expanded = await self._f._expand_symbol_dependencies(
+            expanded = await self._expand_symbol_dependencies(
                 func_name, depth, project_id
             )
             if not expanded:
@@ -6787,6 +7311,60 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Path index & cross‑chunk edges
     # ═══════════════════════════════════════════════════════════════════════════
+    async def _build_view_from_activation(
+        self, entry_point: str, ag: ActivationGraph, project_id: str
+    ) -> Optional[CodePathView]:
+        """Build a CodePathView from an ActivationGraph and register it in PathIndex."""
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        edges_in_map: Dict[str, List[Edge]] = defaultdict(list)
+        for sym, edge_list in edges_out.items():
+            for e in edge_list:
+                edges_in_map[e.dst].append(e)
+
+        extractor = SubgraphExtractor(
+            activation_threshold=self._f.valves.path_activation_threshold,
+            expand_hops=1,
+        )
+        induced_nodes_set, induced_edges = extractor.extract(
+            ag, edges_out, edges_in_map
+        )
+
+        if not induced_nodes_set:
+            return None
+
+        induced_nodes_scored = {node: ag.get_score(node) for node in induced_nodes_set}
+
+        path_id = hashlib.md5(
+            f"{entry_point}|{'|'.join(sorted(induced_nodes_set))}".encode()
+        ).hexdigest()[:16]
+
+        existing = self._f._path_index.get(path_id, project_id)
+        structural_hash = self.compute_structural_hash(induced_nodes_set, project_id)
+        call_graph_hash = self.compute_call_graph_hash(induced_nodes_set, project_id)
+
+        view = CodePathView(
+            path_id=path_id,
+            entry_point=entry_point,
+            seed_nodes=[entry_point],
+            induced_nodes=induced_nodes_scored,
+            induced_edges=induced_edges,
+            activation_score=ag.aggregate_path_score(list(induced_nodes_set)),
+            structural_hash=structural_hash,
+            call_graph_hash=call_graph_hash,
+        )
+
+        if (
+            existing
+            and not existing.is_stale(structural_hash, call_graph_hash)
+            and existing.business_label
+        ):
+            view.business_label = existing.business_label
+            view.summary = existing.summary
+            view.label_confidence = existing.label_confidence
+
+        self._f._path_index.add(view, project_id)
+        return view
+
     async def rebuild_path_index(self, project_id: str) -> None:
         """Reconstruct PathIndex from SymbolIndex for all entry points."""
         state = self._f._state_store.get_state(project_id)
@@ -6797,7 +7375,7 @@ class ActivationEngine:
         )
         for ep in entry_points:
             ag = self.build_activation_graph(ep, project_id)
-            await self._f._build_view_from_activation(ep, ag, project_id)
+            await self._build_view_from_activation(ep, ag, project_id)
 
         if self._f.valves.enable_centrality_prior:
             self._f._node_centrality[project_id] = (
@@ -6891,7 +7469,7 @@ class ActivationEngine:
             ag = ActivationGraph()
             ag.seed([sym_name], initial_score=1.0)
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
-            await self._f._build_view_from_activation(sym_name, ag, project_id)
+            await self._build_view_from_activation(sym_name, ag, project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Hash utilities
@@ -7030,7 +7608,7 @@ class HistoryCompressor:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
 
-            safe, ratio = self._f._verify_code_symbols_indexed(content, project_id)
+            safe, ratio = self._verify_code_symbols_indexed(content, project_id)
             if not safe:
                 self._f._log_debug(
                     f"Code history: skipping compression of Part {part_num}/{total_parts} "
@@ -7039,7 +7617,7 @@ class HistoryCompressor:
                 )
                 continue
 
-            summary = self._f._build_code_commit_summary(
+            summary = self._build_code_commit_summary(
                 content, project_id, part_num, total_parts
             )
             tokens_before = self._f._tokens.estimate_tokens(content)
@@ -7059,6 +7637,87 @@ class HistoryCompressor:
             )
 
         return new_messages
+
+    def _verify_code_symbols_indexed(
+        self, content: str, project_id: str
+    ) -> Tuple[bool, float]:
+        """
+        Verify that code symbols in the content are indexed in the SymbolGraph.
+        Returns (is_indexed, ratio).
+        """
+        _TOP_LEVEL = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+        expected = set(_TOP_LEVEL.findall(content))
+        if not expected:
+            _TOP_FN = re.compile(
+                r"^(?:async )?def\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+            )
+            expected = set(_TOP_FN.findall(content))
+        if not expected:
+            return True, 1.0
+
+        try:
+            graph_symbols = self._f._symbol_index.get_all_names(project_id)
+            ratio = len(expected & graph_symbols) / len(expected)
+            return ratio >= self._f.valves.code_history_symbol_index_threshold, ratio
+        except Exception as exc:
+            self._f._log_debug(f"Symbol index check failed: {exc}")
+            return False, 0.0
+
+    def _build_code_commit_summary(
+        self,
+        content: str,
+        project_id: str,
+        part_num: int,
+        total_parts: int,
+    ) -> str:
+        """Generate a compact commit summary for a compressed code message."""
+        classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        methods = re.findall(
+            r"^\s{4,}(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE
+        )
+
+        code_bodies = re.findall(r"```(?:\w*)\n(.*?)```", content, re.DOTALL)
+        code_lines = sum(b.count("\n") for b in code_bodies)
+        code_tokens = (
+            self._f._tokens.estimate_tokens("\n".join(code_bodies))
+            if code_bodies
+            else 0
+        )
+
+        header_m = re.search(
+            r"##\s*Código\s*[—\-]\s*Parte\s*\d+/\d+[:\s]+(.+?)(?:\n|$)", content
+        )
+        part_label = header_m.group(1).strip() if header_m else ""
+
+        imports = re.findall(r"^from\s+\S+\s+import\s+(.+)$", content, re.MULTILINE)
+        dep_symbols: List[str] = []
+        for imp in imports[:3]:
+            dep_symbols.extend(s.strip() for s in imp.split(","))
+        dep_symbols = dep_symbols[:6]
+
+        title = f"[🗜️ PARTE {part_num}/{total_parts}"
+        if part_label:
+            title += f": {part_label}"
+        title += " — COMPRIMIDO]"
+
+        lines = [title]
+        if classes:
+            lines.append(f"Clases:    {', '.join(classes)}")
+        if top_fns:
+            lines.append(f"Funciones: {', '.join(top_fns[:6])}")
+        if methods:
+            lines.append(f"Métodos:   {len(methods)} implementados")
+        lines.append(f"Volumen:   ~{code_lines} líneas / ~{code_tokens} tokens")
+        if dep_symbols:
+            lines.append(f"Deps usadas: {', '.join(dep_symbols)}")
+        if classes:
+            lines.append(f"Recuperar: /expand {classes[0]}")
+        lines.append(
+            "[Todos los símbolos indexados en SymbolGraph — accesibles via LOD]"
+        )
+
+        return "\n".join(lines)
 
     def lean_user_code_messages(self, messages: list, project_id: str) -> list:
         """
@@ -7338,7 +7997,7 @@ class HistoryCompressor:
             if is_code_context
             else "You produce concise summaries."
         )
-        summary = await self._f._call_llm(
+        summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=system_prompt,
             model_override=self._f.valves.summarization_model,
@@ -7385,7 +8044,7 @@ class HistoryCompressor:
             f"{'Signature: ' + sig + chr(10) if sig else ''}"
             f"```\n{block.content[:self._f.valves.summary_code_max_chars]}\n```"
         )
-        summary = await self._f._call_llm(
+        summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Be concise and technical.",
             model_override=self._f.valves.code_block_summary_model,
@@ -7738,12 +8397,8 @@ class EnrichmentTasks:
         return "\n".join(lines)
 
     async def parallel_context_checks(
-        self,
-        messages: list,
-        query: str,
-        context_hash: str,
-        project_id: str,
-        state: dict,
+        self, messages: list, query: str, context_hash: str,
+        project_id: str, state: dict,
         skip_contradiction: bool = False,
         skip_cache: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
@@ -7759,7 +8414,7 @@ class EnrichmentTasks:
                     self._f.valves.enable_contradiction_detection
                     and not skip_contradiction
                 )
-                else self._noop()
+                else asyncio.sleep(0, result=None)
             ),
             (
                 self._f._ltm.find_cached_response(query, context_hash, state)
@@ -7768,12 +8423,12 @@ class EnrichmentTasks:
                     and HAS_SENTENCE
                     and not skip_cache
                 )
-                else self._noop()
+                else asyncio.sleep(0, result=None)
             ),
             (
                 self._f._ltm.find_duplicate_question(query, project_id)
                 if (self._f.valves.duplicate_question_threshold and HAS_SENTENCE)
-                else self._noop()
+                else asyncio.sleep(0, result=None)
             ),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -7781,10 +8436,6 @@ class EnrichmentTasks:
         cached = results[1] if not isinstance(results[1], Exception) else None
         duplicate = results[2] if not isinstance(results[2], Exception) else None
         return contradiction, cached, duplicate
-
-    @staticmethod
-    async def _noop():
-        return None
 
 
 class ActiveCodeUpdater:
@@ -7810,7 +8461,7 @@ class ActiveCodeUpdater:
         role = message.get("role", "")
 
         # 1. Extract new blocks and symbols
-        new_blocks_pending, symbols_list, content_to_syms = (
+        new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
             await self._extract_and_prepare_new_blocks(content, role)
         )
 
@@ -7937,7 +8588,7 @@ class ActiveCodeUpdater:
             if not isinstance(syms, Exception)
         }
 
-        return new_blocks_pending, symbols_list, content_to_syms
+        return new_blocks_pending, symbols_list, content_to_syms, extracted
 
     def _detect_duplicates(
         self, new_blocks: List["CodeBlock"], state: dict
@@ -8177,7 +8828,26 @@ class ActiveCodeUpdater:
             }
             to_remove = [h for h in state["active_blocks"] if h not in keep_hashes]
             for h in to_remove:
-                del state["active_blocks"][h]
+                block = state["active_blocks"].get(h)
+                if (
+                    block
+                    and self._f.valves.enable_block_paging
+                    and self._f._pager is not None
+                ):
+                    paged = await self._f._pager.page_out_block(
+                        block=block,
+                        project_id=project_id,
+                        state=state,
+                        symbol_index=self._f._symbol_index,
+                        chroma_collection=self._f.memory_collection,
+                        embedder=self._f.embedder,
+                    )
+                    if paged:
+                        del state["active_blocks"][h]
+                        continue
+                # Fallback: remove without paging
+                if h in state["active_blocks"]:
+                    del state["active_blocks"][h]
             if to_remove:
                 self._f._log_debug(
                     f"Evicted {len(to_remove)} blocks due to max_active_blocks limit. "
@@ -8394,53 +9064,223 @@ class InletOrchestrator:
         """Return the current project id from the valves configuration."""
         return self._f.valves.project_id
 
-    async def inlet_preprocess(self, body: dict, project_id: str) -> list:
-        """Handle project switching, symbol cache loading, and KV slot restore."""
-        messages = body.get("messages", [])
+    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        self._log_debug("inlet called")
+        inlet_start = time.monotonic()
+        self._log_section("CONTEXT MANAGER - INLET START")
 
-        if self._f._last_project_id and self._f._last_project_id != project_id:
-            self._f._log_debug(
-                f"Project changed from {self._f._last_project_id} to {project_id}"
+        def _inlet_timing(step_name: str, start: float, end: float = None):
+            if end is None:
+                end = time.monotonic()
+            self._log_timing(step_name, start - inlet_start, end - start)
+
+        project_id = self._inlet_orch.get_project_id()
+        slot_free = True
+
+        # ── Step 1/7: Preprocess ────────────────────────────────────────
+        step_start = time.monotonic()
+        messages = await self._inlet_orch.inlet_preprocess(body, project_id)
+        _inlet_timing("Step 1/7: Preprocess (project switch, cache load)", step_start)
+        if not messages:
+            return body
+
+        # ── Step 2/7: Extract user info ─────────────────────────────────
+        step_start = time.monotonic()
+        (
+            last_user_msg,
+            user_query,
+            user_question,
+            is_explicit_command,
+            has_code_blocks,
+        ) = await self._inlet_orch.inlet_extract_user_info(messages)
+        _inlet_timing("Step 2/7: Extract user info", step_start)
+
+        # ── Detect AutoContinue continuation ────────────────────────────
+        _last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        _hint = ""
+        _is_continuation = False
+        if _last_assistant:
+            _ac = _last_assistant.get("content", "")
+            for _marker in self._MULTI_PHASE_MARKERS:
+                if _marker in _ac:
+                    _is_continuation = True
+                    _idx = _ac.find(_marker)
+                    _hint_line = _ac[_idx:].split("\n")[0]
+                    _hint = re.sub(
+                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
+                        "",
+                        _hint_line,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    if _hint:
+                        user_question = _hint
+                        self._log_debug(
+                            f"AutoContinue detected — LOD query: '{user_question}'"
+                        )
+                    break
+        if _is_continuation:
+            slot_free = False
+            user_query = user_query + " código"
+
+        # ── Step 3/7: Handle explicit commands ──────────────────────────
+        step_start = time.monotonic()
+        handled, handled_messages = await self._commands.handle_explicit_commands(
+            messages, project_id, is_explicit_command, last_user_msg, __user__
+        )
+        _inlet_timing("Step 3/7: Handle explicit commands", step_start)
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
             )
-            old_state = self._f._conversation_state.get(self._f._last_project_id)
-            if old_state:
-                self._f._symbol_index.clear_project(self._f._last_project_id)
-            self._f._cached_lightweight_context.pop(self._f._last_project_id, None)
-            self._f._block_change_summaries.clear()
-        self._f._last_project_id = project_id
+            return body
 
-        # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
-        if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
-            existing_views = self._f._path_index.get_all(project_id)
-            all_names = self._f._symbol_index.get_all_names(project_id)
-            if all_names and not existing_views:
-                self._f._log_debug(
-                    "PathIndex empty but symbols exist — loading from DB"
-                )
-                db_views = await self._f._state_store.load_path_views_from_db(
-                    project_id
-                )
-                for view in db_views:
-                    self._f._path_index.add(view, project_id)
+        # ── Step 4/7: Handle natural language intents ───────────────────
+        step_start = time.monotonic()
+        handled, handled_messages = await self._commands.handle_natural_intents(
+            messages,
+            project_id,
+            is_explicit_command,
+            last_user_msg,
+            slot_free=slot_free,
+        )
+        _inlet_timing("Step 4/7: Handle natural language intents", step_start)
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
+            return body
 
-        # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
-        if self._f.valves.enable_edge_persistence:
-            restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
-            if restored > 0:
-                self._f._log_debug(
-                    f"Cross-session: {restored} symbol edges restored from DB. "
-                    f"No need to re-paste code."
-                )
-
-        # ── v7 (PASO-25): restore KV slot at session start (once per project) ──
+        # ── Silent Ingestion ───────────────────────────────────────────
         if (
-            self._f.valves.enable_slot_persistence
-            and project_id not in self._f._slot_restore_attempted
-            and project_id in self._f._ctx_builder._block_a_cache
+            self.valves.enable_silent_ingestion
+            and last_user_msg is not None
+            and not is_explicit_command
         ):
-            await self._f._ctx_builder.slot_restore(project_id)
+            if await self._commands.is_code_only_message(user_query):
+                self._log_section("SILENT INGESTION MODE")
 
-        return messages
+                _msg_to_index = last_user_msg
+                if "```" not in user_query and self._commands.has_code_indicators(
+                    user_query
+                ):
+                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
+                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                    _msg_to_index = {
+                        **last_user_msg,
+                        "content": f"```{_lang}\n{user_query}\n```",
+                    }
+                    self._log_debug(
+                        f"Silent ingestion: wrapping raw code as {_lang} "
+                        f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
+                    )
+
+                await self._update_active_code(_msg_to_index, project_id)
+                await self._activation.resolve_dangling_edges(project_id)
+
+                if self.valves.enable_path_analysis:
+                    await self._activation.rebuild_path_index(project_id)
+
+                self._ctx_builder.invalidate_block_a_cache(
+                    project_id, "new chunk ingested"
+                )
+
+                state = self._state_store.get_state(project_id)
+                num_blocks = len(state.get("active_blocks", {}))
+                num_symbols = len(self._symbol_index.get_all_names(project_id))
+
+                response = (
+                    f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
+                    "El código está disponible en el SymbolGraph para futuras consultas. "
+                    "Usa `/expand <nombre>` para ver una función/clase completa."
+                )
+
+                messages.pop()
+                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "user", "content": "continue"})
+                body["messages"] = messages
+                _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
+                )
+                return body
+
+        # ── Step 5/7: Prepare code session ──────────────────────────────
+        step_start = time.monotonic()
+        is_code_session, user_question = (
+            await self._inlet_orch.inlet_prepare_code_session(
+                messages, project_id, user_query, is_continuation=_is_continuation
+            )
+        )
+        _inlet_timing("Step 5/7: Prepare code session", step_start)
+
+        # ── Step 6/7: Build system injections ───────────────────────────
+        step_start = time.monotonic()
+        state = self._state_store.get_state(project_id)
+        static_block, dynamic_injections, cached_response, prelim_system = (
+            await self._inlet_build_system_injections(
+                messages,
+                project_id,
+                user_query,
+                user_question,
+                is_code_session,
+                last_user_msg,
+                state,
+                slot_free=slot_free,
+            )
+        )
+        _inlet_timing("Step 6/7: Build system injections", step_start)
+
+        # ── v8: Restore KV slot after Block A has been built (fix #20) ──
+        if (
+            self.valves.enable_slot_persistence
+            and project_id not in self._slot_restore_attempted
+        ):
+            await self._ctx_builder.slot_restore(project_id)
+
+        if cached_response:
+            messages.pop()
+            messages.append(
+                {"role": "assistant", "content": cached_response["response"]}
+            )
+            messages = self._inlet_orch.ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+            )
+            return body
+
+        # ── Step 7/7: Assemble final messages ───────────────────────────
+        step_start = time.monotonic()
+        messages = await self._inlet_assemble_final_messages(
+            messages,
+            project_id,
+            static_block,
+            dynamic_injections,
+            prelim_system,
+            last_user_msg,
+            is_code_session,
+            state,
+            __user__,
+            user_question,
+            has_code_blocks,
+            slot_free=slot_free,
+        )
+        _inlet_timing("Step 7/7: Assemble final messages", step_start)
+
+        body["messages"] = messages
+        _inlet_timing("total_inlet (end-to-end)", inlet_start)
+        self._log_section(
+            "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+        )
+        return body
 
     async def inlet_extract_user_info(
         self,
@@ -8977,6 +9817,108 @@ class SystemPromptBuilder:
 
         return prelim_system
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Static evidence
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _gather_static_evidence(
+        self, hypothesis_text: str, project_id: str
+    ) -> "StaticEvidence":
+        """
+        Gather deterministic evidence about the structural claims in a hypothesis.
+        No LLM. No GPU. Instant.
+
+        Uses SymbolIndex with typed edges for precise validation.
+        Includes data flow upstream information.
+        """
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        state = self._f._state_store.get_state(project_id)
+
+        # ── 1. Symbols mentioned in the hypothesis ──────────────────────
+        words = set(re.findall(r"\b\w+\b", hypothesis_text))
+        mentioned = all_names.intersection(words)
+
+        symbols_found = {
+            name: bool(self._f._symbol_index.find_blocks(name, project_id))
+            for name in mentioned
+        }
+
+        # ── 2. Claimed call relationships ───────────────────────────────
+        call_patterns = re.findall(
+            r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+            hypothesis_text,
+            re.IGNORECASE,
+        )
+        call_relations_valid = {}
+        for caller, callee in call_patterns:
+            if caller not in all_names or callee not in all_names:
+                continue
+            key = f"{caller}_calls_{callee}"
+            caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
+            verified = any(
+                e.dst == callee and e.type in ("calls", "reads", "writes")
+                for e in caller_edges
+            )
+            call_relations_valid[key] = verified
+
+        # ── 3. Recent changes (last hour) ───────────────────────────────
+        now = time.time()
+        recent_window = 3600
+        recent_changes = [
+            name
+            for name in mentioned
+            if any(
+                state["active_blocks"].get(bh) is not None
+                and (now - state["active_blocks"][bh].timestamp) < recent_window
+                for bh in self._f._symbol_index.find_blocks(name, project_id)
+            )
+        ]
+
+        # ── 4. Entry points mentioned ───────────────────────────────────
+        all_views = self._f._path_index.get_all(project_id)
+        entry_points_mentioned = [
+            v.entry_point for v in all_views if v.entry_point in mentioned
+        ]
+
+        # ── 5. Path memberships ─────────────────────────────────────────
+        path_memberships: Dict[str, List[str]] = {}
+        for name in mentioned:
+            path_memberships[name] = self._f._path_index.mark_stale_for_symbol(
+                name, project_id
+            )
+
+        # ── 6. Data flow upstream (backward slicing) ────────────────────
+        data_flow_upstream: Dict[str, List[str]] = {}
+        if mentioned:
+            for sym_name in mentioned:
+                incoming_edges = self._f._symbol_index.get_edges_in(
+                    sym_name, project_id
+                )
+                data_flow_sources = [
+                    e.src for e in incoming_edges if e.type == "data_flow"
+                ]
+                if data_flow_sources:
+                    data_flow_upstream[sym_name] = data_flow_sources
+
+        # ── 7. Objective score ──────────────────────────────────────────
+        verifiable = len(symbols_found) + len(call_relations_valid)
+        if verifiable == 0:
+            objective_score = 0.5
+        else:
+            verified_true = sum(1 for v in symbols_found.values() if v) + sum(
+                1 for v in call_relations_valid.values() if v
+            )
+            objective_score = verified_true / verifiable
+
+        return StaticEvidence(
+            symbols_found=symbols_found,
+            call_relations_valid=call_relations_valid,
+            recent_changes=recent_changes,
+            entry_points_mentioned=entry_points_mentioned,
+            path_memberships=path_memberships,
+            data_flow_upstream=data_flow_upstream,
+            objective_score=objective_score,
+        )
+
 
 class MessageAssembler:
     """
@@ -8988,6 +9930,7 @@ class MessageAssembler:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+        self._last_cot_degraded: bool = False
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -9216,6 +10159,8 @@ class MessageAssembler:
             )
             cot_level = 1
             _mp_cot_degraded = True
+
+        self._last_cot_degraded = _mp_cot_degraded
 
         # ══════════════════════════════════════════════════════════════
         # REGION 2 — GENERATE REASONING
