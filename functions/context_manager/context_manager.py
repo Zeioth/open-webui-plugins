@@ -5231,8 +5231,7 @@ class ReasoningEngine:
             self._f.valves.cot_max_tokens if self._f.valves.cot_max_tokens > 0 else None
         )
 
-        # ── Phase 6 (PASO-35): Step-Back context ──────────────────
-        step_back = await self._f._generate_step_back_context(question, context)
+        step_back = await self._generate_step_back_context(question, context)
         enriched_context = step_back + context if step_back else context
 
         prompt = (
@@ -5279,7 +5278,6 @@ class ReasoningEngine:
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
-        # ── Helpers ─────────────────────────────────────────────────
         def _parse_hypotheses_from_response(text: str) -> List[Tuple[str, float]]:
             results = []
             pattern = re.compile(
@@ -5323,7 +5321,7 @@ class ReasoningEngine:
 
         hypotheses = _parse_hypotheses_from_response(response)
         if len(hypotheses) < 2:
-            return await self._f._generate_cot_reasoning(question, context, label)
+            return await self.generate_cot_reasoning(question, context, label)
 
         best_hypothesis = ""
         best_combined_score = 0.0
@@ -5355,7 +5353,6 @@ class ReasoningEngine:
             if best_combined >= threshold or iteration >= max_iters:
                 break
 
-            # ── Refine: ask LLM to improve hypotheses using evidence ──
             evidence_feedback = (
                 f"Previous best hypothesis (score {best_combined:.2f}):\n"
                 f"{best_hypothesis}\n\n"
@@ -5840,11 +5837,10 @@ class CommandRouter:
             not self._f.valves.enable_natural_language_forget
             or not last_user_msg
             or is_explicit_command
-            or self.has_code_indicators(last_user_msg.get("content", ""))  # ← Corregido
+            or self.has_code_indicators(last_user_msg.get("content", ""))
         ):
             return False, None
 
-        # Skip LLM-based intent parsing if the main model is loaded
         if not slot_free:
             self._f._log_debug(
                 "⚡ COMMAND HANDLING – Natural intents skipped (no free slot)"
@@ -5869,7 +5865,7 @@ class CommandRouter:
             messages.insert(0, {"role": "system", "content": status_msg})
             messages.pop()
             messages.append({"role": "assistant", "content": confirmation})
-            return True, self._f._ensure_last_message_is_user(messages)
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         return False, None
 
@@ -5927,73 +5923,6 @@ class CommandRouter:
         except Exception:
             return {"forget": none, "remember": none, "obsolete": none}
 
-    async def outlet_intercept_expand(
-        self,
-        assistant_content: str,
-        project_id: str,
-    ) -> Tuple[str, bool]:
-        """
-        Intercept /expand commands in the assistant's response and replace them
-        with the actual expanded symbol code from the SymbolIndex.
-        Returns (modified_content, did_expand).
-        """
-        if not self._f.valves.outlet_expand_intercept_enabled:
-            return assistant_content, False
-
-        EXPAND_RE = re.compile(r"/expand\s+(?:(\d+)\s+)?(\w+)", re.IGNORECASE)
-        matches = list(EXPAND_RE.finditer(assistant_content))
-        if not matches:
-            return assistant_content, False
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        replaced_content = assistant_content
-        did_any = False
-        state = self._f._state_store.get_state(project_id)
-
-        max_syms = self._f.valves.outlet_expand_intercept_max_symbols
-        matches_to_process = matches if max_syms == 0 else matches[:max_syms]
-
-        for match in matches_to_process:
-            depth_str = match.group(1)
-            func_name = match.group(2)
-            depth = (
-                int(depth_str)
-                if depth_str
-                else self._f.valves.outlet_expand_intercept_depth
-            )
-            if depth == 0:
-                depth = 9999
-
-            if func_name not in all_names:
-                continue
-
-            expanded = await self._expand_symbol_dependencies(
-                func_name, depth, project_id
-            )
-            if not expanded:
-                continue
-
-            did_any = True
-            replacement = f"[Retrieved `{func_name}`]\n{expanded}"
-            replaced_content = replaced_content.replace(match.group(0), replacement, 1)
-
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                block_hashes = self._f._symbol_index.find_blocks(func_name, project_id)
-                for h in block_hashes:
-                    block = state["active_blocks"].get(h)
-                    if block and not block.obsolete:
-                        block.is_raw = True
-                        block.pinned = True
-                        block.importance_score = 10.0
-                        block.last_mentioned = time.time()
-                        block.last_mentioned_msg_idx = state["message_count"]
-                        break
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-
-        return replaced_content, did_any
-
     async def suggest_commands(self, project_id: str, state: dict) -> Optional[str]:
         """Suggest context management commands to the user after enough messages."""
         if not self._f.valves.enable_command_suggestions:
@@ -6011,9 +5940,16 @@ class CommandRouter:
         return None
 
     async def is_code_only_message(self, content: str) -> bool:
+        """
+        Detect messages that contain only code without a question.
+        Uses a fast path for large raw code pastes (no fences) based on
+        Python structural line ratio and optional CrossEncoder intent check
+        on the non‑code prose.
+        """
         if not content or len(content.strip()) < 20:
             return False
 
+        # ── Fast path: large raw code paste without fences ──────────────
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
         if estimated_tokens >= self._f.valves.lean_user_code_min_tokens:
 
@@ -6082,14 +6018,15 @@ class CommandRouter:
             )
             return code_ratio > 0.07
 
+        # ── Original logic for fenced blocks or smaller messages ──
         code_blocks, _ = await self._f._code_blocks.extract_code_blocks(content)
         if not code_blocks:
             return False
-        spans = await self._f._get_code_spans(content)
+        spans = await self._f._code_blocks.get_code_spans(content)
         if not spans:
             text_outside = re.sub(r"```[\s\S]*?```", "", content).strip()
         else:
-            text_outside = self._f._remove_code_spans(content, spans).strip()
+            text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
         return len(text_outside) < 30
 
     @staticmethod
@@ -7558,6 +7495,105 @@ class ActivationEngine:
         self._f._cached_code_state_hash = None
         self._f._node_centrality.pop(project_id, None)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Static evidence
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _gather_static_evidence(
+        self, hypothesis_text: str, project_id: str
+    ) -> "StaticEvidence":
+        """
+        Gather deterministic evidence about the structural claims in a hypothesis.
+        No LLM. No GPU. Instant.
+        """
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        state = self._f._state_store.get_state(project_id)
+
+        # ── 1. Symbols mentioned in the hypothesis ──────────────────────
+        words = set(re.findall(r"\b\w+\b", hypothesis_text))
+        mentioned = all_names.intersection(words)
+
+        symbols_found = {
+            name: bool(self._f._symbol_index.find_blocks(name, project_id))
+            for name in mentioned
+        }
+
+        # ── 2. Claimed call relationships ───────────────────────────────
+        call_patterns = re.findall(
+            r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+            hypothesis_text,
+            re.IGNORECASE,
+        )
+        call_relations_valid = {}
+        for caller, callee in call_patterns:
+            if caller not in all_names or callee not in all_names:
+                continue
+            key = f"{caller}_calls_{callee}"
+            caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
+            verified = any(
+                e.dst == callee and e.type in ("calls", "reads", "writes")
+                for e in caller_edges
+            )
+            call_relations_valid[key] = verified
+
+        # ── 3. Recent changes (last hour) ───────────────────────────────
+        now = time.time()
+        recent_window = 3600
+        recent_changes = [
+            name
+            for name in mentioned
+            if any(
+                state["active_blocks"].get(bh) is not None
+                and (now - state["active_blocks"][bh].timestamp) < recent_window
+                for bh in self._f._symbol_index.find_blocks(name, project_id)
+            )
+        ]
+
+        # ── 4. Entry points mentioned ───────────────────────────────────
+        all_views = self._f._path_index.get_all(project_id)
+        entry_points_mentioned = [
+            v.entry_point for v in all_views if v.entry_point in mentioned
+        ]
+
+        # ── 5. Path memberships ─────────────────────────────────────────
+        path_memberships: Dict[str, List[str]] = {}
+        for name in mentioned:
+            path_memberships[name] = self._f._path_index.mark_stale_for_symbol(
+                name, project_id
+            )
+
+        # ── 6. Data flow upstream (backward slicing) ────────────────────
+        data_flow_upstream: Dict[str, List[str]] = {}
+        if mentioned:
+            for sym_name in mentioned:
+                incoming_edges = self._f._symbol_index.get_edges_in(
+                    sym_name, project_id
+                )
+                data_flow_sources = [
+                    e.src for e in incoming_edges if e.type == "data_flow"
+                ]
+                if data_flow_sources:
+                    data_flow_upstream[sym_name] = data_flow_sources
+
+        # ── 7. Objective score ──────────────────────────────────────────
+        verifiable = len(symbols_found) + len(call_relations_valid)
+        if verifiable == 0:
+            objective_score = 0.5
+        else:
+            verified_true = sum(1 for v in symbols_found.values() if v) + sum(
+                1 for v in call_relations_valid.values() if v
+            )
+            objective_score = verified_true / verifiable
+
+        return StaticEvidence(
+            symbols_found=symbols_found,
+            call_relations_valid=call_relations_valid,
+            recent_changes=recent_changes,
+            entry_points_mentioned=entry_points_mentioned,
+            path_memberships=path_memberships,
+            data_flow_upstream=data_flow_upstream,
+            objective_score=objective_score,
+        )
+
 
 class HistoryCompressor:
     """Code history compression, message summarisation, and block summaries."""
@@ -8037,7 +8073,7 @@ class HistoryCompressor:
         if block.block_summary:
             return
 
-        sig = self._f._extract_signature(block.content)
+        sig = block.symbols[0].signature if block.symbols else ""
         prompt = (
             f"Summarize the following code block in 3-5 sentences. "
             f"Cover: main purpose, key classes/functions, and important dependencies.\n\n"
@@ -8592,7 +8628,7 @@ class ActiveCodeUpdater:
             if not isinstance(syms, Exception)
         }
 
-        return new_blocks_pending, symbols_list, content_to_syms, extracted
+        return new_blocks_pending, symbols_list, content_to_syms, extracted_blocks
 
     def _detect_duplicates(
         self, new_blocks: List["CodeBlock"], state: dict
@@ -9642,108 +9678,6 @@ class SystemPromptBuilder:
             prelim_system = prelim_system + "\n\n" + base_content
 
         return prelim_system
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Static evidence
-    # ═══════════════════════════════════════════════════════════════════════════
-    def _gather_static_evidence(
-        self, hypothesis_text: str, project_id: str
-    ) -> "StaticEvidence":
-        """
-        Gather deterministic evidence about the structural claims in a hypothesis.
-        No LLM. No GPU. Instant.
-
-        Uses SymbolIndex with typed edges for precise validation.
-        Includes data flow upstream information.
-        """
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        state = self._f._state_store.get_state(project_id)
-
-        # ── 1. Symbols mentioned in the hypothesis ──────────────────────
-        words = set(re.findall(r"\b\w+\b", hypothesis_text))
-        mentioned = all_names.intersection(words)
-
-        symbols_found = {
-            name: bool(self._f._symbol_index.find_blocks(name, project_id))
-            for name in mentioned
-        }
-
-        # ── 2. Claimed call relationships ───────────────────────────────
-        call_patterns = re.findall(
-            r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
-            hypothesis_text,
-            re.IGNORECASE,
-        )
-        call_relations_valid = {}
-        for caller, callee in call_patterns:
-            if caller not in all_names or callee not in all_names:
-                continue
-            key = f"{caller}_calls_{callee}"
-            caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
-            verified = any(
-                e.dst == callee and e.type in ("calls", "reads", "writes")
-                for e in caller_edges
-            )
-            call_relations_valid[key] = verified
-
-        # ── 3. Recent changes (last hour) ───────────────────────────────
-        now = time.time()
-        recent_window = 3600
-        recent_changes = [
-            name
-            for name in mentioned
-            if any(
-                state["active_blocks"].get(bh) is not None
-                and (now - state["active_blocks"][bh].timestamp) < recent_window
-                for bh in self._f._symbol_index.find_blocks(name, project_id)
-            )
-        ]
-
-        # ── 4. Entry points mentioned ───────────────────────────────────
-        all_views = self._f._path_index.get_all(project_id)
-        entry_points_mentioned = [
-            v.entry_point for v in all_views if v.entry_point in mentioned
-        ]
-
-        # ── 5. Path memberships ─────────────────────────────────────────
-        path_memberships: Dict[str, List[str]] = {}
-        for name in mentioned:
-            path_memberships[name] = self._f._path_index.mark_stale_for_symbol(
-                name, project_id
-            )
-
-        # ── 6. Data flow upstream (backward slicing) ────────────────────
-        data_flow_upstream: Dict[str, List[str]] = {}
-        if mentioned:
-            for sym_name in mentioned:
-                incoming_edges = self._f._symbol_index.get_edges_in(
-                    sym_name, project_id
-                )
-                data_flow_sources = [
-                    e.src for e in incoming_edges if e.type == "data_flow"
-                ]
-                if data_flow_sources:
-                    data_flow_upstream[sym_name] = data_flow_sources
-
-        # ── 7. Objective score ──────────────────────────────────────────
-        verifiable = len(symbols_found) + len(call_relations_valid)
-        if verifiable == 0:
-            objective_score = 0.5
-        else:
-            verified_true = sum(1 for v in symbols_found.values() if v) + sum(
-                1 for v in call_relations_valid.values() if v
-            )
-            objective_score = verified_true / verifiable
-
-        return StaticEvidence(
-            symbols_found=symbols_found,
-            call_relations_valid=call_relations_valid,
-            recent_changes=recent_changes,
-            entry_points_mentioned=entry_points_mentioned,
-            path_memberships=path_memberships,
-            data_flow_upstream=data_flow_upstream,
-            objective_score=objective_score,
-        )
 
 
 class MessageAssembler:
@@ -11404,7 +11338,6 @@ class Filter:
             if await self._commands.is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
 
-                # ── Fix: raw code without fences won't be found by _extract_code_blocks ──
                 _msg_to_index = last_user_msg
                 if "```" not in user_query and self._commands.has_code_indicators(
                     user_query
@@ -11419,7 +11352,6 @@ class Filter:
                         f"Silent ingestion: wrapping raw code as {_lang} "
                         f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
                     )
-                # ── End fix ──
 
                 # Process code into SymbolGraph without invoking main LLM
                 await self._update_active_code(_msg_to_index, project_id)
@@ -11435,6 +11367,10 @@ class Filter:
                 self._ctx_builder.invalidate_block_a_cache(
                     project_id, "new chunk ingested"
                 )
+
+                # Forzar guardado del estado tras la ingesta (no hay outlet)
+                self._state_dirty = True
+                await self._state_store.save_state_if_dirty(project_id)
 
                 # Statistics for the user
                 state = self._state_store.get_state(project_id)
@@ -11491,6 +11427,13 @@ class Filter:
             )
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
+
+        # ── v8: Restore KV slot after Block A has been built (fix #20) ──
+        if (
+            self.valves.enable_slot_persistence
+            and project_id not in self._slot_restore_attempted
+        ):
+            await self._ctx_builder.slot_restore(project_id)
 
         if cached_response:
             messages.pop()
