@@ -8397,8 +8397,12 @@ class EnrichmentTasks:
         return "\n".join(lines)
 
     async def parallel_context_checks(
-        self, messages: list, query: str, context_hash: str,
-        project_id: str, state: dict,
+        self,
+        messages: list,
+        query: str,
+        context_hash: str,
+        project_id: str,
+        state: dict,
         skip_contradiction: bool = False,
         skip_cache: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
@@ -9064,223 +9068,45 @@ class InletOrchestrator:
         """Return the current project id from the valves configuration."""
         return self._f.valves.project_id
 
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet called")
-        inlet_start = time.monotonic()
-        self._log_section("CONTEXT MANAGER - INLET START")
+    async def inlet_preprocess(self, body: dict, project_id: str) -> list:
+        """Handle project switching, symbol cache loading, and KV slot restore."""
+        messages = body.get("messages", [])
 
-        def _inlet_timing(step_name: str, start: float, end: float = None):
-            if end is None:
-                end = time.monotonic()
-            self._log_timing(step_name, start - inlet_start, end - start)
-
-        project_id = self._inlet_orch.get_project_id()
-        slot_free = True
-
-        # ── Step 1/7: Preprocess ────────────────────────────────────────
-        step_start = time.monotonic()
-        messages = await self._inlet_orch.inlet_preprocess(body, project_id)
-        _inlet_timing("Step 1/7: Preprocess (project switch, cache load)", step_start)
-        if not messages:
-            return body
-
-        # ── Step 2/7: Extract user info ─────────────────────────────────
-        step_start = time.monotonic()
-        (
-            last_user_msg,
-            user_query,
-            user_question,
-            is_explicit_command,
-            has_code_blocks,
-        ) = await self._inlet_orch.inlet_extract_user_info(messages)
-        _inlet_timing("Step 2/7: Extract user info", step_start)
-
-        # ── Detect AutoContinue continuation ────────────────────────────
-        _last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        _hint = ""
-        _is_continuation = False
-        if _last_assistant:
-            _ac = _last_assistant.get("content", "")
-            for _marker in self._MULTI_PHASE_MARKERS:
-                if _marker in _ac:
-                    _is_continuation = True
-                    _idx = _ac.find(_marker)
-                    _hint_line = _ac[_idx:].split("\n")[0]
-                    _hint = re.sub(
-                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
-                        "",
-                        _hint_line,
-                        flags=re.IGNORECASE,
-                    ).strip()
-                    if _hint:
-                        user_question = _hint
-                        self._log_debug(
-                            f"AutoContinue detected — LOD query: '{user_question}'"
-                        )
-                    break
-        if _is_continuation:
-            slot_free = False
-            user_query = user_query + " código"
-
-        # ── Step 3/7: Handle explicit commands ──────────────────────────
-        step_start = time.monotonic()
-        handled, handled_messages = await self._commands.handle_explicit_commands(
-            messages, project_id, is_explicit_command, last_user_msg, __user__
-        )
-        _inlet_timing("Step 3/7: Handle explicit commands", step_start)
-        if handled:
-            body["messages"] = handled_messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+        if self._f._last_project_id and self._f._last_project_id != project_id:
+            self._f._log_debug(
+                f"Project changed from {self._f._last_project_id} to {project_id}"
             )
-            return body
+            old_state = self._f._conversation_state.get(self._f._last_project_id)
+            if old_state:
+                self._f._symbol_index.clear_project(self._f._last_project_id)
+            self._f._cached_lightweight_context.pop(self._f._last_project_id, None)
+            self._f._block_change_summaries.clear()
+        self._f._last_project_id = project_id
 
-        # ── Step 4/7: Handle natural language intents ───────────────────
-        step_start = time.monotonic()
-        handled, handled_messages = await self._commands.handle_natural_intents(
-            messages,
-            project_id,
-            is_explicit_command,
-            last_user_msg,
-            slot_free=slot_free,
-        )
-        _inlet_timing("Step 4/7: Handle natural language intents", step_start)
-        if handled:
-            body["messages"] = handled_messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
+        # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
+        if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
+            existing_views = self._f._path_index.get_all(project_id)
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            if all_names and not existing_views:
+                self._f._log_debug(
+                    "PathIndex empty but symbols exist — loading from DB"
+                )
+                db_views = await self._f._state_store.load_path_views_from_db(
+                    project_id
+                )
+                for view in db_views:
+                    self._f._path_index.add(view, project_id)
 
-        # ── Silent Ingestion ───────────────────────────────────────────
-        if (
-            self.valves.enable_silent_ingestion
-            and last_user_msg is not None
-            and not is_explicit_command
-        ):
-            if await self._commands.is_code_only_message(user_query):
-                self._log_section("SILENT INGESTION MODE")
-
-                _msg_to_index = last_user_msg
-                if "```" not in user_query and self._commands.has_code_indicators(
-                    user_query
-                ):
-                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
-                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                    _msg_to_index = {
-                        **last_user_msg,
-                        "content": f"```{_lang}\n{user_query}\n```",
-                    }
-                    self._log_debug(
-                        f"Silent ingestion: wrapping raw code as {_lang} "
-                        f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
-                    )
-
-                await self._update_active_code(_msg_to_index, project_id)
-                await self._activation.resolve_dangling_edges(project_id)
-
-                if self.valves.enable_path_analysis:
-                    await self._activation.rebuild_path_index(project_id)
-
-                self._ctx_builder.invalidate_block_a_cache(
-                    project_id, "new chunk ingested"
+        # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
+        if self._f.valves.enable_edge_persistence:
+            restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
+            if restored > 0:
+                self._f._log_debug(
+                    f"Cross-session: {restored} symbol edges restored from DB. "
+                    f"No need to re-paste code."
                 )
 
-                state = self._state_store.get_state(project_id)
-                num_blocks = len(state.get("active_blocks", {}))
-                num_symbols = len(self._symbol_index.get_all_names(project_id))
-
-                response = (
-                    f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
-                    "El código está disponible en el SymbolGraph para futuras consultas. "
-                    "Usa `/expand <nombre>` para ver una función/clase completa."
-                )
-
-                messages.pop()
-                messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "user", "content": "continue"})
-                body["messages"] = messages
-                _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                self._log_section(
-                    "CONTEXT MANAGER - INLET END",
-                    duration=time.monotonic() - inlet_start,
-                )
-                return body
-
-        # ── Step 5/7: Prepare code session ──────────────────────────────
-        step_start = time.monotonic()
-        is_code_session, user_question = (
-            await self._inlet_orch.inlet_prepare_code_session(
-                messages, project_id, user_query, is_continuation=_is_continuation
-            )
-        )
-        _inlet_timing("Step 5/7: Prepare code session", step_start)
-
-        # ── Step 6/7: Build system injections ───────────────────────────
-        step_start = time.monotonic()
-        state = self._state_store.get_state(project_id)
-        static_block, dynamic_injections, cached_response, prelim_system = (
-            await self._inlet_build_system_injections(
-                messages,
-                project_id,
-                user_query,
-                user_question,
-                is_code_session,
-                last_user_msg,
-                state,
-                slot_free=slot_free,
-            )
-        )
-        _inlet_timing("Step 6/7: Build system injections", step_start)
-
-        # ── v8: Restore KV slot after Block A has been built (fix #20) ──
-        if (
-            self.valves.enable_slot_persistence
-            and project_id not in self._slot_restore_attempted
-        ):
-            await self._ctx_builder.slot_restore(project_id)
-
-        if cached_response:
-            messages.pop()
-            messages.append(
-                {"role": "assistant", "content": cached_response["response"]}
-            )
-            messages = self._inlet_orch.ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
-
-        # ── Step 7/7: Assemble final messages ───────────────────────────
-        step_start = time.monotonic()
-        messages = await self._inlet_assemble_final_messages(
-            messages,
-            project_id,
-            static_block,
-            dynamic_injections,
-            prelim_system,
-            last_user_msg,
-            is_code_session,
-            state,
-            __user__,
-            user_question,
-            has_code_blocks,
-            slot_free=slot_free,
-        )
-        _inlet_timing("Step 7/7: Assemble final messages", step_start)
-
-        body["messages"] = messages
-        _inlet_timing("total_inlet (end-to-end)", inlet_start)
-        self._log_section(
-            "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-        )
-        return body
+        return messages
 
     async def inlet_extract_user_info(
         self,
