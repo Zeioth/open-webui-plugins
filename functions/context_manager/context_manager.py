@@ -6707,24 +6707,19 @@ class ActivationEngine:
             effective_budget,
         )
 
-        # Truncado convergente con detección de fences línea a línea (Fix 3)
+        # ── v2.0: Tokenización O(n) con pre‑cálculo de tamaños ──────────
         if max_tokens > 0 and self._f.tokenizer:
-            full_text = "\n".join(parts)
-            current_tokens = len(self._f.tokenizer.encode(full_text))
-            truncation_done = False
+            part_sizes = [len(self._f.tokenizer.encode(p)) for p in parts]
+            current_tokens = sum(part_sizes)
 
             while current_tokens > max_tokens and len(parts) > 2:
                 excess = current_tokens - max_tokens
 
-                largest_idx = -1
-                largest_tok = 0
-                for i, part in enumerate(parts):
-                    part_tok = len(self._f.tokenizer.encode(part))
-                    if part_tok > largest_tok:
-                        largest_tok = part_tok
-                        largest_idx = i
+                # Buscar la parte más grande usando los tamaños pre‑calculados
+                largest_idx = max(range(len(part_sizes)), key=lambda i: part_sizes[i])
+                largest_tok = part_sizes[largest_idx]
 
-                if largest_idx >= 0 and largest_tok >= excess + 100:
+                if largest_tok >= excess + 100:
                     target = max(100, largest_tok - excess - 50)
                     truncated_text = self._f._tokens.truncate_text_to_tokens(
                         parts[largest_idx], target
@@ -6732,14 +6727,17 @@ class ActivationEngine:
                     if self._has_open_fence(truncated_text):
                         truncated_text += "\n```"
                     parts[largest_idx] = truncated_text + "\n[...truncado...]"
-                    truncation_done = True
+
+                    # Actualizar tamaño y total sin re‑tokenizar todo
+                    new_size = len(self._f.tokenizer.encode(parts[largest_idx]))
+                    current_tokens = current_tokens - largest_tok + new_size
+                    part_sizes[largest_idx] = new_size
                 else:
+                    # Eliminar la parte más pequeña (pop)
+                    current_tokens -= part_sizes.pop()
                     parts.pop()
 
-                full_text = "\n".join(parts)
-                current_tokens = len(self._f.tokenizer.encode(full_text))
-
-            if not truncation_done and current_tokens > max_tokens:
+            if current_tokens > max_tokens:
                 parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
 
         return "\n".join(parts)
@@ -9424,7 +9422,7 @@ class SystemPromptBuilder:
         is_code_session: bool,
         slot_free: bool,
     ) -> Optional[str]:
-        """Retrieve and format relevant LTM entries for the current query."""
+        """Retrieve and format relevant LTM entries for the current query, RAPTOR‑first."""
         if not (
             self._f.valves.enable_code_awareness
             and is_code_session
@@ -9435,8 +9433,29 @@ class SystemPromptBuilder:
             return None
 
         _ltm_query = user_question if user_question else user_query
+
+        # ── v2.0: RAPTOR‑first retrieval ────────────────────────────
+        refined_query = _ltm_query
+        if (
+            self._f.valves.enable_raptor
+            and getattr(self._f, "_raptor", None)
+            and self._f.memory_collection is not None
+        ):
+            try:
+                raptor_summaries = await self._f._raptor.retrieve(
+                    query=_ltm_query,
+                    project_id=project_id,
+                    top_k=2,
+                    embedder=self._f.embedder,
+                    chroma_collection=self._f.memory_collection,
+                )
+                if raptor_summaries:
+                    refined_query = _ltm_query + "\n" + "\n".join(raptor_summaries[:2])
+            except Exception:
+                pass  # fall through to plain query on any error
+
         all_meta = await self._f._ltm.retrieve_memories_unified(
-            _ltm_query, project_id, slot_free=slot_free
+            refined_query, project_id, slot_free=slot_free
         )
         if not all_meta:
             return None
@@ -9969,14 +9988,14 @@ class MessageAssembler:
         project_id: str,
         user_question: str,
     ) -> List[dict]:
-        """Apply LLMLingua-2 compression to conversation history if enabled."""
+        """Apply LLMLingua-2 compression to conversation history, with hard cap."""
         if not (
             self._f.valves.enable_history_llmlingua
             and self._f._conv_compressor is not None
         ):
             return messages
 
-        return await self._f._conv_compressor.compress_messages(
+        compressed = await self._f._conv_compressor.compress_messages(
             messages=messages,
             project_id=project_id,
             symbol_index=self._f._symbol_index,
@@ -9987,6 +10006,28 @@ class MessageAssembler:
             indexed_rate=self._f.valves.history_compress_indexed_rate,
             query=user_question,
         )
+
+        # ── v2.0: Hard cap post-compresión ────────────────────────────
+        _HISTORY_BUDGET = 4000  # tokens fijos para historial
+        if self._f.tokenizer:
+            history_msgs = [m for m in compressed if m.get("role") != "system"]
+            total = sum(
+                len(self._f.tokenizer.encode(m.get("content", "")))
+                for m in history_msgs
+            )
+            if total > _HISTORY_BUDGET:
+                kept, used = [], 0
+                for msg in reversed(history_msgs):
+                    tok = len(self._f.tokenizer.encode(msg.get("content", "")))
+                    if used + tok <= _HISTORY_BUDGET:
+                        kept.insert(0, msg)
+                        used += tok
+                    else:
+                        break
+                sys_msgs = [m for m in compressed if m.get("role") == "system"]
+                compressed = sys_msgs + kept
+
+        return compressed
 
     async def _inject_multi_phase_instructions(
         self,
@@ -10062,10 +10103,60 @@ class MessageAssembler:
         Returns (updated_messages, pending_summary).
         """
         history_msgs = [m for m in messages if m.get("role") != "system"]
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
         pending_summary = ""
 
+        # ── v2.0: Proactive history budget enforcement ──────────────────
+        if self._f.valves.history_max_tokens > 0 and self._f.tokenizer:
+            budget = self._f.valves.history_max_tokens
+            kept, used = [], 0
+            for msg in reversed(history_msgs):
+                tok = len(self._f.tokenizer.encode(msg.get("content", "")))
+                if used + tok <= budget:
+                    kept.insert(0, msg)
+                    used += tok
+                else:
+                    # Summarize dropped messages if enabled
+                    if self._f.valves.summarize_old_messages and not pending_summary:
+                        old = [m for m in history_msgs if m not in kept]
+                        if old:
+                            has_code = any("```" in m.get("content", "") for m in old)
+                            summary = (
+                                await self._f._history_compressor.summarize_messages(
+                                    old, is_code_context=has_code
+                                )
+                            )
+                            if summary:
+                                state["conversation_summaries"].append(
+                                    {
+                                        "text": summary,
+                                        "created_at": time.time(),
+                                        "covers_msgs": len(old),
+                                    }
+                                )
+                                cap = self._f.valves.max_conversation_summaries
+                                if (
+                                    cap > 0
+                                    and len(state["conversation_summaries"]) > cap
+                                ):
+                                    dropped = len(state["conversation_summaries"]) - cap
+                                    state["conversation_summaries"] = state[
+                                        "conversation_summaries"
+                                    ][-cap:]
+                                    self._f._log_debug(
+                                        f"Summary cap: dropped {dropped} oldest summary block(s) "
+                                        f"(max_conversation_summaries={cap})"
+                                    )
+                                self._f._state_store.set_state(project_id, state)
+                                pending_summary = (
+                                    f"[Summary of earlier conversation]\n{summary}"
+                                )
+                    break
+            history_msgs = kept
+
+        # ── Existing adaptive_trim logic ─────────────────────────────────
         if self._f.valves.adaptive_trim:
-            total_tokens = self._f._tokens.estimate_tokens(messages)
+            total_tokens = self._f._tokens.estimate_tokens(history_msgs + sys_msgs)
             if total_tokens > self._f.valves.context_window_tokens:
                 keep = self._f.valves.max_turns
                 last_user_idx = -1
@@ -10183,7 +10274,6 @@ class MessageAssembler:
                 else:
                     history_msgs = kept_block
 
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
         return sys_msgs + history_msgs, pending_summary
 
     async def _compress_code_history_and_lean(
@@ -10365,7 +10455,7 @@ class Filter:
             description="Total time budget for retrying failed LLM calls.",
         )
         priority: int = Field(default=0)
-        max_turns: int = Field(default=15)
+        max_turns: int = Field(default=8)  # ← v2.0: was 15
         debug: bool = Field(default=True)
         debug_context: bool = Field(
             default=False,
@@ -10513,7 +10603,7 @@ class Filter:
         code_history_keep_last_n_parts: int = Field(default=2, ge=1, le=5)
         code_history_symbol_index_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
         enable_lean_user_code: bool = Field(default=True)
-        lean_user_code_min_tokens: int = Field(default=8000, ge=2000, le=60000)
+        lean_user_code_min_tokens: int = Field(default=3000)  # ← v2.0: was 8000
 
         # ═══════════════════════════════════════════════════════════════
         #  Code Compression (LLMLingua-2)
@@ -10556,7 +10646,7 @@ class Filter:
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
         auto_cot_min_chars: int = Field(default=200)
-        cot_max_tokens: int = Field(default=0)
+        cot_max_tokens: int = Field(default=1500)  # ← v2.0: was 0
         cot_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         cot_model_level2: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         cot_model_level3: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
@@ -10691,7 +10781,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  RAPTOR Hierarchical LTM
         # ═══════════════════════════════════════════════════════════════
-        enable_raptor: bool = Field(default=False)
+        enable_raptor: bool = Field(default=True)  # ← v2.0: was False
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
@@ -10811,7 +10901,7 @@ class Filter:
         #  v8 — History LLMLingua compression
         # ═══════════════════════════════════════════════════════════════
         enable_history_llmlingua: bool = Field(
-            default=False,
+            default=True,  # ← v2.0: was False
             description=(
                 "Apply LLMLingua-2 compression to full conversation history. "
                 "Reduces old turns 40-80% by tier. Experimental — disable if "
@@ -10870,6 +10960,17 @@ class Filter:
             description=(
                 "Minimum tokens reserved for the LLM's response when computing "
                 "the effective context budget for adaptive trimming."
+            ),
+        )
+
+        # ═══════════════════════════════════════════════════════════════
+        #  v2.0 — Hard history budget
+        # ═══════════════════════════════════════════════════════════════
+        history_max_tokens: int = Field(
+            default=4000,
+            description=(
+                "Maximum tokens for conversation history (non-system messages). "
+                "Enforced after LLMLingua compression. 0 = disabled."
             ),
         )
 
