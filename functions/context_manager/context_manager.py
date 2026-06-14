@@ -103,7 +103,6 @@ from shared_resources import (
 )
 
 _db_global_lock = threading.Lock()
-_llm_semaphore = asyncio.Semaphore(1)
 import fcntl
 import tempfile
 
@@ -1793,6 +1792,12 @@ class ContextBuilder:
         if not state or not state.get("active_blocks"):
             return ""
 
+        # ── Fix 2: Fast path for inventory / listing queries ─────────────
+        if self._LIST_INTENTS.search(query):
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            if all_names:
+                return await self._format_full_symbol_inventory(all_names, project_id)
+
         # ── Step 1: ActivationGraph ──────────────────────────────────────
         ag = self._f._activation.build_activation_graph(
             query, project_id, messages=messages
@@ -2015,37 +2020,28 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
-        # Most relevant content goes LAST: names → signatures → summaries → full bodies
-        sections = [
-            ("## Code Context (activation-based LOD)\n", None),
-            (
-                "**Known symbols** (minimal activation):\n" + ", ".join(_lod0_parts),
-                "lod0",
-            ),
-            (
-                "\n**Signatures** (low activation):\n" + "\n".join(_lod1_parts),
-                "lod1",
-            ),
-            (
+        ordered = []
+        ordered.append("## Code Context (activation-based LOD)\n")
+        if _lod0_parts:
+            ordered.append(
+                "**Known symbols** (minimal activation):\n" + ", ".join(_lod0_parts)
+            )
+        if _lod1_parts:
+            ordered.append(
+                "\n**Signatures** (low activation):\n" + "\n".join(_lod1_parts)
+            )
+        if _lod2_parts:
+            ordered.append(
                 "\n**Signatures + summaries** (medium activation):\n"
-                + "\n".join(_lod2_parts),
-                "lod2",
-            ),
-            (
+                + "\n".join(_lod2_parts)
+            )
+        if _lod3_parts:
+            ordered.append(
                 "\n### Directly relevant code (high activation)\n"
-                + "\n".join(_lod3_parts),
-                "lod3",
-            ),
-        ]
-
-        ordered = [
-            text
-            for text, tier in sections
-            if text and (tier is None or any(part.strip() for part in [text]))
-        ]
+                + "\n".join(_lod3_parts)
+            )
 
         if len(ordered) <= 1:
-            # Only the header, nothing else
             self._f._log_debug(
                 "build_block_b: empty output (un-filled ContextBuilder?) — FIX #11"
             )
@@ -2075,6 +2071,74 @@ class ContextBuilder:
             self._f._last_lod_levels[project_id] = lod_map
 
         return "\n".join(ordered)
+
+    # ── Fix 2: Inventory listing helper ──────────────────────────────────
+
+    async def _format_full_symbol_inventory(
+        self, all_names: set, project_id: str
+    ) -> str:
+        """Return a formatted inventory of all indexed symbols, grouped by file."""
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state.get("active_blocks"):
+            return ""
+
+        by_file: dict = {}
+        for name in sorted(all_names):
+            block_hashes = self._f._symbol_index.find_blocks(name, project_id)
+            for bh in block_hashes:
+                block = state["active_blocks"].get(bh)
+
+                # Page-in fallback: si el bloque fue eviccionado, recuperarlo
+                if block is None and self._f._pager is not None:
+                    if self._f._pager.is_paged(bh, project_id):
+                        block = await self._f._pager.page_in_block(
+                            block_hash=bh,
+                            project_id=project_id,
+                            chroma_collection=self._f.memory_collection,
+                            db_conn=self._f._db_conn,
+                        )
+
+                if block and not block.obsolete:
+                    file_key = block.file_path or "(unknown)"
+                    by_file.setdefault(file_key, []).append((name, block))
+                    break
+
+        if not by_file:
+            return ""
+
+        lines = ["## Full Symbol Inventory\n"]
+        total_tokens = self._f._tokens.estimate_code_tokens(lines[0])
+
+        # Presupuesto dinámico igual que en Fix 4
+        effective_budget = max(
+            4000,
+            self._f.valves.context_window_tokens
+            - self._f._last_system_tokens.get(project_id, 0)
+            - self._f.valves.response_reserve_tokens,
+        )
+        budget = min(effective_budget // 2, 16000)
+
+        for file_path in sorted(by_file.keys()):
+            lines.append(f"### {file_path}")
+            for name, block in by_file[file_path]:
+                sym = next((s for s in block.symbols if s.name == name), None)
+                sig = sym.signature if sym else name
+                summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+                line = f"- `{sig}`{summary}"
+                tok = self._f._tokens.estimate_code_tokens(line)
+                if total_tokens + tok > budget:
+                    lines.append(
+                        f"\n_(Truncated at {budget} tokens — {len(all_names)} symbols total)_"
+                    )
+                    return "\n".join(lines)
+                lines.append(line)
+                total_tokens += tok
+            lines.append("")
+
+        lines.append(
+            f"\n_{len(all_names)} symbols indexed. Use `/expand <name>` for full body._"
+        )
+        return "\n".join(lines)
 
     def _build_swa_ordered_lod_parts(
         self, lod0: list, lod1: list, lod2: list, lod3: list
@@ -2969,6 +3033,7 @@ class StateStore:
             del self._f._conversation_state[oldest_pid]
             self._f._cached_lightweight_context.pop(oldest_pid, None)
             self._f._path_index.clear_project(oldest_pid)
+            self._f._pager.clear_project(oldest_pid)
             self._f._node_centrality.pop(oldest_pid, None)
             self._f._last_static_prefix_hash.pop(oldest_pid, None)
             self._f._last_saved_slot_hash.pop(oldest_pid, None)
@@ -3028,11 +3093,11 @@ class StateStore:
             d = v.dict()
             d["content_type"] = v.content_type.value
             content_hash = v.hash
-            # Persist the raw content separately
-            await anyio.to_thread.run_sync(
-                lambda: self._f._db_conn.execute(
+            # Persist the raw content via the write queue
+            await self._db_enqueue(
+                lambda ch=content_hash, ct=v.content: self._f._db_conn.execute(
                     "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
-                    (content_hash, v.content, time.time()),
+                    (ch, ct, time.time()),
                 )
             )
             d["content"] = f"@@hash:{content_hash}"
@@ -3052,6 +3117,7 @@ class StateStore:
             ),
             "has_any_calls": state.get("has_any_calls", False),
             "last_cot_level": state.get("last_cot_level", 0),
+            "conversation_summaries": state.get("conversation_summaries", []),
         }
 
         def _write():
@@ -3268,6 +3334,7 @@ class StateStore:
                 "last_cleanup_suggestion_msg_idx", 0
             ),
             "last_cot_level": data.get("last_cot_level", 0),
+            "conversation_summaries": data.get("conversation_summaries", []),
         }
 
         # Recalculate cached token counts
@@ -3558,6 +3625,10 @@ class LongTermMemory:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def init(self) -> None:
         """Initialise ChromaDB, embedder, and response cache collection."""
         os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
@@ -3588,6 +3659,10 @@ class LongTermMemory:
             )
         )
         self._f._log_debug("LTM ready")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Response cache & duplicate detection
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def find_cached_response(
         self, query: str, context_hash: str, state: dict
@@ -3707,7 +3782,9 @@ class LongTermMemory:
             self._f._log_debug(f"Error in duplicate question detection: {e}")
         return None
 
-    # ── Query helpers ────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Query helpers
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
         """Extract forced symbol from query (?symbol:Name). Returns (symbol, cleaned_query)."""
@@ -3831,6 +3908,72 @@ class LongTermMemory:
         scored = list(zip(documents, scores))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
+
+    def _is_symbol_indexable(self, symbol: "CodeSymbol") -> bool:
+        """True if this symbol should be indexed in LTM metadata."""
+        if symbol.kind not in ("function", "class", "method"):
+            return False
+        if len(symbol.name) < 3:
+            return False
+        blacklist = getattr(self._f, "_SYMBOL_BLACKLIST", set())
+        if symbol.name in blacklist:
+            return False
+        return True
+
+    async def _build_retrieval_context(
+        self,
+        content: str,
+        project_id: str,
+        role: str,
+        code_symbols: List[str],
+        file_paths: List[str],
+        content_type: str,
+    ) -> str:
+        if not self._f.valves.enable_contextual_retrieval:
+            return ""
+
+        if self._f.valves.contextual_retrieval_mode == "llm":
+            return await self._build_retrieval_context_llm(content, project_id)
+
+        parts: List[str] = [f"Project: {project_id}"]
+        if file_paths:
+            parts.append(f"Files: {', '.join(file_paths[:3])}")
+        if code_symbols:
+            parts.append(f"Functions: {', '.join(code_symbols[:6])}")
+        if content_type and content_type != "general":
+            parts.append(f"Type: {content_type}")
+        role_label = "User question" if role == "user" else "Assistant response"
+        parts.append(f"Role: {role_label}")
+        excerpt = content[:120].replace("\n", " ").strip()
+        if len(content) > 120:
+            excerpt += "..."
+        parts.append(f"Excerpt: {excerpt}")
+        context_line = " | ".join(parts)
+        return f"[{context_line}]\n\n"
+
+    async def _build_retrieval_context_llm(self, content: str, project_id: str) -> str:
+        prompt = (
+            "In one sentence (10-20 words), describe what the following "
+            "code/conversation excerpt is about, for search retrieval:\n\n"
+            f"{content[:400]}"
+        )
+        context = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "Output only one descriptive sentence. "
+                "Be specific about functions, files, or errors mentioned."
+            ),
+            model_override=self._f.valves.llm_model,
+            max_tokens=40,
+            temperature=0.2,
+        )
+        if context and context.strip():
+            return f"[Context: {context.strip()}]\n\n"
+        return ""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Memory retrieval
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def retrieve_memories_unified(
         self, query: str, project_id: str, slot_free: bool = True
@@ -4070,6 +4213,10 @@ class LongTermMemory:
             logger.warning(f"Historical message retrieval failed: {e}")
             return []
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Message storage
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def store_messages(self, project_id: str, messages: list) -> None:
         """Store user/assistant messages in the LTM ChromaDB collection."""
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
@@ -4101,7 +4248,7 @@ class LongTermMemory:
                         blk["code"], blk.get("language")
                     )
                     for sym in syms:
-                        if self._f._is_symbol_indexable(sym):
+                        if self._is_symbol_indexable(sym):
                             ctx_symbols.append(sym.name)
                             if len(ctx_symbols) >= 10:
                                 break
@@ -4112,7 +4259,7 @@ class LongTermMemory:
             if self._f.valves.track_file_paths:
                 ctx_file_paths = self._f._code_blocks.extract_file_paths(content)[:3]
 
-            context_prefix = await self._f._build_retrieval_context(
+            context_prefix = await self._build_retrieval_context(
                 content=content,
                 project_id=project_id,
                 role=msg.get("role", "user"),
@@ -4143,7 +4290,7 @@ class LongTermMemory:
                             blk["code"], blk.get("language")
                         )
                         for sym in syms:
-                            if self._f._is_symbol_indexable(sym):
+                            if self._is_symbol_indexable(sym):
                                 all_syms.add(sym.name)
                                 if (
                                     len(all_syms)
@@ -4183,25 +4330,6 @@ class LongTermMemory:
                     documents=documents_to_store,
                 )
             )
-
-    async def purge_expired_memories(self) -> None:
-        """Remove memories whose expires_at timestamp is in the past."""
-        await asyncio.sleep(0)  # yield to event loop to avoid blocking
-        if not HAS_CHROMA or self._f.memory_collection is None:
-            return
-        if self._f.valves.long_term_memory_expiration_days <= 0:
-            return
-        try:
-            await anyio.to_thread.run_sync(self._do_purge)
-        except Exception as e:
-            logger.warning(f"Purge failed: {e}")
-
-    def _do_purge(self) -> None:
-        now = time.time()
-        expired = self._f.memory_collection.get(where={"expires_at": {"$lt": now}})
-        if expired and expired["ids"]:
-            self._f.memory_collection.delete(ids=expired["ids"])
-            self._f._log_debug(f"Purged {len(expired['ids'])} expired memories")
 
     async def store_response_in_cache(
         self,
@@ -4267,245 +4395,28 @@ class LongTermMemory:
             self._f._response_cache_count.get(project, 0) + 1
         )
 
-    async def _handle_forget_command(
-        self, messages: list, project_id: str, __user__: Optional[dict]
-    ) -> Tuple[list, bool]:
-        """Handle /forget command. Returns (messages, handled)."""
-        if not self._f.valves.enable_forget_command:
-            return messages, False
-        if not messages:
-            return messages, False
-        last_msg = messages[-1]
-        if last_msg.get("role") != "user":
-            return messages, False
-        content = last_msg.get("content", "").strip()
-        if not content.startswith("/forget"):
-            return messages, False
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Maintenance
+    # ═══════════════════════════════════════════════════════════════════════════
 
-        parts = content.split(maxsplit=1)
-        target = parts[1] if len(parts) > 1 else ""
-        state = self._f._state_store.get_state(project_id)
-        if not state:
-            return messages, False
+    async def purge_expired_memories(self) -> None:
+        """Remove memories whose expires_at timestamp is in the past."""
+        await asyncio.sleep(0)
+        if not HAS_CHROMA or self._f.memory_collection is None:
+            return
+        if self._f.valves.long_term_memory_expiration_days <= 0:
+            return
+        try:
+            await anyio.to_thread.run_sync(self._do_purge)
+        except Exception as e:
+            logger.warning(f"Purge failed: {e}")
 
-        if target == "all":
-            for block in state["active_blocks"].values():
-                self._f._symbol_index.remove_all_for_block(
-                    block.hash, block.symbols, project_id
-                )
-            state["active_blocks"].clear()
-            state["recent_changes"].clear()
-            state["committed_changes"].clear()
-            state["has_any_calls"] = False
-            self._f._activation.invalidate_lightweight_cache(project_id)
-            confirmation = "Forgotten all context."
-        elif target == "last":
-            if state["active_blocks"]:
-                last_hash = max(
-                    state["active_blocks"].keys(),
-                    key=lambda h: state["active_blocks"][h].timestamp,
-                )
-                block = state["active_blocks"].get(last_hash)
-                if block:
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                del state["active_blocks"][last_hash]
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                confirmation = "Forgotten the last context block."
-            else:
-                confirmation = "No blocks to forget."
-        else:
-            to_remove = [
-                h
-                for h, blk in state["active_blocks"].items()
-                if (blk.file_path and target in blk.file_path) or target in h
-            ]
-            for h in to_remove:
-                block = state["active_blocks"].get(h)
-                if block:
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                del state["active_blocks"][h]
-            self._f._activation.invalidate_lightweight_cache(project_id)
-            confirmation = f"Forgotten {len(to_remove)} block(s) matching '{target}'."
-
-        self._f._state_store.set_state(project_id, state)
-        messages.pop()
-        messages.append({"role": "assistant", "content": confirmation})
-        return messages, True
-
-    async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
-        """Handle /clean command. Returns a response string."""
-        if (
-            not self._f.valves.cleanup_suggestions_enabled
-            or not self._f.valves.cleanup_command_enabled
-        ):
-            return "Cleanup is disabled."
-
-        lock = await self._f._state_store.get_project_lock(project_id)
-        async with lock:
-            state = self._f._state_store.get_state(project_id)
-            candidates = self._f._activation.get_inactive_block_candidates(project_id)
-            parts = command_text.split(maxsplit=1)
-            subcommand = parts[1].strip() if len(parts) > 1 else ""
-
-            if not subcommand:
-                if not candidates:
-                    return "✅ No inactive blocks to clean."
-                lines = [
-                    f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last "
-                    f"{self._f.valves.cleanup_inactive_threshold_messages} messages):"
-                ]
-                for h in candidates:
-                    blk = state["active_blocks"].get(h)
-                    if blk:
-                        snippet = blk.content[:80].replace("\n", " ")
-                        file_info = f" ({blk.file_path})" if blk.file_path else ""
-                        lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
-                lines.append(
-                    "\nUse `/clean all` to remove all, or `/clean <hash>` for a specific block."
-                )
-                return "\n".join(lines)
-
-            if subcommand.lower() == "all":
-                if not candidates:
-                    return "✅ No inactive blocks to clean."
-                for h in candidates:
-                    block = state["active_blocks"].pop(h, None)
-                    if block:
-                        self._f._symbol_index.remove_all_for_block(
-                            block.hash, block.symbols, project_id
-                        )
-                state["recent_changes"] = [
-                    c for c in state["recent_changes"] if c.hash not in candidates
-                ]
-                state["committed_changes"] = [
-                    c for c in state["committed_changes"] if c.hash not in candidates
-                ]
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-                return f"✅ Cleaned {len(candidates)} inactive block(s)."
-
-            target_hash = subcommand.strip()
-            if target_hash in candidates:
-                block = state["active_blocks"].pop(target_hash, None)
-                if block:
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-                return f"✅ Cleaned block `{target_hash[:8]}...`."
-            else:
-                matched = [h for h in state["active_blocks"] if target_hash in h]
-                for h in matched:
-                    if h in candidates:
-                        block = state["active_blocks"].pop(h, None)
-                        if block:
-                            self._f._symbol_index.remove_all_for_block(
-                                block.hash, block.symbols, project_id
-                            )
-                        self._f._activation.invalidate_lightweight_cache(project_id)
-                        self._f._state_store.set_state(project_id, state)
-                        return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
-                return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
-
-    async def _handle_expand_command(self, text: str, project_id: str) -> str:
-        """Handle /expand command. Returns a response string."""
-        parts = text.strip().split()
-        if len(parts) < 2:
-            return (
-                "Usage: `/expand [depth] <function_name>`\n"
-                "Example: `/expand 3 calcularImpuesto`"
-            )
-        depth = self._f.valves.expand_default_depth
-        if parts[1].isdigit():
-            depth = int(parts[1])
-            func_name = parts[2] if len(parts) > 2 else None
-        else:
-            func_name = parts[1]
-        if not func_name:
-            return "Missing function name."
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        if not all_names:
-            state = self._f._state_store.get_state(project_id)
-            if state and state.get("active_blocks"):
-                self._f._rebuild_symbol_index(state, project_id)
-                all_names = self._f._symbol_index.get_all_names(project_id)
-
-        if not all_names:
-            return (
-                "❌ The symbol index is empty.\n\n"
-                "No code has been processed in this session yet. "
-                "Paste the code you want to analyze first, then use `/expand` again."
-            )
-
-        if func_name not in all_names:
-            lower_name = func_name.lower()
-            suggestions = sorted(
-                [n for n in all_names if lower_name in n.lower()],
-                key=lambda n: (not n.startswith(func_name[0]), n),
-            )[:8]
-            hint = ""
-            if suggestions:
-                hint = "\n\nDid you mean one of these?\n" + "\n".join(
-                    f"- `{s}`" for s in suggestions
-                )
-            else:
-                sample = sorted(all_names)[:10]
-                hint = (
-                    f"\n\nThe index contains {len(all_names)} symbol(s). Sample:\n"
-                    + "\n".join(f"- `{s}`" for s in sample)
-                )
-            return f"❌ Symbol `{func_name}` not found in the index." + hint
-
-        expanded = await self._expand_symbol_dependencies(func_name, depth, project_id)
-        if not expanded:
-            return (
-                f"❌ Symbol `{func_name}` is indexed but its code body could not be retrieved. "
-                "Try pasting the code again."
-            )
-
-        if expanded.count("### ") <= 1:
-            return f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}\n\n> No further call dependencies found."
-
-        return f"## Expanded: `{func_name}` (depth {depth})\n\n{expanded}"
-
-    async def _expand_symbol_dependencies(
-        self, name: str, max_depth: int, project_id: str
-    ) -> str:
-        """Expand a symbol by following its call graph up to max_depth."""
-        state = self._f._state_store.get_state(project_id)
-        if not state:
-            return ""
-        visited = set()
-        lines = []
-
-        async def recurse(current_name, current_depth):
-            if current_depth > max_depth or current_name in visited:
-                return
-            visited.add(current_name)
-            blocks = self._f._symbol_index.find_blocks(current_name, project_id)
-            for h in blocks:
-                block = state["active_blocks"].get(h)
-                if block and not block.obsolete:
-                    loc = f" (file: {block.file_path})" if block.file_path else ""
-                    lines.append(
-                        f"### `{current_name}` (depth {current_depth}){loc}\n"
-                        f"```\n{block.content[:2000]}\n```"
-                    )
-                    for sym in block.symbols:
-                        if sym.name == current_name:
-                            for callee in sym.calls:
-                                await recurse(callee, current_depth + 1)
-                            break
-                    break
-
-        await recurse(name, 1)
-        return "\n".join(lines)
+    def _do_purge(self) -> None:
+        now = time.time()
+        expired = self._f.memory_collection.get(where={"expires_at": {"$lt": now}})
+        if expired and expired["ids"]:
+            self._f.memory_collection.delete(ids=expired["ids"])
+            self._f._log_debug(f"Purged {len(expired['ids'])} expired memories")
 
 
 class LLMOrchestrator:
@@ -4670,72 +4581,72 @@ class LLMOrchestrator:
             try:
                 llm_fd = await self._acquire_llm_lock()
                 try:
-                    async with _llm_semaphore:
-                        await self._maybe_unload_for_model(model, base_url, is_ollama)
+                    # Unload/load management fuera del semáforo de concurrencia
+                    await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-                        attempt = 0
-                        while time.monotonic() < deadline:
-                            attempt += 1
-                            try:
-                                async with self._f._llm_semaphore:
-                                    content = await _shared_call_llm(
-                                        prompt=prompt,
-                                        system=system_prompt,
-                                        base_url=self._f.valves.LLM_BASE_URL,
-                                        model=model,
-                                        api_token=self._f.valves.LLM_API_TOKEN,
-                                        temperature=temperature,
-                                        max_tokens=max_tokens,
-                                        timeout=self._f.valves.llm_request_timeout,
-                                        endpoint_type=ep_type,
-                                    )
-                                if content:
-                                    await self._f._llm_cache.set(cache_key, content)
-                                    future.set_result(content)
-                                    async with self._f._model_lock:
-                                        self._f._last_used_model = model
-                                    in_tokens = (
-                                        len(self._f.tokenizer.encode(prompt))
-                                        if self._f.tokenizer
-                                        else "?"
-                                    )
-                                    out_tokens = (
-                                        len(self._f.tokenizer.encode(content))
-                                        if self._f.tokenizer
-                                        else "?"
-                                    )
-                                    self._f._log_debug(
-                                        f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
-                                        f" took {time.monotonic() - t_start:.3f}s"
-                                    )
-                                    return content
-                                else:
-                                    reason = "empty response"
-                            except asyncio.CancelledError:
-                                raise
-                            except RuntimeError as exc:
-                                reason = f"RuntimeError: {exc}"
-                                if not any(
-                                    c in str(exc)
-                                    for c in ("429", "500", "502", "503", "504")
-                                ):
-                                    self._f._log_debug(
-                                        f"[LLM] {model}{label_str} attempt {attempt} failed "
-                                        f"with non-retryable error: {exc}"
-                                    )
-                                    break
-                            except Exception as exc:
-                                reason = f"{type(exc).__name__}: {exc}"
-
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
+                    attempt = 0
+                    while time.monotonic() < deadline:
+                        attempt += 1
+                        try:
+                            async with self._f._llm_semaphore:
+                                content = await _shared_call_llm(
+                                    prompt=prompt,
+                                    system=system_prompt,
+                                    base_url=self._f.valves.LLM_BASE_URL,
+                                    model=model,
+                                    api_token=self._f.valves.LLM_API_TOKEN,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    timeout=self._f.valves.llm_request_timeout,
+                                    endpoint_type=ep_type,
+                                )
+                            if content:
+                                await self._f._llm_cache.set(cache_key, content)
+                                future.set_result(content)
+                                async with self._f._model_lock:
+                                    self._f._last_used_model = model
+                                in_tokens = (
+                                    len(self._f.tokenizer.encode(prompt))
+                                    if self._f.tokenizer
+                                    else "?"
+                                )
+                                out_tokens = (
+                                    len(self._f.tokenizer.encode(content))
+                                    if self._f.tokenizer
+                                    else "?"
+                                )
+                                self._f._log_debug(
+                                    f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
+                                    f" took {time.monotonic() - t_start:.3f}s"
+                                )
+                                return content
+                            else:
+                                reason = "empty response"
+                        except asyncio.CancelledError:
+                            raise
+                        except RuntimeError as exc:
+                            reason = f"RuntimeError: {exc}"
+                            if not any(
+                                c in str(exc)
+                                for c in ("429", "500", "502", "503", "504")
+                            ):
+                                self._f._log_debug(
+                                    f"[LLM] {model}{label_str} attempt {attempt} failed "
+                                    f"with non-retryable error: {exc}"
+                                )
                                 break
-                            wait = min(RETRY_DELAY, remaining)
-                            self._f._log_debug(
-                                f"[LLM] {model}{label_str} attempt {attempt} failed ({reason}), "
-                                f"retrying in {wait:.1f}s (deadline in {remaining:.0f}s)"
-                            )
-                            await asyncio.sleep(wait)
+                        except Exception as exc:
+                            reason = f"{type(exc).__name__}: {exc}"
+
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        wait = min(RETRY_DELAY, remaining)
+                        self._f._log_debug(
+                            f"[LLM] {model}{label_str} attempt {attempt} failed ({reason}), "
+                            f"retrying in {wait:.1f}s (deadline in {remaining:.0f}s)"
+                        )
+                        await asyncio.sleep(wait)
                 finally:
                     self._release_llm_lock(llm_fd)
             finally:
@@ -5853,11 +5764,11 @@ class CommandRouter:
             if fi.get("action") in (None, "none"):
                 continue
             if intent_type == "forget":
-                confirmation = await self._f._execute_forget_intent(project_id, fi)
+                confirmation = await self._execute_forget_intent(project_id, fi)
             elif intent_type == "remember":
-                confirmation = await self._f._execute_remember_intent(project_id, fi)
+                confirmation = await self._execute_remember_intent(project_id, fi)
             elif intent_type == "obsolete" and self._f.valves.enable_obsolete_marking:
-                confirmation = await self._f._execute_obsolete_intent(project_id, fi)
+                confirmation = await self._execute_obsolete_intent(project_id, fi)
             else:
                 continue
 
@@ -6641,6 +6552,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Active code context
     # ═══════════════════════════════════════════════════════════════════════════
+
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
         state = self._f._state_store.get_state(project_id)
@@ -6783,21 +6695,68 @@ class ActivationEngine:
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(self._f._format_block_context(b, is_latest) + tag)
 
-        max_tokens = self._f.valves.active_context_max_tokens
+        # Presupuesto dinámico (Fix 4 con guard contra negativo)
+        effective_budget = max(
+            4000,
+            self._f.valves.context_window_tokens
+            - self._f._last_system_tokens.get(project_id, 0)
+            - self._f.valves.response_reserve_tokens,
+        )
+        max_tokens = min(
+            self._f.valves.active_context_max_tokens or effective_budget,
+            effective_budget,
+        )
+
+        # Truncado convergente con detección de fences línea a línea (Fix 3)
         if max_tokens > 0 and self._f.tokenizer:
             full_text = "\n".join(parts)
-            while (
-                len(self._f.tokenizer.encode(full_text)) > max_tokens and len(parts) > 3
-            ):
-                parts.pop()
+            current_tokens = len(self._f.tokenizer.encode(full_text))
+            truncation_done = False
+
+            while current_tokens > max_tokens and len(parts) > 2:
+                excess = current_tokens - max_tokens
+
+                largest_idx = -1
+                largest_tok = 0
+                for i, part in enumerate(parts):
+                    part_tok = len(self._f.tokenizer.encode(part))
+                    if part_tok > largest_tok:
+                        largest_tok = part_tok
+                        largest_idx = i
+
+                if largest_idx >= 0 and largest_tok >= excess + 100:
+                    target = max(100, largest_tok - excess - 50)
+                    truncated_text = self._f._tokens.truncate_text_to_tokens(
+                        parts[largest_idx], target
+                    )
+                    if self._has_open_fence(truncated_text):
+                        truncated_text += "\n```"
+                    parts[largest_idx] = truncated_text + "\n[...truncado...]"
+                    truncation_done = True
+                else:
+                    parts.pop()
+
                 full_text = "\n".join(parts)
-            if len(self._f.tokenizer.encode(full_text)) > max_tokens:
+                current_tokens = len(self._f.tokenizer.encode(full_text))
+
+            if not truncation_done and current_tokens > max_tokens:
                 parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
+
         return "\n".join(parts)
+
+    @staticmethod
+    def _has_open_fence(text: str) -> bool:
+        """True if the text ends inside an unclosed fenced code block."""
+        inside = False
+        for line in text.splitlines():
+            if line.strip().startswith("```"):
+                inside = not inside
+        return inside
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Activation graph building
     # ═══════════════════════════════════════════════════════════════════════════
+
     def _extract_query_seeds(
         self, query: str, project_id: str
     ) -> Tuple[List[str], List[str]]:
@@ -6880,7 +6839,7 @@ class ActivationEngine:
         results = []
         for i, func_name in enumerate(unique_frames):
             score = 0.5 + 0.5 * (i / max(n - 1, 1))
-            specificity = self._f._compute_node_specificity(func_name, project_id)
+            specificity = self._compute_node_specificity(func_name, project_id)
             adjusted = min(1.0, score * min(specificity, 1.5))
             results.append((func_name, adjusted))
 
@@ -7248,6 +7207,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Path index & cross‑chunk edges
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def _build_view_from_activation(
         self, entry_point: str, ag: ActivationGraph, project_id: str
     ) -> Optional[CodePathView]:
@@ -7343,11 +7303,9 @@ class ActivationEngine:
 
             for edge in edges_in:
                 if has_definition and edge.confidence < 1.0:
-                    # Symbol now defined → restore confidence
                     edge.confidence = 1.0
                     resolved += 1
                 elif not has_definition and edge.confidence == 1.0:
-                    # Symbol referenced but not defined → mark provisional
                     edge.confidence = 0.3
 
         if resolved > 0:
@@ -7360,6 +7318,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Speculative prefetch
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def speculative_prefetch(
         self,
         project_id: str,
@@ -7375,7 +7334,6 @@ class ActivationEngine:
         if not last_activated:
             return
 
-        # Top symbols from the current query
         top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
 
         prefetch_candidates: Set[str] = set()
@@ -7384,7 +7342,7 @@ class ActivationEngine:
                 if (
                     edge.type == "calls"
                     and edge.effective_weight() >= 0.7
-                    and edge.dst not in last_activated  # not already activated
+                    and edge.dst not in last_activated
                 ):
                     prefetch_candidates.add(edge.dst)
 
@@ -7402,7 +7360,7 @@ class ActivationEngine:
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
         for sym_name in candidates:
             if not self._f._symbol_index.find_blocks(sym_name, project_id):
-                continue  # symbol referenced but not defined
+                continue
             ag = ActivationGraph()
             ag.seed([sym_name], initial_score=1.0)
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
@@ -7411,6 +7369,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Hash utilities
     # ═══════════════════════════════════════════════════════════════════════════
+
     def compute_structural_hash(
         self, symbol_names: Iterable[str], project_id: str
     ) -> str:
@@ -7464,6 +7423,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Inactive block candidates & cache invalidation
     # ═══════════════════════════════════════════════════════════════════════════
+
     def get_inactive_block_candidates(self, project_id: str) -> list:
         """
         Return block hashes that haven't been mentioned in the last
@@ -7498,6 +7458,7 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Static evidence
     # ═══════════════════════════════════════════════════════════════════════════
+
     def _gather_static_evidence(
         self, hypothesis_text: str, project_id: str
     ) -> "StaticEvidence":
@@ -7508,7 +7469,6 @@ class ActivationEngine:
         all_names = self._f._symbol_index.get_all_names(project_id)
         state = self._f._state_store.get_state(project_id)
 
-        # ── 1. Symbols mentioned in the hypothesis ──────────────────────
         words = set(re.findall(r"\b\w+\b", hypothesis_text))
         mentioned = all_names.intersection(words)
 
@@ -7517,7 +7477,6 @@ class ActivationEngine:
             for name in mentioned
         }
 
-        # ── 2. Claimed call relationships ───────────────────────────────
         call_patterns = re.findall(
             r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
             hypothesis_text,
@@ -7535,7 +7494,6 @@ class ActivationEngine:
             )
             call_relations_valid[key] = verified
 
-        # ── 3. Recent changes (last hour) ───────────────────────────────
         now = time.time()
         recent_window = 3600
         recent_changes = [
@@ -7548,20 +7506,17 @@ class ActivationEngine:
             )
         ]
 
-        # ── 4. Entry points mentioned ───────────────────────────────────
         all_views = self._f._path_index.get_all(project_id)
         entry_points_mentioned = [
             v.entry_point for v in all_views if v.entry_point in mentioned
         ]
 
-        # ── 5. Path memberships ─────────────────────────────────────────
         path_memberships: Dict[str, List[str]] = {}
         for name in mentioned:
             path_memberships[name] = self._f._path_index.mark_stale_for_symbol(
                 name, project_id
             )
 
-        # ── 6. Data flow upstream (backward slicing) ────────────────────
         data_flow_upstream: Dict[str, List[str]] = {}
         if mentioned:
             for sym_name in mentioned:
@@ -7574,7 +7529,6 @@ class ActivationEngine:
                 if data_flow_sources:
                     data_flow_upstream[sym_name] = data_flow_sources
 
-        # ── 7. Objective score ──────────────────────────────────────────
         verifiable = len(symbols_found) + len(call_relations_valid)
         if verifiable == 0:
             objective_score = 0.5
@@ -8816,6 +8770,10 @@ class ActiveCodeUpdater:
                 if blk.file_path == new_block.file_path and not blk.pinned:
                     blk.obsolete = True
                     blk._update_importance()
+                    # bug #9 fix: remove symbols of the now‑obsolete block from the index
+                    self._f._symbol_index.remove_all_for_block(
+                        blk.hash, blk.symbols, project_id
+                    )
 
         # Handle content-type specific actions
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
@@ -9709,7 +9667,7 @@ class MessageAssembler:
         has_code_blocks: bool,
         slot_free: bool = True,
     ) -> List[dict]:
-        """Orchestrate CoT, multi-phase, trimming, and final assembly."""
+        """Orchestrate CoT, multi‑phase, trimming, and final assembly."""
         self._f._log_debug(
             "Assembling final messages (CoT, trimming, system prompt injection)"
         )
@@ -9724,6 +9682,7 @@ class MessageAssembler:
             prelim_system,
             project_id,
             slot_free,
+            messages,  # ← bug #6 fix
         )
 
         # 2. History LLMLingua compression (optional)
@@ -9769,6 +9728,7 @@ class MessageAssembler:
         prelim_system: str,
         project_id: str,
         slot_free: bool,
+        messages: List[dict],  # ← bug #6 fix
     ) -> None:
         """
         Detect CoT level and generate reasoning.
@@ -9817,7 +9777,9 @@ class MessageAssembler:
                 and prelim_system
             ):
                 _prelim_tok = len(self._f.tokenizer.encode(prelim_system))
-                _hist_tok = self._f._tokens.estimate_tokens([])
+                _hist_tok = self._f._tokens.estimate_tokens(
+                    [m for m in messages if m.get("role") != "system"]  # ← bug #6 fix
+                )
                 _available_mp_pre = max(
                     0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
                 )
@@ -9900,7 +9862,9 @@ class MessageAssembler:
             and prelim_system
         ):
             _prelim_tok = len(self._f.tokenizer.encode(prelim_system))
-            _hist_tok = self._f._tokens.estimate_tokens([])
+            _hist_tok = self._f._tokens.estimate_tokens(
+                [m for m in messages if m.get("role") != "system"]  # ← bug #6 fix
+            )
             _available_mp_pre = max(
                 0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
             )
@@ -11238,6 +11202,9 @@ class Filter:
 
         project_id = self._inlet_orch.get_project_id()
         slot_free = True
+        # Cold‑start guard: si no hay modelo cargado, no hay slot que liberar
+        if slot_free and self._last_used_model is None:
+            slot_free = False
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
@@ -11383,10 +11350,18 @@ class Filter:
                     "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
 
-                # Replace the last user message with assistant response + "continue"
-                messages.pop()  # remove user code message
+                # ── Fix 1: Replace code with compressed stub instead of deleting it ──
+                all_names = sorted(self._symbol_index.get_all_names(project_id))[:100]
+                compressed_stub = (
+                    f"```python\n"
+                    f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados]\n"
+                    + "\n".join(f"# class/func: {n}" for n in sorted(all_names)[:50])
+                    + "\n```\n\n"
+                    f"(Usa `/expand <nombre>` para ver la implementación completa "
+                    f"de cualquier símbolo de los {num_symbols} disponibles)"
+                )
+                messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "user", "content": "continue"})
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
