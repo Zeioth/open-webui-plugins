@@ -905,6 +905,60 @@ class ContextPager:
         self._paged_hashes.setdefault(project_id, set()).add(block.hash)
         return True
 
+    async def purge_old_versions(
+        self,
+        project_id: str,
+        state: dict,
+        symbol_index: "SymbolIndex",
+        chroma_collection,
+        embedder,
+        max_versions_per_file: int = 3,
+    ) -> int:
+        """
+        Move code blocks older than the N most recent versions per file to cold storage.
+
+        Returns the number of blocks purged.
+        """
+        from collections import defaultdict
+
+        by_file = defaultdict(list)
+        for h, block in state.get("active_blocks", {}).items():
+            if block.file_path and not block.pinned and not block.obsolete:
+                by_file[block.file_path].append((h, block))
+
+        purged = 0
+        for file_path, versions in by_file.items():
+            if len(versions) <= max_versions_per_file:
+                continue
+
+            # Keep the N most recent versions
+            versions.sort(key=lambda x: x[1].timestamp, reverse=True)
+            for h, block in versions[max_versions_per_file:]:
+                if self._f.valves.enable_block_paging and chroma_collection is not None:
+                    paged = await self.page_out_block(
+                        block=block,
+                        project_id=project_id,
+                        state=state,
+                        symbol_index=symbol_index,
+                        chroma_collection=chroma_collection,
+                        embedder=embedder,
+                    )
+                    if paged:
+                        del state["active_blocks"][h]
+                        purged += 1
+                        continue
+                # Fallback: remove from active blocks without paging
+                if h in state["active_blocks"]:
+                    del state["active_blocks"][h]
+                    purged += 1
+
+        if purged > 0:
+            self._f._log_debug(
+                f"Purged {purged} old code version(s) across "
+                f"{len(by_file)} file(s)"
+            )
+        return purged
+
     # ── Page in (ChromaDB → temporary CodeBlock) ──────────────────────────
 
     async def page_in_block(
@@ -10455,7 +10509,7 @@ class Filter:
             description="Total time budget for retrying failed LLM calls.",
         )
         priority: int = Field(default=0)
-        max_turns: int = Field(default=8)  # ← v2.0: was 15
+        max_turns: int = Field(default=50)
         debug: bool = Field(default=True)
         debug_context: bool = Field(
             default=False,
@@ -10940,7 +10994,7 @@ class Filter:
         #  v8 — Conversation summary cap (working-memory lookback)
         # ═══════════════════════════════════════════════════════════════
         max_conversation_summaries: int = Field(
-            default=3,
+            default=50,
             ge=0,
             description=(
                 "Maximum number of conversation summary blocks kept and "
@@ -10967,7 +11021,7 @@ class Filter:
         #  v2.0 — Hard history budget
         # ═══════════════════════════════════════════════════════════════
         history_max_tokens: int = Field(
-            default=4000,
+            default=32000,
             description=(
                 "Maximum tokens for conversation history (non-system messages). "
                 "Enforced after LLMLingua compression. 0 = disabled."
@@ -11572,9 +11626,7 @@ class Filter:
             messages = body.get("messages", [])
             project_id = self._inlet_orch.get_project_id()
             state = self._state_store.get_state(project_id)
-            is_code_session = await self._inlet_orch.classify_session(
-                messages, project_id
-            )
+            is_code_session = await self._inlet_orch.classify_session(messages, project_id)
             last_msg = messages[-1] if messages else None
             if last_msg:
                 last_idx = len(messages) - 1
@@ -11650,12 +11702,8 @@ class Filter:
                             "multi-phase response (continuation marker detected)."
                         )
                     else:
-                        context_hash = self._activation.compute_context_hash(
-                            messages[:-1]
-                        )
-                        code_state_hash = self._activation.compute_code_state_hash(
-                            project_id
-                        )
+                        context_hash = self._activation.compute_context_hash(messages[:-1])
+                        code_state_hash = self._activation.compute_code_state_hash(project_id)
                         await self._ltm.store_response_in_cache(
                             last_user.get("content", ""),
                             last_assistant.get("content", ""),
@@ -11701,9 +11749,7 @@ class Filter:
                     project_id, {}
                 )
                 if last_activated:
-                    await self._activation.speculative_prefetch(
-                        project_id, last_activated
-                    )
+                    await self._activation.speculative_prefetch(project_id, last_activated)
 
             # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
             await self._ltm.purge_expired_memories()
@@ -11747,6 +11793,17 @@ class Filter:
             # 🚀 RESOURCE OPTIMISATION – Save KV slot (delegated to ContextBuilder)
             if self.valves.enable_slot_persistence:
                 await self._ctx_builder.slot_save(project_id)
+
+            # ── v2.0: Purge old code versions per file ─────────────────
+            if self.valves.enable_block_paging and self._pager is not None:
+                await self._pager.purge_old_versions(
+                    project_id=project_id,
+                    state=state,
+                    symbol_index=self._symbol_index,
+                    chroma_collection=self.memory_collection,
+                    embedder=self.embedder,
+                    max_versions_per_file=3,
+                )
 
             # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
             if self.valves.enable_edge_persistence:
