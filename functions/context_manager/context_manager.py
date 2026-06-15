@@ -4797,9 +4797,14 @@ class LongTermMemory:
                 )
                 docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
                 reranked = await self._rerank_results(query, docs_only, rerank_k)
-                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
+                # Carry the full tuple (score, ts, meta_dict) through reranking
+                # so the metadata dict is not lost when len-5 entries are flattened.
+                doc_to_meta = {
+                    d[0]: (d[1], d[2], d[3] if len(d) > 3 else {})
+                    for d in docs_with_meta
+                }
                 docs_with_meta = [
-                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
+                    (doc, *doc_to_meta.get(doc, (0.0, None, {}))) for doc in reranked
                 ]
 
             docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
@@ -4807,14 +4812,22 @@ class LongTermMemory:
             normalized = []
             for entry in docs_with_meta:
                 if len(entry) == 5:
-                    doc, score, ts, _, _ = entry
+                    doc, score, ts, meta_dict, _ = entry
+                elif len(entry) == 4:
+                    # Post-reranking format (edición 1): (doc, score, ts, meta_dict)
+                    doc, score, ts, meta_dict = entry
                 elif len(entry) == 3:
                     doc, score, ts = entry
+                    meta_dict = {}
                 else:
                     doc, score, ts = entry[0], entry[1], entry[2]
-                normalized.append((doc, score, ts))
+                    meta_dict = entry[3] if len(entry) > 3 else {}
+                normalized.append((doc, score, ts, meta_dict))
 
-            return [{"doc": doc, "timestamp": ts} for doc, _, ts in normalized]
+            return [
+                {"doc": doc, "timestamp": ts, "meta": meta_dict}
+                for doc, _, ts, meta_dict in normalized
+            ]
         except Exception as e:
             logger.warning(f"Unified memory retrieval failed: {e}")
             return []
