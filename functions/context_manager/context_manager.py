@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants — v8.0.0 (Con
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 8.0.0
+version: 9.0.0
 license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
 """
@@ -1664,6 +1664,77 @@ class ContextBuilder:
             re.IGNORECASE,
         )
 
+        # ── #15: skeleton TIER cache (project_id → (signature_hash, tier)) ──
+        # Keyed by signature_hash so body edits do NOT invalidate it.
+        self._skeleton_tier_cache: Dict[str, Tuple[str, str]] = {}
+
+        # ── #17: LOD policy per use case ─────────────────────────────
+        self.LOD_PROFILES: Dict[str, dict] = {
+            "A": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.4,
+                "lod3_mult": 2.5,
+                "activation_direction": "both",
+            },
+            "B": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.2,
+                "activation_direction": "callees",
+            },
+            "C": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.0,
+                "activation_direction": "callees",
+            },
+            "D": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.0,
+                "activation_direction": "callers",
+            },
+            "E": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 2.0,
+                "lod3_mult": 4.0,
+                "activation_direction": "callees",
+            },
+        }
+        # Use-case detection. Refactor (D) is tested BEFORE architecture (A)
+        # because the architecture regex also matches "refactor".
+        self._UC_COMMAND_RE = re.compile(
+            r"^\s*/(arch|plan|code|refactor|scaffold)\b", re.IGNORECASE
+        )
+        self._UC_SCAFFOLD_RE = re.compile(
+            r"\b(esqueleto|skeleton|stubs?|scaffold(?:ing)?|solo\s+firmas|"
+            r"signatures?\s+only|boilerplate|plantilla\s+de\s+(?:clase|c[oó]digo))\b",
+            re.IGNORECASE,
+        )
+        self._UC_REFACTOR_RE = re.compile(
+            r"\b(refactor(?:iza(?:r|ndo)?|ing|ed)?|renombr\w*|rename|"
+            r"extrae\s+(?:el\s+)?(?:m[eé]todo|funci[oó]n)|"
+            r"extract\s+(?:a\s+)?(?:method|function)|"
+            r"mueve\s+\w+\s+a|move\s+\w+\s+to|inline\b|deduplic\w*|"
+            r"reorganiz\w*|restructur\w*|split\s+(?:this|the|el|la)\b)\b",
+            re.IGNORECASE,
+        )
+        self._UC_ARCH_RE = re.compile(
+            r"\b(arquitectura|architecture|dise[ñn]o|design|"
+            r"c[oó]mo\s+(?:estructurar|organizar|dividir)|"
+            r"qu[eé]\s+(?:clases|m[oó]dulos|componentes)\s+"
+            r"(?:necesito|crear|a[ñn]adir)|"
+            r"abstract\s+(?:base\s+)?class|interface\s+design|"
+            r"propuesta\s+de\s+dise[ñn]o|API\s+surface)\b",
+            re.IGNORECASE,
+        )
+        self._UC_PLAN_RE = re.compile(
+            r"\b(plan\s+de\s+(?:implementaci[oó]n|cambios)|implementation\s+plan|"
+            r"pasos\s+para|steps\s+to|roadmap|"
+            r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
+            re.IGNORECASE,
+        )
+
     # ── Block construction ────────────────────────────────────────────────
 
     async def build_block_a(
@@ -1748,6 +1819,15 @@ class ContextBuilder:
                 if symbol_section:
                     parts.append(symbol_section)
 
+        # 2.5 Skeleton tier (#15): whole-project signatures as a STABLE cache
+        # prefix. Self-cached by signature_hash (survives body edits) inside
+        # _build_skeleton_tier; rendered here so the Block A prefix hash and the
+        # llama.cpp KV cache cover it. Auto-skipped when over budget.
+        if is_code_session and self._f.valves.enable_code_awareness:
+            skeleton_tier = self._build_skeleton_tier(project_id)
+            if skeleton_tier:
+                parts.append(skeleton_tier)
+
         # 3. Feedback context (stable between requests barring new feedback)
         if (
             is_code_session
@@ -1811,6 +1891,51 @@ class ContextBuilder:
             pass
         if reason:
             self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
+
+    def _build_skeleton_tier(self, project_id: str) -> str:
+        """
+        Render the project skeleton (signatures only) as a STABLE context tier,
+        cached by signature_hash so body edits don't invalidate it. Returns ""
+        when disabled, empty, or over the tier budget (caller then injects no
+        tier and Block B keeps inline signatures).
+        """
+        if not self._f.valves.enable_skeleton_tier:
+            return ""
+        sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+        if not sig_hash:
+            return ""
+        cached = self._skeleton_tier_cache.get(project_id)
+        if cached and cached[0] == sig_hash:
+            return cached[1]
+        skel = self._format_skeleton(project_id)
+        if not skel:
+            return ""
+        budget = self._f.valves.skeleton_tier_max_tokens
+        if budget > 0:
+            tok = self._f._tokens.estimate_code_tokens(skel)
+            if tok > budget:
+                self._f._log_debug(
+                    f"Skeleton tier skipped: {tok} tokens > budget {budget}. "
+                    "Block B keeps signatures inline."
+                )
+                self._skeleton_tier_cache[project_id] = (sig_hash, "")
+                return ""
+        tier = (
+            "## Project Skeleton (stable — signatures only)\n"
+            "_Contracts for the whole project. Bodies are shown on demand below "
+            "or via `/expand <name>`._\n\n"
+            f"{skel}"
+        )
+        self._skeleton_tier_cache[project_id] = (sig_hash, tier)
+        self._f._log_debug(
+            f"Skeleton tier rendered (sig_hash={sig_hash}, "
+            f"~{self._f._tokens.estimate_code_tokens(tier)} tokens)"
+        )
+        return tier
+
+    def invalidate_skeleton_tier_cache(self, project_id: str) -> None:
+        """Drop the cached skeleton tier (signatures may have changed)."""
+        self._skeleton_tier_cache.pop(project_id, None)
 
     async def _get_skeleton_for_cot(
         self,
@@ -2027,6 +2152,56 @@ class ContextBuilder:
         used = getattr(self._f, "_last_system_tokens", {}).get(project_id, 0)
         reserve = self._f.valves.response_reserve_tokens
         return max(0, window - used - reserve)
+
+    def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
+        """
+        Classify the query into one of five use cases and return its LOD profile.
+
+        A architecture · B plans · C programming · D refactor · E scaffolding.
+
+        Resolution order (first match wins):
+          1. Explicit command prefix (/arch /plan /code /refactor /scaffold),
+             when lod_intent_explicit_override is enabled.
+          2. Scaffolding regex (E).
+          3. Refactor regex (D) — BEFORE architecture, since the architecture
+             regex also matches "refactor".
+          4. Architecture/design regex (A).
+          5. Plan regex (B).
+          6. intent_vector tie-break: refactor-dominant → D, explain-dominant
+             → A; otherwise C (most common case).
+
+        Returns (case_label, profile_copy); the copy is safe to mutate.
+        """
+        q = query or ""
+        if self._f.valves.lod_intent_explicit_override:
+            m = self._UC_COMMAND_RE.match(q)
+            if m:
+                case = {
+                    "arch": "A",
+                    "plan": "B",
+                    "code": "C",
+                    "refactor": "D",
+                    "scaffold": "E",
+                }[m.group(1).lower()]
+                return case, dict(self.LOD_PROFILES[case])
+        if self._UC_SCAFFOLD_RE.search(q):
+            return "E", dict(self.LOD_PROFILES["E"])
+        if self._UC_REFACTOR_RE.search(q):
+            return "D", dict(self.LOD_PROFILES["D"])
+        if self._UC_ARCH_RE.search(q):
+            return "A", dict(self.LOD_PROFILES["A"])
+        if self._UC_PLAN_RE.search(q):
+            return "B", dict(self.LOD_PROFILES["B"])
+        iv = intent_vector or {}
+        refactor_w = iv.get("refactor", 0.0)
+        debug_w = iv.get("debug", 0.0)
+        modify_w = iv.get("modify", 0.0)
+        explain_w = iv.get("explain", 0.0)
+        if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
+            return "D", dict(self.LOD_PROFILES["D"])
+        if explain_w >= 0.5 and explain_w > modify_w:
+            return "A", dict(self.LOD_PROFILES["A"])
+        return "C", dict(self.LOD_PROFILES["C"])
 
     async def build_block_b(
         self,
@@ -2292,13 +2467,24 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
+        # #15-4B: when the whole-project skeleton is in the stable tier, Block B
+        # need not repeat bare signatures (LOD-0/LOD-1) — they are already
+        # upstream. EXCEPTION (P4): case D keeps caller signatures, since "who
+        # calls this" is impact signal, not redundancy. LOD-2 (sig+summary) and
+        # LOD-3 (bodies) are always emitted (summaries/bodies aren't in the tier).
+        suppress_sigs = (
+            self._f.valves.enable_skeleton_tier
+            and self._f.valves.skeleton_tier_suppresses_block_b_signatures
+            and _active_use_case != "D"
+            and bool(self._f._symbol_index.compute_signature_hash(project_id))
+        )
         ordered = []
         ordered.append("## Code Context (activation-based LOD)\n")
-        if _lod0_parts:
+        if _lod0_parts and not suppress_sigs:
             ordered.append(
                 "**Known symbols** (minimal activation):\n" + ", ".join(_lod0_parts)
             )
-        if _lod1_parts:
+        if _lod1_parts and not suppress_sigs:
             ordered.append(
                 "\n**Signatures** (low activation):\n" + "\n".join(_lod1_parts)
             )
@@ -2927,14 +3113,30 @@ class ContextBuilder:
 
     # ── KV slot lifecycle ─────────────────────────────────────────────────
 
-    async def slot_save(self, project_id: str) -> bool:
+    async def slot_save(self, project_id: str, force: bool = False) -> bool:
         """
         Save the KV slot after a turn.
+
+        force=True ignores the static-hash guard (used after monotonic
+        compaction, when the history prefix changed but Block A did not — #16).
+        The token-threshold guard (P5) is always respected.
 
         MIGRATE-VERBATIM: Filter._slot_save_if_needed().
         """
         if not self._f.valves.enable_slot_persistence:
             return False
+
+        # Fix P5: skip oversized KV writes — slot save writes the whole KV state
+        # to disk under the server mutex, stalling all inference (~1.5GB stall).
+        _max_ctx = self._f.valves.slot_save_max_context_tokens
+        if _max_ctx > 0:
+            _ctx_tok = self._f._last_total_context_tokens.get(project_id, 0)
+            if _ctx_tok > _max_ctx:
+                self._f._log_debug(
+                    f"Slot save skipped: context {_ctx_tok} tokens > threshold "
+                    f"{_max_ctx} (avoids large KV write under mutex)"
+                )
+                return False
 
         cached = self._block_a_cache.get(project_id)
         if not cached:
@@ -2942,7 +3144,7 @@ class ContextBuilder:
         _, static_text = cached
         static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
 
-        if self._f._last_saved_slot_hash.get(project_id) == static_hash:
+        if not force and self._f._last_saved_slot_hash.get(project_id) == static_hash:
             return False
 
         filename = self._slot_filename(project_id, static_hash)
@@ -3304,6 +3506,53 @@ class SymbolIndex:
             for key, edges in self._edges_out.items()
             if key.startswith(prefix)
         }
+
+    def get_all_edges_in(self, project_id: str) -> Dict[str, List["Edge"]]:
+        """
+        Inverted edge map: {symbol: [Edge(src=symbol, dst=caller), ...]}.
+
+        Built by reversing edges_out so it can feed ActivationGraph.propagate()
+        to activate CALLERS (multi-hop impact propagation for refactoring). The
+        default refactor path in build_block_b uses get_edges_in() for DIRECT
+        (1-hop) callers and does NOT need this; provided for an optional
+        caller-propagation mode.
+        """
+        prefix = f"{project_id}:"
+        inverted: Dict[str, List["Edge"]] = defaultdict(list)
+        for key, edges in self._edges_out.items():
+            if not key.startswith(prefix):
+                continue
+            for e in edges:
+                inverted[e.dst].append(
+                    Edge(
+                        src=e.dst,
+                        dst=e.src,
+                        type=e.type,
+                        weight=e.weight,
+                        confidence=e.confidence,
+                    )
+                )
+        return dict(inverted)
+
+    def compute_signature_hash(self, project_id: str) -> str:
+        """
+        Hash of all symbol signatures (NOT bodies) for a project, sorted by name.
+
+        Changes only when symbols are added/removed/renamed or a signature
+        changes — NOT when a function body is edited. Gives the skeleton tier a
+        much longer cache lifetime than code_state_hash (which changes on any
+        edit). \x1f/\x1e separators avoid collisions when a signature contains
+        ':' or newlines.
+        """
+        names = sorted(self.get_all_names(project_id))
+        if not names:
+            return ""
+        parts = []
+        for name in names:
+            sig = self.get_signature(name, project_id) or name
+            parts.append(f"{name}\x1f{sig}")
+        blob = "\x1e".join(parts)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     # ── Centrality (v8) ────────────────────────────────────────────────
     def precompute_centrality(
@@ -11561,6 +11810,20 @@ class MessageAssembler:
             per_msg.append(turn)
         return per_msg, turn
 
+    def _is_autocontinue_active(self, messages: List[dict]) -> bool:
+        """
+        True if the last assistant message ended with a multi-part continuation
+        marker — i.e. an AutoContinue session is mid-generation. Mirrors the
+        inlet's continuation detection (self._f._MULTI_PHASE_MARKERS).
+        """
+        last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        if not last_assistant:
+            return False
+        content = last_assistant.get("content", "")
+        return any(marker in content for marker in self._f._MULTI_PHASE_MARKERS)
+
     async def _apply_turn_based_window(
         self,
         messages: List[dict],
@@ -11581,6 +11844,17 @@ class MessageAssembler:
         eviction of already-covered turns still proceeds (no LLM needed).
         """
         if not self._f.valves.enable_turn_based_eviction:
+            return messages
+
+        # #16/P7: never compact mid-AutoContinue — rewriting history during
+        # multi-part code generation breaks the KV cache at the worst moment.
+        if (
+            self._f.valves.compaction_defer_during_autocontinue
+            and self._is_autocontinue_active(messages)
+        ):
+            self._f._log_debug(
+                "Turn-based compaction deferred: AutoContinue session active"
+            )
             return messages
 
         summarize_after = self._f.valves.summarize_after_turns
@@ -12284,6 +12558,32 @@ class Filter:
         lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
         lod2_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
         lod1_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
+        # ── LOD by use case (#17) ───────────────────────────────────
+        enable_lod_by_intent: bool = Field(
+            default=True,
+            description=(
+                "Tune Block B LOD policy and activation direction per use case "
+                "(A architecture, B plans, C programming, D refactor, "
+                "E scaffolding) instead of the flat intent-scaling. "
+                "Off = legacy scale() behaviour."
+            ),
+        )
+        lod_intent_explicit_override: bool = Field(
+            default=True,
+            description=(
+                "Allow an explicit command prefix (/arch, /plan, /code, "
+                "/refactor, /scaffold) at the start of the message to force the "
+                "use case, overriding auto-detection."
+            ),
+        )
+        lod_intent_refactor_callers_max: int = Field(
+            default=12,
+            ge=0,
+            description=(
+                "Max DIRECT callers pulled into Block B at LOD-1 for refactor "
+                "(case D) impact analysis. 0 = unlimited."
+            ),
+        )
         # ── Centrality ──────────────────────────────────────────────
         enable_centrality_prior: bool = Field(default=True)
         enable_centrality_lod_bump: bool = Field(default=True)
@@ -12564,6 +12864,49 @@ class Filter:
         enable_slot_persistence: bool = Field(default=True)
         slot_save_path: str = Field(default="/tmp/llama_slots")
         slot_id: int = Field(default=0, ge=0)
+        # ── Slot save threshold guard (fix P5: 1.5GB-under-mutex) ────
+        slot_save_max_context_tokens: int = Field(
+            default=60000,
+            ge=0,
+            description=(
+                "Skip slot save when the total context exceeds this many tokens. "
+                "Saving writes the whole KV state to disk under the server mutex, "
+                "stalling all inference for huge contexts. 0 = no guard."
+            ),
+        )
+        # ── Volatility-tiered context (#15) ─────────────────────────
+        enable_skeleton_tier: bool = Field(
+            default=True,
+            description=(
+                "Inject the project skeleton (signatures) as a stable cache tier "
+                "inside Block A. Cached by signature_hash; survives body edits."
+            ),
+        )
+        skeleton_tier_max_tokens: int = Field(
+            default=6000,
+            ge=0,
+            description=(
+                "Max tokens for the skeleton tier. 0 = unlimited. Over budget → "
+                "tier skipped, Block B keeps inline signatures."
+            ),
+        )
+        skeleton_tier_suppresses_block_b_signatures: bool = Field(
+            default=True,
+            description=(
+                "When the skeleton tier is active, Block B emits only bodies "
+                "(LOD-3) and summaries (LOD-2), not bare signatures (LOD-0/LOD-1) "
+                "— they are already in the stable tier. Case D (refactor) is "
+                "exempt: its caller signatures are impact signal, not duplication."
+            ),
+        )
+        # ── Monotonic compaction (#16) ──────────────────────────────
+        compaction_defer_during_autocontinue: bool = Field(
+            default=True,
+            description=(
+                "Skip turn-based summarize/evict while an AutoContinue multi-part "
+                "session is active, to avoid breaking the KV cache mid-generation."
+            ),
+        )
         # ── Graph persistence ───────────────────────────────────────
         enable_edge_persistence: bool = Field(default=True)
         # ── Speculative prefetch ────────────────────────────────────
@@ -12706,6 +13049,8 @@ class Filter:
             "last_cot_level": 0,
             "conversation_summaries": [],  # ← v8 (Step 5.3)
             "summarized_turn_hwm": 0,  # ← v8 turn-based: highest turn covered by a summary
+            "_pending_slot_resave": False,  # ← #16: compaction happened → re-save slot
+            "_last_evict_target": 0,  # ← #16: highest evicted turn target seen
         }
 
         # Patterns
@@ -12773,6 +13118,9 @@ class Filter:
         self._cached_code_state_hash: Optional[str] = None
 
         self._last_system_tokens: Dict[str, int] = {}
+        # Total context tokens of the last assembled request — read by
+        # ContextBuilder.slot_save() for the threshold guard (fix P5).
+        self._last_total_context_tokens: Dict[str, int] = {}
 
         # ── KV Cache Stability ──
         self._static_context_block_cache: Dict[str, Tuple[str, str]] = {}
@@ -13372,7 +13720,28 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION – Save KV slot (delegated to ContextBuilder)
             if self.valves.enable_slot_persistence:
-                await self._ctx_builder.slot_save(project_id)
+                # Record total context size so slot_save's threshold guard (P5)
+                # can skip oversized KV writes.
+                try:
+                    self._last_total_context_tokens[project_id] = (
+                        self._tokens.estimate_tokens(messages)
+                    )
+                except Exception:
+                    pass
+
+                # #16 (P6): if a summary/eviction changed the history prefix this
+                # turn, force a re-save of the now-smaller, stable prefix
+                # (still subject to slot_save's threshold guard).
+                if state and state.get("_pending_slot_resave"):
+                    saved = await self._ctx_builder.slot_save(project_id, force=True)
+                    if saved:
+                        self._log_debug(
+                            "Slot re-saved after compaction (stable new prefix)"
+                        )
+                    state["_pending_slot_resave"] = False
+                    self._state_store.set_state(project_id, state)
+                else:
+                    await self._ctx_builder.slot_save(project_id)
 
             # ── v2.0: Purge old code versions per file ─────────────────
             if (
