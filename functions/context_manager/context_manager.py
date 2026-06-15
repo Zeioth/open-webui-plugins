@@ -2327,6 +2327,142 @@ class ContextBuilder:
                 sections.append("\n".join(tier))
         return "\n".join(s for s in sections if s.strip())
 
+    # ── Skeleton / scaffolding (signatures only) ──────────────────────────
+
+    def _format_skeleton(self, project_id: str) -> str:
+        """
+        Emit a copy-pasteable signature-only skeleton of the active code: classes
+        with their methods, functions, type hints, decorators and defaults
+        intact, every body replaced by `...`. Derived from the latest source per
+        file, so nesting and signatures are exact. Budget-bounded; truncates by
+        whole files.
+        """
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state.get("active_blocks"):
+            return ""
+
+        # Latest non-obsolete block per file (the skeleton reflects current code).
+        latest_per_file: dict = {}
+        no_file: list = []
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            if block.file_path:
+                cur = latest_per_file.get(block.file_path)
+                if cur is None or block.timestamp > cur.timestamp:
+                    latest_per_file[block.file_path] = block
+            else:
+                no_file.append(block)
+
+        if not latest_per_file and not no_file:
+            return ""
+
+        effective_budget = max(
+            4000,
+            self._f.valves.context_window_tokens
+            - self._f._last_system_tokens.get(project_id, 0)
+            - self._f.valves.response_reserve_tokens,
+        )
+        budget = min(effective_budget // 2, 16000)
+
+        parts = ["## Code Skeleton (signatures only — fill in the bodies)\n"]
+        total = self._f._tokens.estimate_code_tokens(parts[0])
+        truncated = False
+
+        def _emit(label: str, block) -> None:
+            nonlocal total, truncated
+            skel = self._skeleton_from_code(block.content, block.file_path)
+            if not skel:
+                return
+            is_py = (block.file_path or "").endswith(".py")
+            fence = (
+                "python"
+                if is_py
+                else (block.symbols[0].language if block.symbols else "")
+            )
+            chunk = f"### {label}\n```{fence}\n{skel}\n```\n"
+            tok = self._f._tokens.estimate_code_tokens(chunk)
+            if total + tok > budget:
+                truncated = True
+                return
+            parts.append(chunk)
+            total += tok
+
+        for fpath in sorted(latest_per_file.keys()):
+            if truncated:
+                break
+            _emit(fpath, latest_per_file[fpath])
+
+        for i, block in enumerate(no_file):
+            if truncated:
+                break
+            _emit(f"(unnamed block {i + 1})", block)
+
+        if truncated:
+            parts.append("_[skeleton truncated to fit budget — ask per file]_")
+
+        if len(parts) <= 1:
+            return ""
+        return "\n".join(parts)
+
+    @staticmethod
+    def _skeletonize_node(node) -> None:
+        """Recursively replace function bodies with `...`, keeping class structure."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        elif isinstance(node, ast.ClassDef):
+            kept = []
+            for child in node.body:
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    ContextBuilder._skeletonize_node(child)
+                    kept.append(child)
+            node.body = kept or [ast.Expr(value=ast.Constant(value=Ellipsis))]
+
+    @staticmethod
+    def _skeleton_from_code(code: str, file_path: Optional[str]) -> str:
+        """
+        Build a signature-only skeleton from source.
+
+        Python (.py, or `def`-bearing code with no path): ast-based — bodies
+        become `...`, nesting and signatures preserved exactly via ast.unparse
+        (Python 3.9+). Other languages fall back to a flat list of signature
+        lines via regex (not guaranteed valid syntax, but a usable reference).
+        """
+        is_python = (file_path or "").endswith(".py") or (
+            not file_path and bool(re.search(r"\bdef\s+\w+\s*\(", code))
+        )
+        if is_python and hasattr(ast, "unparse"):
+            try:
+                tree = ast.parse(code)
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                nodes = []
+                for node in tree.body:
+                    if isinstance(
+                        node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        ContextBuilder._skeletonize_node(node)
+                        nodes.append(node)
+                if nodes:
+                    module = ast.Module(body=nodes, type_ignores=[])
+                    ast.fix_missing_locations(module)
+                    try:
+                        return ast.unparse(module)
+                    except Exception:
+                        pass
+        # Fallback: flat signature lines
+        sigs = []
+        for m in re.finditer(
+            r"^[ \t]*((?:async\s+)?(?:def|class|function|fn|func)\s+\w+[^\n:{]*)",
+            code,
+            re.MULTILINE,
+        ):
+            sigs.append(m.group(1).strip())
+        return "\n".join(f"{s} ..." for s in sigs) if sigs else ""
+
     # ── KV slot lifecycle ─────────────────────────────────────────────────
 
     async def slot_save(self, project_id: str) -> bool:
