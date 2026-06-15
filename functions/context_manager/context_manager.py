@@ -6072,6 +6072,227 @@ class ReasoningEngine:
         )
         return f"{prefix}\n\n{response}"
 
+    async def generate_scientific_architecture_reasoning(
+        self,
+        question: str,
+        skeleton_context: str,
+        project_id: str,
+        label: str = "",
+    ) -> str:
+        """
+        Scientific-method architecture reasoning on skeleton contracts.
+
+        Generates N competing design hypotheses, scores each against static
+        evidence from the SymbolGraph, refines iteratively, and synthesises
+        a final architecture proposal with concrete signatures and /expand hints.
+
+        Key difference from generate_scientific_reasoning_L3:
+          - Context is the skeleton (contracts), not compressed code.
+          - Hypotheses are DESIGN OPTIONS (new interfaces, refactored signatures,
+            new classes) not debugging explanations.
+          - LLM confidence weighted higher (0.6) than objective score (0.4)
+            because we are PROPOSING changes, not verifying existing behavior.
+          - Output includes skeleton-style signature proposals and /expand hints.
+
+        Falls back to generate_architecture_reasoning if skeleton is empty,
+        hypothesis parsing fails, or the LLM is unavailable.
+        """
+        if not skeleton_context.strip():
+            return await self.generate_architecture_reasoning(
+                question, skeleton_context, project_id, label=label
+            )
+
+        max_hypotheses = self._f.valves.scientific_hypotheses_count
+        threshold = self._f.valves.scientific_confidence_threshold
+        max_iters = self._f.valves.scientific_max_iterations
+
+        # ── Hypothesis parser (reuses same format as L3) ─────────────────
+        def _parse_hypotheses(text: str):
+            results = []
+            pattern = re.compile(
+                r"(?:Design\s+)?(?:Option|Hypothesis)\s*\d*\s*:\s*(.+?)"
+                r"\s*Confidence\s*:\s*([\d.]+)",
+                re.IGNORECASE | re.DOTALL,
+            )
+            for m in pattern.finditer(text):
+                hyp = m.group(1).strip().rstrip(".")
+                try:
+                    conf = max(0.0, min(1.0, float(m.group(2))))
+                except ValueError:
+                    conf = 0.5
+                results.append((hyp, conf))
+            return results
+
+        # ── Step 1: Generate design hypotheses from skeleton ─────────────
+        prompt = (
+            f"Code skeleton (contracts — bodies as `...`):\n"
+            f"{skeleton_context[:3000]}\n\n"
+            f"Architecture question:\n{question[:400]}\n\n"
+            f"Propose {max_hypotheses} distinct design options to address this. "
+            f"Each option should be concrete: name the classes/methods affected, "
+            f"propose new signatures or interfaces as skeleton lines.\n\n"
+            f"Format each option as:\n"
+            f"Design Option N: <one sentence describing the approach>\n"
+            f"Confidence: <0.0-1.0 — how well this fits the existing structure>\n\n"
+            f"Consider reuse of existing symbols (higher confidence) vs "
+            f"creating new ones (lower until validated)."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a software architect generating competing design options. "
+                "Each option must be concrete and reference existing symbol names "
+                "from the skeleton. Output exactly the requested format."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=0.4,
+            label=f"{label}_gen_options" if label else "sci_arch_gen",
+        )
+        if not response:
+            return await self.generate_architecture_reasoning(
+                question, skeleton_context, project_id, label=label
+            )
+
+        hypotheses = _parse_hypotheses(response)
+        if len(hypotheses) < 2:
+            self._f._log_debug(
+                "Scientific arch: could not parse hypotheses — falling back to L2 arch"
+            )
+            return await self.generate_architecture_reasoning(
+                question, skeleton_context, project_id, label=label
+            )
+
+        # ── Steps 2-3: Score + iterative refinement ──────────────────────
+        best_hypothesis = ""
+        best_combined = 0.0
+        best_obj = 0.0
+        best_llm_conf = 0.0
+        best_evidence = None
+
+        for iteration in range(max(1, max_iters)):
+            scored = []
+            for hyp_text, llm_conf in hypotheses:
+                evidence = self._f._activation._gather_static_evidence(
+                    hyp_text, project_id
+                )
+                obj = evidence.objective_score
+                # Architecture weight: LLM confidence dominates (proposing, not verifying)
+                combined = 0.4 * obj + 0.6 * llm_conf
+                scored.append((hyp_text, combined, obj, llm_conf, evidence))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_hypothesis, best_combined, best_obj, best_llm_conf, best_evidence = (
+                scored[0]
+            )
+
+            self._f._log_debug(
+                f"Sci-arch iter {iteration + 1}: best='{best_hypothesis[:60]}…' "
+                f"combined={best_combined:.3f} "
+                f"(obj={best_obj:.3f}, llm={best_llm_conf:.3f})"
+            )
+
+            if best_combined >= threshold or iteration >= max_iters - 1:
+                break
+
+            # Refine: feed evidence back to the LLM
+            symbols_found = {
+                k: v for k, v in best_evidence.symbols_found.items() if not v
+            }
+            call_invalid = {
+                k: v for k, v in best_evidence.call_relations_valid.items() if not v
+            }
+            feedback = (
+                f"Best design option so far (score {best_combined:.2f}):\n"
+                f"{best_hypothesis}\n\n"
+                f"Structural feedback from the codebase:\n"
+                f"- Symbols NOT yet in index (need creation): "
+                f"{list(symbols_found.keys())[:5] or 'none'}\n"
+                f"- Invalid call relationships proposed: "
+                f"{list(call_invalid.keys())[:3] or 'none'}\n"
+                f"- Recently changed symbols: {best_evidence.recent_changes[:3]}\n"
+                f"- Objective feasibility score: {best_obj:.2f}\n\n"
+                f"Revise or propose {max_hypotheses} improved options. "
+                f"Prefer approaches that reuse existing symbols where possible."
+            )
+            refined = await self._f._llm_orchestrator.call_llm(
+                prompt=feedback,
+                system_prompt=(
+                    "You are a software architect refining design options based on "
+                    "structural evidence. Output exactly the same format as before."
+                ),
+                model_override=self._f.valves.cot_model_level3,
+                max_tokens=600,
+                temperature=0.3,
+                label=f"{label}_refine" if label else "sci_arch_refine",
+            )
+            if refined:
+                new_hyps = _parse_hypotheses(refined)
+                if len(new_hyps) >= 2:
+                    hypotheses = new_hyps
+                else:
+                    break
+            else:
+                break
+
+        # ── Step 4: Synthesise final architecture proposal ────────────────
+        evidence_summary = (
+            (
+                f"Symbols confirmed in index: "
+                f"{[k for k, v in best_evidence.symbols_found.items() if v]}\n"
+                f"Symbols to create: "
+                f"{[k for k, v in best_evidence.symbols_found.items() if not v]}\n"
+                f"Valid call relationships: "
+                f"{[k for k, v in best_evidence.call_relations_valid.items() if v]}\n"
+                f"Recent changes affecting this area: {best_evidence.recent_changes}\n"
+            )
+            if best_evidence
+            else ""
+        )
+
+        synthesis_prompt = (
+            f"Skeleton:\n{skeleton_context[:2000]}\n\n"
+            f"Architecture question:\n{question[:400]}\n\n"
+            f"Best design option (score {best_combined:.2f}):\n{best_hypothesis}\n\n"
+            f"Structural evidence:\n{evidence_summary}\n\n"
+            "Produce a final architecture proposal:\n"
+            "1. Concrete signatures of new/modified classes and methods "
+            "(as skeleton lines: `def foo(self, x: int) -> str: ...`).\n"
+            "2. Which existing bodies need implementation changes "
+            "(write `/expand <SymbolName>` for each — DO NOT write the implementation).\n"
+            "3. Migration path: what changes in what order.\n"
+            "Be specific. No vague descriptions."
+        )
+        synthesis = await self._f._llm_orchestrator.call_llm(
+            prompt=synthesis_prompt,
+            system_prompt=(
+                "You are a software architect producing a final design proposal. "
+                "Output concrete signatures and migration steps. "
+                "Use `/expand <Name>` instead of writing full implementations."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=(
+                self._f.valves.skeleton_cot_max_tokens * 2
+                if self._f.valves.skeleton_cot_max_tokens > 0
+                else 1200
+            ),
+            temperature=0.25,
+            label=f"{label}_synthesize" if label else "sci_arch_synth",
+        )
+
+        if not synthesis:
+            return await self.generate_architecture_reasoning(
+                question, skeleton_context, project_id, label=label
+            )
+
+        return (
+            f"## 🔬🏗️ Scientific Architecture Reasoning (Level 3)\n"
+            f"*{max_hypotheses} design options evaluated against the SymbolGraph. "
+            f"Best option score: {best_combined:.2f} "
+            f"(feasibility={best_obj:.2f}, design_fit={best_llm_conf:.2f})*\n\n"
+            f"{synthesis}"
+        )
+
     async def generate_scientific_reasoning_L3(
         self, question: str, context: str, project_id: str, label: str = ""
     ) -> str:
@@ -10707,7 +10928,7 @@ class MessageAssembler:
         prelim_system: str,
         project_id: str,
         slot_free: bool,
-        messages: List[dict],  # ← bug #6 fix
+        messages: List[dict],
     ) -> None:
         """
         Detect CoT level and generate reasoning.
@@ -10757,7 +10978,7 @@ class MessageAssembler:
             ):
                 _prelim_tok = len(self._f.tokenizer.encode(prelim_system))
                 _hist_tok = self._f._tokens.estimate_tokens(
-                    [m for m in messages if m.get("role") != "system"]  # ← bug #6 fix
+                    [m for m in messages if m.get("role") != "system"]
                 )
                 _available_mp_pre = max(
                     0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
@@ -10842,7 +11063,7 @@ class MessageAssembler:
         ):
             _prelim_tok = len(self._f.tokenizer.encode(prelim_system))
             _hist_tok = self._f._tokens.estimate_tokens(
-                [m for m in messages if m.get("role") != "system"]  # ← bug #6 fix
+                [m for m in messages if m.get("role") != "system"]
             )
             _available_mp_pre = max(
                 0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
@@ -10916,8 +11137,17 @@ class MessageAssembler:
 
         if not manual_cot_used:
             question = user_question
-            if _is_arch and cot_level >= 2:
-                # Architecture-mode: reason on skeleton contracts.
+            if (
+                _is_arch
+                and cot_level == 3
+                and self._f.valves.enable_scientific_arch_reasoning
+            ):
+                reasoning = (
+                    await self._f._reasoning.generate_scientific_architecture_reasoning(
+                        question, prelim_for_cot, project_id, label="sci_arch_cot"
+                    )
+                )
+            elif _is_arch and cot_level >= 2:
                 reasoning = await self._f._reasoning.generate_architecture_reasoning(
                     question, prelim_for_cot, project_id, label="arch_cot"
                 )
@@ -10930,7 +11160,17 @@ class MessageAssembler:
                     question, prelim_for_cot, project_id, label="scientific_cot"
                 )
         else:
-            if _is_arch and cot_level >= 2:
+            if (
+                _is_arch
+                and cot_level == 3
+                and self._f.valves.enable_scientific_arch_reasoning
+            ):
+                reasoning = (
+                    await self._f._reasoning.generate_scientific_architecture_reasoning(
+                        cot_question, prelim_for_cot, project_id, label="sci_arch_cot"
+                    )
+                )
+            elif _is_arch and cot_level >= 2:
                 reasoning = await self._f._reasoning.generate_architecture_reasoning(
                     cot_question, prelim_for_cot, project_id, label="arch_cot"
                 )
@@ -10966,9 +11206,6 @@ class MessageAssembler:
             )
             return
 
-        # ══════════════════════════════════════════════════════════════
-        # REGION 3 — INJECT INTO SYSTEM PROMPT
-        # ══════════════════════════════════════════════════════════════
         # ══════════════════════════════════════════════════════════════
         # REGION 3 — INJECT INTO SYSTEM PROMPT
         # ══════════════════════════════════════════════════════════════
@@ -12103,8 +12340,15 @@ class Filter:
             ge=200,
             description="Token budget for all auto-resolved expansions combined.",
         )
+        enable_scientific_arch_reasoning: bool = Field(
+            default=True,
+            description=(
+                "For architecture queries at CoT level 3, use multi-hypothesis "
+                "scientific reasoning on the skeleton (design options evaluated "
+                "against static evidence) instead of single-chain L2 arch reasoning."
+            ),
+        )
         # ── Detection & generation ──────────────────────────────────
-        enable_cot_on_demand: bool = Field(default=True)
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
         auto_cot_min_chars: int = Field(default=200)
