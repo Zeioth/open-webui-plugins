@@ -893,8 +893,14 @@ class ContextPager:
         }
 
         try:
+            safe_text = block.content
+            # Requires an embedder supporting 16384 of context or more.
+            if hasattr(self, "_f") and hasattr(self._f, "_tokens"):
+                safe_text = self._f._tokens.truncate_text_to_tokens(
+                    block.content, 16384
+                )
             embedding = await anyio.to_thread.run_sync(
-                lambda: embedder.encode(block.content[:1000]).tolist()
+                lambda: embedder.encode(safe_text).tolist()
             )
             await anyio.to_thread.run_sync(
                 lambda: chroma_collection.upsert(
@@ -2898,8 +2904,10 @@ class ContextBuilder:
                 if self._f.valves.skeleton_ltm_expiration_days > 0
                 else None
             )
+            # Requires an embedder supporting 16384 context or more.
+            safe_text = self._f._tokens.truncate_text_to_tokens(skeleton_text, 16384)
             embedding = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(skeleton_text[:1500]).tolist()
+                lambda: self._f.embedder.encode(safe_text).tolist()
             )
             await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.upsert(
@@ -4700,7 +4708,7 @@ class LongTermMemory:
         """Initialise ChromaDB, embedder, and response cache collection."""
         os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
         self._f.embedder = _shared_get_embedder()
-        self._f._log_debug("Embedder: using multilingual-e5-large")
+        self._f._log_debug("Embedder: using multilingual-e5-large-instruct")
 
         self._f.chroma_client = _shared_get_chroma_client(
             self._f.valves.long_term_memory_dir
@@ -5068,8 +5076,11 @@ class LongTermMemory:
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
 
             for variant_query in query_variants:
+                # Requires an embedder supporting 16384 context or more.
                 q_emb = await anyio.to_thread.run_sync(
-                    lambda q=variant_query: self._f.embedder.encode(q[:1000]).tolist()
+                    lambda q=variant_query: self._f.embedder.encode(
+                        self._f._tokens.truncate_text_to_tokens(q, 16384)
+                    ).tolist()
                 )
                 try:
                     variant_results = await anyio.to_thread.run_sync(
@@ -5223,8 +5234,11 @@ class LongTermMemory:
             return [{"role": "user", "content": m["doc"]} for m in memories]
 
         try:
+            # Requires an embedder supporting 16384 context or more.
             q_emb = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(query[:1000]).tolist()
+                lambda: self._f.embedder.encode(
+                    self._f._tokens.truncate_text_to_tokens(query, 16384)
+                ).tolist()
             )
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
@@ -5395,10 +5409,13 @@ class LongTermMemory:
                 }
             )
 
+        # Requires an embedder supporting 16384 context or more.
+        safe_texts = [
+            self._f._tokens.truncate_text_to_tokens(t, 16384)
+            for t in texts_for_embedding
+        ]
         embeddings = await anyio.to_thread.run_sync(
-            lambda: self._f.embedder.encode(
-                texts_for_embedding, convert_to_numpy=True
-            ).tolist()
+            lambda: self._f.embedder.encode(safe_texts, convert_to_numpy=True).tolist()
         )
 
         if ids:
@@ -7238,9 +7255,12 @@ class CommandRouter:
     async def is_code_only_message(self, content: str) -> bool:
         """
         Detect messages that contain only code without a question.
+
         Uses a fast path for large raw code pastes (no fences) based on
-        Python structural line ratio and optional CrossEncoder intent check
-        on the non‑code prose.
+        Python structural line ratio.  A new high-confidence guard (structural
+        ratio > 95 %) bypasses the CrossEncoder for huge code dumps, preventing
+        false negatives caused by long docstrings / comments that look like
+        natural-language questions to the model.
         """
         if not content or len(content.strip()) < 20:
             return False
@@ -7255,6 +7275,20 @@ class CommandRouter:
                 r"return |yield |raise |pass\b|break\b|continue\b|#)"
             )
             non_blank = [l for l in content.splitlines() if l.strip()]
+            total_lines = len(non_blank)
+
+            # Structural ratio: how many non-blank lines look like Python
+            # control-flow / definition lines.
+            structural_lines = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l))
+            structural_ratio = structural_lines / total_lines if total_lines > 0 else 0
+
+            # High-confidence guard: > 95 % structural lines → almost
+            # certainly a code-only paste.  Skip the CrossEncoder entirely
+            # to avoid false negatives from long docstrings.
+            if structural_ratio > 0.95:
+                return True
+
+            # Extract the residual prose (comments, docstrings, assignments).
             prose_lines = [
                 l
                 for l in non_blank
@@ -7266,13 +7300,10 @@ class CommandRouter:
             prose_text = " ".join(prose_lines).strip()
 
             if not prose_text or len(prose_text) < 3:
-                code_ratio = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l)) / len(
-                    non_blank
-                )
-                if code_ratio > 0.07:
-                    return True
-                return False
+                # Almost no prose → code ratio alone decides.
+                return structural_ratio > 0.07
 
+            # Explicit question mark → definitely not silent.
             has_question = any(l.strip().endswith("?") for l in prose_lines)
             if has_question:
                 self._f._log_debug(
@@ -7280,39 +7311,41 @@ class CommandRouter:
                 )
                 return False
 
-            pairs = [
-                (prose_text, "The user is asking a question or making a request."),
-                (prose_text, "This text contains no user question or request."),
-            ]
-            scores = await self._predict_cross_encoder(pairs)
-            if scores is None:
-                self._f._log_debug(
-                    "_is_code_only_message: CrossEncoder not available, "
-                    "falling back to keyword intent detection"
-                )
-                _INTENT_RE = re.compile(
-                    r"\b(?:explain|describe|analyze|review|fix|refactor|optimize|"
-                    r"improve|rewrite|check|summarize|show|tell|what|how|why|"
-                    r"explica|analiza|revisa|corrige|refactoriza|optimiza|mejora|"
-                    r"reescribe|comprueba|resume|muestra|dime|qu[eé]|c[oó]mo|"
-                    r"por qu[eé])\b",
-                    re.IGNORECASE,
-                )
-                if _INTENT_RE.search(prose_text):
-                    return False
-            else:
-                has_intent = scores[0] > scores[1]
-                if has_intent:
+            # Only consult the CrossEncoder when there is a meaningful amount
+            # of non‑structural text AND the structural ratio is low enough
+            # that the paste could genuinely be a question with code.
+            if structural_ratio < 0.90:
+                pairs = [
+                    (prose_text, "The user is asking a question or making a request."),
+                    (prose_text, "This text contains no user question or request."),
+                ]
+                scores = await self._predict_cross_encoder(pairs)
+                if scores is None:
                     self._f._log_debug(
-                        f"_is_code_only_message: intent detected "
-                        f"('{prose_text[:60]}') → not silent"
+                        "_is_code_only_message: CrossEncoder not available, "
+                        "falling back to keyword intent detection"
                     )
-                    return False
+                    _INTENT_RE = re.compile(
+                        r"\b(?:explain|describe|analyze|review|fix|refactor|optimize|"
+                        r"improve|rewrite|check|summarize|show|tell|what|how|why|"
+                        r"explica|analiza|revisa|corrige|refactoriza|optimiza|mejora|"
+                        r"reescribe|comprueba|resume|muestra|dime|qu[eé]|c[oó]mo|"
+                        r"por qu[eé])\b",
+                        re.IGNORECASE,
+                    )
+                    if _INTENT_RE.search(prose_text):
+                        return False
+                else:
+                    has_intent = scores[0] > scores[1]
+                    if has_intent:
+                        self._f._log_debug(
+                            f"_is_code_only_message: intent detected "
+                            f"('{prose_text[:60]}') → not silent"
+                        )
+                        return False
 
-            code_ratio = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l)) / len(
-                non_blank
-            )
-            return code_ratio > 0.07
+            # Final fallback: structural ratio still wins.
+            return structural_ratio > 0.07
 
         # ── Original logic for fenced blocks or smaller messages ──
         code_blocks, _ = await self._f._code_blocks.extract_code_blocks(content)
