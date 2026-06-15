@@ -2464,12 +2464,28 @@ class SymbolIndex:
         self._edges_in: Dict[str, List[Edge]] = defaultdict(list)
         # Centrality cache (v8)
         self._centrality_cache: Dict[str, Dict[str, float]] = {}
+        # Per-symbol metadata (v8): (project_id, name) → {signature, summary,
+        # file_path, language, kind}. Feeds RAPTOR clustering, Block A file
+        # grouping, and inventory queries. Last writer wins for a name that
+        # appears in multiple blocks.
+        self._symbol_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     # ── Name ↔ block hash mapping ─────────────────────────────────────
     def add(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
         key = (project_id, symbol.name)
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
+        # Store metadata. Preserve a previously generated summary when the
+        # freshly extracted symbol carries none — summaries are filled in async
+        # after add() and we do not want a re-index to wipe a good one.
+        prev = self._symbol_meta.get(key)
+        self._symbol_meta[key] = {
+            "signature": symbol.signature,
+            "summary": symbol.summary or (prev.get("summary", "") if prev else ""),
+            "file_path": symbol.file_path,
+            "language": symbol.language,
+            "kind": symbol.kind,
+        }
         for callee in symbol.calls:
             callee_key = (project_id, callee)
             self._callee_to_callers[callee_key].add(symbol.name)
@@ -2483,12 +2499,7 @@ class SymbolIndex:
             if not s:
                 del self._name_to_blocks[key]
                 del self._stats[key]
-        for callee in symbol.calls:
-            callee_key = (project_id, callee)
-            if callee_key in self._callee_to_callers:
-                self._callee_to_callers[callee_key].discard(symbol.name)
-                if not self._callee_to_callers[callee_key]:
-                    del self._callee_to_callers[callee_key]
+                self._symbol_meta.pop(key, None)
 
     def remove_all_for_block(
         self, block_hash: str, symbols: List["CodeSymbol"], project_id: str
@@ -2506,6 +2517,32 @@ class SymbolIndex:
     # ── Call relationships (legacy) ────────────────────────────────────
     def get_callers(self, callee_name: str, project_id: str) -> Set[str]:
         return self._callee_to_callers.get((project_id, callee_name), set())
+
+    # ── Per-symbol metadata (v8) ───────────────────────────────────────
+    def get_symbol_meta(self, name: str, project_id: str) -> Optional[Dict[str, Any]]:
+        """Full metadata dict for a symbol, or None if unknown."""
+        return self._symbol_meta.get((project_id, name))
+
+    def get_signature(self, name: str, project_id: str) -> Optional[str]:
+        """Signature string for a symbol, or None. Consumed by RaptorCodeIndex."""
+        meta = self._symbol_meta.get((project_id, name))
+        return meta.get("signature") if meta else None
+
+    def get_summary(self, name: str, project_id: str) -> str:
+        """One-line summary for a symbol, or "". Consumed by RaptorCodeIndex."""
+        meta = self._symbol_meta.get((project_id, name))
+        return meta.get("summary", "") if meta else ""
+
+    def get_file_for_symbol(self, name: str, project_id: str) -> Optional[str]:
+        """File path for a symbol, or None. Consumed by HubSymbolIndex._file_for."""
+        meta = self._symbol_meta.get((project_id, name))
+        return meta.get("file_path") if meta else None
+
+    def update_summary(self, name: str, project_id: str, summary: str) -> None:
+        """Refresh a symbol's stored summary after async enrichment generates it."""
+        meta = self._symbol_meta.get((project_id, name))
+        if meta is not None:
+            meta["summary"] = summary
 
     # ── Typed edge storage (v7+) ───────────────────────────────────────
     def add_edge(self, edge: "Edge", project_id: str) -> None:
@@ -2697,6 +2734,11 @@ class SymbolIndex:
         # Remove centrality cache for this project
         self._centrality_cache.pop(project_id, None)
 
+        # Remove per-symbol metadata for this project
+        meta_keys = [key for key in self._symbol_meta if key[0] == project_id]
+        for key in meta_keys:
+            del self._symbol_meta[key]
+
     def clear(self) -> None:
         self._name_to_blocks.clear()
         self._callee_to_callers.clear()
@@ -2704,6 +2746,7 @@ class SymbolIndex:
         self._edges_out.clear()
         self._edges_in.clear()
         self._centrality_cache.clear()
+        self._symbol_meta.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -8243,6 +8286,9 @@ class EnrichmentTasks:
                     for sym in blk.symbols:
                         if sym.signature == signature:
                             sym.summary = summary.strip()
+                            self._f._symbol_index.update_summary(
+                                sym.name, project_id, summary.strip()
+                            )
                 self._f._state_store.set_state(project_id, state)
             return True
         return False
@@ -9682,11 +9728,22 @@ class SystemPromptBuilder:
         # ── Persisted conversation summaries ───────────────────────────
         summaries = state.get("conversation_summaries", [])
         if summaries:
+
+            def _summary_header(s: dict) -> str:
+                ct = s.get("covers_turns")
+                turns = f", turns {ct[0]}-{ct[1]}" if ct else ""
+                tag = (
+                    "Consolidated summary"
+                    if s.get("level", 1) >= 2
+                    else "Summary of earlier conversation"
+                )
+                ts = datetime.fromtimestamp(
+                    s.get("created_at", 0), tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M")
+                return f"[{tag}{turns} — {ts}]"
+
             joined = "\n\n".join(
-                f"[Summary of earlier conversation — "
-                f"{datetime.fromtimestamp(s['created_at'], tz=timezone.utc):%Y-%m-%d %H:%M}]"
-                f"\n{s['text']}"
-                for s in summaries
+                f"{_summary_header(s)}\n{s['text']}" for s in summaries
             )
             suggestions.append(("medium", joined))
 
@@ -10456,11 +10513,10 @@ class MessageAssembler:
                     await self._persist_turn_summary_to_ltm(
                         summary, project_id, hwm + 1, summarize_target
                     )
-                    cap = self._f.valves.max_conversation_summaries
-                    if cap > 0 and len(state["conversation_summaries"]) > cap:
-                        state["conversation_summaries"] = state[
-                            "conversation_summaries"
-                        ][-cap:]
+                    # Hierarchical consolidation + level-aware cap (replaces the
+                    # flat cap). Folds oldest L1 summaries into an L2 so broad
+                    # coverage survives the cap; also persists state.
+                    await self._consolidate_summaries(state, project_id, slot_free)
                     state["summarized_turn_hwm"] = summarize_target
                     self._f._state_store.set_state(project_id, state)
                     self._f._log_debug(
@@ -10533,6 +10589,119 @@ class MessageAssembler:
             )
         except Exception as e:
             self._f._log_debug(f"Turn summary LTM persist failed: {e}")
+
+    @staticmethod
+    def _summary_sort_key(s: dict):
+        """Sort key for conversation summaries: by covered turn start, oldest first."""
+        ct = s.get("covers_turns")
+        return ct[0] if ct else s.get("created_at", 0)
+
+    async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
+        """
+        Fuse several L1 turn-range summaries into one L2 summary via the LLM.
+        Returns the L2 dict, or None on empty input / LLM failure (caller then
+        leaves the L1 summaries untouched — no-degradation guard).
+        """
+        texts: List[str] = []
+        starts: List[int] = []
+        ends: List[int] = []
+        total_msgs = 0
+        for s in group_summaries:
+            t = s.get("text", "")
+            if t:
+                texts.append(t)
+            ct = s.get("covers_turns")
+            if ct:
+                starts.append(ct[0])
+                ends.append(ct[1])
+            total_msgs += s.get("covers_msgs", 0)
+
+        combined = "\n\n".join(f"- {t}" for t in texts)
+        if not combined.strip():
+            return None
+
+        prompt = (
+            "Consolidate these conversation summaries into ONE higher-level "
+            "summary (3-5 sentences). Preserve key decisions, files modified, and "
+            "architectural changes; drop redundancy and chit-chat.\n\n"
+            f"{combined[:4000]}"
+        )
+        merged = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You produce concise hierarchical summaries of technical "
+                "conversations. Output only the summary."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=self._f.valves.hierarchical_summary_max_tokens,
+            temperature=0.2,
+            label="hierarchical_summary",
+        )
+        if not merged or not merged.strip():
+            return None
+
+        return {
+            "text": merged.strip(),
+            "created_at": time.time(),
+            "covers_msgs": total_msgs,
+            "covers_turns": [min(starts) if starts else 0, max(ends) if ends else 0],
+            "level": 2,
+        }
+
+    async def _consolidate_summaries(
+        self, state: dict, project_id: str, slot_free: bool
+    ) -> None:
+        """
+        Consolidate the oldest L1 summaries into an L2 (when enabled and a free
+        slot exists), then apply a LEVEL-AWARE cap that keeps the most recent L1s
+        (fine detail) plus a bounded set of L2s (broad coverage). Replaces the
+        flat cap of the turn-based window. Persists state.
+        """
+        summaries = state.get("conversation_summaries", [])
+        if not summaries:
+            return
+
+        # ── Step 1: fold oldest L1s into an L2 ────────────────────────────
+        if slot_free and self._f.valves.enable_hierarchical_summaries:
+            group = self._f.valves.hierarchical_summary_group_size
+            l1 = sorted(
+                (s for s in summaries if s.get("level", 1) == 1),
+                key=self._summary_sort_key,
+            )
+            l2plus = [s for s in summaries if s.get("level", 1) >= 2]
+            if len(l1) >= group:
+                oldest = l1[:group]
+                merged = await self._merge_summaries(oldest)
+                if merged:
+                    summaries = l2plus + [merged] + l1[group:]
+                    self._f._log_debug(
+                        f"Hierarchical: folded {group} L1 summaries into one L2 "
+                        f"covering turns {merged['covers_turns'][0]}–"
+                        f"{merged['covers_turns'][1]}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Hierarchical: L2 merge failed; L1 summaries kept "
+                        "(no-degradation guard)."
+                    )
+
+        # ── Step 2: level-aware cap ───────────────────────────────────────
+        max_l1 = self._f.valves.max_conversation_summaries
+        max_l2 = self._f.valves.max_hierarchical_summaries
+        l1 = sorted(
+            (s for s in summaries if s.get("level", 1) == 1),
+            key=self._summary_sort_key,
+        )
+        l2 = sorted(
+            (s for s in summaries if s.get("level", 1) >= 2),
+            key=self._summary_sort_key,
+        )
+        if max_l1 > 0:
+            l1 = l1[-max_l1:]
+        if max_l2 > 0:
+            l2 = l2[-max_l2:]
+        state["conversation_summaries"] = sorted(l2 + l1, key=self._summary_sort_key)
+        self._f._state_store.set_state(project_id, state)
 
     async def _compress_code_history_and_lean(
         self,
@@ -11160,6 +11329,28 @@ class Filter:
             ge=1,
             le=30,
             description="Minimum number of unsummarized turns to accumulate before generating one summary (limits fragmentation).",
+        )
+        # ── Hierarchical (L1 → L2) consolidation ────────────────────
+        enable_hierarchical_summaries: bool = Field(
+            default=True,
+            description="Fold the oldest L1 turn-range summaries into a single L2 summary so the cap retains broad coverage.",
+        )
+        hierarchical_summary_group_size: int = Field(
+            default=4,
+            ge=2,
+            le=12,
+            description="Number of oldest L1 summaries folded into one L2 summary.",
+        )
+        max_hierarchical_summaries: int = Field(
+            default=2,
+            ge=0,
+            description="Maximum L2 summaries kept in the direct re-injection. 0 = keep all.",
+        )
+        hierarchical_summary_max_tokens: int = Field(
+            default=250,
+            ge=80,
+            le=800,
+            description="Token budget for an L2 consolidated summary.",
         )
         # ── Feedback tracking ───────────────────────────────────────
         enable_feedback_tracking: bool = Field(default=True)
