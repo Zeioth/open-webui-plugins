@@ -131,7 +131,7 @@ class CodeSymbol(BaseModel):
     parent_block_hash: str = ""
     language: str = "unknown"
     calls: List[str] = Field(default_factory=list)
-    summary: str = ""
+    docstring: str = ""
 
 
 class CodeBlock(BaseModel):
@@ -1199,13 +1199,13 @@ class RaptorCodeIndex:
                     project_id,
                     default=n,
                 )
-                summ = self._safe(
-                    getattr(symbol_index, "get_summary", None),
+                doc = self._safe(
+                    getattr(symbol_index, "get_doctring", None),
                     n,
                     project_id,
                     default="",
                 )
-                texts.append(f"{sig} — {summ}".strip(" —"))
+                texts.append(f"{sig} — {doc}".strip(" —"))
             item_ids = names
         else:
             prev = await self._load_level_summaries(
@@ -2390,15 +2390,15 @@ class ContextBuilder:
                         (sym.signature for sym in block.symbols if sym.name == node_id),
                         node_id,
                     )
-                    summary = next(
+                    doctring = next(
                         (
-                            sym.summary
+                            sym.doctring
                             for sym in block.symbols
-                            if sym.name == node_id and sym.summary
+                            if sym.name == node_id and sym.doctring
                         ),
                         "",
                     )
-                    text = f"- `{sig}`: {summary}" if summary else f"- `{sig}`"
+                    text = f"- `{sig}`: {doctring}" if doctring else f"- `{sig}`"
                     tok = len(text) // 4 + 2
                     if total_tokens + tok > budget:
                         break
@@ -2483,11 +2483,6 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
-        # #15-4B: when the whole-project skeleton is in the stable tier, Block B
-        # need not repeat bare signatures (LOD-0/LOD-1) — they are already
-        # upstream. EXCEPTION (P4): case D keeps caller signatures, since "who
-        # calls this" is impact signal, not redundancy. LOD-2 (sig+summary) and
-        # LOD-3 (bodies) are always emitted (summaries/bodies aren't in the tier).
         suppress_sigs = (
             self._f.valves.enable_skeleton_tier
             and self._f.valves.skeleton_tier_suppresses_block_b_signatures
@@ -2506,7 +2501,7 @@ class ContextBuilder:
             )
         if _lod2_parts:
             ordered.append(
-                "\n**Signatures + summaries** (medium activation):\n"
+                "\n**Signatures + docstrings** (medium activation):\n"
                 + "\n".join(_lod2_parts)
             )
         if _lod3_parts:
@@ -2547,7 +2542,6 @@ class ContextBuilder:
         return "\n".join(ordered)
 
     # ── Fix 2: Inventory listing helper ──────────────────────────────────
-
     async def _format_full_symbol_inventory(
         self, all_names: set, project_id: str
     ) -> str:
@@ -2558,13 +2552,9 @@ class ContextBuilder:
 
         by_file: dict = {}
         for name in sorted(all_names):
-            # Primary path: read metadata directly from the SymbolIndex.
-            # This works even when the block is paged out to ChromaDB, and
-            # is O(1) per symbol instead of O(blocks × symbols_per_block).
             meta = self._f._symbol_index.get_symbol_meta(name, project_id)
 
             if meta is None:
-                # Fallback: index predates doc #4 — navigate the block.
                 for bh in self._f._symbol_index.find_blocks(name, project_id):
                     block = state["active_blocks"].get(bh)
                     if block is None and self._f._pager is not None:
@@ -2579,7 +2569,7 @@ class ContextBuilder:
                         sym = next((s for s in block.symbols if s.name == name), None)
                         meta = {
                             "signature": sym.signature if sym else name,
-                            "summary": sym.summary if sym else "",
+                            "doctring": sym.doctring if sym else "",
                             "file_path": block.file_path,
                             "kind": sym.kind if sym else "function",
                             "language": sym.language if sym else "unknown",
@@ -2587,7 +2577,7 @@ class ContextBuilder:
                         break
 
             if meta is None:
-                continue  # Symbol not resolvable from either source; skip.
+                continue
 
             file_key = meta.get("file_path") or "(unknown)"
             by_file.setdefault(file_key, []).append((name, meta))
@@ -2595,10 +2585,6 @@ class ContextBuilder:
         if not by_file:
             return ""
 
-        # Hierarchical mode for large codebases: a table of contents + classes
-        # with responsibility + grouped functions, instead of a flat list that
-        # truncates and buries the architecture. Falls back to the flat list
-        # below the threshold.
         if (
             self._f.valves.enable_hierarchical_inventory
             and len(all_names) > self._f.valves.inventory_hierarchical_threshold
@@ -2608,7 +2594,6 @@ class ContextBuilder:
         lines = ["## Full Symbol Inventory\n"]
         total_tokens = self._f._tokens.estimate_code_tokens(lines[0])
 
-        # Presupuesto dinámico igual que en Fix 4
         effective_budget = max(
             4000,
             self._f.valves.context_window_tokens
@@ -2621,8 +2606,8 @@ class ContextBuilder:
             lines.append(f"### {file_path}")
             for name, meta in by_file[file_path]:
                 sig = meta.get("signature") or name
-                summary = f" — {meta['summary']}" if meta.get("summary") else ""
-                line = f"- `{sig}`{summary}"
+                doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                line = f"- `{sig}`{doc}"
                 tok = self._f._tokens.estimate_code_tokens(line)
                 if total_tokens + tok > budget:
                     lines.append(
@@ -2641,20 +2626,6 @@ class ContextBuilder:
     def _format_inventory_hierarchical(
         self, by_file: dict, all_names: set, project_id: str
     ) -> str:
-        """
-        Architecture-first inventory for large codebases.
-
-        Emits, in priority order so the most useful information always fits:
-          1. A file table-of-contents (class/function counts).
-          2. Every CLASS with its responsibility (summary) — never truncated,
-             since classes are few and are what architecture work needs.
-          3. Functions, filling the remaining token budget; each degrades to a
-             name-only line when the budget tightens, and the list stops cleanly
-             when full (with a note pointing at /expand).
-
-        by_file is the already-resolved {file_path: [(name, meta)]} map from
-        _format_full_symbol_inventory (SymbolIndex metadata already applied).
-        """
         effective_budget = max(
             4000,
             self._f.valves.context_window_tokens
@@ -2663,7 +2634,6 @@ class ContextBuilder:
         )
         budget = min(effective_budget // 2, 16000)
 
-        # Split symbols by kind, preserving file grouping.
         classes_by_file: dict = {}
         funcs_by_file: dict = {}
         for fpath, entries in by_file.items():
@@ -2675,7 +2645,6 @@ class ContextBuilder:
         lines = ["## Code Inventory (architecture view)\n"]
         total = self._f._tokens.estimate_code_tokens(lines[0])
 
-        # 1. Table of contents
         lines.append("### Files")
         for fpath in sorted(by_file.keys()):
             n_cls = len(classes_by_file.get(fpath, []))
@@ -2685,18 +2654,16 @@ class ContextBuilder:
             lines.append(toc)
         lines.append("")
 
-        # 2. Classes with responsibility (priority — never truncated)
         if classes_by_file:
             lines.append("### Classes")
             for fpath in sorted(classes_by_file.keys()):
                 for name, meta in classes_by_file[fpath]:
-                    summary = f" — {meta['summary']}" if meta.get("summary") else ""
-                    line = f"- `{name}`{summary}  ({fpath})"
+                    doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                    line = f"- `{name}`{doc}  ({fpath})"
                     total += self._f._tokens.estimate_code_tokens(line)
                     lines.append(line)
             lines.append("")
 
-        # 3. Functions — fill remaining budget, degrade to name-only when tight
         truncated = False
         if funcs_by_file:
             lines.append("### Functions")
@@ -2704,8 +2671,8 @@ class ContextBuilder:
                 bucket: list = []
                 for name, meta in funcs_by_file[fpath]:
                     sig = meta.get("signature") or name
-                    summary = f" — {meta['summary']}" if meta.get("summary") else ""
-                    full = f"- `{sig}`{summary}"
+                    doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                    full = f"- `{sig}`{doc}"
                     tok = self._f._tokens.estimate_code_tokens(full)
                     if total + tok <= budget:
                         bucket.append(full)
@@ -3406,13 +3373,13 @@ class SymbolIndex:
         key = (project_id, symbol.name)
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
-        # Store metadata. Preserve a previously generated summary when the
-        # freshly extracted symbol carries none — summaries are filled in async
+        # Store metadata. Preserve a previously generated docstring when the
+        # freshly extracted symbol carries none — docstrings are filled in async
         # after add() and we do not want a re-index to wipe a good one.
         prev = self._symbol_meta.get(key)
         self._symbol_meta[key] = {
             "signature": symbol.signature,
-            "summary": symbol.summary or (prev.get("summary", "") if prev else ""),
+            "doctring": symbol.doctring or (prev.get("doctring", "") if prev else ""),
             "file_path": symbol.file_path,
             "language": symbol.language,
             "kind": symbol.kind,
@@ -3459,21 +3426,21 @@ class SymbolIndex:
         meta = self._symbol_meta.get((project_id, name))
         return meta.get("signature") if meta else None
 
-    def get_summary(self, name: str, project_id: str) -> str:
-        """One-line summary for a symbol, or "". Consumed by RaptorCodeIndex."""
+    def get_doctring(self, name: str, project_id: str) -> str:
+        """One-line docstring for a symbol, or "". Consumed by RaptorCodeIndex."""
         meta = self._symbol_meta.get((project_id, name))
-        return meta.get("summary", "") if meta else ""
+        return meta.get("doctring", "") if meta else ""
 
     def get_file_for_symbol(self, name: str, project_id: str) -> Optional[str]:
         """File path for a symbol, or None. Consumed by HubSymbolIndex._file_for."""
         meta = self._symbol_meta.get((project_id, name))
         return meta.get("file_path") if meta else None
 
-    def update_summary(self, name: str, project_id: str, summary: str) -> None:
-        """Refresh a symbol's stored summary after async enrichment generates it."""
+    def update_doctring(self, name: str, project_id: str, doctring: str) -> None:
+        """Refresh a symbol's stored docstring after async enrichment generates it."""
         meta = self._symbol_meta.get((project_id, name))
         if meta is not None:
-            meta["summary"] = summary
+            meta["doctring"] = doctring
 
     # ── Typed edge storage (v7+) ───────────────────────────────────────
     def add_edge(self, edge: "Edge", project_id: str) -> None:
@@ -3984,8 +3951,8 @@ class SignatureExtractor:
                         if first_line:
                             doc_map[node.name] = first_line[:120]
             for sym in symbols:
-                if sym.name in doc_map and not sym.summary:
-                    sym.summary = doc_map[sym.name]
+                if sym.name in doc_map and not sym.doctring:
+                    sym.doctring = doc_map[sym.name]
         except SyntaxError:
             pass
 
@@ -9605,23 +9572,23 @@ class EnrichmentTasks:
 
             await self._f._state_store._db_enqueue(_write)
 
-    async def run_missing_summaries_task(self, params: dict, model: str) -> bool:
-        """Generate a missing summary for one symbol."""
+    async def run_missing_docstrings_task(self, params: dict, model: str) -> bool:
+        """Generate a missing docstring for one symbol."""
         signature = params["signature"]
         code_snippet = params["code_snippet"]
         prompt = (
             f"Summarize in one short sentence what this code does:\n\n"
             f"```{signature}\n{code_snippet}```"
         )
-        summary = await self._f._llm_orchestrator.call_llm(
+        doctring = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Output only one concise sentence.",
             model_override=model,
             max_tokens=50,
             temperature=0.1,
-            label="missing_summaries",
+            label="missing_docstrings",
         )
-        if summary and summary.strip():
+        if doctring and doctring.strip():
             project_id = params["project_id"]
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
@@ -9629,9 +9596,9 @@ class EnrichmentTasks:
                 for blk in state["active_blocks"].values():
                     for sym in blk.symbols:
                         if sym.signature == signature:
-                            sym.summary = summary.strip()
-                            self._f._symbol_index.update_summary(
-                                sym.name, project_id, summary.strip()
+                            sym.doctring = doctring.strip()
+                            self._f._symbol_index.update_doctring(
+                                sym.name, project_id, doctring.strip()
                             )
                 self._f._state_store.set_state(project_id, state)
             return True
@@ -9779,7 +9746,7 @@ class EnrichmentTasks:
         response compared to the LOD level they received.
 
         Logic:
-        - If the LLM mentions symbols that only got LOD ≤ 2 (summary/signature):
+        - If the LLM mentions symbols that only got LOD ≤ 2 (docstring/signature):
           → Lower lod3_threshold: give more full code next time.
         - If the LLM does NOT mention symbols that got LOD 3 (full code):
           → Raise lod3_threshold slightly: those expansions were unnecessary.
@@ -9798,7 +9765,7 @@ class EnrichmentTasks:
         response_words = set(re.findall(r"\b\w+\b", response_text))
         referenced = all_names.intersection(response_words)
 
-        # Symbols mentioned in the response that only received summary/signature
+        # Symbols mentioned in the response that only received docstring/signature
         underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
 
         # Symbols that got full code but do not appear in the response
@@ -10120,8 +10087,8 @@ class ActiveCodeUpdater:
             existing.importance_score = 10.0
             existing.symbols = syms
 
-            # Re-index with background summaries
-            await self._reindex_block_symbols_with_summaries(existing, project_id)
+            # Re-index with background docstrings
+            await self._reindex_block_symbols_with_docstrings(existing, project_id)
 
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
@@ -10146,8 +10113,8 @@ class ActiveCodeUpdater:
             existing.last_mentioned_msg_idx = state["message_count"]
             existing.symbols = syms
 
-            # Re-index with background summaries
-            await self._reindex_block_symbols_with_summaries(existing, project_id)
+            # Re-index with background docstrings
+            await self._reindex_block_symbols_with_docstrings(existing, project_id)
 
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
@@ -10159,6 +10126,57 @@ class ActiveCodeUpdater:
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
+            for callee_name in s.calls:
+                edge = Edge(
+                    src=s.name,
+                    dst=callee_name,
+                    type="calls",
+                    weight=EDGE_WEIGHTS["calls"],
+                    confidence=1.0,
+                )
+                self._f._symbol_index.add_edge(edge, project_id)
+            if self._f.valves.enable_data_flow_analysis and block.file_path:
+                df_edges = self._f._code_blocks.extract_data_flow_edges(
+                    block.content, block.file_path, project_id
+                )
+                for df_edge in df_edges:
+                    self._f._symbol_index.add_edge(df_edge, project_id)
+                if df_edges:
+                    self._f._log_debug(
+                        f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
+                    )
+        if self._f.tokenizer:
+            block._cached_token_count = len(self._f.tokenizer.encode(block.content))
+        else:
+            block._cached_token_count = len(block.content) // 4
+        block._update_importance()
+
+    async def _reindex_block_symbols_with_docstrings(
+        self, block: "CodeBlock", project_id: str
+    ) -> None:
+        """Re‑extract symbols for a block and register them + edges in the index,
+        launching background docstring generation for each new symbol."""
+        for s in block.symbols:
+            s.parent_block_hash = block.hash
+            self._f._symbol_index.add(s, block.hash, project_id)
+
+            # Launch docstring generation in background if missing
+            if (
+                self._f.valves.enable_auto_docstrings
+                and not s.doctring
+                and s.kind in ("function", "method")
+            ):
+                asyncio.create_task(
+                    self._f._enrichment.run_missing_docstrings_task(
+                        {
+                            "signature": s.signature,
+                            "code_snippet": block.content[:500],
+                            "project_id": project_id,
+                        },
+                        self._f.valves.llm_model,
+                    )
+                )
+
             for callee_name in s.calls:
                 edge = Edge(
                     src=s.name,
@@ -10204,14 +10222,14 @@ class ActiveCodeUpdater:
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
 
-            # Launch summary generation in background if missing and applicable
+            # Launch docstring generation in background if missing and applicable
             if (
-                self._f.valves.enable_auto_summaries
-                and not sym.summary
+                self._f.valves.enable_auto_docstrings
+                and not sym.doctring
                 and sym.kind in ("function", "method")
             ):
                 asyncio.create_task(
-                    self._f._enrichment.run_missing_summaries_task(
+                    self._f._enrichment.run_missing_docstrings_task(
                         {
                             "signature": sym.signature,
                             "code_snippet": new_block.content[:500],
@@ -10345,58 +10363,54 @@ class ActiveCodeUpdater:
                     f"Their symbols remain in the index for lightweight context."
                 )
 
-        async def _update_assistant_base_blocks(
-            self,
-            extracted: List[dict],
-            content_to_syms: Dict[str, List["CodeSymbol"]],
-            state: dict,
-            project_id: str,
-        ) -> None:
-            """When the assistant replies with code that overlaps existing blocks, merge it in."""
-            for block_info in extracted:
-                best_base = None
-                best_sim = 0.0
-                for base in state["active_blocks"].values():
-                    if base.content_type == ContentType.BASE_CODE:
-                        sim = self._f._code_blocks.calculate_code_similarity(
-                            base.content, block_info["code"]
-                        )
-                        if sim > best_sim and sim > 0.6:
-                            best_sim = sim
-                            best_base = base
-                if best_base and best_sim > 0.5 and best_sim < 0.98:
-                    self._f._symbol_index.remove_all_for_block(
-                        best_base.hash, best_base.symbols, project_id
+    async def _update_assistant_base_blocks(
+        self,
+        extracted: List[dict],
+        content_to_syms: Dict[str, List["CodeSymbol"]],
+        state: dict,
+        project_id: str,
+    ) -> None:
+        """When the assistant replies with code that overlaps existing blocks, merge it in."""
+        for block_info in extracted:
+            best_base = None
+            best_sim = 0.0
+            for base in state["active_blocks"].values():
+                if base.content_type == ContentType.BASE_CODE:
+                    sim = self._f._code_blocks.calculate_code_similarity(
+                        base.content, block_info["code"]
                     )
-                    prev_content = best_base.content
-                    best_base.content = CodeBlockManager.sanitize_text(
-                        block_info["code"]
+                    if sim > best_sim and sim > 0.6:
+                        best_sim = sim
+                        best_base = base
+            if best_base and best_sim > 0.5 and best_sim < 0.98:
+                self._f._symbol_index.remove_all_for_block(
+                    best_base.hash, best_base.symbols, project_id
+                )
+                prev_content = best_base.content
+                best_base.content = CodeBlockManager.sanitize_text(block_info["code"])
+                best_base.hash = hashlib.md5(block_info["code"].encode()).hexdigest()[
+                    :16
+                ]
+                best_base.timestamp = time.time()
+                best_base.is_active = True
+                best_base.importance_score = min(best_base.importance_score + 1.0, 10.0)
+                reused = content_to_syms.get(block_info["code"])
+                if reused is not None:
+                    best_base.symbols = [
+                        s.copy(update={"parent_block_hash": best_base.hash})
+                        for s in reused
+                    ]
+                else:
+                    best_base.symbols = await SignatureExtractor.extract_async(
+                        best_base.content, best_base.file_path
                     )
-                    best_base.hash = hashlib.md5(
-                        block_info["code"].encode()
-                    ).hexdigest()[:16]
-                    best_base.timestamp = time.time()
-                    best_base.is_active = True
-                    best_base.importance_score = min(
-                        best_base.importance_score + 1.0, 10.0
+                await self._reindex_block_symbols(best_base, project_id)
+                if any(s.calls for s in best_base.symbols):
+                    state["has_any_calls"] = True
+                if prev_content != block_info["code"]:
+                    await self._f._enrichment.generate_change_summary(
+                        best_base.hash, prev_content, block_info["code"]
                     )
-                    reused = content_to_syms.get(block_info["code"])
-                    if reused is not None:
-                        best_base.symbols = [
-                            s.copy(update={"parent_block_hash": best_base.hash})
-                            for s in reused
-                        ]
-                    else:
-                        best_base.symbols = await SignatureExtractor.extract_async(
-                            best_base.content, best_base.file_path
-                        )
-                    await self._reindex_block_symbols(best_base, project_id)
-                    if any(s.calls for s in best_base.symbols):
-                        state["has_any_calls"] = True
-                    if prev_content != block_info["code"]:
-                        await self._f._enrichment.generate_change_summary(
-                            best_base.hash, prev_content, block_info["code"]
-                        )
 
     async def _post_update_tasks(
         self,
@@ -10414,9 +10428,9 @@ class ActiveCodeUpdater:
         # Inline block expiration
         await self._f._enrichment.expire_blocks_by_time(project_id)
 
-        # Enrichment tasks that were previously here are now launched reactively
-        # inside _process_new_block and _process_duplicate_block, right after a
-        # symbol is indexed.  No batch loop is needed anymore.
+        # Missing docstrings are now generated reactively in _process_new_block
+        # and _process_duplicate_block, right after a symbol is indexed.
+        # No batch loop is needed anymore.
 
         if self._f.valves.enable_session_summary and not is_continuation:
             interval = self._f.valves.session_summary_interval_messages
@@ -12537,7 +12551,10 @@ class Filter:
         enable_call_graph_extraction: bool = Field(default=True)
         enable_data_flow_analysis: bool = Field(default=True)
         # ── Automatic symbol summaries ──────────────────────────────
-        enable_auto_summaries: bool = Field(default=True)
+        enable_auto_docstrings: bool = Field(
+            default=True,
+            description="Automatically generate missing docstrings for functions and methods using the LLM.",
+        )
         summary_code_max_chars: int = Field(default=8000)
         oversized_summary_max_tokens: int = Field(default=500)
         # ── Block deduplication ─────────────────────────────────────
