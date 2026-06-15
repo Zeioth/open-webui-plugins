@@ -783,7 +783,12 @@ class ContextPager:
     Manages CodeBlock lifecycle between active_blocks (RAM) and ChromaDB (paged).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, filter_ref: "Filter") -> None:
+        # Back-reference to the parent Filter. Only purge_old_versions() needs
+        # it (for valves + logging); the page-in/page-out paths are self-
+        # contained. Kept as a deliberate back-reference rather than passing
+        # the filter through every call.
+        self._f = filter_ref
         # project_id → set of block hashes currently paged out.
         self._paged_hashes: dict = {}
 
@@ -1644,17 +1649,20 @@ class ContextBuilder:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
-        """
-        filter_ref: the parent Filter instance. Used to reach valves, state,
-        symbol_index, path_index, tokenizer, embedder, memory_collection,
-        the LLM caller, the hub index, the pager, and the RAPTOR index.
-        This is a deliberate back-reference: ContextBuilder wraps Filter data
-        rather than duplicating it.
-        """
         self._f = filter_ref
         # Per-project Block A cache: project_id → (static_hash, rendered_text).
         # Invalidated by invalidate_block_a_cache() when symbols/feedback change.
         self._block_a_cache: dict = {}
+        # Fast-path trigger for inventory / structural queries. When a query
+        # matches, build_block_b serves the full symbol inventory straight from
+        # the SymbolIndex (exact names), bypassing PPR activation and code
+        # compression. Compiled once; used by build_block_b.
+        self._LIST_INTENTS = re.compile(
+            r"\b(lista|lístame|listame|enumera|inventario|"
+            r"todas las (clases|funciones)|qué (clases|funciones)|"
+            r"estructura del código|overview|list all|all (classes|functions))\b",
+            re.IGNORECASE,
+        )
 
     # ── Block construction ────────────────────────────────────────────────
 
@@ -3388,6 +3396,7 @@ class StateStore:
             ),
             "last_cot_level": data.get("last_cot_level", 0),
             "conversation_summaries": data.get("conversation_summaries", []),
+            "summarized_turn_hwm": data.get("summarized_turn_hwm", 0),
         }
 
         # Recalculate cached token counts
@@ -6386,6 +6395,23 @@ class CodeBlockManager:
         cleaned = cleaned.replace("`", "'")
         return cleaned
 
+    @staticmethod
+    def format_block_context(block: "CodeBlock", is_latest: bool) -> str:
+        """
+        Render a single active CodeBlock for get_active_code_context().
+
+        Emits an optional file header (with a [LATEST] marker for the most
+        recent version of a file) followed by the fenced code body. The token
+        budgeting loop in get_active_code_context() truncates the combined
+        output afterwards, so the full body is emitted here without per-block
+        trimming. Language is taken from the first symbol when available.
+        """
+        latest_tag = " [LATEST]" if is_latest else ""
+        location = f" `{block.file_path}`" if block.file_path else ""
+        language = block.symbols[0].language if block.symbols else ""
+        header = f"#### Block {block.hash[:8]}{location}{latest_tag}"
+        return f"{header}\n```{language}\n{block.content}\n```"
+
     # ── Proposed changes & diffs ─────────────────────────────────────────
 
     def has_conflicting_proposed_changes(
@@ -6728,25 +6754,25 @@ class ActivationEngine:
             for b in base_codes:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._f._format_block_context(b, is_latest) + tag)
+                parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
         if proposed:
             parts.append("### Proposed Changes (pending review):")
             for b in proposed:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._f._format_block_context(b, is_latest) + tag)
+                parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
         if committed:
             parts.append("### Recently Committed Changes:")
             for b in committed:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._f._format_block_context(b, is_latest) + tag)
+                parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
         if errors:
             parts.append("### Recent Errors:")
             for b in errors:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
-                parts.append(self._f._format_block_context(b, is_latest) + tag)
+                parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
 
         # Presupuesto dinámico (Fix 4 con guard contra negativo)
         effective_budget = max(
@@ -6760,19 +6786,24 @@ class ActivationEngine:
             effective_budget,
         )
 
-        # ── v2.0: Tokenización O(n) con pre‑cálculo de tamaños ──────────
+        # Truncado convergente con detección de fences línea a línea (Fix 3)
         if max_tokens > 0 and self._f.tokenizer:
-            part_sizes = [len(self._f.tokenizer.encode(p)) for p in parts]
-            current_tokens = sum(part_sizes)
+            full_text = "\n".join(parts)
+            current_tokens = len(self._f.tokenizer.encode(full_text))
+            truncation_done = False
 
             while current_tokens > max_tokens and len(parts) > 2:
                 excess = current_tokens - max_tokens
 
-                # Buscar la parte más grande usando los tamaños pre‑calculados
-                largest_idx = max(range(len(part_sizes)), key=lambda i: part_sizes[i])
-                largest_tok = part_sizes[largest_idx]
+                largest_idx = -1
+                largest_tok = 0
+                for i, part in enumerate(parts):
+                    part_tok = len(self._f.tokenizer.encode(part))
+                    if part_tok > largest_tok:
+                        largest_tok = part_tok
+                        largest_idx = i
 
-                if largest_tok >= excess + 100:
+                if largest_idx >= 0 and largest_tok >= excess + 100:
                     target = max(100, largest_tok - excess - 50)
                     truncated_text = self._f._tokens.truncate_text_to_tokens(
                         parts[largest_idx], target
@@ -6780,17 +6811,14 @@ class ActivationEngine:
                     if self._has_open_fence(truncated_text):
                         truncated_text += "\n```"
                     parts[largest_idx] = truncated_text + "\n[...truncado...]"
-
-                    # Actualizar tamaño y total sin re‑tokenizar todo
-                    new_size = len(self._f.tokenizer.encode(parts[largest_idx]))
-                    current_tokens = current_tokens - largest_tok + new_size
-                    part_sizes[largest_idx] = new_size
+                    truncation_done = True
                 else:
-                    # Eliminar la parte más pequeña (pop)
-                    current_tokens -= part_sizes.pop()
                     parts.pop()
 
-            if current_tokens > max_tokens:
+                full_text = "\n".join(parts)
+                current_tokens = len(self._f.tokenizer.encode(full_text))
+
+            if not truncation_done and current_tokens > max_tokens:
                 parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
 
         return "\n".join(parts)
@@ -9754,15 +9782,31 @@ class MessageAssembler:
             prelim_system,
             project_id,
             slot_free,
-            messages,  # ← bug #6 fix
+            messages,
         )
 
-        # 2. History LLMLingua compression (optional)
+        # 2. Code history compression + lean user code FIRST.
+        messages = await self._compress_code_history_and_lean(
+            messages, project_id, dynamic_injections
+        )
+
+        # 3. History LLMLingua compression (prose only — code is already stubbed
+        #    here or skipped verbatim by ConversationCompressor, see FIX 4b).
         messages = await self._apply_history_llmlingua(
             messages, project_id, user_question
         )
 
-        # 3. Multi-phase instructions injection
+        # 4. Turn-based window: summarize turns past summarize_after_turns and
+        #    evict raw turns past evict_raw_after_turns — but only when a
+        #    persisted summary + LTM copy already covers them (no-degradation
+        #    guard). Runs before multi-phase/trim so their token math sees the
+        #    reduced history.
+        messages = await self._apply_turn_based_window(
+            messages, state, project_id, slot_free
+        )
+
+        # 5. Multi-phase instructions injection (token math is now accurate:
+        #    history was leaned/compressed/windowed in steps 2-4).
         await self._inject_multi_phase_instructions(
             dynamic_injections,
             prelim_system,
@@ -9771,17 +9815,12 @@ class MessageAssembler:
             slot_free,
         )
 
-        # 4. Trim and summarize old messages
+        # 6. Trim and summarize old messages
         messages, pending_summary = await self._trim_and_summarize(
             messages, state, project_id, __user__
         )
 
-        # 5. Code history compression and lean user code
-        messages = await self._compress_code_history_and_lean(
-            messages, project_id, dynamic_injections
-        )
-
-        # 6. Assemble final system message and inject into message list
+        # 7. Assemble final system message and inject into message list
         messages = self._assemble_final_system_and_log(
             static_block, dynamic_injections, messages, project_id, pending_summary
         )
@@ -10328,6 +10367,172 @@ class MessageAssembler:
                     history_msgs = kept_block
 
         return sys_msgs + history_msgs, pending_summary
+
+    # ── Turn-based window (summarize@N / evict@M) ─────────────────────────
+
+    @staticmethod
+    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
+        """
+        Assign a 1-based turn number to each history message. A new turn starts
+        at every 'user' message. Messages before the first user message get turn
+        0. Returns (per_message_turn, total_turns).
+        """
+        turn = 0
+        per_msg: List[int] = []
+        for m in history:
+            if m.get("role") == "user":
+                turn += 1
+            per_msg.append(turn)
+        return per_msg, turn
+
+    async def _apply_turn_based_window(
+        self,
+        messages: List[dict],
+        state: dict,
+        project_id: str,
+        slot_free: bool,
+    ) -> List[dict]:
+        """
+        Summarize turns past `summarize_after_turns` and evict raw turns past
+        `evict_raw_after_turns`, enforcing the no-degradation guard: a raw turn
+        is dropped from the prompt only when `summarized_turn_hwm` already covers
+        it (i.e. a persisted summary + LTM copy exists).
+
+        Idempotent: the turn count is derived from the message list each call;
+        `summarized_turn_hwm` is the only persisted bookkeeping. Returns the
+        (possibly reduced) message list. Summary generation is skipped when
+        `slot_free` is False to avoid dirtying the KV slot during AutoContinue;
+        eviction of already-covered turns still proceeds (no LLM needed).
+        """
+        if not self._f.valves.enable_turn_based_eviction:
+            return messages
+
+        summarize_after = self._f.valves.summarize_after_turns
+        evict_after = self._f.valves.evict_raw_after_turns
+
+        # Config sanity: eviction window must be strictly older than summary window
+        if evict_after <= summarize_after:
+            self._f._log_debug(
+                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
+                "skipping window this request."
+            )
+            return messages
+
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        history = [m for m in messages if m.get("role") != "system"]
+        if not history:
+            return messages
+
+        turns, total_turns = self._index_turns(history)
+        if total_turns <= summarize_after:
+            return messages  # nothing old enough yet
+
+        # ── Step 1: summarize the unsummarized band, in batches ───────────
+        summarize_target = (
+            total_turns - summarize_after
+        )  # turns ≤ this must be summarized
+        hwm = state.get("summarized_turn_hwm", 0)
+
+        if (
+            slot_free
+            and summarize_target > hwm
+            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
+        ):
+            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
+            if band:
+                has_code = any("```" in m.get("content", "") for m in band)
+                summary = await self._f._history_compressor.summarize_messages(
+                    band, is_code_context=has_code
+                )
+                if summary:
+                    state["conversation_summaries"].append(
+                        {
+                            "text": summary,
+                            "created_at": time.time(),
+                            "covers_msgs": len(band),
+                            "covers_turns": [hwm + 1, summarize_target],
+                        }
+                    )
+                    await self._persist_turn_summary_to_ltm(
+                        summary, project_id, hwm + 1, summarize_target
+                    )
+                    cap = self._f.valves.max_conversation_summaries
+                    if cap > 0 and len(state["conversation_summaries"]) > cap:
+                        state["conversation_summaries"] = state[
+                            "conversation_summaries"
+                        ][-cap:]
+                    state["summarized_turn_hwm"] = summarize_target
+                    self._f._state_store.set_state(project_id, state)
+                    self._f._log_debug(
+                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
+                        f"({len(band)} msgs); HWM now {summarize_target}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Turn-based: summary generation failed — raw turns kept "
+                        "(no-degradation guard, HWM unchanged)."
+                    )
+
+        # ── Step 2: evict raw turns past the eviction window, if covered ──
+        evict_target = total_turns - evict_after  # turns ≤ this may be dropped
+        current_hwm = state.get("summarized_turn_hwm", 0)
+        if evict_target > 0 and current_hwm >= evict_target:
+            kept = [m for m, t in zip(history, turns) if t > evict_target]
+            dropped = len(history) - len(kept)
+            if dropped:
+                self._f._log_debug(
+                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
+                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
+                )
+            history = kept
+        elif evict_target > 0:
+            self._f._log_debug(
+                f"Turn-based: eviction deferred — summaries cover up to turn "
+                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
+            )
+
+        return sys_msgs + history
+
+    async def _persist_turn_summary_to_ltm(
+        self, summary: str, project_id: str, turn_start: int, turn_end: int
+    ) -> None:
+        """
+        Store a turn-range summary in LTM so evicted turns stay retrievable by
+        similarity. Tagged is_session_summary=True so retrieve_historical_messages
+        already prioritises it; is_turn_summary + covers_turn_* are extra metadata.
+        """
+        if not (HAS_SENTENCE and HAS_CHROMA and self._f.memory_collection is not None):
+            return
+        try:
+            text = f"[Conversation summary, turns {turn_start}-{turn_end}]\n{summary}"
+            embedding = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(text).tolist()
+            )
+            msg_id = (
+                f"{project_id}_turnsummary_{turn_start}_{turn_end}_{int(time.time())}"
+            )
+            await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.upsert(
+                    ids=[msg_id],
+                    embeddings=[embedding],
+                    documents=[text],
+                    metadatas=[
+                        {
+                            "role": "assistant",
+                            "project_id": project_id,
+                            "timestamp": time.time(),
+                            "is_session_summary": True,
+                            "is_turn_summary": True,
+                            "covers_turn_start": turn_start,
+                            "covers_turn_end": turn_end,
+                            "content_type": ContentType.GENERAL.value,
+                            "has_code": False,
+                        }
+                    ],
+                )
+            )
+        except Exception as e:
+            self._f._log_debug(f"Turn summary LTM persist failed: {e}")
 
     async def _compress_code_history_and_lean(
         self,
@@ -10927,6 +11132,35 @@ class Filter:
         enable_session_summary: bool = Field(default=True)
         session_summary_interval_messages: int = Field(default=8)
         session_summary_max_tokens: int = Field(default=200)
+        # ── Turn-based window (summarize@N / evict@M) ───────────────
+        enable_turn_based_eviction: bool = Field(
+            default=True,
+            description=(
+                "Summarize turns older than summarize_after_turns and drop their "
+                "raw form from the prompt once older than evict_raw_after_turns, "
+                "only when a persisted summary + LTM copy already covers them."
+            ),
+        )
+        summarize_after_turns: int = Field(
+            default=30,
+            ge=2,
+            description="A turn becomes eligible for summarization once it is this many turns in the past.",
+        )
+        evict_raw_after_turns: int = Field(
+            default=50,
+            ge=4,
+            description=(
+                "A turn's raw messages are dropped from the prompt once this many "
+                "turns in the past, ONLY if already covered by a persisted summary. "
+                "Must be greater than summarize_after_turns."
+            ),
+        )
+        summarize_batch_turns: int = Field(
+            default=5,
+            ge=1,
+            le=30,
+            description="Minimum number of unsummarized turns to accumulate before generating one summary (limits fragmentation).",
+        )
         # ── Feedback tracking ───────────────────────────────────────
         enable_feedback_tracking: bool = Field(default=True)
         feedback_history_limit: int = Field(default=10)
@@ -11077,7 +11311,7 @@ class Filter:
 
         self._hub_index = HubSymbolIndex()
         self._ctx_builder = ContextBuilder(self)
-        self._pager = ContextPager()
+        self._pager = ContextPager(self)
         self._raptor = RaptorCodeIndex()
         # ────────────────────────────────────────────────────────────────────
 
@@ -11096,6 +11330,7 @@ class Filter:
             "last_cleanup_suggestion_msg_idx": 0,
             "last_cot_level": 0,
             "conversation_summaries": [],  # ← v8 (Step 5.3)
+            "summarized_turn_hwm": 0,  # ← v8 turn-based: highest turn covered by a summary
         }
 
         # Patterns
