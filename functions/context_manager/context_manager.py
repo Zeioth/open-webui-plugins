@@ -570,7 +570,7 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 
 
 def _get_cross_encoder(
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
 ) -> Optional[Any]:
     """Return the CrossEncoder singleton, loading it once. Thread‑safe."""
     global _CROSS_ENCODER
@@ -896,7 +896,9 @@ class ContextPager:
             safe_text = block.content
             # Requires an embedder supporting 32768 of context or more.
             if hasattr(self, "_f") and hasattr(self._f, "_tokens"):
-                safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
+                safe_text = self._f._tokens.truncate_text_to_tokens(
+                    block.content, 32768
+                )
             embedding = await anyio.to_thread.run_sync(
                 lambda: embedder.encode(safe_text).tolist()
             )
@@ -1655,22 +1657,33 @@ class ContextBuilder:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         # Per-project Block A cache: project_id → (static_hash, rendered_text).
-        # Invalidated by invalidate_block_a_cache() when symbols/feedback change.
         self._block_a_cache: dict = {}
-        # Fast-path trigger for inventory / structural queries. When a query
-        # matches, build_block_b serves the full symbol inventory straight from
-        # the SymbolIndex (exact names), bypassing PPR activation and code
-        # compression. Compiled once; used by build_block_b.
+        # Skeleton cache: project_id → (code_state_hash, skeleton_text).
+        self._skeleton_cache: Dict[str, Tuple[str, str]] = {}
+        # Skeleton tier cache: project_id → (signature_hash, tier_text).
+        self._skeleton_tier_cache: Dict[str, Tuple[str, str]] = {}
+
+        # Fast-path trigger for inventory / structural queries.
         self._LIST_INTENTS = re.compile(
             r"\b(lista|lístame|listame|enumera|inventario|"
             r"todas las (clases|funciones)|qué (clases|funciones)|"
             r"estructura del código|overview|list all|all (classes|functions))\b",
             re.IGNORECASE,
         )
-
-        # ── #15: skeleton TIER cache (project_id → (signature_hash, tier)) ──
-        # Keyed by signature_hash so body edits do NOT invalidate it.
-        self._skeleton_tier_cache: Dict[str, Tuple[str, str]] = {}
+        # Fast-path for skeleton/scaffolding queries.
+        self._SKELETON_INTENTS = re.compile(
+            r"\b(esqueleto|skeleton|stubs?|scaffold(ing)?|"
+            r"(solo|sólo)\s+firmas|signatures?\s+only|"
+            r"plantilla\s+de\s+(clases|c[oó]digo))\b"
+            r"|estructura[^.\n]{0,40}(completar|rellenar|esqueleto|stub)",
+            re.IGNORECASE,
+        )
+        # Filtered skeleton: "esqueleto de ClassName" / "skeleton of FuncName".
+        self._SKELETON_SYMBOL_RE = re.compile(
+            r"\b(?:esqueleto|skeleton|stub|scaffolding?)\s+"
+            r"(?:de|of|para|for)?\s*`?(?P<sym>[A-Za-z_]\w*)`?",
+            re.IGNORECASE,
+        )
 
         # ── #17: LOD policy per use case ─────────────────────────────
         self.LOD_PROFILES: Dict[str, dict] = {
@@ -1705,8 +1718,7 @@ class ContextBuilder:
                 "activation_direction": "callees",
             },
         }
-        # Use-case detection. Refactor (D) is tested BEFORE architecture (A)
-        # because the architecture regex also matches "refactor".
+        # Use-case detection. Refactor (D) is tested BEFORE architecture (A).
         self._UC_COMMAND_RE = re.compile(
             r"^\s*/(arch|plan|code|refactor|scaffold)\b", re.IGNORECASE
         )
@@ -7181,58 +7193,79 @@ class CommandRouter:
         return False, None
 
     async def _parse_all_intents(self, user_message: str) -> Dict[str, Any]:
+        """
+        Detect natural-language intents (forget, remember, obsolete) using the
+        fast CrossEncoder instead of the main LLM.
+
+        The CrossEncoder scores candidate action descriptions against the user's
+        prose (code stripped).  The highest-scoring action above a confidence
+        threshold wins; ties or low scores return "none".
+        """
         if not self._f.valves.enable_natural_language_forget:
             none = {"action": "none"}
             return {"forget": none, "remember": none, "obsolete": none}
 
-        code_spans = await self._f._code_blocks.get_code_spans(user_message)
-        cleaned = CodeBlockManager.remove_code_spans(user_message, code_spans).strip()
+        # Strip code spans — only the user's own words matter.
+        try:
+            code_spans = await self._f._code_blocks.get_code_spans(user_message)
+        except Exception:
+            code_spans = []
+        prose = (
+            CodeBlockManager.remove_code_spans(user_message, code_spans).strip()
+            if code_spans
+            else user_message
+        )
+        if not prose or len(prose) < 3:
+            none = {"action": "none"}
+            return {"forget": none, "remember": none, "obsolete": none}
 
-        model = (
-            self._f.valves.natural_language_forget_model
-            or self._f.valves.llm_model
-            or self._f.valves.summarization_model
-        )
-        prompt = (
-            "You are a command parser for a code assistant. Analyze the user message and detect "
-            "ALL of these intents simultaneously.\n\n"
-            "FORGET actions: forget_last, forget_n (n=int), forget_file (file=str), "
-            "forget_block (hash=str), forget_all\n"
-            "REMEMBER/PIN actions: pin_last, pin_n (n=int), pin_file (file=str), "
-            "pin_block (description=str), pin_all, unpin_last, unpin_file, unpin_all\n"
-            "OBSOLETE actions: obsolete_last, obsolete_n (n=int), obsolete_file (file=str), "
-            "obsolete_block (hash=str), obsolete_all, revive_last, revive_file, revive_all\n\n"
-            f'User message (code removed): "{cleaned[:400]}"\n\n'
-            "Output JSON with exactly three keys. Use action='none' when not detected:\n"
-            '{"forget": {"action": "..."}, "remember": {"action": "..."}, "obsolete": {"action": "..."}}\n'
-            "Output only JSON."
-        )
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You output JSON only.",
-            model_override=model,
-            max_tokens=200,
-            temperature=0.0,
-            label="parse_intents",
-        )
+        # ── Action templates (multilingual — the CrossEncoder handles them) ──
+        candidates: List[Tuple[str, str, dict]] = [
+            # FORGET
+            ("forget", "forget last", {"action": "forget_last"}),
+            ("forget", "forget all", {"action": "forget_all"}),
+            ("forget", "forget this", {"action": "forget_last"}),
+            # REMEMBER / PIN
+            ("remember", "pin last", {"action": "pin_last"}),
+            ("remember", "pin this", {"action": "pin_last"}),
+            ("remember", "unpin last", {"action": "unpin_last"}),
+            ("remember", "unpin all", {"action": "unpin_all"}),
+            # OBSOLETE
+            ("obsolete", "mark last as obsolete", {"action": "obsolete_last"}),
+            ("obsolete", "mark all as obsolete", {"action": "obsolete_all"}),
+            ("obsolete", "revive last", {"action": "revive_last"}),
+            ("obsolete", "revive all", {"action": "revive_all"}),
+            # NONE
+            ("none", "no action needed", {"action": "none"}),
+        ]
+
+        # Build pairs: (prose, candidate_description)
+        pairs = [(prose, desc) for _, desc, _ in candidates]
+        scores = await self._predict_cross_encoder(pairs)
 
         none = {"action": "none"}
-        if not response:
+        if scores is None:
             return {"forget": none, "remember": none, "obsolete": none}
-        try:
-            text = response.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.endswith("```"):
-                text = text[:-3]
-            data = json.loads(text)
-            return {
-                "forget": data.get("forget", none),
-                "remember": data.get("remember", none),
-                "obsolete": data.get("obsolete", none),
-            }
-        except Exception:
-            return {"forget": none, "remember": none, "obsolete": none}
+
+        # Select the highest-scoring candidate per category
+        best: Dict[str, Tuple[float, dict]] = {}
+        for (category, _, action), score in zip(candidates, scores):
+            if score > best.get(category, (-1.0, none))[0]:
+                best[category] = (score, action)
+
+        result: Dict[str, dict] = {
+            "forget": none,
+            "remember": none,
+            "obsolete": none,
+        }
+
+        # Confidence threshold: scores below 0.6 are treated as "none"
+        THRESHOLD = 0.6
+        for category, (score, action) in best.items():
+            if score >= THRESHOLD and action["action"] != "none":
+                result[category] = action
+
+        return result
 
     async def suggest_commands(self, project_id: str, state: dict) -> Optional[str]:
         """Suggest context management commands to the user after enough messages."""
@@ -7255,7 +7288,7 @@ class CommandRouter:
         Detect messages that contain only code without a question.
 
         Uses a fast path for large raw code pastes (no fences) based on
-        Python structural line ratio.  A new high-confidence guard (structural
+        Python structural line ratio.  A high-confidence guard (structural
         ratio > 95 %) bypasses the CrossEncoder for huge code dumps, preventing
         false negatives caused by long docstrings / comments that look like
         natural-language questions to the model.
@@ -12367,7 +12400,9 @@ class Filter:
         ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
         # ── Reranking ───────────────────────────────────────────────
         enable_reranking: bool = Field(default=True)
-        reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        reranker_model: str = Field(
+            default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+        )
         reranker_top_k: int = Field(default=5)
         # ── RAPTOR ──────────────────────────────────────────────────
         enable_raptor: bool = Field(
@@ -12897,7 +12932,7 @@ class Filter:
         slot_id: int = Field(default=0, ge=0)
         # ── Slot save threshold guard (fix P5: 1.5GB-under-mutex) ────
         slot_save_max_context_tokens: int = Field(
-            default=60000,
+            default=0,
             ge=0,
             description=(
                 "Skip slot save when the total context exceeds this many tokens. "
@@ -12914,7 +12949,7 @@ class Filter:
             ),
         )
         skeleton_tier_max_tokens: int = Field(
-            default=6000,
+            default=0,
             ge=0,
             description=(
                 "Max tokens for the skeleton tier. 0 = unlimited. Over budget → "
