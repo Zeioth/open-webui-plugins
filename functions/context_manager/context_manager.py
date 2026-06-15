@@ -1861,8 +1861,9 @@ class ContextBuilder:
         exact_seeds = list(all_names.intersection(query_words))
         if exact_seeds:
             ag.seed(exact_seeds[:top_n_symbols], initial_score=1.0)
-            ag.propagate(edges_out, max_steps=2, min_score=0.1,
-                         alpha=self._f.valves.ppr_alpha)
+            ag.propagate(
+                edges_out, max_steps=2, min_score=0.1, alpha=self._f.valves.ppr_alpha
+            )
             activated = ag.get_activated_nodes(
                 threshold=self._f.valves.path_activation_threshold
             )
@@ -2550,6 +2551,68 @@ class ContextBuilder:
         ):
             sigs.append(m.group(1).strip())
         return "\n".join(f"{s} ..." for s in sigs) if sigs else ""
+
+    async def _persist_skeleton_to_ltm(
+        self,
+        skeleton_text: str,
+        project_id: str,
+        symbol: Optional[str],
+    ) -> None:
+        """
+        Store a skeleton snapshot in ChromaDB so future sessions can retrieve
+        the architecture without re-deriving it from source.
+
+        Tagged with is_skeleton=True and code_state_hash for freshness checking.
+        Deduplicates by code_state_hash+symbol: if the code hasn't changed since
+        last storage, the upsert is a no-op (same id → overwrites with same data).
+        """
+        if not (
+            HAS_SENTENCE
+            and HAS_CHROMA
+            and self._f.memory_collection is not None
+            and self._f.embedder is not None
+        ):
+            return
+        try:
+            code_hash = self._f._activation.compute_code_state_hash(project_id)
+            if not code_hash:
+                return
+            sym_tag = symbol or "__full__"
+            entry_id = f"{project_id}_skeleton_{sym_tag}_{code_hash}"
+            now = time.time()
+            expires_at = (
+                now + self._f.valves.skeleton_ltm_expiration_days * 86400
+                if self._f.valves.skeleton_ltm_expiration_days > 0
+                else None
+            )
+            embedding = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(skeleton_text[:1500]).tolist()
+            )
+            await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.upsert(
+                    ids=[entry_id],
+                    embeddings=[embedding],
+                    documents=[skeleton_text],
+                    metadatas=[
+                        {
+                            "project_id": project_id,
+                            "role": "assistant",
+                            "timestamp": now,
+                            "expires_at": expires_at,
+                            "is_skeleton": True,
+                            "skeleton_symbol": sym_tag,
+                            "code_state_hash": code_hash,
+                            "content_type": ContentType.BASE_CODE.value,
+                            "has_code": True,
+                        }
+                    ],
+                )
+            )
+            self._f._log_debug(
+                f"Skeleton persisted to LTM " f"(symbol={sym_tag}, hash={code_hash})"
+            )
+        except Exception as exc:
+            self._f._log_debug(f"Skeleton LTM persist failed: {exc}")
 
     async def _format_skeleton_for_symbol(
         self,
@@ -5342,6 +5405,25 @@ class ReasoningEngine:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # Signals that the query is about design / architecture / refactoring,
+    # not about a specific implementation detail. When matched, the CoT context
+    # is replaced by the code skeleton (contracts-first reasoning).
+    _ARCH_INTENT_RE = re.compile(
+        r"\b(arquitectura|architecture|diseño|design|refactor(?:iza)?r?|"
+        r"plan\s+de\s+(implementaci[oó]n|cambios)|dise[ñn]a|restructur|"
+        r"reorganiz|breakdown|dependency|dependencias|"
+        r"c[oó]mo\s+(estructurar|organizar|dividir)|"
+        r"qu[eé]\s+(clases|m[oó]dulos|componentes)\s+(necesito|crear|a[ñn]adir)|"
+        r"propuesta\s+de|propose\s+(a\s+)?design|"
+        r"abstract\s+(base\s+)?class|interface\s+design|"
+        r"contrato|contracts?|API\s+surface|surface\s+area)\b",
+        re.IGNORECASE,
+    )
+
+    def is_architecture_query(self, user_content: str) -> bool:
+        """True when the query targets design / architecture / refactoring."""
+        return bool(self._ARCH_INTENT_RE.search(user_content))
+
     async def parse_cot_intent(self, user_content: str) -> Tuple[Optional[str], int]:
         """Parse /think command: returns (question, level) or (None, 2)."""
         content = user_content.strip()
@@ -5797,6 +5879,71 @@ class ReasoningEngine:
                 prefix += " *Includes step-back architectural context.*"
             return f"{prefix}\n\n{response}"
         return "Unable to generate reasoning."
+
+    async def generate_architecture_reasoning(
+        self,
+        question: str,
+        skeleton_context: str,
+        project_id: str,
+        label: str = "",
+    ) -> str:
+        """
+        Architecture-mode CoT: reason on the code skeleton (contracts only).
+
+        Different from generate_cot_reasoning in three ways:
+          1. Context is the skeleton, not the system prompt → compact, precise.
+          2. Reasoning focuses on contracts, dependency changes, and invariants,
+             not on implementation steps.
+          3. Output includes /expand hints so the main model knows which symbols
+             need full bodies if it decides to implement them.
+
+        Falls back to generate_cot_reasoning if skeleton is empty or LLM fails.
+        """
+        if not skeleton_context.strip():
+            return await self.generate_cot_reasoning(question, "", label=label)
+
+        effective_max_tokens = (
+            self._f.valves.skeleton_cot_max_tokens
+            if self._f.valves.skeleton_cot_max_tokens > 0
+            else 600
+        )
+
+        prompt = (
+            f"Code skeleton (contracts only — bodies as `...`):\n"
+            f"{skeleton_context[:4000]}\n\n"
+            f"Architecture question:\n{question[:500]}\n\n"
+            "Reason step by step at the CONTRACT level:\n"
+            "1. Which classes / methods are affected and why?\n"
+            "2. What invariants or interfaces must be preserved or changed?\n"
+            "3. What new signatures are needed? Write them as skeleton lines.\n"
+            "4. Which existing bodies need to change? List as `/expand <name>`.\n"
+            "Be specific about signatures; avoid implementation details."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a software architect reasoning about code structure and "
+                "contracts. Focus on interfaces, dependencies, and invariants. "
+                "When a full implementation is needed, write `/expand <SymbolName>` "
+                "instead of generating code."
+            ),
+            model_override=self._f.valves.cot_model_level2,
+            max_tokens=effective_max_tokens,
+            temperature=0.3,
+            label=label or "arch_cot",
+        )
+
+        if not response or response.strip() == "Unable to generate reasoning.":
+            self._f._log_debug("Architecture CoT failed — falling back to standard CoT")
+            return await self.generate_cot_reasoning(
+                question, skeleton_context, label=label
+            )
+
+        prefix = (
+            "## 🏗️ Architecture Reasoning (skeleton-based CoT)\n"
+            f"*Reasoning on contracts — use `/expand <name>` for implementations.*"
+        )
+        return f"{prefix}\n\n{response}"
 
     async def generate_scientific_reasoning_L3(
         self, question: str, context: str, project_id: str, label: str = ""
@@ -10128,7 +10275,21 @@ class SystemPromptBuilder:
                 time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
                     "%Y-%m-%d %H:%M:%SZ"
                 )
-                text = f"[{time_str}] {mem['doc']}"
+                # Skeleton snapshots get a staleness label so the model
+                # knows whether the architecture is still current.
+                if mem.get("meta", {}).get("is_skeleton"):
+                    saved_hash = mem.get("meta", {}).get("code_state_hash", "")
+                    current_hash = self._f._activation.compute_code_state_hash(
+                        project_id
+                    )
+                    fresh = (
+                        "current ✓"
+                        if saved_hash and saved_hash == current_hash
+                        else "stale — code changed since"
+                    )
+                    text = f"[Skeleton snapshot {time_str} — {fresh}]\n" f"{mem['doc']}"
+                else:
+                    text = f"[{time_str}] {mem['doc']}"
             else:
                 text = f"[unknown date] {mem['doc']}"
             frag_tok = self._f._tokens.estimate_code_tokens(text)
@@ -10583,20 +10744,57 @@ class MessageAssembler:
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
         _model_ctx = self._f.valves.active_context_max_tokens or 28000
         _cot_context_limit = _model_ctx // 3
-        if self._f.tokenizer:
-            _prelim_tokens = len(self._f.tokenizer.encode(prelim_system))
-            if _prelim_tokens > _cot_context_limit:
-                prelim_for_cot = self._f._tokens.truncate_text_to_tokens(
-                    prelim_system, _cot_context_limit
+
+        # Architecture-mode: replace the full system prompt with the skeleton
+        # as CoT context. The skeleton (~1-3K tokens) gives the reasoning model
+        # a contracts-first view of the codebase without the LOD noise.
+        _is_arch = (
+            self._f.valves.enable_skeleton_cot
+            and self._f._reasoning.is_architecture_query(user_question)
+        )
+        _skeleton_ctx = ""
+        if _is_arch:
+            self._f._log_debug(
+                "🏗️ Architecture intent detected — fetching skeleton for CoT prior"
+            )
+            try:
+                _skeleton_ctx = await self._f._ctx_builder._get_skeleton_for_cot(
+                    project_id, user_question
+                )
+            except Exception as _ske:
+                self._f._log_debug(f"Skeleton for CoT failed: {_ske}")
+            if _skeleton_ctx:
+                prelim_for_cot = _skeleton_ctx
+                self._f._log_debug(
+                    f"🏗️ CoT context = skeleton "
+                    f"(~{self._f._tokens.estimate_code_tokens(_skeleton_ctx)} tokens)"
                 )
             else:
-                prelim_for_cot = prelim_system
-        else:
-            prelim_for_cot = prelim_system[: _cot_context_limit * 4]
+                _is_arch = False  # no skeleton available; fall back to normal CoT
+                self._f._log_debug(
+                    "🏗️ No skeleton available — falling back to standard CoT context"
+                )
+
+        if not _is_arch:
+            if self._f.tokenizer:
+                _prelim_tokens = len(self._f.tokenizer.encode(prelim_system))
+                if _prelim_tokens > _cot_context_limit:
+                    prelim_for_cot = self._f._tokens.truncate_text_to_tokens(
+                        prelim_system, _cot_context_limit
+                    )
+                else:
+                    prelim_for_cot = prelim_system
+            else:
+                prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
         if not manual_cot_used:
             question = user_question
-            if cot_level == 2:
+            if _is_arch and cot_level >= 2:
+                # Architecture-mode: reason on skeleton contracts.
+                reasoning = await self._f._reasoning.generate_architecture_reasoning(
+                    question, prelim_for_cot, project_id, label="arch_cot"
+                )
+            elif cot_level == 2:
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
                     question, prelim_for_cot
                 )
@@ -10605,7 +10803,11 @@ class MessageAssembler:
                     question, prelim_for_cot, project_id, label="scientific_cot"
                 )
         else:
-            if cot_level == 2:
+            if _is_arch and cot_level >= 2:
+                reasoning = await self._f._reasoning.generate_architecture_reasoning(
+                    cot_question, prelim_for_cot, project_id, label="arch_cot"
+                )
+            elif cot_level == 2:
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
                     cot_question, prelim_for_cot
                 )
