@@ -2356,24 +2356,39 @@ class ContextBuilder:
 
         by_file: dict = {}
         for name in sorted(all_names):
-            block_hashes = self._f._symbol_index.find_blocks(name, project_id)
-            for bh in block_hashes:
-                block = state["active_blocks"].get(bh)
+            # Primary path: read metadata directly from the SymbolIndex.
+            # This works even when the block is paged out to ChromaDB, and
+            # is O(1) per symbol instead of O(blocks × symbols_per_block).
+            meta = self._f._symbol_index.get_symbol_meta(name, project_id)
 
-                # Page-in fallback: si el bloque fue eviccionado, recuperarlo
-                if block is None and self._f._pager is not None:
-                    if self._f._pager.is_paged(bh, project_id):
-                        block = await self._f._pager.page_in_block(
-                            block_hash=bh,
-                            project_id=project_id,
-                            chroma_collection=self._f.memory_collection,
-                            db_conn=self._f._db_conn,
-                        )
+            if meta is None:
+                # Fallback: index predates doc #4 — navigate the block.
+                for bh in self._f._symbol_index.find_blocks(name, project_id):
+                    block = state["active_blocks"].get(bh)
+                    if block is None and self._f._pager is not None:
+                        if self._f._pager.is_paged(bh, project_id):
+                            block = await self._f._pager.page_in_block(
+                                block_hash=bh,
+                                project_id=project_id,
+                                chroma_collection=self._f.memory_collection,
+                                db_conn=self._f._db_conn,
+                            )
+                    if block and not block.obsolete:
+                        sym = next((s for s in block.symbols if s.name == name), None)
+                        meta = {
+                            "signature": sym.signature if sym else name,
+                            "summary": sym.summary if sym else "",
+                            "file_path": block.file_path,
+                            "kind": sym.kind if sym else "function",
+                            "language": sym.language if sym else "unknown",
+                        }
+                        break
 
-                if block and not block.obsolete:
-                    file_key = block.file_path or "(unknown)"
-                    by_file.setdefault(file_key, []).append((name, block))
-                    break
+            if meta is None:
+                continue  # Symbol not resolvable from either source; skip.
+
+            file_key = meta.get("file_path") or "(unknown)"
+            by_file.setdefault(file_key, []).append((name, meta))
 
         if not by_file:
             return ""
@@ -2402,10 +2417,9 @@ class ContextBuilder:
 
         for file_path in sorted(by_file.keys()):
             lines.append(f"### {file_path}")
-            for name, block in by_file[file_path]:
-                sym = next((s for s in block.symbols if s.name == name), None)
-                sig = sym.signature if sym else name
-                summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+            for name, meta in by_file[file_path]:
+                sig = meta.get("signature") or name
+                summary = f" — {meta['summary']}" if meta.get("summary") else ""
                 line = f"- `{sig}`{summary}"
                 tok = self._f._tokens.estimate_code_tokens(line)
                 if total_tokens + tok > budget:
@@ -2436,8 +2450,8 @@ class ContextBuilder:
              name-only line when the budget tightens, and the list stops cleanly
              when full (with a note pointing at /expand).
 
-        by_file is the already-resolved {file_path: [(name, block)]} map from
-        _format_full_symbol_inventory (page-in already applied upstream).
+        by_file is the already-resolved {file_path: [(name, meta)]} map from
+        _format_full_symbol_inventory (SymbolIndex metadata already applied).
         """
         effective_budget = max(
             4000,
@@ -2451,11 +2465,10 @@ class ContextBuilder:
         classes_by_file: dict = {}
         funcs_by_file: dict = {}
         for fpath, entries in by_file.items():
-            for name, block in entries:
-                sym = next((s for s in block.symbols if s.name == name), None)
-                kind = sym.kind if sym else "function"
+            for name, meta in entries:
+                kind = meta.get("kind", "function")
                 target = classes_by_file if kind == "class" else funcs_by_file
-                target.setdefault(fpath, []).append((name, sym))
+                target.setdefault(fpath, []).append((name, meta))
 
         lines = ["## Code Inventory (architecture view)\n"]
         total = self._f._tokens.estimate_code_tokens(lines[0])
@@ -2474,8 +2487,8 @@ class ContextBuilder:
         if classes_by_file:
             lines.append("### Classes")
             for fpath in sorted(classes_by_file.keys()):
-                for name, sym in classes_by_file[fpath]:
-                    summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+                for name, meta in classes_by_file[fpath]:
+                    summary = f" — {meta['summary']}" if meta.get("summary") else ""
                     line = f"- `{name}`{summary}  ({fpath})"
                     total += self._f._tokens.estimate_code_tokens(line)
                     lines.append(line)
@@ -2487,9 +2500,9 @@ class ContextBuilder:
             lines.append("### Functions")
             for fpath in sorted(funcs_by_file.keys()):
                 bucket: list = []
-                for name, sym in funcs_by_file[fpath]:
-                    sig = sym.signature if sym else name
-                    summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+                for name, meta in funcs_by_file[fpath]:
+                    sig = meta.get("signature") or name
+                    summary = f" — {meta['summary']}" if meta.get("summary") else ""
                     full = f"- `{sig}`{summary}"
                     tok = self._f._tokens.estimate_code_tokens(full)
                     if total + tok <= budget:
