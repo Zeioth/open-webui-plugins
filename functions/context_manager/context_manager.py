@@ -1853,6 +1853,14 @@ class ContextBuilder:
         if not state or not state.get("active_blocks"):
             return ""
 
+        # ── Fast path: skeleton / scaffolding queries (signatures only) ──
+        if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
+            query
+        ):
+            skel = self._format_skeleton(project_id)
+            if skel:
+                return skel
+
         # ── Fix 2: Fast path for inventory / listing queries ─────────────
         if self._LIST_INTENTS.search(query):
             all_names = self._f._symbol_index.get_all_names(project_id)
@@ -2167,6 +2175,16 @@ class ContextBuilder:
         if not by_file:
             return ""
 
+        # Hierarchical mode for large codebases: a table of contents + classes
+        # with responsibility + grouped functions, instead of a flat list that
+        # truncates and buries the architecture. Falls back to the flat list
+        # below the threshold.
+        if (
+            self._f.valves.enable_hierarchical_inventory
+            and len(all_names) > self._f.valves.inventory_hierarchical_threshold
+        ):
+            return self._format_inventory_hierarchical(by_file, all_names, project_id)
+
         lines = ["## Full Symbol Inventory\n"]
         total_tokens = self._f._tokens.estimate_code_tokens(lines[0])
 
@@ -2199,6 +2217,101 @@ class ContextBuilder:
         lines.append(
             f"\n_{len(all_names)} symbols indexed. Use `/expand <name>` for full body._"
         )
+        return "\n".join(lines)
+
+    def _format_inventory_hierarchical(
+        self, by_file: dict, all_names: set, project_id: str
+    ) -> str:
+        """
+        Architecture-first inventory for large codebases.
+
+        Emits, in priority order so the most useful information always fits:
+          1. A file table-of-contents (class/function counts).
+          2. Every CLASS with its responsibility (summary) — never truncated,
+             since classes are few and are what architecture work needs.
+          3. Functions, filling the remaining token budget; each degrades to a
+             name-only line when the budget tightens, and the list stops cleanly
+             when full (with a note pointing at /expand).
+
+        by_file is the already-resolved {file_path: [(name, block)]} map from
+        _format_full_symbol_inventory (page-in already applied upstream).
+        """
+        effective_budget = max(
+            4000,
+            self._f.valves.context_window_tokens
+            - self._f._last_system_tokens.get(project_id, 0)
+            - self._f.valves.response_reserve_tokens,
+        )
+        budget = min(effective_budget // 2, 16000)
+
+        # Split symbols by kind, preserving file grouping.
+        classes_by_file: dict = {}
+        funcs_by_file: dict = {}
+        for fpath, entries in by_file.items():
+            for name, block in entries:
+                sym = next((s for s in block.symbols if s.name == name), None)
+                kind = sym.kind if sym else "function"
+                target = classes_by_file if kind == "class" else funcs_by_file
+                target.setdefault(fpath, []).append((name, sym))
+
+        lines = ["## Code Inventory (architecture view)\n"]
+        total = self._f._tokens.estimate_code_tokens(lines[0])
+
+        # 1. Table of contents
+        lines.append("### Files")
+        for fpath in sorted(by_file.keys()):
+            n_cls = len(classes_by_file.get(fpath, []))
+            n_fn = len(funcs_by_file.get(fpath, []))
+            toc = f"- `{fpath}` — {n_cls} class(es), {n_fn} function(s)"
+            total += self._f._tokens.estimate_code_tokens(toc)
+            lines.append(toc)
+        lines.append("")
+
+        # 2. Classes with responsibility (priority — never truncated)
+        if classes_by_file:
+            lines.append("### Classes")
+            for fpath in sorted(classes_by_file.keys()):
+                for name, sym in classes_by_file[fpath]:
+                    summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+                    line = f"- `{name}`{summary}  ({fpath})"
+                    total += self._f._tokens.estimate_code_tokens(line)
+                    lines.append(line)
+            lines.append("")
+
+        # 3. Functions — fill remaining budget, degrade to name-only when tight
+        truncated = False
+        if funcs_by_file:
+            lines.append("### Functions")
+            for fpath in sorted(funcs_by_file.keys()):
+                bucket: list = []
+                for name, sym in funcs_by_file[fpath]:
+                    sig = sym.signature if sym else name
+                    summary = f" — {sym.summary}" if (sym and sym.summary) else ""
+                    full = f"- `{sig}`{summary}"
+                    tok = self._f._tokens.estimate_code_tokens(full)
+                    if total + tok <= budget:
+                        bucket.append(full)
+                        total += tok
+                        continue
+                    short = f"- `{name}`"
+                    stok = self._f._tokens.estimate_code_tokens(short)
+                    if total + stok <= budget:
+                        bucket.append(short)
+                        total += stok
+                    else:
+                        truncated = True
+                        break
+                if bucket:
+                    lines.append(f"#### {fpath}")
+                    lines.extend(bucket)
+                if truncated:
+                    break
+
+        footer = f"\n_{len(all_names)} symbols indexed."
+        if truncated:
+            footer += " Function list truncated to fit budget;"
+        footer += " use `/expand <name>` for any full body._"
+        lines.append(footer)
         return "\n".join(lines)
 
     def _build_swa_ordered_lod_parts(
@@ -2997,7 +3110,9 @@ class SignatureExtractor:
             tree = ast.parse(code)
             doc_map = {}
             for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
                     docstring = ast.get_docstring(node)
                     if docstring:
                         first_line = docstring.strip().split("\n")[0].strip()
@@ -11110,6 +11225,16 @@ class Filter:
             le=200,
             description="Maximum hub symbols (top‑N by centrality) kept in Block A.",
         )
+        # ── Inventory (structural / listing queries) ────────────────
+        enable_hierarchical_inventory: bool = Field(
+            default=True,
+            description="For large codebases, serve an architecture-first inventory (classes-with-responsibility + grouped functions) instead of a flat list.",
+        )
+        inventory_hierarchical_threshold: int = Field(
+            default=80,
+            ge=20,
+            description="Symbol count above which the inventory switches to hierarchical mode.",
+        )
         # ── Soft‑eviction ───────────────────────────────────────────
         enable_block_paging: bool = Field(
             default=True,
@@ -11267,6 +11392,10 @@ class Filter:
         outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
         outlet_expand_intercept_depth: int = Field(default=5, ge=0)
         expand_default_depth: int = Field(default=2)
+        enable_skeleton_intent: bool = Field(
+            default=True,
+            description="Serve a copy-pasteable signature-only code skeleton (bodies as ...) for scaffolding queries (esqueleto / skeleton / stubs / solo firmas).",
+        )
         # ── Proactive suggestions ───────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
