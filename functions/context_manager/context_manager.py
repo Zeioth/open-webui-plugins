@@ -1801,6 +1801,7 @@ class ContextBuilder:
         addition — recompute centrality so HubSymbolIndex sees fresh scores.
         """
         self._block_a_cache.pop(project_id, None)
+        self._skeleton_cache.pop(project_id, None)
         # Refresh centrality so the next build_block_a() ranks hubs correctly.
         try:
             self._f._node_centrality[project_id] = (
@@ -1809,7 +1810,96 @@ class ContextBuilder:
         except Exception:
             pass
         if reason:
-            self._f._log_debug(f"Block A cache invalidated ({reason})")
+            self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
+
+    async def _get_skeleton_for_cot(
+        self,
+        project_id: str,
+        query: str,
+        top_n_symbols: int = 6,
+    ) -> str:
+        """
+        Return a skeleton string suitable for use as CoT context.
+
+        Cache hit: skeleton is fresh (same code_state_hash) → instant.
+        Cache miss: derive from the top-N activated symbols and store.
+
+        top_n_symbols caps the skeleton so CoT context stays under
+        skeleton_cot_max_tokens even for large codebases.
+        """
+        current_hash = self._f._activation.compute_code_state_hash(project_id)
+        if not current_hash:
+            return ""
+
+        # Cache hit
+        cached = self._skeleton_cache.get(project_id)
+        if cached:
+            cached_hash, cached_skel = cached
+            if cached_hash == current_hash:
+                self._f._log_debug(
+                    "Skeleton cache HIT for CoT "
+                    f"(hash={current_hash}, "
+                    f"~{self._f._tokens.estimate_code_tokens(cached_skel)} tokens)"
+                )
+                return cached_skel
+
+        # Cache miss: activate top-N symbols for this query and skeletonize
+        self._f._log_debug(
+            f"Skeleton cache MISS — deriving from top-{top_n_symbols} activated "
+            f"symbols for query: '{query[:60]}'"
+        )
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return ""
+
+        # Use centrality-ranked symbols as seeds when no query-seed activates
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        ag = ActivationGraph()
+
+        # Seed from query tokens first
+        query_words = set(re.findall(r"\b\w+\b", query))
+        exact_seeds = list(all_names.intersection(query_words))
+        if exact_seeds:
+            ag.seed(exact_seeds[:top_n_symbols], initial_score=1.0)
+            ag.propagate(edges_out, max_steps=2, min_score=0.1,
+                         alpha=self._f.valves.ppr_alpha)
+            activated = ag.get_activated_nodes(
+                threshold=self._f.valves.path_activation_threshold
+            )
+        else:
+            activated = {}
+
+        # Fall back to top-N by centrality (architecture overview)
+        if len(activated) < top_n_symbols:
+            centrality = self._f._node_centrality.get(project_id, {})
+            ranked = sorted(centrality, key=lambda n: -centrality[n])
+            for name in ranked:
+                if name not in activated:
+                    activated[name] = centrality[name]
+                if len(activated) >= top_n_symbols:
+                    break
+
+        if not activated:
+            return ""
+
+        # Build skeleton for each activated symbol (primary = highest score)
+        primary = max(activated, key=lambda n: activated[n])
+        skel = await self._format_skeleton_for_symbol(primary, project_id, query)
+        if not skel:
+            # Fallback: full module skeleton capped to budget
+            skel = self._format_skeleton(project_id)
+
+        if not skel:
+            return ""
+
+        # Store in cache
+        self._skeleton_cache[project_id] = (current_hash, skel)
+        self._f._log_debug(
+            f"Skeleton cached for CoT "
+            f"(~{self._f._tokens.estimate_code_tokens(skel)} tokens, "
+            f"primary='{primary}')"
+        )
+        return skel
 
     def get_effective_context_budget(self, project_id: str) -> int:
         """
@@ -1834,16 +1924,6 @@ class ContextBuilder:
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
-
-        MIGRATION: body is copied from Filter._get_path_context(), but the final
-        assembly is reorganised into four LOD tiers and reordered so LOD-3 sits
-        LAST (closest to the user message). Two NEW injections are added:
-          - RAPTOR cluster summaries (into the LOD-2 tier)
-          - Page‑in support for evicted LOD-3 blocks
-        The persisted conversation-summary read path is handled by the Filter
-        injection list, not here (see Step 5.5).
-
-        Returns "" if there is nothing to inject.
         """
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
@@ -1853,6 +1933,19 @@ class ContextBuilder:
         if not state or not state.get("active_blocks"):
             return ""
 
+        # ── Fast path: FILTERED skeleton (single symbol + 1-hop deps) ────
+        if self._f.valves.enable_skeleton_intent:
+            _sym_match = self._SKELETON_SYMBOL_RE.search(query)
+            if _sym_match:
+                _sym_name = _sym_match.group("sym")
+                _all = self._f._symbol_index.get_all_names(project_id)
+                if _sym_name in _all:
+                    skel = await self._format_skeleton_for_symbol(
+                        _sym_name, project_id, query
+                    )
+                    if skel:
+                        return skel
+
         # ── Fast path: skeleton / scaffolding queries (signatures only) ──
         if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
             query
@@ -1861,7 +1954,7 @@ class ContextBuilder:
             if skel:
                 return skel
 
-        # ── Fix 2: Fast path for inventory / listing queries ─────────────
+        # ── Fast path for inventory / listing queries ────────────────────
         if self._LIST_INTENTS.search(query):
             all_names = self._f._symbol_index.get_all_names(project_id)
             if all_names:
@@ -1922,7 +2015,6 @@ class ContextBuilder:
             budget = min(budget, max(8000, _available_for_context))
 
         injected_blocks: Set[str] = set()
-
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
         # Centrality LOD bump
@@ -1961,7 +2053,7 @@ class ContextBuilder:
                     continue
                 block = state["active_blocks"].get(bh)
 
-                # ── Page-in support for evicted blocks (NEW) ──────────
+                # Page-in support for evicted blocks
                 if block is None and self._f._pager is not None:
                     if self._f._pager.is_paged(bh, project_id):
                         block = await self._f._pager.page_in_block(
@@ -1975,7 +2067,6 @@ class ContextBuilder:
                     continue
 
                 if score < lod2:
-                    # LOD‑1: signature only
                     sig = next(
                         (sym.signature for sym in block.symbols if sym.name == node_id),
                         node_id,
@@ -1989,7 +2080,6 @@ class ContextBuilder:
                     injected_blocks.add(bh)
 
                 elif score < lod3:
-                    # LOD‑2: signature + summary
                     sig = next(
                         (sym.signature for sym in block.symbols if sym.name == node_id),
                         node_id,
@@ -2012,11 +2102,9 @@ class ContextBuilder:
                     injected_blocks.add(bh)
 
                 else:
-                    # LOD‑3: full code (with optional compression)
                     content_to_inject = block.content
                     tok = block._cached_token_count or (len(block.content) // 4)
 
-                    # Overflow action at injection time
                     _is_oversized = (
                         self._f.valves.max_code_block_tokens > 0
                         and tok > self._f.valves.max_code_block_tokens
@@ -2066,9 +2154,9 @@ class ContextBuilder:
                     total_tokens += tok
                     injected_blocks.add(bh)
 
-                break  # only one block per symbol at the highest LOD level
+                break
 
-        # ── RAPTOR cluster summaries (NEW) → LOD-2 tier ───────────────────
+        # ── RAPTOR cluster summaries → LOD-2 tier ─────────────────────────
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
             try:
                 raptor_hits = await self._f._raptor.retrieve(
@@ -2462,6 +2550,190 @@ class ContextBuilder:
         ):
             sigs.append(m.group(1).strip())
         return "\n".join(f"{s} ..." for s in sigs) if sigs else ""
+
+    async def _format_skeleton_for_symbol(
+        self,
+        symbol_name: str,
+        project_id: str,
+        query: str,
+    ) -> str:
+        """
+        Emit a signature-only skeleton scoped to `symbol_name` plus its direct
+        callees (1-hop neighbours in the call graph).
+
+        Strategy:
+          1. Build an ActivationGraph seeded on `symbol_name` with 1 propagation
+             step so direct callees light up.
+          2. Collect the block hashes of every activated symbol; page-in evicted
+             blocks when needed.
+          3. Re-skeletonize: extract the AST nodes that match the activated
+             symbols, build a synthetic module, and unparse it — so the output
+             is a valid, minimal Python file containing only the relevant
+             skeletons, in class-first order.
+          4. If no activated symbols can be reconstructed, return "".
+        """
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state.get("active_blocks"):
+            return ""
+
+        # 1. Seed activation on the target symbol + 1 hop
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        ag = ActivationGraph()
+        ag.seed([symbol_name], initial_score=1.0)
+        ag.propagate(
+            edges_out, max_steps=2, min_score=0.1, alpha=self._f.valves.ppr_alpha
+        )
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
+        )
+        if not activated:
+            activated = {symbol_name: 1.0}
+
+        # 2. Resolve activated symbols → blocks (with page-in fallback)
+        block_hashes: Set[str] = set()
+        for sym in activated:
+            for bh in self._f._symbol_index.find_blocks(sym, project_id):
+                block_hashes.add(bh)
+
+        blocks_content: List[tuple] = []  # (content, file_path, is_primary)
+        seen_hashes: Set[str] = set()
+        for bh in block_hashes:
+            if bh in seen_hashes:
+                continue
+            seen_hashes.add(bh)
+            block = state["active_blocks"].get(bh)
+            if block is None and self._f._pager is not None:
+                if self._f._pager.is_paged(bh, project_id):
+                    block = await self._f._pager.page_in_block(
+                        block_hash=bh,
+                        project_id=project_id,
+                        chroma_collection=self._f.memory_collection,
+                        db_conn=self._f._db_conn,
+                    )
+            if block and not block.obsolete:
+                is_primary = any(s.name == symbol_name for s in block.symbols)
+                blocks_content.append((block.content, block.file_path, is_primary))
+
+        if not blocks_content:
+            return ""
+
+        # 3. Re-skeletonize: filter AST nodes to only the activated set
+        skel_parts = self._extract_filtered_skeleton(
+            blocks_content, activated, symbol_name
+        )
+        if not skel_parts:
+            return ""
+
+        # 4. Format output
+        effective_budget = max(
+            4000,
+            self._f.valves.context_window_tokens
+            - self._f._last_system_tokens.get(project_id, 0)
+            - self._f.valves.response_reserve_tokens,
+        )
+        budget = min(effective_budget // 2, 16000)
+
+        hop_count = len(activated) - 1
+        header = (
+            f"## Skeleton of `{symbol_name}` "
+            f"(+{hop_count} direct dep(s))\n"
+            "_Signatures only — bodies as `...` — fill in to implement._\n"
+        )
+        total = self._f._tokens.estimate_code_tokens(header)
+        lines = [header]
+        truncated = False
+
+        for label, code, is_primary in skel_parts:
+            if truncated:
+                break
+            fence_lang = "python" if (label or "").endswith(".py") else ""
+            tag = " _(primary)_" if is_primary else ""
+            chunk = f"### `{label}`{tag}\n```{fence_lang}\n{code}\n```\n"
+            tok = self._f._tokens.estimate_code_tokens(chunk)
+            if total + tok > budget:
+                truncated = True
+                break
+            lines.append(chunk)
+            total += tok
+
+        if truncated:
+            lines.append("_[skeleton truncated — use `/expand <name>` for full body]_")
+
+        hint = (
+            f"\n_Use `/expand {symbol_name}` for the full implementation. "
+            "Mention any symbol name in your next message to activate its LOD context._"
+        )
+        lines.append(hint)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_filtered_skeleton(
+        blocks_content: List[tuple],
+        activated: dict,
+        primary_name: str,
+    ) -> List[tuple]:
+        """
+        For each (content, file_path, is_primary) triple, parse the source and
+        keep only the top-level AST nodes (ClassDef / FunctionDef /
+        AsyncFunctionDef) whose name is in `activated`. Skeletonize each kept
+        node and unparse. Returns [(label, skeleton_code, is_primary)] in
+        primary-first order.
+
+        Falls back to the regex-based flat signature list when ast.unparse is
+        unavailable (Python < 3.9) or parsing fails.
+        """
+        results = []
+        # Primary block first so it appears at the top of the output.
+        ordered = sorted(blocks_content, key=lambda t: (not t[2], t[1] or ""))
+
+        for content, file_path, is_primary in ordered:
+            label = file_path or "(inline)"
+            if not content:
+                continue
+            kept_nodes = []
+            parsed_ok = False
+            if hasattr(ast, "unparse"):
+                try:
+                    tree = ast.parse(content)
+                    parsed_ok = True
+                except SyntaxError:
+                    pass
+
+            if parsed_ok:
+                for node in tree.body:
+                    node_name = getattr(node, "name", None)
+                    if node_name not in activated:
+                        continue
+                    if isinstance(
+                        node,
+                        (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                    ):
+                        ContextBuilder._skeletonize_node(node)
+                        kept_nodes.append(node)
+
+                if kept_nodes:
+                    module = ast.Module(body=kept_nodes, type_ignores=[])
+                    ast.fix_missing_locations(module)
+                    try:
+                        skel_code = ast.unparse(module)
+                        results.append((label, skel_code, is_primary))
+                        continue
+                    except Exception:
+                        pass
+
+            # Fallback: regex flat signatures filtered by activated set
+            sigs = []
+            for m in re.finditer(
+                r"^[ \t]*((?:async\s+)?(?:def|class)\s+(\w+)[^\n:{]*)",
+                content,
+                re.MULTILINE,
+            ):
+                if m.group(2) in activated:
+                    sigs.append(m.group(1).strip() + " ...")
+            if sigs:
+                results.append((label, "\n".join(sigs), is_primary))
+
+        return results
 
     # ── KV slot lifecycle ─────────────────────────────────────────────────
 
@@ -11442,6 +11714,30 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         #  Reasoning (Chain‑of‑Thought)
         # ═══════════════════════════════════════════════════════════════
+        # ── Architecture-mode CoT ────────────────────────────────────
+        enable_skeleton_cot: bool = Field(
+            default=True,
+            description=(
+                "For architecture / design / refactor queries, use the code "
+                "skeleton (contracts only) as the CoT reasoning context instead "
+                "of the full system prompt. Produces cleaner hypotheses and plans."
+            ),
+        )
+        skeleton_cot_max_tokens: int = Field(
+            default=600,
+            ge=200,
+            le=2000,
+            description="Token budget for the architecture reasoning chain.",
+        )
+        enable_skeleton_ltm: bool = Field(
+            default=True,
+            description="Store the generated skeleton in LTM so future sessions can retrieve the architecture without re-deriving it.",
+        )
+        skeleton_ltm_expiration_days: int = Field(
+            default=14,
+            ge=0,
+            description="How long to keep skeleton snapshots in LTM. 0 = never expire.",
+        )
         # ── Detection & generation ──────────────────────────────────
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
