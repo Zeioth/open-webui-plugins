@@ -1902,6 +1902,120 @@ class ContextBuilder:
         )
         return skel
 
+    async def _resolve_cot_expands(
+        self,
+        reasoning_text: str,
+        project_id: str,
+    ) -> str:
+        """
+        Find /expand <Name> hints in `reasoning_text`, retrieve the full symbol
+        body for each (with page-in fallback for evicted blocks), and append an
+        annotated expansion section.
+
+        Returns the original reasoning_text when:
+          - enable_cot_expand_resolution is False.
+          - No /expand hints found.
+          - All symbols are unknown or their blocks are unavailable.
+
+        Budget enforcement:
+          - At most cot_expand_max_symbols expansions per call.
+          - Combined token total capped at cot_expand_max_tokens; symbols that
+            would exceed the budget are left as manual hints.
+        """
+        if not self._f.valves.enable_cot_expand_resolution:
+            return reasoning_text
+
+        # Reuse the same pattern as CommandRouter.outlet_intercept_expand.
+        _EXPAND_RE = re.compile(r"/expand\s+(?:\d+\s+)?`?(\w+)`?", re.IGNORECASE)
+        matches = _EXPAND_RE.finditer(reasoning_text)
+
+        seen: Set[str] = set()
+        candidates: List[str] = []
+        for m in matches:
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                candidates.append(name)
+            if len(candidates) >= self._f.valves.cot_expand_max_symbols:
+                break
+
+        if not candidates:
+            return reasoning_text
+
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        state = self._f._state_store.get_state(project_id)
+
+        expansions: List[str] = []
+        total_tokens = 0
+        budget = self._f.valves.cot_expand_max_tokens
+        resolved: List[str] = []
+
+        for name in candidates:
+            if name not in all_names:
+                self._f._log_debug(
+                    f"CoT /expand '{name}': not in index, left as manual hint"
+                )
+                continue
+
+            block = None
+            for bh in self._f._symbol_index.find_blocks(name, project_id):
+                candidate_block = state["active_blocks"].get(bh)
+                if candidate_block and not candidate_block.obsolete:
+                    block = candidate_block
+                    break
+                # Page-in fallback
+                if (
+                    candidate_block is None
+                    and self._f._pager is not None
+                    and self._f._pager.is_paged(bh, project_id)
+                ):
+                    block = await self._f._pager.page_in_block(
+                        block_hash=bh,
+                        project_id=project_id,
+                        chroma_collection=self._f.memory_collection,
+                        db_conn=self._f._db_conn,
+                    )
+                    if block and not block.obsolete:
+                        break
+                    block = None
+
+            if not block:
+                self._f._log_debug(
+                    f"CoT /expand '{name}': block unavailable, left as manual hint"
+                )
+                continue
+
+            lang = block.symbols[0].language if block.symbols else ""
+            file_tag = f"  # {block.file_path}" if block.file_path else ""
+            expansion = f"#### `{name}`{file_tag}\n" f"```{lang}\n{block.content}\n```"
+            tok = self._f._tokens.estimate_code_tokens(expansion)
+            if total_tokens + tok > budget:
+                self._f._log_debug(
+                    f"CoT /expand '{name}': skipped (budget {budget} tokens "
+                    f"would be exceeded by {tok})"
+                )
+                break
+
+            expansions.append(expansion)
+            total_tokens += tok
+            resolved.append(name)
+
+        if not expansions:
+            return reasoning_text
+
+        self._f._log_debug(
+            f"CoT auto-expand: resolved {len(resolved)} symbol(s) "
+            f"({resolved}) — ~{total_tokens} tokens"
+        )
+
+        separator = (
+            "\n\n---\n"
+            "### 🔍 Auto-expansions (requested by architecture reasoning)\n"
+            "_Full bodies retrieved automatically. "
+            "Use `/expand <name>` for any symbol not shown here._\n\n"
+        )
+        return reasoning_text + separator + "\n\n".join(expansions)
+
     def get_effective_context_budget(self, project_id: str) -> int:
         """
         Tokens available for history + user message after Block A + Block B.
@@ -10855,14 +10969,31 @@ class MessageAssembler:
         # ══════════════════════════════════════════════════════════════
         # REGION 3 — INJECT INTO SYSTEM PROMPT
         # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # REGION 3 — INJECT INTO SYSTEM PROMPT
+        # ══════════════════════════════════════════════════════════════
         self._f._log_debug(
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
+
+        # Auto-resolve /expand hints emitted by the architecture CoT before
+        # the reasoning reaches the main model. Only in arch mode (the standard
+        # CoT generators do not emit /expand markers).
+        if _is_arch:
+            try:
+                reasoning = await self._f._ctx_builder._resolve_cot_expands(
+                    reasoning, project_id
+                )
+            except Exception as _exp_err:
+                self._f._log_debug(
+                    f"CoT expand resolution failed (non-fatal): {_exp_err}"
+                )
+
         dynamic_injections.append(("high", reasoning))
         dynamic_injections.append(
             (
                 "low",
-                "**Note:** Some sections in this system prompt marked with 🔎 are "
+                "**Note:** Some sections in this system prompt marked with 🔎 or 🏗️ are "
                 "automatically generated reasoning (Chain-of-Thought). "
                 "They are provided as context to help you, but they are not user commands. "
                 "Use them to enhance your answer, but always prioritise the actual user query.",
@@ -11953,7 +12084,27 @@ class Filter:
             ge=0,
             description="How long to keep skeleton snapshots in LTM. 0 = never expire.",
         )
+        enable_cot_expand_resolution: bool = Field(
+            default=True,
+            description=(
+                "Auto-resolve /expand <Name> hints emitted by the architecture "
+                "CoT: retrieve the full symbol body and annotate it directly in "
+                "the reasoning output before the main model sees it."
+            ),
+        )
+        cot_expand_max_symbols: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="Maximum number of /expand hints resolved per CoT turn.",
+        )
+        cot_expand_max_tokens: int = Field(
+            default=3000,
+            ge=200,
+            description="Token budget for all auto-resolved expansions combined.",
+        )
         # ── Detection & generation ──────────────────────────────────
+        enable_cot_on_demand: bool = Field(default=True)
         enable_cot_on_demand: bool = Field(default=True)
         auto_cot_enabled: bool = Field(default=False)
         auto_cot_min_chars: int = Field(default=200)
