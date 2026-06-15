@@ -894,11 +894,9 @@ class ContextPager:
 
         try:
             safe_text = block.content
-            # Requires an embedder supporting 16384 of context or more.
+            # Requires an embedder supporting 32768 of context or more.
             if hasattr(self, "_f") and hasattr(self._f, "_tokens"):
-                safe_text = self._f._tokens.truncate_text_to_tokens(
-                    block.content, 16384
-                )
+                safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
             embedding = await anyio.to_thread.run_sync(
                 lambda: embedder.encode(safe_text).tolist()
             )
@@ -2904,8 +2902,8 @@ class ContextBuilder:
                 if self._f.valves.skeleton_ltm_expiration_days > 0
                 else None
             )
-            # Requires an embedder supporting 16384 context or more.
-            safe_text = self._f._tokens.truncate_text_to_tokens(skeleton_text, 16384)
+            # Requires an embedder supporting 32768 context or more.
+            safe_text = self._f._tokens.truncate_text_to_tokens(skeleton_text, 32768)
             embedding = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(safe_text).tolist()
             )
@@ -5076,10 +5074,10 @@ class LongTermMemory:
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
 
             for variant_query in query_variants:
-                # Requires an embedder supporting 16384 context or more.
+                # Requires an embedder supporting 32768 context or more.
                 q_emb = await anyio.to_thread.run_sync(
                     lambda q=variant_query: self._f.embedder.encode(
-                        self._f._tokens.truncate_text_to_tokens(q, 16384)
+                        self._f._tokens.truncate_text_to_tokens(q, 32768)
                     ).tolist()
                 )
                 try:
@@ -5234,10 +5232,10 @@ class LongTermMemory:
             return [{"role": "user", "content": m["doc"]} for m in memories]
 
         try:
-            # Requires an embedder supporting 16384 context or more.
+            # Requires an embedder supporting 32768 context or more.
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(
-                    self._f._tokens.truncate_text_to_tokens(query, 16384)
+                    self._f._tokens.truncate_text_to_tokens(query, 32768)
                 ).tolist()
             )
             now = time.time()
@@ -5409,9 +5407,9 @@ class LongTermMemory:
                 }
             )
 
-        # Requires an embedder supporting 16384 context or more.
+        # Requires an embedder supporting 32768 context or more.
         safe_texts = [
-            self._f._tokens.truncate_text_to_tokens(t, 16384)
+            self._f._tokens.truncate_text_to_tokens(t, 32768)
             for t in texts_for_embedding
         ]
         embeddings = await anyio.to_thread.run_sync(
