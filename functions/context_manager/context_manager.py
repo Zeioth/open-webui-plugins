@@ -4718,7 +4718,7 @@ class LongTermMemory:
         """Initialise ChromaDB, embedder, and response cache collection."""
         os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
         self._f.embedder = _shared_get_embedder()
-        self._f._log_debug("Embedder: using multilingual-e5-large-instruct")
+        self._f._log_debug("Embedder: using Qwen/Qwen3-Embedding-0.6B")
 
         self._f.chroma_client = _shared_get_chroma_client(
             self._f.valves.long_term_memory_dir
@@ -9603,7 +9603,7 @@ class EnrichmentTasks:
                 )
                 self._f._db_conn.commit()
 
-            await self._f._db_enqueue(_write)
+            await self._f._state_store._db_enqueue(_write)
 
     async def run_missing_summaries_task(self, params: dict, model: str) -> bool:
         """Generate a missing summary for one symbol."""
@@ -10119,7 +10119,10 @@ class ActiveCodeUpdater:
             existing.is_raw = existing.is_raw or new_block.is_raw
             existing.importance_score = 10.0
             existing.symbols = syms
-            await self._reindex_block_symbols(existing, project_id)
+
+            # Re-index with background summaries
+            await self._reindex_block_symbols_with_summaries(existing, project_id)
+
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
                     existing.hash, prev_content, new_block.content
@@ -10142,7 +10145,10 @@ class ActiveCodeUpdater:
             existing.last_mentioned = time.time()
             existing.last_mentioned_msg_idx = state["message_count"]
             existing.symbols = syms
-            await self._reindex_block_symbols(existing, project_id)
+
+            # Re-index with background summaries
+            await self._reindex_block_symbols_with_summaries(existing, project_id)
+
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
                     existing.hash, prev_content, new_block.content
@@ -10197,6 +10203,24 @@ class ActiveCodeUpdater:
         # Index symbols and edges
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
+
+            # Launch summary generation in background if missing and applicable
+            if (
+                self._f.valves.enable_auto_summaries
+                and not sym.summary
+                and sym.kind in ("function", "method")
+            ):
+                asyncio.create_task(
+                    self._f._enrichment.run_missing_summaries_task(
+                        {
+                            "signature": sym.signature,
+                            "code_snippet": new_block.content[:500],
+                            "project_id": project_id,
+                        },
+                        self._f.valves.llm_model,
+                    )
+                )
+
             for callee_name in sym.calls:
                 edge = Edge(
                     src=sym.name,
@@ -10321,54 +10345,58 @@ class ActiveCodeUpdater:
                     f"Their symbols remain in the index for lightweight context."
                 )
 
-    async def _update_assistant_base_blocks(
-        self,
-        extracted: List[dict],
-        content_to_syms: Dict[str, List["CodeSymbol"]],
-        state: dict,
-        project_id: str,
-    ) -> None:
-        """When the assistant replies with code that overlaps existing blocks, merge it in."""
-        for block_info in extracted:
-            best_base = None
-            best_sim = 0.0
-            for base in state["active_blocks"].values():
-                if base.content_type == ContentType.BASE_CODE:
-                    sim = self._f._code_blocks.calculate_code_similarity(
-                        base.content, block_info["code"]
+        async def _update_assistant_base_blocks(
+            self,
+            extracted: List[dict],
+            content_to_syms: Dict[str, List["CodeSymbol"]],
+            state: dict,
+            project_id: str,
+        ) -> None:
+            """When the assistant replies with code that overlaps existing blocks, merge it in."""
+            for block_info in extracted:
+                best_base = None
+                best_sim = 0.0
+                for base in state["active_blocks"].values():
+                    if base.content_type == ContentType.BASE_CODE:
+                        sim = self._f._code_blocks.calculate_code_similarity(
+                            base.content, block_info["code"]
+                        )
+                        if sim > best_sim and sim > 0.6:
+                            best_sim = sim
+                            best_base = base
+                if best_base and best_sim > 0.5 and best_sim < 0.98:
+                    self._f._symbol_index.remove_all_for_block(
+                        best_base.hash, best_base.symbols, project_id
                     )
-                    if sim > best_sim and sim > 0.6:
-                        best_sim = sim
-                        best_base = base
-            if best_base and best_sim > 0.5 and best_sim < 0.98:
-                self._f._symbol_index.remove_all_for_block(
-                    best_base.hash, best_base.symbols, project_id
-                )
-                prev_content = best_base.content
-                best_base.content = CodeBlockManager.sanitize_text(block_info["code"])
-                best_base.hash = hashlib.md5(block_info["code"].encode()).hexdigest()[
-                    :16
-                ]
-                best_base.timestamp = time.time()
-                best_base.is_active = True
-                best_base.importance_score = min(best_base.importance_score + 1.0, 10.0)
-                reused = content_to_syms.get(block_info["code"])
-                if reused is not None:
-                    best_base.symbols = [
-                        s.copy(update={"parent_block_hash": best_base.hash})
-                        for s in reused
-                    ]
-                else:
-                    best_base.symbols = await SignatureExtractor.extract_async(
-                        best_base.content, best_base.file_path
+                    prev_content = best_base.content
+                    best_base.content = CodeBlockManager.sanitize_text(
+                        block_info["code"]
                     )
-                await self._reindex_block_symbols(best_base, project_id)
-                if any(s.calls for s in best_base.symbols):
-                    state["has_any_calls"] = True
-                if prev_content != block_info["code"]:
-                    await self._f._enrichment.generate_change_summary(
-                        best_base.hash, prev_content, block_info["code"]
+                    best_base.hash = hashlib.md5(
+                        block_info["code"].encode()
+                    ).hexdigest()[:16]
+                    best_base.timestamp = time.time()
+                    best_base.is_active = True
+                    best_base.importance_score = min(
+                        best_base.importance_score + 1.0, 10.0
                     )
+                    reused = content_to_syms.get(block_info["code"])
+                    if reused is not None:
+                        best_base.symbols = [
+                            s.copy(update={"parent_block_hash": best_base.hash})
+                            for s in reused
+                        ]
+                    else:
+                        best_base.symbols = await SignatureExtractor.extract_async(
+                            best_base.content, best_base.file_path
+                        )
+                    await self._reindex_block_symbols(best_base, project_id)
+                    if any(s.calls for s in best_base.symbols):
+                        state["has_any_calls"] = True
+                    if prev_content != block_info["code"]:
+                        await self._f._enrichment.generate_change_summary(
+                            best_base.hash, prev_content, block_info["code"]
+                        )
 
     async def _post_update_tasks(
         self,
@@ -10386,41 +10414,9 @@ class ActiveCodeUpdater:
         # Inline block expiration
         await self._f._enrichment.expire_blocks_by_time(project_id)
 
-        # Enrichment tasks – run sequentially
-        tasks_to_run = []
-        max_tasks_per_type = 5
-
-        for block in list(state["active_blocks"].values()):
-            if block.obsolete:
-                continue
-            if self._f.valves.enable_auto_summaries:
-                syms_without_summary = [
-                    s
-                    for s in block.symbols
-                    if not s.summary and s.kind in ("function", "method")
-                ]
-                for sym in syms_without_summary[:3]:
-                    tasks_to_run.append(
-                        (
-                            "missing_summaries",
-                            {
-                                "signature": sym.signature,
-                                "code_snippet": block.content[:500],
-                                "project_id": project_id,
-                            },
-                        )
-                    )
-                    if len(tasks_to_run) >= max_tasks_per_type:
-                        break
-
-        for task_type, params in tasks_to_run:
-            try:
-                if task_type == "missing_summaries":
-                    await self._f._enrichment.run_missing_summaries_task(
-                        params, self._f.valves.llm_model
-                    )
-            except Exception as e:
-                self._f._log_debug(f"Immediate enrichment task {task_type} failed: {e}")
+        # Enrichment tasks that were previously here are now launched reactively
+        # inside _process_new_block and _process_duplicate_block, right after a
+        # symbol is indexed.  No batch loop is needed anymore.
 
         if self._f.valves.enable_session_summary and not is_continuation:
             interval = self._f.valves.session_summary_interval_messages
@@ -13493,13 +13489,15 @@ class Filter:
 
                 # ── Fix 1: Replace code with compressed stub instead of deleting it ──
                 all_names = sorted(self._symbol_index.get_all_names(project_id))[:100]
+                # We used to include this line in the compressed stub, but now we have
+                # code scaffolding it would be redundant:
+                # + "\n".join(f"# class/func: {n}" for n in sorted(all_names)[:50])
                 compressed_stub = (
                     f"```python\n"
-                    f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados]\n"
-                    + "\n".join(f"# class/func: {n}" for n in sorted(all_names)[:50])
-                    + "\n```\n\n"
-                    f"(Usa `/expand <nombre>` para ver la implementación completa "
-                    f"de cualquier símbolo de los {num_symbols} disponibles)"
+                    f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados en SymbolGraph]\n"
+                    f"# Usa /expand <nombre> para ver cualquier implementación.\n"
+                    f"```\n\n"
+                    f"_(El código está disponible internamente; no es necesario repetirlo aquí.)_"
                 )
                 messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
