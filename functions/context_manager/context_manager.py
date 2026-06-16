@@ -106,8 +106,6 @@ _db_global_lock = threading.Lock()
 import fcntl
 import tempfile
 
-_llm_lock_path = os.path.join(tempfile.gettempdir(), "openwebui_llm.lock")
-
 
 # ---------------------------------------------------------------------------
 # Models & Enums
@@ -5595,19 +5593,6 @@ class LLMOrchestrator:
                 f"Reusing auxiliary model '{model_name}' (already loaded)"
             )
 
-    async def _acquire_llm_lock(self):
-        """Acquire an inter‑process file lock for exclusive LLM access."""
-        loop = asyncio.get_event_loop()
-        fd = open(_llm_lock_path, "w")
-        await loop.run_in_executor(self._f._db_executor, fcntl.flock, fd, fcntl.LOCK_EX)
-        return fd
-
-    @staticmethod
-    def _release_llm_lock(fd):
-        """Release the inter‑process file lock and close the file descriptor."""
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        fd.close()
-
     def init_cache(self) -> None:
         """Return the shared AsyncLRUCache instance for LLM response caching."""
         self._f._llm_cache = _AsyncLRUCache(
@@ -5696,7 +5681,6 @@ class LLMOrchestrator:
             async with self._f._active_llm_tasks_lock:
                 self._f._active_llm_tasks.add(task)
             try:
-                llm_fd = await self._acquire_llm_lock()
                 try:
                     # Unload/load management fuera del semáforo de concurrencia
                     await self._maybe_unload_for_model(model, base_url, is_ollama)
@@ -5765,7 +5749,7 @@ class LLMOrchestrator:
                         )
                         await asyncio.sleep(wait)
                 finally:
-                    self._release_llm_lock(llm_fd)
+                    pass
             finally:
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.discard(task)
@@ -11297,6 +11281,7 @@ class InletOrchestrator:
 
         return result
 
+
 class SystemPromptBuilder:
     """
     Builds the system prompt in two blocks:
@@ -13286,7 +13271,7 @@ class Filter:
         llm_request_timeout: int = Field(default=900)
         llm_per_call_timeout: int = Field(default=900, ge=1)
         llm_retry_total_timeout: int = Field(default=950, ge=10)
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=1, ge=1, le=10)
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
         llamacpp_endpoint_type: str = Field(default="chat")
