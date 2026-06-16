@@ -9629,13 +9629,16 @@ class EnrichmentTasks:
                 if sym.name == name and sym.docstring:
                     return sym.docstring
 
-        # 2. Check SQLite
-        row = await self._f._state_store._db_enqueue_and_wait(
-            lambda: self._f._db_conn.execute(
-                "SELECT doctring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
-                (project_id, name),
-            ).fetchone()
-        )
+        # 2. Check SQLite (direct read)
+        try:
+            row = await anyio.to_thread.run_sync(
+                lambda: self._f._db_conn.execute(
+                    "SELECT doctring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
+                    (project_id, name),
+                ).fetchone()
+            )
+        except Exception:
+            row = None
         if row and row[0]:
             doc = row[0]
             # Update in-memory symbol
@@ -9649,7 +9652,6 @@ class EnrichmentTasks:
             return doc
 
         # 3. Generate via LLM
-        # Find the symbol to get its signature and code snippet
         state = self._f._state_store.get_state(project_id)
         signature = name
         snippet = ""
@@ -9683,9 +9685,9 @@ class EnrichmentTasks:
                     self._f._symbol_index.update_docstring(name, project_id, docstring)
                     break
         await self._f._state_store._db_enqueue(
-            lambda: self._f._db_conn.execute(
+            lambda name=name, doc=docstring, pid=project_id: self._f._db_conn.execute(
                 "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, doctring, updated_at) VALUES (?,?,?,?)",
-                (project_id, name, docstring, time.time()),
+                (pid, name, doc, time.time()),
             )
         )
         return docstring
