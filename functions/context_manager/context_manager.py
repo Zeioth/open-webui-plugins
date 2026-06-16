@@ -2487,11 +2487,14 @@ class ContextBuilder:
                 )
                 _lod2_parts.insert(0, raptor_section)
 
+        # Determine active use case for skeleton tier suppression logic
+        active_use_case, _ = self.classify_use_case(query, intent_vector)
+
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
         suppress_sigs = (
             self._f.valves.enable_skeleton_tier
             and self._f.valves.skeleton_tier_suppresses_block_b_signatures
-            and _active_use_case != "D"
+            and active_use_case != "D"
             and bool(self._f._symbol_index.compute_signature_hash(project_id))
         )
         ordered = []
