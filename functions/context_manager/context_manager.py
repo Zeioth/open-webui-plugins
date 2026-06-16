@@ -11297,13 +11297,18 @@ class EnrichmentTasks:
     ) -> None:
         """
         Launch background tasks to generate docstrings for the given symbols.
-        Does NOT await the tasks; they run independently. The tasks are stored
-        in self._docstring_tasks so they can be cancelled by the inlet later.
+        Does NOT await the tasks; they run independently. Only the first
+        N symbols are launched per call, where N is controlled by the valve
+        'background_docstring_batch_size'. The rest will be picked up on
+        subsequent turns.
         """
         if not pending:
             return
+        max_batch = self._f.valves.background_docstring_batch_size
+        launched = 0
         for name, signature in pending:
-            # Evitar duplicados si ya hay una tarea en vuelo para ese símbolo
+            if launched >= max_batch:
+                break
             if name in self._docstrings_in_flight:
                 continue
             self._docstrings_in_flight.add(name)
@@ -11311,8 +11316,11 @@ class EnrichmentTasks:
                 self._background_docstring(name, signature, project_id)
             )
             self._docstring_tasks.add(task)
-            task.add_done_callback(lambda t: self._docstring_tasks.discard(t))
-
+            task.add_done_callback(
+                lambda t, n=name: self._docstrings_in_flight.discard(n)
+            )
+            self._f._log_debug(f"📝 Docstring task launched for '{name}'")
+            launched += 1
 
 class ActiveCodeUpdater:
     """
@@ -14248,6 +14256,17 @@ class Filter:
                 "When disabled, docstrings are only generated on-demand (lazy)."
             ),
         )
+        background_docstring_batch_size: int = Field(
+            default=5,
+            ge=1,
+            le=50,
+            description=(
+                "Maximum number of background docstring tasks launched "
+                "simultaneously per outlet call. Limits concurrency to avoid "
+                "saturating the model while still generating all docstrings "
+                "progressively across turns."
+            ),
+        ),
         # ── Block deduplication ─────────────────────────────────────
         code_similarity_threshold: float = Field(default=0.85)
         enable_ast_deduplication: bool = Field(default=True)
@@ -15327,9 +15346,6 @@ class Filter:
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
-        # ── Record whether we are coming from a silent ingestion ──
-        silent_ingestion_active = self._is_silent_ingestion
-
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
 
@@ -15337,48 +15353,34 @@ class Filter:
             messages = body.get("messages", [])
             project_id = self._inlet_orch.get_project_id()
             state = self._state_store.get_state(project_id)
-            is_code_session = await self._inlet_orch.classify_session(
-                messages, project_id
-            )
+            is_code_session = await self._inlet_orch.classify_session(messages, project_id)
             last_msg = messages[-1] if messages else None
 
             if last_msg:
                 last_idx = len(messages) - 1
                 if last_idx <= self._last_processed_message_idx.get(project_id, -1):
-                    self._log_debug(
-                        "outlet: last message already processed in inlet, skipping"
-                    )
+                    self._log_debug("outlet: last message already processed in inlet, skipping")
                 else:
                     if (
                         last_msg.get("role") == "assistant"
                         and is_code_session
                         and "/expand" in last_msg.get("content", "")
                     ):
-                        self._log_debug(
-                            "🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code"
-                        )
-                        modified_content, did_expand = (
-                            await self._commands.outlet_intercept_expand(
-                                last_msg.get("content", ""), project_id
-                            )
+                        self._log_debug("🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code")
+                        modified_content, did_expand = await self._commands.outlet_intercept_expand(
+                            last_msg.get("content", ""), project_id
                         )
                         if did_expand:
                             messages[-1]["content"] = modified_content
                             body["messages"] = messages
-                            self._log_debug(
-                                "outlet: /expand intercepted — history rewritten with real code"
-                            )
+                            self._log_debug("outlet: /expand intercepted — history rewritten with real code")
 
                     if last_msg.get("role") in ("user", "assistant"):
                         await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
-                            self._log_debug(
-                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (new code detected)"
-                            )
+                            self._log_debug("🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (new code detected)")
                             await self._update_active_code(last_msg, project_id)
-                            await self._ltm.store_messages(
-                                project_id, [last_msg], wait=False
-                            )
+                            await self._ltm.store_messages(project_id, [last_msg], wait=False)
 
                             if self.valves.enable_auto_docstrings_background:
                                 state = self._state_store.get_state(project_id)
@@ -15387,56 +15389,30 @@ class Filter:
                                     if block.obsolete:
                                         continue
                                     for sym in block.symbols:
-                                        if (
-                                            sym.kind in ("function", "method")
-                                            and not sym.docstring
-                                        ):
+                                        if sym.kind in ("function", "method") and not sym.docstring:
                                             pending.append((sym.name, sym.signature))
                                 if pending:
-                                    self._enrichment.schedule_docstrings(
-                                        pending, project_id
-                                    )
+                                    self._enrichment.schedule_docstrings(pending, project_id)
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
-                                self._log_debug(
-                                    "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
-                                )
-                                await self._ltm.store_messages(
-                                    project_id, [last_msg], wait=False
-                                )
+                                self._log_debug("🔥 STATE MANAGEMENT – Storing non‑code session message in LTM")
+                                await self._ltm.store_messages(project_id, [last_msg], wait=False)
 
             # ── Response cache ─────────────────────────────────────────
-            if (
-                self.valves.enable_response_cache
-                and HAS_SENTENCE
-                and len(messages) >= 2
-            ):
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Storing response in cache (to avoid recomputation for similar future requests)"
-                )
-                last_user = next(
-                    (m for m in reversed(messages) if m.get("role") == "user"), None
-                )
-                last_assistant = next(
-                    (m for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
+            if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+                self._log_debug("🚀 RESOURCE OPTIMISATION – Storing response in cache (to avoid recomputation for similar future requests)")
+                last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                last_assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
                 if last_user and last_assistant:
                     _is_partial_mp = self.valves.enable_multi_phase_response and any(
                         marker in last_assistant.get("content", "")
                         for marker in self._MULTI_PHASE_MARKERS
                     )
                     if _is_partial_mp:
-                        self._log_debug(
-                            "Response cache: skipping storage for partial multi-phase response"
-                        )
+                        self._log_debug("Response cache: skipping storage for partial multi-phase response")
                     else:
-                        context_hash = self._activation.compute_context_hash(
-                            messages[:-1]
-                        )
-                        code_state_hash = self._activation.compute_code_state_hash(
-                            project_id
-                        )
+                        context_hash = self._activation.compute_context_hash(messages[:-1])
+                        code_state_hash = self._activation.compute_code_state_hash(project_id)
                         await self._ltm.store_response_in_cache(
                             last_user.get("content", ""),
                             last_assistant.get("content", ""),
@@ -15448,42 +15424,22 @@ class Filter:
 
             # ── LOD adaptive ───────────────────────────────────────────
             if self.valves.enable_lod_adaptive and is_code_session:
-                last_assistant = next(
-                    (m for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
+                last_assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
                 if last_assistant and last_assistant.get("content"):
                     _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
-                        any(
-                            marker in last_assistant["content"]
-                            for marker in self._MULTI_PHASE_MARKERS
-                        )
-                        or bool(
-                            re.search(
-                                r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
-                                last_assistant["content"],
-                                re.IGNORECASE,
-                            )
-                        )
+                        any(marker in last_assistant["content"] for marker in self._MULTI_PHASE_MARKERS)
+                        or bool(re.search(r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE", last_assistant["content"], re.IGNORECASE))
                     )
                     if _is_partial_mp_lod:
-                        self._log_debug(
-                            "LOD adaptive: skipping feedback for partial multi-phase response"
-                        )
+                        self._log_debug("LOD adaptive: skipping feedback for partial multi-phase response")
                     else:
-                        await self._enrichment.update_lod_thresholds_from_response(
-                            project_id, last_assistant["content"]
-                        )
+                        await self._enrichment.update_lod_thresholds_from_response(project_id, last_assistant["content"])
 
             # ── Speculative prefetch ───────────────────────────────────
             if self.valves.enable_speculative_prefetch and is_code_session:
-                last_activated = getattr(self, "_last_activation_scores", {}).get(
-                    project_id, {}
-                )
+                last_activated = getattr(self, "_last_activation_scores", {}).get(project_id, {})
                 if last_activated:
-                    await self._activation.speculative_prefetch(
-                        project_id, last_activated
-                    )
+                    await self._activation.speculative_prefetch(project_id, last_activated)
 
             # ── Purge expired memories ─────────────────────────────────
             await self._ltm.purge_expired_memories()
@@ -15498,11 +15454,7 @@ class Filter:
             ):
                 self._log_debug("RAPTOR: triggering index rebuild")
                 edges_out = self._symbol_index.get_all_edges_out(project_id)
-                graph_weight = (
-                    self.valves.raptor_graph_weight
-                    if self.valves.raptor_use_call_graph_proximity
-                    else 0.0
-                )
+                graph_weight = self.valves.raptor_graph_weight if self.valves.raptor_use_call_graph_proximity else 0.0
                 await self._raptor.rebuild(
                     project_id=project_id,
                     symbol_index=self._symbol_index,
@@ -15518,26 +15470,20 @@ class Filter:
 
             # ── DB checkpoints ─────────────────────────────────────────
             if self._write_counter % 100 == 0:
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
-                )
+                self._log_debug("🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)")
                 await self._state_store.run_db_checkpoints()
 
             # ── Slot save ──────────────────────────────────────────────
             if self.valves.enable_slot_persistence:
                 try:
-                    self._last_total_context_tokens[project_id] = (
-                        self._tokens.estimate_tokens(messages)
-                    )
+                    self._last_total_context_tokens[project_id] = self._tokens.estimate_tokens(messages)
                 except Exception:
                     pass
 
                 if state and state.get("_pending_slot_resave"):
                     saved = await self._ctx_builder.slot_save(project_id, force=True)
                     if saved:
-                        self._log_debug(
-                            "Slot re-saved after compaction (stable new prefix)"
-                        )
+                        self._log_debug("Slot re-saved after compaction (stable new prefix)")
                     state["_pending_slot_resave"] = False
                     self._state_store.set_state(project_id, state)
                 else:
@@ -15564,25 +15510,17 @@ class Filter:
 
             # ── Save path views ───────────────────────────────────────
             if self.valves.enable_path_analysis:
-                await self._state_store.save_path_views_to_db(
-                    project_id, self._path_index.get_all(project_id)
-                )
+                await self._state_store.save_path_views_to_db(project_id, self._path_index.get_all(project_id))
 
             # ── Save state if dirty ───────────────────────────────────
-            self._log_debug(
-                "🔥 STATE MANAGEMENT – Saving conversation state (to preserve context across restarts)"
-            )
+            self._log_debug("🔥 STATE MANAGEMENT – Saving conversation state (to preserve context across restarts)")
             await self._state_store.save_state_if_dirty(project_id)
 
-            self._log_debug(
-                "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
-            )
+            self._log_debug("🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache")
         finally:
             # ── Release silent ingestion flag at the very end ──
-            if silent_ingestion_active:
+            if getattr(self, '_is_silent_ingestion', False):
                 self._is_silent_ingestion = False
 
-        self._log_section(
-            "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
-        )
+        self._log_section("CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time)
         return body
