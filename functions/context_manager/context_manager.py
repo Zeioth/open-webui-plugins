@@ -4420,6 +4420,27 @@ class StateStore:
             else:
                 blk._cached_token_count = len(blk.content) // 4
 
+        # ── Restore persisted docstrings from SQLite into memory ──
+        try:
+            cur = self._f._db_conn.execute(
+                "SELECT symbol_name, docstring FROM symbol_docstrings WHERE project_id = ?",
+                (project_id,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                doc_map = {row[0]: row[1] for row in rows}
+                for block in state["active_blocks"].values():
+                    if block.obsolete:
+                        continue
+                    for sym in block.symbols:
+                        if sym.name in doc_map and not sym.docstring:
+                            sym.docstring = doc_map[sym.name]
+                            self._f._symbol_index.update_docstring(
+                                sym.name, project_id, doc_map[sym.name]
+                            )
+        except Exception as e:
+            self._f._log_debug(f"Failed to load persisted docstrings: {e}")
+
         return state
 
     def _rebuild_symbol_index(self, state: dict, project_id: str) -> None:
