@@ -11405,7 +11405,6 @@ class SystemPromptBuilder:
         if not (
             self._f.valves.enable_code_awareness
             and is_code_session
-            and not self._f.valves.smart_context_selection
             and HAS_SENTENCE
             and HAS_CHROMA
         ):
@@ -12118,6 +12117,409 @@ class MessageAssembler:
 
         return compressed
 
+    def _assemble_final_system_and_log(
+        self,
+        static_block: str,
+        dynamic_injections: List[Tuple[str, str]],
+        messages: List[dict],
+        project_id: str,
+        pending_summary: str,
+    ) -> List[dict]:
+        """Assemble final system prompt, inject it, and log token breakdown."""
+        budget = self._f.valves.global_injection_token_budget
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+        if budget > 0 and self._f.tokenizer:
+            dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected_dynamic: List[str] = []
+            used_dyn = 0
+            static_tokens = (
+                len(self._f.tokenizer.encode(static_block)) if static_block else 0
+            )
+            dyn_budget = max(0, budget - static_tokens)
+            for prio, text in dynamic_injections:
+                if not text:
+                    continue
+                tok = len(self._f.tokenizer.encode(text))
+                if used_dyn + tok <= dyn_budget:
+                    selected_dynamic.append(text)
+                    used_dyn += tok
+                elif prio in ("critical", "high"):
+                    avail = dyn_budget - used_dyn
+                    if avail > 20:
+                        selected_dynamic.append(text[: avail * 4] + "\n[truncated]")
+                        break
+            dynamic_block = "\n\n".join(selected_dynamic)
+        else:
+            dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
+
+        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
+        final_system = static_block + separator + dynamic_block
+
+        # Append base system content (from original message)
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
+        if base_content.strip():
+            final_system = final_system + "\n\n" + base_content
+
+        # Append pending summary if any
+        if pending_summary:
+            final_system = final_system + "\n\n" + pending_summary
+
+        # Inject final system message
+        if final_system.strip():
+            messages = [m for m in messages if m.get("role") != "system"]
+            messages.insert(0, {"role": "system", "content": final_system})
+
+        # Ensure last message is from user
+        if messages and messages[-1].get("role") != "user":
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                messages = messages[: last_user_idx + 1]
+            else:
+                messages.append({"role": "user", "content": "continue"})
+
+        # ── Token breakdown log ─────────────────────────────────────────
+        if self._f.valves.debug and self._f.tokenizer and final_system.strip():
+            static_tok = (
+                len(self._f.tokenizer.encode(static_block)) if static_block else 0
+            )
+            dynamic_tok = (
+                len(self._f.tokenizer.encode(dynamic_block)) if dynamic_block else 0
+            )
+            total_system_tok = len(self._f.tokenizer.encode(final_system))
+
+            self._f._last_system_tokens[project_id] = total_system_tok
+
+            prefix_hash = self._f._last_static_prefix_hash.get(project_id, "N/A")
+            self._f._log_debug("─" * 60)
+            self._f._log_debug("TOKEN BREAKDOWN — system prompt")
+            self._f._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
+            self._f._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
+            self._f._log_debug(
+                f"  TOTAL system tokens:          ~{total_system_tok} tokens"
+            )
+            self._f._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
+            self._f._log_debug(
+                f"  → If hash matches previous:   KV cache HIT in llama.cpp"
+            )
+            self._f._log_debug(
+                f"  → If hash changed:            KV cache MISS, full prefill"
+            )
+            if self._f.valves.enable_multi_phase_response:
+                if "_mp_available" not in dir():
+                    self._f._log_debug(
+                        "  Multi-phase:                  (see earlier log)"
+                    )
+            if (
+                self._f.valves.enable_code_history_compression
+                or self._f.valves.enable_lean_user_code
+            ):
+                _compressed_parts = sum(
+                    1
+                    for m in messages
+                    if m.get("role") == "assistant"
+                    and re.search(r"\[🗜️ PARTE \d+/\d+", m.get("content", ""))
+                )
+                _leaned_msgs = sum(
+                    1
+                    for m in messages
+                    if m.get("role") == "user"
+                    and "[CÓDIGO COMPRIMIDO" in m.get("content", "")
+                )
+                self._f._log_debug(
+                    f"  Code history:                 "
+                    f"{_compressed_parts} part(s) compressed, "
+                    f"{_leaned_msgs} user msg(s) leaned"
+                )
+            self._f._log_debug("─" * 60)
+
+        # ── Context dump (evolution tracking) ─────────────────────────
+        # Capture exactly what the model will receive this turn. Non-blocking:
+        # the snapshot payload is built synchronously (cheap string copies) and
+        # the disk write is offloaded to a background task. Never raises into
+        # the inlet path.
+        if self._f.valves.enable_context_dump:
+            try:
+                self._f._context_dumper.schedule_inlet_snapshot(
+                    project_id=project_id,
+                    static_block=static_block,
+                    dynamic_block=dynamic_block,
+                    final_system=final_system,
+                    messages=messages,
+                )
+            except Exception as _dump_err:
+                self._f._log_debug(f"Context dump scheduling failed: {_dump_err}")
+
+        return messages
+
+
+# ---------------------------------------------------------------------------
+# ContextDumper — per-turn context snapshots for evolution tracking
+# ---------------------------------------------------------------------------
+class ContextDumper:
+    """
+    Dump the assembled per-turn context to disk for evolution tracking.
+
+    Each inlet writes one Markdown snapshot of what the model receives this turn
+    (Block A, Block B, message window) plus a compact JSONL metrics line, so the
+    operator can follow how the context grows and when the KV-cache prefix
+    (Block A) changes across a conversation.
+
+    Writes are best-effort and fully decoupled from the request path: the
+    payload is captured synchronously (cheap string copies), the disk I/O runs
+    in a worker thread, and any failure is swallowed with a debug log. Nothing
+    here can break inlet/outlet.
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+        self._tasks: Set[asyncio.Task] = set()
+
+    # ── Public API (called from MessageAssembler) ─────────────────────────
+
+    def schedule_inlet_snapshot(
+        self,
+        *,
+        project_id: str,
+        static_block: str,
+        dynamic_block: str,
+        final_system: str,
+        messages: List[dict],
+    ) -> None:
+        """
+        Capture the snapshot payload now and offload the write to a task.
+
+        Called from a synchronous context inside the async inlet, so a running
+        loop exists; if it does not (unexpected), fall back to a blocking write.
+        """
+        if not self._f.valves.enable_context_dump:
+            return
+
+        payload = self._capture_payload(
+            project_id, static_block, dynamic_block, final_system, messages
+        )
+        try:
+            task = asyncio.create_task(self._write_async(payload))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except RuntimeError:
+            # No running event loop — write inline (best effort).
+            try:
+                self._write_sync(payload)
+            except Exception as exc:
+                self._f._log_debug(f"Context dump inline write failed: {exc}")
+
+    # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
+
+    def _capture_payload(
+        self,
+        project_id: str,
+        static_block: str,
+        dynamic_block: str,
+        final_system: str,
+        messages: List[dict],
+    ) -> dict:
+        """Snapshot strings + metadata immediately so later mutation can't race."""
+        max_chars = self._f.valves.context_dump_message_max_chars
+        msg_copy: List[Tuple[str, str]] = []
+        if self._f.valves.context_dump_include_messages:
+            for m in messages:
+                role = m.get("role", "")
+                content = m.get("content", "") or ""
+                if max_chars > 0 and len(content) > max_chars:
+                    content = (
+                        content[:max_chars]
+                        + f"\n[...truncated {len(content) - max_chars} chars...]"
+                    )
+                msg_copy.append((role, content))
+
+        try:
+            code_state_hash = self._f._activation.compute_code_state_hash(project_id)
+        except Exception:
+            code_state_hash = ""
+        block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
+        slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
+        try:
+            state = self._f._state_store.get_state(project_id)
+            turn = state.get("message_count", 0)
+            n_active_blocks = len(state.get("active_blocks", {}))
+        except Exception:
+            turn = 0
+            n_active_blocks = 0
+        try:
+            n_symbols = len(self._f._symbol_index.get_all_names(project_id))
+        except Exception:
+            n_symbols = 0
+
+        now = time.time()
+        return {
+            "project_id": project_id,
+            "turn": turn,
+            "timestamp": now,
+            "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "static_block": static_block or "",
+            "dynamic_block": dynamic_block or "",
+            "final_system": final_system or "",
+            "messages": msg_copy,
+            "block_a_hash": block_a_hash,
+            "code_state_hash": code_state_hash,
+            "slot_saved_hash": slot_hash,
+            "n_active_blocks": n_active_blocks,
+            "n_symbols": n_symbols,
+        }
+
+    # ── Async write (offloaded to a worker thread) ────────────────────────
+
+    async def _write_async(self, payload: dict) -> None:
+        try:
+            await anyio.to_thread.run_sync(self._write_sync, payload)
+        except Exception as exc:
+            self._f._log_debug(f"Context dump write failed: {exc}")
+
+    def _write_sync(self, payload: dict) -> None:
+        """Render Markdown + JSONL and write to the project dump directory."""
+        project_dir = self._project_dir(payload["project_id"])
+        os.makedirs(project_dir, exist_ok=True)
+
+        # Token counts (done here, off the hot path).
+        tok = self._f._tokens
+        block_a_tokens = tok.estimate_code_tokens(payload["static_block"])
+        block_b_tokens = tok.estimate_code_tokens(payload["dynamic_block"])
+        system_tokens = tok.estimate_code_tokens(payload["final_system"])
+        history_tokens = sum(
+            tok.estimate_code_tokens(c) for r, c in payload["messages"] if r != "system"
+        )
+
+        # 1. Markdown snapshot
+        md = self._render_markdown(
+            payload, block_a_tokens, block_b_tokens, system_tokens, history_tokens
+        )
+        fname = f"t{payload['turn']:04d}_{int(payload['timestamp'] * 1000)}.md"
+        with open(os.path.join(project_dir, fname), "w", encoding="utf-8") as fh:
+            fh.write(md)
+
+        # 2. Rolling latest.md (handy for tail/watch).
+        try:
+            with open(
+                os.path.join(project_dir, "latest.md"), "w", encoding="utf-8"
+            ) as fh:
+                fh.write(md)
+        except Exception:
+            pass
+
+        # 3. Append compact metrics to the evolution log.
+        if self._f.valves.context_dump_write_jsonl:
+            record = {
+                "ts": payload["timestamp"],
+                "iso": payload["iso"],
+                "turn": payload["turn"],
+                "block_a_tokens": block_a_tokens,
+                "block_b_tokens": block_b_tokens,
+                "system_tokens": system_tokens,
+                "history_tokens": history_tokens,
+                "n_messages": len(payload["messages"]),
+                "n_active_blocks": payload["n_active_blocks"],
+                "n_symbols": payload["n_symbols"],
+                "block_a_hash": payload["block_a_hash"],
+                "code_state_hash": payload["code_state_hash"],
+                "slot_saved_hash": payload["slot_saved_hash"],
+            }
+            with open(
+                os.path.join(project_dir, "evolution.jsonl"), "a", encoding="utf-8"
+            ) as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # 4. Prune old snapshots.
+        self._prune(project_dir)
+
+    # ── Rendering ─────────────────────────────────────────────────────────
+
+    def _render_markdown(
+        self,
+        payload: dict,
+        block_a_tokens: int,
+        block_b_tokens: int,
+        system_tokens: int,
+        history_tokens: int,
+    ) -> str:
+        lines: List[str] = []
+        lines.append(
+            f"# Context Snapshot — `{payload['project_id']}` — "
+            f"turn {payload['turn']} — {payload['iso']}"
+        )
+        lines.append("")
+        lines.append("## Metadata")
+        lines.append(f"- turn (message_count): {payload['turn']}")
+        lines.append(f"- Block A tokens (static):  ~{block_a_tokens}")
+        lines.append(f"- Block B tokens (dynamic): ~{block_b_tokens}")
+        lines.append(f"- system prompt tokens:     ~{system_tokens}")
+        lines.append(f"- history tokens:           ~{history_tokens}")
+        lines.append(f"- Block A prefix hash: `{payload['block_a_hash'] or 'N/A'}`")
+        lines.append(f"- code_state_hash:     `{payload['code_state_hash'] or 'N/A'}`")
+        lines.append(f"- slot saved hash:     `{payload['slot_saved_hash'] or 'N/A'}`")
+        lines.append(f"- active blocks: {payload['n_active_blocks']}")
+        lines.append(f"- indexed symbols: {payload['n_symbols']}")
+        lines.append("")
+
+        lines.append("## Block A — static (KV-cache prefix)")
+        lines.append("```text")
+        lines.append(payload["static_block"] or "(empty)")
+        lines.append("```")
+        lines.append("")
+
+        lines.append("## Block B — dynamic (per-query)")
+        lines.append("```text")
+        lines.append(payload["dynamic_block"] or "(empty)")
+        lines.append("```")
+        lines.append("")
+
+        if self._f.valves.context_dump_include_messages:
+            lines.append("## Message window (non-system, sent to model)")
+            idx = 0
+            for role, content in payload["messages"]:
+                if role == "system":
+                    continue  # already shown as Block A + Block B above
+                lines.append(f"### [{idx}] {role}")
+                lines.append("```text")
+                lines.append(content or "(empty)")
+                lines.append("```")
+                idx += 1
+            lines.append("")
+
+        return "\n".join(lines)
+
+    # ── Housekeeping ──────────────────────────────────────────────────────
+
+    def _project_dir(self, project_id: str) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:40] or "default"
+        return os.path.join(self._f.valves.context_dump_dir.rstrip("/"), slug)
+
+    def _prune(self, project_dir: str) -> None:
+        keep = self._f.valves.context_dump_max_files_per_project
+        if keep <= 0:
+            return
+        try:
+            snapshots = sorted(
+                f
+                for f in os.listdir(project_dir)
+                if f.startswith("t") and f.endswith(".md")
+            )
+        except Exception:
+            return
+        excess = len(snapshots) - keep
+        for fname in snapshots[: max(0, excess)]:
+            try:
+                os.remove(os.path.join(project_dir, fname))
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Valves
@@ -12765,7 +13167,37 @@ class Filter:
         #  Utilities & tuning
         # ═══════════════════════════════════════════════════════════════
         debug: bool = Field(default=True)
-        debug_context: bool = Field(default=False)
+        # ── Context dump (evolution tracking) ───────────────────────
+        enable_context_dump: bool = Field(
+            default=True,
+            description=(
+                "Dump the assembled per-turn context (Block A, Block B, message "
+                "window) to disk for evolution tracking. Off by default; writes "
+                "are best-effort and fully decoupled from the request path."
+            ),
+        )
+        context_dump_dir: str = Field(
+            default="/app/backend/data/context_dumps",
+            description="Directory for per-turn context snapshots (one subdir per project).",
+        )
+        context_dump_max_files_per_project: int = Field(
+            default=200,
+            ge=0,
+            description="Max Markdown snapshots kept per project (oldest pruned). 0 = keep all.",
+        )
+        context_dump_include_messages: bool = Field(
+            default=True,
+            description="Include the non-system message window in each snapshot.",
+        )
+        context_dump_message_max_chars: int = Field(
+            default=8000,
+            ge=0,
+            description="Truncate each captured message body to this many chars. 0 = no truncation.",
+        )
+        context_dump_write_jsonl: bool = Field(
+            default=True,
+            description="Append a compact metrics line per turn to evolution.jsonl (token counts + hashes).",
+        )
         priority: int = Field(default=0)
         use_tiktoken: bool = Field(default=True)
         # ── Weighting & decay ───────────────────────────────────────
@@ -12867,6 +13299,7 @@ class Filter:
         self._active_code_updater = ActiveCodeUpdater(self)
         self._system_prompt_builder = SystemPromptBuilder(self)  # ← v8
         self._message_assembler = MessageAssembler(self)  # ← v8
+        self._context_dumper = ContextDumper(self)  # context evolution dumps
 
         self._hub_index = HubSymbolIndex()
         self._ctx_builder = ContextBuilder(self)
