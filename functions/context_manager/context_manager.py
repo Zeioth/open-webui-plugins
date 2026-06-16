@@ -1200,7 +1200,7 @@ class RaptorCodeIndex:
                     default=n,
                 )
                 doc = self._safe(
-                    getattr(symbol_index, "get_doctring", None),
+                    getattr(symbol_index, "get_docstring", None),
                     n,
                     project_id,
                     default="",
@@ -2390,15 +2390,15 @@ class ContextBuilder:
                         (sym.signature for sym in block.symbols if sym.name == node_id),
                         node_id,
                     )
-                    doctring = next(
+                    docstring = next(
                         (
-                            sym.doctring
+                            sym.docstring
                             for sym in block.symbols
-                            if sym.name == node_id and sym.doctring
+                            if sym.name == node_id and sym.docstring
                         ),
                         "",
                     )
-                    text = f"- `{sig}`: {doctring}" if doctring else f"- `{sig}`"
+                    text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
                     tok = len(text) // 4 + 2
                     if total_tokens + tok > budget:
                         break
@@ -2569,7 +2569,7 @@ class ContextBuilder:
                         sym = next((s for s in block.symbols if s.name == name), None)
                         meta = {
                             "signature": sym.signature if sym else name,
-                            "doctring": sym.doctring if sym else "",
+                            "docstring": sym.docstring if sym else "",
                             "file_path": block.file_path,
                             "kind": sym.kind if sym else "function",
                             "language": sym.language if sym else "unknown",
@@ -2606,7 +2606,7 @@ class ContextBuilder:
             lines.append(f"### {file_path}")
             for name, meta in by_file[file_path]:
                 sig = meta.get("signature") or name
-                doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
                 line = f"- `{sig}`{doc}"
                 tok = self._f._tokens.estimate_code_tokens(line)
                 if total_tokens + tok > budget:
@@ -2658,7 +2658,7 @@ class ContextBuilder:
             lines.append("### Classes")
             for fpath in sorted(classes_by_file.keys()):
                 for name, meta in classes_by_file[fpath]:
-                    doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                    doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
                     line = f"- `{name}`{doc}  ({fpath})"
                     total += self._f._tokens.estimate_code_tokens(line)
                     lines.append(line)
@@ -2671,7 +2671,7 @@ class ContextBuilder:
                 bucket: list = []
                 for name, meta in funcs_by_file[fpath]:
                     sig = meta.get("signature") or name
-                    doc = f" — {meta['doctring']}" if meta.get("doctring") else ""
+                    doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
                     full = f"- `{sig}`{doc}"
                     tok = self._f._tokens.estimate_code_tokens(full)
                     if total + tok <= budget:
@@ -3379,7 +3379,8 @@ class SymbolIndex:
         prev = self._symbol_meta.get(key)
         self._symbol_meta[key] = {
             "signature": symbol.signature,
-            "doctring": symbol.doctring or (prev.get("doctring", "") if prev else ""),
+            "docstring": symbol.docstring
+            or (prev.get("docstring", "") if prev else ""),
             "file_path": symbol.file_path,
             "language": symbol.language,
             "kind": symbol.kind,
@@ -3426,21 +3427,21 @@ class SymbolIndex:
         meta = self._symbol_meta.get((project_id, name))
         return meta.get("signature") if meta else None
 
-    def get_doctring(self, name: str, project_id: str) -> str:
+    def get_docstring(self, name: str, project_id: str) -> str:
         """One-line docstring for a symbol, or "". Consumed by RaptorCodeIndex."""
         meta = self._symbol_meta.get((project_id, name))
-        return meta.get("doctring", "") if meta else ""
+        return meta.get("docstring", "") if meta else ""
 
     def get_file_for_symbol(self, name: str, project_id: str) -> Optional[str]:
         """File path for a symbol, or None. Consumed by HubSymbolIndex._file_for."""
         meta = self._symbol_meta.get((project_id, name))
         return meta.get("file_path") if meta else None
 
-    def update_doctring(self, name: str, project_id: str, doctring: str) -> None:
+    def update_docstring(self, name: str, project_id: str, docstring: str) -> None:
         """Refresh a symbol's stored docstring after async enrichment generates it."""
         meta = self._symbol_meta.get((project_id, name))
         if meta is not None:
-            meta["doctring"] = doctring
+            meta["docstring"] = docstring
 
     # ── Typed edge storage (v7+) ───────────────────────────────────────
     def add_edge(self, edge: "Edge", project_id: str) -> None:
@@ -3951,8 +3952,8 @@ class SignatureExtractor:
                         if first_line:
                             doc_map[node.name] = first_line[:120]
             for sym in symbols:
-                if sym.name in doc_map and not sym.doctring:
-                    sym.doctring = doc_map[sym.name]
+                if sym.name in doc_map and not sym.docstring:
+                    sym.docstring = doc_map[sym.name]
         except SyntaxError:
             pass
 
@@ -9580,7 +9581,7 @@ class EnrichmentTasks:
             f"Summarize in one short sentence what this code does:\n\n"
             f"```{signature}\n{code_snippet}```"
         )
-        doctring = await self._f._llm_orchestrator.call_llm(
+        docstring = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Output only one concise sentence.",
             model_override=model,
@@ -9588,7 +9589,7 @@ class EnrichmentTasks:
             temperature=0.1,
             label="missing_docstrings",
         )
-        if doctring and doctring.strip():
+        if docstring and docstring.strip():
             project_id = params["project_id"]
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
@@ -9596,9 +9597,9 @@ class EnrichmentTasks:
                 for blk in state["active_blocks"].values():
                     for sym in blk.symbols:
                         if sym.signature == signature:
-                            sym.doctring = doctring.strip()
-                            self._f._symbol_index.update_doctring(
-                                sym.name, project_id, doctring.strip()
+                            sym.docstring = docstring.strip()
+                            self._f._symbol_index.update_docstring(
+                                sym.name, project_id, docstring.strip()
                             )
                 self._f._state_store.set_state(project_id, state)
             return True
@@ -10163,7 +10164,7 @@ class ActiveCodeUpdater:
             # Launch docstring generation in background if missing
             if (
                 self._f.valves.enable_auto_docstrings
-                and not s.doctring
+                and not s.docstring
                 and s.kind in ("function", "method")
             ):
                 asyncio.create_task(
@@ -10225,7 +10226,7 @@ class ActiveCodeUpdater:
             # Launch docstring generation in background if missing and applicable
             if (
                 self._f.valves.enable_auto_docstrings
-                and not sym.doctring
+                and not sym.docstring
                 and sym.kind in ("function", "method")
             ):
                 asyncio.create_task(
