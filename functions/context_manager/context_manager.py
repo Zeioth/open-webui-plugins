@@ -4272,6 +4272,15 @@ class StateStore:
                 saved_at        REAL NOT NULL
             )
         """)
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_docstrings (
+                project_id  TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                docstring    TEXT NOT NULL,
+                updated_at  REAL NOT NULL,
+                PRIMARY KEY (project_id, symbol_name)
+            )
+        """)
         self._f._db_conn.commit()
 
     def _load_state_from_db(self, project_id: str) -> Optional[dict]:
@@ -4400,6 +4409,27 @@ class StateStore:
                 blk._cached_token_count = len(self._f.tokenizer.encode(blk.content))
             else:
                 blk._cached_token_count = len(blk.content) // 4
+
+        # ── Load persisted docstrings (cross-session survival) ──
+        try:
+            cur = self._f._db_conn.execute(
+                "SELECT symbol_name, docstring FROM symbol_docstrings WHERE project_id = ?",
+                (project_id,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                doc_map = {row[0]: row[1] for row in rows}
+                for block in state["active_blocks"].values():
+                    if block.obsolete:
+                        continue
+                    for sym in block.symbols:
+                        if sym.name in doc_map and not sym.docstring:
+                            sym.docstring = doc_map[sym.name]
+                            self._f._symbol_index.update_docstring(
+                                sym.name, project_id, doc_map[sym.name]
+                            )
+        except Exception as e:
+            self._f._log_debug(f"Failed to load persisted docstrings: {e}")
 
         return state
 
@@ -9574,7 +9604,7 @@ class EnrichmentTasks:
             await self._f._state_store._db_enqueue(_write)
 
     async def run_missing_docstrings_task(self, params: dict, model: str) -> bool:
-        """Generate a missing docstring for one symbol."""
+        """Generate a missing docstring for one symbol and persist it immediately."""
         signature = params["signature"]
         code_snippet = params["code_snippet"]
         prompt = (
@@ -9589,21 +9619,42 @@ class EnrichmentTasks:
             temperature=0.1,
             label="missing_docstrings",
         )
-        if docstring and docstring.strip():
-            project_id = params["project_id"]
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                state = self._f._state_store.get_state(project_id)
-                for blk in state["active_blocks"].values():
-                    for sym in blk.symbols:
-                        if sym.signature == signature:
-                            sym.docstring = docstring.strip()
-                            self._f._symbol_index.update_docstring(
-                                sym.name, project_id, docstring.strip()
-                            )
-                self._f._state_store.set_state(project_id, state)
-            return True
-        return False
+        if not docstring or not docstring.strip():
+            return False
+
+        doc_clean = docstring.strip()
+        project_id = params["project_id"]
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            matched_name = None
+            for blk in state["active_blocks"].values():
+                for sym in blk.symbols:
+                    if sym.signature == signature:
+                        sym.docstring = doc_clean
+                        self._f._symbol_index.update_docstring(
+                            sym.name, project_id, doc_clean
+                        )
+                        matched_name = sym.name
+                        break
+                if matched_name:
+                    break
+
+            if matched_name is None:
+                # Symbol not found in current active blocks – may be evicted; skip persistence
+                return False
+
+            self._f._state_store.set_state(project_id, state)
+
+            # Persist immediately to SQLite so the docstring survives restarts
+            await self._f._state_store._db_enqueue(
+                lambda name=matched_name, doc=doc_clean, pid=project_id: self._f._db_conn.execute(
+                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (pid, name, doc, time.time()),
+                )
+            )
+        return True
 
     async def run_session_summary_task(self, params: dict, model: str) -> bool:
         """Generate an autobiographical session summary and store it in LTM."""
@@ -13357,9 +13408,12 @@ class Filter:
 
         project_id = self._inlet_orch.get_project_id()
         slot_free = True
-        # Cold‑start guard: si no hay modelo cargado, no hay slot que liberar
+        # Cold‑start guard: if no model is loaded, there is no slot to free
         if slot_free and self._last_used_model is None:
             slot_free = False
+
+        # ─── Wait until last turn't background tasks finish ───
+        await self._llm_orchestrator.wait_for_llm_tasks()
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
@@ -13662,7 +13716,8 @@ class Filter:
 
                     # ── 🔥 STATE MANAGEMENT: update active code blocks & store in LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
-                        await self._llm_orchestrator.wait_for_llm_tasks()
+                        # No need to wait for docstrings before persisting.
+                        # await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
                             self._log_debug(
                                 "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM "
