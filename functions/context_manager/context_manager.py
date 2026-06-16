@@ -13850,6 +13850,10 @@ class Filter:
         if slot_free and self._last_used_model is None:
             slot_free = False
 
+        # Cancel any pending background docstring tasks from the previous turn
+        # instead of blocking — ensure_docstring will handle missing ones on demand
+        self._enrichment.cancel_docstring_tasks()
+
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   1. Preprocess (project switch, cache load)
@@ -14035,7 +14039,6 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         state = self._state_store.get_state(project_id)
-
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
                 messages,
@@ -14090,14 +14093,6 @@ class Filter:
             slot_free=slot_free,
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
-
-        # ── Restore KV cache (undo lazy docstring pollution) ──
-        if (
-            is_code_session
-            and self.valves.enable_slot_persistence
-            and self.valves.enable_auto_docstrings
-        ):
-            await self._ctx_builder.slot_restore(project_id)
 
         body["messages"] = messages
 
