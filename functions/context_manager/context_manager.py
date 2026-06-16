@@ -9778,38 +9778,6 @@ class EnrichmentTasks:
 
             await self._f._state_store._db_enqueue(_write)
 
-    async def run_missing_docstrings_task(self, params: dict, model: str) -> bool:
-        """Generate a missing docstring for one symbol."""
-        signature = params["signature"]
-        code_snippet = params["code_snippet"]
-        prompt = (
-            f"Summarize in one short sentence what this code does:\n\n"
-            f"```{signature}\n{code_snippet}```"
-        )
-        docstring = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-            model_override=model,
-            max_tokens=50,
-            temperature=0.1,
-            label="missing_docstrings",
-        )
-        if docstring and docstring.strip():
-            project_id = params["project_id"]
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                state = self._f._state_store.get_state(project_id)
-                for blk in state["active_blocks"].values():
-                    for sym in blk.symbols:
-                        if sym.signature == signature:
-                            sym.docstring = docstring.strip()
-                            self._f._symbol_index.update_docstring(
-                                sym.name, project_id, docstring.strip()
-                            )
-                self._f._state_store.set_state(project_id, state)
-            return True
-        return False
-
     async def run_session_summary_task(self, params: dict, model: str) -> bool:
         """Generate an autobiographical session summary and store it in LTM."""
         project_id = params["project_id"]
