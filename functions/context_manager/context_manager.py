@@ -10488,6 +10488,11 @@ class ActiveCodeUpdater:
 
             self._f._state_store.set_state(project_id, state)
 
+        # ── Invalidate session classification cache whenever active blocks change ──
+        # (ensures that subsequent queries remain code sessions if code exists)
+        if new_blocks_pending:
+            self._f._session_classify_cache.clear()
+
     # ── Private helpers (called in order by `process`) ────────────────────
 
     async def _extract_and_prepare_new_blocks(
@@ -11184,8 +11189,10 @@ class InletOrchestrator:
     async def classify_session(self, messages: list, project_id: str) -> bool:
         """
         Determine whether the current session is a coding session.
-        Uses cached results per project, then falls back to code indicators,
-        block extraction, and finally a CrossEncoder check on the last user message.
+        If there are active code blocks, always return True, bypassing any
+        cached result that might be stale (e.g. a previous False before code
+        was ingested).  Otherwise fall back to code indicators, block
+        extraction, and finally a CrossEncoder check on the last user message.
         """
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -11196,6 +11203,16 @@ class InletOrchestrator:
             cache_key = (
                 f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
             )
+
+        # ── Active blocks always mean a code session (regardless of cache) ──
+        state = self._f._state_store.get_state(project_id)
+        if state and state.get("active_blocks"):
+            if cache_key:
+                self._f._session_classify_cache[cache_key] = (True, time.time())
+            return True
+
+        # ── Check the cache (only when there are no active blocks) ────────
+        if cache_key is not None:
             cached = self._f._session_classify_cache.get(cache_key)
             if cached is not None:
                 result, ts = cached
@@ -11203,12 +11220,7 @@ class InletOrchestrator:
                     return result
                 del self._f._session_classify_cache[cache_key]
 
-        state = self._f._state_store.get_state(project_id)
-        if state and state.get("active_blocks"):
-            if cache_key:
-                self._f._session_classify_cache[cache_key] = (True, time.time())
-            return True
-
+        # ── Heuristics for messages without active blocks ─────────────────
         for msg in reversed(messages[-10:]):
             if msg.get("role") != "user":
                 continue
@@ -11227,10 +11239,8 @@ class InletOrchestrator:
                 self._f._session_classify_cache[cache_key] = (True, time.time())
             return True
 
-        if (
-            last_user
-            and not state.get("active_blocks")
-            and not self._f._commands.has_code_indicators(last_user.get("content", ""))
+        if last_user and not self._f._commands.has_code_indicators(
+            last_user.get("content", "")
         ):
             if len(last_user.get("content", "")) > 200:
                 blocks, _ = await self._f._code_blocks.extract_code_blocks(
@@ -11278,6 +11288,7 @@ class InletOrchestrator:
 
         if cache_key:
             self._f._session_classify_cache[cache_key] = (result, time.time())
+            # Trim cache if it grows too large
             if len(self._f._session_classify_cache) >= 500:
                 items = sorted(
                     self._f._session_classify_cache.items(), key=lambda x: x[1][1]
@@ -11285,7 +11296,6 @@ class InletOrchestrator:
                 self._f._session_classify_cache = dict(items[-400:])
 
         return result
-
 
 class SystemPromptBuilder:
     """
