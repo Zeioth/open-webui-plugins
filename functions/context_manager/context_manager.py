@@ -10696,9 +10696,6 @@ class EnrichmentTasks:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self._lazy_docstrings_generated_this_turn: int = 0
-        self._docstrings_in_flight: Set[str] = set()
-        self._docstring_tasks: Set[asyncio.Task] = set()
-        self._active_bg_event: Optional[asyncio.Event] = None
         self._active_bg_task: Optional[asyncio.Task] = None
 
     async def generate_change_summary(
@@ -11208,114 +11205,56 @@ class EnrichmentTasks:
 
         return sys_msgs + history
 
-    async def _background_docstring(
-        self, name: str, signature: str, project_id: str
-    ) -> None:
-        """Generate one docstring in background, persist it, and remove from in‑flight set."""
-        # Mark this task as the active one so the inlet can wait for it
-        self._active_bg_event = asyncio.Event()
-        self._active_bg_task = asyncio.current_task()
-        try:
-            state = self._f._state_store.get_state(project_id)
-            snippet = ""
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if sym.name == name:
-                        snippet = block.content[:500]
-                        break
-                if snippet:
-                    break
-
-            docstring = await self._f._llm_orchestrator.call_llm(
-                prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
-                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                model_override=self._f.valves.llm_model,
-                max_tokens=50,
-                temperature=0.1,
-                label="bg_docstring",
-            )
-            if not docstring or not docstring.strip():
-                return
-
-            docstring = docstring.strip()
-
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                state = self._f._state_store.get_state(project_id)
-                for block in state["active_blocks"].values():
-                    for sym in block.symbols:
-                        if sym.name == name:
-                            sym.docstring = docstring
-                            self._f._symbol_index.update_docstring(
-                                name, project_id, docstring
-                            )
-                            break
-                self._f._state_store.set_state(project_id, state)
-
-            await self._f._state_store._db_enqueue(
-                lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
-                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                    (pid, n, d, time.time()),
-                )
-            )
-        finally:
-            self._docstrings_in_flight.discard(name)
-            if self._active_bg_task is asyncio.current_task():
-                self._active_bg_event = None
-                self._active_bg_task = None
-
     async def cancel_docstring_tasks(self) -> None:
         """
-        Cancel pending background docstring tasks gracefully.
+        Cancel the background docstring generation loop gracefully.
 
-        If a task is currently in flight (inside the LLM call), wait for it to
-        finish so the slot is released cleanly. All other queued tasks are
-        cancelled immediately and their symbols will be picked up by the lazy
-        generator if needed.
+        If a docstring task is currently in flight (inside the LLM call), wait
+        for it to finish so the slot is released cleanly.
         """
-        # 1. Cancel all tasks that are NOT the currently active one
-        active_task = self._active_bg_task
-        for task in list(self._docstring_tasks):
-            if task is not active_task:
-                task.cancel()
-        self._docstring_tasks.clear()
-
-        # 2. Wait for the active task (if any) to finish
-        if active_task and not active_task.done():
+        if self._active_bg_task is not None and not self._active_bg_task.done():
+            self._active_bg_task.cancel()
             try:
-                await asyncio.wait_for(active_task, timeout=30.0)
+                await asyncio.wait_for(self._active_bg_task, timeout=30.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-
-        # 3. Final cleanup
-        self._docstrings_in_flight.clear()
-        self._active_bg_event = None
         self._active_bg_task = None
 
-    def schedule_docstrings(
-        self, pending: List[Tuple[str, str]], project_id: str
-    ) -> None:
+    async def _docstring_generation_loop(self, project_id: str) -> None:
         """
-        Launch background tasks to generate docstrings for the given symbols.
-        Does NOT await the tasks; they run independently. Only ONE task is
-        launched per call to avoid saturating the single inference slot.
-        The rest will be picked up on subsequent turns.
+        Background loop that generates docstrings one at a time until no
+        pending symbols remain.  Yields between generations to avoid
+        saturating the server.
         """
-        if not pending:
-            return
-        for name, signature in pending:
-            if name in self._docstrings_in_flight:
-                continue
-            self._docstrings_in_flight.add(name)
-            task = asyncio.create_task(
-                self._background_docstring(name, signature, project_id)
-            )
-            self._docstring_tasks.add(task)
-            task.add_done_callback(
-                lambda t, n=name: self._docstrings_in_flight.discard(n)
-            )
-            self._f._log_debug(f"📝 Docstring task launched for '{name}'")
-            break  # solo una tarea por llamada
+        while True:
+            state = self._f._state_store.get_state(project_id)
+            pending = []
+            for block in state["active_blocks"].values():
+                if block.obsolete:
+                    continue
+                for sym in block.symbols:
+                    if sym.kind in ("function", "method") and not sym.docstring:
+                        pending.append((sym.name, sym.signature))
+            if not pending:
+                break
+
+            # Find the first symbol without a docstring
+            name, signature = pending[0]
+            # Run the generation synchronously (one at a time inside the loop)
+            await self._background_docstring(name, signature, project_id)
+            # Small pause between tasks
+            await asyncio.sleep(1)
+
+    def start_docstring_loop(self, project_id: str) -> None:
+        """
+        Launch the background docstring generation loop (if not already running).
+        """
+        if self._active_bg_task is not None and not self._active_bg_task.done():
+            return  # loop already running
+
+        self._active_bg_task = asyncio.create_task(
+            self._docstring_generation_loop(project_id)
+        )
 
 
 class ActiveCodeUpdater:
@@ -15395,9 +15334,7 @@ class Filter:
                                         ):
                                             pending.append((sym.name, sym.signature))
                                 if pending:
-                                    self._enrichment.schedule_docstrings(
-                                        pending, project_id
-                                    )
+                                    self._enrichment.start_docstring_loop(project_id)
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 self._log_debug(
