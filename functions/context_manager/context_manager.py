@@ -862,23 +862,23 @@ class ContextPager:
         embedder,
     ) -> bool:
         """
-        Soft-evict `block` to ChromaDB.
+        Soft‑evict `block` to ChromaDB **without blocking**.
 
-        The caller is responsible for removing the block from active_blocks
-        AFTER this returns True. Symbols remain in the SymbolIndex (the block
-        is still indexed and searchable, just not resident in RAM). The full
-        body stays in the SQLite code_contents table; we do not duplicate it.
-
-        Returns True if the ChromaDB write succeeded, False otherwise (in which
-        case the caller must keep the block in active_blocks).
+        The block is removed from active_blocks synchronously; the actual
+        embedding and ChromaDB upsert are offloaded to a background task.
+        The full body stays in the SQLite code_contents table, so the block
+        can always be reconstructed later.
         """
         if chroma_collection is None or embedder is None:
             return False
 
+        # Capture the data needed for the background task
         entry_id = f"{project_id}_paged_{block.hash}"
         excerpt = block.content[:500]
         symbol_names = ",".join(s.name for s in block.symbols)
-
+        safe_text = block.content
+        if hasattr(self._f, "_tokens"):
+            safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
         metadata = {
             "project_id": project_id,
             "is_paged_block": True,
@@ -890,13 +890,33 @@ class ContextPager:
             "symbol_names": symbol_names,
         }
 
+        # Offload the heavy embedding + upsert
+        asyncio.create_task(
+            self._page_out_async(
+                entry_id=entry_id,
+                safe_text=safe_text,
+                excerpt=excerpt,
+                metadata=metadata,
+                embedder=embedder,
+                chroma_collection=chroma_collection,
+            )
+        )
+
+        # Mark as paged immediately so the caller can remove the block
+        self._paged_hashes.setdefault(project_id, set()).add(block.hash)
+        return True
+
+    async def _page_out_async(
+        self,
+        entry_id: str,
+        safe_text: str,
+        excerpt: str,
+        metadata: dict,
+        embedder,
+        chroma_collection,
+    ) -> None:
+        """Background task for embedding and upserting a paged block."""
         try:
-            safe_text = block.content
-            # Requires an embedder supporting 32768 of context or more.
-            if hasattr(self, "_f") and hasattr(self._f, "_tokens"):
-                safe_text = self._f._tokens.truncate_text_to_tokens(
-                    block.content, 32768
-                )
             embedding = await anyio.to_thread.run_sync(
                 lambda: embedder.encode(safe_text).tolist()
             )
@@ -909,10 +929,8 @@ class ContextPager:
                 )
             )
         except Exception:
-            return False
-
-        self._paged_hashes.setdefault(project_id, set()).add(block.hash)
-        return True
+            # Best effort; the block content is still in SQLite
+            pass
 
     async def purge_old_versions(
         self,
@@ -5330,8 +5348,14 @@ class LongTermMemory:
     # Message storage
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def store_messages(self, project_id: str, messages: list) -> None:
-        """Store user/assistant messages in the LTM ChromaDB collection."""
+    async def store_messages(
+        self, project_id: str, messages: list, wait: bool = True
+    ) -> None:
+        """Store user/assistant messages in the LTM ChromaDB collection.
+
+        If `wait` is False, the actual embedding and upsert run in a background
+        task and the method returns immediately.
+        """
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return
         valid = [
@@ -5342,6 +5366,12 @@ class LongTermMemory:
         if not valid:
             return
 
+        if not wait:
+            # Offload the heavy embedding to a background task
+            asyncio.create_task(self._store_messages_async(project_id, valid))
+            return
+
+        # Original synchronous path (unchanged)
         texts_for_embedding: List[str] = []
         documents_to_store: List[str] = []
         ids = []
@@ -5447,6 +5477,105 @@ class LongTermMemory:
                 )
             )
 
+    async def _store_messages_async(self, project_id: str, valid: list) -> None:
+        """Store each message one by one, offloading embedding to a thread."""
+        for msg in valid:
+            try:
+                await self._store_single_message(project_id, msg)
+            except Exception as e:
+                self._f._log_debug(f"Async LTM store failed: {e}")
+
+    async def _store_single_message(self, project_id: str, msg: dict) -> None:
+        """Embed and insert a single message into ChromaDB (used by async path)."""
+        content = msg["content"]
+        extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
+        content_type = self._f._code_blocks.classify_content(content, extracted)
+
+        ctx_symbols: List[str] = []
+        for blk in extracted[:3]:
+            try:
+                syms = await SignatureExtractor.extract_async(
+                    blk["code"], blk.get("language")
+                )
+                for sym in syms:
+                    if self._is_symbol_indexable(sym):
+                        ctx_symbols.append(sym.name)
+                        if len(ctx_symbols) >= 10:
+                            break
+            except Exception:
+                pass
+
+        ctx_file_paths: List[str] = []
+        if self._f.valves.track_file_paths:
+            ctx_file_paths = self._f._code_blocks.extract_file_paths(content)[:3]
+
+        context_prefix = await self._build_retrieval_context(
+            content=content,
+            project_id=project_id,
+            role=msg.get("role", "user"),
+            code_symbols=ctx_symbols[:6],
+            file_paths=ctx_file_paths,
+            content_type=content_type.value,
+        )
+
+        contextual_doc = context_prefix + content
+        safe_text = self._f._tokens.truncate_text_to_tokens(contextual_doc, 32768)
+        now = time.time()
+
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode(safe_text).tolist()
+        )
+
+        msg_id = (
+            f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+        )
+        expires_at = (
+            now + (self._f.valves.long_term_memory_expiration_days * 86400)
+            if self._f.valves.long_term_memory_expiration_days > 0
+            else None
+        )
+
+        code_symbols_str = ""
+        if self._f.valves.ltm_index_symbols_enabled:
+            all_syms = set()
+            for blk in extracted:
+                try:
+                    syms = await SignatureExtractor.extract_async(
+                        blk["code"], blk.get("language")
+                    )
+                    for sym in syms:
+                        if self._is_symbol_indexable(sym):
+                            all_syms.add(sym.name)
+                            if (
+                                len(all_syms)
+                                >= self._f.valves.ltm_symbol_index_max_per_message
+                            ):
+                                break
+                except Exception:
+                    pass
+            if all_syms:
+                code_symbols_str = "," + ",".join(sorted(all_syms)) + ","
+
+        metadata = {
+            "role": msg.get("role"),
+            "project_id": project_id,
+            "timestamp": now,
+            "expires_at": expires_at,
+            "content_type": content_type.value,
+            "has_code": len(extracted) > 0,
+            "code_symbols": code_symbols_str,
+            "memory_id": msg_id,
+        }
+
+        await anyio.to_thread.run_sync(
+            lambda: self._f.memory_collection.upsert(
+                ids=[msg_id],
+                embeddings=[embedding],
+                metadatas=[metadata],
+                documents=[contextual_doc],
+            )
+        )
+
     async def store_response_in_cache(
         self,
         query: str,
@@ -5454,12 +5583,37 @@ class LongTermMemory:
         context_hash: str,
         state: dict,
         code_state_hash: str,
+        wait: bool = True,
     ) -> None:
-        """Store a response in the ChromaDB response cache for future reuse."""
+        """Store a response in the ChromaDB response cache for future reuse.
+        If `wait` is False, the embedding and upsert are offloaded to a background task.
+        """
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return
         if not query or not response:
             return
+
+        if not wait:
+            asyncio.create_task(
+                self._store_response_in_cache_async(
+                    query, response, context_hash, state, code_state_hash
+                )
+            )
+            return
+
+        await self._store_response_in_cache_sync(
+            query, response, context_hash, state, code_state_hash
+        )
+
+    async def _store_response_in_cache_sync(
+        self,
+        query: str,
+        response: str,
+        context_hash: str,
+        state: dict,
+        code_state_hash: str,
+    ) -> None:
+        """Synchronous version of response cache storage."""
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
             return
@@ -5510,6 +5664,22 @@ class LongTermMemory:
         self._f._response_cache_count[project] = (
             self._f._response_cache_count.get(project, 0) + 1
         )
+
+    async def _store_response_in_cache_async(
+        self,
+        query: str,
+        response: str,
+        context_hash: str,
+        state: dict,
+        code_state_hash: str,
+    ) -> None:
+        """Background wrapper for response cache storage."""
+        try:
+            await self._store_response_in_cache_sync(
+                query, response, context_hash, state, code_state_hash
+            )
+        except Exception as e:
+            self._f._log_debug(f"Async response cache store failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Maintenance
@@ -5617,6 +5787,10 @@ class LLMOrchestrator:
         ``llm_retry_total_timeout`` is used.
         Between retries, a fixed 1‑second pause is applied.
         """
+        # ── Silent ingestion guard: never call the LLM during code ingestion ──
+        if getattr(self._f, "_is_silent_ingestion", False):
+            return None
+
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -9556,9 +9730,11 @@ class EnrichmentTasks:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
-        self._docstrings_in_flight: Set[str] = set()
         self._lazy_docstrings_generated_this_turn: int = 0
+        self._docstrings_in_flight: Set[str] = set()
         self._docstring_tasks: Set[asyncio.Task] = set()
+        self._active_bg_event: Optional[asyncio.Event] = None
+        self._active_bg_task: Optional[asyncio.Task] = None
 
     async def generate_change_summary(
         self,
@@ -9900,9 +10076,8 @@ class EnrichmentTasks:
     async def ensure_docstring(self, name: str, project_id: str) -> str:
         """
         Return the docstring for `name`, generating and persisting it on the fly
-        if missing.  If a background task is already working on this symbol,
-        return "" immediately to avoid duplicate work.  Respects the per‑turn
-        lazy generation limit (lazy_docstring_max_per_turn).
+        if missing.  Respects the per‑turn lazy generation limit
+        (lazy_docstring_max_per_turn).
         """
         # 1. Already in memory?
         state = self._f._state_store.get_state(project_id)
@@ -9932,11 +10107,7 @@ class EnrichmentTasks:
                         break
             return doc
 
-        # 3. Already being generated in background? → skip (no blocking)
-        if name in self._docstrings_in_flight:
-            return ""
-
-        # 4. Respect per‑turn lazy generation limit
+        # 3. Respect per‑turn lazy generation limit
         if self._f.valves.lazy_docstring_max_per_turn > 0:
             if (
                 self._lazy_docstrings_generated_this_turn
@@ -9944,7 +10115,7 @@ class EnrichmentTasks:
             ):
                 return ""
 
-        # 5. Generate synchronously
+        # 4. Generate synchronously
         signature = name
         snippet = ""
         for block in state["active_blocks"].values():
@@ -9986,47 +10157,132 @@ class EnrichmentTasks:
         self._lazy_docstrings_generated_this_turn += 1
         return docstring
 
-    def schedule_docstrings(
-        self, symbols: List[Tuple[str, str]], project_id: str
-    ) -> None:
-        if not self._f.valves.enable_auto_docstrings:
-            return
+    async def _apply_turn_based_window(
+        self,
+        messages: List[dict],
+        state: dict,
+        project_id: str,
+        slot_free: bool,
+    ) -> List[dict]:
+        """
+        Summarize turns past `summarize_after_turns` and evict raw turns past
+        `evict_raw_after_turns`, enforcing the no-degradation guard: a raw turn
+        is dropped from the prompt only when `summarized_turn_hwm` already covers
+        it (i.e. a persisted summary + LTM copy exists).
 
-        state = self._f._state_store.get_state(project_id)
-        for name, signature in symbols:
-            if name in self._docstrings_in_flight:
-                continue
-            in_memory = False
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if sym.name == name and sym.docstring:
-                        in_memory = True
-                        break
-                if in_memory:
-                    break
-            if in_memory:
-                continue
+        Idempotent: the turn count is derived from the message list each call;
+        `summarized_turn_hwm` is the only persisted bookkeeping. Returns the
+        (possibly reduced) message list. Summary generation is skipped when
+        `slot_free` is False to avoid dirtying the KV slot during AutoContinue;
+        eviction of already-covered turns still proceeds (no LLM needed).
+        """
+        if not self._f.valves.enable_turn_based_eviction:
+            return messages
 
-            self._docstrings_in_flight.add(name)
-            task = asyncio.create_task(
-                self._background_docstring(name, signature, project_id)
+        # #16/P7: never compact mid-AutoContinue — rewriting history during
+        # multi-part code generation breaks the KV cache at the worst moment.
+        if (
+            self._f.valves.compaction_defer_during_autocontinue
+            and self._is_autocontinue_active(messages)
+        ):
+            self._f._log_debug(
+                "Turn-based compaction deferred: AutoContinue session active"
             )
-            self._docstring_tasks.add(task)
-            task.add_done_callback(self._docstring_tasks.discard)
+            return messages
 
-    def cancel_docstring_tasks(self) -> None:
-        """Cancel all pending background docstring tasks and clear tracking sets."""
-        for task in list(self._docstring_tasks):
-            task.cancel()
-        self._docstring_tasks.clear()
-        self._docstrings_in_flight.clear()
+        summarize_after = self._f.valves.summarize_after_turns
+        evict_after = self._f.valves.evict_raw_after_turns
+
+        # Config sanity: eviction window must be strictly older than summary window
+        if evict_after <= summarize_after:
+            self._f._log_debug(
+                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
+                "skipping window this request."
+            )
+            return messages
+
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        history = [m for m in messages if m.get("role") != "system"]
+        if not history:
+            return messages
+
+        turns, total_turns = self._index_turns(history)
+        if total_turns <= summarize_after:
+            return messages  # nothing old enough yet
+
+        # ── Step 1: summarize the unsummarized band, in batches ───────────
+        summarize_target = (
+            total_turns - summarize_after
+        )  # turns ≤ this must be summarized
+        hwm = state.get("summarized_turn_hwm", 0)
+
+        if (
+            slot_free
+            and summarize_target > hwm
+            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
+        ):
+            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
+            if band:
+                has_code = any("```" in m.get("content", "") for m in band)
+                summary = await self._f._history_compressor.summarize_messages(
+                    band, is_code_context=has_code
+                )
+                if summary:
+                    state["conversation_summaries"].append(
+                        {
+                            "text": summary,
+                            "created_at": time.time(),
+                            "covers_msgs": len(band),
+                            "covers_turns": [hwm + 1, summarize_target],
+                        }
+                    )
+                    await self._persist_turn_summary_to_ltm(
+                        summary, project_id, hwm + 1, summarize_target
+                    )
+                    # Hierarchical consolidation + level-aware cap (replaces the
+                    # flat cap). Folds oldest L1 summaries into an L2 so broad
+                    # coverage survives the cap; also persists state.
+                    await self._consolidate_summaries(state, project_id, slot_free)
+                    state["summarized_turn_hwm"] = summarize_target
+                    self._f._state_store.set_state(project_id, state)
+                    self._f._log_debug(
+                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
+                        f"({len(band)} msgs); HWM now {summarize_target}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Turn-based: summary generation failed — raw turns kept "
+                        "(no-degradation guard, HWM unchanged)."
+                    )
+
+        # ── Step 2: evict raw turns past the eviction window, if covered ──
+        evict_target = total_turns - evict_after  # turns ≤ this may be dropped
+        current_hwm = state.get("summarized_turn_hwm", 0)
+        if evict_target > 0 and current_hwm >= evict_target:
+            kept = [m for m, t in zip(history, turns) if t > evict_target]
+            dropped = len(history) - len(kept)
+            if dropped:
+                self._f._log_debug(
+                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
+                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
+                )
+            history = kept
+        elif evict_target > 0:
+            self._f._log_debug(
+                f"Turn-based: eviction deferred — summaries cover up to turn "
+                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
+            )
+
+        return sys_msgs + history
 
     async def _background_docstring(
         self, name: str, signature: str, project_id: str
     ) -> None:
         """Generate one docstring in background, persist it, and remove from in‑flight set."""
+        # Mark this task as the active one so the inlet can wait for it
+        self._active_bg_event = asyncio.Event()
+        self._active_bg_task = asyncio.current_task()
         try:
-            # Re‑fetch snippet (may have been evicted; best effort)
             state = self._f._state_store.get_state(project_id)
             snippet = ""
             for block in state["active_blocks"].values():
@@ -10050,7 +10306,6 @@ class EnrichmentTasks:
 
             docstring = docstring.strip()
 
-            # Persist and update memory
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
                 state = self._f._state_store.get_state(project_id)
@@ -10072,322 +10327,58 @@ class EnrichmentTasks:
             )
         finally:
             self._docstrings_in_flight.discard(name)
+            if self._active_bg_task is asyncio.current_task():
+                self._active_bg_event = None
+                self._active_bg_task = None
 
+    async def cancel_docstring_tasks(self) -> None:
+        """
+        Cancel pending background docstring tasks gracefully.
 
-async def _background_docstring(
-    self, name: str, signature: str, project_id: str
-) -> None:
-    """Generate one docstring in background, persist it, and remove from in‑flight set."""
-    try:
-        # Re‑fetch snippet (may have been evicted; best effort)
-        state = self._f._state_store.get_state(project_id)
-        snippet = ""
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.name == name:
-                    snippet = block.content[:500]
-                    break
-            if snippet:
-                break
+        If a task is currently in flight (inside the LLM call), wait for it to
+        finish so the slot is released cleanly. All other queued tasks are
+        cancelled immediately and their symbols will be picked up by the lazy
+        generator if needed.
+        """
+        # 1. Cancel all tasks that are NOT the currently active one
+        active_task = self._active_bg_task
+        for task in list(self._docstring_tasks):
+            if task is not active_task:
+                task.cancel()
+        self._docstring_tasks.clear()
 
-        docstring = await self._f._llm_orchestrator.call_llm(
-            prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
-            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-            model_override=self._f.valves.llm_model,
-            max_tokens=50,
-            temperature=0.1,
-            label="bg_docstring",
-        )
-        if not docstring or not docstring.strip():
-            return
+        # 2. Wait for the active task (if any) to finish
+        if active_task and not active_task.done():
+            try:
+                await asyncio.wait_for(active_task, timeout=30.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
-        docstring = docstring.strip()
+        # 3. Final cleanup
+        self._docstrings_in_flight.clear()
+        self._active_bg_event = None
+        self._active_bg_task = None
 
-        # Persist and update memory
-        lock = await self._f._state_store.get_project_lock(project_id)
-        async with lock:
-            state = self._f._state_store.get_state(project_id)
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if sym.name == name:
-                        sym.docstring = docstring
-                        self._f._symbol_index.update_docstring(
-                            name, project_id, docstring
-                        )
-                        break
-            self._f._state_store.set_state(project_id, state)
-
-        await self._f._state_store._db_enqueue(
-            lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
-                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                (pid, n, d, time.time()),
-            )
-        )
-    finally:
-        self._docstrings_in_flight.discard(name)
-
-    async def run_session_summary_task(self, params: dict, model: str) -> bool:
-        """Generate an autobiographical session summary and store it in LTM."""
-        project_id = params["project_id"]
-        code_state_hash = params.get("code_state_hash", "")
-
-        recent = await self._f._ltm.retrieve_historical_messages(
-            query="recent conversation summary",
-            project_id=project_id,
-            limit=self._f.valves.session_summary_interval_messages,
-        )
-        if not recent:
-            return False
-
-        conversation_text = "\n".join(
-            f"{m['role']}: {m['content'][:300]}" for m in recent
-        )
-        prompt = (
-            "Summarise the following conversation segment in 2-3 sentences, "
-            "capturing the main task, decisions made, files modified, "
-            "and architectural changes:\n\n"
-            f"{conversation_text[:3000]}"
-        )
-        summary = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
-            model_override=model,
-            max_tokens=self._f.valves.session_summary_max_tokens,
-            temperature=0.2,
-            label="session_summary",
-        )
-        if not summary:
-            return False
-
-        msg_id = f"{project_id}_session_summary_{int(time.time())}"
-        embedding = await anyio.to_thread.run_sync(
-            lambda: self._f.embedder.encode(summary).tolist()
-        )
-        await anyio.to_thread.run_sync(
-            lambda: self._f.memory_collection.upsert(
-                ids=[msg_id],
-                embeddings=[embedding],
-                metadatas=[
-                    {
-                        "role": "assistant",
-                        "project_id": project_id,
-                        "timestamp": time.time(),
-                        "is_session_summary": True,
-                        "code_state_hash": code_state_hash,
-                        "content_type": ContentType.GENERAL.value,
-                        "has_code": False,
-                    }
-                ],
-                documents=[f"[Session summary]\n{summary}"],
-            )
-        )
-        self._f._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
-        return True
-
-    def update_mentions_from_message(
-        self,
-        state: dict,
-        message_content: str,
-        project_id: str,
+    def schedule_docstrings(
+        self, pending: List[Tuple[str, str]], project_id: str
     ) -> None:
         """
-        Increment mention counts for symbols referenced in the message content,
-        and mark the corresponding blocks as recently mentioned.
+        Launch background tasks to generate docstrings for the given symbols.
+        Does NOT await the tasks; they run independently. The tasks are stored
+        in self._docstring_tasks so they can be cancelled by the inlet later.
         """
-        if not message_content:
+        if not pending:
             return
-        all_symbol_names = self._f._symbol_index.get_all_names(project_id)
-        words = set(re.findall(r"\b[\w-]+\b", message_content))
-        mentioned_names = all_symbol_names.intersection(words)
-        if not mentioned_names:
-            return
-        affected_blocks: Set[str] = set()
-        for name in mentioned_names:
-            affected_blocks.update(self._f._symbol_index.find_blocks(name, project_id))
-        for block_hash in affected_blocks:
-            block = state["active_blocks"].get(block_hash)
-            if block:
-                block.mention_count += 1
-                block.last_mentioned = time.time()
-                block.last_mentioned_msg_idx = state["message_count"]
-                block._update_importance()
-
-    async def expire_blocks_by_time(self, project_id: str) -> None:
-        """Remove blocks that have not been mentioned recently, based on configured timeouts."""
-        lock = await self._f._state_store.get_project_lock(project_id)
-        async with lock:
-            state = self._f._state_store.get_state(project_id)
-            if not state:
-                return
-            now = time.time()
-            expiration_seconds = self._f.valves.block_expiration_hours * 3600
-            to_remove = []
-            for h, block in state["active_blocks"].items():
-                if block.pinned or block.obsolete:
-                    continue
-                age = now - block.last_mentioned
-                if (
-                    block.content_type == ContentType.ERROR
-                    and self._f.valves.error_retention_turns > 0
-                ):
-                    if age > max(
-                        self._f.valves.error_retention_turns * 300, expiration_seconds
-                    ):
-                        to_remove.append(h)
-                elif (
-                    block.content_type == ContentType.PROPOSED_CHANGE
-                    and self._f.valves.proposed_change_retention_turns > 0
-                ):
-                    if age > max(
-                        self._f.valves.proposed_change_retention_turns * 300,
-                        expiration_seconds,
-                    ):
-                        to_remove.append(h)
-            for h in to_remove:
-                if h in state["active_blocks"]:
-                    block = state["active_blocks"][h]
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                del state["active_blocks"][h]
-            if to_remove:
-                state["has_any_calls"] = any(
-                    any(s.calls for s in b.symbols)
-                    for b in state["active_blocks"].values()
-                )
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-
-    async def update_lod_thresholds_from_response(
-        self,
-        project_id: str,
-        response_text: str,
-    ) -> None:
-        """
-        Adjust lod3_threshold based on which symbols appear in the LLM's
-        response compared to the LOD level they received.
-
-        Logic:
-        - If the LLM mentions symbols that only got LOD ≤ 2 (docstring/signature):
-          → Lower lod3_threshold: give more full code next time.
-        - If the LLM does NOT mention symbols that got LOD 3 (full code):
-          → Raise lod3_threshold slightly: those expansions were unnecessary.
-
-        Adjustments are small (lod_adapt_rate) and bounded [min, max].
-        Threshold state is NOT persisted across server restarts.
-        """
-        if not self._f.valves.enable_lod_adaptive:
-            return
-
-        last_lod_map = getattr(self._f, "_last_lod_levels", {}).get(project_id, {})
-        if not last_lod_map:
-            return
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        response_words = set(re.findall(r"\b\w+\b", response_text))
-        referenced = all_names.intersection(response_words)
-
-        # Symbols mentioned in the response that only received docstring/signature
-        underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
-
-        # Symbols that got full code but do not appear in the response
-        overserved = [
-            sym
-            for sym in last_lod_map
-            if last_lod_map[sym] == 3 and sym not in referenced
-        ]
-
-        old_threshold = self._f.valves.lod3_threshold
-        changed = False
-
-        if len(underserved) >= self._f.valves.lod_adapt_underserved_min:
-            # Lower threshold → more full code next time
-            self._f.valves.lod3_threshold = max(
-                self._f.valves.lod_adapt_min,
-                self._f.valves.lod3_threshold - self._f.valves.lod_adapt_rate,
+        for name, signature in pending:
+            # Evitar duplicados si ya hay una tarea en vuelo para ese símbolo
+            if name in self._docstrings_in_flight:
+                continue
+            self._docstrings_in_flight.add(name)
+            task = asyncio.create_task(
+                self._background_docstring(name, signature, project_id)
             )
-            changed = True
-            self._f._log_debug(
-                f"LOD adaptive ↓: threshold {old_threshold:.2f} → "
-                f"{self._f.valves.lod3_threshold:.2f} "
-                f"({len(underserved)} underserved: {underserved[:3]})"
-            )
-        elif len(overserved) >= self._f.valves.lod_adapt_overserved_min:
-            # Raise threshold → fewer unnecessary expansions
-            self._f.valves.lod3_threshold = min(
-                self._f.valves.lod_adapt_max,
-                self._f.valves.lod3_threshold + self._f.valves.lod_adapt_rate * 0.5,
-            )
-            changed = True
-            self._f._log_debug(
-                f"LOD adaptive ↑: threshold {old_threshold:.2f} → "
-                f"{self._f.valves.lod3_threshold:.2f} "
-                f"({len(overserved)} overserved symbols)"
-            )
-
-        if not changed:
-            self._f._log_debug(
-                f"LOD adaptive: no adjustment needed "
-                f"(threshold={self._f.valves.lod3_threshold:.2f})"
-            )
-
-    def get_feedback_context(self, project_id: str) -> str:
-        """Return a formatted string of recent feedback for the given project."""
-        state = self._f._state_store.get_state(project_id)
-        feedback = state.get("feedback_history", [])
-        if not feedback:
-            return ""
-        recent = feedback[-self._f.valves.feedback_history_limit :]
-        lines = ["## Previous Feedback"]
-        for fb in recent:
-            success = "✅" if fb.success else "❌"
-            lines.append(f"- {success} {fb.change_description[:100]}")
-        return "\n".join(lines)
-
-    async def parallel_context_checks(
-        self,
-        messages: list,
-        query: str,
-        context_hash: str,
-        project_id: str,
-        state: dict,
-        skip_contradiction: bool = False,
-        skip_cache: bool = False,
-    ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
-        """
-        Run contradiction detection, response cache lookup, and duplicate question
-        detection in parallel. Returns (contradiction_warning, cached_response,
-        duplicate_match). All three can be None.
-        """
-        tasks = [
-            (
-                self._f._commands._detect_contradictions(messages)
-                if (
-                    self._f.valves.enable_contradiction_detection
-                    and not skip_contradiction
-                )
-                else asyncio.sleep(0, result=None)
-            ),
-            (
-                self._f._ltm.find_cached_response(query, context_hash, state)
-                if (
-                    self._f.valves.enable_response_cache
-                    and HAS_SENTENCE
-                    and not skip_cache
-                )
-                else asyncio.sleep(0, result=None)
-            ),
-            (
-                self._f._ltm.find_duplicate_question(query, project_id)
-                if (self._f.valves.duplicate_question_threshold and HAS_SENTENCE)
-                else asyncio.sleep(0, result=None)
-            ),
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        contradiction = results[0] if not isinstance(results[0], Exception) else None
-        cached = results[1] if not isinstance(results[1], Exception) else None
-        duplicate = results[2] if not isinstance(results[2], Exception) else None
-        return contradiction, cached, duplicate
+            self._docstring_tasks.add(task)
+            task.add_done_callback(lambda t: self._docstring_tasks.discard(t))
 
 
 class ActiveCodeUpdater:
@@ -11927,8 +11918,6 @@ class MessageAssembler:
         _cot_context_limit = _model_ctx // 3
 
         # Architecture-mode: replace the full system prompt with the skeleton
-        # as CoT context. The skeleton (~1-3K tokens) gives the reasoning model
-        # a contracts-first view of the codebase without the LOD noise.
         _is_arch = (
             self._f.valves.enable_skeleton_cot
             and self._f._reasoning.is_architecture_query(user_question)
@@ -12046,9 +12035,7 @@ class MessageAssembler:
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
 
-        # Auto-resolve /expand hints emitted by the architecture CoT before
-        # the reasoning reaches the main model. Only in arch mode (the standard
-        # CoT generators do not emit /expand markers).
+        # Auto-resolve /expand hints emitted by the architecture CoT
         if _is_arch:
             try:
                 reasoning = await self._f._ctx_builder._resolve_cot_expands(
@@ -12116,6 +12103,41 @@ class MessageAssembler:
                 compressed = sys_msgs + kept
 
         return compressed
+
+    async def _compress_code_history_and_lean(
+        self,
+        messages: List[dict],
+        project_id: str,
+        dynamic_injections: List[Tuple[str, str]],
+    ) -> List[dict]:
+        """Apply code history compression and lean user code if enabled."""
+        if not (
+            self._f.valves.enable_code_history_compression
+            or self._f.valves.enable_lean_user_code
+        ):
+            return messages
+
+        if self._f.valves.enable_code_history_compression:
+            messages = self._f._history_compressor.compress_code_history(
+                messages, project_id
+            )
+
+        if self._f.valves.enable_lean_user_code:
+            messages = self._f._history_compressor.lean_user_code_messages(
+                messages, project_id
+            )
+
+        _refactor_state = self._f._history_compressor.build_refactor_state_injection(
+            messages
+        )
+        if _refactor_state:
+            dynamic_injections.append(("medium", _refactor_state))
+            self._f._log_debug(
+                "Code history: injected refactor state into Block B "
+                f"({self._f._tokens.estimate_code_tokens(_refactor_state)} tokens)."
+            )
+
+        return messages
 
     def _assemble_final_system_and_log(
         self,
@@ -12239,10 +12261,6 @@ class MessageAssembler:
             self._f._log_debug("─" * 60)
 
         # ── Context dump (evolution tracking) ─────────────────────────
-        # Capture exactly what the model will receive this turn. Non-blocking:
-        # the snapshot payload is built synchronously (cheap string copies) and
-        # the disk write is offloaded to a background task. Never raises into
-        # the inlet path.
         if self._f.valves.enable_context_dump:
             try:
                 self._f._context_dumper.schedule_inlet_snapshot(
@@ -12256,6 +12274,519 @@ class MessageAssembler:
                 self._f._log_debug(f"Context dump scheduling failed: {_dump_err}")
 
         return messages
+
+    # ── Turn‑based window helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
+        """Assign a 1‑based turn number to each history message."""
+        turn = 0
+        per_msg: List[int] = []
+        for m in history:
+            if m.get("role") == "user":
+                turn += 1
+            per_msg.append(turn)
+        return per_msg, turn
+
+    def _is_autocontinue_active(self, messages: List[dict]) -> bool:
+        """True if the last assistant message ended with a multi‑part continuation marker."""
+        last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        if not last_assistant:
+            return False
+        content = last_assistant.get("content", "")
+        return any(marker in content for marker in self._f._MULTI_PHASE_MARKERS)
+
+    async def _apply_turn_based_window(
+        self,
+        messages: List[dict],
+        state: dict,
+        project_id: str,
+        slot_free: bool,
+    ) -> List[dict]:
+        """
+        Summarize turns past `summarize_after_turns` and evict raw turns past
+        `evict_raw_after_turns`, enforcing the no-degradation guard.
+        """
+        if not self._f.valves.enable_turn_based_eviction:
+            return messages
+
+        if (
+            self._f.valves.compaction_defer_during_autocontinue
+            and self._is_autocontinue_active(messages)
+        ):
+            self._f._log_debug(
+                "Turn-based compaction deferred: AutoContinue session active"
+            )
+            return messages
+
+        summarize_after = self._f.valves.summarize_after_turns
+        evict_after = self._f.valves.evict_raw_after_turns
+
+        if evict_after <= summarize_after:
+            self._f._log_debug(
+                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
+                "skipping window this request."
+            )
+            return messages
+
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        history = [m for m in messages if m.get("role") != "system"]
+        if not history:
+            return messages
+
+        turns, total_turns = self._index_turns(history)
+        if total_turns <= summarize_after:
+            return messages
+
+        # Step 1: summarize
+        summarize_target = total_turns - summarize_after
+        hwm = state.get("summarized_turn_hwm", 0)
+
+        if (
+            slot_free
+            and summarize_target > hwm
+            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
+        ):
+            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
+            if band:
+                has_code = any("```" in m.get("content", "") for m in band)
+                summary = await self._f._history_compressor.summarize_messages(
+                    band, is_code_context=has_code
+                )
+                if summary:
+                    state["conversation_summaries"].append(
+                        {
+                            "text": summary,
+                            "created_at": time.time(),
+                            "covers_msgs": len(band),
+                            "covers_turns": [hwm + 1, summarize_target],
+                        }
+                    )
+                    await self._persist_turn_summary_to_ltm(
+                        summary, project_id, hwm + 1, summarize_target
+                    )
+                    await self._consolidate_summaries(state, project_id, slot_free)
+                    state["summarized_turn_hwm"] = summarize_target
+                    self._f._state_store.set_state(project_id, state)
+                    self._f._log_debug(
+                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
+                        f"({len(band)} msgs); HWM now {summarize_target}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Turn-based: summary generation failed — raw turns kept "
+                        "(no-degradation guard, HWM unchanged)."
+                    )
+
+        # Step 2: evict
+        evict_target = total_turns - evict_after
+        current_hwm = state.get("summarized_turn_hwm", 0)
+        if evict_target > 0 and current_hwm >= evict_target:
+            kept = [m for m, t in zip(history, turns) if t > evict_target]
+            dropped = len(history) - len(kept)
+            if dropped:
+                self._f._log_debug(
+                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
+                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
+                )
+            history = kept
+        elif evict_target > 0:
+            self._f._log_debug(
+                f"Turn-based: eviction deferred — summaries cover up to turn "
+                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
+            )
+
+        return sys_msgs + history
+
+    async def _persist_turn_summary_to_ltm(
+        self, summary: str, project_id: str, turn_start: int, turn_end: int
+    ) -> None:
+        """Store a turn‑range summary in LTM."""
+        if not (HAS_SENTENCE and HAS_CHROMA and self._f.memory_collection is not None):
+            return
+        try:
+            text = f"[Conversation summary, turns {turn_start}-{turn_end}]\n{summary}"
+            embedding = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(text).tolist()
+            )
+            msg_id = (
+                f"{project_id}_turnsummary_{turn_start}_{turn_end}_{int(time.time())}"
+            )
+            await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.upsert(
+                    ids=[msg_id],
+                    embeddings=[embedding],
+                    documents=[text],
+                    metadatas=[
+                        {
+                            "role": "assistant",
+                            "project_id": project_id,
+                            "timestamp": time.time(),
+                            "is_session_summary": True,
+                            "is_turn_summary": True,
+                            "covers_turn_start": turn_start,
+                            "covers_turn_end": turn_end,
+                            "content_type": ContentType.GENERAL.value,
+                            "has_code": False,
+                        }
+                    ],
+                )
+            )
+        except Exception as e:
+            self._f._log_debug(f"Turn summary LTM persist failed: {e}")
+
+    @staticmethod
+    def _summary_sort_key(s: dict):
+        """Sort key for conversation summaries: by covered turn start, oldest first."""
+        ct = s.get("covers_turns")
+        return ct[0] if ct else s.get("created_at", 0)
+
+    async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
+        """Fuse several L1 turn‑range summaries into one L2 summary via the LLM."""
+        texts: List[str] = []
+        starts: List[int] = []
+        ends: List[int] = []
+        total_msgs = 0
+        for s in group_summaries:
+            t = s.get("text", "")
+            if t:
+                texts.append(t)
+            ct = s.get("covers_turns")
+            if ct:
+                starts.append(ct[0])
+                ends.append(ct[1])
+            total_msgs += s.get("covers_msgs", 0)
+
+        combined = "\n\n".join(f"- {t}" for t in texts)
+        if not combined.strip():
+            return None
+
+        prompt = (
+            "Consolidate these conversation summaries into ONE higher-level "
+            "summary (3-5 sentences). Preserve key decisions, files modified, and "
+            "architectural changes; drop redundancy and chit-chat.\n\n"
+            f"{combined[:4000]}"
+        )
+        merged = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You produce concise hierarchical summaries of technical "
+                "conversations. Output only the summary."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=self._f.valves.hierarchical_summary_max_tokens,
+            temperature=0.2,
+            label="hierarchical_summary",
+        )
+        if not merged or not merged.strip():
+            return None
+
+        return {
+            "text": merged.strip(),
+            "created_at": time.time(),
+            "covers_msgs": total_msgs,
+            "covers_turns": [min(starts) if starts else 0, max(ends) if ends else 0],
+            "level": 2,
+        }
+
+    async def _consolidate_summaries(
+        self, state: dict, project_id: str, slot_free: bool
+    ) -> None:
+        """Consolidate L1 summaries into L2 and apply level‑aware cap."""
+        summaries = state.get("conversation_summaries", [])
+        if not summaries:
+            return
+
+        if slot_free and self._f.valves.enable_hierarchical_summaries:
+            group = self._f.valves.hierarchical_summary_group_size
+            l1 = sorted(
+                (s for s in summaries if s.get("level", 1) == 1),
+                key=self._summary_sort_key,
+            )
+            l2plus = [s for s in summaries if s.get("level", 1) >= 2]
+            if len(l1) >= group:
+                oldest = l1[:group]
+                merged = await self._merge_summaries(oldest)
+                if merged:
+                    summaries = l2plus + [merged] + l1[group:]
+                    self._f._log_debug(
+                        f"Hierarchical: folded {group} L1 summaries into one L2 "
+                        f"covering turns {merged['covers_turns'][0]}–"
+                        f"{merged['covers_turns'][1]}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Hierarchical: L2 merge failed; L1 summaries kept "
+                        "(no-degradation guard)."
+                    )
+
+        max_l1 = self._f.valves.max_conversation_summaries
+        max_l2 = self._f.valves.max_hierarchical_summaries
+        l1 = sorted(
+            (s for s in summaries if s.get("level", 1) == 1),
+            key=self._summary_sort_key,
+        )
+        l2 = sorted(
+            (s for s in summaries if s.get("level", 1) >= 2),
+            key=self._summary_sort_key,
+        )
+        if max_l1 > 0:
+            l1 = l1[-max_l1:]
+        if max_l2 > 0:
+            l2 = l2[-max_l2:]
+        state["conversation_summaries"] = sorted(l2 + l1, key=self._summary_sort_key)
+        self._f._state_store.set_state(project_id, state)
+
+    # ── Multi‑phase instructions ──────────────────────────────────────────
+
+    async def _inject_multi_phase_instructions(
+        self,
+        dynamic_injections: List[Tuple[str, str]],
+        prelim_system: str,
+        messages: List[dict],
+        user_question: str,
+        slot_free: bool,
+    ) -> None:
+        """Inject multi‑phase protocol if the token budget is tight."""
+        if not (
+            self._f.valves.enable_multi_phase_response
+            and self._f.tokenizer
+            and prelim_system
+        ):
+            return
+
+        _prelim_tok: int = len(self._f.tokenizer.encode(prelim_system))
+        _hist_tok: int = self._f._tokens.estimate_tokens(
+            [m for m in messages if m.get("role") != "system"]
+        )
+        _mp_available: int = max(
+            0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
+        )
+
+        if (
+            _mp_available < self._f.valves.multi_phase_response_budget_warn
+            and not self._f.valves.force_multi_phase_response
+        ):
+            self._f._log_debug(
+                f"Multi-phase CRITICAL ({_mp_available} tokens): "
+                "wrap-up hint appended to user message (0 system tokens used)."
+            )
+            self._f._multi_phase.append_critical_wrap_up_hint(messages)
+            return
+
+        if (
+            _mp_available < self._f.valves.multi_phase_response_threshold
+            or self._f.valves.force_multi_phase_response
+        ):
+            _INSTRUCTION_OVERHEAD = 450
+            _mp_budget_reported = max(500, _mp_available - _INSTRUCTION_OVERHEAD)
+            _mp_instructions = self._f._multi_phase.build_multi_phase_instructions(
+                available_tokens=_mp_budget_reported,
+                user_query=user_question,
+                cot_degraded_to_l1=False,
+                is_continuation=not slot_free,
+            )
+            dynamic_injections.append(("critical", _mp_instructions))
+            self._f._log_debug(
+                f"Multi-phase injected (priority=critical): "
+                f"{_mp_available} available, reporting {_mp_budget_reported} to model "
+                f"(overhead={_INSTRUCTION_OVERHEAD})."
+            )
+        else:
+            self._f._log_debug(
+                f"Multi-phase: not needed ({_mp_available} tokens > threshold "
+                f"{self._f.valves.multi_phase_response_threshold})."
+            )
+
+    # ── Adaptive trimming & summarization ─────────────────────────────────
+
+    async def _trim_and_summarize(
+        self,
+        messages: List[dict],
+        state: dict,
+        project_id: str,
+        __user__: Optional[dict],
+    ) -> Tuple[List[dict], str]:
+        """
+        Apply adaptive trimming to fit messages within the token window.
+        Optionally summarize trimmed messages and persist the summary.
+        Returns (updated_messages, pending_summary).
+        """
+        history_msgs = [m for m in messages if m.get("role") != "system"]
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        pending_summary = ""
+
+        # ── v2.0: Proactive history budget enforcement ──────────────────
+        if self._f.valves.history_max_tokens > 0 and self._f.tokenizer:
+            budget = self._f.valves.history_max_tokens
+            kept, used = [], 0
+            for msg in reversed(history_msgs):
+                tok = len(self._f.tokenizer.encode(msg.get("content", "")))
+                if used + tok <= budget:
+                    kept.insert(0, msg)
+                    used += tok
+                else:
+                    # Summarize dropped messages if enabled
+                    if self._f.valves.summarize_old_messages and not pending_summary:
+                        old = [m for m in history_msgs if m not in kept]
+                        if old:
+                            has_code = any("```" in m.get("content", "") for m in old)
+                            summary = (
+                                await self._f._history_compressor.summarize_messages(
+                                    old, is_code_context=has_code
+                                )
+                            )
+                            if summary:
+                                state["conversation_summaries"].append(
+                                    {
+                                        "text": summary,
+                                        "created_at": time.time(),
+                                        "covers_msgs": len(old),
+                                    }
+                                )
+                                cap = self._f.valves.max_conversation_summaries
+                                if (
+                                    cap > 0
+                                    and len(state["conversation_summaries"]) > cap
+                                ):
+                                    dropped = len(state["conversation_summaries"]) - cap
+                                    state["conversation_summaries"] = state[
+                                        "conversation_summaries"
+                                    ][-cap:]
+                                    self._f._log_debug(
+                                        f"Summary cap: dropped {dropped} oldest summary block(s) "
+                                        f"(max_conversation_summaries={cap})"
+                                    )
+                                self._f._state_store.set_state(project_id, state)
+                                pending_summary = (
+                                    f"[Summary of earlier conversation]\n{summary}"
+                                )
+                    break
+            history_msgs = kept
+
+        # ── Existing adaptive_trim logic ─────────────────────────────────
+        if self._f.valves.adaptive_trim:
+            total_tokens = self._f._tokens.estimate_tokens(history_msgs + sys_msgs)
+            if total_tokens > self._f.valves.context_window_tokens:
+                keep = self._f.valves.max_turns
+                last_user_idx = -1
+                for i in range(len(history_msgs) - 1, -1, -1):
+                    if history_msgs[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                if last_user_idx != -1:
+                    start_idx = max(0, last_user_idx - keep + 1)
+                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                    kept_block = history_msgs[start_idx:]
+                else:
+                    old_block = history_msgs[:-keep] if keep > 0 else []
+                    kept_block = history_msgs[-keep:] if keep > 0 else []
+
+                if self._f.valves.summarize_old_messages and old_block:
+                    has_code = any("```" in m.get("content", "") for m in old_block)
+                    summary = await self._f._history_compressor.summarize_messages(
+                        old_block, is_code_context=has_code
+                    )
+                    if summary:
+                        state["conversation_summaries"].append(
+                            {
+                                "text": summary,
+                                "created_at": time.time(),
+                                "covers_msgs": len(old_block),
+                            }
+                        )
+                        cap = self._f.valves.max_conversation_summaries
+                        if cap > 0 and len(state["conversation_summaries"]) > cap:
+                            dropped = len(state["conversation_summaries"]) - cap
+                            state["conversation_summaries"] = state[
+                                "conversation_summaries"
+                            ][-cap:]
+                            self._f._log_debug(
+                                f"Summary cap: dropped {dropped} oldest summary block(s) "
+                                f"(max_conversation_summaries={cap})"
+                            )
+                        self._f._state_store.set_state(project_id, state)
+                        pending_summary = (
+                            f"[Summary of earlier conversation]\n{summary}"
+                        )
+                    history_msgs = kept_block
+                else:
+                    history_msgs = kept_block if old_block else history_msgs
+
+                if self._f.valves.preserve_tool_calls:
+                    while history_msgs and history_msgs[0].get("role") == "tool":
+                        history_msgs.pop(0)
+                    if (
+                        history_msgs
+                        and history_msgs[0].get("role") == "assistant"
+                        and history_msgs[0].get("tool_calls")
+                    ):
+                        tool_call_ids = {
+                            tc.get("id") for tc in history_msgs[0]["tool_calls"]
+                        }
+                        tool_response_ids = {
+                            m.get("tool_call_id")
+                            for m in history_msgs[1:]
+                            if m.get("role") == "tool"
+                        }
+                        if not tool_call_ids.issubset(tool_response_ids):
+                            history_msgs.pop(0)
+        else:
+            user_max = (
+                __user__["valves"].max_turns
+                if __user__ and hasattr(__user__, "valves")
+                else None
+            )
+            eff_max = user_max if user_max is not None else self._f.valves.max_turns
+            if len(history_msgs) > eff_max:
+                keep = eff_max
+                last_user_idx = -1
+                for i in range(len(history_msgs) - 1, -1, -1):
+                    if history_msgs[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                if last_user_idx != -1:
+                    start_idx = max(0, last_user_idx - keep + 1)
+                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                    kept_block = history_msgs[start_idx:]
+                else:
+                    old_block = history_msgs[:-keep] if keep > 0 else []
+                    kept_block = history_msgs[-keep:] if keep > 0 else []
+
+                if self._f.valves.summarize_old_messages and old_block:
+                    has_code = any("```" in m.get("content", "") for m in old_block)
+                    summary = await self._f._history_compressor.summarize_messages(
+                        old_block, is_code_context=has_code
+                    )
+                    if summary:
+                        state["conversation_summaries"].append(
+                            {
+                                "text": summary,
+                                "created_at": time.time(),
+                                "covers_msgs": len(old_block),
+                            }
+                        )
+                        cap = self._f.valves.max_conversation_summaries
+                        if cap > 0 and len(state["conversation_summaries"]) > cap:
+                            dropped = len(state["conversation_summaries"]) - cap
+                            state["conversation_summaries"] = state[
+                                "conversation_summaries"
+                            ][-cap:]
+                            self._f._log_debug(
+                                f"Summary cap: dropped {dropped} oldest summary block(s) "
+                                f"(max_conversation_summaries={cap})"
+                            )
+                        self._f._state_store.set_state(project_id, state)
+                        pending_summary = (
+                            f"[Summary of earlier conversation]\n{summary}"
+                        )
+                    history_msgs = kept_block
+                else:
+                    history_msgs = kept_block
+
+        return sys_msgs + history_msgs, pending_summary
 
 
 # ---------------------------------------------------------------------------
@@ -12300,6 +12831,9 @@ class ContextDumper:
         if not self._f.valves.enable_context_dump:
             return
 
+        # Log para saber que se ha programado un volcado
+        self._f._log_debug(f"📸 Scheduling context dump for project '{project_id}'")
+
         payload = self._capture_payload(
             project_id, static_block, dynamic_block, final_system, messages
         )
@@ -12309,79 +12843,85 @@ class ContextDumper:
             task.add_done_callback(self._tasks.discard)
         except RuntimeError:
             # No running event loop — write inline (best effort).
+            self._f._log_debug("No event loop, writing context dump inline")
             try:
                 self._write_sync(payload)
             except Exception as exc:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
-    # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
+        # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
 
-    def _capture_payload(
-        self,
-        project_id: str,
-        static_block: str,
-        dynamic_block: str,
-        final_system: str,
-        messages: List[dict],
-    ) -> dict:
-        """Snapshot strings + metadata immediately so later mutation can't race."""
-        max_chars = self._f.valves.context_dump_message_max_chars
-        msg_copy: List[Tuple[str, str]] = []
-        if self._f.valves.context_dump_include_messages:
-            for m in messages:
-                role = m.get("role", "")
-                content = m.get("content", "") or ""
-                if max_chars > 0 and len(content) > max_chars:
-                    content = (
-                        content[:max_chars]
-                        + f"\n[...truncated {len(content) - max_chars} chars...]"
-                    )
-                msg_copy.append((role, content))
+        def _capture_payload(
+            self,
+            project_id: str,
+            static_block: str,
+            dynamic_block: str,
+            final_system: str,
+            messages: List[dict],
+        ) -> dict:
+            """Snapshot strings + metadata immediately so later mutation can't race."""
+            max_chars = self._f.valves.context_dump_message_max_chars
+            msg_copy: List[Tuple[str, str]] = []
+            if self._f.valves.context_dump_include_messages:
+                for m in messages:
+                    role = m.get("role", "")
+                    content = m.get("content", "") or ""
+                    if max_chars > 0 and len(content) > max_chars:
+                        content = (
+                            content[:max_chars]
+                            + f"\n[...truncated {len(content) - max_chars} chars...]"
+                        )
+                    msg_copy.append((role, content))
 
-        try:
-            code_state_hash = self._f._activation.compute_code_state_hash(project_id)
-        except Exception:
-            code_state_hash = ""
-        block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
-        slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
-        try:
-            state = self._f._state_store.get_state(project_id)
-            turn = state.get("message_count", 0)
-            n_active_blocks = len(state.get("active_blocks", {}))
-        except Exception:
-            turn = 0
-            n_active_blocks = 0
-        try:
-            n_symbols = len(self._f._symbol_index.get_all_names(project_id))
-        except Exception:
-            n_symbols = 0
+            try:
+                code_state_hash = self._f._activation.compute_code_state_hash(
+                    project_id
+                )
+            except Exception:
+                code_state_hash = ""
+            block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
+            slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
+            try:
+                state = self._f._state_store.get_state(project_id)
+                turn = state.get("message_count", 0)
+                n_active_blocks = len(state.get("active_blocks", {}))
+            except Exception:
+                turn = 0
+                n_active_blocks = 0
+            try:
+                n_symbols = len(self._f._symbol_index.get_all_names(project_id))
+            except Exception:
+                n_symbols = 0
 
-        now = time.time()
-        return {
-            "project_id": project_id,
-            "turn": turn,
-            "timestamp": now,
-            "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "static_block": static_block or "",
-            "dynamic_block": dynamic_block or "",
-            "final_system": final_system or "",
-            "messages": msg_copy,
-            "block_a_hash": block_a_hash,
-            "code_state_hash": code_state_hash,
-            "slot_saved_hash": slot_hash,
-            "n_active_blocks": n_active_blocks,
-            "n_symbols": n_symbols,
-        }
+            now = time.time()
+            return {
+                "project_id": project_id,
+                "turn": turn,
+                "timestamp": now,
+                "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "static_block": static_block or "",
+                "dynamic_block": dynamic_block or "",
+                "final_system": final_system or "",
+                "messages": msg_copy,
+                "block_a_hash": block_a_hash,
+                "code_state_hash": code_state_hash,
+                "slot_saved_hash": slot_hash,
+                "n_active_blocks": n_active_blocks,
+                "n_symbols": n_symbols,
+            }
 
     # ── Async write (offloaded to a worker thread) ────────────────────────
 
     async def _write_async(self, payload: dict) -> None:
+        """Write context dump asynchronously with progress logging."""
+        self._f._log_debug(f"📝 Writing context dump (turn {payload['turn']})...")
         try:
             await anyio.to_thread.run_sync(self._write_sync, payload)
+            self._f._log_debug(f"✅ Context dump written (turn {payload['turn']})")
         except Exception as exc:
-            self._f._log_debug(f"Context dump write failed: {exc}")
+            self._f._log_debug(f"❌ Context dump write failed: {exc}")
 
     def _write_sync(self, payload: dict) -> None:
         """Render Markdown + JSONL and write to the project dump directory."""
@@ -12748,6 +13288,14 @@ class Filter:
             default=25,
             ge=0,
             description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
+        )
+        enable_auto_docstrings_background: bool = Field(
+            default=True,
+            description=(
+                "Launch background tasks from the outlet to generate missing docstrings. "
+                "Requires --parallel > 1 on the server to avoid blocking the next user turn. "
+                "When disabled, docstrings are only generated on-demand (lazy)."
+            ),
         )
         # ── Block deduplication ─────────────────────────────────────
         code_similarity_threshold: float = Field(default=0.85)
@@ -13169,7 +13717,7 @@ class Filter:
         debug: bool = Field(default=True)
         # ── Context dump (evolution tracking) ───────────────────────
         enable_context_dump: bool = Field(
-            default=True,
+            default=False,
             description=(
                 "Dump the assembled per-turn context (Block A, Block B, message "
                 "window) to disk for evolution tracking. Off by default; writes "
@@ -13278,7 +13826,6 @@ class Filter:
         self._cross_encoder_unavailable_logged = False
         self._cross_encoder_lock = asyncio.Lock()
 
-        # ── v8: New manager instances ──────────────────────────────────────
         self._conv_compressor = _shared_get_conversation_compressor()
         self._llmlingua_compressor = (
             self._conv_compressor.raw if self._conv_compressor else None
@@ -13297,17 +13844,15 @@ class Filter:
         self._enrichment = EnrichmentTasks(self)
         self._inlet_orch = InletOrchestrator(self)
         self._active_code_updater = ActiveCodeUpdater(self)
-        self._system_prompt_builder = SystemPromptBuilder(self)  # ← v8
-        self._message_assembler = MessageAssembler(self)  # ← v8
-        self._context_dumper = ContextDumper(self)  # context evolution dumps
+        self._system_prompt_builder = SystemPromptBuilder(self)
+        self._message_assembler = MessageAssembler(self)
+        self._context_dumper = ContextDumper(self)
 
         self._hub_index = HubSymbolIndex()
         self._ctx_builder = ContextBuilder(self)
         self._pager = ContextPager(self)
         self._raptor = RaptorCodeIndex()
-        # ────────────────────────────────────────────────────────────────────
 
-        # Conversation state (moved to StateStore)
         self._conversation_state: OrderedDict = OrderedDict()
         self._state_factory = lambda: {
             "active_blocks": {},
@@ -13321,10 +13866,10 @@ class Filter:
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
             "last_cot_level": 0,
-            "conversation_summaries": [],  # ← v8 (Step 5.3)
-            "summarized_turn_hwm": 0,  # ← v8 turn-based: highest turn covered by a summary
-            "_pending_slot_resave": False,  # ← #16: compaction happened → re-save slot
-            "_last_evict_target": 0,  # ← #16: highest evicted turn target seen
+            "conversation_summaries": [],
+            "summarized_turn_hwm": 0,
+            "_pending_slot_resave": False,
+            "_last_evict_target": 0,
         }
 
         # Patterns
@@ -13392,8 +13937,6 @@ class Filter:
         self._cached_code_state_hash: Optional[str] = None
 
         self._last_system_tokens: Dict[str, int] = {}
-        # Total context tokens of the last assembled request — read by
-        # ContextBuilder.slot_save() for the threshold guard (fix P5).
         self._last_total_context_tokens: Dict[str, int] = {}
 
         # ── KV Cache Stability ──
@@ -13437,6 +13980,9 @@ class Filter:
         # State debounce
         self._state_dirty = False
         self._state_last_saved = 0.0
+
+        # ── Silent ingestion guard ──
+        self._is_silent_ingestion = False
 
         print("[CodeAware] Filter loaded")
 
@@ -13555,9 +14101,9 @@ class Filter:
         if slot_free and self._last_used_model is None:
             slot_free = False
 
-        # Cancel any pending background docstring tasks from the previous turn
-        # instead of blocking — ensure_docstring will handle missing ones on demand
-        self._enrichment.cancel_docstring_tasks()
+        # Cancel any pending background docstring tasks, waiting for the
+        # in‑flight one to finish so the slot is released cleanly.
+        await self._enrichment.cancel_docstring_tasks()
 
         # Reset the per‑turn lazy docstring counter so the new turn starts fresh
         self._enrichment._lazy_docstrings_generated_this_turn = 0
@@ -13676,8 +14222,13 @@ class Filter:
                         f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
                     )
 
-                # Process code into SymbolGraph without invoking main LLM
-                await self._update_active_code(_msg_to_index, project_id)
+                # ── Evitar cualquier llamada al LLM durante la ingesta ─
+                self._is_silent_ingestion = True
+                try:
+                    # Process code into SymbolGraph without invoking main LLM
+                    await self._update_active_code(_msg_to_index, project_id)
+                finally:
+                    self._is_silent_ingestion = False
 
                 # Resolve cross‑references with previous chunks
                 await self._activation.resolve_dangling_edges(project_id)
@@ -13706,11 +14257,6 @@ class Filter:
                     "Usa `/expand <nombre>` para ver una función/clase completa."
                 )
 
-                # ── Fix 1: Replace code with compressed stub instead of deleting it ──
-                all_names = sorted(self._symbol_index.get_all_names(project_id))[:100]
-                # We used to include this line in the compressed stub, but now we have
-                # code scaffolding it would be redundant:
-                # + "\n".join(f"# class/func: {n}" for n in sorted(all_names)[:50])
                 compressed_stub = (
                     f"```python\n"
                     f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados en SymbolGraph]\n"
@@ -13825,9 +14371,6 @@ class Filter:
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
 
-        # ── Cancel any background docstring tasks from previous turn ──
-        self._enrichment.cancel_docstring_tasks()
-
         try:
             messages = body.get("messages", [])
             project_id = self._inlet_orch.get_project_id()
@@ -13836,6 +14379,7 @@ class Filter:
                 messages, project_id
             )
             last_msg = messages[-1] if messages else None
+
             if last_msg:
                 last_idx = len(messages) - 1
                 if last_idx <= self._last_processed_message_idx.get(project_id, -1):
@@ -13843,7 +14387,6 @@ class Filter:
                         "outlet: last message already processed in inlet, skipping"
                     )
                 else:
-                    # ── 🔥 STATE MANAGEMENT: intercept /expand commands ──
                     if (
                         last_msg.get("role") == "assistant"
                         and is_code_session
@@ -13864,20 +14407,18 @@ class Filter:
                                 "outlet: /expand intercepted — history rewritten with real code"
                             )
 
-                    # ── 🔥 STATE MANAGEMENT: update active code blocks & store in LTM ──
                     if last_msg.get("role") in ("user", "assistant"):
                         await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
                             self._log_debug(
-                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM "
-                                "(new code detected)"
+                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (new code detected)"
                             )
                             await self._update_active_code(last_msg, project_id)
-                            # Store immediately in LTM
-                            await self._ltm.store_messages(project_id, [last_msg])
+                            await self._ltm.store_messages(
+                                project_id, [last_msg], wait=False
+                            )
 
-                            # ── Schedule background docstring generation ──
-                            if self.valves.enable_auto_docstrings:
+                            if self.valves.enable_auto_docstrings_background:
                                 state = self._state_store.get_state(project_id)
                                 pending = []
                                 for block in state["active_blocks"].values():
@@ -13898,17 +14439,18 @@ class Filter:
                                 self._log_debug(
                                     "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
                                 )
-                                await self._ltm.store_messages(project_id, [last_msg])
+                                await self._ltm.store_messages(
+                                    project_id, [last_msg], wait=False
+                                )
 
-            # 🚀 RESOURCE OPTIMISATION: response cache storage
+            # ── Response cache ─────────────────────────────────────────
             if (
                 self.valves.enable_response_cache
                 and HAS_SENTENCE
                 and len(messages) >= 2
             ):
                 self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Storing response in cache "
-                    "(to avoid recomputation for similar future requests)"
+                    "🚀 RESOURCE OPTIMISATION – Storing response in cache (to avoid recomputation for similar future requests)"
                 )
                 last_user = next(
                     (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -13924,8 +14466,7 @@ class Filter:
                     )
                     if _is_partial_mp:
                         self._log_debug(
-                            "Response cache: skipping storage for partial "
-                            "multi-phase response (continuation marker detected)."
+                            "Response cache: skipping storage for partial multi-phase response"
                         )
                     else:
                         context_hash = self._activation.compute_context_hash(
@@ -13940,9 +14481,10 @@ class Filter:
                             context_hash,
                             state,
                             code_state_hash,
+                            wait=False,
                         )
 
-            # 🔄 LOD ADAPTIVE FEEDBACK (v7 Phase 5)
+            # ── LOD adaptive ───────────────────────────────────────────
             if self.valves.enable_lod_adaptive and is_code_session:
                 last_assistant = next(
                     (m for m in reversed(messages) if m.get("role") == "assistant"),
@@ -13964,16 +14506,14 @@ class Filter:
                     )
                     if _is_partial_mp_lod:
                         self._log_debug(
-                            "LOD adaptive: skipping feedback for partial "
-                            "multi-phase response (continuation marker detected)."
+                            "LOD adaptive: skipping feedback for partial multi-phase response"
                         )
                     else:
                         await self._enrichment.update_lod_thresholds_from_response(
-                            project_id,
-                            last_assistant["content"],
+                            project_id, last_assistant["content"]
                         )
 
-            # 🚀 RESOURCE OPTIMISATION – Speculative prefetch (inline)
+            # ── Speculative prefetch ───────────────────────────────────
             if self.valves.enable_speculative_prefetch and is_code_session:
                 last_activated = getattr(self, "_last_activation_scores", {}).get(
                     project_id, {}
@@ -13983,13 +14523,12 @@ class Filter:
                         project_id, last_activated
                     )
 
-            # 🚀 RESOURCE OPTIMISATION: purge expired memories periodically
+            # ── Purge expired memories ─────────────────────────────────
             await self._ltm.purge_expired_memories()
 
-            # 🚀 RESOURCE OPTIMISATION: DB checkpoints every 100 writes
             self._write_counter += 1
 
-            # ── v8: RAPTOR rebuild (delegated to RaptorCodeIndex) ──────────
+            # ── RAPTOR rebuild ─────────────────────────────────────────
             if (
                 self.valves.enable_raptor
                 and self._write_counter % self.valves.raptor_rebuild_interval == 0
@@ -14015,17 +14554,15 @@ class Filter:
                     graph_weight=graph_weight,
                 )
 
+            # ── DB checkpoints ─────────────────────────────────────────
             if self._write_counter % 100 == 0:
                 self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Running DB checkpoints "
-                    "(to ensure data durability and prevent WAL buildup)"
+                    "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
                 )
                 await self._state_store.run_db_checkpoints()
 
-            # 🚀 RESOURCE OPTIMISATION – Save KV slot (delegated to ContextBuilder)
+            # ── Slot save ──────────────────────────────────────────────
             if self.valves.enable_slot_persistence:
-                # Record total context size so slot_save's threshold guard (P5)
-                # can skip oversized KV writes.
                 try:
                     self._last_total_context_tokens[project_id] = (
                         self._tokens.estimate_tokens(messages)
@@ -14033,9 +14570,6 @@ class Filter:
                 except Exception:
                     pass
 
-                # #16 (P6): if a summary/eviction changed the history prefix this
-                # turn, force a re-save of the now-smaller, stable prefix
-                # (still subject to slot_save's threshold guard).
                 if state and state.get("_pending_slot_resave"):
                     saved = await self._ctx_builder.slot_save(project_id, force=True)
                     if saved:
@@ -14047,7 +14581,7 @@ class Filter:
                 else:
                     await self._ctx_builder.slot_save(project_id)
 
-            # ── v2.0: Purge old code versions per file ─────────────────
+            # ── Purge old versions ─────────────────────────────────────
             if (
                 self.valves.purge_old_code_versions_enabled
                 and self.valves.enable_block_paging
@@ -14062,24 +14596,22 @@ class Filter:
                     max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
                 )
 
-            # 🔥 STATE MANAGEMENT – Persistir edges del SymbolGraph
+            # ── Save edges ─────────────────────────────────────────────
             if self.valves.enable_edge_persistence:
                 await self._state_store.save_symbol_edges_to_db(project_id)
 
-            # ── v8: Persistir CodePathViews ──
+            # ── Save path views ───────────────────────────────────────
             if self.valves.enable_path_analysis:
                 await self._state_store.save_path_views_to_db(
                     project_id, self._path_index.get_all(project_id)
                 )
 
-            # 🔥 STATE MANAGEMENT: persist conversation state if dirty
+            # ── Save state if dirty ───────────────────────────────────
             self._log_debug(
-                "🔥 STATE MANAGEMENT – Saving conversation state "
-                "(to preserve context across restarts)"
+                "🔥 STATE MANAGEMENT – Saving conversation state (to preserve context across restarts)"
             )
             await self._state_store.save_state_if_dirty(project_id)
 
-            # 🚀 RESOURCE OPTIMISATION: Skipping unload to keep main model loaded
             self._log_debug(
                 "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
             )
