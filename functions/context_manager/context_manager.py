@@ -1975,6 +1975,15 @@ class ContextBuilder:
         )
         return tier
 
+    def _make_docstring_provider(self, project_id: str):
+        """Return f(symbol_name) -> one-line docstring or ''.
+        Backed by the index (covers both source-extracted and LLM-generated docstrings)."""
+        if not self._f.valves.skeleton_include_docstrings:
+            return lambda _name: ""
+        def _provider(symbol_name: str) -> str:
+            return self._f._symbol_index.get_docstring(symbol_name, project_id) or ""
+        return _provider
+        
     def invalidate_skeleton_tier_cache(self, project_id: str) -> None:
         """Drop the cached skeleton tier (signatures may have changed)."""
         self._skeleton_tier_cache.pop(project_id, None)
