@@ -12908,7 +12908,8 @@ class ContextDumper:
         md = self._render_markdown(
             payload, block_a_tokens, block_b_tokens, system_tokens, history_tokens
         )
-        fname = f"t{payload['turn']:04d}_{int(payload['timestamp'] * 1000)}.md"
+        # Nombre de archivo más legible: turno + timestamp
+        fname = f"{payload['turn']:04d}_turn_{int(payload['timestamp'] * 1000)}.md"
         with open(os.path.join(project_dir, fname), "w", encoding="utf-8") as fh:
             fh.write(md)
 
@@ -13013,10 +13014,11 @@ class ContextDumper:
         if keep <= 0:
             return
         try:
+            # Encuentra todos los snapshots con el nuevo formato: XXXX_turn_...md
             snapshots = sorted(
                 f
                 for f in os.listdir(project_dir)
-                if f.startswith("t") and f.endswith(".md")
+                if re.match(r'^\d{4}_turn_\d+\.md$', f)
             )
         except Exception:
             return
@@ -13026,7 +13028,6 @@ class ContextDumper:
                 os.remove(os.path.join(project_dir, fname))
             except Exception:
                 pass
-
 
 # ---------------------------------------------------------------------------
 # Valves
