@@ -6264,6 +6264,11 @@ class LLMOrchestrator:
             if tasks:
                 await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
+    async def wait_for_slot(self) -> None:
+        """Wait until the inference slot is free, then return immediately."""
+        async with self._f._llm_semaphore:
+            pass
+
 
 class ReasoningEngine:
     """Chain‑of‑Thought detection and generation."""
@@ -11207,18 +11212,69 @@ class EnrichmentTasks:
 
     async def cancel_docstring_tasks(self) -> None:
         """
-        Cancel the background docstring generation loop gracefully.
-
-        If a docstring task is currently in flight (inside the LLM call), wait
-        for it to finish so the slot is released cleanly.
+        Cancel the background docstring generation loop gracefully,
+        then wait until the inference slot is free before returning.
         """
         if self._active_bg_task is not None and not self._active_bg_task.done():
             self._active_bg_task.cancel()
             try:
-                await asyncio.wait_for(self._active_bg_task, timeout=30.0)
+                await asyncio.wait_for(self._active_bg_task, timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         self._active_bg_task = None
+
+        # Wait for the inference slot to be released
+        await self._f._llm_orchestrator.wait_for_slot()
+
+    async def _background_docstring(
+        self, name: str, signature: str, project_id: str
+    ) -> None:
+        """Generate one docstring in background and persist it."""
+        try:
+            state = self._f._state_store.get_state(project_id)
+            snippet = ""
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if sym.name == name:
+                        snippet = block.content[:500]
+                        break
+                if snippet:
+                    break
+
+            docstring = await self._f._llm_orchestrator.call_llm(
+                prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
+                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                model_override=self._f.valves.llm_model,
+                max_tokens=50,
+                temperature=0.1,
+                label="bg_docstring",
+            )
+            if not docstring or not docstring.strip():
+                return
+
+            docstring = docstring.strip()
+
+            lock = await self._f._state_store.get_project_lock(project_id)
+            async with lock:
+                state = self._f._state_store.get_state(project_id)
+                for block in state["active_blocks"].values():
+                    for sym in block.symbols:
+                        if sym.name == name:
+                            sym.docstring = docstring
+                            self._f._symbol_index.update_docstring(
+                                name, project_id, docstring
+                            )
+                            break
+                self._f._state_store.set_state(project_id, state)
+
+            await self._f._state_store._db_enqueue(
+                lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                    (pid, n, d, time.time()),
+                )
+            )
+        except Exception as e:
+            self._f._log_debug(f"❌ Docstring generation failed for '{name}': {e}")
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
