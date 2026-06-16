@@ -127,6 +127,7 @@ class CodeSymbol(BaseModel):
     line_start: Optional[int] = None
     line_end: Optional[int] = None
     parent_block_hash: str = ""
+    parent_symbol: str = ""
     language: str = "unknown"
     calls: List[str] = Field(default_factory=list)
     docstring: str = ""
@@ -758,7 +759,7 @@ class HubSymbolIndex:
         Render one hub symbol line using data available from the SymbolIndex.
 
         Format:
-          - `name` (centrality: 0.87)  ← used by: x, y
+          - `ClassName.method` (centrality: 0.87)  ← used by: x, y
         Callers come from the index; callee data requires the symbol object
         which Block A does not carry, so the "→ calls" segment is omitted
         rather than fabricated.
@@ -766,7 +767,13 @@ class HubSymbolIndex:
         score = centrality.get(name, 0.0)
         callers = self._safe_callers(name, project_id, symbol_index)
 
-        parts = [f"- `{name}` (centrality: {score:.2f})"]
+        # NEW: qualify with enclosing class name when available
+        parent = getattr(symbol_index, "get_parent_symbol", lambda *_: "")(
+            name, project_id
+        )
+        display_name = f"{parent}.{name}" if parent else name
+
+        parts = [f"- `{display_name}` (centrality: {score:.2f})"]
 
         if callers:
             shown = sorted(callers)[:5]
@@ -1933,7 +1940,10 @@ class ContextBuilder:
         """
         if not self._f.valves.enable_skeleton_tier:
             return ""
-        sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+        if self._f.valves.skeleton_include_docstrings:
+            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
+        else:
+            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
         if not sig_hash:
             return ""
         cached = self._skeleton_tier_cache.get(project_id)
@@ -2597,6 +2607,7 @@ class ContextBuilder:
                             "file_path": block.file_path,
                             "kind": sym.kind if sym else "function",
                             "language": sym.language if sym else "unknown",
+                            "parent_symbol": sym.parent_symbol if sym else "",  # NEW
                         }
                         break
 
@@ -2634,9 +2645,12 @@ class ContextBuilder:
         for file_path in sorted(by_file.keys()):
             lines.append(f"### {file_path}")
             for name, meta in by_file[file_path]:
+                # ── Qualified name (Class.method) ──
+                parent = meta.get("parent_symbol", "")
+                qualified = f"{parent}.{name}" if parent else name
                 sig = meta.get("signature") or name
                 doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
-                line = f"- `{sig}`{doc}"
+                line = f"- `{qualified}` `{sig}`{doc}"
                 tok = self._f._tokens.estimate_code_tokens(line)
                 if total_tokens + tok > budget:
                     lines.append(
@@ -2749,7 +2763,8 @@ class ContextBuilder:
         with their methods, functions, type hints, decorators and defaults
         intact, every body replaced by `...`. Derived from the latest source per
         file, so nesting and signatures are exact. Budget-bounded; truncates by
-        whole files.
+        whole files or, for path-less blocks grouped by class, elides the
+        lowest-centrality methods within each class.
         """
         state = self._f._state_store.get_state(project_id)
         if not state or not state.get("active_blocks"):
@@ -2783,18 +2798,11 @@ class ContextBuilder:
         total = self._f._tokens.estimate_code_tokens(parts[0])
         truncated = False
 
-        def _emit(label: str, block) -> None:
+        docstring_provider = self._make_docstring_provider(project_id)
+
+        def _emit(label: str, code: str, fence: str = "python") -> None:
             nonlocal total, truncated
-            skel = self._skeleton_from_code(block.content, block.file_path)
-            if not skel:
-                return
-            is_py = (block.file_path or "").endswith(".py")
-            fence = (
-                "python"
-                if is_py
-                else (block.symbols[0].language if block.symbols else "")
-            )
-            chunk = f"### {label}\n```{fence}\n{skel}\n```\n"
+            chunk = f"### {label}\n```{fence}\n{code}\n```\n"
             tok = self._f._tokens.estimate_code_tokens(chunk)
             if total + tok > budget:
                 truncated = True
@@ -2802,15 +2810,60 @@ class ContextBuilder:
             parts.append(chunk)
             total += tok
 
+        # 1) Files with a real path (deterministic order by path).
         for fpath in sorted(latest_per_file.keys()):
             if truncated:
                 break
-            _emit(fpath, latest_per_file[fpath])
+            block = latest_per_file[fpath]
+            skel = self._skeleton_from_code(
+                block.content, block.file_path, docstring_provider
+            )
+            if skel:
+                fence = (
+                    "python"
+                    if (block.file_path or "").endswith(".py")
+                    else (block.symbols[0].language if block.symbols else "")
+                )
+                _emit(fpath, skel, fence)
 
-        for i, block in enumerate(no_file):
+        # 2) Path-less blocks grouped by REAL class (cross-chunk merge).
+        grouped_by_class: Dict[str, List["CodeBlock"]] = defaultdict(list)
+        truly_unnamed: List["CodeBlock"] = []
+        for block in no_file:
+            parent = next(
+                (s.parent_symbol for s in block.symbols if s.parent_symbol), ""
+            )
+            if parent:
+                grouped_by_class[parent].append(block)
+            else:
+                truly_unnamed.append(block)
+
+        for class_name in sorted(grouped_by_class.keys()):  # deterministic
             if truncated:
                 break
-            _emit(f"(unnamed block {i + 1})", block)
+            _emit(
+                f"class `{class_name}`",
+                self._render_class_skeleton(
+                    class_name,
+                    grouped_by_class[class_name],
+                    project_id,
+                    docstring_provider,
+                    budget - total,
+                ),
+            )
+
+        # 3) Genuine top-level functions (no class).
+        for block in sorted(truly_unnamed, key=lambda b: b.timestamp):
+            if truncated:
+                break
+            skel = self._skeleton_from_code(
+                block.content, block.file_path, docstring_provider
+            )
+            if not skel:
+                continue
+            label = block.symbols[0].name if block.symbols else "(unnamed)"
+            fence = block.symbols[0].language if block.symbols else ""
+            _emit(f"`{label}`", skel, fence)
 
         if truncated:
             parts.append("_[skeleton truncated to fit budget — ask per file]_")
@@ -2819,23 +2872,90 @@ class ContextBuilder:
             return ""
         return "\n".join(parts)
 
+    def _render_class_skeleton(
+        self,
+        class_name: str,
+        blocks: List["CodeBlock"],
+        project_id: str,
+        docstring_provider,
+        remaining_budget: int,
+    ) -> str:
+        """Render `class X:` followed by method signatures (indented), ordered by
+        source line. If the class exceeds its share of the budget, keep the
+        highest-centrality methods and append a `# (+N more, /expand {class})`
+        elision line."""
+        centrality = self._f._node_centrality.get(project_id, {})
+        # Collect (method_name, skeleton_line) in source order.
+        method_lines: List[Tuple[str, str]] = []
+        for block in sorted(blocks, key=lambda b: b.timestamp):
+            skel = self._skeleton_from_code(
+                block.content, block.file_path, docstring_provider
+            )
+            if not skel:
+                continue
+            for sym in block.symbols:
+                method_lines.append((sym.name, skel))
+                break  # one representative skeleton per method block
+
+        # Budget-aware elision: rank by centrality, keep what fits.
+        per_class_budget = max(400, remaining_budget)
+        ranked = sorted(method_lines, key=lambda ml: -centrality.get(ml[0], 0.0))
+        kept, used, dropped = [], 0, 0
+        for mname, line in ranked:
+            tok = self._f._tokens.estimate_code_tokens(line)
+            if used + tok <= per_class_budget:
+                kept.append((mname, line))
+                used += tok
+            else:
+                dropped += 1
+        # Re-sort kept back into source order for readability.
+        kept_names = {m for m, _ in kept}
+        body = "\n".join(
+            textwrap.indent(line, "    ")
+            for mname, line in method_lines
+            if mname in kept_names
+        )
+        out = (
+            f"class {class_name}:\n{body}" if body else f"class {class_name}:\n    ..."
+        )
+        if dropped:
+            out += f"\n    # (+{dropped} more method(s) — /expand {class_name})"
+        return out
+
     @staticmethod
-    def _skeletonize_node(node) -> None:
-        """Recursively replace function bodies with `...`, keeping class structure."""
+    def _skeletonize_node(node, docstring_provider=None) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+            body = []
+            existing = ast.get_docstring(node, clean=True)
+            doc = existing
+            if not doc and docstring_provider is not None:
+                doc = docstring_provider(node.name)
+            if doc:
+                one_line = doc.strip().split("\n")[0][:120]
+                body.append(ast.Expr(value=ast.Constant(value=one_line)))
+            body.append(ast.Expr(value=ast.Constant(value=Ellipsis)))
+            node.body = body
         elif isinstance(node, ast.ClassDef):
             kept = []
+            existing = ast.get_docstring(node, clean=True)
+            doc = existing
+            if not doc and docstring_provider is not None:
+                doc = docstring_provider(node.name)
+            if doc:
+                one_line = doc.strip().split("\n")[0][:120]
+                kept.append(ast.Expr(value=ast.Constant(value=one_line)))
             for child in node.body:
                 if isinstance(
                     child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
                 ):
-                    ContextBuilder._skeletonize_node(child)
+                    ContextBuilder._skeletonize_node(child, docstring_provider)
                     kept.append(child)
             node.body = kept or [ast.Expr(value=ast.Constant(value=Ellipsis))]
 
     @staticmethod
-    def _skeleton_from_code(code: str, file_path: Optional[str]) -> str:
+    def _skeleton_from_code(
+        code: str, file_path: Optional[str], docstring_provider=None
+    ) -> str:
         """
         Build a signature-only skeleton from source.
 
@@ -2843,6 +2963,9 @@ class ContextBuilder:
         become `...`, nesting and signatures preserved exactly via ast.unparse
         (Python 3.9+). Other languages fall back to a flat list of signature
         lines via regex (not guaranteed valid syntax, but a usable reference).
+
+        When docstring_provider is given, docstrings from the source are kept
+        and missing ones are filled from the provider (e.g. LLM-generated).
         """
         is_python = (file_path or "").endswith(".py") or (
             not file_path and bool(re.search(r"\bdef\s+\w+\s*\(", code))
@@ -2858,7 +2981,7 @@ class ContextBuilder:
                     if isinstance(
                         node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
                     ):
-                        ContextBuilder._skeletonize_node(node)
+                        ContextBuilder._skeletonize_node(node, docstring_provider)
                         nodes.append(node)
                 if nodes:
                     module = ast.Module(body=nodes, type_ignores=[])
@@ -2867,7 +2990,7 @@ class ContextBuilder:
                         return ast.unparse(module)
                     except Exception:
                         pass
-        # Fallback: flat signature lines
+        # Fallback: flat signature lines (unchanged, no docstrings available)
         sigs = []
         for m in re.finditer(
             r"^[ \t]*((?:async\s+)?(?:def|class|function|fn|func)\s+\w+[^\n:{]*)",
@@ -3413,6 +3536,9 @@ class SymbolIndex:
             "file_path": symbol.file_path,
             "language": symbol.language,
             "kind": symbol.kind,
+            "parent_symbol": symbol.parent_symbol
+            or (prev.get("parent_symbol", "") if prev else ""),  # NEW
+            "line_start": symbol.line_start,  # NEW
         }
         for callee in symbol.calls:
             callee_key = (project_id, callee)
@@ -3447,6 +3573,46 @@ class SymbolIndex:
         return self._callee_to_callers.get((project_id, callee_name), set())
 
     # ── Per-symbol metadata (v8) ───────────────────────────────────────
+    def get_parent_symbol(self, name: str, project_id: str) -> str:
+        """Enclosing class name for a symbol, or '' if top-level/unknown."""
+        meta = self._symbol_meta.get((project_id, name))
+        return meta.get("parent_symbol", "") if meta else ""
+
+    def get_class_members(self, class_name: str, project_id: str) -> List[str]:
+        """All symbol names whose parent_symbol == class_name, sorted by source
+        order (line_start) then name. Accumulates across blocks/chunks so a class
+        split across several pasted fragments resolves to ONE member set."""
+        members = []
+        for (pid, name), meta in self._symbol_meta.items():
+            if pid == project_id and meta.get("parent_symbol") == class_name:
+                members.append(name)
+        return sorted(
+            members,
+            key=lambda n: (
+                self._symbol_line_start(n, project_id),
+                n,
+            ),
+        )
+
+    def get_classes(self, project_id: str) -> Set[str]:
+        """All class names that have at least one indexed member, plus any symbol
+        whose kind == 'class'."""
+        classes = set()
+        for (pid, name), meta in self._symbol_meta.items():
+            if pid != project_id:
+                continue
+            if meta.get("kind") == "class":
+                classes.add(name)
+            parent = meta.get("parent_symbol")
+            if parent:
+                classes.add(parent)
+        return classes
+
+    def _symbol_line_start(self, name: str, project_id: str) -> int:
+        """Return the line_start for a symbol, or 999999 if unknown."""
+        meta = self._symbol_meta.get((project_id, name))
+        return meta.get("line_start", 999999) if meta else 999999
+
     def get_symbol_meta(self, name: str, project_id: str) -> Optional[Dict[str, Any]]:
         """Full metadata dict for a symbol, or None if unknown."""
         return self._symbol_meta.get((project_id, name))
@@ -3558,6 +3724,9 @@ class SymbolIndex:
         much longer cache lifetime than code_state_hash (which changes on any
         edit). \x1f/\x1e separators avoid collisions when a signature contains
         ':' or newlines.
+
+        Now includes parent_symbol so that moving a method to another class
+        (or promoting a function to a method) correctly invalidates the cache.
         """
         names = sorted(self.get_all_names(project_id))
         if not names:
@@ -3565,7 +3734,25 @@ class SymbolIndex:
         parts = []
         for name in names:
             sig = self.get_signature(name, project_id) or name
-            parts.append(f"{name}\x1f{sig}")
+            parent = self.get_parent_symbol(name, project_id)
+            parts.append(f"{parent}\x1f{name}\x1f{sig}")
+        blob = "\x1e".join(parts)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+    def compute_skeleton_hash(self, project_id: str) -> str:
+        """Skeleton-tier cache key: signature structure + docstring coverage.
+        Distinct from signature_hash so the skeleton tier (which now renders
+        docstrings) invalidates as background docstrings land, then stabilizes,
+        WITHOUT churning the other signature_hash consumers."""
+        names = sorted(self.get_all_names(project_id))
+        if not names:
+            return ""
+        parts = []
+        for name in names:
+            sig = self.get_signature(name, project_id) or name
+            parent = self.get_parent_symbol(name, project_id)
+            doc = self.get_docstring(name, project_id)
+            parts.append(f"{parent}\x1f{name}\x1f{sig}\x1f{doc}")
         blob = "\x1e".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -3873,6 +4060,20 @@ class SignatureExtractor:
                         kind = "class"
                         break
                     parent = parent.parent
+
+                # NEW — walk up from the symbol's own node to find an enclosing class.
+                parent_symbol = ""
+                walker = node.parent
+                while walker:
+                    if walker.type in class_types:
+                        name_node = walker.child_by_field_name("name")
+                        if name_node:
+                            parent_symbol = name_node.text.decode("utf-8")
+                        break
+                    walker = walker.parent
+                if kind == "function" and parent_symbol:
+                    kind = "method"
+
                 sig = (
                     parent.text.decode("utf-8").split("\n")[0].strip()[:200]
                     if parent
@@ -3888,6 +4089,7 @@ class SignatureExtractor:
                         line_start=node.start_point[0] + 1,
                         line_end=node.end_point[0] + 1,
                         language=lang,
+                        parent_symbol=parent_symbol,  # NEW
                     )
                 )
             return symbols
@@ -7089,10 +7291,25 @@ class MultiPhasePlanner:
 class CommandRouter:
     """Explicit commands, natural‑language intents, and suggestions."""
 
+    # ----------------------------------------------------------------------
+    # Regex patterns
+    # ----------------------------------------------------------------------
+    _EXPAND_DOTTED = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
+
+    # ----------------------------------------------------------------------
+    # Initialization
+    # ----------------------------------------------------------------------
     def __init__(self, filter_ref: "Filter") -> None:
+        """Store a reference to the parent Filter for shared state."""
         self._f = filter_ref
 
+    # ----------------------------------------------------------------------
+    # ML‑based helpers (CrossEncoder, contradiction detection)
+    # ----------------------------------------------------------------------
     async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
+        """Run the CrossEncoder on (text_a, text_b) pairs.
+        Returns raw scores or None if the model is not loaded.
+        """
         if self._f._cross_encoder is None:
             if not self._f._cross_encoder_unavailable_logged:
                 self._f._log_debug(
@@ -7104,6 +7321,9 @@ class CommandRouter:
             return await anyio.to_thread.run_sync(self._f._cross_encoder.predict, pairs)
 
     async def _detect_contradictions(self, messages: list) -> Optional[str]:
+        """Check if the last user message contradicts recent conversation history.
+        Returns a warning string if a contradiction is detected, else None.
+        """
         if not self._f.valves.enable_contradiction_detection or len(messages) < 3:
             return None
         last_user = next(
@@ -7146,7 +7366,13 @@ class CommandRouter:
             )
         return None
 
+    # ----------------------------------------------------------------------
+    # Intent classification
+    # ----------------------------------------------------------------------
     async def classify_intent(self, user_query: str, project_id: str) -> dict:
+        """Classify the user's intent using the CrossEncoder.
+        Returns a dict with probabilities for explain, modify, debug, refactor.
+        """
         pairs = [
             (user_query[:500], "The user wants to understand or explain code."),
             (user_query[:500], "The user wants to modify, fix, or create code."),
@@ -7176,6 +7402,9 @@ class CommandRouter:
         self._f._log_debug("Intent: softmax failed, using default distribution.")
         return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
+    # ----------------------------------------------------------------------
+    # Explicit command dispatch (called from inlet)
+    # ----------------------------------------------------------------------
     async def handle_explicit_commands(
         self,
         messages: list,
@@ -7248,6 +7477,114 @@ class CommandRouter:
 
         return False, None
 
+    # ----------------------------------------------------------------------
+    # Expand commands (/expand, outlet intercept)
+    # ----------------------------------------------------------------------
+    def _resolve_expand_target(self, token: str, project_id: str):
+        """Classify an /expand target.
+        Returns ('method', name) | ('class', name) | ('symbol', name).
+        """
+        m = self._EXPAND_DOTTED.match(token)
+        if m:
+            cls, meth = m.group(1), m.group(2)
+            if meth in self._f._symbol_index.get_all_names(project_id):
+                return ("method", meth)
+        if token in self._f._symbol_index.get_classes(project_id):
+            members = self._f._symbol_index.get_class_members(token, project_id)
+            if members:
+                return ("class", token)
+        return ("symbol", token)
+
+    async def _handle_expand_command(self, content: str, project_id: str) -> str:
+        """Process /expand [depth] <symbol|Class|Class.method>.
+        Returns the expanded code or an error message.
+        """
+        parts = content.strip().split()
+        if len(parts) < 2:
+            return "Usage: /expand [depth] <name|Class|Class.method>"
+
+        depth = self._f.valves.expand_default_depth
+        token = parts[-1]
+        # Only the last numeric argument is the depth, anything else is part of the token
+        for i in range(1, len(parts)):
+            if parts[i].isdigit():
+                depth = int(parts[i])
+            else:
+                token = " ".join(parts[i:])
+                break
+
+        target_type, target_name = self._resolve_expand_target(token, project_id)
+
+        if target_type == "class":
+            members = self._f._symbol_index.get_class_members(target_name, project_id)
+            if not members:
+                return f"Class `{target_name}` has no indexed members."
+            state = self._f._state_store.get_state(project_id)
+            parts_out = [f"## class `{target_name}` ({len(members)} methods)\n"]
+            seen_hashes = set()
+            for mname in members:
+                for bh in self._f._symbol_index.find_blocks(mname, project_id):
+                    if bh in seen_hashes:
+                        continue
+                    seen_hashes.add(bh)
+                    block = state["active_blocks"].get(bh)
+                    if block and not block.obsolete:
+                        lang = block.symbols[0].language if block.symbols else ""
+                        parts_out.append(
+                            f"### `{mname}`\n```{lang}\n{block.content}\n```\n"
+                        )
+            if len(parts_out) == 1:
+                return f"Class `{target_name}` found but no code blocks available."
+            return "\n".join(parts_out)
+
+        elif target_type == "method":
+            expanded = await self._expand_symbol_dependencies(
+                target_name, depth, project_id
+            )
+            if expanded:
+                return f"[Retrieved `{target_name}`]\n{expanded}"
+            return f"Symbol `{target_name}` not found or has no code."
+
+        else:
+            expanded = await self._expand_symbol_dependencies(
+                target_name, depth, project_id
+            )
+            if expanded:
+                return f"[Retrieved `{target_name}`]\n{expanded}"
+            return f"Symbol `{target_name}` not found or has no code."
+
+    async def _expand_symbol_dependencies(
+        self, name: str, max_depth: int, project_id: str
+    ) -> str:
+        """Recursively expand a symbol and its callees up to max_depth."""
+        state = self._f._state_store.get_state(project_id)
+        if not state:
+            return ""
+        visited = set()
+        lines = []
+
+        async def recurse(current_name, current_depth):
+            if current_depth > max_depth or current_name in visited:
+                return
+            visited.add(current_name)
+            blocks = self._f._symbol_index.find_blocks(current_name, project_id)
+            for h in blocks:
+                block = state["active_blocks"].get(h)
+                if block and not block.obsolete:
+                    loc = f" (file: {block.file_path})" if block.file_path else ""
+                    lines.append(
+                        f"### `{current_name}` (depth {current_depth}){loc}\n```\n{block.content[:2000]}\n```"
+                    )
+                    for sym in block.symbols:
+                        if sym.name == current_name:
+                            for callee in sym.calls:
+                                await recurse(callee, current_depth + 1)
+                            break
+                    break
+
+        await recurse(name, 1)
+        return "\n".join(lines)
+
     async def outlet_intercept_expand(
         self,
         assistant_content: str,
@@ -7256,17 +7593,18 @@ class CommandRouter:
         """
         Intercept /expand commands in the assistant's response and replace them
         with the actual expanded symbol code from the SymbolIndex.
+        Now supports `/expand Class`, `/expand Class.method`, and the legacy
+        `/expand symbol` forms.
         Returns (modified_content, did_expand).
         """
         if not self._f.valves.outlet_expand_intercept_enabled:
             return assistant_content, False
 
-        EXPAND_RE = re.compile(r"/expand\s+(?:(\d+)\s+)?(\w+)", re.IGNORECASE)
+        EXPAND_RE = re.compile(r"/expand\s+(?:(\d+)\s+)?(\S+)", re.IGNORECASE)
         matches = list(EXPAND_RE.finditer(assistant_content))
         if not matches:
             return assistant_content, False
 
-        all_names = self._f._symbol_index.get_all_names(project_id)
         replaced_content = assistant_content
         did_any = False
         state = self._f._state_store.get_state(project_id)
@@ -7276,7 +7614,7 @@ class CommandRouter:
 
         for match in matches_to_process:
             depth_str = match.group(1)
-            func_name = match.group(2)
+            token = match.group(2)
             depth = (
                 int(depth_str)
                 if depth_str
@@ -7285,36 +7623,504 @@ class CommandRouter:
             if depth == 0:
                 depth = 9999
 
-            if func_name not in all_names:
-                continue
+            target_type, target_name = self._resolve_expand_target(token, project_id)
 
-            expanded = await self._expand_symbol_dependencies(
-                func_name, depth, project_id
-            )
-            if not expanded:
-                continue
+            if target_type == "class":
+                members = self._f._symbol_index.get_class_members(
+                    target_name, project_id
+                )
+                if not members:
+                    continue
+                seen_hashes = set()
+                buf = [f"## class `{target_name}` ({len(members)} methods)\n"]
+                for mname in members:
+                    for bh in self._f._symbol_index.find_blocks(mname, project_id):
+                        if bh in seen_hashes:
+                            continue
+                        seen_hashes.add(bh)
+                        block = state["active_blocks"].get(bh)
+                        if block and not block.obsolete:
+                            lang = block.symbols[0].language if block.symbols else ""
+                            buf.append(
+                                f"### `{mname}`\n```{lang}\n{block.content}\n```\n"
+                            )
+                if len(buf) > 1:
+                    replacement = "\n".join(buf)
+                else:
+                    continue
+
+            elif target_type in ("method", "symbol"):
+                expanded = await self._expand_symbol_dependencies(
+                    target_name, depth, project_id
+                )
+                if not expanded:
+                    continue
+                replacement = f"[Retrieved `{target_name}`]\n{expanded}"
 
             did_any = True
-            replacement = f"[Retrieved `{func_name}`]\n{expanded}"
             replaced_content = replaced_content.replace(match.group(0), replacement, 1)
 
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                block_hashes = self._f._symbol_index.find_blocks(func_name, project_id)
-                for h in block_hashes:
-                    block = state["active_blocks"].get(h)
-                    if block and not block.obsolete:
-                        block.is_raw = True
-                        block.pinned = True
-                        block.importance_score = 10.0
-                        block.last_mentioned = time.time()
-                        block.last_mentioned_msg_idx = state["message_count"]
-                        break
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
+            # Pin the block if it exists (only for method/symbol, not for class aggregates)
+            if target_type != "class":
+                lock = await self._f._state_store.get_project_lock(project_id)
+                async with lock:
+                    block_hashes = self._f._symbol_index.find_blocks(
+                        target_name, project_id
+                    )
+                    for h in block_hashes:
+                        block = state["active_blocks"].get(h)
+                        if block and not block.obsolete:
+                            block.is_raw = True
+                            block.pinned = True
+                            block.importance_score = 10.0
+                            block.last_mentioned = time.time()
+                            block.last_mentioned_msg_idx = state["message_count"]
+                            break
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                    self._f._state_store.set_state(project_id, state)
 
         return replaced_content, did_any
 
+    # --------------------------------------------------------------------------
+    # Forget / remember / obsolete commands
+    # --------------------------------------------------------------------------
+    async def _handle_forget_command(
+        self, messages: List[dict], project_id: str, __user__: Optional[dict]
+    ) -> Tuple[List[dict], bool]:
+        """Handle /forget [all|last|<file_or_hash>].
+        Returns (messages, was_handled).
+        """
+        if not (
+            self._f.valves.enable_forget_command
+            or self._f.valves.enable_natural_language_forget
+        ):
+            return messages, False
+        if not messages:
+            return messages, False
+        last_msg = messages[-1]
+        if last_msg.get("role") != "user":
+            return messages, False
+        content = last_msg.get("content", "").strip()
+        if self._f.valves.enable_forget_command and content.startswith("/forget"):
+            parts = content.split(maxsplit=1)
+            target = parts[1] if len(parts) > 1 else ""
+            state = self._f._state_store.get_state(project_id)
+            if not state:
+                return messages, False
+            if target == "all":
+                for block in state["active_blocks"].values():
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                state["active_blocks"].clear()
+                state["recent_changes"].clear()
+                state["committed_changes"].clear()
+                state["has_any_calls"] = False
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                confirmation = "Forgotten all context."
+            elif target == "last":
+                if state["active_blocks"]:
+                    last_hash = max(
+                        state["active_blocks"].keys(),
+                        key=lambda h: state["active_blocks"][h].timestamp,
+                    )
+                    block = state["active_blocks"].get(last_hash)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                    del state["active_blocks"][last_hash]
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                    confirmation = "Forgotten the last context block."
+                else:
+                    confirmation = "No blocks to forget."
+            else:
+                to_remove = [
+                    h
+                    for h, blk in state["active_blocks"].items()
+                    if (blk.file_path and target in blk.file_path) or target in h
+                ]
+                for h in to_remove:
+                    block = state["active_blocks"].get(h)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                    del state["active_blocks"][h]
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                confirmation = (
+                    f"Forgotten {len(to_remove)} block(s) matching '{target}'."
+                )
+            self._f._state_store.set_state(project_id, state)
+            messages.pop()
+            messages.append({"role": "assistant", "content": confirmation})
+            return messages, True
+        return messages, False
+
+    async def _execute_forget_intent(self, project_id: str, intent: Dict) -> str:
+        """Execute a natural-language forget intent. Returns a user message."""
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            if not state:
+                return "No active context to forget."
+
+            action = intent.get("action")
+            if action == "forget_all":
+                return (
+                    "⚠️ For safety, the natural language 'forget all' is disabled. "
+                    "Please type `/forget all` explicitly to confirm."
+                )
+
+            if action == "forget_last":
+                if state["active_blocks"]:
+                    last_hash = max(
+                        state["active_blocks"].keys(),
+                        key=lambda h: state["active_blocks"][h].timestamp,
+                    )
+                    block = state["active_blocks"].get(last_hash)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                    del state["active_blocks"][last_hash]
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                return "Forgotten the last context block."
+
+            elif action == "forget_n":
+                n = intent.get("n", 1)
+                blocks_by_time = sorted(
+                    state["active_blocks"].items(),
+                    key=lambda x: x[1].timestamp,
+                    reverse=True,
+                )
+                removed = 0
+                for h, block in blocks_by_time[:n]:
+                    if h in state["active_blocks"]:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                        del state["active_blocks"][h]
+                        removed += 1
+                if removed:
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                return f"Forgotten the last {removed} context block(s)."
+
+            elif action == "forget_file":
+                file_path = intent.get("file", "")
+                if not file_path:
+                    return "No file specified."
+                to_remove = [
+                    h
+                    for h, blk in state["active_blocks"].items()
+                    if blk.file_path and file_path in blk.file_path
+                ]
+                for h in to_remove:
+                    block = state["active_blocks"].get(h)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                    del state["active_blocks"][h]
+                if to_remove:
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                return f"Forgotten {len(to_remove)} block(s) related to {file_path}."
+
+            elif action == "forget_block":
+                block_id = intent.get("hash") or intent.get("id") or ""
+                if not block_id:
+                    return "No block specified."
+                if block_id in state["active_blocks"]:
+                    block = state["active_blocks"][block_id]
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                    del state["active_blocks"][block_id]
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                    return f"Forgotten block {block_id}."
+                matches = [h for h in state["active_blocks"] if block_id in h]
+                if matches:
+                    for h in matches:
+                        block = state["active_blocks"].get(h)
+                        if block:
+                            self._f._symbol_index.remove_all_for_block(
+                                block.hash, block.symbols, project_id
+                            )
+                        del state["active_blocks"][h]
+                    self._f._activation.invalidate_lightweight_cache(project_id)
+                    return f"Forgotten {len(matches)} block(s) matching {block_id}."
+                return f"No block found for {block_id}."
+
+            else:
+                return "Unrecognized forget action."
+
+    async def _execute_remember_intent(self, project_id: str, intent: Dict) -> str:
+        """Execute a natural-language remember/pin intent."""
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            if not state:
+                return "No active context to pin."
+
+            def set_pinned(blocks, pinned_value):
+                count = 0
+                for blk in blocks:
+                    blk.pinned = pinned_value
+                    if pinned_value:
+                        blk.importance_score = 10.0
+                    else:
+                        blk._update_importance()
+                    count += 1
+                return count
+
+            action = intent.get("action", "")
+            blocks = list(state["active_blocks"].values())
+            if not blocks:
+                return "No blocks available."
+
+            if action == "pin_last":
+                last_block = max(blocks, key=lambda b: b.timestamp)
+                set_pinned([last_block], True)
+                return "Pinned last code block."
+            elif action == "pin_n":
+                n = intent.get("n", 1)
+                blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
+                to_pin = blocks_by_time[:n]
+                count = set_pinned(to_pin, True)
+                return f"Pinned {count} block(s)."
+            elif action == "pin_file":
+                file_path = intent.get("file", "")
+                if not file_path:
+                    return "No file specified."
+                to_pin = [
+                    blk
+                    for blk in blocks
+                    if blk.file_path and file_path in blk.file_path
+                ]
+                count = set_pinned(to_pin, True)
+                return f"Pinned {count} block(s) related to {file_path}."
+            elif action == "pin_block":
+                desc = intent.get("description", "") or intent.get("hash", "")
+                if not desc:
+                    return "No block identifier."
+                matches = [
+                    blk
+                    for blk in blocks
+                    if desc in blk.content
+                    or (blk.hash and desc in blk.hash)
+                    or (blk.file_path and desc in blk.file_path)
+                ]
+                count = set_pinned(matches, True)
+                return f"Pinned {count} block(s) matching '{desc}'."
+            elif action == "pin_all":
+                count = set_pinned(blocks, True)
+                return f"Pinned all {count} active blocks."
+            elif action == "unpin_last":
+                last_block = max(blocks, key=lambda b: b.timestamp)
+                set_pinned([last_block], False)
+                return "Unpinned last block."
+            elif action == "unpin_file":
+                file_path = intent.get("file", "")
+                if not file_path:
+                    return "No file specified."
+                to_unpin = [
+                    blk
+                    for blk in blocks
+                    if blk.file_path and file_path in blk.file_path
+                ]
+                count = set_pinned(to_unpin, False)
+                return f"Unpinned {count} block(s) related to {file_path}."
+            elif action == "unpin_all":
+                count = set_pinned(blocks, False)
+                return f"Unpinned all {count} blocks."
+            else:
+                return "Unrecognized pin action."
+
+    async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
+        """Execute a natural-language obsolete/revive intent."""
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            if not state:
+                return "No active context to mark as obsolete."
+
+            action = intent.get("action", "")
+            if action == "obsolete_all":
+                return (
+                    "⚠️ For safety, the natural language 'obsolete all' is disabled. "
+                    "Please type `/obsolete all` explicitly to confirm."
+                )
+
+            blocks = list(state["active_blocks"].values())
+            if not blocks:
+                return "No blocks available."
+
+            def set_obsolete(blks, val):
+                for b in blks:
+                    b.obsolete = val
+                    b._update_importance()
+                return len(blks)
+
+            if action == "obsolete_last":
+                last_block = max(blocks, key=lambda b: b.timestamp)
+                set_obsolete([last_block], True)
+                return "Marked last code block as obsolete."
+
+            elif action == "obsolete_n":
+                n = intent.get("n", 1)
+                blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
+                to_obsolete = blocks_by_time[:n]
+                count = set_obsolete(to_obsolete, True)
+                return f"Marked {count} block(s) as obsolete."
+
+            elif action == "obsolete_file":
+                file_path = intent.get("file", "")
+                if not file_path:
+                    return "No file specified."
+                to_obsolete = [
+                    blk
+                    for blk in blocks
+                    if blk.file_path and file_path in blk.file_path
+                ]
+                count = set_obsolete(to_obsolete, True)
+                return f"Marked {count} block(s) related to {file_path} as obsolete."
+
+            elif action == "obsolete_block":
+                desc = intent.get("description", "") or intent.get("hash", "")
+                if not desc:
+                    return "No block identifier."
+                matches = [
+                    blk
+                    for blk in blocks
+                    if desc in blk.content
+                    or (blk.hash and desc in blk.hash)
+                    or (blk.file_path and desc in blk.file_path)
+                ]
+                count = set_obsolete(matches, True)
+                return f"Marked {count} block(s) matching '{desc}' as obsolete."
+
+            elif action == "revive_last":
+                last_block = max(blocks, key=lambda b: b.timestamp)
+                set_obsolete([last_block], False)
+                return "Removed obsolete mark from last block."
+
+            elif action == "revive_file":
+                file_path = intent.get("file", "")
+                if not file_path:
+                    return "No file specified."
+                to_revive = [
+                    blk
+                    for blk in blocks
+                    if blk.file_path and file_path in blk.file_path
+                ]
+                count = set_obsolete(to_revive, False)
+                return f"Removed obsolete mark from {count} block(s) related to {file_path}."
+
+            elif action == "revive_all":
+                count = set_obsolete(blocks, False)
+                return f"Removed obsolete mark from all {count} block(s)."
+
+            else:
+                return "Unrecognized obsolete action."
+
+    # --------------------------------------------------------------------------
+    # Proactive cleanup commands
+    # --------------------------------------------------------------------------
+    def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
+        """Return hashes of blocks that haven't been mentioned recently."""
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return []
+        threshold = self._f.valves.cleanup_inactive_threshold_messages
+        excluded_types = set(self._f.valves.cleanup_excluded_content_types)
+        current_msg_idx = state["message_count"]
+        candidates = []
+        for h, block in state["active_blocks"].items():
+            if block.pinned or block.obsolete:
+                continue
+            if block.content_type.value in excluded_types:
+                continue
+            last_idx = block.last_mentioned_msg_idx
+            if last_idx is None:
+                last_idx = current_msg_idx
+            if current_msg_idx - last_idx > threshold:
+                candidates.append(h)
+        return candidates
+
+    async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
+        """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
+        if (
+            not self._f.valves.cleanup_suggestions_enabled
+            or not self._f.valves.cleanup_command_enabled
+        ):
+            return "Cleanup is disabled."
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            candidates = self._get_inactive_block_candidates(project_id)
+            parts = command_text.split(maxsplit=1)
+            subcommand = parts[1].strip() if len(parts) > 1 else ""
+            if not subcommand:
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                lines = [
+                    f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last {self._f.valves.cleanup_inactive_threshold_messages} messages):"
+                ]
+                for h in candidates:
+                    blk = state["active_blocks"].get(h)
+                    if blk:
+                        snippet = blk.content[:80].replace("\n", " ")
+                        file_info = f" ({blk.file_path})" if blk.file_path else ""
+                        lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
+                lines.append(
+                    "\nUse `/clean all` to remove all, or `/clean <hash>` for a specific block."
+                )
+                return "\n".join(lines)
+            if subcommand.lower() == "all":
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                for h in candidates:
+                    block = state["active_blocks"].pop(h, None)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                state["recent_changes"] = [
+                    c for c in state["recent_changes"] if c.hash not in candidates
+                ]
+                state["committed_changes"] = [
+                    c for c in state["committed_changes"] if c.hash not in candidates
+                ]
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned {len(candidates)} inactive block(s)."
+            target_hash = subcommand.strip()
+            if target_hash in candidates:
+                block = state["active_blocks"].pop(target_hash, None)
+                if block:
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned block `{target_hash[:8]}...`."
+            else:
+                matched = [h for h in state["active_blocks"] if target_hash in h]
+                for h in matched:
+                    if h in candidates:
+                        block = state["active_blocks"].pop(h, None)
+                        if block:
+                            self._f._symbol_index.remove_all_for_block(
+                                block.hash, block.symbols, project_id
+                            )
+                        self._f._activation.invalidate_lightweight_cache(project_id)
+                        self._f._state_store.set_state(project_id, state)
+                        return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
+                return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
+
+    # ----------------------------------------------------------------------
+    # Natural language intents (forget, remember, obsolete)
+    # ----------------------------------------------------------------------
     async def handle_natural_intents(
         self,
         messages: list,
@@ -7437,6 +8243,9 @@ class CommandRouter:
 
         return result
 
+    # ----------------------------------------------------------------------
+    # Suggestions
+    # ----------------------------------------------------------------------
     async def suggest_commands(self, project_id: str, state: dict) -> Optional[str]:
         """Suggest context management commands to the user after enough messages."""
         if not self._f.valves.enable_command_suggestions:
@@ -7453,6 +8262,9 @@ class CommandRouter:
             )
         return None
 
+    # ----------------------------------------------------------------------
+    # Code-only message detection
+    # ----------------------------------------------------------------------
     async def is_code_only_message(self, content: str) -> bool:
         """
         Detect messages that contain only code without a question.
@@ -7559,6 +8371,9 @@ class CommandRouter:
             text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
         return len(text_outside) < 30
 
+    # ----------------------------------------------------------------------
+    # Static helpers
+    # ----------------------------------------------------------------------
     @staticmethod
     def has_code_indicators(content: str) -> bool:
         """True if the content looks like it contains source code."""
@@ -7618,11 +8433,25 @@ class CodeBlockManager:
     async def extract_code_blocks(
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        """Extract fenced and indented code blocks from message content."""
+        """Extract fenced and indented code blocks from message content.
+        When tree-sitter is available, symbol extraction runs once on the whole
+        document BEFORE chunking, so that method→class membership is preserved.
+        Each block receives a 'precomputed_symbols' list of CodeSymbols that fall
+        within its line range.
+        """
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
+
+        # Single full-document extraction (class context is still intact here).
+        full_doc_symbols: List[CodeSymbol] = []
+        if HAS_TREE_SITTER:
+            try:
+                full_doc_symbols = await SignatureExtractor.extract_async(content, None)
+            except Exception:
+                full_doc_symbols = []
+
         # tree-sitter attempt
         if HAS_TREE_SITTER:
             try:
@@ -7650,14 +8479,56 @@ class CodeBlockManager:
                     else:
                         code = raw
                         block_type = "indented"
-                    blocks.append({"language": lang, "code": code, "type": block_type})
+
+                    # Assign full-doc symbols whose line range falls inside this block.
+                    start_line = content.count("\n", 0, start) + 1
+                    end_line = content.count("\n", 0, end) + 1
+                    block_symbols = [
+                        s
+                        for s in full_doc_symbols
+                        if s.line_start and start_line <= s.line_start <= end_line
+                    ]
+
+                    blocks.append(
+                        {
+                            "language": lang,
+                            "code": code,
+                            "type": block_type,
+                            "precomputed_symbols": block_symbols,
+                        }
+                    )
                     spans.append((start, end))
                 if blocks:
-                    return blocks, spans
+                    # Apply existing post-processing (file path extraction,
+                    # internal filter) while preserving 'precomputed_symbols'.
+                    processed_blocks = []
+                    processed_spans = []
+                    for idx, block in enumerate(blocks):
+                        blk_file = None
+                        if self._f.valves.track_file_paths and spans:
+                            blk_file = self.extract_file_path_for_block(
+                                content, spans[idx][0]
+                            )
+                        if not blk_file and len(blocks) == 1:
+                            extracted_paths = self.extract_file_paths(content)
+                            blk_file = extracted_paths[0] if extracted_paths else None
+
+                        if self._f.valves.exclude_filter_internals and blk_file:
+                            if (
+                                "/app/backend/data/functions/" in blk_file
+                                or "open-webui/functions/" in blk_file
+                            ):
+                                continue
+
+                        block["file_path"] = blk_file
+                        processed_blocks.append(block)
+                        processed_spans.append(spans[idx])
+                    return processed_blocks, processed_spans
             except Exception:
                 pass
 
-        # Regex fallback
+        # Regex fallback (unchanged) — no precomputed_symbols; the consumer
+        # will re-extract per fragment (class context lost, acceptable degradation).
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
@@ -7693,7 +8564,7 @@ class CodeBlockManager:
             end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
             spans.append((start_offset, end_offset))
 
-        # Post-processing and file path extraction with auto‑symbol filter
+        # Post-processing for regex fallback (unchanged)
         processed_blocks = []
         processed_spans = []
         for idx, block in enumerate(blocks):
@@ -7704,7 +8575,6 @@ class CodeBlockManager:
                 extracted_paths = self.extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
 
-            # Exclude blocks that belong to the filter's own source code
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
@@ -10496,8 +11366,14 @@ class ActiveCodeUpdater:
             new_blocks_pending.append(new_block)
 
         symbols_list = []
-        for blk in new_blocks_pending:
-            syms = await SignatureExtractor.extract_async(blk.content, blk.file_path)
+        for blk, block_info in zip(new_blocks_pending, extracted_blocks):
+            precomputed = block_info.get("precomputed_symbols")
+            if precomputed:
+                syms = precomputed
+            else:
+                syms = await SignatureExtractor.extract_async(
+                    blk.content, blk.file_path
+                )
             symbols_list.append(syms)
 
         content_to_syms: Dict[str, List[CodeSymbol]] = {
@@ -12861,6 +13737,18 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
+        # ── NEW: class membership metrics ──
+        try:
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            n_with_parent = sum(
+                1
+                for n in all_names
+                if self._f._symbol_index.get_parent_symbol(n, project_id)
+            )
+            n_classes = len(self._f._symbol_index.get_classes(project_id))
+        except Exception:
+            n_with_parent, n_classes = 0, 0
+
         now = time.time()
         return {
             "project_id": project_id,
@@ -12878,6 +13766,8 @@ class ContextDumper:
             "slot_saved_hash": slot_hash,
             "n_active_blocks": n_active_blocks,
             "n_symbols": n_symbols,
+            "n_symbols_with_parent": n_with_parent,  # NEW
+            "n_classes": n_classes,  # NEW
         }
 
     # ── Async write (offloaded to a worker thread) ────────────────────────
@@ -12974,6 +13864,11 @@ class ContextDumper:
         lines.append(f"- slot saved hash:     `{payload['slot_saved_hash'] or 'N/A'}`")
         lines.append(f"- active blocks: {payload['n_active_blocks']}")
         lines.append(f"- indexed symbols: {payload['n_symbols']}")
+        lines.append(
+            f"- symbols with class resolved: "
+            f"{payload['n_symbols_with_parent']}/{payload['n_symbols']}"  # NEW
+        )
+        lines.append(f"- classes detected: {payload['n_classes']}")  # NEW
         lines.append("")
 
         lines.append("## Block A — static (KV-cache prefix)")
@@ -13018,7 +13913,7 @@ class ContextDumper:
             snapshots = sorted(
                 f
                 for f in os.listdir(project_dir)
-                if re.match(r'^\d{4}_turn_\d+\.md$', f)
+                if re.match(r"^\d{4}_turn_\d+\.md$", f)
             )
         except Exception:
             return
@@ -13028,6 +13923,7 @@ class ContextDumper:
                 os.remove(os.path.join(project_dir, fname))
             except Exception:
                 pass
+
 
 # ---------------------------------------------------------------------------
 # Valves
@@ -13663,6 +14559,18 @@ class Filter:
                 "exempt: its caller signatures are impact signal, not duplication."
             ),
         )
+        skeleton_include_docstrings: bool = (
+            Field(
+                default=True,
+                description=(
+                    "Include one-line docstrings (source + LLM-generated) in the skeleton "
+                    "tier. Improves LLM comprehension. Cost: the skeleton tier cache key "
+                    "becomes docstring-aware, so Block A re-renders as background "
+                    "docstrings land, then stabilizes. Set False for a strictly stable, "
+                    "signature-only Block A prefix if KV-cache churn is observed."
+                ),
+            ),
+        )
         # ── Monotonic compaction (#16) ──────────────────────────────
         compaction_defer_during_autocontinue: bool = Field(
             default=True,
@@ -14196,7 +15104,7 @@ class Filter:
                     # Process code into SymbolGraph without invoking main LLM
                     await self._update_active_code(_msg_to_index, project_id)
                 finally:
-                    self._is_silent_ingestion = False
+                    pass  # flag stays active until outlet clears it
 
                 # Resolve cross‑references with previous chunks
                 await self._activation.resolve_dangling_edges(project_id)
@@ -14218,11 +15126,13 @@ class Filter:
                 state = self._state_store.get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
+                num_classes = len(self._symbol_index.get_classes(project_id))  # NEW
 
+                # ── Mensaje enriquecido con conteo de clases ──
                 response = (
-                    f"✅ {num_symbols} símbolos indexados ({num_blocks} bloques activos). "
-                    "El código está disponible en el SymbolGraph para futuras consultas. "
-                    "Usa `/expand <nombre>` para ver una función/clase completa."
+                    f"✅ {num_symbols} símbolos en {num_classes} clases "
+                    f"({num_blocks} bloques activos). El código está en el SymbolGraph. "
+                    f"Usa `/expand <Clase>` o `/expand <Clase>.<método>` para ver implementaciones."
                 )
 
                 compressed_stub = (
