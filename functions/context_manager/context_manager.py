@@ -3448,7 +3448,7 @@ class SymbolIndex:
         return meta.get("file_path") if meta else None
 
     def update_docstring(self, name: str, project_id: str, docstring: str) -> None:
-        """Refresh a symbol's stored docstring after async enrichment generates it."""
+        """Actualiza el docstring almacenado de un símbolo (compatibilidad)."""
         meta = self._symbol_meta.get((project_id, name))
         if meta is not None:
             meta["docstring"] = docstring
@@ -4280,6 +4280,15 @@ class StateStore:
                 code_state_hash TEXT NOT NULL,
                 edge_count      INTEGER NOT NULL DEFAULT 0,
                 saved_at        REAL NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_docstrings (
+                project_id  TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                docstring    TEXT NOT NULL,
+                updated_at  REAL NOT NULL,
+                PRIMARY KEY (project_id, symbol_name)
             )
         """)
         self._f._db_conn.commit()
@@ -5589,7 +5598,6 @@ class LLMOrchestrator:
         model_override: Optional[str] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.3,
-        response_format: Optional[Dict[str, Any]] = None,
         label: str = "",
         total_timeout: Optional[float] = None,
     ) -> Optional[str]:
@@ -9540,6 +9548,8 @@ class EnrichmentTasks:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+        self._docstrings_in_flight: Set[str] = set()
+        self._docstring_tasks: Set[asyncio.Task] = set()
 
     async def generate_change_summary(
         self,
@@ -9615,25 +9625,287 @@ class EnrichmentTasks:
             return True
         return False
 
+    async def run_session_summary_task(self, params: dict, model: str) -> bool:
+        """Generate an autobiographical session summary and store it in LTM."""
+        project_id = params["project_id"]
+        code_state_hash = params.get("code_state_hash", "")
+
+        recent = await self._f._ltm.retrieve_historical_messages(
+            query="recent conversation summary",
+            project_id=project_id,
+            limit=self._f.valves.session_summary_interval_messages,
+        )
+        if not recent:
+            return False
+
+        conversation_text = "\n".join(
+            f"{m['role']}: {m['content'][:300]}" for m in recent
+        )
+        prompt = (
+            "Summarise the following conversation segment in 2-3 sentences, "
+            "capturing the main task, decisions made, files modified, "
+            "and architectural changes:\n\n"
+            f"{conversation_text[:3000]}"
+        )
+        summary = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that produces concise autobiographical session summaries.",
+            model_override=model,
+            max_tokens=self._f.valves.session_summary_max_tokens,
+            temperature=0.2,
+            label="session_summary",
+        )
+        if not summary:
+            return False
+
+        msg_id = f"{project_id}_session_summary_{int(time.time())}"
+        embedding = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode(summary).tolist()
+        )
+        await anyio.to_thread.run_sync(
+            lambda: self._f.memory_collection.upsert(
+                ids=[msg_id],
+                embeddings=[embedding],
+                metadatas=[
+                    {
+                        "role": "assistant",
+                        "project_id": project_id,
+                        "timestamp": time.time(),
+                        "is_session_summary": True,
+                        "code_state_hash": code_state_hash,
+                        "content_type": ContentType.GENERAL.value,
+                        "has_code": False,
+                    }
+                ],
+                documents=[f"[Session summary]\n{summary}"],
+            )
+        )
+        self._f._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
+        return True
+
+    def update_mentions_from_message(
+        self,
+        state: dict,
+        message_content: str,
+        project_id: str,
+    ) -> None:
+        """
+        Increment mention counts for symbols referenced in the message content,
+        and mark the corresponding blocks as recently mentioned.
+        """
+        if not message_content:
+            return
+        all_symbol_names = self._f._symbol_index.get_all_names(project_id)
+        words = set(re.findall(r"\b[\w-]+\b", message_content))
+        mentioned_names = all_symbol_names.intersection(words)
+        if not mentioned_names:
+            return
+        affected_blocks: Set[str] = set()
+        for name in mentioned_names:
+            affected_blocks.update(self._f._symbol_index.find_blocks(name, project_id))
+        for block_hash in affected_blocks:
+            block = state["active_blocks"].get(block_hash)
+            if block:
+                block.mention_count += 1
+                block.last_mentioned = time.time()
+                block.last_mentioned_msg_idx = state["message_count"]
+                block._update_importance()
+
+    async def expire_blocks_by_time(self, project_id: str) -> None:
+        """Remove blocks that have not been mentioned recently, based on configured timeouts."""
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            if not state:
+                return
+            now = time.time()
+            expiration_seconds = self._f.valves.block_expiration_hours * 3600
+            to_remove = []
+            for h, block in state["active_blocks"].items():
+                if block.pinned or block.obsolete:
+                    continue
+                age = now - block.last_mentioned
+                if (
+                    block.content_type == ContentType.ERROR
+                    and self._f.valves.error_retention_turns > 0
+                ):
+                    if age > max(
+                        self._f.valves.error_retention_turns * 300, expiration_seconds
+                    ):
+                        to_remove.append(h)
+                elif (
+                    block.content_type == ContentType.PROPOSED_CHANGE
+                    and self._f.valves.proposed_change_retention_turns > 0
+                ):
+                    if age > max(
+                        self._f.valves.proposed_change_retention_turns * 300,
+                        expiration_seconds,
+                    ):
+                        to_remove.append(h)
+            for h in to_remove:
+                if h in state["active_blocks"]:
+                    block = state["active_blocks"][h]
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                del state["active_blocks"][h]
+            if to_remove:
+                state["has_any_calls"] = any(
+                    any(s.calls for s in b.symbols)
+                    for b in state["active_blocks"].values()
+                )
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+
+    async def update_lod_thresholds_from_response(
+        self,
+        project_id: str,
+        response_text: str,
+    ) -> None:
+        """
+        Adjust lod3_threshold based on which symbols appear in the LLM's
+        response compared to the LOD level they received.
+
+        Logic:
+        - If the LLM mentions symbols that only got LOD ≤ 2 (docstring/signature):
+          → Lower lod3_threshold: give more full code next time.
+        - If the LLM does NOT mention symbols that got LOD 3 (full code):
+          → Raise lod3_threshold slightly: those expansions were unnecessary.
+
+        Adjustments are small (lod_adapt_rate) and bounded [min, max].
+        Threshold state is NOT persisted across server restarts.
+        """
+        if not self._f.valves.enable_lod_adaptive:
+            return
+
+        last_lod_map = getattr(self._f, "_last_lod_levels", {}).get(project_id, {})
+        if not last_lod_map:
+            return
+
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        response_words = set(re.findall(r"\b\w+\b", response_text))
+        referenced = all_names.intersection(response_words)
+
+        # Symbols mentioned in the response that only received docstring/signature
+        underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
+
+        # Symbols that got full code but do not appear in the response
+        overserved = [
+            sym
+            for sym in last_lod_map
+            if last_lod_map[sym] == 3 and sym not in referenced
+        ]
+
+        old_threshold = self._f.valves.lod3_threshold
+        changed = False
+
+        if len(underserved) >= self._f.valves.lod_adapt_underserved_min:
+            # Lower threshold → more full code next time
+            self._f.valves.lod3_threshold = max(
+                self._f.valves.lod_adapt_min,
+                self._f.valves.lod3_threshold - self._f.valves.lod_adapt_rate,
+            )
+            changed = True
+            self._f._log_debug(
+                f"LOD adaptive ↓: threshold {old_threshold:.2f} → "
+                f"{self._f.valves.lod3_threshold:.2f} "
+                f"({len(underserved)} underserved: {underserved[:3]})"
+            )
+        elif len(overserved) >= self._f.valves.lod_adapt_overserved_min:
+            # Raise threshold → fewer unnecessary expansions
+            self._f.valves.lod3_threshold = min(
+                self._f.valves.lod_adapt_max,
+                self._f.valves.lod3_threshold + self._f.valves.lod_adapt_rate * 0.5,
+            )
+            changed = True
+            self._f._log_debug(
+                f"LOD adaptive ↑: threshold {old_threshold:.2f} → "
+                f"{self._f.valves.lod3_threshold:.2f} "
+                f"({len(overserved)} overserved symbols)"
+            )
+
+        if not changed:
+            self._f._log_debug(
+                f"LOD adaptive: no adjustment needed "
+                f"(threshold={self._f.valves.lod3_threshold:.2f})"
+            )
+
+    def get_feedback_context(self, project_id: str) -> str:
+        """Return a formatted string of recent feedback for the given project."""
+        state = self._f._state_store.get_state(project_id)
+        feedback = state.get("feedback_history", [])
+        if not feedback:
+            return ""
+        recent = feedback[-self._f.valves.feedback_history_limit :]
+        lines = ["## Previous Feedback"]
+        for fb in recent:
+            success = "✅" if fb.success else "❌"
+            lines.append(f"- {success} {fb.change_description[:100]}")
+        return "\n".join(lines)
+
+    async def parallel_context_checks(
+        self,
+        messages: list,
+        query: str,
+        context_hash: str,
+        project_id: str,
+        state: dict,
+        skip_contradiction: bool = False,
+        skip_cache: bool = False,
+    ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
+        """
+        Run contradiction detection, response cache lookup, and duplicate question
+        detection in parallel. Returns (contradiction_warning, cached_response,
+        duplicate_match). All three can be None.
+        """
+        tasks = [
+            (
+                self._f._commands._detect_contradictions(messages)
+                if (
+                    self._f.valves.enable_contradiction_detection
+                    and not skip_contradiction
+                )
+                else asyncio.sleep(0, result=None)
+            ),
+            (
+                self._f._ltm.find_cached_response(query, context_hash, state)
+                if (
+                    self._f.valves.enable_response_cache
+                    and HAS_SENTENCE
+                    and not skip_cache
+                )
+                else asyncio.sleep(0, result=None)
+            ),
+            (
+                self._f._ltm.find_duplicate_question(query, project_id)
+                if (self._f.valves.duplicate_question_threshold and HAS_SENTENCE)
+                else asyncio.sleep(0, result=None)
+            ),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        contradiction = results[0] if not isinstance(results[0], Exception) else None
+        cached = results[1] if not isinstance(results[1], Exception) else None
+        duplicate = results[2] if not isinstance(results[2], Exception) else None
+        return contradiction, cached, duplicate
+
     async def ensure_docstring(self, name: str, project_id: str) -> str:
         """
         Return the docstring for `name`, generating and persisting it on the fly
-        if missing.  This is a synchronous call (blocks until the LLM responds)
-        so it should only be used for a handful of symbols per request.
+        if missing.  If a background task is already working on this symbol,
+        return "" immediately to avoid duplicate work.
         """
         # 1. Already in memory?
-        for block in self._f._state_store.get_state(project_id)[
-            "active_blocks"
-        ].values():
+        state = self._f._state_store.get_state(project_id)
+        for block in state["active_blocks"].values():
             for sym in block.symbols:
                 if sym.name == name and sym.docstring:
                     return sym.docstring
 
-        # 2. Check SQLite (direct read)
+        # 2. Check SQLite
         try:
             row = await anyio.to_thread.run_sync(
                 lambda: self._f._db_conn.execute(
-                    "SELECT doctring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
+                    "SELECT docstring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
                     (project_id, name),
                 ).fetchone()
             )
@@ -9642,17 +9914,19 @@ class EnrichmentTasks:
         if row and row[0]:
             doc = row[0]
             # Update in-memory symbol
-            for block in self._f._state_store.get_state(project_id)[
-                "active_blocks"
-            ].values():
+            for block in state["active_blocks"].values():
                 for sym in block.symbols:
                     if sym.name == name:
                         sym.docstring = doc
+                        self._f._symbol_index.update_docstring(name, project_id, doc)
                         break
             return doc
 
-        # 3. Generate via LLM
-        state = self._f._state_store.get_state(project_id)
+        # 3. Already being generated in background? → skip (no blocking)
+        if name in self._docstrings_in_flight:
+            return ""
+
+        # 4. Generate synchronously
         signature = name
         snippet = ""
         for block in state["active_blocks"].values():
@@ -9676,7 +9950,6 @@ class EnrichmentTasks:
             return ""
 
         docstring = docstring.strip()
-
         # Persist and update
         for block in state["active_blocks"].values():
             for sym in block.symbols:
@@ -9685,12 +9958,152 @@ class EnrichmentTasks:
                     self._f._symbol_index.update_docstring(name, project_id, docstring)
                     break
         await self._f._state_store._db_enqueue(
-            lambda name=name, doc=docstring, pid=project_id: self._f._db_conn.execute(
-                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, doctring, updated_at) VALUES (?,?,?,?)",
-                (pid, name, doc, time.time()),
+            lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                (pid, n, d, time.time()),
             )
         )
         return docstring
+
+    def schedule_docstrings(
+        self, symbols: List[Tuple[str, str]], project_id: str
+    ) -> None:
+        if not self._f.valves.enable_auto_docstrings:
+            return
+
+        state = self._f._state_store.get_state(project_id)
+        for name, signature in symbols:
+            if name in self._docstrings_in_flight:
+                continue
+            in_memory = False
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if sym.name == name and sym.docstring:
+                        in_memory = True
+                        break
+                if in_memory:
+                    break
+            if in_memory:
+                continue
+
+            self._docstrings_in_flight.add(name)
+            task = asyncio.create_task(
+                self._background_docstring(name, signature, project_id)
+            )
+            self._docstring_tasks.add(task)
+            task.add_done_callback(self._docstring_tasks.discard)
+
+    def cancel_docstring_tasks(self) -> None:
+        """Cancel all pending background docstring tasks and clear tracking sets."""
+        for task in list(self._docstring_tasks):
+            task.cancel()
+        self._docstring_tasks.clear()
+        self._docstrings_in_flight.clear()
+
+    async def _background_docstring(
+        self, name: str, signature: str, project_id: str
+    ) -> None:
+        """Generate one docstring in background, persist it, and remove from in‑flight set."""
+        try:
+            # Re‑fetch snippet (may have been evicted; best effort)
+            state = self._f._state_store.get_state(project_id)
+            snippet = ""
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if sym.name == name:
+                        snippet = block.content[:500]
+                        break
+                if snippet:
+                    break
+
+            docstring = await self._f._llm_orchestrator.call_llm(
+                prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
+                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+                model_override=self._f.valves.llm_model,
+                max_tokens=50,
+                temperature=0.1,
+                label="bg_docstring",
+            )
+            if not docstring or not docstring.strip():
+                return
+
+            docstring = docstring.strip()
+
+            # Persist and update memory
+            lock = await self._f._state_store.get_project_lock(project_id)
+            async with lock:
+                state = self._f._state_store.get_state(project_id)
+                for block in state["active_blocks"].values():
+                    for sym in block.symbols:
+                        if sym.name == name:
+                            sym.docstring = docstring
+                            self._f._symbol_index.update_docstring(
+                                name, project_id, docstring
+                            )
+                            break
+                self._f._state_store.set_state(project_id, state)
+
+            await self._f._state_store._db_enqueue(
+                lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                    (pid, n, d, time.time()),
+                )
+            )
+        finally:
+            self._docstrings_in_flight.discard(name)
+
+
+async def _background_docstring(
+    self, name: str, signature: str, project_id: str
+) -> None:
+    """Generate one docstring in background, persist it, and remove from in‑flight set."""
+    try:
+        # Re‑fetch snippet (may have been evicted; best effort)
+        state = self._f._state_store.get_state(project_id)
+        snippet = ""
+        for block in state["active_blocks"].values():
+            for sym in block.symbols:
+                if sym.name == name:
+                    snippet = block.content[:500]
+                    break
+            if snippet:
+                break
+
+        docstring = await self._f._llm_orchestrator.call_llm(
+            prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
+            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+            model_override=self._f.valves.llm_model,
+            max_tokens=50,
+            temperature=0.1,
+            label="bg_docstring",
+        )
+        if not docstring or not docstring.strip():
+            return
+
+        docstring = docstring.strip()
+
+        # Persist and update memory
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if sym.name == name:
+                        sym.docstring = docstring
+                        self._f._symbol_index.update_docstring(
+                            name, project_id, docstring
+                        )
+                        break
+            self._f._state_store.set_state(project_id, state)
+
+        await self._f._state_store._db_enqueue(
+            lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                (pid, n, d, time.time()),
+            )
+        )
+    finally:
+        self._docstrings_in_flight.discard(name)
 
     async def run_session_summary_task(self, params: dict, model: str) -> bool:
         """Generate an autobiographical session summary and store it in LTM."""
@@ -13598,6 +14011,7 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         state = self._state_store.get_state(project_id)
+
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
                 messages,
@@ -13653,6 +14067,14 @@ class Filter:
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
+        # ── Restore KV cache (undo lazy docstring pollution) ──
+        if (
+            is_code_session
+            and self.valves.enable_slot_persistence
+            and self.valves.enable_auto_docstrings
+        ):
+            await self._ctx_builder.slot_restore(project_id)
+
         body["messages"] = messages
 
         _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -13675,6 +14097,9 @@ class Filter:
 
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
+
+        # ── Cancel any background docstring tasks from previous turn ──
+        self._enrichment.cancel_docstring_tasks()
 
         try:
             messages = body.get("messages", [])
@@ -13723,6 +14148,24 @@ class Filter:
                             await self._update_active_code(last_msg, project_id)
                             # Store immediately in LTM
                             await self._ltm.store_messages(project_id, [last_msg])
+
+                            # ── Schedule background docstring generation ──
+                            if self.valves.enable_auto_docstrings:
+                                state = self._state_store.get_state(project_id)
+                                pending = []
+                                for block in state["active_blocks"].values():
+                                    if block.obsolete:
+                                        continue
+                                    for sym in block.symbols:
+                                        if (
+                                            sym.kind in ("function", "method")
+                                            and not sym.docstring
+                                        ):
+                                            pending.append((sym.name, sym.signature))
+                                if pending:
+                                    self._enrichment.schedule_docstrings(
+                                        pending, project_id
+                                    )
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 self._log_debug(
