@@ -13271,7 +13271,7 @@ class Filter:
         llm_request_timeout: int = Field(default=900)
         llm_per_call_timeout: int = Field(default=900, ge=1)
         llm_retry_total_timeout: int = Field(default=950, ge=10)
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=2, ge=1, le=10)
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=3, ge=1, le=10)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
         llamacpp_endpoint_type: str = Field(default="chat")
