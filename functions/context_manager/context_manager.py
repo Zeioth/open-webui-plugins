@@ -12819,73 +12819,70 @@ class ContextDumper:
             except Exception as exc:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
-        # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
+    # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
 
-        def _capture_payload(
-            self,
-            project_id: str,
-            static_block: str,
-            dynamic_block: str,
-            final_system: str,
-            messages: List[dict],
-        ) -> dict:
-            """Snapshot strings + metadata immediately so later mutation can't race."""
-            max_chars = self._f.valves.context_dump_message_max_chars
-            msg_copy: List[Tuple[str, str]] = []
-            if self._f.valves.context_dump_include_messages:
-                for m in messages:
-                    role = m.get("role", "")
-                    content = m.get("content", "") or ""
-                    if max_chars > 0 and len(content) > max_chars:
-                        content = (
-                            content[:max_chars]
-                            + f"\n[...truncated {len(content) - max_chars} chars...]"
-                        )
-                    msg_copy.append((role, content))
+    def _capture_payload(
+        self,
+        project_id: str,
+        static_block: str,
+        dynamic_block: str,
+        final_system: str,
+        messages: List[dict],
+    ) -> dict:
+        """Snapshot strings + metadata immediately so later mutation can't race."""
+        max_chars = self._f.valves.context_dump_message_max_chars
+        msg_copy: List[Tuple[str, str]] = []
+        if self._f.valves.context_dump_include_messages:
+            for m in messages:
+                role = m.get("role", "")
+                content = m.get("content", "") or ""
+                if max_chars > 0 and len(content) > max_chars:
+                    content = (
+                        content[:max_chars]
+                        + f"\n[...truncated {len(content) - max_chars} chars...]"
+                    )
+                msg_copy.append((role, content))
 
-            try:
-                code_state_hash = self._f._activation.compute_code_state_hash(
-                    project_id
-                )
-            except Exception:
-                code_state_hash = ""
-            block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
-            slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
-            try:
-                state = self._f._state_store.get_state(project_id)
-                turn = state.get("message_count", 0)
-                n_active_blocks = len(state.get("active_blocks", {}))
-            except Exception:
-                turn = 0
-                n_active_blocks = 0
-            try:
-                n_symbols = len(self._f._symbol_index.get_all_names(project_id))
-            except Exception:
-                n_symbols = 0
+        try:
+            code_state_hash = self._f._activation.compute_code_state_hash(project_id)
+        except Exception:
+            code_state_hash = ""
+        block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
+        slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
+        try:
+            state = self._f._state_store.get_state(project_id)
+            turn = state.get("message_count", 0)
+            n_active_blocks = len(state.get("active_blocks", {}))
+        except Exception:
+            turn = 0
+            n_active_blocks = 0
+        try:
+            n_symbols = len(self._f._symbol_index.get_all_names(project_id))
+        except Exception:
+            n_symbols = 0
 
-            now = time.time()
-            return {
-                "project_id": project_id,
-                "turn": turn,
-                "timestamp": now,
-                "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
-                "static_block": static_block or "",
-                "dynamic_block": dynamic_block or "",
-                "final_system": final_system or "",
-                "messages": msg_copy,
-                "block_a_hash": block_a_hash,
-                "code_state_hash": code_state_hash,
-                "slot_saved_hash": slot_hash,
-                "n_active_blocks": n_active_blocks,
-                "n_symbols": n_symbols,
-            }
+        now = time.time()
+        return {
+            "project_id": project_id,
+            "turn": turn,
+            "timestamp": now,
+            "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "static_block": static_block or "",
+            "dynamic_block": dynamic_block or "",
+            "final_system": final_system or "",
+            "messages": msg_copy,
+            "block_a_hash": block_a_hash,
+            "code_state_hash": code_state_hash,
+            "slot_saved_hash": slot_hash,
+            "n_active_blocks": n_active_blocks,
+            "n_symbols": n_symbols,
+        }
 
     # ── Async write (offloaded to a worker thread) ────────────────────────
 
     async def _write_async(self, payload: dict) -> None:
-        """Write context dump asynchronously with progress logging."""
         self._f._log_debug(f"📝 Writing context dump (turn {payload['turn']})...")
         try:
             await anyio.to_thread.run_sync(self._write_sync, payload)
