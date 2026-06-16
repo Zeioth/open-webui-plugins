@@ -5787,8 +5787,10 @@ class LLMOrchestrator:
         ``llm_retry_total_timeout`` is used.
         Between retries, a fixed 1‑second pause is applied.
         """
-        # ── Silent ingestion guard: never call the LLM during code ingestion ──
-        if getattr(self._f, "_is_silent_ingestion", False):
+        # ── Silent ingestion guard: only allow background docstring calls ──
+        if getattr(self._f, "_is_silent_ingestion", False) and label not in (
+            "bg_docstring",
+        ):
             return None
 
         dedup_key = hashlib.md5(
@@ -13685,7 +13687,7 @@ class Filter:
         debug: bool = Field(default=True)
         # ── Context dump (evolution tracking) ───────────────────────
         enable_context_dump: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Dump the assembled per-turn context (Block A, Block B, message "
                 "window) to disk for evolution tracking. Off by default; writes "
@@ -14336,6 +14338,9 @@ class Filter:
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
+        # ── Record whether we are coming from a silent ingestion ──
+        silent_ingestion_active = self._is_silent_ingestion
+
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
 
@@ -14584,7 +14589,9 @@ class Filter:
                 "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
             )
         finally:
-            pass
+            # ── Release silent ingestion flag at the very end ──
+            if silent_ingestion_active:
+                self._is_silent_ingestion = False
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
