@@ -2831,8 +2831,10 @@ class ContextBuilder:
                 block.content, block.file_path, docstring_provider
             )
             if skel:
-                fence = "python" if (block.file_path or "").endswith(".py") else (
-                    block.symbols[0].language if block.symbols else ""
+                fence = (
+                    "python"
+                    if (block.file_path or "").endswith(".py")
+                    else (block.symbols[0].language if block.symbols else "")
                 )
                 _emit(fpath, skel, fence)
 
@@ -2846,9 +2848,7 @@ class ContextBuilder:
                 (s.parent_symbol for s in block.symbols if s.parent_symbol), ""
             )
             # Check if this block IS a class definition
-            block_is_class_def = any(
-                s.kind == "class" for s in block.symbols
-            )
+            block_is_class_def = any(s.kind == "class" for s in block.symbols)
             if block_is_class_def:
                 # Store the class header block for later use
                 class_name = next(
@@ -2870,7 +2870,7 @@ class ContextBuilder:
         for class_name, header_block in class_header_blocks.items():
             grouped_by_class[class_name].insert(0, header_block)
 
-        for class_name in sorted(grouped_by_class.keys()):   # deterministic
+        for class_name in sorted(grouped_by_class.keys()):  # deterministic
             if truncated:
                 break
             _emit(
@@ -2974,9 +2974,7 @@ class ContextBuilder:
 
         # Budget-aware elision: rank by centrality, keep what fits.
         per_class_budget = max(400, remaining_budget)
-        ranked = sorted(
-            method_lines, key=lambda ml: -centrality.get(ml[0], 0.0)
-        )
+        ranked = sorted(method_lines, key=lambda ml: -centrality.get(ml[0], 0.0))
         kept, used, dropped = [], 0, 0
         for mname, line in ranked:
             tok = self._f._tokens.estimate_code_tokens(line)
@@ -8524,20 +8522,9 @@ class CodeBlockManager:
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # Use symbols pre-extracted from the raw code (silent ingestion path).
-        # When the inlet wrapped the code in fences, the full-document extraction
-        # would fail on the markdown syntax, so we supply the symbols that were
-        # extracted from the raw content before wrapping.
-        full_doc_symbols = getattr(self._f, '_raw_ingested_symbols', None)
-        if full_doc_symbols is None:
-            full_doc_symbols = []
-        else:
-            # Clear the temporary storage so it's not reused for later calls
-            self._f._raw_ingested_symbols = None
-
-        # If we didn't get pre-extracted symbols, perform the extraction now
-        # (only when tree-sitter is available).
-        if not full_doc_symbols and HAS_TREE_SITTER:
+        # Full-document symbol extraction (works on raw code, no fences needed).
+        full_doc_symbols = []
+        if HAS_TREE_SITTER:
             try:
                 full_doc_symbols = await SignatureExtractor.extract_async(content, None)
             except Exception:
@@ -8550,16 +8537,26 @@ class CodeBlockManager:
                 ts_blocks = await anyio.to_thread.run_sync(
                     lambda: process(content, config)
                 )
+
+                # If the inlet told us the language, use it for ALL blocks
+                # instead of guessing from tiny fragments.
+                ingested_lang = getattr(self._f, "_ingested_lang", None)
+
                 for tsb in ts_blocks:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
+
+                    # Determine language for this block
                     lang = tsb.language or "text"
-                    if lang in ("text", ""):
+                    if ingested_lang:
+                        lang = ingested_lang
+                    elif lang in ("text", ""):
                         guessed = SignatureExtractor._guess_language(None, raw)
                         if guessed != "unknown":
                             lang = guessed
                         else:
                             lang = await self._infer_code_language(raw)
+
                     lines = raw.splitlines()
                     if lines and lines[0].startswith("```"):
                         lines = lines[1:]
@@ -8575,17 +8572,25 @@ class CodeBlockManager:
                     start_line = content.count("\n", 0, start) + 1
                     end_line = content.count("\n", 0, end) + 1
                     block_symbols = [
-                        s for s in full_doc_symbols
+                        s
+                        for s in full_doc_symbols
                         if s.line_start and start_line <= s.line_start <= end_line
                     ]
 
-                    blocks.append({
-                        "language": lang,
-                        "code": code,
-                        "type": block_type,
-                        "precomputed_symbols": block_symbols,
-                    })
+                    blocks.append(
+                        {
+                            "language": lang,
+                            "code": code,
+                            "type": block_type,
+                            "precomputed_symbols": block_symbols,
+                        }
+                    )
                     spans.append((start, end))
+
+                # Clear the ingested language so later calls aren't affected.
+                if hasattr(self._f, "_ingested_lang"):
+                    self._f._ingested_lang = None
+
                 if blocks:
                     # Apply existing post-processing (file path extraction,
                     # internal filter) while preserving 'precomputed_symbols'.
@@ -11958,288 +11963,45 @@ class InletOrchestrator:
         """Return the current project id from the valves configuration."""
         return self._f.valves.project_id
 
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet called")
-        inlet_start = time.monotonic()
-        self._log_section("CONTEXT MANAGER - INLET START")
+    async def inlet_preprocess(self, body: dict, project_id: str) -> list:
+        """Handle project switching, symbol cache loading, and KV slot restore."""
+        messages = body.get("messages", [])
 
-        def _inlet_timing(step_name: str, start: float, end: float = None):
-            if end is None:
-                end = time.monotonic()
-            self._log_timing(step_name, start - inlet_start, end - start)
-
-        project_id = self._inlet_orch.get_project_id()
-        slot_free = True
-        # Cold‑start guard: si no hay modelo cargado, no hay slot que liberar
-        if slot_free and self._last_used_model is None:
-            slot_free = False
-
-        # Cancel any pending background docstring tasks, waiting for the
-        # in‑flight one to finish so the slot is released cleanly.
-        await self._enrichment.cancel_docstring_tasks()
-
-        # Reset the per‑turn lazy docstring counter so the new turn starts fresh
-        self._enrichment._lazy_docstrings_generated_this_turn = 0
-
-        # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT (Critical)
-        #   1. Preprocess (project switch, cache load)
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        messages = await self._inlet_orch.inlet_preprocess(body, project_id)
-        _inlet_timing("Step 1/7: Preprocess (project switch, cache load)", step_start)
-        if not messages:
-            return body
-
-        # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT (Critical)
-        #   2. Extract user info
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        (
-            last_user_msg,
-            user_query,
-            user_question,
-            is_explicit_command,
-            has_code_blocks,
-        ) = await self._inlet_orch.inlet_extract_user_info(messages)
-        _inlet_timing("Step 2/7: Extract user info", step_start)
-
-        # ── Detect AutoContinue continuation ──────────────────────────────
-        _last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        _hint = ""
-        _is_continuation = False
-        if _last_assistant:
-            _ac = _last_assistant.get("content", "")
-            for _marker in self._MULTI_PHASE_MARKERS:
-                if _marker in _ac:
-                    _is_continuation = True
-                    _idx = _ac.find(_marker)
-                    _hint_line = _ac[_idx:].split("\n")[0]
-                    _hint = re.sub(
-                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
-                        "",
-                        _hint_line,
-                        flags=re.IGNORECASE,
-                    ).strip()
-                    if _hint:
-                        user_question = _hint
-                        self._log_debug(
-                            f"AutoContinue detected — LOD query: '{user_question}'"
-                        )
-                    break
-        if _is_continuation:
-            slot_free = False
-            user_query = user_query + " código"
-
-        # ─────────────────────────────────────────────────────────────────
-        # ⚡ COMMAND HANDLING (High value)
-        #   3. Explicit commands (/forget, /status, /clean, /expand)
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        handled, handled_messages = await self._commands.handle_explicit_commands(
-            messages, project_id, is_explicit_command, last_user_msg, __user__
-        )
-        _inlet_timing("Step 3/7: Handle explicit commands", step_start)
-        if handled:
-            body["messages"] = handled_messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+        if self._f._last_project_id and self._f._last_project_id != project_id:
+            self._f._log_debug(
+                f"Project changed from {self._f._last_project_id} to {project_id}"
             )
-            return body
+            old_state = self._f._conversation_state.get(self._f._last_project_id)
+            if old_state:
+                self._f._symbol_index.clear_project(self._f._last_project_id)
+            self._f._cached_lightweight_context.pop(self._f._last_project_id, None)
+            self._f._block_change_summaries.clear()
+        self._f._last_project_id = project_id
 
-        # ⚡ COMMAND HANDLING (High value)
-        #   4. Natural language intents (forget, remember, obsolete)
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        handled, handled_messages = await self._commands.handle_natural_intents(
-            messages,
-            project_id,
-            is_explicit_command,
-            last_user_msg,
-            slot_free=slot_free,
-        )
-        _inlet_timing("Step 4/7: Handle natural language intents", step_start)
-        if handled:
-            body["messages"] = handled_messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
+        # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
+        if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
+            existing_views = self._f._path_index.get_all(project_id)
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            if all_names and not existing_views:
+                self._f._log_debug(
+                    "PathIndex empty but symbols exist — loading from DB"
+                )
+                db_views = await self._f._state_store.load_path_views_from_db(
+                    project_id
+                )
+                for view in db_views:
+                    self._f._path_index.add(view, project_id)
 
-        # ── Silent Ingestion (Modo B: chunked paste) ────────────────────
-        if (
-            self.valves.enable_silent_ingestion
-            and last_user_msg is not None
-            and not is_explicit_command
-        ):
-            if await self._commands.is_code_only_message(user_query):
-                self._log_section("SILENT INGESTION MODE")
-
-                # ── Extract full-document symbols from raw code now,
-                # before wrapping in markdown fences ──
-                raw_symbols = []
-                if HAS_TREE_SITTER:
-                    try:
-                        raw_symbols = await SignatureExtractor.extract_async(user_query, None)
-                    except Exception:
-                        pass
-                self._raw_ingested_symbols = raw_symbols
-
-                _msg_to_index = last_user_msg
-                if "```" not in user_query and self._commands.has_code_indicators(
-                    user_query
-                ):
-                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
-                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                    _msg_to_index = {
-                        **last_user_msg,
-                        "content": f"```{_lang}\n{user_query}\n```",
-                    }
-                    self._log_debug(
-                        f"Silent ingestion: wrapping raw code as {_lang} "
-                        f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
-                    )
-
-                # ── Evitar cualquier llamada al LLM durante la ingesta ─
-                self._is_silent_ingestion = True
-                try:
-                    # Process code into SymbolGraph without invoking main LLM
-                    await self._update_active_code(_msg_to_index, project_id)
-                finally:
-                    pass  # flag stays active until outlet clears it
-
-                # Resolve cross‑references with previous chunks
-                await self._activation.resolve_dangling_edges(project_id)
-
-                # Rebuild PathIndex with new symbols
-                if self.valves.enable_path_analysis:
-                    await self._activation.rebuild_path_index(project_id)
-
-                # Invalidate static block (new code → new Block A)
-                self._ctx_builder.invalidate_block_a_cache(
-                    project_id, "new chunk ingested"
+        # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
+        if self._f.valves.enable_edge_persistence:
+            restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
+            if restored > 0:
+                self._f._log_debug(
+                    f"Cross-session: {restored} symbol edges restored from DB. "
+                    f"No need to re-paste code."
                 )
 
-                # Forzar guardado del estado tras la ingesta (no hay outlet)
-                self._state_dirty = True
-                await self._state_store.save_state_if_dirty(project_id)
-
-                # Statistics for the user
-                state = self._state_store.get_state(project_id)
-                num_blocks = len(state.get("active_blocks", {}))
-                num_symbols = len(self._symbol_index.get_all_names(project_id))
-                num_classes = len(self._symbol_index.get_classes(project_id))
-
-                # ── Mensaje enriquecido con conteo de clases ──
-                response = (
-                    f"✅ {num_symbols} símbolos en {num_classes} clases "
-                    f"({num_blocks} bloques activos). El código está en el SymbolGraph. "
-                    f"Usa `/expand <Clase>` o `/expand <Clase>.<método>` para ver implementaciones."
-                )
-
-                compressed_stub = (
-                    f"```python\n"
-                    f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados en SymbolGraph]\n"
-                    f"# Usa /expand <nombre> para ver cualquier implementación.\n"
-                    f"```\n\n"
-                    f"_(El código está disponible internamente; no es necesario repetirlo aquí.)_"
-                )
-                messages[-1] = {**messages[-1], "content": compressed_stub}
-                messages.append({"role": "assistant", "content": response})
-                body["messages"] = messages
-                _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                self._log_section(
-                    "CONTEXT MANAGER - INLET END",
-                    duration=time.monotonic() - inlet_start,
-                )
-                return body
-
-        # ─────────────────────────────────────────────────────────────────
-        # 🔥 STATE MANAGEMENT (Critical)
-        #   5. Prepare code session (classify, update code blocks)
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        is_code_session, user_question = (
-            await self._inlet_orch.inlet_prepare_code_session(
-                messages, project_id, user_query, is_continuation=_is_continuation
-            )
-        )
-        _inlet_timing("Step 5/7: Prepare code session", step_start)
-
-        # ─────────────────────────────────────────────────────────────────
-        # 🧠 ENRICHMENT (High value)
-        #   6. Build system injections and assemble final messages
-        #      (delegates Block A/B construction to ContextBuilder)
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        state = self._state_store.get_state(project_id)
-        static_block, dynamic_injections, cached_response, prelim_system = (
-            await self._inlet_build_system_injections(
-                messages,
-                project_id,
-                user_query,
-                user_question,
-                is_code_session,
-                last_user_msg,
-                state,
-                slot_free=slot_free,
-            )
-        )
-        _inlet_timing("Step 6/7: Build system injections", step_start)
-
-        # ── v8: Restore KV slot after Block A has been built (fix #20) ──
-        if (
-            self.valves.enable_slot_persistence
-            and project_id not in self._slot_restore_attempted
-        ):
-            await self._ctx_builder.slot_restore(project_id)
-
-        if cached_response:
-            messages.pop()
-            messages.append(
-                {"role": "assistant", "content": cached_response["response"]}
-            )
-            messages = self._inlet_orch.ensure_last_message_is_user(messages)
-            body["messages"] = messages
-            _inlet_timing("total_inlet (end-to-end)", inlet_start)
-            self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-            )
-            return body
-
-        # ─────────────────────────────────────────────────────────────────
-        # 📦 COMPRESSION + ASSEMBLY (High value)
-        #   7. Assemble final messages with CoT, multi-phase, trimming
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        messages = await self._inlet_assemble_final_messages(
-            messages,
-            project_id,
-            static_block,
-            dynamic_injections,
-            prelim_system,
-            last_user_msg,
-            is_code_session,
-            state,
-            __user__,
-            user_question,
-            has_code_blocks,
-            slot_free=slot_free,
-        )
-        _inlet_timing("Step 7/7: Assemble final messages", step_start)
-
-        body["messages"] = messages
-
-        _inlet_timing("total_inlet (end-to-end)", inlet_start)
-        self._log_section(
-            "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
-        )
-        return body
+        return messages
 
     async def inlet_extract_user_info(
         self,
@@ -12354,10 +12116,8 @@ class InletOrchestrator:
     async def classify_session(self, messages: list, project_id: str) -> bool:
         """
         Determine whether the current session is a coding session.
-        If there are active code blocks, always return True, bypassing any
-        cached result that might be stale (e.g. a previous False before code
-        was ingested).  Otherwise fall back to code indicators, block
-        extraction, and finally a CrossEncoder check on the last user message.
+        Uses cached results per project, then falls back to code indicators,
+        block extraction, and finally a CrossEncoder check on the last user message.
         """
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -12368,16 +12128,6 @@ class InletOrchestrator:
             cache_key = (
                 f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
             )
-
-        # ── Active blocks always mean a code session (regardless of cache) ──
-        state = self._f._state_store.get_state(project_id)
-        if state and state.get("active_blocks"):
-            if cache_key:
-                self._f._session_classify_cache[cache_key] = (True, time.time())
-            return True
-
-        # ── Check the cache (only when there are no active blocks) ────────
-        if cache_key is not None:
             cached = self._f._session_classify_cache.get(cache_key)
             if cached is not None:
                 result, ts = cached
@@ -12385,7 +12135,12 @@ class InletOrchestrator:
                     return result
                 del self._f._session_classify_cache[cache_key]
 
-        # ── Heuristics for messages without active blocks ─────────────────
+        state = self._f._state_store.get_state(project_id)
+        if state and state.get("active_blocks"):
+            if cache_key:
+                self._f._session_classify_cache[cache_key] = (True, time.time())
+            return True
+
         for msg in reversed(messages[-10:]):
             if msg.get("role") != "user":
                 continue
@@ -12404,8 +12159,10 @@ class InletOrchestrator:
                 self._f._session_classify_cache[cache_key] = (True, time.time())
             return True
 
-        if last_user and not self._f._commands.has_code_indicators(
-            last_user.get("content", "")
+        if (
+            last_user
+            and not state.get("active_blocks")
+            and not self._f._commands.has_code_indicators(last_user.get("content", ""))
         ):
             if len(last_user.get("content", "")) > 200:
                 blocks, _ = await self._f._code_blocks.extract_code_blocks(
@@ -12453,7 +12210,6 @@ class InletOrchestrator:
 
         if cache_key:
             self._f._session_classify_cache[cache_key] = (result, time.time())
-            # Trim cache if it grows too large
             if len(self._f._session_classify_cache) >= 500:
                 items = sorted(
                     self._f._session_classify_cache.items(), key=lambda x: x[1][1]
@@ -15414,20 +15170,14 @@ class Filter:
             if await self._commands.is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
 
+                # ── Guardamos el lenguaje para que extract_code_blocks lo use
+                #     sin necesidad de adivinarlo desde fragmentos pequeños.
+                _guessed_lang = SignatureExtractor._guess_language(None, user_query)
+                self._ingested_lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+
+                # Pasamos el mensaje SIN envolver (el código crudo mantiene los
+                # números de línea correctos para la asignación de símbolos).
                 _msg_to_index = last_user_msg
-                if "```" not in user_query and self._commands.has_code_indicators(
-                    user_query
-                ):
-                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
-                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                    _msg_to_index = {
-                        **last_user_msg,
-                        "content": f"```{_lang}\n{user_query}\n```",
-                    }
-                    self._log_debug(
-                        f"Silent ingestion: wrapping raw code as {_lang} "
-                        f"({self._tokens.estimate_code_tokens(user_query)} tokens)"
-                    )
 
                 # ── Evitar cualquier llamada al LLM durante la ingesta ─
                 self._is_silent_ingestion = True
@@ -15457,7 +15207,7 @@ class Filter:
                 state = self._state_store.get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
-                num_classes = len(self._symbol_index.get_classes(project_id))  # NEW
+                num_classes = len(self._symbol_index.get_classes(project_id))
 
                 # ── Mensaje enriquecido con conteo de clases ──
                 response = (
