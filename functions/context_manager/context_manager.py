@@ -2585,7 +2585,7 @@ class ContextBuilder:
             if meta is None:
                 continue
 
-            # ── Lazy docstring generation ──
+            # ── Lazy docstring generation (respects per‑turn limit) ──
             if not meta.get("docstring") and self._f.valves.enable_auto_docstrings:
                 doc = await self._f._enrichment.ensure_docstring(name, project_id)
                 meta["docstring"] = doc
@@ -9557,6 +9557,7 @@ class EnrichmentTasks:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self._docstrings_in_flight: Set[str] = set()
+        self._lazy_docstrings_generated_this_turn: int = 0
         self._docstring_tasks: Set[asyncio.Task] = set()
 
     async def generate_change_summary(
@@ -9900,7 +9901,8 @@ class EnrichmentTasks:
         """
         Return the docstring for `name`, generating and persisting it on the fly
         if missing.  If a background task is already working on this symbol,
-        return "" immediately to avoid duplicate work.
+        return "" immediately to avoid duplicate work.  Respects the per‑turn
+        lazy generation limit (lazy_docstring_max_per_turn).
         """
         # 1. Already in memory?
         state = self._f._state_store.get_state(project_id)
@@ -9934,7 +9936,15 @@ class EnrichmentTasks:
         if name in self._docstrings_in_flight:
             return ""
 
-        # 4. Generate synchronously
+        # 4. Respect per‑turn lazy generation limit
+        if self._f.valves.lazy_docstring_max_per_turn > 0:
+            if (
+                self._lazy_docstrings_generated_this_turn
+                >= self._f.valves.lazy_docstring_max_per_turn
+            ):
+                return ""
+
+        # 5. Generate synchronously
         signature = name
         snippet = ""
         for block in state["active_blocks"].values():
@@ -9958,7 +9968,8 @@ class EnrichmentTasks:
             return ""
 
         docstring = docstring.strip()
-        # Persist and update
+
+        # Persist and update memory
         for block in state["active_blocks"].values():
             for sym in block.symbols:
                 if sym.name == name:
@@ -9971,6 +9982,8 @@ class EnrichmentTasks:
                 (pid, n, d, time.time()),
             )
         )
+
+        self._lazy_docstrings_generated_this_turn += 1
         return docstring
 
     def schedule_docstrings(
@@ -12083,19 +12096,19 @@ class MessageAssembler:
             query=user_question,
         )
 
-        # ── v2.0: Hard cap post-compresión ────────────────────────────
-        _HISTORY_BUDGET = 4000  # tokens fijos para historial
-        if self._f.tokenizer:
+        # ── v2.0: Hard cap post‑compresión ────────────────────────────
+        if self._f.tokenizer and self._f.valves.history_max_tokens > 0:
+            budget = self._f.valves.history_max_tokens
             history_msgs = [m for m in compressed if m.get("role") != "system"]
             total = sum(
                 len(self._f.tokenizer.encode(m.get("content", "")))
                 for m in history_msgs
             )
-            if total > _HISTORY_BUDGET:
+            if total > budget:
                 kept, used = [], 0
                 for msg in reversed(history_msgs):
                     tok = len(self._f.tokenizer.encode(msg.get("content", "")))
-                    if used + tok <= _HISTORY_BUDGET:
+                    if used + tok <= budget:
                         kept.insert(0, msg)
                         used += tok
                     else:
@@ -12104,714 +12117,6 @@ class MessageAssembler:
                 compressed = sys_msgs + kept
 
         return compressed
-
-    async def _inject_multi_phase_instructions(
-        self,
-        dynamic_injections: List[Tuple[str, str]],
-        prelim_system: str,
-        messages: List[dict],
-        user_question: str,
-        slot_free: bool,
-    ) -> None:
-        """Inject multi-phase protocol if the token budget is tight."""
-        if not (
-            self._f.valves.enable_multi_phase_response
-            and self._f.tokenizer
-            and prelim_system
-        ):
-            return
-
-        _prelim_tok: int = len(self._f.tokenizer.encode(prelim_system))
-        _hist_tok: int = self._f._tokens.estimate_tokens(
-            [m for m in messages if m.get("role") != "system"]
-        )
-        _mp_available: int = max(
-            0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
-        )
-
-        if (
-            _mp_available < self._f.valves.multi_phase_response_budget_warn
-            and not self._f.valves.force_multi_phase_response
-        ):
-            # Critical: hint en mensaje usuario
-            self._f._log_debug(
-                f"Multi-phase CRITICAL ({_mp_available} tokens): "
-                "wrap-up hint appended to user message (0 system tokens used)."
-            )
-            # El método append_critical_wrap_up_hint modifica la lista in‑place
-            self._f._multi_phase.append_critical_wrap_up_hint(messages)
-            return
-
-        if (
-            _mp_available < self._f.valves.multi_phase_response_threshold
-            or self._f.valves.force_multi_phase_response
-        ):
-            _INSTRUCTION_OVERHEAD = 450
-            _mp_budget_reported = max(500, _mp_available - _INSTRUCTION_OVERHEAD)
-            _mp_instructions = self._f._multi_phase.build_multi_phase_instructions(
-                available_tokens=_mp_budget_reported,
-                user_query=user_question,
-                cot_degraded_to_l1=False,  # este valor se determinará fuera; lo mantengo simple
-                is_continuation=not slot_free,
-            )
-            dynamic_injections.append(("critical", _mp_instructions))
-            self._f._log_debug(
-                f"Multi-phase injected (priority=critical): "
-                f"{_mp_available} available, reporting {_mp_budget_reported} to model "
-                f"(overhead={_INSTRUCTION_OVERHEAD})."
-            )
-        else:
-            self._f._log_debug(
-                f"Multi-phase: not needed ({_mp_available} tokens > threshold "
-                f"{self._f.valves.multi_phase_response_threshold})."
-            )
-
-    async def _trim_and_summarize(
-        self,
-        messages: List[dict],
-        state: dict,
-        project_id: str,
-        __user__: Optional[dict],
-    ) -> Tuple[List[dict], str]:
-        """
-        Apply adaptive trimming to fit messages within the token window.
-        Optionally summarize trimmed messages and persist the summary.
-        Returns (updated_messages, pending_summary).
-        """
-        history_msgs = [m for m in messages if m.get("role") != "system"]
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        pending_summary = ""
-
-        # ── v2.0: Proactive history budget enforcement ──────────────────
-        if self._f.valves.history_max_tokens > 0 and self._f.tokenizer:
-            budget = self._f.valves.history_max_tokens
-            kept, used = [], 0
-            for msg in reversed(history_msgs):
-                tok = len(self._f.tokenizer.encode(msg.get("content", "")))
-                if used + tok <= budget:
-                    kept.insert(0, msg)
-                    used += tok
-                else:
-                    # Summarize dropped messages if enabled
-                    if self._f.valves.summarize_old_messages and not pending_summary:
-                        old = [m for m in history_msgs if m not in kept]
-                        if old:
-                            has_code = any("```" in m.get("content", "") for m in old)
-                            summary = (
-                                await self._f._history_compressor.summarize_messages(
-                                    old, is_code_context=has_code
-                                )
-                            )
-                            if summary:
-                                state["conversation_summaries"].append(
-                                    {
-                                        "text": summary,
-                                        "created_at": time.time(),
-                                        "covers_msgs": len(old),
-                                    }
-                                )
-                                cap = self._f.valves.max_conversation_summaries
-                                if (
-                                    cap > 0
-                                    and len(state["conversation_summaries"]) > cap
-                                ):
-                                    dropped = len(state["conversation_summaries"]) - cap
-                                    state["conversation_summaries"] = state[
-                                        "conversation_summaries"
-                                    ][-cap:]
-                                    self._f._log_debug(
-                                        f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                        f"(max_conversation_summaries={cap})"
-                                    )
-                                self._f._state_store.set_state(project_id, state)
-                                pending_summary = (
-                                    f"[Summary of earlier conversation]\n{summary}"
-                                )
-                    break
-            history_msgs = kept
-
-        # ── Existing adaptive_trim logic ─────────────────────────────────
-        if self._f.valves.adaptive_trim:
-            total_tokens = self._f._tokens.estimate_tokens(history_msgs + sys_msgs)
-            if total_tokens > self._f.valves.context_window_tokens:
-                keep = self._f.valves.max_turns
-                last_user_idx = -1
-                for i in range(len(history_msgs) - 1, -1, -1):
-                    if history_msgs[i].get("role") == "user":
-                        last_user_idx = i
-                        break
-                if last_user_idx != -1:
-                    start_idx = max(0, last_user_idx - keep + 1)
-                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                    kept_block = history_msgs[start_idx:]
-                else:
-                    old_block = history_msgs[:-keep] if keep > 0 else []
-                    kept_block = history_msgs[-keep:] if keep > 0 else []
-
-                if self._f.valves.summarize_old_messages and old_block:
-                    has_code = any("```" in m.get("content", "") for m in old_block)
-                    summary = await self._f._history_compressor.summarize_messages(
-                        old_block, is_code_context=has_code
-                    )
-                    if summary:
-                        state["conversation_summaries"].append(
-                            {
-                                "text": summary,
-                                "created_at": time.time(),
-                                "covers_msgs": len(old_block),
-                            }
-                        )
-                        cap = self._f.valves.max_conversation_summaries
-                        if cap > 0 and len(state["conversation_summaries"]) > cap:
-                            dropped = len(state["conversation_summaries"]) - cap
-                            state["conversation_summaries"] = state[
-                                "conversation_summaries"
-                            ][-cap:]
-                            self._f._log_debug(
-                                f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                f"(max_conversation_summaries={cap})"
-                            )
-                        self._f._state_store.set_state(project_id, state)
-                        pending_summary = (
-                            f"[Summary of earlier conversation]\n{summary}"
-                        )
-                    history_msgs = kept_block
-                else:
-                    history_msgs = kept_block if old_block else history_msgs
-
-                if self._f.valves.preserve_tool_calls:
-                    while history_msgs and history_msgs[0].get("role") == "tool":
-                        history_msgs.pop(0)
-                    if (
-                        history_msgs
-                        and history_msgs[0].get("role") == "assistant"
-                        and history_msgs[0].get("tool_calls")
-                    ):
-                        tool_call_ids = {
-                            tc.get("id") for tc in history_msgs[0]["tool_calls"]
-                        }
-                        tool_response_ids = {
-                            m.get("tool_call_id")
-                            for m in history_msgs[1:]
-                            if m.get("role") == "tool"
-                        }
-                        if not tool_call_ids.issubset(tool_response_ids):
-                            history_msgs.pop(0)
-        else:
-            user_max = (
-                __user__["valves"].max_turns
-                if __user__ and hasattr(__user__, "valves")
-                else None
-            )
-            eff_max = user_max if user_max is not None else self._f.valves.max_turns
-            if len(history_msgs) > eff_max:
-                keep = eff_max
-                last_user_idx = -1
-                for i in range(len(history_msgs) - 1, -1, -1):
-                    if history_msgs[i].get("role") == "user":
-                        last_user_idx = i
-                        break
-                if last_user_idx != -1:
-                    start_idx = max(0, last_user_idx - keep + 1)
-                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                    kept_block = history_msgs[start_idx:]
-                else:
-                    old_block = history_msgs[:-keep] if keep > 0 else []
-                    kept_block = history_msgs[-keep:] if keep > 0 else []
-
-                if self._f.valves.summarize_old_messages and old_block:
-                    has_code = any("```" in m.get("content", "") for m in old_block)
-                    summary = await self._f._history_compressor.summarize_messages(
-                        old_block, is_code_context=has_code
-                    )
-                    if summary:
-                        state["conversation_summaries"].append(
-                            {
-                                "text": summary,
-                                "created_at": time.time(),
-                                "covers_msgs": len(old_block),
-                            }
-                        )
-                        cap = self._f.valves.max_conversation_summaries
-                        if cap > 0 and len(state["conversation_summaries"]) > cap:
-                            dropped = len(state["conversation_summaries"]) - cap
-                            state["conversation_summaries"] = state[
-                                "conversation_summaries"
-                            ][-cap:]
-                            self._f._log_debug(
-                                f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                f"(max_conversation_summaries={cap})"
-                            )
-                        self._f._state_store.set_state(project_id, state)
-                        pending_summary = (
-                            f"[Summary of earlier conversation]\n{summary}"
-                        )
-                    history_msgs = kept_block
-                else:
-                    history_msgs = kept_block
-
-        return sys_msgs + history_msgs, pending_summary
-
-    # ── Turn-based window (summarize@N / evict@M) ─────────────────────────
-
-    @staticmethod
-    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
-        """
-        Assign a 1-based turn number to each history message. A new turn starts
-        at every 'user' message. Messages before the first user message get turn
-        0. Returns (per_message_turn, total_turns).
-        """
-        turn = 0
-        per_msg: List[int] = []
-        for m in history:
-            if m.get("role") == "user":
-                turn += 1
-            per_msg.append(turn)
-        return per_msg, turn
-
-    def _is_autocontinue_active(self, messages: List[dict]) -> bool:
-        """
-        True if the last assistant message ended with a multi-part continuation
-        marker — i.e. an AutoContinue session is mid-generation. Mirrors the
-        inlet's continuation detection (self._f._MULTI_PHASE_MARKERS).
-        """
-        last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        if not last_assistant:
-            return False
-        content = last_assistant.get("content", "")
-        return any(marker in content for marker in self._f._MULTI_PHASE_MARKERS)
-
-    async def _apply_turn_based_window(
-        self,
-        messages: List[dict],
-        state: dict,
-        project_id: str,
-        slot_free: bool,
-    ) -> List[dict]:
-        """
-        Summarize turns past `summarize_after_turns` and evict raw turns past
-        `evict_raw_after_turns`, enforcing the no-degradation guard: a raw turn
-        is dropped from the prompt only when `summarized_turn_hwm` already covers
-        it (i.e. a persisted summary + LTM copy exists).
-
-        Idempotent: the turn count is derived from the message list each call;
-        `summarized_turn_hwm` is the only persisted bookkeeping. Returns the
-        (possibly reduced) message list. Summary generation is skipped when
-        `slot_free` is False to avoid dirtying the KV slot during AutoContinue;
-        eviction of already-covered turns still proceeds (no LLM needed).
-        """
-        if not self._f.valves.enable_turn_based_eviction:
-            return messages
-
-        # #16/P7: never compact mid-AutoContinue — rewriting history during
-        # multi-part code generation breaks the KV cache at the worst moment.
-        if (
-            self._f.valves.compaction_defer_during_autocontinue
-            and self._is_autocontinue_active(messages)
-        ):
-            self._f._log_debug(
-                "Turn-based compaction deferred: AutoContinue session active"
-            )
-            return messages
-
-        summarize_after = self._f.valves.summarize_after_turns
-        evict_after = self._f.valves.evict_raw_after_turns
-
-        # Config sanity: eviction window must be strictly older than summary window
-        if evict_after <= summarize_after:
-            self._f._log_debug(
-                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
-                "skipping window this request."
-            )
-            return messages
-
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        history = [m for m in messages if m.get("role") != "system"]
-        if not history:
-            return messages
-
-        turns, total_turns = self._index_turns(history)
-        if total_turns <= summarize_after:
-            return messages  # nothing old enough yet
-
-        # ── Step 1: summarize the unsummarized band, in batches ───────────
-        summarize_target = (
-            total_turns - summarize_after
-        )  # turns ≤ this must be summarized
-        hwm = state.get("summarized_turn_hwm", 0)
-
-        if (
-            slot_free
-            and summarize_target > hwm
-            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
-        ):
-            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
-            if band:
-                has_code = any("```" in m.get("content", "") for m in band)
-                summary = await self._f._history_compressor.summarize_messages(
-                    band, is_code_context=has_code
-                )
-                if summary:
-                    state["conversation_summaries"].append(
-                        {
-                            "text": summary,
-                            "created_at": time.time(),
-                            "covers_msgs": len(band),
-                            "covers_turns": [hwm + 1, summarize_target],
-                        }
-                    )
-                    await self._persist_turn_summary_to_ltm(
-                        summary, project_id, hwm + 1, summarize_target
-                    )
-                    # Hierarchical consolidation + level-aware cap (replaces the
-                    # flat cap). Folds oldest L1 summaries into an L2 so broad
-                    # coverage survives the cap; also persists state.
-                    await self._consolidate_summaries(state, project_id, slot_free)
-                    state["summarized_turn_hwm"] = summarize_target
-                    self._f._state_store.set_state(project_id, state)
-                    self._f._log_debug(
-                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
-                        f"({len(band)} msgs); HWM now {summarize_target}."
-                    )
-                else:
-                    self._f._log_debug(
-                        "Turn-based: summary generation failed — raw turns kept "
-                        "(no-degradation guard, HWM unchanged)."
-                    )
-
-        # ── Step 2: evict raw turns past the eviction window, if covered ──
-        evict_target = total_turns - evict_after  # turns ≤ this may be dropped
-        current_hwm = state.get("summarized_turn_hwm", 0)
-        if evict_target > 0 and current_hwm >= evict_target:
-            kept = [m for m, t in zip(history, turns) if t > evict_target]
-            dropped = len(history) - len(kept)
-            if dropped:
-                self._f._log_debug(
-                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
-                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
-                )
-            history = kept
-        elif evict_target > 0:
-            self._f._log_debug(
-                f"Turn-based: eviction deferred — summaries cover up to turn "
-                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
-            )
-
-        return sys_msgs + history
-
-    async def _persist_turn_summary_to_ltm(
-        self, summary: str, project_id: str, turn_start: int, turn_end: int
-    ) -> None:
-        """
-        Store a turn-range summary in LTM so evicted turns stay retrievable by
-        similarity. Tagged is_session_summary=True so retrieve_historical_messages
-        already prioritises it; is_turn_summary + covers_turn_* are extra metadata.
-        """
-        if not (HAS_SENTENCE and HAS_CHROMA and self._f.memory_collection is not None):
-            return
-        try:
-            text = f"[Conversation summary, turns {turn_start}-{turn_end}]\n{summary}"
-            embedding = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(text).tolist()
-            )
-            msg_id = (
-                f"{project_id}_turnsummary_{turn_start}_{turn_end}_{int(time.time())}"
-            )
-            await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.upsert(
-                    ids=[msg_id],
-                    embeddings=[embedding],
-                    documents=[text],
-                    metadatas=[
-                        {
-                            "role": "assistant",
-                            "project_id": project_id,
-                            "timestamp": time.time(),
-                            "is_session_summary": True,
-                            "is_turn_summary": True,
-                            "covers_turn_start": turn_start,
-                            "covers_turn_end": turn_end,
-                            "content_type": ContentType.GENERAL.value,
-                            "has_code": False,
-                        }
-                    ],
-                )
-            )
-        except Exception as e:
-            self._f._log_debug(f"Turn summary LTM persist failed: {e}")
-
-    @staticmethod
-    def _summary_sort_key(s: dict):
-        """Sort key for conversation summaries: by covered turn start, oldest first."""
-        ct = s.get("covers_turns")
-        return ct[0] if ct else s.get("created_at", 0)
-
-    async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
-        """
-        Fuse several L1 turn-range summaries into one L2 summary via the LLM.
-        Returns the L2 dict, or None on empty input / LLM failure (caller then
-        leaves the L1 summaries untouched — no-degradation guard).
-        """
-        texts: List[str] = []
-        starts: List[int] = []
-        ends: List[int] = []
-        total_msgs = 0
-        for s in group_summaries:
-            t = s.get("text", "")
-            if t:
-                texts.append(t)
-            ct = s.get("covers_turns")
-            if ct:
-                starts.append(ct[0])
-                ends.append(ct[1])
-            total_msgs += s.get("covers_msgs", 0)
-
-        combined = "\n\n".join(f"- {t}" for t in texts)
-        if not combined.strip():
-            return None
-
-        prompt = (
-            "Consolidate these conversation summaries into ONE higher-level "
-            "summary (3-5 sentences). Preserve key decisions, files modified, and "
-            "architectural changes; drop redundancy and chit-chat.\n\n"
-            f"{combined[:4000]}"
-        )
-        merged = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You produce concise hierarchical summaries of technical "
-                "conversations. Output only the summary."
-            ),
-            model_override=self._f.valves.summarization_model,
-            max_tokens=self._f.valves.hierarchical_summary_max_tokens,
-            temperature=0.2,
-            label="hierarchical_summary",
-        )
-        if not merged or not merged.strip():
-            return None
-
-        return {
-            "text": merged.strip(),
-            "created_at": time.time(),
-            "covers_msgs": total_msgs,
-            "covers_turns": [min(starts) if starts else 0, max(ends) if ends else 0],
-            "level": 2,
-        }
-
-    async def _consolidate_summaries(
-        self, state: dict, project_id: str, slot_free: bool
-    ) -> None:
-        """
-        Consolidate the oldest L1 summaries into an L2 (when enabled and a free
-        slot exists), then apply a LEVEL-AWARE cap that keeps the most recent L1s
-        (fine detail) plus a bounded set of L2s (broad coverage). Replaces the
-        flat cap of the turn-based window. Persists state.
-        """
-        summaries = state.get("conversation_summaries", [])
-        if not summaries:
-            return
-
-        # ── Step 1: fold oldest L1s into an L2 ────────────────────────────
-        if slot_free and self._f.valves.enable_hierarchical_summaries:
-            group = self._f.valves.hierarchical_summary_group_size
-            l1 = sorted(
-                (s for s in summaries if s.get("level", 1) == 1),
-                key=self._summary_sort_key,
-            )
-            l2plus = [s for s in summaries if s.get("level", 1) >= 2]
-            if len(l1) >= group:
-                oldest = l1[:group]
-                merged = await self._merge_summaries(oldest)
-                if merged:
-                    summaries = l2plus + [merged] + l1[group:]
-                    self._f._log_debug(
-                        f"Hierarchical: folded {group} L1 summaries into one L2 "
-                        f"covering turns {merged['covers_turns'][0]}–"
-                        f"{merged['covers_turns'][1]}."
-                    )
-                else:
-                    self._f._log_debug(
-                        "Hierarchical: L2 merge failed; L1 summaries kept "
-                        "(no-degradation guard)."
-                    )
-
-        # ── Step 2: level-aware cap ───────────────────────────────────────
-        max_l1 = self._f.valves.max_conversation_summaries
-        max_l2 = self._f.valves.max_hierarchical_summaries
-        l1 = sorted(
-            (s for s in summaries if s.get("level", 1) == 1),
-            key=self._summary_sort_key,
-        )
-        l2 = sorted(
-            (s for s in summaries if s.get("level", 1) >= 2),
-            key=self._summary_sort_key,
-        )
-        if max_l1 > 0:
-            l1 = l1[-max_l1:]
-        if max_l2 > 0:
-            l2 = l2[-max_l2:]
-        state["conversation_summaries"] = sorted(l2 + l1, key=self._summary_sort_key)
-        self._f._state_store.set_state(project_id, state)
-
-    async def _compress_code_history_and_lean(
-        self,
-        messages: List[dict],
-        project_id: str,
-        dynamic_injections: List[Tuple[str, str]],
-    ) -> List[dict]:
-        """Apply code history compression and lean user code if enabled."""
-        if not (
-            self._f.valves.enable_code_history_compression
-            or self._f.valves.enable_lean_user_code
-        ):
-            return messages
-
-        if self._f.valves.enable_code_history_compression:
-            messages = self._f._history_compressor.compress_code_history(
-                messages, project_id
-            )
-
-        if self._f.valves.enable_lean_user_code:
-            messages = self._f._history_compressor.lean_user_code_messages(
-                messages, project_id
-            )
-
-        _refactor_state = self._f._history_compressor.build_refactor_state_injection(
-            messages
-        )
-        if _refactor_state:
-            dynamic_injections.append(("medium", _refactor_state))
-            self._f._log_debug(
-                "Code history: injected refactor state into Block B "
-                f"({self._f._tokens.estimate_code_tokens(_refactor_state)} tokens)."
-            )
-
-        return messages
-
-    def _assemble_final_system_and_log(
-        self,
-        static_block: str,
-        dynamic_injections: List[Tuple[str, str]],
-        messages: List[dict],
-        project_id: str,
-        pending_summary: str,
-    ) -> List[dict]:
-        """Assemble final system prompt, inject it, and log token breakdown."""
-        budget = self._f.valves.global_injection_token_budget
-        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-
-        if budget > 0 and self._f.tokenizer:
-            dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
-            selected_dynamic: List[str] = []
-            used_dyn = 0
-            static_tokens = (
-                len(self._f.tokenizer.encode(static_block)) if static_block else 0
-            )
-            dyn_budget = max(0, budget - static_tokens)
-            for prio, text in dynamic_injections:
-                if not text:
-                    continue
-                tok = len(self._f.tokenizer.encode(text))
-                if used_dyn + tok <= dyn_budget:
-                    selected_dynamic.append(text)
-                    used_dyn += tok
-                elif prio in ("critical", "high"):
-                    avail = dyn_budget - used_dyn
-                    if avail > 20:
-                        selected_dynamic.append(text[: avail * 4] + "\n[truncated]")
-                        break
-            dynamic_block = "\n\n".join(selected_dynamic)
-        else:
-            dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
-
-        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
-        final_system = static_block + separator + dynamic_block
-
-        # Append base system content (from original message)
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
-        if base_content.strip():
-            final_system = final_system + "\n\n" + base_content
-
-        # Append pending summary if any
-        if pending_summary:
-            final_system = final_system + "\n\n" + pending_summary
-
-        # Inject final system message
-        if final_system.strip():
-            messages = [m for m in messages if m.get("role") != "system"]
-            messages.insert(0, {"role": "system", "content": final_system})
-
-        # Ensure last message is from user
-        if messages and messages[-1].get("role") != "user":
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                messages = messages[: last_user_idx + 1]
-            else:
-                messages.append({"role": "user", "content": "continue"})
-
-        # ── Token breakdown log ─────────────────────────────────────────
-        if self._f.valves.debug and self._f.tokenizer and final_system.strip():
-            static_tok = (
-                len(self._f.tokenizer.encode(static_block)) if static_block else 0
-            )
-            dynamic_tok = (
-                len(self._f.tokenizer.encode(dynamic_block)) if dynamic_block else 0
-            )
-            total_system_tok = len(self._f.tokenizer.encode(final_system))
-
-            self._f._last_system_tokens[project_id] = total_system_tok
-
-            prefix_hash = self._f._last_static_prefix_hash.get(project_id, "N/A")
-            self._f._log_debug("─" * 60)
-            self._f._log_debug("TOKEN BREAKDOWN — system prompt")
-            self._f._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
-            self._f._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
-            self._f._log_debug(
-                f"  TOTAL system tokens:          ~{total_system_tok} tokens"
-            )
-            self._f._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
-            self._f._log_debug(
-                f"  → If hash matches previous:   KV cache HIT in llama.cpp"
-            )
-            self._f._log_debug(
-                f"  → If hash changed:            KV cache MISS, full prefill"
-            )
-            if self._f.valves.enable_multi_phase_response:
-                if "_mp_available" not in dir():  # Not available here; log simple
-                    self._f._log_debug(
-                        "  Multi-phase:                  (see earlier log)"
-                    )
-            if (
-                self._f.valves.enable_code_history_compression
-                or self._f.valves.enable_lean_user_code
-            ):
-                _compressed_parts = sum(
-                    1
-                    for m in messages
-                    if m.get("role") == "assistant"
-                    and re.search(r"\[🗜️ PARTE \d+/\d+", m.get("content", ""))
-                )
-                _leaned_msgs = sum(
-                    1
-                    for m in messages
-                    if m.get("role") == "user"
-                    and "[CÓDIGO COMPRIMIDO" in m.get("content", "")
-                )
-                self._f._log_debug(
-                    f"  Code history:                 "
-                    f"{_compressed_parts} part(s) compressed, "
-                    f"{_leaned_msgs} user msg(s) leaned"
-                )
-            self._f._log_debug("─" * 60)
-
-        return messages
 
 
 # ---------------------------------------------------------------------------
@@ -12825,14 +12130,14 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════
         context_window_tokens: int = Field(
             default=262000,
-            description="Total token capacity of the LLM server. Must match the llama.cpp configuration.",
+            description="Total token capacity of the LLM server. Must match the llama.cpp --ctx-size exactly.",
         )
         active_context_max_tokens: int = Field(
-            default=9000,
+            default=40000,
             description="Maximum tokens for code context injected in Block B (LOD‑activated code).",
         )
         history_max_tokens: int = Field(
-            default=4000,
+            default=24000,
             description=(
                 "Maximum tokens for conversation history (non‑system messages). "
                 "Only operates over conversation messages, not code. "
@@ -12840,36 +12145,45 @@ class Filter:
             ),
         )
         ltm_retrieval_max_tokens: int = Field(
-            default=2000,
+            default=6000,
             description="Maximum tokens for long‑term memory retrieved per request. 0 = unlimited.",
         )
         cot_max_tokens: int = Field(
-            default=1500,
+            default=4000,
             description="Maximum tokens for Chain‑of‑Thought reasoning responses. 0 = unlimited.",
         )
         response_reserve_tokens: int = Field(
-            default=2048,
+            default=8192,
             ge=256,
             le=16384,
             description="Minimum tokens reserved for the LLM's response when computing the effective context budget.",
         )
         global_injection_token_budget: int = Field(
-            default=0,
+            default=120000,
             description="Hard cap for ALL system injections combined (Block A + Block B). 0 = disabled.",
         )
         # ── Per‑block limits ───────────────────────────────────────
         max_code_block_tokens: int = Field(
-            default=0,
+            default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited. See code_block_overflow_action.",
         )
         code_block_overflow_action: str = Field(
-            default="warn",
+            default="summarize",
             description="Action when a code block exceeds max_code_block_tokens: 'warn', 'truncate', or 'summarize'.",
         )
         code_block_truncate_keep_head: int = Field(default=50)
         code_block_truncate_keep_tail: int = Field(default=50)
         code_block_warn_message: str = Field(
             default="[Code block too large - truncated by system]"
+        )
+        # ── Oversized block summaries ──────────────────────────────
+        summary_code_max_chars: int = Field(
+            default=20000,
+            description="Maximum characters of source code sent to the LLM when generating a summary for an oversized code block.",
+        )
+        oversized_summary_max_tokens: int = Field(
+            default=1000,
+            description="Maximum tokens allowed for the generated summary of an oversized code block.",
         )
 
         # ═══════════════════════════════════════════════════════════════
@@ -12881,10 +12195,7 @@ class Filter:
         long_term_memory_top_k: int = Field(default=10)
         long_term_memory_similarity_threshold: float = Field(default=0.65)
         ltm_time_decay_hours: float = Field(default=12.0)
-        ltm_include_timestamps: bool = Field(default=True)
         ltm_store_only_code_sessions: bool = Field(default=True)
-        ltm_compress_after_messages: int = Field(default=50)
-        ltm_summarization_trigger_similarity: float = Field(default=0.85)
         # ── Symbol indexing in LTM ──────────────────────────────────
         ltm_index_symbols_enabled: bool = Field(default=True)
         ltm_symbol_index_max_per_message: int = Field(default=20)
@@ -13009,15 +12320,6 @@ class Filter:
         summary_fallback_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
-        summary_include_metadata: bool = Field(default=True)
-        # ── Selective summarization ─────────────────────────────────
-        selective_summarization: bool = Field(default=True)
-        error_preserve_verbatim: bool = Field(default=True)
-        error_max_age_hours: float = Field(default=48.0)
-        code_summary_level: str = Field(default="balanced")
-        general_summary_max_tokens: int = Field(default=200)
-        tool_call_preserve: bool = Field(default=True)
-        code_always_keep_signature: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════
         #  SymbolGraph & active code
@@ -13035,13 +12337,16 @@ class Filter:
         # ── Call‑graph extraction ───────────────────────────────────
         enable_call_graph_extraction: bool = Field(default=True)
         enable_data_flow_analysis: bool = Field(default=True)
-        # ── Automatic symbol summaries ──────────────────────────────
+        # ── Generate missing symbol docstrings ──────────────────────
         enable_auto_docstrings: bool = Field(
             default=True,
             description="Automatically generate missing docstrings for functions and methods using the LLM.",
         )
-        summary_code_max_chars: int = Field(default=8000)
-        oversized_summary_max_tokens: int = Field(default=500)
+        lazy_docstring_max_per_turn: int = Field(
+            default=25,
+            ge=0,
+            description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
+        )
         # ── Block deduplication ─────────────────────────────────────
         code_similarity_threshold: float = Field(default=0.85)
         enable_ast_deduplication: bool = Field(default=True)
@@ -13184,7 +12489,7 @@ class Filter:
             ),
         )
         skeleton_cot_max_tokens: int = Field(
-            default=600,
+            default=1600,
             ge=200,
             le=2000,
             description="Token budget for the architecture reasoning chain.",
@@ -13233,9 +12538,6 @@ class Filter:
         cot_model_level2: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         cot_model_level3: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         enable_cot_llm_detection: bool = Field(default=True)
-        cot_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
         # ── Scientific method ───────────────────────────────────────
         enforce_scientific_method: bool = Field(default=False)
         scientific_hypotheses_count: int = Field(default=3, ge=2, le=6)
@@ -13245,16 +12547,12 @@ class Filter:
         enable_step_back_prompting: bool = Field(default=True)
         step_back_always: bool = Field(default=False)
         step_back_max_tokens: int = Field(default=150, ge=50, le=400)
-        # ── Contradictions & assumptions ────────────────────────────
+        # ── Contradictions ──────────────────────────────────────────
         enable_contradiction_detection: bool = Field(default=True)
         contradiction_detection_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         contradiction_inject_warning: bool = Field(default=True)
-        enable_assumption_extraction: bool = Field(default=True)
-        assumption_extraction_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
         # ── Confidence scoring ──────────────────────────────────────
         enable_confidence_scoring: bool = Field(default=True)
         confidence_prompt: str = Field(
@@ -13271,18 +12569,10 @@ class Filter:
         llm_request_timeout: int = Field(default=900)
         llm_per_call_timeout: int = Field(default=900, ge=1)
         llm_retry_total_timeout: int = Field(default=950, ge=10)
-        LLM_MAX_CONCURRENT_CALLS: int = Field(default=3, ge=1, le=10)
+        LLM_MAX_CONCURRENT_CALLS: int = Field(default=1, ge=1, le=10)
         LLM_CACHE_TTL: int = Field(default=300)
         LLM_CACHE_MAX_SIZE: int = Field(default=100)
         llamacpp_endpoint_type: str = Field(default="chat")
-        intent_classifier_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
-        enable_intent_llm_fallback: bool = Field(default=True)
-        openai_api_base: str = Field(
-            default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
-        )
-        openai_api_key: str = Field(default=os.getenv("OPENAI_API_KEY", "dummy"))
         # ── Auxiliary models ────────────────────────────────────────
         code_block_summary_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
@@ -13296,7 +12586,7 @@ class Filter:
         # ── Multi‑phase response ────────────────────────────────────
         enable_multi_phase_response: bool = Field(default=True)
         force_multi_phase_response: bool = Field(default=True)
-        multi_phase_effective_max_tokens: int = Field(default=4500, ge=1000, le=200000)
+        multi_phase_effective_max_tokens: int = Field(default=8000, ge=1000, le=200000)
         multi_phase_response_threshold: int = Field(default=7000, ge=0, le=200000)
         multi_phase_response_budget_warn: int = Field(default=800, ge=500, le=40000)
         auto_budget_context_for_parts: bool = Field(default=True)
@@ -13318,12 +12608,7 @@ class Filter:
         # ── Proactive suggestions ───────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
-        proactive_context_warning_threshold: float = Field(default=0.85)
-        proactive_context_warning_message: str = Field(
-            default="\n\n⚠️ **Context Warning**: ..."
-        )
         proactive_summary_threshold: float = Field(default=0.75)
-        proactive_summary_growth_window: int = Field(default=3)
         # ── Context cleanup ─────────────────────────────────────────
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
@@ -13416,9 +12701,6 @@ class Filter:
         duplicate_question_threshold: float = Field(default=0.92)
         duplicate_question_lookback: int = Field(default=20)
         duplicate_question_lookback_hours: float = Field(default=24.0)
-        similar_message_handling: str = Field(default="replace")
-        similar_message_threshold: float = Field(default=0.92)
-        similar_message_check_code_only: bool = Field(default=True)
 
         # ═══════════════════════════════════════════════════════════════
         #  Performance & persistence
@@ -13428,9 +12710,9 @@ class Filter:
         enable_slot_persistence: bool = Field(default=True)
         slot_save_path: str = Field(default="/tmp/llama_slots")
         slot_id: int = Field(default=0, ge=0)
-        # ── Slot save threshold guard (fix P5: 1.5GB-under-mutex) ────
+        # ── Slot save threshold guard ────────────────────────────────
         slot_save_max_context_tokens: int = Field(
-            default=0,
+            default=60000,
             ge=0,
             description=(
                 "Skip slot save when the total context exceeds this many tokens. "
@@ -13500,11 +12782,6 @@ class Filter:
         frequency_weight_factor: float = Field(default=0.3)
         min_mentions_for_boost: int = Field(default=3)
         frequency_decay_hours: float = Field(default=12.0)
-        # ── Smart context (experimental) ────────────────────────────
-        smart_context_selection: bool = Field(default=False)
-        smart_context_top_k: int = Field(default=15)
-        smart_context_min_tokens: int = Field(default=1024)
-        smart_context_include_last_user: bool = Field(default=True)
 
     # --------------------------------------------------------------------------
     # Class-level constants
@@ -13848,6 +13125,9 @@ class Filter:
         # Cancel any pending background docstring tasks from the previous turn
         # instead of blocking — ensure_docstring will handle missing ones on demand
         self._enrichment.cancel_docstring_tasks()
+
+        # Reset the per‑turn lazy docstring counter so the new turn starts fresh
+        self._enrichment._lazy_docstrings_generated_this_turn = 0
 
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
