@@ -4394,7 +4394,8 @@ class SignatureExtractor:
         Resolution order (first match wins):
         1. tree-sitter extension detection if *file_path* is provided.
         2. Extension‑to‑language map (``_LANG_MAP``).
-        3. Source‑code heuristics (``def`` → python, ``function`` → javascript).
+        3. Source‑code heuristics: Python keywords (def, class, import, from)
+           or JavaScript 'function' keyword.
         4. ``"unknown"`` — callers will skip tree-sitter extraction.
         """
         if file_path and HAS_TREE_SITTER:
@@ -4407,7 +4408,8 @@ class SignatureExtractor:
         if file_path:
             ext = file_path.rsplit(".", 1)[-1].lower()
             return SignatureExtractor._LANG_MAP.get(ext, "unknown")
-        if re.search(r"\bdef\s+\w+\s*\(", code):
+        # Check for multiple Python-specific patterns, not just 'def'
+        if re.search(r"\b(?:def|class|import|from)\s+\w+", code):
             return "python"
         if re.search(r"\bfunction\s+\w+\s*\(", code):
             return "javascript"
@@ -4572,8 +4574,13 @@ class SignatureExtractor:
             parser = SignatureExtractor._parser_cache.get(lang)
         if parser is None:
             lang_obj = get_language(lang)
-            parser = TSParser()
-            parser.set_language(lang_obj)
+            # tree-sitter >= 0.21 removed set_language(); the language is now
+            # passed directly to the Parser constructor.
+            try:
+                parser = TSParser(lang_obj)
+            except TypeError:
+                parser = TSParser()
+                parser.set_language(lang_obj)
             with SignatureExtractor._parser_cache_lock:
                 SignatureExtractor._parser_cache[lang] = parser
         return parser.parse(code_bytes)
@@ -4609,75 +4616,78 @@ class SignatureExtractor:
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
-            cursor = query.cursor()
-            try:
-                captures = cursor.captures(tree.root_node)
-            except TypeError:
-                captures = query.captures(tree.root_node)
+            # Use QueryCursor as the official API (py-tree-sitter >= 0.22).
+            # Query itself does not expose captures() or cursor().
+            from tree_sitter import QueryCursor
+
+            cursor = QueryCursor(query)
+            captures = cursor.captures(tree.root_node)
+            # captures is a dict {capture_name: [node, ...]}
             symbols = []
-            for cap_name, node in captures:
+            for cap_name, nodes in captures.items():
                 if cap_name != "name":
                     continue
-                parent = node.parent
-                kind = "unknown"
-                func_types = (
-                    "function_definition",
-                    "function_declaration",
-                    "method_declaration",
-                    "function_item",
-                    "arrow_function",
-                    "function_expression",
-                )
-                class_types = (
-                    "class_definition",
-                    "class_declaration",
-                    "type_spec",
-                    "struct_item",
-                    "enum_item",
-                    "class_specifier",
-                )
-                while parent:
-                    if parent.type in func_types:
-                        kind = "function"
-                        break
-                    elif parent.type in class_types:
-                        kind = "class"
-                        break
-                    parent = parent.parent
-
-                # Walk up from the symbol's own node to find an enclosing class.
-                parent_symbol = ""
-                walker = node.parent
-                if walker is not None:
-                    walker = walker.parent  # skip the symbol's own def node
-                while walker:
-                    if walker.type in class_types:
-                        name_node = walker.child_by_field_name("name")
-                        if name_node:
-                            parent_symbol = name_node.text.decode("utf-8")
-                        break
-                    walker = walker.parent
-                if kind == "function" and parent_symbol:
-                    kind = "method"
-
-                sig = (
-                    parent.text.decode("utf-8").split("\n")[0].strip()[:200]
-                    if parent
-                    else node.text.decode("utf-8")
-                )
-                name = node.text.decode("utf-8")
-                symbols.append(
-                    CodeSymbol(
-                        name=name,
-                        kind=kind,
-                        signature=sig,
-                        file_path=file_path,
-                        line_start=node.start_point[0] + 1,
-                        line_end=node.end_point[0] + 1,
-                        language=lang,
-                        parent_symbol=parent_symbol,
+                for node in nodes:
+                    parent = node.parent
+                    kind = "unknown"
+                    func_types = (
+                        "function_definition",
+                        "function_declaration",
+                        "method_declaration",
+                        "function_item",
+                        "arrow_function",
+                        "function_expression",
                     )
-                )
+                    class_types = (
+                        "class_definition",
+                        "class_declaration",
+                        "type_spec",
+                        "struct_item",
+                        "enum_item",
+                        "class_specifier",
+                    )
+                    while parent:
+                        if parent.type in func_types:
+                            kind = "function"
+                            break
+                        elif parent.type in class_types:
+                            kind = "class"
+                            break
+                        parent = parent.parent
+
+                    # Walk up from the symbol's own node to find an enclosing class.
+                    parent_symbol = ""
+                    walker = node.parent
+                    if walker is not None:
+                        walker = walker.parent  # skip the symbol's own def node
+                    while walker:
+                        if walker.type in class_types:
+                            name_node = walker.child_by_field_name("name")
+                            if name_node:
+                                parent_symbol = name_node.text.decode("utf-8")
+                            break
+                        walker = walker.parent
+                    if kind == "function" and parent_symbol:
+                        kind = "method"
+
+                    sig = (
+                        parent.text.decode("utf-8").split("\n")[0].strip()[:200]
+                        if parent
+                        else node.text.decode("utf-8")
+                    )
+                    name = node.text.decode("utf-8")
+                    symbols.append(
+                        CodeSymbol(
+                            name=name,
+                            kind=kind,
+                            signature=sig,
+                            file_path=file_path,
+                            line_start=node.start_point[0] + 1,
+                            line_end=node.end_point[0] + 1,
+                            language=lang,
+                            parent_symbol=parent_symbol,
+                        )
+                    )
             return symbols
         except Exception as e:
             logger.warning(
@@ -4733,81 +4743,89 @@ class SignatureExtractor:
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
-            cursor = query.cursor()
-            try:
-                captures = cursor.captures(tree.root_node)
-            except TypeError:
-                captures = query.captures(tree.root_node)
+            # Use QueryCursor as the official API (py-tree-sitter >= 0.22).
+            # Query itself does not expose captures() or cursor().
+            from tree_sitter import QueryCursor
+
+            cursor = QueryCursor(query)
+            captures = cursor.captures(tree.root_node)
+            # captures is a dict {capture_name: [node, ...]}
             call_map: Dict[str, Set[str]] = defaultdict(set)
             current_arrow_caller = None
-            for cap_name, node in captures:
+            for cap_name, nodes in captures.items():
                 if cap_name == "caller_name":
-                    current_arrow_caller = node.text.decode("utf-8")
+                    for node in nodes:
+                        current_arrow_caller = node.text.decode("utf-8")
                     continue
                 if cap_name == "callee":
-                    if node.type in (
-                        "attribute",
-                        "field_access",
-                        "member_expression",
-                        "selector_expression",
-                        "field_expression",
-                    ):
-                        callee_name = (
-                            node.text.decode("utf-8")
-                            .split(".")[-1]
-                            .split("->")[-1]
-                            .strip()
-                        )
-                    else:
-                        callee_name = node.text.decode("utf-8")
-
-                    caller = None
-                    caller_container = None
-                    parent = node.parent
-                    while parent:
-                        if parent.type in (
-                            "function_definition",
-                            "function_declaration",
-                            "method_declaration",
-                            "function_item",
+                    for node in nodes:
+                        if node.type in (
+                            "attribute",
+                            "field_access",
+                            "member_expression",
+                            "selector_expression",
+                            "field_expression",
                         ):
-                            name_node = parent.child_by_field_name("name")
-                            if name_node:
-                                caller = name_node.text.decode("utf-8")
-                            caller_container = parent
-                            break
-                        elif parent.type == "arrow_function":
-                            if current_arrow_caller:
-                                caller = current_arrow_caller
-                            else:
-                                declarator = parent
-                                while (
-                                    declarator
-                                    and declarator.type != "variable_declarator"
-                                ):
-                                    declarator = declarator.parent
-                                if declarator:
-                                    name_node = declarator.child_by_field_name("name")
-                                    if name_node:
-                                        caller = name_node.text.decode("utf-8")
-                            caller_container = parent
-                            break
-                        parent = parent.parent
+                            callee_name = (
+                                node.text.decode("utf-8")
+                                .split(".")[-1]
+                                .split("->")[-1]
+                                .strip()
+                            )
+                        else:
+                            callee_name = node.text.decode("utf-8")
 
-                    if caller:
-                        caller_class = ""
-                        class_walker = (
-                            caller_container.parent if caller_container else None
-                        )
-                        while class_walker:
-                            if class_walker.type in _class_node_types:
-                                cname_node = class_walker.child_by_field_name("name")
-                                if cname_node:
-                                    caller_class = cname_node.text.decode("utf-8")
+                        caller = None
+                        caller_container = None
+                        parent = node.parent
+                        while parent:
+                            if parent.type in (
+                                "function_definition",
+                                "function_declaration",
+                                "method_declaration",
+                                "function_item",
+                            ):
+                                name_node = parent.child_by_field_name("name")
+                                if name_node:
+                                    caller = name_node.text.decode("utf-8")
+                                caller_container = parent
                                 break
-                            class_walker = class_walker.parent
-                        caller_qid = qualify_symbol_name(caller, caller_class)
-                        call_map[caller_qid].add(callee_name)
+                            elif parent.type == "arrow_function":
+                                if current_arrow_caller:
+                                    caller = current_arrow_caller
+                                else:
+                                    declarator = parent
+                                    while (
+                                        declarator
+                                        and declarator.type != "variable_declarator"
+                                    ):
+                                        declarator = declarator.parent
+                                    if declarator:
+                                        name_node = declarator.child_by_field_name(
+                                            "name"
+                                        )
+                                        if name_node:
+                                            caller = name_node.text.decode("utf-8")
+                                caller_container = parent
+                                break
+                            parent = parent.parent
+
+                        if caller:
+                            caller_class = ""
+                            class_walker = (
+                                caller_container.parent if caller_container else None
+                            )
+                            while class_walker:
+                                if class_walker.type in _class_node_types:
+                                    cname_node = class_walker.child_by_field_name(
+                                        "name"
+                                    )
+                                    if cname_node:
+                                        caller_class = cname_node.text.decode("utf-8")
+                                    break
+                                class_walker = class_walker.parent
+                            caller_qid = qualify_symbol_name(caller, caller_class)
+                            call_map[caller_qid].add(callee_name)
             return {k: list(v) for k, v in call_map.items()}
         except Exception as e:
             logger.warning(
@@ -9184,6 +9202,54 @@ class CodeBlockManager:
                 chars[i] = " "
         return "".join(chars)
 
+    async def _extract_full_document_symbols(
+        self, content: str, file_path: Optional[str]
+    ) -> Tuple[List["CodeSymbol"], str]:
+        """Parse the ENTIRE content once with tree-sitter so nested class
+        context is never lost, regardless of how the content is later
+        chunked for CodeBlock storage.
+
+        Mirrors what Silent Ingestion already does for the single-mega-block
+        case, but generalized for reuse by both ingestion paths.
+
+        Returns (symbols, detected_language).  *symbols* is empty when the
+        language cannot be detected or tree-sitter fails.
+        """
+        lang = (
+            getattr(self._f, "_ingested_lang", None)
+            or SignatureExtractor._guess_language(file_path, content)
+        )
+        if lang == "unknown":
+            return [], lang
+        symbols = await SignatureExtractor.extract_async(
+            content, file_path, language=lang
+        )
+        if symbols:
+            symbols = SignatureExtractor.enrich_symbols_with_parent_info(
+                symbols, content
+            )
+        return symbols, lang
+
+    def _assign_symbols_to_span(
+        self,
+        full_doc_symbols: List["CodeSymbol"],
+        chunk_start_line: int,
+        chunk_end_line: int,
+    ) -> List["CodeSymbol"]:
+        """Return the subset of *full_doc_symbols* whose ``line_start``
+        falls inside ``[chunk_start_line, chunk_end_line]``.
+
+        Symbols keep the ``parent_symbol`` resolved from the FULL document
+        parse — splitting into chunks afterward is now harmless because
+        the class context was captured upfront.
+        """
+        return [
+            s
+            for s in full_doc_symbols
+            if s.line_start is not None
+            and chunk_start_line <= s.line_start <= chunk_end_line
+        ]
+
     async def extract_code_blocks(
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
@@ -9225,6 +9291,20 @@ class CodeBlockManager:
             block["file_path"] = blk_file
             return [block], [(0, len(content))]
 
+        # ── Full-document symbol extraction (once, before chunking) ──
+        # Pre-compute line offsets ONCE so every chunk can translate its
+        # byte span to a line span without rescanning the content.
+        lines = content.split("\n")
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line) + 1)
+
+        # Parse the ENTIRE document once so that class context is never
+        # lost when process() later splits methods into separate chunks.
+        full_doc_symbols, full_doc_lang = (
+            await self._extract_full_document_symbols(content, None)
+        )
+
         # If we reach here, there are no pre‑extracted symbols.
         # Perform the normal tree‑sitter / regex extraction.
         ingested_lang = getattr(self._f, "_ingested_lang", None)
@@ -9258,18 +9338,42 @@ class CodeBlockManager:
                         else:
                             lang = await self._infer_code_language(raw)
 
-                    lines = raw.splitlines()
-                    if lines and lines[0].startswith("```"):
-                        lines = lines[1:]
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        code = "\n".join(lines).strip()
+                    lines_in_block = raw.splitlines()
+                    if lines_in_block and lines_in_block[0].startswith("```"):
+                        lines_in_block = lines_in_block[1:]
+                        if lines_in_block and lines_in_block[-1].startswith("```"):
+                            lines_in_block = lines_in_block[:-1]
+                        code = "\n".join(lines_in_block).strip()
                         block_type = "fenced"
                     else:
                         code = raw
                         block_type = "indented"
 
-                    blocks.append({"language": lang, "code": code, "type": block_type})
+                    # Compute line range for this chunk and assign
+                    # precomputed symbols from the full-document parse.
+                    start_line = next(
+                        (i for i, off in enumerate(line_offsets) if off > start),
+                        len(lines),
+                    )
+                    end_line = next(
+                        (i for i, off in enumerate(line_offsets) if off >= end),
+                        len(lines),
+                    )
+                    pre_syms = (
+                        self._assign_symbols_to_span(
+                            full_doc_symbols, start_line, end_line
+                        )
+                        if full_doc_symbols
+                        else []
+                    )
+                    blocks.append(
+                        {
+                            "language": lang,
+                            "code": code,
+                            "type": block_type,
+                            "precomputed_symbols": pre_syms,
+                        }
+                    )
                     spans.append((start, end))
 
                 if hasattr(self._f, "_ingested_lang"):
@@ -9303,16 +9407,35 @@ class CodeBlockManager:
             except Exception:
                 pass
 
-        # Regex fallback (unchanged)
+        # Regex fallback (unchanged logic, now also enriched)
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
-            blocks.append({"language": lang, "code": code, "type": "fenced"})
+            start_line = next(
+                (i for i, off in enumerate(line_offsets) if off > match.start()),
+                len(lines),
+            )
+            end_line = next(
+                (i for i, off in enumerate(line_offsets) if off >= match.end()),
+                len(lines),
+            )
+            pre_syms = (
+                self._assign_symbols_to_span(
+                    full_doc_symbols, start_line, end_line
+                )
+                if full_doc_symbols
+                else []
+            )
+            blocks.append(
+                {
+                    "language": lang,
+                    "code": code,
+                    "type": "fenced",
+                    "precomputed_symbols": pre_syms,
+                }
+            )
             spans.append((match.start(), match.end()))
-        lines = content.split("\n")
-        line_offsets = [0]
-        for line in lines:
-            line_offsets.append(line_offsets[-1] + len(line) + 1)
+
         indented = []
         i = 0
         while i < len(lines):
@@ -9323,17 +9446,48 @@ class CodeBlockManager:
             else:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
+                    start_line = i - len(indented) + 1
+                    end_line = i
+                    pre_syms = (
+                        self._assign_symbols_to_span(
+                            full_doc_symbols, start_line, end_line
+                        )
+                        if full_doc_symbols
+                        else []
+                    )
                     blocks.append(
-                        {"language": "text", "code": code, "type": "indented"}
+                        {
+                            "language": "text",
+                            "code": code,
+                            "type": "indented",
+                            "precomputed_symbols": pre_syms,
+                        }
                     )
                     start_offset = line_offsets[i - len(indented)]
                     end_offset = line_offsets[i] - 1
                     spans.append((start_offset, end_offset))
                 indented = []
                 i += 1
+
         if len(indented) >= 3:
             code = "\n".join(indented)
-            blocks.append({"language": "text", "code": code, "type": "indented"})
+            start_line = len(lines) - len(indented) + 1
+            end_line = len(lines)
+            pre_syms = (
+                self._assign_symbols_to_span(
+                    full_doc_symbols, start_line, end_line
+                )
+                if full_doc_symbols
+                else []
+            )
+            blocks.append(
+                {
+                    "language": "text",
+                    "code": code,
+                    "type": "indented",
+                    "precomputed_symbols": pre_syms,
+                }
+            )
             start_offset = line_offsets[len(lines) - len(indented)]
             end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
             spans.append((start_offset, end_offset))
@@ -9636,43 +9790,6 @@ class CodeBlockManager:
                 return True
         return False
 
-    async def apply_change_with_diff(
-        self, base_block: "CodeBlock", proposed_block: "CodeBlock"
-    ) -> bool:
-        """Apply a unified diff from a proposed change block onto a base block."""
-        if proposed_block.content_type != ContentType.PROPOSED_CHANGE:
-            return False
-        if not (
-            "@@" in proposed_block.content
-            and ("-" in proposed_block.content or "+" in proposed_block.content)
-        ):
-            return False
-        new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
-        if new_code and new_code != base_block.content:
-            project_id = self._f.valves.project_id
-            self._f._symbol_index.remove_all_for_block(
-                base_block.hash, base_block.symbols, project_id
-            )
-            base_block.content = new_code
-            base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
-            base_block.symbols = await SignatureExtractor.extract_async(
-                new_code, base_block.file_path
-            )
-            for sym in base_block.symbols:
-                sym.parent_block_hash = base_block.hash
-                self._f._symbol_index.add(sym, base_block.hash, project_id)
-            if self._f.tokenizer:
-                base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
-            else:
-                base_block._cached_token_count = len(new_code) // 4
-            base_block.timestamp = time.time()
-            base_block.is_active = True
-            base_block.potentially_affected = False
-            base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
-            self._f._activation.invalidate_lightweight_cache(project_id)
-            return True
-        return False
-
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
         """Apply a unified diff patch to original text. Returns new text or None."""
         if not self._f.valves.enable_diff_application:
@@ -9731,7 +9848,77 @@ class CodeBlockManager:
             return None
         return "\n".join(result_lines)
 
+    async def apply_change_with_diff(
+        self, base_block: "CodeBlock", proposed_block: "CodeBlock"
+    ) -> bool:
+        """Apply a unified diff from a proposed change block onto a base block."""
+        if proposed_block.content_type != ContentType.PROPOSED_CHANGE:
+            return False
+        if not (
+            "@@" in proposed_block.content
+            and ("-" in proposed_block.content or "+" in proposed_block.content)
+        ):
+            return False
+        new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
+        if new_code and new_code != base_block.content:
+            project_id = self._f.valves.project_id
+            self._f._symbol_index.remove_all_for_block(
+                base_block.hash, base_block.symbols, project_id
+            )
+            base_block.content = new_code
+            base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
+            base_block.symbols = await SignatureExtractor.extract_async(
+                new_code, base_block.file_path
+            )
+            for sym in base_block.symbols:
+                sym.parent_block_hash = base_block.hash
+                self._f._symbol_index.add(sym, base_block.hash, project_id)
+            if self._f.tokenizer:
+                base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
+            else:
+                base_block._cached_token_count = len(new_code) // 4
+            base_block.timestamp = time.time()
+            base_block.is_active = True
+            base_block.potentially_affected = False
+            base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
+            self._f._activation.invalidate_lightweight_cache(project_id)
+            return True
+        return False
+
     # ── Data flow edges ──────────────────────────────────────────────────
+
+    def _extract_data_flow_edges_regex(
+        self, code: str, project_id: str
+    ) -> List["Edge"]:
+        """Fallback data flow extraction for non‑Python languages via regex."""
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        edges: List[Edge] = []
+        pattern = re.compile(
+            r"\b(\w+)\s*=\s*(" + "|".join(re.escape(n) for n in all_names) + r")\s*\("
+        )
+        for match in pattern.finditer(code):
+            callee = match.group(2)
+            var_name = match.group(1)
+            use_pattern = re.compile(
+                r"\b("
+                + "|".join(re.escape(n) for n in all_names)
+                + r")\s*\([^)]*\b"
+                + re.escape(var_name)
+                + r"\b"
+            )
+            for use_match in use_pattern.finditer(code):
+                consumer = use_match.group(1)
+                if consumer != callee:
+                    edges.append(
+                        Edge(
+                            src=callee,
+                            dst=consumer,
+                            type="data_flow",
+                            weight=EDGE_WEIGHTS["data_flow"],
+                            confidence=0.5,
+                        )
+                    )
+        return edges
 
     def extract_data_flow_edges(
         self, code: str, file_path: Optional[str], project_id: str
@@ -9810,39 +9997,6 @@ class CodeBlockManager:
                             type="data_flow",
                             weight=EDGE_WEIGHTS["data_flow"],
                             confidence=0.7,
-                        )
-                    )
-        return edges
-
-    def _extract_data_flow_edges_regex(
-        self, code: str, project_id: str
-    ) -> List["Edge"]:
-        """Fallback data flow extraction for non‑Python languages via regex."""
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        edges: List[Edge] = []
-        pattern = re.compile(
-            r"\b(\w+)\s*=\s*(" + "|".join(re.escape(n) for n in all_names) + r")\s*\("
-        )
-        for match in pattern.finditer(code):
-            callee = match.group(2)
-            var_name = match.group(1)
-            use_pattern = re.compile(
-                r"\b("
-                + "|".join(re.escape(n) for n in all_names)
-                + r")\s*\([^)]*\b"
-                + re.escape(var_name)
-                + r"\b"
-            )
-            for use_match in use_pattern.finditer(code):
-                consumer = use_match.group(1)
-                if consumer != callee:
-                    edges.append(
-                        Edge(
-                            src=callee,
-                            dst=consumer,
-                            type="data_flow",
-                            weight=EDGE_WEIGHTS["data_flow"],
-                            confidence=0.5,
                         )
                     )
         return edges
@@ -12253,7 +12407,11 @@ class EnrichmentTasks:
                 name, signature, block_hash, line_start, line_end, project_id
             )
             # Brief pause between tasks to avoid tight loop on cache hits
-            await asyncio.sleep(0.01)
+            self._bg_docstring_count += 1
+            if self._bg_docstring_count % 10 == 0:
+                await asyncio.sleep(2)  # longer cooldown every 10 docstrings
+            else:
+                await asyncio.sleep(0.5)  # minimal pause between individual calls
 
     def start_docstring_loop(self, project_id: str) -> None:
         """
