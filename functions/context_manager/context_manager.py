@@ -2382,6 +2382,32 @@ class ContextBuilder:
         _lod2_parts: List[str] = []
         _lod3_parts: List[str] = []
 
+        # ── Batched LOD-2 docstring pre-resolution ──
+        # Same reasoning as the inventory listing: resolve all of this turn's
+        # missing LOD-2 docstrings in a handful of LLM calls up front, instead
+        # of one call per symbol inside the loop below.
+        if self._f.valves.enable_auto_docstrings:
+            lod2_candidates = [
+                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+            ]
+            if lod2_candidates:
+                missing = []
+                for node_id in lod2_candidates:
+                    has_doc = False
+                    for bh in self._f._symbol_index.find_blocks(node_id, project_id):
+                        blk = state["active_blocks"].get(bh)
+                        if blk and any(
+                            s.name == node_id and s.docstring for s in blk.symbols
+                        ):
+                            has_doc = True
+                            break
+                    if not has_doc:
+                        missing.append(node_id)
+                if missing:
+                    await self._f._enrichment.ensure_docstrings_batch(
+                        missing, project_id
+                    )
+
         for node_id, score in sorted_nodes:
             if total_tokens >= budget:
                 break
@@ -2436,11 +2462,8 @@ class ContextBuilder:
                         ),
                         "",
                     )
-                    # ── Lazy docstring generation ──
-                    if not docstring and self._f.valves.enable_auto_docstrings:
-                        docstring = await self._f._enrichment.ensure_docstring(
-                            node_id, project_id
-                        )
+                    # ── Lazy docstring generation has been moved to the
+                    # batched pre-pass above; docstring is already filled in.
                     text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
                     tok = len(text) // 4 + 2
                     if total_tokens + tok > budget:
@@ -2597,6 +2620,7 @@ class ContextBuilder:
             return ""
 
         by_file: dict = {}
+        pending_docstrings: List[str] = []
         for name in sorted(all_names):
             meta = self._f._symbol_index.get_symbol_meta(name, project_id)
 
@@ -2619,20 +2643,30 @@ class ContextBuilder:
                             "file_path": block.file_path,
                             "kind": sym.kind if sym else "function",
                             "language": sym.language if sym else "unknown",
-                            "parent_symbol": sym.parent_symbol if sym else "",  # NEW
+                            "parent_symbol": sym.parent_symbol if sym else "",
                         }
                         break
 
             if meta is None:
                 continue
 
-            # ── Lazy docstring generation (respects per‑turn limit) ──
             if not meta.get("docstring") and self._f.valves.enable_auto_docstrings:
-                doc = await self._f._enrichment.ensure_docstring(name, project_id)
-                meta["docstring"] = doc
+                pending_docstrings.append(name)
 
             file_key = meta.get("file_path") or "(unknown)"
             by_file.setdefault(file_key, []).append((name, meta))
+
+        # ── Batched docstring resolution: a handful of LLM calls covering
+        # every missing docstring, instead of one call per symbol. ──
+        if pending_docstrings:
+            resolved = await self._f._enrichment.ensure_docstrings_batch(
+                pending_docstrings, project_id
+            )
+            if resolved:
+                for entries in by_file.values():
+                    for name, meta in entries:
+                        if name in resolved:
+                            meta["docstring"] = resolved[name]
 
         if not by_file:
             return ""
@@ -10238,6 +10272,9 @@ class HistoryCompressor:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+        # block.hash -> in-flight background summary task, to avoid firing
+        # a second summary attempt for the same block while one is pending.
+        self._pending_block_summaries: Set[str] = set()
 
     # ── Public API ────────────────────────────────────────────────────────
     def compress_code_history(self, messages: list, project_id: str) -> list:
@@ -10698,6 +10735,39 @@ class HistoryCompressor:
             )
         return None
 
+    async def schedule_block_summary(self, block: "CodeBlock", project_id: str) -> None:
+        """
+        Fire-and-forget oversized-block summary generation.
+
+        Returns immediately. Does nothing if the block already has a summary,
+        is under the size threshold, or a background attempt is already
+        in flight for this exact block hash.
+        """
+        if block.block_summary or block.hash in self._pending_block_summaries:
+            return
+        tok = block._cached_token_count or (len(block.content) // 4)
+        if (
+            self._f.valves.max_code_block_tokens <= 0
+            or tok <= self._f.valves.max_code_block_tokens
+        ):
+            return
+
+        self._pending_block_summaries.add(block.hash)
+
+        async def _run() -> None:
+            try:
+                await self.maybe_generate_block_summary(block)
+                if block.block_summary:
+                    # Mark state dirty so the next save_state_if_dirty() persists it.
+                    state = self._f._state_store.get_state(project_id)
+                    self._f._state_store.set_state(project_id, state)
+            except Exception as exc:
+                self._f._log_debug(f"Background block summary failed: {exc}")
+            finally:
+                self._pending_block_summaries.discard(block.hash)
+
+        asyncio.create_task(_run())
+
     async def maybe_generate_block_summary(self, block: "CodeBlock") -> None:
         """Generate a summary for an oversized code block when overflow action is 'summarize'."""
         if not (
@@ -11088,89 +11158,159 @@ class EnrichmentTasks:
         duplicate = results[2] if not isinstance(results[2], Exception) else None
         return contradiction, cached, duplicate
 
-    async def ensure_docstring(self, name: str, project_id: str) -> str:
-        """
-        Return the docstring for `name`, generating and persisting it on the fly
-        if missing.  Respects the per‑turn lazy generation limit
-        (lazy_docstring_max_per_turn).
-        """
-        # 1. Already in memory?
-        state = self._f._state_store.get_state(project_id)
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.name == name and sym.docstring:
-                    return sym.docstring
+    _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_]\w*)\s*:\s*(.+)$")
 
-        # 2. Check SQLite
-        try:
-            row = await anyio.to_thread.run_sync(
-                lambda: self._f._db_conn.execute(
-                    "SELECT docstring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
-                    (project_id, name),
-                ).fetchone()
-            )
-        except Exception:
-            row = None
-        if row and row[0]:
-            doc = row[0]
-            # Update in-memory symbol
+    def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
+        """items: list of (name, signature, snippet). Builds one prompt asking
+        for all of them at once."""
+        parts = []
+        for name, signature, snippet in items:
+            parts.append(f"### {name}\n```\n{signature}\n{snippet[:300]}\n```")
+        listing = "\n\n".join(parts)
+        return (
+            f"For each of the following {len(items)} code symbols, write ONE "
+            f"short sentence describing what it does.\n\n{listing}\n\n"
+            f"Output exactly one line per symbol, in this exact format:\n"
+            f"<name>: <one short sentence>\n"
+            f"Use the exact symbol name as given above. Do not add numbering, "
+            f"headers, or any other text."
+        )
+
+    def _parse_docstring_batch_response(
+        self, response: str, expected_names: Set[str]
+    ) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for line in response.splitlines():
+            m = self._BATCH_DOCSTRING_LINE_RE.match(line.strip())
+            if not m:
+                continue
+            name, desc = m.group(1), m.group(2).strip()
+            if name in expected_names and desc:
+                result[name] = desc[:200]
+        return result
+
+    async def ensure_docstrings_batch(
+        self, names: List[str], project_id: str
+    ) -> Dict[str, str]:
+        """
+        Resolve docstrings for many symbols at once.
+
+        Cache hits (already in memory or in SQLite) are resolved for free.
+        Cache misses are generated in groups of `docstring_batch_size`,
+        ONE LLM call per group instead of one call per symbol — this is the
+        whole point: under --parallel 1 we cannot run multiple LLM calls
+        concurrently, so the only way to go faster is to make fewer calls.
+
+        Returns {name: docstring} for every name that has (or now has) a
+        non-empty docstring. A name absent from the result means it is still
+        undocumented this turn (cache miss, per-turn budget exhausted, or the
+        LLM skipped it in its batch response) — it will be picked up by the
+        existing background docstring loop on a later turn.
+        """
+        state = self._f._state_store.get_state(project_id)
+        resolved: Dict[str, str] = {}
+        pending: List[str] = []
+
+        # 1. Memory + SQLite cache — no LLM call needed.
+        for name in names:
+            found = ""
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if sym.name == name and sym.docstring:
+                        found = sym.docstring
+                        break
+                if found:
+                    break
+            if not found:
+                try:
+                    row = await anyio.to_thread.run_sync(
+                        lambda n=name: self._f._db_conn.execute(
+                            "SELECT docstring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
+                            (project_id, n),
+                        ).fetchone()
+                    )
+                except Exception:
+                    row = None
+                if row and row[0]:
+                    found = row[0]
+                    for block in state["active_blocks"].values():
+                        for sym in block.symbols:
+                            if sym.name == name:
+                                sym.docstring = found
+                                self._f._symbol_index.update_docstring(
+                                    name, project_id, found
+                                )
+                                break
+            if found:
+                resolved[name] = found
+            else:
+                pending.append(name)
+
+        if not pending:
+            return resolved
+
+        # 2. Respect the existing per-turn lazy generation budget.
+        budget = self._f.valves.lazy_docstring_max_per_turn
+        if budget > 0:
+            remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
+            pending = pending[:remaining]
+        if not pending:
+            return resolved
+
+        # 3. Gather signature + snippet for each pending symbol.
+        items: List[Tuple[str, str, str]] = []
+        for name in pending:
+            signature, snippet = name, ""
             for block in state["active_blocks"].values():
                 for sym in block.symbols:
                     if sym.name == name:
-                        sym.docstring = doc
-                        self._f._symbol_index.update_docstring(name, project_id, doc)
+                        signature = sym.signature
+                        snippet = block.content[:500]
                         break
-            return doc
-
-        # 3. Respect per‑turn lazy generation limit
-        if self._f.valves.lazy_docstring_max_per_turn > 0:
-            if (
-                self._lazy_docstrings_generated_this_turn
-                >= self._f.valves.lazy_docstring_max_per_turn
-            ):
-                return ""
-
-        # 4. Generate synchronously
-        signature = name
-        snippet = ""
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.name == name:
-                    signature = sym.signature
-                    snippet = block.content[:500]
+                if snippet:
                     break
-            if snippet:
-                break
+            items.append((name, signature, snippet))
 
-        docstring = await self._f._llm_orchestrator.call_llm(
-            prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
-            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-            model_override=self._f.valves.llm_model,
-            max_tokens=50,
-            temperature=0.1,
-            label="lazy_docstring",
-        )
-        if not docstring or not docstring.strip():
-            return ""
-
-        docstring = docstring.strip()
-
-        # Persist and update memory
-        for block in state["active_blocks"].values():
-            for sym in block.symbols:
-                if sym.name == name:
-                    sym.docstring = docstring
-                    self._f._symbol_index.update_docstring(name, project_id, docstring)
-                    break
-        await self._f._state_store._db_enqueue(
-            lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
-                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                (pid, n, d, time.time()),
+        # 4. One LLM call per batch instead of one per symbol.
+        batch_size = max(1, self._f.valves.docstring_batch_size)
+        for i in range(0, len(items), batch_size):
+            batch = items[i : i + batch_size]
+            expected = {n for n, _, _ in batch}
+            prompt = self._build_docstring_batch_prompt(batch)
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a code summarization assistant. Output only the "
+                    "requested lines, one per symbol, no extra commentary."
+                ),
+                model_override=self._f.valves.llm_model,
+                max_tokens=min(60 * len(batch), 600),
+                temperature=0.1,
+                label="lazy_docstring_batch",
             )
-        )
+            self._lazy_docstrings_generated_this_turn += len(batch)
+            if not response:
+                continue
 
-        self._lazy_docstrings_generated_this_turn += 1
-        return docstring
+            parsed = self._parse_docstring_batch_response(response, expected)
+            for name, docstring in parsed.items():
+                resolved[name] = docstring
+                for block in state["active_blocks"].values():
+                    for sym in block.symbols:
+                        if sym.name == name:
+                            sym.docstring = docstring
+                            self._f._symbol_index.update_docstring(
+                                name, project_id, docstring
+                            )
+                            break
+                await self._f._state_store._db_enqueue(
+                    lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                        "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                        (pid, n, d, time.time()),
+                    )
+                )
+
+        return resolved
 
     async def _apply_turn_based_window(
         self,
@@ -11967,8 +12107,8 @@ class ActiveCodeUpdater:
         ):
             for block in state["active_blocks"].values():
                 if not block.obsolete:
-                    await self._f._history_compressor.maybe_generate_block_summary(
-                        block
+                    await self._f._history_compressor.schedule_block_summary(
+                        block, project_id
                     )
 
         self._f._activation.invalidate_lightweight_cache(project_id)
@@ -14163,7 +14303,7 @@ class Filter:
             description="Maximum characters of source code sent to the LLM when generating a summary for an oversized code block.",
         )
         oversized_summary_max_tokens: int = Field(
-            default=1000,
+            default=350,
             description="Maximum tokens allowed for the generated summary of an oversized code block.",
         )
 
@@ -14327,6 +14467,17 @@ class Filter:
             default=25,
             ge=0,
             description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
+        )
+        docstring_batch_size: int = Field(
+            default=8,
+            ge=1,
+            le=20,
+            description=(
+                "How many symbols to bundle into a single lazy-docstring LLM "
+                "call. Higher = fewer round trips (important under "
+                "--parallel 1, where calls cannot run concurrently) at the "
+                "cost of a larger prompt/response per call."
+            ),
         )
         enable_auto_docstrings_background: bool = Field(
             default=True,
