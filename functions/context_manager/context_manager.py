@@ -3778,12 +3778,16 @@ class ReentrantAsyncLock:
     """Reentrant asyncio lock with optional timeout to prevent deadlocks."""
 
     def __init__(self, default_timeout: float = 60.0) -> None:
+        """*default_timeout* applies to every ``acquire()`` call that doesn't
+        specify its own timeout."""
         self._lock = asyncio.Lock()
         self._owner: Optional[asyncio.Task] = None
         self._count = 0
         self._default_timeout = default_timeout
 
     async def acquire(self, timeout: Optional[float] = None) -> None:
+        """Acquire the lock, reentrantly if already held by the current task.
+        *timeout* overrides the instance default."""
         task = asyncio.current_task()
         if self._owner is task:
             self._count += 1
@@ -3797,6 +3801,8 @@ class ReentrantAsyncLock:
         self._count = 1
 
     def release(self) -> None:
+        """Release the lock once.  Raises ``RuntimeError`` if the current
+        task does not own the lock."""
         task = asyncio.current_task()
         if self._owner is not task:
             raise RuntimeError("Lock not owned by current task")
@@ -3806,10 +3812,12 @@ class ReentrantAsyncLock:
             self._lock.release()
 
     async def __aenter__(self):
+        """Async context manager entry."""
         await self.acquire()
         return self
 
     async def __aexit__(self, *args) -> None:
+        """Async context manager exit."""
         self.release()
 
 
@@ -3817,26 +3825,19 @@ class ReentrantAsyncLock:
 # SymbolIndex – central name→block mapping and typed edges
 # ---------------------------------------------------------------------------
 class SymbolIndex:
-    """Maps qualified symbol identities to block hashes, tracks call edges,
-    and computes centrality.
+    """Central index that stores every known symbol under a **qualified id**
+    (``ClassName.method`` or ``module.function``) so that methods with the
+    same bare name in different classes never collide.
 
-    Symbols are stored under a QUALIFIED identity
-    (qualify_symbol_name(name, parent_symbol), e.g. "ContextBuilder.__init__")
-    instead of the bare name.  This fixes a real, observed bug: dozens of
-    methods in typical Python code share bare names ("__init__", "__str__",
-    small private helpers...) across completely different classes.  Before
-    this change, every API here was indexed by bare name only, so the LAST
-    symbol indexed under a given name silently overwrote the
-    signature/docstring/parent_symbol of any other symbol with the same name
-    in the project, and the legacy call-edge storage also fused their
-    outgoing calls.
+    Provides:
+    * Block‑hash lookup by qualified id, with bare‑name fallback that
+      returns **all** matching symbols (inclusive, not last‑writer‑wins).
+    * Typed call edges (``calls``, ``data_flow``, …) between symbols.
+    * Per‑symbol metadata: signature, docstring, kind, file path, line span.
+    * PageRank centrality over the qualified call graph.
 
-    A `_bare_index` reverse mapping is maintained so that every existing
-    bare‑name lookup (used everywhere for text/query matching — a user typing
-    "fix call_llm" has no idea which class to qualify with) still works:
-    exact qualified matches are tried first, then bare‑name fallback, which
-    is INCLUSIVE (returns/affects every match) instead of the old silently-
-    overwriting-single-entry behaviour.
+    Use ``get_all_names()`` for coarse text matching, ``get_all_qualified_names()``
+    when every distinct symbol must be visible (inventories, hashes, centrality).
     """
 
     MAX_ENTRIES = 10_000
@@ -3871,6 +3872,8 @@ class SymbolIndex:
 
     # ── Name ↔ block hash mapping ─────────────────────────────────────
     def add(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
+        """Register *symbol* in the index, keyed by its qualified id.
+        Updates the bare‑name reverse index and call‑relationship storage."""
         qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
         self._name_to_blocks[key].add(block_hash)
@@ -3896,6 +3899,9 @@ class SymbolIndex:
         self._evict_if_needed()
 
     def remove(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
+        """Remove *symbol* from the index.  If the block hash was the last
+        reference to that qualified id, the entry is fully deleted from all
+        internal structures."""
         qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
         s = self._name_to_blocks.get(key)
@@ -3915,6 +3921,7 @@ class SymbolIndex:
     def remove_all_for_block(
         self, block_hash: str, symbols: List["CodeSymbol"], project_id: str
     ) -> None:
+        """Remove every symbol belonging to *block_hash* and their edges."""
         for sym in symbols:
             self.remove(sym, block_hash, project_id)
             qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
@@ -3987,6 +3994,8 @@ class SymbolIndex:
         return self._symbol_meta.get((project_id, chosen))
 
     def get_parent_symbol(self, name_or_qid: str, project_id: str) -> str:
+        """Enclosing class name for a symbol, or ``""`` if it is top-level
+        or the symbol is not found."""
         meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("parent_symbol", "") if meta else ""
 
@@ -4008,6 +4017,8 @@ class SymbolIndex:
         return sorted(members, key=lambda q: (_line_start(q), q))
 
     def get_classes(self, project_id: str) -> Set[str]:
+        """Return every class name that has at least one indexed member,
+        plus every symbol whose kind is ``"class"``."""
         classes = set()
         for (pid, qid), meta in self._symbol_meta.items():
             if pid != project_id:
@@ -4022,17 +4033,22 @@ class SymbolIndex:
     def get_symbol_meta(
         self, name_or_qid: str, project_id: str
     ) -> Optional[Dict[str, Any]]:
+        """Full metadata dict for a symbol (signature, docstring, kind, …),
+        or ``None`` if not found."""
         return self._resolve_meta(name_or_qid, project_id)
 
     def get_signature(self, name_or_qid: str, project_id: str) -> Optional[str]:
+        """Signature string for a symbol, or ``None``."""
         meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("signature") if meta else None
 
     def get_docstring(self, name_or_qid: str, project_id: str) -> str:
+        """One-line docstring for a symbol, or ``""``."""
         meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("docstring", "") if meta else ""
 
     def get_file_for_symbol(self, name_or_qid: str, project_id: str) -> Optional[str]:
+        """File path for a symbol, or ``None``."""
         meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("file_path") if meta else None
 
@@ -4137,6 +4153,8 @@ class SymbolIndex:
         return dict(inverted)
 
     def compute_signature_hash(self, project_id: str) -> str:
+        """Stable hash of all symbol signatures (not bodies).  Changes only
+        when symbols are added/removed/renamed or a signature changes."""
         qids = sorted(self.get_all_qualified_names(project_id))
         if not qids:
             return ""
@@ -4151,6 +4169,7 @@ class SymbolIndex:
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     def compute_skeleton_hash(self, project_id: str) -> str:
+        """Stable hash of the skeleton tier (signatures + docstrings)."""
         qids = sorted(self.get_all_qualified_names(project_id))
         if not qids:
             return ""
@@ -4246,6 +4265,9 @@ class SymbolIndex:
     def get_hub_symbols(
         self, project_id: str, centrality: Dict[str, float], top_n: int
     ) -> List[Tuple[str, float]]:
+        """Top‑N symbols by centrality, sorted by descending score.
+        Falls back to the cached scores from the last
+        ``precompute_centrality()`` call if *centrality* is empty."""
         if not centrality:
             centrality = getattr(self, "_centrality_cache", {}).get(project_id, {})
         if not centrality or top_n <= 0:
@@ -4255,6 +4277,8 @@ class SymbolIndex:
 
     # ── Internal helpers ────────────────────────────────────────────────
     def _evict_if_needed(self) -> None:
+        """Drop the least‑frequently‑added entry when the index exceeds
+        ``MAX_ENTRIES``, keeping memory bounded."""
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
             least_common = self._stats.most_common()[-1][0]
             project_id, qid = least_common
@@ -4272,6 +4296,7 @@ class SymbolIndex:
             self._symbol_meta.pop(least_common, None)
 
     def _store_centrality(self, project_id: str, scores: Dict[str, float]) -> None:
+        """Cache centrality scores for cheap re-reads by ``get_hub_symbols()``."""
         self._centrality_cache[project_id] = scores
 
     def _iter_names(self, project_id: str):
@@ -4284,6 +4309,7 @@ class SymbolIndex:
 
     # ── Project lifecycle ──────────────────────────────────────────────
     def clear_project(self, project_id: str) -> None:
+        """Remove every symbol, edge, and metadata entry for *project_id*."""
         keys_to_remove = [key for key in self._name_to_blocks if key[0] == project_id]
         for key in keys_to_remove:
             del self._name_to_blocks[key]
@@ -4312,6 +4338,7 @@ class SymbolIndex:
             del self._symbol_meta[key]
 
     def clear(self) -> None:
+        """Drop all in‑memory data for all projects."""
         self._name_to_blocks.clear()
         self._bare_index.clear()
         self._callee_to_callers.clear()
@@ -4326,7 +4353,21 @@ class SymbolIndex:
 # SignatureExtractor – tree‑sitter based symbol and call extraction
 # ---------------------------------------------------------------------------
 class SignatureExtractor:
-    """Extracts CodeSymbols and call relationships from source code."""
+    """Extracts ``CodeSymbol`` lists and call relationships from source code
+    using tree‑sitter for precise, qualified results.
+
+    Each returned symbol carries a **qualified identity** (``ClassName.method``
+    or ``module.function``) via its ``parent_symbol`` field, so downstream
+    indexing never confuses same‑named methods from different classes.
+
+    When tree‑sitter is unavailable or the language cannot be detected, an
+    empty list is returned and a warning is logged — no unqualified fallback
+    data is ever produced.
+
+    Docstrings are extracted statically for Python via the ``ast`` module;
+    for other languages (or when the source lacks a docstring), they are
+    filled in later by the LLM‑driven ``ensure_docstrings_batch`` path.
+    """
 
     MAX_PARSE_SIZE_BYTES = 5_000_000
     _LANG_MAP: Dict[str, str] = {
@@ -4854,7 +4895,29 @@ class SignatureExtractor:
 
 
 class StateStore:
-    """SQLite-backed conversation state, DB write queue, and project locks."""
+    """Persistent conversation state backed by SQLite, with an async write
+    queue and per‑project reentrant locks.
+
+    Provides:
+    * ``get_state(project_id)`` — loads state from the in‑memory LRU cache
+      or falls back to SQLite, rebuilding the SymbolIndex on cache miss.
+    * ``set_state(project_id, state)`` — marks the state dirty without
+      blocking; actual persistence is deferred to ``save_state_if_dirty()``.
+    * ``save_state_if_dirty(project_id)`` — writes the state to SQLite via
+      the background write queue, with a minimum cooldown between writes.
+    * ``init_db()`` — idempotent DDL for all tables and indexes.
+    * ``get_project_lock(project_id)`` — returns a ``ReentrantAsyncLock``
+      scoped to a single project, preventing concurrent mutation of the
+      same project's state from different requests.
+    * ``_rebuild_symbol_index(state, project_id)`` — reconstructs the
+      SymbolIndex from the active blocks after a cold load, ensuring
+      call‑graph edges are correctly qualified.
+    * ``_db_enqueue(fn)`` — non‑blocking, serialised writes to SQLite
+      handled by a dedicated worker loop (``db_worker``).
+
+    The write queue ensures SQLite never sees concurrent writes even under
+    high parallelism, avoiding "database is locked" errors.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -5079,7 +5142,7 @@ class StateStore:
         self._f._db_conn.commit()
 
     def _load_state_from_db(self, project_id: str) -> Optional[dict]:
-        """Carga el estado de conversación desde SQLite. Devuelve None si no existe."""
+        """Load conversation state from SQLite. Returns None if it does not exist."""
         cur = self._f._db_conn.execute(
             "SELECT state_json FROM conversation_state WHERE project_id = ?",
             (project_id,),
@@ -5089,7 +5152,7 @@ class StateStore:
             return None
         data = json.loads(row[0])
 
-        # Asegurar claves esperadas con valores por defecto
+        # Ensure expected keys with default values
         for key in [
             "feedback_history",
             "last_compression_timestamp",
@@ -5103,7 +5166,7 @@ class StateStore:
             )
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
 
-        # Detección de corrupción en active_blocks
+        # Detection of corruption in active_blocks
         raw_active = data.get("active_blocks")
         if raw_active is None:
             self._f._log_debug(
@@ -5147,7 +5210,7 @@ class StateStore:
             except Exception:
                 self._f._log_debug("Skipping corrupted block %s in state DB" % k)
 
-        # Restaurar otras colecciones
+        # Restore other collections
         recent = []
         for b in data.get("recent_changes", []):
             try:
@@ -5248,7 +5311,7 @@ class StateStore:
                     self._f._symbol_index.add_edge(edge, project_id)
 
     async def _db_enqueue(self, fn, args=(), kwargs=None) -> None:
-        """Encola una operación de escritura en la cola del worker de BD."""
+        """Enqueue a write operation on the DB worker queue."""
         if kwargs is None:
             kwargs = {}
         await self._f._db_write_queue.put((fn, args, kwargs))
@@ -5501,7 +5564,18 @@ class StateStore:
 
 
 class LongTermMemory:
-    """ChromaDB embeddings, conversation memory, and response cache."""
+    """Manages long‑term conversational and code memory using ChromaDB
+    with semantic embeddings.
+
+    Provides:
+    * Storage and retrieval of user/assistant messages indexed by project
+      and enriched with code symbols, file paths, and content type.
+    * A response cache that avoids redundant LLM calls when semantically
+      similar queries are repeated under the same code state.
+    * Duplicate question detection using cosine similarity and optional
+      CrossEncoder reranking.
+    * Time‑bounded expiration of old memories.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -5548,15 +5622,25 @@ class LongTermMemory:
     async def find_cached_response(
         self, query: str, context_hash: str, state: dict
     ) -> Optional[dict]:
+        """Search the response cache for a semantically similar query.
+
+        Returns a dict with ``response``, ``query``, and ``timestamp`` on a
+        hit, or ``None`` if no valid cached entry is found.  Stale entries
+        (code state changed or TTL expired) are deleted on the fly.
+        """
+        # ── Early exit: cache disabled or collection missing ──────────
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return None
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
             return None
 
+        # ── Embed query ───────────────────────────────────────────────
         query_vec = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
+
+        # ── Retrieve nearest neighbour ─────────────────────────────────
         results = await anyio.to_thread.run_sync(
             lambda: col.query(
                 query_embeddings=[query_vec],
@@ -5568,11 +5652,13 @@ class LongTermMemory:
         if not results or not results["ids"] or not results["ids"][0]:
             return None
 
+        # ── Validate similarity ────────────────────────────────────────
         dist = results["distances"][0][0]
         similarity = 1.0 - (dist / 2.0)
         if similarity < self._f.valves.response_cache_similarity_threshold:
             return None
 
+        # ── Check staleness: code state hash ───────────────────────────
         meta = results["metadatas"][0][0]
         stored_code_state = meta.get("code_state_hash", "")
         if (
@@ -5585,6 +5671,7 @@ class LongTermMemory:
             )
             return None
 
+        # ── Check staleness: TTL ───────────────────────────────────────
         ttl = self._f.valves.response_cache_ttl_hours * 3600
         ts = meta.get("timestamp", 0)
         if ttl > 0 and time.time() - ts > ttl:
@@ -5599,15 +5686,26 @@ class LongTermMemory:
     async def find_duplicate_question(
         self, query: str, project_id: str
     ) -> Optional[dict]:
+        """Detect near‑duplicate user questions using cosine similarity and,
+        when available, a CrossEncoder reranker.
+
+        Returns ``{"sim": float, "doc": str}`` if a duplicate is found, or
+        ``None`` otherwise.
+        """
+        # ── Early exit: prerequisites ──────────────────────────────────
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return None
         if not query or len(query.strip()) < 15:
             return None
+
         try:
+            # ── Embed query ────────────────────────────────────────────
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(query[:1000]).tolist()
             )
             now = time.time()
+
+            # ── Build time‑bounded filter ──────────────────────────────
             where = {
                 "$and": [
                     {"project_id": {"$eq": project_id}},
@@ -5620,6 +5718,8 @@ class LongTermMemory:
                     },
                 ]
             }
+
+            # ── Query ChromaDB ─────────────────────────────────────────
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
                     query_embeddings=[q_emb],
@@ -5631,6 +5731,7 @@ class LongTermMemory:
             if not results or not results["ids"] or not results["ids"][0]:
                 return None
 
+            # ── Find best candidate, optionally via CrossEncoder ────────
             best_candidate = None
             best_sim = 0.0
             for i, doc in enumerate(results["documents"][0]):
@@ -5810,12 +5911,22 @@ class LongTermMemory:
         file_paths: List[str],
         content_type: str,
     ) -> str:
+        """Build a short prefix that enriches a ChromaDB document for better
+        retrieval.  Two modes are supported via ``contextual_retrieval_mode``:
+
+        * ``"metadata"`` — fast, concatenates structured fields (project,
+          files, symbols, type, excerpt).
+        * ``"llm"`` — asks the LLM for a one‑sentence description of the
+          content (slower, but captures nuance better).
+        """
         if not self._f.valves.enable_contextual_retrieval:
             return ""
 
+        # ── LLM mode ────────────────────────────────────────────────────
         if self._f.valves.contextual_retrieval_mode == "llm":
             return await self._build_retrieval_context_llm(content, project_id)
 
+        # ── Metadata mode ───────────────────────────────────────────────
         parts: List[str] = [f"Project: {project_id}"]
         if file_paths:
             parts.append(f"Files: {', '.join(file_paths[:3])}")
@@ -5833,6 +5944,8 @@ class LongTermMemory:
         return f"[{context_line}]\n\n"
 
     async def _build_retrieval_context_llm(self, content: str, project_id: str) -> str:
+        """Use the LLM to generate a one‑sentence contextual description
+        of *content* for improved long‑term memory retrieval."""
         prompt = (
             "In one sentence (10-20 words), describe what the following "
             "code/conversation excerpt is about, for search retrieval:\n\n"
@@ -6475,7 +6588,27 @@ class LongTermMemory:
 
 
 class LLMOrchestrator:
-    """Shared LLM caller, cache, and task tracking."""
+    """Centralised LLM caller with built‑in response cache, retry logic,
+    and task deduplication.
+
+    Provides:
+    * ``call_llm(prompt, ...)`` — the single entry point for all LLM calls.
+      Retries transient failures (429, 5xx) with a configurable total
+      deadline and an exponential backoff.
+    * In‑memory response cache (``AsyncLRUCache``) keyed by prompt hash,
+      shared across the whole process.
+    * Deduplication of concurrent identical prompts via per‑key futures,
+      so parallel background tasks (docstrings, summaries) never fire
+      duplicate LLM requests.
+    * A concurrency semaphore (``_llm_semaphore``) that serialises
+      inference for llama.cpp's ``--parallel 1`` mode.
+    * ``should_keep_full_code(query)`` — lightweight CrossEncoder call
+      that decides whether the user wants the full implementation or a
+      summary.
+    * ``wait_for_slot()`` / ``wait_for_llm_tasks()`` — coordination
+      primitives used by the inlet and outlet to avoid dirtying the KV
+      cache while auxiliary LLM work is in flight.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -6760,7 +6893,30 @@ class LLMOrchestrator:
 
 
 class ReasoningEngine:
-    """Chain‑of‑Thought detection and generation."""
+    """Detects when Chain‑of‑Thought reasoning is appropriate and generates
+    reasoning chains using the LLM.
+
+    Provides:
+    * ``detect_cot_level(query)`` — returns 0‑3 (inconclusive → deep
+      scientific reasoning) using either a CrossEncoder classifier or a
+      keyword‑based heuristic.
+    * ``generate_cot_reasoning(question, context)`` — produces a step‑by‑step
+      reasoning block (Level 2).
+    * ``generate_architecture_reasoning(question, skeleton, project_id)`` —
+      Level 2 reasoning that works on the code skeleton (contracts only)
+      instead of the full system prompt, producing /expand hints for
+      implementation.
+    * ``generate_scientific_reasoning_L3(question, context, project_id)`` —
+      multi‑hypothesis reasoning validated against the SymbolGraph
+      (StaticEvidence).
+    * ``generate_scientific_architecture_reasoning(...)`` — Level 3
+      architecture reasoning that evaluates competing design options
+      against structural evidence.
+    * ``is_architecture_query(query)`` — fast regex test to route design /
+      refactor queries to the skeleton‑based reasoning path.
+    * ``parse_cot_intent(content)`` — extracts the question and level from
+      explicit ``/think`` commands.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -7699,7 +7855,20 @@ class ReasoningEngine:
 
 
 class MultiPhasePlanner:
-    """Multi‑phase response instructions and wrap‑up hints."""
+    """Generates the multi‑phase protocol instructions injected into the
+    system prompt when the response budget is tight, and appends wrap‑up
+    hints when the token window is critically low.
+
+    Provides:
+    * ``build_multi_phase_instructions(available_tokens, query, ...)`` —
+      returns a complete multi‑phase protocol block (analysis → architecture
+      → contract → code parts → verification) tailored to whether the task
+      is code‑generation or a general long‑form answer.
+    * ``append_critical_wrap_up_hint(messages)`` — appends a short (~25
+      token) reminder to the last user message telling the model to stop
+      cleanly and write a continuation marker, without consuming system
+      prompt budget.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -7861,7 +8030,28 @@ class MultiPhasePlanner:
 
 
 class CommandRouter:
-    """Explicit commands, natural‑language intents, and suggestions."""
+    """Dispatches explicit slash‑commands, interprets natural‑language
+    intents, and injects proactive suggestions into the conversation.
+
+    Provides:
+    * ``handle_explicit_commands(messages, ...)`` — processes ``/forget``,
+      ``/status``, ``/clean``, and ``/expand`` commands, returning a
+      fully‑formed assistant response when one is triggered.
+    * ``handle_natural_intents(messages, ...)`` — detects forget / remember /
+      obsolete requests expressed in natural language using the CrossEncoder
+      and executes them without an explicit command prefix.
+    * ``outlet_intercept_expand(assistant_content, project_id)`` — scans the
+      assistant's response for ``/expand`` commands and replaces them inline
+      with the actual symbol bodies from the SymbolIndex, so the user sees
+      the code immediately.
+    * ``classify_intent(query)`` — returns a probability distribution over
+      explain / modify / debug / refactor using the CrossEncoder.
+    * ``suggest_commands(project_id, state)`` — returns context‑management
+      tips (``/forget``, ``/status``, ``/clean``) after the conversation
+      reaches a threshold, with a cooldown between suggestions.
+    * ``is_code_only_message(content)`` — detects messages that contain only
+      code without a question, used by the inlet to trigger silent ingestion.
+    """
 
     # ----------------------------------------------------------------------
     # Regex patterns
@@ -8971,7 +9161,26 @@ class CommandRouter:
 
 
 class CodeBlockManager:
-    """Extraction, classification, deduplication, and diff application."""
+    """Extracts code blocks from messages, classifies their content type,
+    deduplicates near‑identical code, and applies unified diffs.
+
+    Provides:
+    * ``extract_code_blocks(content)`` — returns fenced/indented code blocks
+      with language detection and optional tree‑sitter processing.
+    * ``classify_content(content, blocks)`` — labels a message as base code,
+      proposed change, error, tool call, or general text.
+    * ``remove_duplicate_blocks(state, project_id)`` — evicts duplicate or
+      near‑duplicate code blocks using AST similarity and content‑hash
+      deduplication.
+    * ``apply_change_with_diff(base, proposed)`` — applies a unified diff
+      onto a base block, re‑extracting symbols afterward.
+    * ``extract_file_paths(content)`` — returns all file paths matching the
+      configured pattern.
+    * ``format_block_context(block, is_latest)`` — renders a single active
+      CodeBlock for injection into the system prompt.
+    * ``has_conflicting_proposed_changes(state, new_block)`` — detects
+      whether a new proposed change conflicts with an existing one.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
@@ -9673,7 +9882,28 @@ class CodeBlockManager:
 
 
 class ActivationEngine:
-    """PPR activation, path index, centrality, and speculative prefetch."""
+    """Builds activation graphs from query seeds and the symbol call graph,
+    determining which code blocks are relevant to the current user message.
+
+    Provides:
+    * ``build_activation_graph(query, project_id)`` — produces an
+      ``ActivationGraph`` with scores for every symbol reachable from
+      query‑matched seeds, traceback frames, and recent history.
+    * ``get_active_code_context(project_id, query)`` — returns a formatted
+      string of all active blocks, sorted by relevance, for injection
+      when path analysis is disabled.
+    * ``rebuild_path_index(project_id)`` — reconstructs the ``PathIndex``
+      from the current ``SymbolIndex`` after code changes.
+    * ``resolve_dangling_edges(project_id)`` — upgrades provisional cross‑chunk
+      call edges when the referenced symbol is later defined.
+    * ``speculative_prefetch(project_id, last_activated)`` — pre‑builds
+      ``CodePathView`` objects for symbols likely to be needed in the next
+      request.
+    * ``compute_code_state_hash(project_id)`` — returns a hash of the active
+      blocks, used to detect KV‑cache invalidations and staleness.
+    * ``invalidate_lightweight_cache(project_id)`` — clears cached context
+      and centrality so the next request rebuilds them from scratch.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -10728,7 +10958,30 @@ class ActivationEngine:
 
 
 class HistoryCompressor:
-    """Code history compression, message summarisation, and block summaries."""
+    """Compresses conversation history and code blocks to keep the token
+    budget under control without losing essential information.
+
+    Provides:
+    * ``compress_code_history(messages, project_id)`` — replaces old
+      multi‑phase code parts with compact commit summaries when their
+      symbols are safely indexed in the SymbolGraph.
+    * ``lean_user_code_messages(messages, project_id)`` — replaces large
+      code blocks in user messages with stubs when the SymbolGraph already
+      covers every symbol, avoiding redundant token consumption.
+    * ``compress_code_block(code, language, rate, query)`` — applies
+      LLMLingua‑2 compression to a single code block, preserving structural
+      tokens and optionally conditioning on the user's question.
+    * ``summarize_messages(old_messages, is_code_context)`` — produces a
+      single‑paragraph summary of trimmed conversation turns.
+    * ``build_refactor_state_injection(messages)`` — builds a compact
+      "Refactor Status" block from compressed code parts so the model knows
+      what has already been written.
+    * ``schedule_block_summary(block, project_id)`` — fire‑and‑forget
+      background task that generates a summary for an oversized code block.
+    * ``check_and_suggest_summarization(project_id, ...)`` — returns a
+      proactive suggestion when the conversation is approaching the token
+      window limit.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -11265,7 +11518,15 @@ class HistoryCompressor:
 
 
 class TokenUtils:
-    """Token estimation and text truncation helpers."""
+    """Token‑level utilities for budget management and text truncation.
+
+    Provides:
+    * ``estimate_tokens(messages)`` — total token count for a list of
+      message dicts (content + role overhead).
+    * ``estimate_code_tokens(code)`` — token count for a raw code string.
+    * ``truncate_text_to_tokens(text, max_tokens)`` — truncates text to
+      approximately *max_tokens* while preserving word boundaries.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -11306,7 +11567,25 @@ class TokenUtils:
 
 
 class EnrichmentTasks:
-    """Post‑processing enrichment: summaries, feedback, LOD adaptation."""
+    """Runs post‑processing enrichment after each user or assistant message,
+    keeping the symbol index, conversation state, and LOD thresholds aligned
+    with the evolving conversation.
+
+    Provides:
+    * Change and session summaries persisted to LTM and SQLite.
+    * Mention tracking that decays block importance over time.
+    * Time‑ and turn‑based expiration of inactive blocks.
+    * Adaptive LOD threshold tuning based on which symbols the LLM actually
+      used in its response.
+    * Feedback context injection into Block A.
+    * Parallel contradiction detection, response cache lookup, and duplicate
+      question detection.
+    * Batched, lazy docstring generation for symbols that lack one,
+      including a background loop that fills missing docstrings without
+      blocking the request path.
+    * Turn‑based conversation window management (summarise then evict old
+      turns, with a no‑degradation guard).
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -12022,10 +12301,19 @@ class EnrichmentTasks:
 
 
 class ActiveCodeUpdater:
-    """
-    Processes a new user/assistant message: extracts code, updates
-    active_blocks, runs symbol extraction, handles duplicates, diffs,
-    and triggers post‑update tasks (expiration, enrichment, soft‑eviction).
+    """Processes a new user or assistant message through the full code‑aware
+    pipeline, keeping the active block set and SymbolIndex in sync.
+
+    Orchestrates, in order:
+    * Extraction of code blocks and symbols via tree‑sitter.
+    * Duplicate detection against the current active blocks.
+    * Registration of new blocks (indexing symbols, call edges, data‑flow edges).
+    * Handling of duplicate blocks (pinned/raw force‑update, obsolete marking).
+    * Conflict detection for proposed changes and optional diff application.
+    * Hard eviction when ``max_active_blocks`` is exceeded.
+    * Post‑update tasks: mention tracking, expiration, duplicate removal,
+      oversized‑block summaries, path‑index invalidation, and soft‑eviction
+      via the ContextPager.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -12673,7 +12961,27 @@ class ActiveCodeUpdater:
 
 
 class InletOrchestrator:
-    """Inlet pre‑processing, user info extraction, session classification."""
+    """Handles the early stages of request processing: extracting user
+    information, classifying the session type, and preparing the code
+    session for context assembly.
+
+    Provides:
+    * ``get_project_id()`` — returns the current project id from valves.
+    * ``inlet_preprocess(body, project_id)`` — detects project switches,
+      loads persisted edges and path views, and initiates KV‑slot restore.
+    * ``inlet_extract_user_info(messages)`` — finds the last user message,
+      strips code spans to isolate the question, and detects explicit
+      slash‑commands.
+    * ``inlet_prepare_code_session(messages, project_id, ...)`` —
+      classifies whether the session involves code, triggers active‑block
+      updates, and handles AutoContinue continuations.
+    * ``classify_session(messages, project_id)`` — returns True if the
+      conversation context (recent messages, active blocks, last user text)
+      indicates a coding session.  Uses a short‑lived cache to avoid
+      redundant CrossEncoder calls.
+    * ``ensure_last_message_is_user(messages)`` — guarantees the message
+      list ends with a user role, inserting a placeholder if necessary.
+    """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -12939,12 +13247,21 @@ class InletOrchestrator:
 
 
 class SystemPromptBuilder:
-    """
-    Builds the system prompt in two blocks:
-      - Block A (static, via ContextBuilder)
-      - Block B (dynamic: LTM, parallel checks, activated code, suggestions,
-        persisted summaries)
-    Returns (static_block, dynamic_injections, cached_response, prelim_system).
+    """Assembles the complete system prompt from two layers: a stable,
+    KV‑cache‑friendly Block A (built once per code state) and a dynamic,
+    per‑query Block B that injects LTM, activated code, and proactive
+    suggestions.
+
+    Provides:
+    * ``build(messages, project_id, ...)`` — orchestrates Block A + Block B
+      construction, runs parallel checks (contradiction, cache, duplicate
+      detection), and returns the static block, dynamic injection list,
+      an optional cached response, and the assembled preliminary system
+      prompt.
+    * Internal helpers for each dynamic source: LTM retrieval, contradiction
+      warning injection, activated code context via ``ContextBuilder``,
+      proactive cleanup/summarisation suggestions, and persisted
+      conversation summaries.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -13304,11 +13621,17 @@ class SystemPromptBuilder:
 
 
 class MessageAssembler:
-    """
-    Post‑processes the final message list: CoT detection & generation,
-    history LLMLingua compression, multi‑phase instructions, adaptive
-    trimming, and final system‑message injection.
-    Returns the final list of messages ready for the LLM.
+    """Final processing of the message list before it is sent to the LLM.
+
+    Orchestrates, in order:
+    * Chain‑of‑Thought detection and reasoning generation (Level 1‑3).
+    * Code‑history compression and lean‑user‑code stubbing.
+    * LLMLingua‑2 compression of conversation prose.
+    * Turn‑based window management (summarise then evict old turns).
+    * Multi‑phase protocol injection when the token budget is tight.
+    * Adaptive trimming of old messages with optional summarisation.
+    * Assembly of the final system prompt (Block A + Block B) and its
+      injection as the first message.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -14445,18 +14768,24 @@ class MessageAssembler:
 # ContextDumper — per-turn context snapshots for evolution tracking
 # ---------------------------------------------------------------------------
 class ContextDumper:
-    """
-    Dump the assembled per-turn context to disk for evolution tracking.
+    """Captures per‑turn context snapshots and writes them to disk for
+    offline evolution tracking — the operator can follow how the context
+    grows and when the Block‑A KV‑cache prefix changes across a
+    conversation.
 
-    Each inlet writes one Markdown snapshot of what the model receives this turn
-    (Block A, Block B, message window) plus a compact JSONL metrics line, so the
-    operator can follow how the context grows and when the KV-cache prefix
-    (Block A) changes across a conversation.
+    Provides:
+    * ``schedule_inlet_snapshot(project_id, static_block, dynamic_block,
+      final_system, messages)`` — captures the current payload synchronously
+      (cheap string copies) and offloads the disk write to a background task.
+    * Markdown snapshots (one per turn) and a rolling ``latest.md`` for
+      quick inspection.
+    * A compact JSONL metrics log (``evolution.jsonl``) with token counts
+      and hashes, suitable for plotting context growth over time.
+    * Automatic pruning of old snapshots per project.
 
-    Writes are best-effort and fully decoupled from the request path: the
-    payload is captured synchronously (cheap string copies), the disk I/O runs
-    in a worker thread, and any failure is swallowed with a debug log. Nothing
-    here can break inlet/outlet.
+    Writes are best‑effort and fully decoupled from the request path: any
+    failure is swallowed with a debug log, so nothing here can break the
+    inlet or outlet.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -14543,7 +14872,7 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
-        # ── NEW: class membership metrics ──
+        # ── class membership metrics ──
         try:
             all_names = self._f._symbol_index.get_all_names(project_id)
             n_with_parent = sum(
@@ -14735,8 +15064,19 @@ class ContextDumper:
 # Valves
 # ---------------------------------------------------------------------------
 class Filter:
+    """OpenWebUI pipeline filter that implements the full CodeAware context
+    manager.  Owns all configuration valves, persistent state, long‑term
+    memory, and every subsystem class.
+
+    The ``inlet()`` and ``outlet()`` methods are the entry points called by
+    the OpenWebUI runtime at the start and end of each request.
+    """
 
     class Valves(BaseModel):
+        """Pydantic model holding every user‑facing configuration valve for
+        the filter, with descriptions, defaults, and constraints.
+        """
+
         # ═══════════════════════════════════════════════════════════════
         #  Context window budgets
         # ═══════════════════════════════════════════════════════════════
@@ -15807,6 +16147,20 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        """Pre‑process the request before the LLM sees it.
+
+        Orchestrates seven sequential steps:
+        1. Project‑switch detection, cache loading, and KV‑slot restore.
+        2. User‑info extraction (last message, question, explicit commands).
+        3. Explicit command dispatch (/forget, /status, /clean, /expand).
+        4. Natural‑language intent dispatch (forget, remember, obsolete).
+        5. Silent ingestion when the message is a large code‑only paste.
+        6. Session classification and active‑code update.
+        7. System‑prompt assembly (Block A + Block B) with CoT, compression,
+           multi‑phase, and adaptive trimming.
+
+        Returns the modified body with the final message list ready for the LLM.
+        """
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
@@ -16100,6 +16454,23 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        """Post‑process the response after the LLM has generated it.
+
+        Runs maintenance and persistence tasks that do not block the user:
+        * Updates active code blocks and stores the new message in LTM.
+        * Intercepts ``/expand`` commands in the assistant's response and
+          replaces them with real code from the SymbolIndex.
+        * Stores the response in the semantic cache for future reuse.
+        * Adjusts LOD thresholds adaptively based on which symbols the LLM
+          actually used.
+        * Runs speculative prefetch for the next likely query.
+        * Purges expired memories, rebuilds RAPTOR clusters periodically,
+          and runs SQLite + ChromaDB checkpoints.
+        * Persists the KV‑cache slot, symbol edges, path views, and dirty
+          conversation state.
+
+        Returns the (possibly modified) body unchanged.
+        """
         self._log_debug("outlet called")
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
