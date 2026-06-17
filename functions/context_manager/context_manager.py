@@ -106,105 +106,11 @@ _db_global_lock = threading.Lock()
 import fcntl
 import tempfile
 
-
 # ---------------------------------------------------------------------------
-# Models & Enums
+# Globals
 # ---------------------------------------------------------------------------
-class ContentType(str, Enum):
-    """Classification of a code block's role in the conversation."""
 
-    BASE_CODE = "base_code"  # Existing code provided by the user
-    PROPOSED_CHANGE = "proposed_change"  # Suggested modification (diff or snippet)
-    COMMITTED_CHANGE = "committed_change"  # Accepted / applied change
-    GENERAL = "general"  # Plain conversation text
-    TOOL_CALL = "tool_call"  # Structured tool / function call payload
-    ERROR = "error"  # Traceback or error message
-
-
-class CodeSymbol(BaseModel):
-    """A single function, method, or class extracted from source code."""
-
-    name: str
-    kind: str  # "function", "class", or "method"
-    signature: str
-    file_path: Optional[str] = None
-    line_start: Optional[int] = None
-    line_end: Optional[int] = None
-    parent_block_hash: str = ""  # Hash of the CodeBlock that owns this symbol
-    parent_symbol: str = ""  # Enclosing class name, or "" for top-level
-    language: str = "unknown"
-    calls: List[str] = Field(default_factory=list)  # Bare names called by this symbol
-    docstring: str = ""
-
-
-class CodeBlock(BaseModel):
-    """A chunk of code managed by the context system.
-
-    Every code block carries a content hash for deduplication, an importance
-    score that decays over time, and a list of ``CodeSymbol`` entries
-    extracted from its content.  The importance score is recalculated
-    whenever ``_update_importance()`` is called.
-    """
-
-    content: str
-    content_type: ContentType
-    file_path: Optional[str] = None
-    line_range: Optional[Tuple[int, int]] = None
-    timestamp: float = Field(default_factory=time.time)
-    is_active: bool = True
-    hash: str = ""
-    importance_score: float = 1.0
-    mention_count: int = 1
-    last_mentioned: float = Field(default_factory=time.time)
-    generated_by_assistant: bool = False
-    pinned: bool = False
-    obsolete: bool = False
-    is_raw: bool = False
-    block_summary: str = ""
-    symbols: List[CodeSymbol] = Field(default_factory=list)
-    _cached_token_count: int = 0
-    last_mentioned_msg_idx: Optional[int] = None
-
-    def __init__(self, **data):
-        super().__init__(**data)
-        if not self.hash:
-            self.hash = hashlib.md5(self.content.encode()).hexdigest()[:16]
-        self._update_importance()
-
-    def _update_importance(self):
-        """Recalculate the importance score from content type, keywords,
-        mention frequency, recency, and obsolete status."""
-        base_score = {
-            ContentType.BASE_CODE: 8.0,
-            ContentType.ERROR: 7.0,
-            ContentType.COMMITTED_CHANGE: 6.0,
-            ContentType.PROPOSED_CHANGE: 5.0,
-            ContentType.TOOL_CALL: 3.0,
-            ContentType.GENERAL: 2.0,
-        }.get(self.content_type, 2.0)
-        keyword_boost = (
-            2.0
-            if re.search(
-                r"\b(fix|bug|security|critical|important|todo)\b", self.content, re.I
-            )
-            else 0.0
-        )
-        if self.generated_by_assistant:
-            base_score *= 0.8
-        mention_boost = min(self.mention_count / 5, 3.0)
-        recency_factor = 0.5 ** ((time.time() - self.last_mentioned) / 3600)
-        penalty = 1.0
-        if self.obsolete:
-            penalty = 0.1
-            self.is_active = False
-        self.importance_score = (
-            (base_score + keyword_boost) * mention_boost * recency_factor * penalty
-        )
-
-
-# ---------------------------------------------------------------------------
 # Edge types and base weights
-# ---------------------------------------------------------------------------
 EDGE_WEIGHTS: Dict[str, float] = {
     "calls": 1.0,  # A function/method calls another
     "imports": 0.6,  # Module-level import relationship
@@ -215,366 +121,23 @@ EDGE_WEIGHTS: Dict[str, float] = {
     "data_flow": 0.8,  # Data passes from a producer to a consumer via arguments
 }
 
+# CrossEncoder singleton (module‑level)
+_CROSS_ENCODER = None
+_CROSS_ENCODER_LOCK = threading.Lock()
 
-class Edge(BaseModel):
-    """A directed relationship between two symbols in the call graph.
-
-    The source (``src``) is always a qualified symbol id
-    (``ClassName.method`` or ``module.function``).  The destination
-    (``dst``) is a bare name — resolving it to a concrete class would
-    require type inference, which is outside the scope of a static pass.
-    Downstream components handle this by fanning out to every qualified
-    symbol that shares the bare callee name.
-    """
-
-    src: str
-    dst: str
-    type: str
-    weight: float = 1.0  # Base importance of this edge type
-    confidence: float = 1.0  # 1.0 = confirmed, < 1.0 = inferred / provisional
-
-    def effective_weight(self) -> float:
-        """Effective weight used in activation propagation (PPR)."""
-        return self.weight * self.confidence
-
-
-# ---------------------------------------------------------------------------
-# Qualified symbol identity helper (v9)
-# ---------------------------------------------------------------------------
-def qualify_symbol_name(
-    name: str, parent_symbol: str, file_path: Optional[str] = None
-) -> str:
-    """
-    Unique-within-project identity for a symbol.
-
-    - Class-scoped symbols: 'ClassName.method'
-    - Module-level functions: 'module.function' (derived from file_path)
-    - Fallback: bare name when neither parent nor file_path is available
-
-    This is the central fix for the docstring / call-graph collision bug:
-    same-named methods in different classes, and same-named functions in
-    different files, are now stored under distinct qualified ids so they
-    never stomp on or fuse with each other.
-    """
-    if parent_symbol:
-        return f"{parent_symbol}.{name}"
-    if file_path:
-        module = os.path.splitext(os.path.basename(file_path))[0]
-        if module and module != name:
-            return f"{module}.{name}"
-    return name
-
-
-# ---------------------------------------------------------------------------
-# Activation Graph — query‑conditioned node activation
-# ---------------------------------------------------------------------------
-class ActivationState(BaseModel):
-    """Snapshot of a single node's activation during PPR propagation."""
-
-    node_id: str
-    score: float
-    depth: int
-    source: str
-
-
-class ActivationGraph:
-    """Personalised PageRank (PPR) engine for the symbol call graph.
-
-    Seeds are set from user-query terms, tracebacks, and recent history.
-    ``propagate()`` runs the PPR power iteration over the directed edges
-    stored in ``SymbolIndex``, spreading activation to related symbols.
-    The resulting scores determine the LOD tiers in Block B.
-    """
-
-    DECAY_BASE: float = 0.7
-
-    def __init__(self):
-        self._activations: Dict[str, ActivationState] = {}
-
-    def seed(self, node_ids: List[str], initial_score: float = 1.0):
-        """Insert activation seeds.  Called once before ``propagate()``."""
-        for nid in node_ids:
-            self._activations[nid] = ActivationState(
-                node_id=nid,
-                score=initial_score,
-                depth=0,
-                source="seed",
-            )
-
-    def propagate(
-        self,
-        edges_out: Dict[str, List[Edge]],
-        max_steps: int = 20,
-        min_score: float = 0.05,
-        alpha: float = 0.85,
-        tolerance: float = 1e-6,
-    ):
-        """Run the PPR power iteration until convergence or ``max_steps``."""
-        if not self._activations:
-            return
-        seed_total = sum(
-            s.score for s in self._activations.values() if s.source == "seed"
-        )
-        if seed_total == 0:
-            return
-        personalization: Dict[str, float] = {
-            nid: s.score / seed_total
-            for nid, s in self._activations.items()
-            if s.source == "seed"
-        }
-        out_weight_total: Dict[str, float] = {}
-        for src, edges in edges_out.items():
-            total_w = sum(e.effective_weight() for e in edges)
-            out_weight_total[src] = total_w if total_w > 0 else 1.0
-        r: Dict[str, float] = dict(personalization)
-        for iteration in range(max_steps):
-            r_new: Dict[str, float] = {}
-            for node, score in personalization.items():
-                r_new[node] = (1.0 - alpha) * score
-            for src, edges in edges_out.items():
-                src_score = r.get(src, 0.0)
-                if src_score < min_score:
-                    continue
-                out_w = out_weight_total.get(src, 1.0)
-                for edge in edges:
-                    contribution = alpha * src_score * edge.effective_weight() / out_w
-                    r_new[edge.dst] = r_new.get(edge.dst, 0.0) + contribution
-            all_keys = set(r.keys()) | set(r_new.keys())
-            delta = sum(abs(r_new.get(k, 0.0) - r.get(k, 0.0)) for k in all_keys)
-            r = r_new
-            if delta < tolerance:
-                break
-        for node_id, score in r.items():
-            if score < min_score:
-                continue
-            existing = self._activations.get(node_id)
-            self._activations[node_id] = ActivationState(
-                node_id=node_id,
-                score=score,
-                depth=existing.depth if existing else 99,
-                source=existing.source if existing else "propagation",
-            )
-
-    def get_score(self, node_id: str) -> float:
-        """Return the final activation score of a node (0.0 if not activated)."""
-        state = self._activations.get(node_id)
-        return state.score if state else 0.0
-
-    def get_activated_nodes(self, threshold: float = 0.1) -> Dict[str, float]:
-        """Return {node_id: score} for nodes whose score >= threshold."""
-        return {
-            nid: s.score for nid, s in self._activations.items() if s.score >= threshold
-        }
-
-    def aggregate_path_score(self, symbol_list: List[str]) -> float:
-        """Mean activation score of a list of symbols (ignoring inactive ones)."""
-        scores = [self.get_score(s) for s in symbol_list]
-        active = [s for s in scores if s > 0]
-        if not active:
-            return 0.0
-        return sum(active) / len(active)
-
-
-# ---------------------------------------------------------------------------
-# Query model and SubgraphExtractor skeleton
-# ---------------------------------------------------------------------------
-class SubgraphExtractor:
-    """Extract a connected subgraph induced by activated nodes.
-
-    Takes an ``ActivationGraph`` and the full edge set, then returns
-    the subset of nodes that are activated (above threshold) and the
-    edges among them.  Optionally expands the subgraph by one hop along
-    high-confidence ``calls`` edges.
-    """
-
-    def __init__(self, activation_threshold: float = 0.1, expand_hops: int = 1):
-        self.activation_threshold = activation_threshold
-        self.expand_hops = expand_hops
-
-    def extract(
-        self,
-        activation: ActivationGraph,
-        edges_out: Dict[str, List[Edge]],
-        edges_in: Dict[str, List[Edge]],
-    ) -> Tuple[Set[str], List[Edge]]:
-        """Return (activated_nodes, edges_among_them) after optional expansion."""
-        activated = activation.get_activated_nodes(self.activation_threshold)
-        included_nodes: Set[str] = set(activated.keys())
-        if self.expand_hops > 0:
-            expansion_candidates = []
-            for node_id in list(included_nodes):
-                for edge in edges_out.get(node_id, []):
-                    if (
-                        edge.dst not in included_nodes
-                        and edge.effective_weight() >= 0.8
-                        and edge.type == "calls"
-                    ):
-                        expansion_candidates.append(edge.dst)
-            included_nodes.update(expansion_candidates)
-        included_edges: List[Edge] = []
-        for node_id in included_nodes:
-            for edge in edges_out.get(node_id, []):
-                if edge.dst in included_nodes:
-                    included_edges.append(edge)
-        return included_nodes, included_edges
-
-
-# ---------------------------------------------------------------------------
-# CodePathView — a cached projection of an activated subgraph
-# ---------------------------------------------------------------------------
-class CodePathView(BaseModel):
-    """A cached snapshot of an activated subgraph, used for speculative
-    prefetch and path tracking.  Holds the induced nodes (with scores),
-    edges, and structural hashes so staleness can be detected cheaply."""
-
-    path_id: str
-    entry_point: str
-    seed_nodes: List[str]
-    induced_nodes: Dict[str, float]  # node_id → activation score
-    induced_edges: List[Edge]
-    activation_score: float
-    business_label: str = ""
-    summary: str = ""
-    label_confidence: float = 0.0
-    structural_hash: str = ""  # Hash of block content for induced nodes
-    call_graph_hash: str = ""  # Hash of call relationships among them
-    last_built: float = Field(default_factory=time.time)
-
-    def is_stale(self, current_structural: str, current_call_graph: str) -> bool:
-        """True if the code or call graph has changed since this view was built."""
-        return (
-            self.structural_hash != current_structural
-            or self.call_graph_hash != current_call_graph
-        )
-
-    def top_symbols(self, n: int = 10) -> List[str]:
-        """Return the *n* symbols with the highest activation score in this view."""
-        return sorted(
-            self.induced_nodes.keys(),
-            key=lambda s: self.induced_nodes[s],
-            reverse=True,
-        )[:n]
-
-
-# ---------------------------------------------------------------------------
-# StaticEvidence – deterministic proof from the SymbolGraph
-# ---------------------------------------------------------------------------
-class StaticEvidence(BaseModel):
-    """Deterministic evidence gathered from the SymbolGraph to validate a
-    hypothesis during scientific Chain‑of‑Thought reasoning.
-
-    All fields are derived without an LLM call — they come directly from the
-    SymbolIndex, active blocks, and path index.  ``objective_score`` is the
-    fraction of verifiable claims that hold true."""
-
-    symbols_found: Dict[str, bool]  # Is each mentioned symbol in the index?
-    call_relations_valid: Dict[str, bool]  # Are claimed call edges actually present?
-    recent_changes: List[str]  # Mentioned symbols changed in the last hour
-    entry_points_mentioned: List[str]  # Entry points referenced in the hypothesis
-    path_memberships: Dict[str, List[str]]  # Path views each symbol belongs to
-    data_flow_upstream: Dict[str, List[str]] = Field(default_factory=dict)
-    objective_score: float  # Fraction of verifiable claims that hold
-
-
-# ---------------------------------------------------------------------------
-# PathIndex — index of CodePathViews
-# ---------------------------------------------------------------------------
-class PathIndex:
-    """Lightweight in‑memory index of ``CodePathView`` objects, organised by
-    project and symbol.  Used for speculative prefetch, staleness detection,
-    and entry‑point discovery.
-    """
-
-    def __init__(self):
-        self._views: Dict[str, CodePathView] = {}
-        self._symbol_to_views: Dict[str, Set[str]] = defaultdict(set)
-
-    def add(self, view: CodePathView, project_id: str):
-        """Register a view and cross‑reference all its induced symbols."""
-        key = f"{project_id}:{view.path_id}"
-        self._views[key] = view
-        for sym_name in view.induced_nodes:
-            self._symbol_to_views[f"{project_id}:{sym_name}"].add(view.path_id)
-
-    def remove(self, path_id: str, project_id: str):
-        """Remove a view and its symbol cross‑references."""
-        key = f"{project_id}:{path_id}"
-        view = self._views.pop(key, None)
-        if view:
-            for sym_name in view.induced_nodes:
-                sym_key = f"{project_id}:{sym_name}"
-                self._symbol_to_views[sym_key].discard(path_id)
-
-    def get(self, path_id: str, project_id: str) -> Optional[CodePathView]:
-        """Return a single view by path_id, or None."""
-        return self._views.get(f"{project_id}:{path_id}")
-
-    def get_all(self, project_id: str) -> List[CodePathView]:
-        """All views for a project (order undefined)."""
-        prefix = f"{project_id}:"
-        return [v for k, v in self._views.items() if k.startswith(prefix)]
-
-    def clear_project(self, project_id: str):
-        """Drop every view and cross‑reference for a project."""
-        prefix = f"{project_id}:"
-        keys = [k for k in self._views if k.startswith(prefix)]
-        for k in keys:
-            del self._views[k]
-        sym_keys = [k for k in self._symbol_to_views if k.startswith(prefix)]
-        for k in sym_keys:
-            del self._symbol_to_views[k]
-
-    def mark_stale_for_symbol(self, symbol_name: str, project_id: str) -> List[str]:
-        """Return path_ids that reference a given symbol (to invalidate them later)."""
-        key = f"{project_id}:{symbol_name}"
-        return list(self._symbol_to_views.get(key, set()))
-
-    def find_entry_points(
-        self, symbol_index: "SymbolIndex", project_id: str
-    ) -> Set[str]:
-        """Symbols with no known caller — used as activation seeds when a
-        query matches nothing in the index.  Operates on QUALIFIED ids so
-        that, for example, a class's only method that is called exclusively
-        from outside is not confused with another class's same-named method
-        that DOES have registered callers."""
-        all_qids = symbol_index.get_all_qualified_names(project_id)
-        result = set()
-        for qid in all_qids:
-            meta = symbol_index.get_symbol_meta(qid, project_id) or {}
-            bare = meta.get("name", qid.rsplit(".", 1)[-1])
-            if not symbol_index.get_callers(bare, project_id):
-                result.add(qid)
-        return result
-
-
-# ---------------------------------------------------------------------------
-# AppliedChangeFeedback
-# ---------------------------------------------------------------------------
-class AppliedChangeFeedback(BaseModel):
-    """Feedback record for a change that was applied (or rejected) by the user.
-
-    Kept in the conversation state so the system can learn from past changes
-    and surface context in Block A when ``inject_feedback_context`` is enabled.
-    """
-
-    change_hash: str
-    change_description: str
-    file_path: Optional[str] = None
-    timestamp: float = Field(default_factory=time.time)
-    success: bool = True
-    user_comment: str = ""
-    resolved: bool = False
-
+# Global lock for SQLite operations (prevents "database is locked" errors)
+_db_global_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Tree‑sitter fallback queries
 # ---------------------------------------------------------------------------
-# These S-expression patterns tell tree-sitter how to locate function / class
+# These S‑expression patterns tell tree‑sitter how to locate function / class
 # definitions and call sites for each supported programming language.
 # They are used by _extract_symbols_from_tree and _extract_calls_from_tree,
 # which together produce the qualified CodeSymbol list and the call graph.
 # If a language is missing from these maps, extraction is skipped with a
 # warning — there is no legacy fallback that could inject unqualified data.
+
 FALLBACK_LANGUAGE_QUERIES = {
     "python": """
         (function_definition name: (identifier) @name) @func
@@ -683,12 +246,649 @@ FALLBACK_CALL_QUERIES = {
 }
 
 # ---------------------------------------------------------------------------
+# Global helper functions
+# ---------------------------------------------------------------------------
+
+
+def qualify_symbol_name(
+    name: str, parent_symbol: str, file_path: Optional[str] = None
+) -> str:
+    """
+    Unique-within-project identity for a symbol.
+
+    - Class-scoped symbols: 'ClassName.method'
+    - Module-level functions: 'module.function' (derived from file_path)
+    - Fallback: bare name when neither parent nor file_path is available
+
+    This is the central fix for the docstring / call-graph collision bug:
+    same-named methods in different classes, and same-named functions in
+    different files, are now stored under distinct qualified ids so they
+    never stomp on or fuse with each other.
+    """
+    if parent_symbol:
+        return f"{parent_symbol}.{name}"
+    if file_path:
+        module = os.path.splitext(os.path.basename(file_path))[0]
+        if module and module != name:
+            return f"{module}.{name}"
+    return name
+
+
+def _get_cross_encoder(
+    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+) -> Optional[Any]:
+    """
+    Return the CrossEncoder singleton, loading it once. Thread‑safe.
+
+    Used by `CommandRouter._predict_cross_encoder()` and other intent‑
+    classification / reranking paths.  Returns None if the model cannot
+    be loaded or `sentence_transformers` is not available.
+    """
+    global _CROSS_ENCODER
+    if _CROSS_ENCODER is None:
+        with _CROSS_ENCODER_LOCK:
+            if _CROSS_ENCODER is None:
+                try:
+                    from sentence_transformers import CrossEncoder
+
+                    _CROSS_ENCODER = CrossEncoder(model_name)
+                except Exception:
+                    return None
+    return _CROSS_ENCODER
+
+
+# ---------------------------------------------------------------------------
+# Models & Enums
+# ---------------------------------------------------------------------------
+class ContentType(str, Enum):
+    """Classification of a code block's role in the conversation."""
+
+    BASE_CODE = "base_code"  # Existing code provided by the user
+    PROPOSED_CHANGE = "proposed_change"  # Suggested modification (diff or snippet)
+    COMMITTED_CHANGE = "committed_change"  # Accepted / applied change
+    GENERAL = "general"  # Plain conversation text
+    TOOL_CALL = "tool_call"  # Structured tool / function call payload
+    ERROR = "error"  # Traceback or error message
+
+
+class CodeSymbol(BaseModel):
+    """A single function, method, or class extracted from source code."""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Symbol identity
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    name: str
+    kind: str  # "function", "class", or "method"
+    signature: str
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Location in source
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    file_path: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Relationships & context
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    parent_block_hash: str = ""  # Hash of the CodeBlock that owns this symbol
+    parent_symbol: str = ""  # Enclosing class name, or "" for top-level
+    language: str = "unknown"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Additional metadata (calls, docstring)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    calls: List[str] = Field(default_factory=list)  # Bare names called by this symbol
+    docstring: str = ""
+
+
+class CodeBlock(BaseModel):
+    """A chunk of code managed by the context system.
+
+    Every code block carries a content hash for deduplication, an importance
+    score that decays over time, and a list of ``CodeSymbol`` entries
+    extracted from its content.  The importance score is recalculated
+    whenever ``_update_importance()`` is called.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Core content & identity
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    content: str
+    content_type: ContentType
+    hash: str = ""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Location & timing
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    file_path: Optional[str] = None
+    line_range: Optional[Tuple[int, int]] = None
+    timestamp: float = Field(default_factory=time.time)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. State flags
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    is_active: bool = True
+    generated_by_assistant: bool = False
+    pinned: bool = False
+    obsolete: bool = False
+    is_raw: bool = False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Importance & recency
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    importance_score: float = 1.0
+    mention_count: int = 1
+    last_mentioned: float = Field(default_factory=time.time)
+    last_mentioned_msg_idx: Optional[int] = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Extracted symbols & summary
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    block_summary: str = ""
+    symbols: List[CodeSymbol] = Field(default_factory=list)
+    _cached_token_count: int = 0
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 6. Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if not self.hash:
+            self.hash = hashlib.md5(self.content.encode()).hexdigest()[:16]
+        self._update_importance()
+
+    def _update_importance(self):
+        """Recalculate the importance score from content type, keywords,
+        mention frequency, recency, and obsolete status."""
+        base_score = {
+            ContentType.BASE_CODE: 8.0,
+            ContentType.ERROR: 7.0,
+            ContentType.COMMITTED_CHANGE: 6.0,
+            ContentType.PROPOSED_CHANGE: 5.0,
+            ContentType.TOOL_CALL: 3.0,
+            ContentType.GENERAL: 2.0,
+        }.get(self.content_type, 2.0)
+        keyword_boost = (
+            2.0
+            if re.search(
+                r"\b(fix|bug|security|critical|important|todo)\b", self.content, re.I
+            )
+            else 0.0
+        )
+        if self.generated_by_assistant:
+            base_score *= 0.8
+        mention_boost = min(self.mention_count / 5, 3.0)
+        recency_factor = 0.5 ** ((time.time() - self.last_mentioned) / 3600)
+        penalty = 1.0
+        if self.obsolete:
+            penalty = 0.1
+            self.is_active = False
+        self.importance_score = (
+            (base_score + keyword_boost) * mention_boost * recency_factor * penalty
+        )
+
+
+class Edge(BaseModel):
+    """A directed relationship between two symbols in the call graph.
+
+    The source (``src``) is always a qualified symbol id
+    (``ClassName.method`` or ``module.function``).  The destination
+    (``dst``) is a bare name — resolving it to a concrete class would
+    require type inference, which is outside the scope of a static pass.
+    Downstream components handle this by fanning out to every qualified
+    symbol that shares the bare callee name.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Source & destination (identity)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    src: str
+    dst: str
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Edge type & weight
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    type: str
+    weight: float = 1.0  # Base importance of this edge type
+    confidence: float = 1.0  # 1.0 = confirmed, < 1.0 = inferred / provisional
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def effective_weight(self) -> float:
+        """Effective weight used in activation propagation (PPR)."""
+        return self.weight * self.confidence
+
+
+# ---------------------------------------------------------------------------
+# Activation Graph — query‑conditioned node activation
+# ---------------------------------------------------------------------------
+class ActivationState(BaseModel):
+    """Snapshot of a single node's activation during PPR propagation."""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Node identity
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    node_id: str
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Activation score
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    score: float
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Propagation metadata
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    depth: int
+    source: str
+
+
+class ActivationGraph:
+    """Personalised PageRank (PPR) engine for the symbol call graph.
+
+    Seeds are set from user-query terms, tracebacks, and recent history.
+    ``propagate()`` runs the PPR power iteration over the directed edges
+    stored in ``SymbolIndex``, spreading activation to related symbols.
+    The resulting scores determine the LOD tiers in Block B.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Constants & initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    DECAY_BASE: float = 0.7
+
+    def __init__(self):
+        self._activations: Dict[str, ActivationState] = {}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Seed activation
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def seed(self, node_ids: List[str], initial_score: float = 1.0):
+        """Insert activation seeds.  Called once before ``propagate()``."""
+        for nid in node_ids:
+            self._activations[nid] = ActivationState(
+                node_id=nid,
+                score=initial_score,
+                depth=0,
+                source="seed",
+            )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. PPR propagation
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def propagate(
+        self,
+        edges_out: Dict[str, List[Edge]],
+        max_steps: int = 20,
+        min_score: float = 0.05,
+        alpha: float = 0.85,
+        tolerance: float = 1e-6,
+    ):
+        """Run the PPR power iteration until convergence or ``max_steps``."""
+        if not self._activations:
+            return
+        seed_total = sum(
+            s.score for s in self._activations.values() if s.source == "seed"
+        )
+        if seed_total == 0:
+            return
+        personalization: Dict[str, float] = {
+            nid: s.score / seed_total
+            for nid, s in self._activations.items()
+            if s.source == "seed"
+        }
+        out_weight_total: Dict[str, float] = {}
+        for src, edges in edges_out.items():
+            total_w = sum(e.effective_weight() for e in edges)
+            out_weight_total[src] = total_w if total_w > 0 else 1.0
+        r: Dict[str, float] = dict(personalization)
+        for iteration in range(max_steps):
+            r_new: Dict[str, float] = {}
+            for node, score in personalization.items():
+                r_new[node] = (1.0 - alpha) * score
+            for src, edges in edges_out.items():
+                src_score = r.get(src, 0.0)
+                if src_score < min_score:
+                    continue
+                out_w = out_weight_total.get(src, 1.0)
+                for edge in edges:
+                    contribution = alpha * src_score * edge.effective_weight() / out_w
+                    r_new[edge.dst] = r_new.get(edge.dst, 0.0) + contribution
+            all_keys = set(r.keys()) | set(r_new.keys())
+            delta = sum(abs(r_new.get(k, 0.0) - r.get(k, 0.0)) for k in all_keys)
+            r = r_new
+            if delta < tolerance:
+                break
+        for node_id, score in r.items():
+            if score < min_score:
+                continue
+            existing = self._activations.get(node_id)
+            self._activations[node_id] = ActivationState(
+                node_id=node_id,
+                score=score,
+                depth=existing.depth if existing else 99,
+                source=existing.source if existing else "propagation",
+            )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Query methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_score(self, node_id: str) -> float:
+        """Return the final activation score of a node (0.0 if not activated)."""
+        state = self._activations.get(node_id)
+        return state.score if state else 0.0
+
+    def get_activated_nodes(self, threshold: float = 0.1) -> Dict[str, float]:
+        """Return {node_id: score} for nodes whose score >= threshold."""
+        return {
+            nid: s.score for nid, s in self._activations.items() if s.score >= threshold
+        }
+
+    def aggregate_path_score(self, symbol_list: List[str]) -> float:
+        """Mean activation score of a list of symbols (ignoring inactive ones)."""
+        scores = [self.get_score(s) for s in symbol_list]
+        active = [s for s in scores if s > 0]
+        if not active:
+            return 0.0
+        return sum(active) / len(active)
+
+
+# ---------------------------------------------------------------------------
+# Query model and SubgraphExtractor skeleton
+# ---------------------------------------------------------------------------
+class SubgraphExtractor:
+    """Extract a connected subgraph induced by activated nodes.
+
+    Takes an ``ActivationGraph`` and the full edge set, then returns
+    the subset of nodes that are activated (above threshold) and the
+    edges among them.  Optionally expands the subgraph by one hop along
+    high-confidence ``calls`` edges.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def __init__(self, activation_threshold: float = 0.1, expand_hops: int = 1):
+        self.activation_threshold = activation_threshold
+        self.expand_hops = expand_hops
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Extraction
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def extract(
+        self,
+        activation: ActivationGraph,
+        edges_out: Dict[str, List[Edge]],
+        edges_in: Dict[str, List[Edge]],
+    ) -> Tuple[Set[str], List[Edge]]:
+        """Return (activated_nodes, edges_among_them) after optional expansion."""
+        activated = activation.get_activated_nodes(self.activation_threshold)
+        included_nodes: Set[str] = set(activated.keys())
+        if self.expand_hops > 0:
+            expansion_candidates = []
+            for node_id in list(included_nodes):
+                for edge in edges_out.get(node_id, []):
+                    if (
+                        edge.dst not in included_nodes
+                        and edge.effective_weight() >= 0.8
+                        and edge.type == "calls"
+                    ):
+                        expansion_candidates.append(edge.dst)
+            included_nodes.update(expansion_candidates)
+        included_edges: List[Edge] = []
+        for node_id in included_nodes:
+            for edge in edges_out.get(node_id, []):
+                if edge.dst in included_nodes:
+                    included_edges.append(edge)
+        return included_nodes, included_edges
+
+
+# ---------------------------------------------------------------------------
+# CodePathView — a cached projection of an activated subgraph
+# ---------------------------------------------------------------------------
+class CodePathView(BaseModel):
+    """A cached snapshot of an activated subgraph, used for speculative
+    prefetch and path tracking.  Holds the induced nodes (with scores),
+    edges, and structural hashes so staleness can be detected cheaply."""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Core identity & structural hashes
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    path_id: str
+    entry_point: str
+    seed_nodes: List[str]
+
+    structural_hash: str = ""  # Hash of block content for induced nodes
+    call_graph_hash: str = ""  # Hash of call relationships among them
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Induced subgraph data
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    induced_nodes: Dict[str, float]  # node_id → activation score
+    induced_edges: List[Edge]
+    activation_score: float
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Business metadata (LLM-generated labels)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    business_label: str = ""
+    summary: str = ""
+    label_confidence: float = 0.0
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Timestamp
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    last_built: float = Field(default_factory=time.time)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def is_stale(self, current_structural: str, current_call_graph: str) -> bool:
+        """True if the code or call graph has changed since this view was built."""
+        return (
+            self.structural_hash != current_structural
+            or self.call_graph_hash != current_call_graph
+        )
+
+    def top_symbols(self, n: int = 10) -> List[str]:
+        """Return the *n* symbols with the highest activation score in this view."""
+        return sorted(
+            self.induced_nodes.keys(),
+            key=lambda s: self.induced_nodes[s],
+            reverse=True,
+        )[:n]
+
+
+# ---------------------------------------------------------------------------
+# StaticEvidence – deterministic proof from the SymbolGraph
+# ---------------------------------------------------------------------------
+class StaticEvidence(BaseModel):
+    """Deterministic evidence gathered from the SymbolGraph to validate a
+    hypothesis during scientific Chain‑of‑Thought reasoning.
+
+    All fields are derived without an LLM call — they come directly from the
+    SymbolIndex, active blocks, and path index.  ``objective_score`` is the
+    fraction of verifiable claims that hold true."""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Symbol evidence & call relations
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    symbols_found: Dict[str, bool]  # Is each mentioned symbol in the index?
+    call_relations_valid: Dict[str, bool]  # Are claimed call edges actually present?
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Recent changes & entry points
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    recent_changes: List[str]  # Mentioned symbols changed in the last hour
+    entry_points_mentioned: List[str]  # Entry points referenced in the hypothesis
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Path memberships & data flow
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    path_memberships: Dict[str, List[str]]  # Path views each symbol belongs to
+    data_flow_upstream: Dict[str, List[str]] = Field(default_factory=dict)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Objective score
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    objective_score: float  # Fraction of verifiable claims that hold
+
+
+# ---------------------------------------------------------------------------
+# PathIndex — index of CodePathViews
+# ---------------------------------------------------------------------------
+class PathIndex:
+    """Lightweight in‑memory index of ``CodePathView`` objects, organised by
+    project and symbol.  Used for speculative prefetch, staleness detection,
+    and entry‑point discovery.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def __init__(self):
+        self._views: Dict[str, CodePathView] = {}
+        self._symbol_to_views: Dict[str, Set[str]] = defaultdict(set)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. View management (add, remove, get)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def add(self, view: CodePathView, project_id: str):
+        """Register a view and cross‑reference all its induced symbols."""
+        key = f"{project_id}:{view.path_id}"
+        self._views[key] = view
+        for sym_name in view.induced_nodes:
+            self._symbol_to_views[f"{project_id}:{sym_name}"].add(view.path_id)
+
+    def remove(self, path_id: str, project_id: str):
+        """Remove a view and its symbol cross‑references."""
+        key = f"{project_id}:{path_id}"
+        view = self._views.pop(key, None)
+        if view:
+            for sym_name in view.induced_nodes:
+                sym_key = f"{project_id}:{sym_name}"
+                self._symbol_to_views[sym_key].discard(path_id)
+
+    def get(self, path_id: str, project_id: str) -> Optional[CodePathView]:
+        """Return a single view by path_id, or None."""
+        return self._views.get(f"{project_id}:{path_id}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Project-level queries & cleanup
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_all(self, project_id: str) -> List[CodePathView]:
+        """All views for a project (order undefined)."""
+        prefix = f"{project_id}:"
+        return [v for k, v in self._views.items() if k.startswith(prefix)]
+
+    def clear_project(self, project_id: str):
+        """Drop every view and cross‑reference for a project."""
+        prefix = f"{project_id}:"
+        keys = [k for k in self._views if k.startswith(prefix)]
+        for k in keys:
+            del self._views[k]
+        sym_keys = [k for k in self._symbol_to_views if k.startswith(prefix)]
+        for k in sym_keys:
+            del self._symbol_to_views[k]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Symbol-level queries
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def mark_stale_for_symbol(self, symbol_name: str, project_id: str) -> List[str]:
+        """Return path_ids that reference a given symbol (to invalidate them later)."""
+        key = f"{project_id}:{symbol_name}"
+        return list(self._symbol_to_views.get(key, set()))
+
+    def find_entry_points(
+        self, symbol_index: "SymbolIndex", project_id: str
+    ) -> Set[str]:
+        """Symbols with no known caller — used as activation seeds when a
+        query matches nothing in the index.  Operates on QUALIFIED ids so
+        that, for example, a class's only method that is called exclusively
+        from outside is not confused with another class's same-named method
+        that DOES have registered callers."""
+        all_qids = symbol_index.get_all_qualified_names(project_id)
+        result = set()
+        for qid in all_qids:
+            meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+            bare = meta.get("name", qid.rsplit(".", 1)[-1])
+            if not symbol_index.get_callers(bare, project_id):
+                result.add(qid)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# AppliedChangeFeedback
+# ---------------------------------------------------------------------------
+class AppliedChangeFeedback(BaseModel):
+    """Feedback record for a change that was applied (or rejected) by the user.
+
+    Kept in the conversation state so the system can learn from past changes
+    and surface context in Block A when ``inject_feedback_context`` is enabled.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Change identity & description
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    change_hash: str
+    change_description: str
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Location
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    file_path: Optional[str] = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Status & metadata (original order: timestamp, success, user_comment, resolved)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    timestamp: float = Field(default_factory=time.time)
+    success: bool = True
+    user_comment: str = ""
+    resolved: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Reranker singleton factory (module level)
 # ---------------------------------------------------------------------------
-_CROSS_ENCODER = None
-_CROSS_ENCODER_LOCK = threading.Lock()
-
-
 def _get_cross_encoder(
     model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
 ) -> Optional[Any]:
@@ -718,7 +918,9 @@ class HubSymbolIndex:
     bidirectional view of who calls them and whom they call.
     """
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Public API
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def get_hub_names(self, centrality: dict, top_n: int) -> list:
         """Return symbol ids sorted by descending centrality, capped at *top_n*.
@@ -765,7 +967,9 @@ class HubSymbolIndex:
 
         return "\n\n".join(s for s in sections if s.strip())
 
-    # ── Class / function outline (NEW) ────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Class / function outline (Architecture Map)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_class_outline(self, symbol_index, project_id, valves=None) -> str:
         """Render the ``## Code Architecture Map`` section: one line per class
@@ -842,7 +1046,9 @@ class HubSymbolIndex:
             return ""
         return "\n".join(lines)
 
-    # ── Hub symbols with bidirectional call graph ────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Hub symbols with bidirectional call graph
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_hub_section(
         self, hub_qids, centrality, symbol_index, project_id, enable_callees=True
@@ -890,7 +1096,9 @@ class HubSymbolIndex:
         )
         return "\n".join(lines)
 
-    # ── Private helpers ───────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Private helpers
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _file_for(self, qid, project_id, symbol_index):
         """Resolve a symbol's file path from the SymbolIndex, or None."""
@@ -957,6 +1165,10 @@ class ContextPager:
     Manages CodeBlock lifecycle between active_blocks (RAM) and ChromaDB (paged).
     """
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization & state management
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def __init__(self, filter_ref: "Filter") -> None:
         # Back-reference to the parent Filter. Only purge_old_versions() needs
         # it (for valves + logging); the page-in/page-out paths are self-
@@ -966,7 +1178,17 @@ class ContextPager:
         # project_id → set of block hashes currently paged out.
         self._paged_hashes: dict = {}
 
-    # ── Eviction candidate selection ──────────────────────────────────────
+    def is_paged(self, block_hash: str, project_id: str) -> bool:
+        """True if block_hash has been paged out to ChromaDB for this project."""
+        return block_hash in self._paged_hashes.get(project_id, set())
+
+    def clear_project(self, project_id: str) -> None:
+        """Drop the in-memory paged registry for a project (on project switch)."""
+        self._paged_hashes.pop(project_id, None)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Eviction candidate selection & page-out
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def get_eviction_candidates(
         self,
@@ -1026,12 +1248,6 @@ class ContextPager:
             pass
 
         return selected
-
-    def is_paged(self, block_hash: str, project_id: str) -> bool:
-        """True if block_hash has been paged out to ChromaDB for this project."""
-        return block_hash in self._paged_hashes.get(project_id, set())
-
-    # ── Page out (active_blocks → ChromaDB) ───────────────────────────────
 
     async def page_out_block(
         self,
@@ -1113,6 +1329,10 @@ class ContextPager:
             # Best effort; the block content is still in SQLite
             pass
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Purge old versions (per-file version limit)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def purge_old_versions(
         self,
         project_id: str,
@@ -1166,7 +1386,9 @@ class ContextPager:
             )
         return purged
 
-    # ── Page in (ChromaDB → temporary CodeBlock) ──────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Page-in (temporary reconstruction from ChromaDB)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def page_in_block(
         self,
@@ -1191,7 +1413,7 @@ class ContextPager:
 
         Returns None if the block cannot be reconstructed from either source.
         """
-        if not self.is_paged(block_hash, project_id):
+        if not this.is_paged(block_hash, project_id):
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
@@ -1268,12 +1490,6 @@ class ContextPager:
         for s in block.symbols:
             s.parent_block_hash = block_hash
         return block
-
-    # ── Cleanup ───────────────────────────────────────────────────────────
-
-    def clear_project(self, project_id: str) -> None:
-        """Drop the in-memory paged registry for a project (on project switch)."""
-        self._paged_hashes.pop(project_id, None)
 
 
 class RaptorCodeIndex:
@@ -3822,6 +4038,10 @@ class ContextBuilder:
 class ReentrantAsyncLock:
     """Reentrant asyncio lock with optional timeout to prevent deadlocks."""
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def __init__(self, default_timeout: float = 60.0) -> None:
         """*default_timeout* applies to every ``acquire()`` call that doesn't
         specify its own timeout."""
@@ -3829,6 +4049,10 @@ class ReentrantAsyncLock:
         self._owner: Optional[asyncio.Task] = None
         self._count = 0
         self._default_timeout = default_timeout
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Core synchronization methods
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def acquire(self, timeout: Optional[float] = None) -> None:
         """Acquire the lock, reentrantly if already held by the current task.
@@ -3855,6 +4079,10 @@ class ReentrantAsyncLock:
         if self._count == 0:
             self._owner = None
             self._lock.release()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Async context manager support
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -4997,7 +5225,10 @@ class StateStore:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
-    # ── State access ──────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. State access & persistence
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def get_state(self, project_id: str) -> dict:
         """Return the conversation state for the given project, loading from DB if needed."""
         if project_id in self._f._conversation_state:
@@ -5114,7 +5345,10 @@ class StateStore:
 
         await self._db_enqueue(_write)
 
-    # ── DB lifecycle ──────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Database lifecycle (init, load, rebuild)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def init_db(self) -> None:
         """Create tables and indexes (idempotent)."""
         db_path = self._f.valves.state_db_path
@@ -5385,6 +5619,10 @@ class StateStore:
                     )
                     self._f._symbol_index.add_edge(edge, project_id)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. DB write queue (serialised, non-blocking writes)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _db_enqueue(self, fn, args=(), kwargs=None) -> None:
         """Enqueue a write operation on the DB worker queue."""
         if kwargs is None:
@@ -5424,6 +5662,10 @@ class StateStore:
                         else:
                             raise
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Maintenance (checkpoints)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def run_db_checkpoints(self) -> None:
         """Run SQLite WAL checkpoint and ChromaDB persist."""
         try:
@@ -5440,7 +5682,10 @@ class StateStore:
         except Exception as e:
             self._f._log_debug(f"ChromaDB checkpoint error: {e}")
 
-    # ── Edge & path persistence ───────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Edge & path persistence
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def save_symbol_edges_to_db(self, project_id: str) -> int:
         """
         Persist the typed edges from the SymbolIndex to SQLite.
@@ -5629,7 +5874,10 @@ class StateStore:
                 self._f._log_debug(f"Skipping corrupt CodePathView: {e}")
         return views
 
-    # ── Project locks ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 6. Project locks (reentrant async locks per project)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def get_project_lock(self, project_id: str) -> "ReentrantAsyncLock":
         """Return (or create) the reentrant async lock for the given project."""
         async with self._f._lock_lock:
@@ -5656,7 +5904,7 @@ class LongTermMemory:
         self._f = filter_ref
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Initialization
+    # 1. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
 
     def init(self) -> None:
@@ -5691,7 +5939,7 @@ class LongTermMemory:
         self._f._log_debug("LTM ready")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Response cache & duplicate detection
+    # 2. Response cache & duplicate detection
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def find_cached_response(
@@ -5840,7 +6088,7 @@ class LongTermMemory:
         return None
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Query helpers
+    # 3. Query helpers (parsing, symbol extraction, expansion)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
@@ -5854,48 +6102,24 @@ class LongTermMemory:
             return symbol, cleaned if cleaned else symbol
         return None, query
 
-    async def _retrieve_by_symbol(
-        self, symbol: str, cleaned_query: str, project_id: str
-    ) -> List[Dict[str, Any]]:
-        """Retrieve memories filtered by a specific code symbol."""
-        now = time.time()
-        where = {
-            "$and": [
-                {"project_id": {"$eq": project_id}},
-                {"code_symbols": {"$contains": f",{symbol},"}},
-            ]
-        }
-        if self._f.valves.long_term_memory_expiration_days > 0:
-            where["$and"].append({"expires_at": {"$gt": now}})
-        q_emb = await anyio.to_thread.run_sync(
-            lambda: self._f.embedder.encode(cleaned_query[:1000]).tolist()
-        )
-        results = await anyio.to_thread.run_sync(
-            lambda: self._f.memory_collection.query(
-                query_embeddings=[q_emb],
-                n_results=self._f.valves.long_term_memory_top_k * 2,
-                where=where,
-                include=["documents", "metadatas", "distances"],
-            )
-        )
-        docs_with_meta = []
-        if results and results["documents"]:
-            for i, doc in enumerate(results["documents"][0]):
-                meta = results["metadatas"][0][i]
-                sim = 1.0 - (results["distances"][0][i] / 2.0)
-                ts = meta.get("timestamp")
-                if ts is not None and ts < 1000000000:
-                    ts = None
-                if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
-                    age_hours = (now - ts) / 3600
-                    sim *= 0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
-                if sim >= self._f.valves.long_term_memory_similarity_threshold:
-                    docs_with_meta.append((doc, sim, ts, meta))
-        docs_with_meta.sort(key=lambda x: x[1], reverse=True)
-        docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
-        if not docs_with_meta and self._f.valves.ltm_symbol_force_fallback_to_semantic:
-            return await self.retrieve_memories_unified(cleaned_query, project_id)
-        return [{"doc": doc, "timestamp": ts} for doc, _, ts, _ in docs_with_meta]
+    def _extract_query_symbols(self, query: str, project_id: str) -> Set[str]:
+        """Return symbol names from the query that exist in the SymbolIndex."""
+        if not query or not project_id:
+            return set()
+        words = set(re.findall(r"\b\w+\b", query))
+        project_symbols = self._f._symbol_index.get_all_names(project_id)
+        return words.intersection(project_symbols)
+
+    def _is_symbol_indexable(self, symbol: "CodeSymbol") -> bool:
+        """True if this symbol should be indexed in LTM metadata."""
+        if symbol.kind not in ("function", "class", "method"):
+            return False
+        if len(symbol.name) < 3:
+            return False
+        blacklist = getattr(self._f, "_SYMBOL_BLACKLIST", set())
+        if symbol.name in blacklist:
+            return False
+        return True
 
     async def _expand_query_for_retrieval(
         self, query: str, slot_free: bool = True
@@ -5941,14 +6165,6 @@ class LongTermMemory:
             )
         return queries
 
-    def _extract_query_symbols(self, query: str, project_id: str) -> Set[str]:
-        """Return symbol names from the query that exist in the SymbolIndex."""
-        if not query or not project_id:
-            return set()
-        words = set(re.findall(r"\b\w+\b", query))
-        project_symbols = self._f._symbol_index.get_all_names(project_id)
-        return words.intersection(project_symbols)
-
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
     ) -> List[str]:
@@ -5965,17 +6181,6 @@ class LongTermMemory:
         scored = list(zip(documents, scores))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in scored[:top_k]]
-
-    def _is_symbol_indexable(self, symbol: "CodeSymbol") -> bool:
-        """True if this symbol should be indexed in LTM metadata."""
-        if symbol.kind not in ("function", "class", "method"):
-            return False
-        if len(symbol.name) < 3:
-            return False
-        blacklist = getattr(self._f, "_SYMBOL_BLACKLIST", set())
-        if symbol.name in blacklist:
-            return False
-        return True
 
     async def _build_retrieval_context(
         self,
@@ -6040,8 +6245,51 @@ class LongTermMemory:
             return f"[Context: {context.strip()}]\n\n"
         return ""
 
+    async def _retrieve_by_symbol(
+        self, symbol: str, cleaned_query: str, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """Retrieve memories filtered by a specific code symbol."""
+        now = time.time()
+        where = {
+            "$and": [
+                {"project_id": {"$eq": project_id}},
+                {"code_symbols": {"$contains": f",{symbol},"}},
+            ]
+        }
+        if self._f.valves.long_term_memory_expiration_days > 0:
+            where["$and"].append({"expires_at": {"$gt": now}})
+        q_emb = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode(cleaned_query[:1000]).tolist()
+        )
+        results = await anyio.to_thread.run_sync(
+            lambda: self._f.memory_collection.query(
+                query_embeddings=[q_emb],
+                n_results=self._f.valves.long_term_memory_top_k * 2,
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        docs_with_meta = []
+        if results and results["documents"]:
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i]
+                sim = 1.0 - (results["distances"][0][i] / 2.0)
+                ts = meta.get("timestamp")
+                if ts is not None and ts < 1000000000:
+                    ts = None
+                if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
+                    age_hours = (now - ts) / 3600
+                    sim *= 0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
+                if sim >= self._f.valves.long_term_memory_similarity_threshold:
+                    docs_with_meta.append((doc, sim, ts, meta))
+        docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+        docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
+        if not docs_with_meta and self._f.valves.ltm_symbol_force_fallback_to_semantic:
+            return await self.retrieve_memories_unified(cleaned_query, project_id)
+        return [{"doc": doc, "timestamp": ts} for doc, _, ts, _ in docs_with_meta]
+
     # ═══════════════════════════════════════════════════════════════════════════
-    # Memory retrieval
+    # 4. Main retrieval methods
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def retrieve_memories_unified(
@@ -6302,7 +6550,7 @@ class LongTermMemory:
             return []
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Message storage
+    # 5. Message storage (LTM + response cache)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def store_messages(
@@ -6639,7 +6887,7 @@ class LongTermMemory:
             self._f._log_debug(f"Async response cache store failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Maintenance
+    # 6. Maintenance (purge expired memories)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def purge_expired_memories(self) -> None:
@@ -7016,9 +7264,8 @@ class ReasoningEngine:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
-    # Signals that the query is about design / architecture / refactoring,
-    # not about a specific implementation detail. When matched, the CoT context
-    # is replaced by the code skeleton (contracts-first reasoning).
+    # ── Architecture/design intent detection (regex) ─────────────────────
+
     _ARCH_INTENT_RE = re.compile(
         r"\b(arquitectura|architecture|diseño|design|refactor(?:iza)?r?|"
         r"plan\s+de\s+(implementaci[oó]n|cambios)|dise[ñn]a|restructur|"
@@ -7030,6 +7277,10 @@ class ReasoningEngine:
         r"contrato|contracts?|API\s+surface|surface\s+area)\b",
         re.IGNORECASE,
     )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Query classification (architecture intent, /think command parsing)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def is_architecture_query(self, user_content: str) -> bool:
         """True when the query targets design / architecture / refactoring."""
@@ -7053,6 +7304,10 @@ class ReasoningEngine:
             level = 2
             question = rest
         return question, level
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. CoT level detection (CrossEncoder / heuristic)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def detect_cot_level(
         self, user_content: str, is_code_session: bool, state: dict
@@ -7140,73 +7395,6 @@ class ReasoningEngine:
             return 2
         else:
             return 3
-
-    async def _generate_step_back_context(
-        self, question: str, code_context: str
-    ) -> str:
-        """
-        Generate an architectural step-back for better CoT hypothesis quality.
-
-        Asks: "What high-level principle governs this code?" before diving
-        into the specific bug/question.
-
-        Returns a formatted string to prepend to the CoT context,
-        or empty string if disabled or the LLM call fails.
-        """
-        if not self._f.valves.enable_step_back_prompting:
-            return ""
-        if len(question.strip()) < 15:
-            return ""
-
-        debug_signals = (
-            "error",
-            "fail",
-            "bug",
-            "wrong",
-            "exception",
-            "traceback",
-            "falla",
-            "error",
-            "excepción",
-            "no funciona",
-        )
-        question_lower = question.lower()
-        if not any(signal in question_lower for signal in debug_signals):
-            if not self._f.valves.step_back_always:
-                return ""
-
-        step_back_prompt = (
-            f"A programmer is debugging this specific issue:\n{question[:300]}\n\n"
-            "What is the underlying architectural principle, design invariant, or "
-            "general concept that governs correct behavior here? "
-            "State it as an abstract question and answer it in 2-3 sentences. "
-            "Focus on system-level understanding, not the specific bug."
-        )
-
-        step_back_response = await self._f._llm_orchestrator.call_llm(
-            prompt=step_back_prompt,
-            system_prompt=(
-                "You are a senior software architect. "
-                "Answer the abstract question concisely (2-3 sentences). "
-                "Focus on principles, not the specific implementation."
-            ),
-            model_override=self._f.valves.cot_model_level2,
-            max_tokens=self._f.valves.step_back_max_tokens,
-            temperature=0.3,
-            label="step_back",
-        )
-
-        if step_back_response and step_back_response.strip():
-            self._f._log_debug(
-                "Step-back context generated "
-                f"({len(step_back_response.split())} words)"
-            )
-            return (
-                "## Architectural Context (Step-Back)\n"
-                f"{step_back_response.strip()}\n\n"
-                "---\n\n"
-            )
-        return ""
 
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
@@ -7455,6 +7643,81 @@ class ReasoningEngine:
         else:
             return 0
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Step‑back prompting (architectural context for better CoT)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_step_back_context(
+        self, question: str, code_context: str
+    ) -> str:
+        """
+        Generate an architectural step-back for better CoT hypothesis quality.
+
+        Asks: "What high-level principle governs this code?" before diving
+        into the specific bug/question.
+
+        Returns a formatted string to prepend to the CoT context,
+        or empty string if disabled or the LLM call fails.
+        """
+        if not self._f.valves.enable_step_back_prompting:
+            return ""
+        if len(question.strip()) < 15:
+            return ""
+
+        debug_signals = (
+            "error",
+            "fail",
+            "bug",
+            "wrong",
+            "exception",
+            "traceback",
+            "falla",
+            "error",
+            "excepción",
+            "no funciona",
+        )
+        question_lower = question.lower()
+        if not any(signal in question_lower for signal in debug_signals):
+            if not self._f.valves.step_back_always:
+                return ""
+
+        step_back_prompt = (
+            f"A programmer is debugging this specific issue:\n{question[:300]}\n\n"
+            "What is the underlying architectural principle, design invariant, or "
+            "general concept that governs correct behavior here? "
+            "State it as an abstract question and answer it in 2-3 sentences. "
+            "Focus on system-level understanding, not the specific bug."
+        )
+
+        step_back_response = await self._f._llm_orchestrator.call_llm(
+            prompt=step_back_prompt,
+            system_prompt=(
+                "You are a senior software architect. "
+                "Answer the abstract question concisely (2-3 sentences). "
+                "Focus on principles, not the specific implementation."
+            ),
+            model_override=self._f.valves.cot_model_level2,
+            max_tokens=self._f.valves.step_back_max_tokens,
+            temperature=0.3,
+            label="step_back",
+        )
+
+        if step_back_response and step_back_response.strip():
+            self._f._log_debug(
+                "Step-back context generated "
+                f"({len(step_back_response.split())} words)"
+            )
+            return (
+                "## Architectural Context (Step-Back)\n"
+                f"{step_back_response.strip()}\n\n"
+                "---\n\n"
+            )
+        return ""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Level 2 reasoning generation (standard CoT + architecture mode)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def generate_cot_reasoning(
         self, question: str, context: str, label: str = ""
     ) -> str:
@@ -7555,6 +7818,181 @@ class ReasoningEngine:
             f"*Reasoning on contracts — use `/expand <name>` for implementations.*"
         )
         return f"{prefix}\n\n{response}"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Level 3 scientific reasoning (multi‑hypothesis, evidence‑validated)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def generate_scientific_reasoning_L3(
+        self, question: str, context: str, project_id: str, label: str = ""
+    ) -> str:
+        """
+        Scientific Chain-of-Thought reasoning with structural validation.
+
+        Flow:
+        1. Generate N hypotheses about the answer.
+        2. Score each hypothesis using StaticEvidence (deterministic) +
+           LLM-expressed confidence (if available).
+        3. If the best hypothesis passes the confidence threshold, stop.
+        4. Otherwise, feed evidence back to the LLM to refine hypotheses.
+        5. Iterate up to scientific_max_iterations times.
+        6. Synthesize a final reasoning from the best hypothesis + evidence.
+        """
+        max_hypotheses = self._f.valves.scientific_hypotheses_count
+        threshold = self._f.valves.scientific_confidence_threshold
+        max_iters = self._f.valves.scientific_max_iterations
+
+        def _parse_hypotheses_from_response(text: str) -> List[Tuple[str, float]]:
+            results = []
+            pattern = re.compile(
+                r"Hypothesis\s*\d*\s*:\s*(.+?)\s*Confidence\s*:\s*([\d.]+)",
+                re.IGNORECASE | re.DOTALL,
+            )
+            for match in pattern.finditer(text):
+                hyp_text = match.group(1).strip().rstrip(".")
+                try:
+                    conf = float(match.group(2))
+                    conf = max(0.0, min(1.0, conf))
+                except ValueError:
+                    conf = 0.5
+                results.append((hyp_text, conf))
+            return results
+
+        # ── Step 1: Generate initial hypotheses ────────────────────
+        prompt = (
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question[:500]}\n\n"
+            f"Propose {max_hypotheses} distinct hypotheses that could explain the issue "
+            f"or solve the problem. For each, state:\n"
+            f"Hypothesis: <one concise sentence>\n"
+            f"Confidence: <0.0-1.0>\n\n"
+            f"Be specific: mention function names, files, or data flows if possible."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a scientific reasoning engine. Output exactly the requested "
+                "hypotheses with confidence scores. No extra commentary."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=0.4,
+            label=label + "_gen_hypotheses" if label else "sci_gen_hypotheses",
+        )
+
+        if not response:
+            return "Unable to generate hypotheses for scientific reasoning."
+
+        hypotheses = _parse_hypotheses_from_response(response)
+        if len(hypotheses) < 2:
+            return await self.generate_cot_reasoning(question, context, label)
+
+        best_hypothesis = ""
+        best_combined_score = 0.0
+        iteration = 0
+
+        # ── Iterative refinement loop ──────────────────────────────
+        while iteration < max_iters:
+            iteration += 1
+            scored = []
+            for hyp_text, llm_conf in hypotheses:
+                evidence = self._f._activation._gather_static_evidence(
+                    hyp_text, project_id
+                )
+                obj_score = evidence.objective_score
+                combined = 0.5 * obj_score + 0.5 * llm_conf
+                scored.append((hyp_text, combined, obj_score, llm_conf, evidence))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top = scored[0]
+            best_hypothesis, best_combined, best_obj, best_llm_conf, best_evidence = top
+
+            self._f._log_debug(
+                f"Scientific CoT iter {iteration}: best hypothesis "
+                f"'{best_hypothesis[:80]}...' "
+                f"score={best_combined:.3f} "
+                f"(obj={best_obj:.3f}, llm_conf={best_llm_conf:.3f})"
+            )
+
+            if best_combined >= threshold or iteration >= max_iters:
+                break
+
+            evidence_feedback = (
+                f"Previous best hypothesis (score {best_combined:.2f}):\n"
+                f"{best_hypothesis}\n\n"
+                f"Structural evidence:\n"
+                f"- Symbols found: {best_evidence.symbols_found}\n"
+                f"- Call relations valid: {best_evidence.call_relations_valid}\n"
+                f"- Recent changes: {best_evidence.recent_changes}\n"
+                f"- Data flow upstream: {best_evidence.data_flow_upstream}\n"
+                f"- Objective score: {best_evidence.objective_score:.2f}\n\n"
+                f"Based on this evidence, propose {max_hypotheses} improved hypotheses."
+            )
+
+            refine_prompt = (
+                f"{evidence_feedback}\n\n"
+                f"Output the same format as before: Hypothesis: ... Confidence: ..."
+            )
+            refine_response = await self._f._llm_orchestrator.call_llm(
+                prompt=refine_prompt,
+                system_prompt=(
+                    "You are a scientific reasoning engine refining hypotheses "
+                    "based on evidence."
+                ),
+                model_override=self._f.valves.cot_model_level3,
+                max_tokens=600,
+                temperature=0.4,
+                label=label + "_refine" if label else "sci_refine",
+            )
+            if refine_response:
+                new_hypotheses = _parse_hypotheses_from_response(refine_response)
+                if len(new_hypotheses) >= 2:
+                    hypotheses = new_hypotheses
+                else:
+                    break
+            else:
+                break
+
+        # ── Step 6: Synthesize final reasoning ────────────────────
+        final_prompt = (
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question[:500]}\n\n"
+            f"The best validated hypothesis (score {best_combined:.3f}):\n"
+            f"{best_hypothesis}\n\n"
+            f"Structural evidence supporting it:\n"
+            f"- Symbols found: {best_evidence.symbols_found}\n"
+            f"- Call relations valid: {best_evidence.call_relations_valid}\n"
+            f"- Recent changes: {best_evidence.recent_changes}\n"
+            f"- Data flow upstream: {best_evidence.data_flow_upstream}\n\n"
+            f"Provide a step-by-step reasoning to answer the question, "
+            f"grounded in this evidence."
+        )
+        reasoning = await self._f._llm_orchestrator.call_llm(
+            prompt=final_prompt,
+            system_prompt=(
+                "You are a helpful assistant that reasons step by step "
+                "based on verified evidence."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=(
+                self._f.valves.cot_max_tokens
+                if self._f.valves.cot_max_tokens > 0
+                else None
+            ),
+            temperature=0.3,
+            label=label + "_synthesize" if label else "sci_synthesize",
+        )
+
+        if not reasoning:
+            return "Unable to synthesize scientific reasoning."
+
+        return (
+            f"## 🔬 Scientific Reasoning (Level 3)\n"
+            f"*Validated against code structure. "
+            f"Best hypothesis score: {best_combined:.2f} "
+            f"(obj={best_obj:.2f}, llm_conf={best_llm_conf:.2f})*\n\n"
+            f"{reasoning}"
+        )
 
     async def generate_scientific_architecture_reasoning(
         self,
@@ -7777,177 +8215,6 @@ class ReasoningEngine:
             f"{synthesis}"
         )
 
-    async def generate_scientific_reasoning_L3(
-        self, question: str, context: str, project_id: str, label: str = ""
-    ) -> str:
-        """
-        Scientific Chain-of-Thought reasoning with structural validation.
-
-        Flow:
-        1. Generate N hypotheses about the answer.
-        2. Score each hypothesis using StaticEvidence (deterministic) +
-           LLM-expressed confidence (if available).
-        3. If the best hypothesis passes the confidence threshold, stop.
-        4. Otherwise, feed evidence back to the LLM to refine hypotheses.
-        5. Iterate up to scientific_max_iterations times.
-        6. Synthesize a final reasoning from the best hypothesis + evidence.
-        """
-        max_hypotheses = self._f.valves.scientific_hypotheses_count
-        threshold = self._f.valves.scientific_confidence_threshold
-        max_iters = self._f.valves.scientific_max_iterations
-
-        def _parse_hypotheses_from_response(text: str) -> List[Tuple[str, float]]:
-            results = []
-            pattern = re.compile(
-                r"Hypothesis\s*\d*\s*:\s*(.+?)\s*Confidence\s*:\s*([\d.]+)",
-                re.IGNORECASE | re.DOTALL,
-            )
-            for match in pattern.finditer(text):
-                hyp_text = match.group(1).strip().rstrip(".")
-                try:
-                    conf = float(match.group(2))
-                    conf = max(0.0, min(1.0, conf))
-                except ValueError:
-                    conf = 0.5
-                results.append((hyp_text, conf))
-            return results
-
-        # ── Step 1: Generate initial hypotheses ────────────────────
-        prompt = (
-            f"Context:\n{context[:3000]}\n\n"
-            f"Question:\n{question[:500]}\n\n"
-            f"Propose {max_hypotheses} distinct hypotheses that could explain the issue "
-            f"or solve the problem. For each, state:\n"
-            f"Hypothesis: <one concise sentence>\n"
-            f"Confidence: <0.0-1.0>\n\n"
-            f"Be specific: mention function names, files, or data flows if possible."
-        )
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a scientific reasoning engine. Output exactly the requested "
-                "hypotheses with confidence scores. No extra commentary."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=600,
-            temperature=0.4,
-            label=label + "_gen_hypotheses" if label else "sci_gen_hypotheses",
-        )
-
-        if not response:
-            return "Unable to generate hypotheses for scientific reasoning."
-
-        hypotheses = _parse_hypotheses_from_response(response)
-        if len(hypotheses) < 2:
-            return await self.generate_cot_reasoning(question, context, label)
-
-        best_hypothesis = ""
-        best_combined_score = 0.0
-        iteration = 0
-
-        # ── Iterative refinement loop ──────────────────────────────
-        while iteration < max_iters:
-            iteration += 1
-            scored = []
-            for hyp_text, llm_conf in hypotheses:
-                evidence = self._f._activation._gather_static_evidence(
-                    hyp_text, project_id
-                )
-                obj_score = evidence.objective_score
-                combined = 0.5 * obj_score + 0.5 * llm_conf
-                scored.append((hyp_text, combined, obj_score, llm_conf, evidence))
-
-            scored.sort(key=lambda x: x[1], reverse=True)
-            top = scored[0]
-            best_hypothesis, best_combined, best_obj, best_llm_conf, best_evidence = top
-
-            self._f._log_debug(
-                f"Scientific CoT iter {iteration}: best hypothesis "
-                f"'{best_hypothesis[:80]}...' "
-                f"score={best_combined:.3f} "
-                f"(obj={best_obj:.3f}, llm_conf={best_llm_conf:.3f})"
-            )
-
-            if best_combined >= threshold or iteration >= max_iters:
-                break
-
-            evidence_feedback = (
-                f"Previous best hypothesis (score {best_combined:.2f}):\n"
-                f"{best_hypothesis}\n\n"
-                f"Structural evidence:\n"
-                f"- Symbols found: {best_evidence.symbols_found}\n"
-                f"- Call relations valid: {best_evidence.call_relations_valid}\n"
-                f"- Recent changes: {best_evidence.recent_changes}\n"
-                f"- Data flow upstream: {best_evidence.data_flow_upstream}\n"
-                f"- Objective score: {best_evidence.objective_score:.2f}\n\n"
-                f"Based on this evidence, propose {max_hypotheses} improved hypotheses."
-            )
-
-            refine_prompt = (
-                f"{evidence_feedback}\n\n"
-                f"Output the same format as before: Hypothesis: ... Confidence: ..."
-            )
-            refine_response = await self._f._llm_orchestrator.call_llm(
-                prompt=refine_prompt,
-                system_prompt=(
-                    "You are a scientific reasoning engine refining hypotheses "
-                    "based on evidence."
-                ),
-                model_override=self._f.valves.cot_model_level3,
-                max_tokens=600,
-                temperature=0.4,
-                label=label + "_refine" if label else "sci_refine",
-            )
-            if refine_response:
-                new_hypotheses = _parse_hypotheses_from_response(refine_response)
-                if len(new_hypotheses) >= 2:
-                    hypotheses = new_hypotheses
-                else:
-                    break
-            else:
-                break
-
-        # ── Step 6: Synthesize final reasoning ────────────────────
-        final_prompt = (
-            f"Context:\n{context[:3000]}\n\n"
-            f"Question:\n{question[:500]}\n\n"
-            f"The best validated hypothesis (score {best_combined:.3f}):\n"
-            f"{best_hypothesis}\n\n"
-            f"Structural evidence supporting it:\n"
-            f"- Symbols found: {best_evidence.symbols_found}\n"
-            f"- Call relations valid: {best_evidence.call_relations_valid}\n"
-            f"- Recent changes: {best_evidence.recent_changes}\n"
-            f"- Data flow upstream: {best_evidence.data_flow_upstream}\n\n"
-            f"Provide a step-by-step reasoning to answer the question, "
-            f"grounded in this evidence."
-        )
-        reasoning = await self._f._llm_orchestrator.call_llm(
-            prompt=final_prompt,
-            system_prompt=(
-                "You are a helpful assistant that reasons step by step "
-                "based on verified evidence."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=(
-                self._f.valves.cot_max_tokens
-                if self._f.valves.cot_max_tokens > 0
-                else None
-            ),
-            temperature=0.3,
-            label=label + "_synthesize" if label else "sci_synthesize",
-        )
-
-        if not reasoning:
-            return "Unable to synthesize scientific reasoning."
-
-        return (
-            f"## 🔬 Scientific Reasoning (Level 3)\n"
-            f"*Validated against code structure. "
-            f"Best hypothesis score: {best_combined:.2f} "
-            f"(obj={best_obj:.2f}, llm_conf={best_llm_conf:.2f})*\n\n"
-            f"{reasoning}"
-        )
-
 
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
@@ -7967,6 +8234,10 @@ class MultiPhasePlanner:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Build multi‑phase protocol instructions
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def build_multi_phase_instructions(
         self,
@@ -8093,6 +8364,10 @@ class MultiPhasePlanner:
 
         return f"{header}\n\n{phases}"
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Wrap‑up hint (appended to user message when token window is critical)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     @staticmethod
     def append_critical_wrap_up_hint(messages: list) -> list:
         """
@@ -8148,21 +8423,45 @@ class CommandRouter:
       code without a question, used by the inlet to trigger silent ingestion.
     """
 
-    # ----------------------------------------------------------------------
-    # Regex patterns
-    # ----------------------------------------------------------------------
+    # ── Class constants ────────────────────────────────────────────────────
+
     _EXPAND_DOTTED = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
 
-    # ----------------------------------------------------------------------
-    # Initialization
-    # ----------------------------------------------------------------------
+    # ── Intent keywords ──────────────────────────────────────────────────
+    INTENT_KEYWORDS = {
+        "forget",
+        "olvida",
+        "olvid",
+        "remember",
+        "recuerda",
+        "pin",
+        "fija",
+        "guarda",
+        "obsolete",
+        "obsoleto",
+        "deprecated",
+        "ya no",
+        "remove",
+        "elimina",
+        "borra",
+        "quita",
+        "keep",
+        "mantén",
+        "conserva",
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def __init__(self, filter_ref: "Filter") -> None:
         """Store a reference to the parent Filter for shared state."""
         self._f = filter_ref
 
-    # ----------------------------------------------------------------------
-    # ML‑based helpers (CrossEncoder, contradiction detection)
-    # ----------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. CrossEncoder & ML helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
         """Run the CrossEncoder on (text_a, text_b) pairs.
         Returns raw scores or None if the model is not loaded.
@@ -8223,9 +8522,6 @@ class CommandRouter:
             )
         return None
 
-    # ----------------------------------------------------------------------
-    # Intent classification
-    # ----------------------------------------------------------------------
     async def classify_intent(self, user_query: str, project_id: str) -> dict:
         """Classify the user's intent using the CrossEncoder.
         Returns a dict with probabilities for explain, modify, debug, refactor.
@@ -8259,9 +8555,10 @@ class CommandRouter:
         self._f._log_debug("Intent: softmax failed, using default distribution.")
         return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
-    # ----------------------------------------------------------------------
-    # Explicit command dispatch (called from inlet)
-    # ----------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Explicit command dispatch (called from inlet)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def handle_explicit_commands(
         self,
         messages: list,
@@ -8334,9 +8631,10 @@ class CommandRouter:
 
         return False, None
 
-    # ----------------------------------------------------------------------
-    # Expand commands (/expand, outlet intercept)
-    # ----------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Expand commands (/expand, outlet intercept)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _resolve_expand_target(self, token: str, project_id: str):
         """Classify an /expand target.
         Returns ('method', id) | ('class', name) | ('symbol', name)."""
@@ -8544,9 +8842,10 @@ class CommandRouter:
 
         return replaced_content, did_any
 
-    # --------------------------------------------------------------------------
-    # Forget / remember / obsolete commands
-    # --------------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Forget / remember / obsolete commands (explicit and natural)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _handle_forget_command(
         self, messages: List[dict], project_id: str, __user__: Optional[dict]
     ) -> Tuple[List[dict], bool]:
@@ -8886,104 +9185,10 @@ class CommandRouter:
             else:
                 return "Unrecognized obsolete action."
 
-    # --------------------------------------------------------------------------
-    # Proactive cleanup commands
-    # --------------------------------------------------------------------------
-    def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
-        """Return hashes of blocks that haven't been mentioned recently."""
-        state = self._f._state_store.get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return []
-        threshold = self._f.valves.cleanup_inactive_threshold_messages
-        excluded_types = set(self._f.valves.cleanup_excluded_content_types)
-        current_msg_idx = state["message_count"]
-        candidates = []
-        for h, block in state["active_blocks"].items():
-            if block.pinned or block.obsolete:
-                continue
-            if block.content_type.value in excluded_types:
-                continue
-            last_idx = block.last_mentioned_msg_idx
-            if last_idx is None:
-                last_idx = current_msg_idx
-            if current_msg_idx - last_idx > threshold:
-                candidates.append(h)
-        return candidates
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 6. Natural language intents (forget, remember, obsolete)
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
-        """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
-        if (
-            not self._f.valves.cleanup_suggestions_enabled
-            or not self._f.valves.cleanup_command_enabled
-        ):
-            return "Cleanup is disabled."
-        lock = await self._f._state_store.get_project_lock(project_id)
-        async with lock:
-            state = self._f._state_store.get_state(project_id)
-            candidates = self._get_inactive_block_candidates(project_id)
-            parts = command_text.split(maxsplit=1)
-            subcommand = parts[1].strip() if len(parts) > 1 else ""
-            if not subcommand:
-                if not candidates:
-                    return "✅ No inactive blocks to clean."
-                lines = [
-                    f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last {self._f.valves.cleanup_inactive_threshold_messages} messages):"
-                ]
-                for h in candidates:
-                    blk = state["active_blocks"].get(h)
-                    if blk:
-                        snippet = blk.content[:80].replace("\n", " ")
-                        file_info = f" ({blk.file_path})" if blk.file_path else ""
-                        lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
-                lines.append(
-                    "\nUse `/clean all` to remove all, or `/clean <hash>` for a specific block."
-                )
-                return "\n".join(lines)
-            if subcommand.lower() == "all":
-                if not candidates:
-                    return "✅ No inactive blocks to clean."
-                for h in candidates:
-                    block = state["active_blocks"].pop(h, None)
-                    if block:
-                        self._f._symbol_index.remove_all_for_block(
-                            block.hash, block.symbols, project_id
-                        )
-                state["recent_changes"] = [
-                    c for c in state["recent_changes"] if c.hash not in candidates
-                ]
-                state["committed_changes"] = [
-                    c for c in state["committed_changes"] if c.hash not in candidates
-                ]
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-                return f"✅ Cleaned {len(candidates)} inactive block(s)."
-            target_hash = subcommand.strip()
-            if target_hash in candidates:
-                block = state["active_blocks"].pop(target_hash, None)
-                if block:
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
-                return f"✅ Cleaned block `{target_hash[:8]}...`."
-            else:
-                matched = [h for h in state["active_blocks"] if target_hash in h]
-                for h in matched:
-                    if h in candidates:
-                        block = state["active_blocks"].pop(h, None)
-                        if block:
-                            self._f._symbol_index.remove_all_for_block(
-                                block.hash, block.symbols, project_id
-                            )
-                        self._f._activation.invalidate_lightweight_cache(project_id)
-                        self._f._state_store.set_state(project_id, state)
-                        return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
-                return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
-
-    # ----------------------------------------------------------------------
-    # Natural language intents (forget, remember, obsolete)
-    # ----------------------------------------------------------------------
     async def handle_natural_intents(
         self,
         messages: list,
@@ -9106,9 +9311,10 @@ class CommandRouter:
 
         return result
 
-    # ----------------------------------------------------------------------
-    # Suggestions
-    # ----------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. Proactive suggestions
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def suggest_commands(self, project_id: str, state: dict) -> Optional[str]:
         """Suggest context management commands to the user after enough messages."""
         if not self._f.valves.enable_command_suggestions:
@@ -9125,9 +9331,102 @@ class CommandRouter:
             )
         return None
 
-    # ----------------------------------------------------------------------
-    # Code-only message detection
-    # ----------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. Utilities & helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
+        """Return hashes of blocks that haven't been mentioned recently."""
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return []
+        threshold = self._f.valves.cleanup_inactive_threshold_messages
+        excluded_types = set(self._f.valves.cleanup_excluded_content_types)
+        current_msg_idx = state["message_count"]
+        candidates = []
+        for h, block in state["active_blocks"].items():
+            if block.pinned or block.obsolete:
+                continue
+            if block.content_type.value in excluded_types:
+                continue
+            last_idx = block.last_mentioned_msg_idx
+            if last_idx is None:
+                last_idx = current_msg_idx
+            if current_msg_idx - last_idx > threshold:
+                candidates.append(h)
+        return candidates
+
+    async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
+        """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
+        if (
+            not self._f.valves.cleanup_suggestions_enabled
+            or not self._f.valves.cleanup_command_enabled
+        ):
+            return "Cleanup is disabled."
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            candidates = self._get_inactive_block_candidates(project_id)
+            parts = command_text.split(maxsplit=1)
+            subcommand = parts[1].strip() if len(parts) > 1 else ""
+            if not subcommand:
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                lines = [
+                    f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last {self._f.valves.cleanup_inactive_threshold_messages} messages):"
+                ]
+                for h in candidates:
+                    blk = state["active_blocks"].get(h)
+                    if blk:
+                        snippet = blk.content[:80].replace("\n", " ")
+                        file_info = f" ({blk.file_path})" if blk.file_path else ""
+                        lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
+                lines.append(
+                    "\nUse `/clean all` to remove all, or `/clean <hash>` for a specific block."
+                )
+                return "\n".join(lines)
+            if subcommand.lower() == "all":
+                if not candidates:
+                    return "✅ No inactive blocks to clean."
+                for h in candidates:
+                    block = state["active_blocks"].pop(h, None)
+                    if block:
+                        self._f._symbol_index.remove_all_for_block(
+                            block.hash, block.symbols, project_id
+                        )
+                state["recent_changes"] = [
+                    c for c in state["recent_changes"] if c.hash not in candidates
+                ]
+                state["committed_changes"] = [
+                    c for c in state["committed_changes"] if c.hash not in candidates
+                ]
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned {len(candidates)} inactive block(s)."
+            target_hash = subcommand.strip()
+            if target_hash in candidates:
+                block = state["active_blocks"].pop(target_hash, None)
+                if block:
+                    self._f._symbol_index.remove_all_for_block(
+                        block.hash, block.symbols, project_id
+                    )
+                self._f._activation.invalidate_lightweight_cache(project_id)
+                self._f._state_store.set_state(project_id, state)
+                return f"✅ Cleaned block `{target_hash[:8]}...`."
+            else:
+                matched = [h for h in state["active_blocks"] if target_hash in h]
+                for h in matched:
+                    if h in candidates:
+                        block = state["active_blocks"].pop(h, None)
+                        if block:
+                            self._f._symbol_index.remove_all_for_block(
+                                block.hash, block.symbols, project_id
+                            )
+                        self._f._activation.invalidate_lightweight_cache(project_id)
+                        self._f._state_store.set_state(project_id, state)
+                        return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
+                return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
+
     async def is_code_only_message(self, content: str) -> bool:
         """
         Detect messages that contain only code without a question.
@@ -9234,9 +9533,6 @@ class CommandRouter:
             text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
         return len(text_outside) < 30
 
-    # ----------------------------------------------------------------------
-    # Static helpers
-    # ----------------------------------------------------------------------
     @staticmethod
     def has_code_indicators(content: str) -> bool:
         """True if the content looks like it contains source code."""
@@ -11784,6 +12080,10 @@ class TokenUtils:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Token estimation
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def estimate_tokens(self, messages: list) -> int:
         """Estimate total token count for a list of messages."""
         if self._f.tokenizer:
@@ -11802,6 +12102,10 @@ class TokenUtils:
         if self._f.tokenizer:
             return len(self._f.tokenizer.encode(code))
         return len(code) // 4
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Text truncation
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
         """Truncate text to approximately max_tokens while preserving word boundaries."""
@@ -15176,7 +15480,9 @@ class ContextDumper:
         self._f = filter_ref
         self._tasks: Set[asyncio.Task] = set()
 
-    # ── Public API (called from MessageAssembler) ─────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Public API – schedule snapshot capture
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def schedule_inlet_snapshot(
         self,
@@ -15214,7 +15520,9 @@ class ContextDumper:
             except Exception as exc:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
-    # ── Payload capture (sync, cheap, mutation-safe) ──────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Payload capture (sync, cheap, mutation‑safe)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _capture_payload(
         self,
@@ -15289,7 +15597,9 @@ class ContextDumper:
             "n_classes": n_classes,  # NEW
         }
 
-    # ── Async write (offloaded to a worker thread) ────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Writing (async + sync)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def _write_async(self, payload: dict) -> None:
         self._f._log_debug(f"📝 Writing context dump (turn {payload['turn']})...")
@@ -15356,7 +15666,9 @@ class ContextDumper:
         # 4. Prune old snapshots.
         self._prune(project_dir)
 
-    # ── Rendering ─────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Rendering
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _render_markdown(
         self,
@@ -15417,7 +15729,9 @@ class ContextDumper:
 
         return "\n".join(lines)
 
-    # ── Housekeeping ──────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Directory & pruning
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _project_dir(self, project_id: str) -> str:
         slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:40] or "default"
@@ -15456,14 +15770,67 @@ class Filter:
     the OpenWebUI runtime at the start and end of each request.
     """
 
+    # ── Class constants ────────────────────────────────────────────────────
+
+    INTENT_KEYWORDS = {
+        "forget",
+        "olvida",
+        "olvid",
+        "remember",
+        "recuerda",
+        "pin",
+        "fija",
+        "guarda",
+        "obsolete",
+        "obsoleto",
+        "deprecated",
+        "ya no",
+        "remove",
+        "elimina",
+        "borra",
+        "quita",
+        "keep",
+        "mantén",
+        "conserva",
+    }
+
+    _COT_NEGATION_PREFIXES: frozenset = frozenset(
+        {
+            "don't",
+            "do not",
+            "dont",
+            "no need to",
+            "without",
+            "not",
+            "never",
+            "avoid",
+            "skip",
+            "no",
+            "sin",
+            "no hace falta",
+            "no es necesario",
+        }
+    )
+
+    _MULTI_PHASE_MARKERS: frozenset = frozenset(
+        {
+            "▶ CONTINÚA:",
+            "▶ CONTINÚA EN LA SIGUIENTE PARTE",
+        }
+    )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Configuration valves (nested class)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     class Valves(BaseModel):
         """Pydantic model holding every user‑facing configuration valve for
         the filter, with descriptions, defaults, and constraints.
         """
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Context window budgets
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         context_window_tokens: int = Field(
             default=262000,
             description="Total token capacity of the LLM server. Must match the llama.cpp --ctx-size exactly.",
@@ -15522,9 +15889,9 @@ class Filter:
             description="Maximum tokens allowed for the generated summary of an oversized code block.",
         )
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Long‑term memory (ChromaDB + RAPTOR)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── ChromaDB infrastructure ─────────────────────────────────
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
         long_term_memory_expiration_days: int = Field(default=30)
@@ -15573,9 +15940,9 @@ class Filter:
         enable_multi_query_retrieval: bool = Field(default=True)
         multi_query_variants: int = Field(default=2, ge=1, le=4)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Context compression (conversation + code)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── History compression with LLMLingua ──────────────────────
         enable_history_llmlingua: bool = Field(
             default=True,
@@ -15657,9 +16024,9 @@ class Filter:
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  SymbolGraph & active code
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Extraction & detection ──────────────────────────────────
         enable_code_awareness: bool = Field(default=True)
         auto_detect_code_blocks: bool = Field(default=True)
@@ -15766,9 +16133,9 @@ class Filter:
             description="Number of recent code versions per file to keep in active context.",
         )
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Activation graph (PPR, LOD, seeds)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Path activation ─────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
         path_activation_threshold: float = Field(default=0.1, ge=0.01, le=1.0)
@@ -15831,9 +16198,9 @@ class Filter:
         lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
         lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Reasoning (Chain‑of‑Thought)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Architecture-mode CoT ────────────────────────────────────
         enable_skeleton_cot: bool = Field(
             default=True,
@@ -15914,9 +16281,9 @@ class Filter:
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'..."
         )
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  LLM & orchestration
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Endpoint & model ────────────────────────────────────────
         LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
         LLM_API_TOKEN: str = Field(default="")
@@ -15945,9 +16312,9 @@ class Filter:
         multi_phase_response_budget_warn: int = Field(default=800, ge=500, le=40000)
         auto_budget_context_for_parts: bool = Field(default=True)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Interaction & commands
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Explicit commands ───────────────────────────────────────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
@@ -15974,9 +16341,9 @@ class Filter:
         cleanup_suggestion_cooldown_messages: int = Field(default=20)
         cleanup_command_enabled: bool = Field(default=True)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Session & state
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── Session management ──────────────────────────────────────
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
@@ -16056,9 +16423,9 @@ class Filter:
         duplicate_question_lookback: int = Field(default=20)
         duplicate_question_lookback_hours: float = Field(default=24.0)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Performance & persistence
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # ── KV cache ────────────────────────────────────────────────
         enable_kv_cache_stability: bool = Field(default=True)
         enable_slot_persistence: bool = Field(default=True)
@@ -16099,16 +16466,14 @@ class Filter:
                 "exempt: its caller signatures are impact signal, not duplication."
             ),
         )
-        skeleton_include_docstrings: bool = (
-            Field(
-                default=True,
-                description=(
-                    "Include one-line docstrings (source + LLM-generated) in the skeleton "
-                    "tier. Improves LLM comprehension. Cost: the skeleton tier cache key "
-                    "becomes docstring-aware, so Block A re-renders as background "
-                    "docstrings land, then stabilizes. Set False for a strictly stable, "
-                    "signature-only Block A prefix if KV-cache churn is observed."
-                ),
+        skeleton_include_docstrings: bool = Field(
+            default=True,
+            description=(
+                "Include one-line docstrings (source + LLM-generated) in the skeleton "
+                "tier. Improves LLM comprehension. Cost: the skeleton tier cache key "
+                "becomes docstring-aware, so Block A re-renders as background "
+                "docstrings land, then stabilizes. Set False for a strictly stable, "
+                "signature-only Block A prefix if KV-cache churn is observed."
             ),
         )
         # ── Monotonic compaction (#16) ──────────────────────────────
@@ -16127,9 +16492,9 @@ class Filter:
         # ── Silent ingestion ────────────────────────────────────────
         enable_silent_ingestion: bool = Field(default=True)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Utilities & tuning
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         debug: bool = Field(default=True)
         # ── Context dump (evolution tracking) ───────────────────────
         enable_context_dump: bool = Field(
@@ -16179,9 +16544,9 @@ class Filter:
         min_mentions_for_boost: int = Field(default=3)
         frequency_decay_hours: float = Field(default=12.0)
 
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         #  Architecture Map
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         enable_architecture_map: bool = Field(
             default=True,
             description=(
@@ -16208,59 +16573,10 @@ class Filter:
             ),
         )
 
-    # --------------------------------------------------------------------------
-    # Class-level constants
-    # --------------------------------------------------------------------------
-    INTENT_KEYWORDS = {
-        "forget",
-        "olvida",
-        "olvid",
-        "remember",
-        "recuerda",
-        "pin",
-        "fija",
-        "guarda",
-        "obsolete",
-        "obsoleto",
-        "deprecated",
-        "ya no",
-        "remove",
-        "elimina",
-        "borra",
-        "quita",
-        "keep",
-        "mantén",
-        "conserva",
-    }
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    _COT_NEGATION_PREFIXES: frozenset = frozenset(
-        {
-            "don't",
-            "do not",
-            "dont",
-            "no need to",
-            "without",
-            "not",
-            "never",
-            "avoid",
-            "skip",
-            "no",
-            "sin",
-            "no hace falta",
-            "no es necesario",
-        }
-    )
-
-    _MULTI_PHASE_MARKERS: frozenset = frozenset(
-        {
-            "▶ CONTINÚA:",
-            "▶ CONTINÚA EN LA SIGUIENTE PARTE",
-        }
-    )
-
-    # --------------------------------------------------------------------------
-    # Initialization
-    # --------------------------------------------------------------------------
     def __init__(self):
         # Valves and basic objects
         self.valves = self.Valves()
@@ -16431,9 +16747,10 @@ class Filter:
 
         print("[CodeAware] Filter loaded")
 
-    # --------------------------------------------------------------------------
-    # Logging helpers
-    # --------------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Logging utilities
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _log_debug(self, msg: str):
         if self.valves.debug:
             timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -16460,9 +16777,20 @@ class Filter:
         line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
 
-    # --------------------------------------------------------------------------
-    # Inlet helpers
-    # --------------------------------------------------------------------------
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Code update helper
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _update_active_code(
+        self, message: dict, project_id: str, is_continuation: bool = False
+    ) -> None:
+        """Update active blocks and SymbolIndex from a new message."""
+        await self._active_code_updater.process(message, project_id, is_continuation)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Inlet helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _inlet_build_system_injections(
         self,
         messages,
@@ -16515,11 +16843,6 @@ class Filter:
             slot_free,
         )
 
-    async def _update_active_code(
-        self, message: dict, project_id: str, is_continuation: bool = False
-    ) -> None:
-        await self._active_code_updater.process(message, project_id, is_continuation)
-
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
@@ -16530,6 +16853,7 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """Pre‑process the request before the LLM sees it.
 
@@ -16837,6 +17161,7 @@ class Filter:
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """Post‑process the response after the LLM has generated it.
 
