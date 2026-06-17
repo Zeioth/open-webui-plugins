@@ -3610,8 +3610,8 @@ class SymbolIndex:
             "language": symbol.language,
             "kind": symbol.kind,
             "parent_symbol": symbol.parent_symbol
-            or (prev.get("parent_symbol", "") if prev else ""),  # NEW
-            "line_start": symbol.line_start,  # NEW
+            or (prev.get("parent_symbol", "") if prev else ""),
+            "line_start": symbol.line_start,
         }
         for callee in symbol.calls:
             callee_key = (project_id, callee)
@@ -4014,7 +4014,7 @@ class SignatureExtractor:
 
     @staticmethod
     async def extract_async(
-        code: str, file_path: Optional[str] = None
+        code: str, file_path: Optional[str] = None, language: Optional[str] = None
     ) -> List["CodeSymbol"]:
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             return []
@@ -4025,7 +4025,7 @@ class SignatureExtractor:
                 sym.calls = call_map.get(sym.name, [])
             return syms
 
-        lang = SignatureExtractor._guess_language(file_path, code)
+        lang = language or SignatureExtractor._guess_language(file_path, code)
         if lang == "unknown":
             syms = SignatureExtractor._extract_generic(code, file_path)
             call_map = SignatureExtractor._extract_calls_generic(code)
@@ -4039,7 +4039,7 @@ class SignatureExtractor:
                 loop.run_in_executor(
                     None, SignatureExtractor._parse_sync, code.encode(), lang
                 ),
-                timeout=5.0,
+                timeout=30.0,
             )
         except (asyncio.TimeoutError, Exception):
             syms = SignatureExtractor._extract_generic(code, file_path)
@@ -4058,6 +4058,82 @@ class SignatureExtractor:
         if lang == "python" or (file_path and file_path.endswith(".py")):
             SignatureExtractor._extract_docstrings_python(code, syms)
         return syms
+
+    @staticmethod
+    def enrich_symbols_with_parent_info(
+        symbols: List["CodeSymbol"], full_code: str
+    ) -> List["CodeSymbol"]:
+        """Assign parent_symbol using AST line-range mapping.
+        For symbols that come from the generic extractor (line_start=None),
+        the line number is recovered by scanning the source code for the
+        definition (def / class / async def) before matching.
+        """
+        import ast as ast_module
+
+        # ── 1. Recover missing line numbers by scanning the source ──────
+        lines = full_code.split("\n")
+        for sym in symbols:
+            if sym.line_start is not None:
+                continue
+            # Build a regex that matches the definition of this symbol
+            if sym.kind in ("function", "method"):
+                pattern = re.compile(
+                    r"^\s*(?:async\s+)?def\s+" + re.escape(sym.name) + r"\b"
+                )
+            elif sym.kind == "class":
+                pattern = re.compile(r"^\s*class\s+" + re.escape(sym.name) + r"\b")
+            else:
+                continue
+            for i, line in enumerate(lines, start=1):
+                if pattern.search(line):
+                    sym.line_start = i
+                    break
+
+        # ── 2. Build the AST class‑line mapping using DFS (not BFS) ──
+        try:
+            tree = ast_module.parse(full_code)
+        except SyntaxError:
+            return symbols
+
+        line_to_class: Dict[int, str] = {}
+
+        def _visit(node, current_class: str) -> None:
+            """Recursive DFS: current_class is the nearest enclosing class name
+            (or "" at module level). Local functions nested inside a method keep
+            the method's enclosing class — matching the heuristic tree-sitter
+            already uses elsewhere in this file."""
+            for child in ast_module.iter_child_nodes(node):
+                if isinstance(child, ast_module.ClassDef):
+                    end_lineno = getattr(child, "end_lineno", child.lineno)
+                    for lineno in range(child.lineno, end_lineno + 1):
+                        line_to_class[lineno] = current_class
+                    _visit(child, child.name)
+                elif isinstance(
+                    child, (ast_module.FunctionDef, ast_module.AsyncFunctionDef)
+                ):
+                    end_lineno = getattr(child, "end_lineno", child.lineno)
+                    for lineno in range(child.lineno, end_lineno + 1):
+                        line_to_class[lineno] = current_class
+                    _visit(child, current_class)
+                else:
+                    _visit(child, current_class)
+
+        _visit(tree, "")
+
+        # ── 3. Assign parent_symbol where possible ─────────────────────
+        assigned = 0
+        for sym in symbols:
+            if sym.parent_symbol:
+                continue  # tree-sitter already resolved this correctly — keep it
+            if sym.line_start and sym.line_start in line_to_class:
+                parent = line_to_class[sym.line_start]
+                if parent and parent != sym.name:
+                    sym.parent_symbol = parent
+                    if sym.kind == "function":
+                        sym.kind = "method"
+                    assigned += 1
+
+        return symbols
 
     @staticmethod
     def _guess_language(file_path: Optional[str], code: str) -> str:
@@ -8517,41 +8593,66 @@ class CodeBlockManager:
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """Extract fenced and indented code blocks from message content.
-        When tree-sitter is available, symbol extraction runs once on the whole
-        document BEFORE chunking, so that method→class membership is preserved.
-        Each block receives a 'precomputed_symbols' list of CodeSymbols that fall
-        within its line range.
+        When the inlet has already extracted full‑document symbols (silent
+        ingestion), we return a single block with all symbols – no need to
+        chunk with process().  This avoids process() failures and correctly
+        preserves parent_symbol for every method.
         """
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # Full-document symbol extraction (works on raw code, no fences needed).
-        full_doc_symbols = []
-        if HAS_TREE_SITTER:
-            try:
-                full_doc_symbols = await SignatureExtractor.extract_async(content, None)
-            except Exception:
-                full_doc_symbols = []
+        # ── Pre‑extracted symbols from the inlet (silent ingestion) ──
+        raw = getattr(self._f, "_raw_ingested_symbols", None)
+        if raw is not None:
+            self._f._raw_ingested_symbols = None  # use only once
+            lang = getattr(self._f, "_ingested_lang", None) or "python"
+            # Single block containing the whole document
+            block = {
+                "language": lang,
+                "code": content,
+                "type": "indented",
+                "precomputed_symbols": raw,
+            }
+            # Apply minimal post‑processing (file path & internal filter)
+            blk_file = None
+            if self._f.valves.track_file_paths:
+                # Try to extract a file path from the beginning of the content
+                blk_file = self.extract_file_paths(content)
+                blk_file = blk_file[0] if blk_file else None
+            if self._f.valves.exclude_filter_internals and blk_file:
+                if (
+                    "/app/backend/data/functions/" in blk_file
+                    or "open-webui/functions/" in blk_file
+                ):
+                    return [], []  # ignore internal code
+            block["file_path"] = blk_file
+            return [block], [(0, len(content))]
 
-        # tree-sitter attempt
+        # If we reach here, there are no pre‑extracted symbols.
+        # Perform the normal tree‑sitter / regex extraction.
+        ingested_lang = getattr(self._f, "_ingested_lang", None)
+
+        # tree‑sitter attempt
         if HAS_TREE_SITTER:
             try:
                 config = ProcessConfig()
+                if ingested_lang:
+                    try:
+                        config.language = ingested_lang
+                    except Exception:
+                        pass
                 ts_blocks = await anyio.to_thread.run_sync(
                     lambda: process(content, config)
                 )
-
-                # If the inlet told us the language, use it for ALL blocks
-                # instead of guessing from tiny fragments.
-                ingested_lang = getattr(self._f, "_ingested_lang", None)
+                if hasattr(ts_blocks, "blocks"):
+                    ts_blocks = ts_blocks.blocks
 
                 for tsb in ts_blocks:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
 
-                    # Determine language for this block
                     lang = tsb.language or "text"
                     if ingested_lang:
                         lang = ingested_lang
@@ -8573,32 +8674,14 @@ class CodeBlockManager:
                         code = raw
                         block_type = "indented"
 
-                    # Assign full-doc symbols whose line range falls inside this block.
-                    start_line = content.count("\n", 0, start) + 1
-                    end_line = content.count("\n", 0, end) + 1
-                    block_symbols = [
-                        s
-                        for s in full_doc_symbols
-                        if s.line_start and start_line <= s.line_start <= end_line
-                    ]
-
-                    blocks.append(
-                        {
-                            "language": lang,
-                            "code": code,
-                            "type": block_type,
-                            "precomputed_symbols": block_symbols,
-                        }
-                    )
+                    blocks.append({"language": lang, "code": code, "type": block_type})
                     spans.append((start, end))
 
-                # Clear the ingested language so later calls aren't affected.
                 if hasattr(self._f, "_ingested_lang"):
                     self._f._ingested_lang = None
 
                 if blocks:
-                    # Apply existing post-processing (file path extraction,
-                    # internal filter) while preserving 'precomputed_symbols'.
+                    # Post‑process (file path, internal filter)
                     processed_blocks = []
                     processed_spans = []
                     for idx, block in enumerate(blocks):
@@ -8625,14 +8708,12 @@ class CodeBlockManager:
             except Exception:
                 pass
 
-        # Regex fallback (unchanged) — no precomputed_symbols; the consumer
-        # will re-extract per fragment (class context lost, acceptable degradation).
+        # Regex fallback (unchanged)
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
             blocks.append({"language": lang, "code": code, "type": "fenced"})
             spans.append((match.start(), match.end()))
-        # indented blocks
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
@@ -8662,7 +8743,6 @@ class CodeBlockManager:
             end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
             spans.append((start_offset, end_offset))
 
-        # Post-processing for regex fallback (unchanged)
         processed_blocks = []
         processed_spans = []
         for idx, block in enumerate(blocks):
@@ -11458,7 +11538,9 @@ class ActiveCodeUpdater:
             new_blocks_pending.append(new_block)
 
         symbols_list = []
-        for blk, block_info in zip(new_blocks_pending, extracted_blocks):
+        for idx, (blk, block_info) in enumerate(
+            zip(new_blocks_pending, extracted_blocks)
+        ):
             precomputed = block_info.get("precomputed_symbols")
             if precomputed:
                 syms = precomputed
@@ -11591,16 +11673,19 @@ class ActiveCodeUpdater:
                     confidence=1.0,
                 )
                 self._f._symbol_index.add_edge(edge, project_id)
-            if self._f.valves.enable_data_flow_analysis and block.file_path:
-                df_edges = self._f._code_blocks.extract_data_flow_edges(
-                    block.content, block.file_path, project_id
+
+        # Data-flow edges: ONE full-file AST pass per block, not per symbol.
+        if self._f.valves.enable_data_flow_analysis and block.file_path:
+            df_edges = self._f._code_blocks.extract_data_flow_edges(
+                block.content, block.file_path, project_id
+            )
+            for df_edge in df_edges:
+                self._f._symbol_index.add_edge(df_edge, project_id)
+            if df_edges:
+                self._f._log_debug(
+                    f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
                 )
-                for df_edge in df_edges:
-                    self._f._symbol_index.add_edge(df_edge, project_id)
-                if df_edges:
-                    self._f._log_debug(
-                        f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
-                    )
+
         if self._f.tokenizer:
             block._cached_token_count = len(self._f.tokenizer.encode(block.content))
         else:
@@ -11624,16 +11709,19 @@ class ActiveCodeUpdater:
                     confidence=1.0,
                 )
                 self._f._symbol_index.add_edge(edge, project_id)
-            if self._f.valves.enable_data_flow_analysis and block.file_path:
-                df_edges = self._f._code_blocks.extract_data_flow_edges(
-                    block.content, block.file_path, project_id
+
+        # Data-flow edges: ONE full-file AST pass per block, not per symbol.
+        if self._f.valves.enable_data_flow_analysis and block.file_path:
+            df_edges = self._f._code_blocks.extract_data_flow_edges(
+                block.content, block.file_path, project_id
+            )
+            for df_edge in df_edges:
+                self._f._symbol_index.add_edge(df_edge, project_id)
+            if df_edges:
+                self._f._log_debug(
+                    f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
                 )
-                for df_edge in df_edges:
-                    self._f._symbol_index.add_edge(df_edge, project_id)
-                if df_edges:
-                    self._f._log_debug(
-                        f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
-                    )
+
         if self._f.tokenizer:
             block._cached_token_count = len(self._f.tokenizer.encode(block.content))
         else:
@@ -11656,7 +11744,7 @@ class ActiveCodeUpdater:
         new_block.symbols = syms
         new_block.last_mentioned_msg_idx = state["message_count"]
 
-        # Index symbols and edges
+        # Index symbols and call-graph edges (cheap, per-symbol is fine here)
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
 
@@ -11669,16 +11757,18 @@ class ActiveCodeUpdater:
                     confidence=1.0,
                 )
                 self._f._symbol_index.add_edge(edge, project_id)
-            if self._f.valves.enable_data_flow_analysis and new_block.file_path:
-                df_edges = self._f._code_blocks.extract_data_flow_edges(
-                    new_block.content, new_block.file_path, project_id
+
+        # Data-flow edges: ONE full-file AST pass per block, not per symbol.
+        if self._f.valves.enable_data_flow_analysis and new_block.file_path:
+            df_edges = self._f._code_blocks.extract_data_flow_edges(
+                new_block.content, new_block.file_path, project_id
+            )
+            for df_edge in df_edges:
+                self._f._symbol_index.add_edge(df_edge, project_id)
+            if df_edges:
+                self._f._log_debug(
+                    f"Data flow: {len(df_edges)} edge(s) extracted from {new_block.file_path}"
                 )
-                for df_edge in df_edges:
-                    self._f._symbol_index.add_edge(df_edge, project_id)
-                if df_edges:
-                    self._f._log_debug(
-                        f"Data flow: {len(df_edges)} edge(s) extracted from {new_block.file_path}"
-                    )
 
         if any(s.calls for s in syms):
             state["has_any_calls"] = True
@@ -11702,7 +11792,6 @@ class ActiveCodeUpdater:
                 if blk.file_path == new_block.file_path and not blk.pinned:
                     blk.obsolete = True
                     blk._update_importance()
-                    # bug #9 fix: remove symbols of the now‑obsolete block from the index
                     self._f._symbol_index.remove_all_for_block(
                         blk.hash, blk.symbols, project_id
                     )
@@ -15168,12 +15257,29 @@ class Filter:
             if await self._commands.is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
 
-                # ── Guardamos el lenguaje para que extract_code_blocks lo use
-                #     sin necesidad de adivinarlo desde fragmentos pequeños.
+                # ── Guardamos el lenguaje para que extract_code_blocks lo use ──
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
-                self._ingested_lang = (
-                    _guessed_lang if _guessed_lang != "unknown" else "python"
-                )
+                _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                self._ingested_lang = _lang
+
+                # ── Extraemos los símbolos del documento completo AHORA,
+                #     antes de que extract_code_blocks trocee el código.
+                raw_symbols = []
+                if HAS_TREE_SITTER:
+                    try:
+                        raw_symbols = await SignatureExtractor.extract_async(
+                            user_query, None, language=_lang
+                        )
+                    except Exception:
+                        raw_symbols = []
+
+                # ── Enriquecer con parent_symbol usando el AST ──
+                if raw_symbols:
+                    raw_symbols = SignatureExtractor.enrich_symbols_with_parent_info(
+                        raw_symbols, user_query
+                    )
+
+                self._raw_ingested_symbols = raw_symbols
 
                 # Pasamos el mensaje SIN envolver (el código crudo mantiene los
                 # números de línea correctos para la asignación de símbolos).
