@@ -11754,6 +11754,13 @@ class ActivationEngine:
         Delegates seed extraction and the single‑seed / multi‑seed construction
         to private helpers, keeping the top‑level logic easy to read.
         """
+        self._f._log_debug(
+            f"[PPR] build_activation_graph: query='{query[:100]}', "
+            f"project_id='{project_id}', "
+            f"max_steps={max_propagation_steps}, "
+            f"has_messages={bool(messages)}"
+        )
+
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
 
         # 1. Extract all seed symbols from the query and history
@@ -11761,8 +11768,15 @@ class ActivationEngine:
             self._prepare_seed_symbols(query, project_id, messages)
         )
 
+        self._f._log_debug(
+            f"[PPR] Seeds extracted: exact={len(exact_seeds)} ({exact_seeds[:5] if exact_seeds else 'none'}), "
+            f"partial={len(partial_seeds)} ({partial_seeds[:5] if partial_seeds else 'none'}), "
+            f"tb={len(tb_seeds)}, history={len(history_boosts)}"
+        )
+
         # 2. Build the activation graph in the appropriate mode
         if not self._f.valves.enable_multi_seed_activation:
+            self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
             ag = self._build_single_seed_graph(
                 exact_seeds,
                 partial_seeds,
@@ -11772,6 +11786,7 @@ class ActivationEngine:
                 project_id,
             )
         else:
+            self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
             ag = self._build_multi_seed_graph(
                 exact_seeds,
                 partial_seeds,
@@ -11783,6 +11798,13 @@ class ActivationEngine:
 
         # 3. Store scores for downstream consumers (LOD, prefetch, pager)
         self._store_activation_scores(ag, project_id)
+
+        activated = ag.get_activated_nodes(threshold=self._f.valves.path_activation_threshold)
+        self._f._log_debug(
+            f"[PPR] Activation complete: {len(activated)} nodes activated "
+            f"(threshold={self._f.valves.path_activation_threshold})"
+        )
+
         return ag
 
     # ═══════════════════════════════════════════════════════════════════════════
