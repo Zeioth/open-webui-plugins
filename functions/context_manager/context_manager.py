@@ -2611,9 +2611,6 @@ class ContextBuilder:
         _lod3_parts: List[str] = []
 
         # ── Batched LOD-2 docstring pre-resolution ──
-        # Same reasoning as the inventory listing: resolve all of this turn's
-        # missing LOD-2 docstrings in a handful of LLM calls up front, instead
-        # of one call per symbol inside the loop below.
         if self._f.valves.enable_auto_docstrings:
             lod2_candidates = [
                 node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
@@ -2639,9 +2636,6 @@ class ContextBuilder:
                     )
 
         # ── Cambio B: Batched LOD-2.5 CFG pre-resolution ──
-        # Gate: only when the intent (explicit refactor or debug) makes
-        # branch detail worth the extra ~80 tokens/symbol. Reuses the same
-        # score range as LOD2 — no extra graph traversal needed.
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
@@ -2650,8 +2644,19 @@ class ContextBuilder:
             cfg_candidates = [
                 node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
             ]
+            self._f._log_debug(
+                f"CFG gate TRIGGERED: use_case={active_use_case}, "
+                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"candidates={cfg_candidates}"
+            )
             if cfg_candidates:
                 await self._f._enrichment.ensure_cfg_batch(cfg_candidates, project_id)
+        else:
+            self._f._log_debug(
+                f"CFG gate NOT triggered: use_case={active_use_case}, "
+                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
+            )
 
         for node_id, score in sorted_nodes:
             if total_tokens >= budget:
@@ -2727,9 +2732,12 @@ class ContextBuilder:
                         or intent_vector.get("debug", 0.0)
                         >= self._f.valves.cfg_skeleton_debug_intent_threshold
                     ):
-                        cfg_skeleton = self._f._symbol_index.get_cfg(node_id, project_id) or ""
+                        cfg_skeleton = (
+                            self._f._symbol_index.get_cfg(node_id, project_id) or ""
+                        )
 
                     if cfg_skeleton:
+                        self._f._log_debug(f"💉 CFG injected for '{node_id}' (LOD2)")
                         text = f"`{sig}`"
                         if docstring:
                             text += f": {docstring}"
@@ -4208,6 +4216,13 @@ class SymbolIndex:
             "cfg_skeleton": "",  # NUEVO — lazy CFG skeleton (populated by ensure_cfg_batch)
             "cfg_body_hash": "",  # NUEVO — hash of the source body that generated cfg_skeleton
         }
+
+        # Log para confirmar que los campos CFG se han inicializado
+        logger.debug(
+            f"[CFG] SymbolIndex.add: initialized CFG fields for '{qid}' "
+            f"(kind={symbol.kind}, line_start={symbol.line_start}, line_end={symbol.line_end})"
+        )
+
         for callee in symbol.calls:
             callee_key = (project_id, callee)
             self._callee_to_callers[callee_key].add(qid)
@@ -4372,12 +4387,32 @@ class SymbolIndex:
         if key in self._symbol_meta:
             self._symbol_meta[key]["cfg_skeleton"] = cfg_skeleton
             self._symbol_meta[key]["cfg_body_hash"] = body_hash
+            logger.debug(
+                f"[CFG] SymbolIndex.update_cfg: stored CFG for '{qid}' "
+                f"(body_hash={body_hash}, skeleton_len={len(cfg_skeleton)} chars)"
+            )
+        else:
+            logger.debug(
+                f"[CFG] SymbolIndex.update_cfg: key '{qid}' NOT found in _symbol_meta — "
+                "CFG not stored (symbol may have been evicted)"
+            )
 
     def get_cfg(self, qid: str, project_id: str) -> Optional[str]:
         """Return the cached CFG skeleton for an exact qualified id, or None.
         No bare-name fallback — see update_cfg()."""
         meta = self._symbol_meta.get((project_id, qid))
-        return meta.get("cfg_skeleton") if meta else None
+        if meta:
+            skeleton = meta.get("cfg_skeleton")
+            if skeleton:
+                logger.debug(f"[CFG] SymbolIndex.get_cfg: found CFG for '{qid}'")
+                return skeleton
+            else:
+                logger.debug(
+                    f"[CFG] SymbolIndex.get_cfg: '{qid}' exists but cfg_skeleton is empty"
+                )
+        else:
+            logger.debug(f"[CFG] SymbolIndex.get_cfg: no metadata for '{qid}'")
+        return None
 
     def get_file_for_symbol(self, name_or_qid: str, project_id: str) -> Optional[str]:
         """File path for a symbol, or ``None``."""
@@ -5040,18 +5075,37 @@ class SignatureExtractor:
                         else node.text.decode("utf-8")
                     )
                     name = node.text.decode("utf-8")
+
+                    # --- FIX: usar parent para line_start/line_end ---
+                    # FIX original: node solo es el token @name (una línea)
+                    # parent es el nodo de definición completo.
+                    if parent:
+                        line_start = parent.start_point[0] + 1
+                        line_end = parent.end_point[0] + 1
+                    else:
+                        line_start = node.start_point[0] + 1
+                        line_end = node.end_point[0] + 1
+
+                    # Log para depuración – muestra qué rango de líneas se está asignando
+                    logger.debug(
+                        f"[EXTRACT] Symbol '{name}' kind={kind}: "
+                        f"line_start={line_start}, line_end={line_end} "
+                        f"(parent type={parent.type if parent else 'None'})"
+                    )
+
                     symbols.append(
                         CodeSymbol(
                             name=name,
                             kind=kind,
                             signature=sig,
                             file_path=file_path,
-                            line_start=node.start_point[0] + 1,
-                            line_end=node.end_point[0] + 1,
+                            line_start=line_start,
+                            line_end=line_end,
                             language=lang,
                             parent_symbol=parent_symbol,
                         )
                     )
+            logger.debug(f"[EXTRACT] Extracted {len(symbols)} symbols from {lang} code")
             return symbols
         except Exception as e:
             logger.warning(
@@ -5248,19 +5302,31 @@ class ControlFlowExtractor:
           - the function body has no control-flow nodes worth preserving.
         """
         if symbol.kind not in ("function", "method"):
+            logger.debug(
+                f"[CFG] SKIP: symbol kind is {symbol.kind}, not function/method"
+            )
             return None
         if not symbol.line_start or not symbol.line_end:
+            logger.debug(f"[CFG] SKIP: no line_start/line_end for {symbol.name}")
             return None
         if symbol.line_end - symbol.line_start > max_lines:
+            logger.debug(
+                f"[CFG] SKIP: line_count={symbol.line_end - symbol.line_start} > max_lines={max_lines}"
+            )
             return None
         if len(block_content.encode()) > ControlFlowExtractor.MAX_PARSE_SIZE_BYTES:
+            logger.debug(f"[CFG] SKIP: block_content exceeds MAX_PARSE_SIZE_BYTES")
             return None
 
         lines = block_content.split("\n")
         start_idx = max(0, symbol.line_start - 1)
         end_idx = min(len(lines), symbol.line_end)
         snippet = "\n".join(lines[start_idx:end_idx])
+
         if not snippet.strip():
+            logger.debug(
+                f"[CFG] SKIP: snippet is empty or whitespace only for {symbol.name}"
+            )
             return None
 
         body_hash = hashlib.md5(snippet.encode()).hexdigest()[:16]
@@ -5270,7 +5336,8 @@ class ControlFlowExtractor:
         dedented = textwrap.dedent(snippet)
         try:
             tree = ast.parse(dedented)
-        except SyntaxError:
+        except SyntaxError as e:
+            logger.debug(f"[CFG] PARSE ERROR: {symbol.name} – {e}")
             return None
 
         func_node = next(
@@ -5282,9 +5349,15 @@ class ControlFlowExtractor:
             None,
         )
         if func_node is None:
+            logger.debug(
+                f"[CFG] SKIP: no FunctionDef/AsyncFunctionDef node found for {symbol.name}"
+            )
             return None
 
         if not ControlFlowExtractor._has_control_flow(func_node):
+            logger.debug(
+                f"[CFG] SKIP: no control-flow (if/try/for/while) in body of {symbol.name}"
+            )
             return None  # nothing to compress — LOD2 docstring already suffices
 
         role_queue: List[Optional[str]] = []
@@ -5295,10 +5368,14 @@ class ControlFlowExtractor:
 
         try:
             skeleton = ast.unparse(func_node)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[CFG] SKIP: ast.unparse failed for {symbol.name} – {e}")
             return None
 
         skeleton = ControlFlowExtractor._inject_role_comments(skeleton, role_queue)
+        logger.debug(
+            f"[CFG] SUCCESS: CFG generated for {symbol.name} (body_hash={body_hash})"
+        )
         return skeleton, body_hash
 
     # ═══════════════════════════════════════════════════════════════════
@@ -5313,7 +5390,14 @@ class ControlFlowExtractor:
             if node is func_node:
                 continue
             if isinstance(node, (ast.If, ast.Try, ast.For, ast.While, ast.AsyncFor)):
+                logger.debug(
+                    f"[CFG] _has_control_flow: found control-flow node "
+                    f"'{type(node).__name__}' in function"
+                )
                 return True
+        logger.debug(
+            "[CFG] _has_control_flow: no control-flow nodes found (straight-line function)"
+        )
         return False
 
     # ═══════════════════════════════════════════════════════════════════
@@ -5338,31 +5422,62 @@ class ControlFlowExtractor:
         """
         out: List[ast.stmt] = []
         straight_run: List[ast.stmt] = []
+        total_stmts = len(stmts)
+        control_count = 0
+        call_count = 0
+        terminal_count = 0
+
+        logger.debug(f"[CFG] _compress_stmt_list: processing {total_stmts} statements")
 
         def _flush_run() -> None:
             if straight_run:
+                logger.debug(
+                    f"[CFG] _compress_stmt_list: flushing straight-run of "
+                    f"{len(straight_run)} statements"
+                )
                 out.append(ControlFlowExtractor._placeholder_for(straight_run))
                 straight_run.clear()
 
         for stmt in stmts:
             if isinstance(stmt, ast.If):
                 _flush_run()
+                control_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found If statement")
                 out.append(ControlFlowExtractor._compress_if(stmt, role_queue))
             elif isinstance(stmt, ast.Try):
                 _flush_run()
+                control_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found Try statement")
                 out.append(ControlFlowExtractor._compress_try(stmt, role_queue))
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
                 _flush_run()
+                control_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found Loop statement")
                 out.append(ControlFlowExtractor._compress_loop(stmt, role_queue))
             elif isinstance(stmt, (ast.Return, ast.Raise)):
                 _flush_run()
-                out.append(stmt)  # terminal — keep verbatim, it IS the signal
+                terminal_count += 1
+                logger.debug(
+                    "[CFG] _compress_stmt_list: found terminal statement (return/raise)"
+                )
+                out.append(stmt)  # terminal — keep verbatim
             elif ControlFlowExtractor._is_call_statement(stmt):
                 _flush_run()
+                call_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found call statement")
                 out.append(ControlFlowExtractor._call_placeholder(stmt))
             else:
                 straight_run.append(stmt)
         _flush_run()
+
+        logger.debug(
+            f"[CFG] _compress_stmt_list: completed - "
+            f"{len(out)} output statements, "
+            f"{control_count} control structures, "
+            f"{call_count} calls, "
+            f"{terminal_count} terminals"
+        )
+
         return out or [ast.Expr(value=ast.Constant(value=Ellipsis))]
 
     @staticmethod
@@ -5374,6 +5489,12 @@ class ControlFlowExtractor:
           - `elif` chains are preserved as nested `if` nodes.
           - Plain `else` blocks are compressed without role annotation.
         """
+        logger.debug(
+            f"[CFG] _compress_if: compressing If node "
+            f"(has_orelse={bool(node.orelse)}, "
+            f"body_len={len(node.body)})"
+        )
+
         role_queue.append(ControlFlowExtractor._classify_if_role(node))
         new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
 
@@ -5381,10 +5502,17 @@ class ControlFlowExtractor:
         if node.orelse:
             if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 # elif chain — recurse; the nested call appends its own role.
+                logger.debug(
+                    "[CFG] _compress_if: elif chain detected (single If in orelse)"
+                )
                 new_orelse = [
                     ControlFlowExtractor._compress_if(node.orelse[0], role_queue)
                 ]
             else:
+                logger.debug(
+                    f"[CFG] _compress_if: plain else block "
+                    f"(orelse length {len(node.orelse)})"
+                )
                 role_queue.append(None)  # plain `else:` — never guess
                 new_orelse = ControlFlowExtractor._compress_stmt_list(
                     node.orelse, role_queue
@@ -5392,6 +5520,11 @@ class ControlFlowExtractor:
 
         new_node = ast.If(test=node.test, body=new_body, orelse=new_orelse)
         ast.copy_location(new_node, node)
+        logger.debug(
+            f"[CFG] _compress_if: completed - "
+            f"body={len(new_body)} stmts, "
+            f"orelse={len(new_orelse)} stmts"
+        )
         return new_node
 
     @staticmethod
@@ -5402,11 +5535,19 @@ class ControlFlowExtractor:
           - Each `except` handler gets a role from `_classify_except_role`.
           - `else:` and `finally:` blocks are compressed without role annotation.
         """
+        logger.debug(
+            f"[CFG] _compress_try: compressing Try node - "
+            f"{len(node.handlers)} handlers, "
+            f"has_orelse={bool(node.orelse)}, "
+            f"has_finalbody={bool(node.finalbody)}"
+        )
+
         role_queue.append(None)  # the `try:` line itself never gets a role
         new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
 
         new_handlers: List[ast.ExceptHandler] = []
-        for handler in node.handlers:
+        for i, handler in enumerate(node.handlers):
+            logger.debug(f"[CFG] _compress_try: processing handler {i+1}")
             role_queue.append(ControlFlowExtractor._classify_except_role(handler))
             new_handler_body = ControlFlowExtractor._compress_stmt_list(
                 handler.body, role_queue
@@ -5419,12 +5560,14 @@ class ControlFlowExtractor:
 
         new_orelse: List[ast.stmt] = []
         if node.orelse:
+            logger.debug("[CFG] _compress_try: processing else block")
             new_orelse = ControlFlowExtractor._compress_stmt_list(
                 node.orelse, role_queue
             )
 
         new_finalbody: List[ast.stmt] = []
         if node.finalbody:
+            logger.debug("[CFG] _compress_try: processing finally block")
             role_queue.append(None)
             new_finalbody = ControlFlowExtractor._compress_stmt_list(
                 node.finalbody, role_queue
@@ -5437,6 +5580,13 @@ class ControlFlowExtractor:
             finalbody=new_finalbody,
         )
         ast.copy_location(new_node, node)
+        logger.debug(
+            f"[CFG] _compress_try: completed - "
+            f"body={len(new_body)} stmts, "
+            f"{len(new_handlers)} handlers, "
+            f"orelse={len(new_orelse)} stmts, "
+            f"finalbody={len(new_finalbody)} stmts"
+        )
         return new_node
 
     @staticmethod
@@ -5447,6 +5597,12 @@ class ControlFlowExtractor:
           - The body is compressed recursively.
           - An `else:` clause on the loop (if present) is compressed without role.
         """
+        loop_type = type(node).__name__
+        logger.debug(
+            f"[CFG] _compress_loop: compressing {loop_type} node "
+            f"(has_orelse={bool(node.orelse)})"
+        )
+
         role_queue.append(None)  # loops never get an automatic role in v1
         new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
         new_orelse = (
@@ -5463,6 +5619,12 @@ class ControlFlowExtractor:
             kwargs["test"] = node.test
         new_node = cls(**kwargs)
         ast.copy_location(new_node, node)
+
+        logger.debug(
+            f"[CFG] _compress_loop: completed {loop_type} - "
+            f"body={len(new_body)} stmts, "
+            f"orelse={len(new_orelse)} stmts"
+        )
         return new_node
 
     # ═══════════════════════════════════════════════════════════════════
@@ -5473,11 +5635,17 @@ class ControlFlowExtractor:
     def _is_call_statement(stmt: "ast.stmt") -> bool:
         """Return True if `stmt` is an expression statement or assignment
         whose right‑hand side is a function call."""
+        is_call = False
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            return True
-        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
-            return True
-        return False
+            is_call = True
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            is_call = True
+
+        if is_call:
+            logger.debug("[CFG] _is_call_statement: detected call statement")
+        else:
+            logger.debug("[CFG] _is_call_statement: not a call statement")
+        return is_call
 
     @staticmethod
     def _call_placeholder(stmt: "ast.stmt") -> "ast.stmt":
@@ -5486,6 +5654,13 @@ class ControlFlowExtractor:
         (that's LOD3 detail)."""
         call_node = stmt.value
         has_args = bool(call_node.args or call_node.keywords)
+
+        logger.debug(
+            f"[CFG] _call_placeholder: creating placeholder for call to "
+            f"'{ast.unparse(call_node.func)[:50]}' "
+            f"(has_args={has_args})"
+        )
+
         new_call = ast.Call(
             func=call_node.func,
             args=[ast.Constant(value=Ellipsis)] if has_args else [],
@@ -5502,6 +5677,10 @@ class ControlFlowExtractor:
     @staticmethod
     def _placeholder_for(straight_run: List["ast.stmt"]) -> "ast.stmt":
         """Collapse a run of non-control statements into a single `...`."""
+        logger.debug(
+            f"[CFG] _placeholder_for: collapsing straight-run of "
+            f"{len(straight_run)} statements to '...'"
+        )
         placeholder = ast.Expr(value=ast.Constant(value=Ellipsis))
         ast.copy_location(placeholder, straight_run[0])
         return placeholder
@@ -5527,13 +5706,32 @@ class ControlFlowExtractor:
         lines = skeleton_text.split("\n")
         queue = list(role_queue)
         out_lines = []
+        roles_assigned = 0
+
+        logger.debug(
+            f"[CFG] _inject_role_comments: {len(lines)} lines, "
+            f"{len(queue)} roles in queue"
+        )
+
         for line in lines:
             m = ControlFlowExtractor._CONTROL_LINE_RE.match(line)
             if m and queue:
                 role = queue.pop(0)
                 if role:
                     line = line.rstrip() + f"  # {role}"
+                    roles_assigned += 1
+                    logger.debug(
+                        f"[CFG] _inject_role_comments: assigned role '{role}' "
+                        f"to line: '{line[:60]}...'"
+                    )
+                else:
+                    logger.debug("[CFG] _inject_role_comments: skipped None role")
             out_lines.append(line)
+
+        logger.debug(
+            f"[CFG] _inject_role_comments: injected {roles_assigned} role comment(s), "
+            f"{len(queue)} roles remaining (should be 0 if queue matched lines)"
+        )
         return "\n".join(out_lines)
 
     @staticmethod
@@ -5541,11 +5739,31 @@ class ControlFlowExtractor:
         """'fast path' if the test mentions cache/memo AND the body returns
         directly. Any other `if` is left unlabeled — we never guess."""
         if not hasattr(ast, "unparse"):
+            logger.debug("[CFG] _classify_if_role: ast.unparse not available")
             return None
+
         test_src = ast.unparse(if_node.test)
         body_has_return = any(isinstance(s, ast.Return) for s in if_node.body)
+
+        logger.debug(
+            f"[CFG] _classify_if_role: test='{test_src[:80]}', "
+            f"body_has_return={body_has_return}"
+        )
+
         if body_has_return and ControlFlowExtractor._CACHE_HIT_RE.search(test_src):
+            logger.debug(
+                f"[CFG] _classify_if_role: MATCH fast path (test mentions cache/memo)"
+            )
             return "fast path"
+        else:
+            if not body_has_return:
+                logger.debug(
+                    "[CFG] _classify_if_role: no fast path (body does not return directly)"
+                )
+            elif not ControlFlowExtractor._CACHE_HIT_RE.search(test_src):
+                logger.debug(
+                    "[CFG] _classify_if_role: no fast path (test does not mention cache/memo)"
+                )
         return None
 
     @staticmethod
@@ -5558,9 +5776,18 @@ class ControlFlowExtractor:
         has_return_value = any(
             isinstance(s, ast.Return) and s.value is not None for s in handler.body
         )
+
+        logger.debug(
+            f"[CFG] _classify_except_role: has_raise={has_raise}, "
+            f"has_return_value={has_return_value}"
+        )
+
         if has_return_value and not has_raise:
+            logger.debug("[CFG] _classify_except_role: MATCH fallback path")
             return "fallback path"
-        return "error path"
+        else:
+            logger.debug("[CFG] _classify_except_role: MATCH error path")
+            return "error path"
 
 
 class StateStore:
@@ -13071,6 +13298,7 @@ class EnrichmentTasks:
         that fail to parse, are silently absent — the caller falls back to the
         existing LOD2 tier (signature + docstring) for those.
         """
+        self._f._log_debug(f"CFG batch: invoked with {len(qids)} candidate(s): {qids}")
         state = self._f._state_store.get_state(project_id)
         resolved: Dict[str, str] = {}
 
@@ -13085,8 +13313,14 @@ class EnrichmentTasks:
         for qid in qids:
             sym, block = _find_symbol_and_block(qid)
             if sym is None or block is None:
+                self._f._log_debug(
+                    f"CFG batch: '{qid}' NOT FOUND in active_blocks — skipping"
+                )
                 continue
             if not sym.line_start or not sym.line_end:
+                self._f._log_debug(
+                    f"CFG batch: '{qid}' has no line_start/line_end — skipping"
+                )
                 continue
 
             lines = block.content.split("\n")
@@ -13097,6 +13331,7 @@ class EnrichmentTasks:
             cached_skeleton = meta.get("cfg_skeleton", "")
             cached_hash = meta.get("cfg_body_hash", "")
             if cached_skeleton and cached_hash == current_hash:
+                self._f._log_debug(f"CFG batch: '{qid}' cache HIT")
                 resolved[qid] = cached_skeleton
                 continue
 
@@ -13104,8 +13339,15 @@ class EnrichmentTasks:
                 block.content, sym, max_lines=self._f.valves.cfg_skeleton_max_lines
             )
             if result is None:
+                self._f._log_debug(
+                    f"CFG batch: '{qid}' extractor returned None "
+                    "(no control-flow, parse error, or exceeds max_lines)"
+                )
                 continue
             skeleton, body_hash = result
+            self._f._log_debug(
+                f"CFG batch: '{qid}' skeleton generated ({len(skeleton)} chars)"
+            )
             self._f._symbol_index.update_cfg(qid, project_id, skeleton, body_hash)
             resolved[qid] = skeleton
 
@@ -13117,7 +13359,9 @@ class EnrichmentTasks:
                     (pid, q, s, h, time.time()),
                 )
             )
+            self._f._log_debug(f"CFG batch: persisted '{qid}' (body_hash={body_hash})")
 
+        self._f._log_debug(f"CFG batch: resolved {len(resolved)}/{len(qids)}")
         return resolved
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -13191,7 +13435,47 @@ class EnrichmentTasks:
             if not docstring_text or not docstring_text.strip():
                 return
 
-            docstring_text = docstring_text.strip()
+            # ── FIX: parse the response to extract only the docstring ──
+            # The LLM may include reasoning or extra text. Extract the first
+            # line that matches the expected format, or use the first non-empty line.
+            lines = docstring_text.strip().splitlines()
+            docstring = None
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # If it matches "name: description", use it directly
+                if re.match(r"^\s*[A-Za-z_][\w.]*\s*:", stripped):
+                    docstring = stripped
+                    break
+                # Otherwise, treat the first meaningful line as the docstring
+                if len(stripped) > 10:
+                    docstring = stripped
+                    break
+
+            if not docstring:
+                self._f._log_debug(
+                    f"Background docstring: no valid docstring extracted for '{name}'"
+                )
+                return
+
+            # Clean up: remove any leading "name:" prefix if present (batch format)
+            if re.match(r"^\s*[A-Za-z_][\w.]*\s*:", docstring):
+                docstring = re.sub(
+                    r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1
+                )
+
+            # Truncate to one sentence (first sentence, max 200 chars)
+            docstring = docstring[:200].strip()
+            if docstring.endswith("."):
+                pass  # keep it
+            else:
+                # Try to split on . or ? or ! but keep it safe
+                first_sentence = re.split(r"[.!?]\s", docstring, maxsplit=1)[0]
+                if first_sentence and len(first_sentence) > 10:
+                    docstring = first_sentence + "."
+
+            docstring_text = docstring
 
             # Acquire the project lock to safely update state and index
             lock = await self._f._state_store.get_project_lock(project_id)
@@ -13211,7 +13495,7 @@ class EnrichmentTasks:
                                 qid, project_id, docstring_text
                             )
 
-                            # Persist to SQLite (qid is guaranteed to be defined here)
+                            # Persist to SQLite
                             await self._f._state_store._db_enqueue(
                                 lambda q=qid, d=docstring_text, pid=project_id: self._f._db_conn.execute(
                                     "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
@@ -13222,13 +13506,11 @@ class EnrichmentTasks:
 
                     self._f._state_store.set_state(project_id, state)
                 else:
-                    # Block disappeared between snapshot and execution
                     self._f._log_debug(
                         f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
                     )
 
         except Exception as e:
-            # Log the error but do NOT retry — prevents infinite loops
             self._f._log_debug(
                 f"❌ Docstring generation failed for '{name}' (line {line_start}): {e}"
             )
