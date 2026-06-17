@@ -1413,7 +1413,7 @@ class ContextPager:
 
         Returns None if the block cannot be reconstructed from either source.
         """
-        if not this.is_paged(block_hash, project_id):
+        if not self.is_paged(block_hash, project_id):
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
@@ -12475,150 +12475,7 @@ class EnrichmentTasks:
         return contradiction, cached, duplicate
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Turn-based window management
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _apply_turn_based_window(
-        self,
-        messages: List[dict],
-        state: dict,
-        project_id: str,
-        slot_free: bool,
-    ) -> List[dict]:
-        """
-        Summarize turns past `summarize_after_turns` and evict raw turns past
-        `evict_raw_after_turns`, enforcing the no-degradation guard: a raw turn
-        is dropped from the prompt only when `summarized_turn_hwm` already covers
-        it (i.e. a persisted summary + LTM copy exists).
-
-        Idempotent: the turn count is derived from the message list each call;
-        `summarized_turn_hwm` is the only persisted bookkeeping. Returns the
-        (possibly reduced) message list. Summary generation is skipped when
-        `slot_free` is False to avoid dirtying the KV slot during AutoContinue;
-        eviction of already-covered turns still proceeds (no LLM needed).
-        """
-        if not self._f.valves.enable_turn_based_eviction:
-            return messages
-
-        # #16/P7: never compact mid-AutoContinue — rewriting history during
-        # multi-part code generation breaks the KV cache at the worst moment.
-        if (
-            self._f.valves.compaction_defer_during_autocontinue
-            and self._is_autocontinue_active(messages)
-        ):
-            self._f._log_debug(
-                "Turn-based compaction deferred: AutoContinue session active"
-            )
-            return messages
-
-        summarize_after = self._f.valves.summarize_after_turns
-        evict_after = self._f.valves.evict_raw_after_turns
-
-        # Config sanity: eviction window must be strictly older than summary window
-        if evict_after <= summarize_after:
-            self._f._log_debug(
-                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
-                "skipping window this request."
-            )
-            return messages
-
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        history = [m for m in messages if m.get("role") != "system"]
-        if not history:
-            return messages
-
-        turns, total_turns = self._index_turns(history)
-        if total_turns <= summarize_after:
-            return messages  # nothing old enough yet
-
-        # ── Step 1: summarize the unsummarized band, in batches ───────────
-        summarize_target = (
-            total_turns - summarize_after
-        )  # turns ≤ this must be summarized
-        hwm = state.get("summarized_turn_hwm", 0)
-
-        if (
-            slot_free
-            and summarize_target > hwm
-            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
-        ):
-            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
-            if band:
-                has_code = any("```" in m.get("content", "") for m in band)
-                summary = await self._f._history_compressor.summarize_messages(
-                    band, is_code_context=has_code
-                )
-                if summary:
-                    state["conversation_summaries"].append(
-                        {
-                            "text": summary,
-                            "created_at": time.time(),
-                            "covers_msgs": len(band),
-                            "covers_turns": [hwm + 1, summarize_target],
-                        }
-                    )
-                    await self._persist_turn_summary_to_ltm(
-                        summary, project_id, hwm + 1, summarize_target
-                    )
-                    # Hierarchical consolidation + level-aware cap (replaces the
-                    # flat cap). Folds oldest L1 summaries into an L2 so broad
-                    # coverage survives the cap; also persists state.
-                    await self._consolidate_summaries(state, project_id, slot_free)
-                    state["summarized_turn_hwm"] = summarize_target
-                    self._f._state_store.set_state(project_id, state)
-                    self._f._log_debug(
-                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
-                        f"({len(band)} msgs); HWM now {summarize_target}."
-                    )
-                else:
-                    self._f._log_debug(
-                        "Turn-based: summary generation failed — raw turns kept "
-                        "(no-degradation guard, HWM unchanged)."
-                    )
-
-        # ── Step 2: evict raw turns past the eviction window, if covered ──
-        evict_target = total_turns - evict_after  # turns ≤ this may be dropped
-        current_hwm = state.get("summarized_turn_hwm", 0)
-        if evict_target > 0 and current_hwm >= evict_target:
-            kept = [m for m, t in zip(history, turns) if t > evict_target]
-            dropped = len(history) - len(kept)
-            if dropped:
-                self._f._log_debug(
-                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
-                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
-                )
-            history = kept
-        elif evict_target > 0:
-            self._f._log_debug(
-                f"Turn-based: eviction deferred — summaries cover up to turn "
-                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
-            )
-
-        return sys_msgs + history
-
-    @staticmethod
-    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
-        """Assign a 1‑based turn number to each history message."""
-        turn = 0
-        per_msg: List[int] = []
-        for m in history:
-            if m.get("role") == "user":
-                turn += 1
-            per_msg.append(turn)
-        return per_msg, turn
-
-    def _is_autocontinue_active(self, messages: List[dict]) -> bool:
-        """True if the last assistant message ended with a multi‑part continuation marker."""
-        last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        if not last_assistant:
-            return False
-        content = last_assistant.get("content", "")
-        return any(marker in content for marker in self._f._MULTI_PHASE_MARKERS)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Docstring generation (batch and background)
+    # 6. Docstring generation (batch and background)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
@@ -12768,6 +12625,10 @@ class EnrichmentTasks:
                 )
 
         return resolved
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. Background docstring loop
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def cancel_docstring_tasks(self) -> None:
         """
