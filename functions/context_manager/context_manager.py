@@ -2562,6 +2562,9 @@ class ContextBuilder:
         lod2 *= scale
         lod1 *= scale
 
+        # ── Cambio A: Move classify_use_case here (was near the end) ──
+        active_use_case, _ = self.classify_use_case(query, intent_vector)
+
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
         total_tokens = 0
         budget = self._f.valves.active_context_max_tokens or 32000
@@ -2635,6 +2638,21 @@ class ContextBuilder:
                         missing, project_id
                     )
 
+        # ── Cambio B: Batched LOD-2.5 CFG pre-resolution ──
+        # Gate: only when the intent (explicit refactor or debug) makes
+        # branch detail worth the extra ~80 tokens/symbol. Reuses the same
+        # score range as LOD2 — no extra graph traversal needed.
+        if self._f.valves.enable_cfg_skeletons and (
+            active_use_case == "D"
+            or intent_vector.get("debug", 0.0)
+            >= self._f.valves.cfg_skeleton_debug_intent_threshold
+        ):
+            cfg_candidates = [
+                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+            ]
+            if cfg_candidates:
+                await self._f._enrichment.ensure_cfg_batch(cfg_candidates, project_id)
+
         for node_id, score in sorted_nodes:
             if total_tokens >= budget:
                 break
@@ -2701,10 +2719,25 @@ class ContextBuilder:
                         ),
                         "",
                     )
-                    # ── Lazy docstring generation has been moved to the
-                    # batched pre-pass above; docstring is already filled in.
-                    text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
-                    tok = len(text) // 4 + 2
+
+                    # ── Cambio C: Use CFG if available ──
+                    cfg_skeleton = ""
+                    if self._f.valves.enable_cfg_skeletons and (
+                        active_use_case == "D"
+                        or intent_vector.get("debug", 0.0)
+                        >= self._f.valves.cfg_skeleton_debug_intent_threshold
+                    ):
+                        cfg_skeleton = self._f._symbol_index.get_cfg(node_id, project_id) or ""
+
+                    if cfg_skeleton:
+                        text = f"`{sig}`"
+                        if docstring:
+                            text += f": {docstring}"
+                        text += f"\n```python\n{cfg_skeleton}\n```"
+                    else:
+                        text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
+
+                    tok = self._f._tokens.estimate_code_tokens(text)
                     if total_tokens + tok > budget:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
@@ -2788,7 +2821,9 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # Determine active use case for skeleton tier suppression logic
-        active_use_case, _ = self.classify_use_case(query, intent_vector)
+        # (Cambio A: this line is now unused because active_use_case was
+        # already defined above, so we remove the duplicate assignment)
+        # active_use_case, _ = self.classify_use_case(query, intent_vector)  # ← ELIMINADA
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
         suppress_sigs = (
@@ -4170,6 +4205,8 @@ class SymbolIndex:
             "parent_symbol": symbol.parent_symbol
             or (prev.get("parent_symbol", "") if prev else ""),
             "line_start": symbol.line_start,
+            "cfg_skeleton": "",  # NUEVO — lazy CFG skeleton (populated by ensure_cfg_batch)
+            "cfg_body_hash": "",  # NUEVO — hash of the source body that generated cfg_skeleton
         }
         for callee in symbol.calls:
             callee_key = (project_id, callee)
@@ -4319,6 +4356,28 @@ class SymbolIndex:
         """One-line docstring for a symbol, or ``""``."""
         meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("docstring", "") if meta else ""
+
+    def update_cfg(
+        self, qid: str, project_id: str, cfg_skeleton: str, body_hash: str
+    ) -> None:
+        """
+        Store a symbol's control-flow skeleton and the body_hash it was derived
+        from. Unlike update_docstring, this ONLY updates an exact qualified-id
+        match — never a bare-name fallback. A CFG skeleton is specific to one
+        concrete function body; applying it to "every symbol sharing this bare
+        name" (as update_docstring does for resilience) would silently show the
+        wrong control flow for a same-named method in a different class.
+        """
+        key = (project_id, qid)
+        if key in self._symbol_meta:
+            self._symbol_meta[key]["cfg_skeleton"] = cfg_skeleton
+            self._symbol_meta[key]["cfg_body_hash"] = body_hash
+
+    def get_cfg(self, qid: str, project_id: str) -> Optional[str]:
+        """Return the cached CFG skeleton for an exact qualified id, or None.
+        No bare-name fallback — see update_cfg()."""
+        meta = self._symbol_meta.get((project_id, qid))
+        return meta.get("cfg_skeleton") if meta else None
 
     def get_file_for_symbol(self, name_or_qid: str, project_id: str) -> Optional[str]:
         """File path for a symbol, or ``None``."""
@@ -5136,6 +5195,374 @@ class SignatureExtractor:
             pass
 
 
+class ControlFlowExtractor:
+    """
+    Extracts a compressed control-flow skeleton for a single function or
+    method, deterministically and without any LLM call.
+
+    For a function body, this:
+      1. Replaces straight-line statement runs with `...` (same spirit as
+         ContextBuilder._skeletonize_node), but PRESERVES control structures
+         (if/elif/else, try/except/finally, for, while) and the calls that
+         sit directly inside them.
+      2. Annotates branches with a deterministic role comment when a
+         heuristic matches confidently (error path, fallback path, fast
+         path). Branches that match nothing are left unannotated.
+      3. Computes a body_hash from the exact source snippet
+         [line_start, line_end] so the skeleton can be invalidated
+         independently of sibling symbols in the same block and
+         independently of the function's signature.
+
+    Python only — see module-level discussion for why runtime
+    instrumentation and bytecode introspection are not viable here
+    (CodeAware never executes user-pasted code; many snippets are not even
+    importable).
+    """
+
+    MAX_PARSE_SIZE_BYTES = SignatureExtractor.MAX_PARSE_SIZE_BYTES
+
+    _CACHE_HIT_RE = re.compile(r"\b(cache|cached|memo)\w*\b", re.IGNORECASE)
+
+    _CONTROL_LINE_RE = re.compile(
+        r"^(\s*)(if\b|elif\b|else:|try:|except\b.*:|finally:|for\b|while\b|async for\b)"
+    )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 1. Public entry point
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def extract_for_symbol(
+        block_content: str,
+        symbol: "CodeSymbol",
+        max_lines: int = 40,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Build the control-flow skeleton for one symbol.
+
+        Returns (cfg_skeleton, body_hash), or None if:
+          - the symbol isn't a function/method, or has no line_start/line_end;
+          - the snippet exceeds max_lines (very long functions don't produce
+            a "compressed" skeleton — they produce another wall of text);
+          - the snippet doesn't parse as valid Python after dedent;
+          - the function body has no control-flow nodes worth preserving.
+        """
+        if symbol.kind not in ("function", "method"):
+            return None
+        if not symbol.line_start or not symbol.line_end:
+            return None
+        if symbol.line_end - symbol.line_start > max_lines:
+            return None
+        if len(block_content.encode()) > ControlFlowExtractor.MAX_PARSE_SIZE_BYTES:
+            return None
+
+        lines = block_content.split("\n")
+        start_idx = max(0, symbol.line_start - 1)
+        end_idx = min(len(lines), symbol.line_end)
+        snippet = "\n".join(lines[start_idx:end_idx])
+        if not snippet.strip():
+            return None
+
+        body_hash = hashlib.md5(snippet.encode()).hexdigest()[:16]
+
+        # A method snippet sliced out of a class body starts indented
+        # (e.g. "    def foo(...):"); dedent before parsing.
+        dedented = textwrap.dedent(snippet)
+        try:
+            tree = ast.parse(dedented)
+        except SyntaxError:
+            return None
+
+        func_node = next(
+            (
+                n
+                for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            None,
+        )
+        if func_node is None:
+            return None
+
+        if not ControlFlowExtractor._has_control_flow(func_node):
+            return None  # nothing to compress — LOD2 docstring already suffices
+
+        role_queue: List[Optional[str]] = []
+        func_node.body = ControlFlowExtractor._compress_stmt_list(
+            func_node.body, role_queue
+        )
+        ast.fix_missing_locations(func_node)
+
+        try:
+            skeleton = ast.unparse(func_node)
+        except Exception:
+            return None
+
+        skeleton = ControlFlowExtractor._inject_role_comments(skeleton, role_queue)
+        return skeleton, body_hash
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 2. Control-flow detection
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _has_control_flow(func_node: "ast.AST") -> bool:
+        """True if the function body contains at least one branch worth
+        preserving. A straight-line function gets no CFG tier."""
+        for node in ast.walk(func_node):
+            if node is func_node:
+                continue
+            if isinstance(node, (ast.If, ast.Try, ast.For, ast.While, ast.AsyncFor)):
+                return True
+        return False
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 3. Body compression (recursive AST rewrite)
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _compress_stmt_list(
+        stmts: List["ast.stmt"], role_queue: List[Optional[str]]
+    ) -> List["ast.stmt"]:
+        """
+        Compress a list of statements by collapsing straight‑line runs into `...`,
+        while preserving control‑flow statements (if, try, for, while) and
+        call statements that appear as direct expressions.
+
+        The `role_queue` is appended to during traversal in the same order that
+        control‑keyword lines will appear in the final text output, enabling
+        correct role comment injection after unparse().
+
+        Returns a new list of AST statements with the same structure but with
+        all non‑control bodies replaced by `...` or call placeholders.
+        """
+        out: List[ast.stmt] = []
+        straight_run: List[ast.stmt] = []
+
+        def _flush_run() -> None:
+            if straight_run:
+                out.append(ControlFlowExtractor._placeholder_for(straight_run))
+                straight_run.clear()
+
+        for stmt in stmts:
+            if isinstance(stmt, ast.If):
+                _flush_run()
+                out.append(ControlFlowExtractor._compress_if(stmt, role_queue))
+            elif isinstance(stmt, ast.Try):
+                _flush_run()
+                out.append(ControlFlowExtractor._compress_try(stmt, role_queue))
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                _flush_run()
+                out.append(ControlFlowExtractor._compress_loop(stmt, role_queue))
+            elif isinstance(stmt, (ast.Return, ast.Raise)):
+                _flush_run()
+                out.append(stmt)  # terminal — keep verbatim, it IS the signal
+            elif ControlFlowExtractor._is_call_statement(stmt):
+                _flush_run()
+                out.append(ControlFlowExtractor._call_placeholder(stmt))
+            else:
+                straight_run.append(stmt)
+        _flush_run()
+        return out or [ast.Expr(value=ast.Constant(value=Ellipsis))]
+
+    @staticmethod
+    def _compress_if(node: "ast.If", role_queue: List[Optional[str]]) -> "ast.If":
+        """
+        Compress an `if` statement:
+          - The `if` line itself gets a role from `_classify_if_role`.
+          - The body is compressed recursively.
+          - `elif` chains are preserved as nested `if` nodes.
+          - Plain `else` blocks are compressed without role annotation.
+        """
+        role_queue.append(ControlFlowExtractor._classify_if_role(node))
+        new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
+
+        new_orelse: List[ast.stmt] = []
+        if node.orelse:
+            if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                # elif chain — recurse; the nested call appends its own role.
+                new_orelse = [
+                    ControlFlowExtractor._compress_if(node.orelse[0], role_queue)
+                ]
+            else:
+                role_queue.append(None)  # plain `else:` — never guess
+                new_orelse = ControlFlowExtractor._compress_stmt_list(
+                    node.orelse, role_queue
+                )
+
+        new_node = ast.If(test=node.test, body=new_body, orelse=new_orelse)
+        ast.copy_location(new_node, node)
+        return new_node
+
+    @staticmethod
+    def _compress_try(node: "ast.Try", role_queue: List[Optional[str]]) -> "ast.Try":
+        """
+        Compress a `try` statement:
+          - The `try:` line gets no role (queue None).
+          - Each `except` handler gets a role from `_classify_except_role`.
+          - `else:` and `finally:` blocks are compressed without role annotation.
+        """
+        role_queue.append(None)  # the `try:` line itself never gets a role
+        new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
+
+        new_handlers: List[ast.ExceptHandler] = []
+        for handler in node.handlers:
+            role_queue.append(ControlFlowExtractor._classify_except_role(handler))
+            new_handler_body = ControlFlowExtractor._compress_stmt_list(
+                handler.body, role_queue
+            )
+            new_handler = ast.ExceptHandler(
+                type=handler.type, name=handler.name, body=new_handler_body
+            )
+            ast.copy_location(new_handler, handler)
+            new_handlers.append(new_handler)
+
+        new_orelse: List[ast.stmt] = []
+        if node.orelse:
+            new_orelse = ControlFlowExtractor._compress_stmt_list(
+                node.orelse, role_queue
+            )
+
+        new_finalbody: List[ast.stmt] = []
+        if node.finalbody:
+            role_queue.append(None)
+            new_finalbody = ControlFlowExtractor._compress_stmt_list(
+                node.finalbody, role_queue
+            )
+
+        new_node = ast.Try(
+            body=new_body,
+            handlers=new_handlers,
+            orelse=new_orelse,
+            finalbody=new_finalbody,
+        )
+        ast.copy_location(new_node, node)
+        return new_node
+
+    @staticmethod
+    def _compress_loop(node, role_queue: List[Optional[str]]):
+        """
+        Compress a `for`, `async for`, or `while` loop:
+          - The loop header line gets no role (queue None).
+          - The body is compressed recursively.
+          - An `else:` clause on the loop (if present) is compressed without role.
+        """
+        role_queue.append(None)  # loops never get an automatic role in v1
+        new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
+        new_orelse = (
+            ControlFlowExtractor._compress_stmt_list(node.orelse, role_queue)
+            if node.orelse
+            else []
+        )
+        cls = type(node)
+        kwargs = dict(body=new_body, orelse=new_orelse)
+        if hasattr(node, "target"):
+            kwargs["target"] = node.target
+            kwargs["iter"] = node.iter
+        if hasattr(node, "test"):
+            kwargs["test"] = node.test
+        new_node = cls(**kwargs)
+        ast.copy_location(new_node, node)
+        return new_node
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 4. Call & straight-run placeholders
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _is_call_statement(stmt: "ast.stmt") -> bool:
+        """Return True if `stmt` is an expression statement or assignment
+        whose right‑hand side is a function call."""
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            return True
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            return True
+        return False
+
+    @staticmethod
+    def _call_placeholder(stmt: "ast.stmt") -> "ast.stmt":
+        """Keep the call's name, drop its arguments to `...` — the point is
+        showing WHICH call happens in WHICH branch, not its exact inputs
+        (that's LOD3 detail)."""
+        call_node = stmt.value
+        has_args = bool(call_node.args or call_node.keywords)
+        new_call = ast.Call(
+            func=call_node.func,
+            args=[ast.Constant(value=Ellipsis)] if has_args else [],
+            keywords=[],
+        )
+        ast.copy_location(new_call, call_node)
+        if isinstance(stmt, ast.Assign):
+            new_stmt = ast.Assign(targets=stmt.targets, value=new_call)
+        else:
+            new_stmt = ast.Expr(value=new_call)
+        ast.copy_location(new_stmt, stmt)
+        return new_stmt
+
+    @staticmethod
+    def _placeholder_for(straight_run: List["ast.stmt"]) -> "ast.stmt":
+        """Collapse a run of non-control statements into a single `...`."""
+        placeholder = ast.Expr(value=ast.Constant(value=Ellipsis))
+        ast.copy_location(placeholder, straight_run[0])
+        return placeholder
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 5. Role comment injection (post-unparse text pass)
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _inject_role_comments(
+        skeleton_text: str, role_queue: List[Optional[str]]
+    ) -> str:
+        """
+        ast.unparse() drops comments entirely (they aren't part of the AST).
+        This walks the unparsed text in order and, for each control-keyword
+        line, pops the next role from role_queue (collected during the same
+        pre-order walk that produced the text) and appends it as a comment.
+
+        Safe because we never reorder statements — only truncate bodies —
+        so textual top-to-bottom order of control lines matches the
+        pre-order AST walk order exactly.
+        """
+        lines = skeleton_text.split("\n")
+        queue = list(role_queue)
+        out_lines = []
+        for line in lines:
+            m = ControlFlowExtractor._CONTROL_LINE_RE.match(line)
+            if m and queue:
+                role = queue.pop(0)
+                if role:
+                    line = line.rstrip() + f"  # {role}"
+            out_lines.append(line)
+        return "\n".join(out_lines)
+
+    @staticmethod
+    def _classify_if_role(if_node: "ast.If") -> Optional[str]:
+        """'fast path' if the test mentions cache/memo AND the body returns
+        directly. Any other `if` is left unlabeled — we never guess."""
+        if not hasattr(ast, "unparse"):
+            return None
+        test_src = ast.unparse(if_node.test)
+        body_has_return = any(isinstance(s, ast.Return) for s in if_node.body)
+        if body_has_return and ControlFlowExtractor._CACHE_HIT_RE.search(test_src):
+            return "fast path"
+        return None
+
+    @staticmethod
+    def _classify_except_role(handler: "ast.ExceptHandler") -> str:
+        """'fallback path' if the handler returns an alternative value without
+        re-raising; 'error path' in any other case (includes re-raise, log +
+        pass, etc.). Unlike _classify_if_role, an except ALWAYS receives a role
+        — there is no real ambiguity about whether an except is error handling."""
+        has_raise = any(isinstance(s, ast.Raise) for s in handler.body)
+        has_return_value = any(
+            isinstance(s, ast.Return) and s.value is not None for s in handler.body
+        )
+        if has_return_value and not has_raise:
+            return "fallback path"
+        return "error path"
+
+
 class StateStore:
     """Persistent conversation state backed by SQLite, with an async write
     queue and per‑project reentrant locks.
@@ -5384,6 +5811,16 @@ class StateStore:
                 symbol_name TEXT NOT NULL,
                 docstring    TEXT NOT NULL,
                 updated_at  REAL NOT NULL,
+                PRIMARY KEY (project_id, symbol_name)
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_cfg (
+                project_id   TEXT NOT NULL,
+                symbol_name  TEXT NOT NULL,
+                cfg_skeleton TEXT NOT NULL,
+                body_hash    TEXT NOT NULL,
+                updated_at   REAL NOT NULL,
                 PRIMARY KEY (project_id, symbol_name)
             )
         """)
@@ -12615,6 +13052,74 @@ class EnrichmentTasks:
 
         return resolved
 
+    async def ensure_cfg_batch(
+        self, qids: List[str], project_id: str
+    ) -> Dict[str, str]:
+        """
+        Resolve control-flow skeletons for many symbols, identified by their
+        QUALIFIED id. Pure CPU, deterministic, no LLM call — unlike
+        ensure_docstrings_batch there is no network round trip to batch away;
+        "batch" here just means "resolve N symbols under one state read instead
+        of N reads."
+
+        Cache hits (already in _symbol_meta with a matching body_hash) are free.
+        Cache misses are recomputed via ControlFlowExtractor.extract_for_symbol
+        and persisted to SQLite for observability.
+
+        Returns {qid: cfg_skeleton} for every qid that has (or now has) a
+        non-empty skeleton. Symbols with no control-flow worth preserving, or
+        that fail to parse, are silently absent — the caller falls back to the
+        existing LOD2 tier (signature + docstring) for those.
+        """
+        state = self._f._state_store.get_state(project_id)
+        resolved: Dict[str, str] = {}
+
+        def _find_symbol_and_block(qid: str):
+            """Locate the CodeSymbol and its block by qualified id."""
+            for block in state["active_blocks"].values():
+                for sym in block.symbols:
+                    if qualify_symbol_name(sym.name, sym.parent_symbol) == qid:
+                        return sym, block
+            return None, None
+
+        for qid in qids:
+            sym, block = _find_symbol_and_block(qid)
+            if sym is None or block is None:
+                continue
+            if not sym.line_start or not sym.line_end:
+                continue
+
+            lines = block.content.split("\n")
+            snippet = "\n".join(lines[max(0, sym.line_start - 1) : sym.line_end])
+            current_hash = hashlib.md5(snippet.encode()).hexdigest()[:16]
+
+            meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
+            cached_skeleton = meta.get("cfg_skeleton", "")
+            cached_hash = meta.get("cfg_body_hash", "")
+            if cached_skeleton and cached_hash == current_hash:
+                resolved[qid] = cached_skeleton
+                continue
+
+            result = ControlFlowExtractor.extract_for_symbol(
+                block.content, sym, max_lines=self._f.valves.cfg_skeleton_max_lines
+            )
+            if result is None:
+                continue
+            skeleton, body_hash = result
+            self._f._symbol_index.update_cfg(qid, project_id, skeleton, body_hash)
+            resolved[qid] = skeleton
+
+            await self._f._state_store._db_enqueue(
+                lambda q=qid, s=skeleton, h=body_hash, pid=project_id: self._f._db_conn.execute(
+                    "INSERT OR REPLACE INTO symbol_cfg "
+                    "(project_id, symbol_name, cfg_skeleton, body_hash, updated_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (pid, q, s, h, time.time()),
+                )
+            )
+
+        return resolved
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Background docstring loop
     # ═══════════════════════════════════════════════════════════════════════════
@@ -12645,27 +13150,36 @@ class EnrichmentTasks:
         project_id: str,
     ) -> None:
         """
-        Generate one docstring in background and persist it.
+        Generate one docstring in the background and persist it.
 
-        Matched by (block_hash, name, line_start) instead of name alone:
-        many symbols in this codebase share the same bare name across
-        different classes (e.g. every class's `__init__`), so matching by
-        name only would silently write the result onto the wrong symbol —
-        and the targeted one would never get marked done, looping forever.
+        This function is called once per pending symbol. If the block no longer
+        exists (e.g., was purged or expired), it logs and exits gracefully.
+        The database persistence happens only after the symbol is successfully
+        found and updated, ensuring `qid` is always defined.
         """
         try:
             state = self._f._state_store.get_state(project_id)
             snippet = ""
             target_block = state["active_blocks"].get(block_hash)
+
+            # Extract a code snippet for the LLM context
             if target_block and line_start:
                 lines = target_block.content.split("\n")
                 start_idx = max(0, line_start - 1)
                 end_idx = min(len(lines), (line_end or line_start + 30))
                 snippet = "\n".join(lines[start_idx:end_idx])[:500]
-            if not snippet and target_block:
+            elif target_block:
                 snippet = target_block.content[:500]
 
-            docstring = await self._f._llm_orchestrator.call_llm(
+            # If the block no longer exists, skip silently (no infinite loop)
+            if target_block is None:
+                self._f._log_debug(
+                    f"Background docstring: block {block_hash} not found, skipping '{name}'"
+                )
+                return
+
+            # Ask the LLM for a concise docstring
+            docstring_text = await self._f._llm_orchestrator.call_llm(
                 prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
                 system_prompt="You are a code summarization assistant. Output only one concise sentence.",
                 model_override=self._f.valves.llm_model,
@@ -12673,80 +13187,107 @@ class EnrichmentTasks:
                 temperature=0.1,
                 label="bg_docstring",
             )
-            if not docstring or not docstring.strip():
+
+            if not docstring_text or not docstring_text.strip():
                 return
 
-            docstring = docstring.strip()
+            docstring_text = docstring_text.strip()
 
+            # Acquire the project lock to safely update state and index
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
                 state = self._f._state_store.get_state(project_id)
                 block = state["active_blocks"].get(block_hash)
+
                 if block:
+                    # Find the exact symbol instance by name and line number
                     for sym in block.symbols:
                         if sym.name == name and sym.line_start == line_start:
-                            sym.docstring = docstring
+                            sym.docstring = docstring_text
                             qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+
+                            # Update in-memory index
                             self._f._symbol_index.update_docstring(
-                                qid, project_id, docstring
+                                qid, project_id, docstring_text
+                            )
+
+                            # Persist to SQLite (qid is guaranteed to be defined here)
+                            await self._f._state_store._db_enqueue(
+                                lambda q=qid, d=docstring_text, pid=project_id: self._f._db_conn.execute(
+                                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                                    (pid, q, d, time.time()),
+                                )
                             )
                             break
-                self._f._state_store.set_state(project_id, state)
 
-            await self._f._state_store._db_enqueue(
-                lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
-                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                    (pid, q, d, time.time()),
-                )
-            )
+                    self._f._state_store.set_state(project_id, state)
+                else:
+                    # Block disappeared between snapshot and execution
+                    self._f._log_debug(
+                        f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
+                    )
+
         except Exception as e:
+            # Log the error but do NOT retry — prevents infinite loops
             self._f._log_debug(
                 f"❌ Docstring generation failed for '{name}' (line {line_start}): {e}"
             )
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
-        Background loop that generates docstrings one at a time until no
-        pending symbols remain. Yields between generations to avoid
-        saturating the server.
+        Background loop that generates docstrings for all pending symbols.
 
-        Pending entries carry (block_hash, line_start) alongside name/signature
-        so the same symbol instance can be re-identified later — many symbols
-        in this codebase share the same bare name across different classes
-        (e.g. every class's `__init__`), so name alone is not a safe identifier.
+        Takes a snapshot of all symbols missing docstrings at the start,
+        then processes each one exactly once. This prevents infinite retries
+        on failing symbols and ensures the loop terminates naturally.
         """
-        while True:
-            state = self._f._state_store.get_state(project_id)
-            pending = []
-            for block in state["active_blocks"].values():
-                if block.obsolete:
-                    continue
-                for sym in block.symbols:
-                    if sym.kind in ("function", "method") and not sym.docstring:
-                        pending.append(
-                            (
-                                sym.name,
-                                sym.signature,
-                                block.hash,
-                                sym.line_start,
-                                sym.line_end,
-                            )
-                        )
-            if not pending:
-                break
+        # --- Snapshot: collect all symbols without docstrings ---
+        state = self._f._state_store.get_state(project_id)
+        pending = []
 
-            # Find the first symbol without a docstring
-            name, signature, block_hash, line_start, line_end = pending[0]
-            # Run the generation synchronously (one at a time inside the loop)
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                if sym.kind in ("function", "method") and not sym.docstring:
+                    pending.append(
+                        (
+                            sym.name,
+                            sym.signature,
+                            block.hash,
+                            sym.line_start,
+                            sym.line_end,
+                        )
+                    )
+
+        if not pending:
+            self._f._log_debug("Background docstring loop: no pending symbols")
+            return
+
+        self._f._log_debug(
+            f"Background docstring loop: {len(pending)} symbol(s) to process"
+        )
+
+        # --- Process each symbol once ---
+        for idx, (name, signature, block_hash, line_start, line_end) in enumerate(
+            pending, 1
+        ):
             await self._background_docstring(
-                name, signature, block_hash, line_start, line_end, project_id
+                name,
+                signature,
+                block_hash,
+                line_start,
+                line_end,
+                project_id,
             )
-            # Brief pause between tasks to avoid tight loop on cache hits
-            self._bg_docstring_count += 1
-            if self._bg_docstring_count % 10 == 0:
-                await asyncio.sleep(2)  # longer cooldown every 10 docstrings
+
+            # Throttle requests to avoid saturating the LLM server
+            if idx % 5 == 0:
+                await asyncio.sleep(1.0)
             else:
-                await asyncio.sleep(0.5)  # minimal pause between individual calls
+                await asyncio.sleep(0.3)
+
+        self._f._log_debug("Background docstring loop: finished")
 
     def start_docstring_loop(self, project_id: str) -> None:
         """
@@ -15895,6 +16436,33 @@ class Filter:
             default=True,
             description="Automatically generate missing docstrings for functions and methods using the LLM.",
         )
+        enable_cfg_skeletons: bool = Field(
+            default=True,
+            description=(
+                "Generate and inject compressed control-flow skeletons (branches "
+                "preserved, straight-line bodies elided) for LOD2-tier symbols when "
+                "the use-case is refactor (/refactor, case D) or the query has high "
+                "debug intent. Deterministic, no LLM call."
+            ),
+        )
+        cfg_skeleton_debug_intent_threshold: float = Field(
+            default=0.4,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum intent_vector['debug'] weight that triggers CFG skeleton "
+                "injection outside of the explicit refactor use-case (D)."
+            ),
+        )
+        cfg_skeleton_max_lines: int = Field(
+            default=40,
+            ge=5,
+            description=(
+                "Skip CFG skeleton generation for functions whose source snippet "
+                "exceeds this many lines — very long functions produce skeletons "
+                "too large to count as 'compressed'."
+            ),
+        )
         lazy_docstring_max_per_turn: int = Field(
             default=25,
             ge=0,
@@ -16899,7 +17467,7 @@ class Filter:
                 # pre-computed in Block A (KV-cache-anchoring), not deferred
                 # to whatever Block B does on the next real query.
                 try:
-                    await self._ctx_builder.build_block_a(
+                    static_block = await self._ctx_builder.build_block_a(
                         project_id, is_code_session=True, is_continuation=False
                     )
                     self._log_debug(
@@ -16907,6 +17475,7 @@ class Filter:
                         "pre-built after silent ingestion"
                     )
                 except Exception as _scaffold_err:
+                    static_block = ""
                     self._log_debug(
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
@@ -16937,6 +17506,26 @@ class Filter:
                 )
                 messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
+
+                # ── Context dump: silent ingestion never passes through
+                # MessageAssembler._assemble_final_system_and_log, which is the
+                # only place where the snapshot is normally scheduled.
+                # Without this, ingestion turns — precisely where the SymbolGraph
+                # grows the most — remain invisible in evolution.jsonl.
+                if self.valves.enable_context_dump:
+                    try:
+                        self._context_dumper.schedule_inlet_snapshot(
+                            project_id=project_id,
+                            static_block=static_block,
+                            dynamic_block="",
+                            final_system=static_block,
+                            messages=messages,
+                        )
+                    except Exception as _dump_err:
+                        self._log_debug(
+                            f"Context dump scheduling failed (silent ingestion): {_dump_err}"
+                        )
+
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
