@@ -11447,19 +11447,34 @@ class EnrichmentTasks:
         await self._f._llm_orchestrator.wait_for_slot()
 
     async def _background_docstring(
-        self, name: str, signature: str, project_id: str
+        self,
+        name: str,
+        signature: str,
+        block_hash: str,
+        line_start: Optional[int],
+        line_end: Optional[int],
+        project_id: str,
     ) -> None:
-        """Generate one docstring in background and persist it."""
+        """
+        Generate one docstring in background and persist it.
+
+        Matched by (block_hash, name, line_start) instead of name alone:
+        many symbols in this codebase share the same bare name across
+        different classes (e.g. every class's `__init__`), so matching by
+        name only would silently write the result onto the wrong symbol —
+        and the targeted one would never get marked done, looping forever.
+        """
         try:
             state = self._f._state_store.get_state(project_id)
             snippet = ""
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if sym.name == name:
-                        snippet = block.content[:500]
-                        break
-                if snippet:
-                    break
+            target_block = state["active_blocks"].get(block_hash)
+            if target_block and line_start:
+                lines = target_block.content.split("\n")
+                start_idx = max(0, line_start - 1)
+                end_idx = min(len(lines), (line_end or line_start + 30))
+                snippet = "\n".join(lines[start_idx:end_idx])[:500]
+            if not snippet and target_block:
+                snippet = target_block.content[:500]
 
             docstring = await self._f._llm_orchestrator.call_llm(
                 prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
@@ -11477,9 +11492,10 @@ class EnrichmentTasks:
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
                 state = self._f._state_store.get_state(project_id)
-                for block in state["active_blocks"].values():
+                block = state["active_blocks"].get(block_hash)
+                if block:
                     for sym in block.symbols:
-                        if sym.name == name:
+                        if sym.name == name and sym.line_start == line_start:
                             sym.docstring = docstring
                             self._f._symbol_index.update_docstring(
                                 name, project_id, docstring
@@ -11494,13 +11510,20 @@ class EnrichmentTasks:
                 )
             )
         except Exception as e:
-            self._f._log_debug(f"❌ Docstring generation failed for '{name}': {e}")
+            self._f._log_debug(
+                f"❌ Docstring generation failed for '{name}' (line {line_start}): {e}"
+            )
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
         Background loop that generates docstrings one at a time until no
-        pending symbols remain.  Yields between generations to avoid
+        pending symbols remain. Yields between generations to avoid
         saturating the server.
+
+        Pending entries carry (block_hash, line_start) alongside name/signature
+        so the same symbol instance can be re-identified later — many symbols
+        in this codebase share the same bare name across different classes
+        (e.g. every class's `__init__`), so name alone is not a safe identifier.
         """
         while True:
             state = self._f._state_store.get_state(project_id)
@@ -11510,16 +11533,26 @@ class EnrichmentTasks:
                     continue
                 for sym in block.symbols:
                     if sym.kind in ("function", "method") and not sym.docstring:
-                        pending.append((sym.name, sym.signature))
+                        pending.append(
+                            (
+                                sym.name,
+                                sym.signature,
+                                block.hash,
+                                sym.line_start,
+                                sym.line_end,
+                            )
+                        )
             if not pending:
                 break
 
             # Find the first symbol without a docstring
-            name, signature = pending[0]
+            name, signature, block_hash, line_start, line_end = pending[0]
             # Run the generation synchronously (one at a time inside the loop)
-            await self._background_docstring(name, signature, project_id)
-            # Small pause between tasks
-            await asyncio.sleep(1)
+            await self._background_docstring(
+                name, signature, block_hash, line_start, line_end, project_id
+            )
+            # Brief pause between tasks to avoid tight loop on cache hits
+            await asyncio.sleep(0.1)
 
     def start_docstring_loop(self, project_id: str) -> None:
         """
