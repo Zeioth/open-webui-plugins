@@ -214,6 +214,29 @@ class Edge(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Qualified symbol identity helper (v9)
+# ---------------------------------------------------------------------------
+def qualify_symbol_name(name: str, parent_symbol: str) -> str:
+    """
+    Unique-within-class identity for a symbol: 'ClassName.method' when
+    it has an enclosing class, or the bare name for module-level functions.
+
+    This is the central fix for the docstring / call-graph collision bug:
+    dozens of methods in this codebase share bare names like '__init__'
+    across completely unrelated classes.  SymbolIndex now stores every-
+    thing under this qualified id so that same-named methods in different
+    classes never stomp on or fuse with each other (signature, docstring,
+    call edges).
+
+    Module-level functions (parent_symbol == "") keep their bare name,
+    because they are unique within a project in the common case.  Two
+    module-level functions with the exact same bare name in different
+    files is a known edge-case, out of scope here.
+    """
+    return f"{parent_symbol}.{name}" if parent_symbol else name
+
+
+# ---------------------------------------------------------------------------
 # Activation Graph — query‑conditioned node activation
 # ---------------------------------------------------------------------------
 class ActivationState(BaseModel):
@@ -432,10 +455,19 @@ class PathIndex:
     def find_entry_points(
         self, symbol_index: "SymbolIndex", project_id: str
     ) -> Set[str]:
-        all_names = symbol_index.get_all_names(project_id)
-        return {
-            name for name in all_names if not symbol_index.get_callers(name, project_id)
-        }
+        """Symbols with no known caller — used as activation seeds when a
+        query matches nothing in the index.  Operates on QUALIFIED ids so
+        that, for example, a class's only method that is called exclusively
+        from outside is not confused with another class's same-named method
+        that DOES have registered callers."""
+        all_qids = symbol_index.get_all_qualified_names(project_id)
+        result = set()
+        for qid in all_qids:
+            meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+            bare = meta.get("name", qid.rsplit(".", 1)[-1])
+            if not symbol_index.get_callers(bare, project_id):
+                result.add(qid)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -592,38 +624,20 @@ def _get_cross_encoder(
 
 class HubSymbolIndex:
     """
-    Produce the hub-symbol text for Block A using top-N symbols by centrality.
+    Build the architecture map for Block A: a compact class→members outline,
+    plus, for the hub symbols (top-N by call-graph centrality), a
+    bidirectional view of who calls them and whom they call.
     """
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def get_hub_names(
-        self,
-        centrality: dict,
-        top_n: int,
-    ) -> list:
-        """
-        Return symbol names sorted by descending centrality, capped at top_n.
-
-        centrality: {symbol_name: score in [0, 1]} from
-                    SymbolIndex.precompute_centrality().
-        Ties are broken alphabetically for deterministic, cache-stable output.
-        """
+    def get_hub_names(self, centrality: dict, top_n: int) -> list:
         if not centrality or top_n <= 0:
             return []
-        ranked = sorted(
-            centrality.items(),
-            key=lambda kv: (-kv[1], kv[0]),  # score desc, then name asc
-        )
+        ranked = sorted(centrality.items(), key=lambda kv: (-kv[1], kv[0]))
         return [name for name, _ in ranked[:top_n]]
 
-    def is_hub(
-        self,
-        symbol_name: str,
-        centrality: dict,
-        top_n: int,
-    ) -> bool:
-        """True if symbol_name would appear in Block A for the given top_n."""
+    def is_hub(self, symbol_name: str, centrality: dict, top_n: int) -> bool:
         return symbol_name in set(self.get_hub_names(centrality, top_n))
 
     def build(
@@ -632,50 +646,141 @@ class HubSymbolIndex:
         centrality: dict,
         project_id: str,
         top_n: int = 30,
+        valves=None,
     ) -> str:
         """
-        Build the Block A hub-symbol text (always <= top_n entries).
-
-        Output is deterministic and stable between requests while the code
-        state (and therefore centrality) is unchanged — this is what lets
-        llama.cpp reuse the KV cache for Block A.
-
-        Returns "" if there is no centrality data (no indexed code yet).
+        Build the full Block A symbol text: class outline + hub symbols
+        section with bidirectional call graph.  Deterministic while the code
+        is unchanged (alphabetical / centrality order), so llama.cpp's KV
+        cache stays stable.
         """
-        hub_names = self.get_hub_names(centrality, top_n)
-        if not hub_names:
+        sections = []
+
+        outline = self._build_class_outline(symbol_index, project_id, valves)
+        if outline:
+            sections.append(outline)
+
+        hub_qids = self.get_hub_names(centrality, top_n)
+        if hub_qids:
+            enable_callees = (
+                getattr(valves, "enable_hub_callees", True) if valves else True
+            )
+            sections.append(
+                self._build_hub_section(
+                    hub_qids, centrality, symbol_index, project_id, enable_callees
+                )
+            )
+
+        return "\n\n".join(s for s in sections if s.strip())
+
+    # ── Class / function outline (NEW) ────────────────────────────────────
+
+    def _build_class_outline(self, symbol_index, project_id, valves=None) -> str:
+        if valves is not None and not getattr(valves, "enable_architecture_map", True):
+            return ""
+        max_per_class = (
+            getattr(valves, "architecture_map_max_methods_per_class", 15)
+            if valves
+            else 15
+        )
+        max_tokens = (
+            getattr(valves, "architecture_map_max_tokens", 3000) if valves else 3000
+        )
+
+        classes = sorted(symbol_index.get_classes(project_id))
+        if not classes:
             return ""
 
-        # Group by file (using index's file resolution, if available)
+        lines = [
+            "## Code Architecture Map",
+            "_Class → methods. See the hub section below for call relationships "
+            "of the most central symbols. Use `/expand <name>` or "
+            "`/expand Class.method` for full bodies._",
+            "",
+        ]
+        total_chars = sum(len(l) for l in lines)
+        budget_chars = max_tokens * 4 if max_tokens > 0 else None
+        truncated = False
+
+        for class_name in classes:
+            member_qids = symbol_index.get_class_members(class_name, project_id)
+            if not member_qids:
+                continue
+            bare_members = []
+            for qid in member_qids:
+                meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+                bare_members.append(meta.get("name", qid.rsplit(".", 1)[-1]))
+            shown = bare_members[:max_per_class]
+            extra = len(bare_members) - len(shown)
+            extra_txt = f", ... (+{extra} more)" if extra > 0 else ""
+            line = (
+                f"- **{class_name}** ({len(bare_members)} methods): "
+                f"{', '.join(shown)}{extra_txt}"
+            )
+            if budget_chars is not None and total_chars + len(line) > budget_chars:
+                lines.append(
+                    f"_(Outline truncated to fit budget — {len(classes)} classes total)_"
+                )
+                truncated = True
+                break
+            lines.append(line)
+            total_chars += len(line)
+
+        if not truncated:
+            top_level = sorted(
+                qid
+                for qid in symbol_index.get_all_qualified_names(project_id)
+                if "." not in qid
+                and (symbol_index.get_symbol_meta(qid, project_id) or {}).get("kind")
+                == "function"
+            )
+            if top_level:
+                shown = top_level[:max_per_class]
+                extra = len(top_level) - len(shown)
+                extra_txt = f", ... (+{extra} more)" if extra > 0 else ""
+                line = f"- **(module-level functions)**: {', '.join(shown)}{extra_txt}"
+                if budget_chars is None or total_chars + len(line) <= budget_chars:
+                    lines.append(line)
+
+        if len(lines) <= 3:
+            return ""
+        return "\n".join(lines)
+
+    # ── Hub symbols with bidirectional call graph ────────────────────────
+
+    def _build_hub_section(
+        self, hub_qids, centrality, symbol_index, project_id, enable_callees=True
+    ) -> str:
         by_file: dict = {}
-        for name in hub_names:
-            file_path = self._file_for(name, project_id, symbol_index)
-            by_file.setdefault(file_path, []).append(name)
+        for qid in hub_qids:
+            file_path = self._file_for(qid, project_id, symbol_index)
+            by_file.setdefault(file_path, []).append(qid)
 
         lines = [
-            f"## Code Symbol Index — Hub Symbols (top {len(hub_names)} by call-graph centrality)",
+            f"## Code Symbol Index — Hub Symbols (top {len(hub_qids)} by call-graph centrality)",
             "> Remaining symbols are available via LOD activation. "
             "Use /expand <name> for any symbol's full body.",
             "",
         ]
 
-        # If file info is missing for all symbols, use flat list; otherwise group by file.
         if len(by_file) == 1 and None in by_file:
-            for name in sorted(hub_names, key=lambda n: -centrality.get(n, 0)):
+            for qid in sorted(hub_qids, key=lambda q: -centrality.get(q, 0)):
                 lines.append(
-                    self._format_symbol_line(name, centrality, symbol_index, project_id)
+                    self._format_symbol_line(
+                        qid, centrality, symbol_index, project_id, enable_callees
+                    )
                 )
         else:
             for file_path in sorted(by_file.keys(), key=lambda fp: (fp is None, fp)):
                 if file_path is None:
                     continue
                 lines.append(f"### {file_path}")
-                for name in sorted(
-                    by_file[file_path], key=lambda n: -centrality.get(n, 0)
+                for qid in sorted(
+                    by_file[file_path], key=lambda q: -centrality.get(q, 0)
                 ):
                     lines.append(
                         self._format_symbol_line(
-                            name, centrality, symbol_index, project_id
+                            qid, centrality, symbol_index, project_id, enable_callees
                         )
                     )
                 lines.append("")
@@ -688,97 +793,58 @@ class HubSymbolIndex:
 
     # ── Private helpers ───────────────────────────────────────────────────
 
-    def _file_for(
-        self, name: str, project_id: str, symbol_index: "SymbolIndex"
-    ) -> Optional[str]:
-        """
-        Resolve a symbol's file path from the SymbolIndex, if possible.
+    def _file_for(self, qid, project_id, symbol_index):
+        return symbol_index.get_file_for_symbol(qid, project_id)
 
-        Tries public methods first (get_file_for_symbol, get_symbol_file,
-        file_for), then internal attributes (_file_by_symbol, _symbol_files).
-        Returns None when the index exposes no file info at all, which makes
-        build() emit a flat centrality-ranked list instead of a useless
-        '### unknown' section.
-        """
-        # Try public methods first
-        for attr in ("get_file_for_symbol", "get_symbol_file", "file_for"):
-            fn = getattr(symbol_index, attr, None)
-            if callable(fn):
-                try:
-                    res = fn(name, project_id)
-                    if res:
-                        return res
-                except Exception:
-                    pass
-        # Try internal attributes
-        internal = getattr(symbol_index, "_file_by_symbol", None) or getattr(
-            symbol_index, "_symbol_files", None
-        )
-        if isinstance(internal, dict):
-            key = f"{project_id}:{name}"
-            if key in internal:
-                return internal[key]
-            if name in internal:
-                return internal[name]
-        return None
-
-    def _safe_callers(
-        self, name: str, project_id: str, symbol_index: "SymbolIndex"
-    ) -> set:
-        """
-        Return set of caller names for `name`, or empty set on any error.
-
-        Tries `get_callers(name, project_id)`, then `get_callers(name)` as a
-        fallback for index implementations that omit the project argument.
-        """
-        fn = getattr(symbol_index, "get_callers", None)
+    def _safe_callers(self, qid, project_id, symbol_index) -> set:
+        """Callers of `qid`, looked up by its BARE name — edge destinations
+        are best-effort bare strings (see SymbolIndex docstring), so this is
+        the only reliable lookup direction, with the known limitation that a
+        very common bare name (e.g. __init__) will show callers from any
+        method of that same name, not only this one."""
+        meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+        bare = meta.get("name", qid.rsplit(".", 1)[-1])
+        fn = getattr(symbol_index, "get_edges_in", None)
         if not callable(fn):
             return set()
         try:
-            res = fn(name, project_id)
-            if isinstance(res, (set, list)):
-                return set(res)
+            edges = fn(bare, project_id)
+            return {e.src for e in edges}
         except Exception:
-            pass
+            return set()
+
+    def _safe_callees(self, qid, project_id, symbol_index) -> set:
+        """Callees of `qid`, looked up by its qualified id — precise, since
+        edge sources are always the exact symbol in whose body the call was
+        found."""
+        fn = getattr(symbol_index, "get_edges_out", None)
+        if not callable(fn):
+            return set()
         try:
-            res = fn(name)  # fallback without project_id
-            if isinstance(res, (set, list)):
-                return set(res)
+            edges = fn(qid, project_id)
+            return {e.dst for e in edges}
         except Exception:
-            pass
-        return set()
+            return set()
 
     def _format_symbol_line(
-        self,
-        name: str,
-        centrality: dict,
-        symbol_index: "SymbolIndex",
-        project_id: str,
+        self, qid, centrality, symbol_index, project_id, enable_callees=True
     ) -> str:
-        """
-        Render one hub symbol line using data available from the SymbolIndex.
+        score = centrality.get(qid, 0.0)
+        callers = self._safe_callers(qid, project_id, symbol_index)
 
-        Format:
-          - `ClassName.method` (centrality: 0.87)  ← used by: x, y
-        Callers come from the index; callee data requires the symbol object
-        which Block A does not carry, so the "→ calls" segment is omitted
-        rather than fabricated.
-        """
-        score = centrality.get(name, 0.0)
-        callers = self._safe_callers(name, project_id, symbol_index)
-
-        # NEW: qualify with enclosing class name when available
-        parent = getattr(symbol_index, "get_parent_symbol", lambda *_: "")(
-            name, project_id
-        )
-        display_name = f"{parent}.{name}" if parent else name
-
-        parts = [f"- `{display_name}` (centrality: {score:.2f})"]
+        parts = [f"- `{qid}` (centrality: {score:.2f})"]
 
         if callers:
             shown = sorted(callers)[:5]
             extra = f", ... (+{len(callers) - 5} more)" if len(callers) > 5 else ""
-            parts.append(f"  ← used by: {', '.join(shown)}{extra}")
+            parts.append(f"\n  ← used by: {', '.join(shown)}{extra}")
+
+        if enable_callees:
+            callees = self._safe_callees(qid, project_id, symbol_index)
+            if callees:
+                shown = sorted(callees)[:5]
+                extra = f", ... (+{len(callees) - 5} more)" if len(callees) > 5 else ""
+                parts.append(f"\n  → calls: {', '.join(shown)}{extra}")
 
         return "".join(parts)
 
@@ -830,7 +896,12 @@ class ContextPager:
                 continue
             if block.symbols:
                 block_activation = max(
-                    (activation_scores.get(s.name, 0.0) for s in block.symbols),
+                    (
+                        activation_scores.get(
+                            qualify_symbol_name(s.name, s.parent_symbol), 0.0
+                        )
+                        for s in block.symbols
+                    ),
                     default=0.0,
                 )
             else:
@@ -1854,6 +1925,7 @@ class ContextBuilder:
                     centrality=centrality,
                     project_id=project_id,
                     top_n=self._f.valves.symbol_index_max_in_block_a,
+                    valves=self._f.valves,
                 )
                 if symbol_section:
                     parts.append(symbol_section)
@@ -1976,20 +2048,19 @@ class ContextBuilder:
         return tier
 
     def _make_docstring_provider(self, project_id: str):
-        """Return f(symbol_name) -> one-line docstring or ''.
-        Backed by the index (covers both source-extracted and LLM-generated docstrings).
-        """
+        """Return f(symbol_name, parent_class='') -> one-line docstring or ''.
+        Backed by the index (covers both source-extracted and LLM-generated
+        docstrings).  `parent_class` allows resolving the EXACT occurrence's
+        docstring (e.g. THIS class's __init__, not another's) instead of an
+        ambiguous one."""
         if not self._f.valves.skeleton_include_docstrings:
-            return lambda _name: ""
+            return lambda _name, _parent="": ""
 
-        def _provider(symbol_name: str) -> str:
-            return self._f._symbol_index.get_docstring(symbol_name, project_id) or ""
+        def _provider(symbol_name: str, parent_class: str = "") -> str:
+            qid = qualify_symbol_name(symbol_name, parent_class)
+            return self._f._symbol_index.get_docstring(qid, project_id) or ""
 
         return _provider
-
-    def invalidate_skeleton_tier_cache(self, project_id: str) -> None:
-        """Drop the cached skeleton tier (signatures may have changed)."""
-        self._skeleton_tier_cache.pop(project_id, None)
 
     async def _get_skeleton_for_cot(
         self,
@@ -2105,7 +2176,7 @@ class ContextBuilder:
             return reasoning_text
 
         # Reuse the same pattern as CommandRouter.outlet_intercept_expand.
-        _EXPAND_RE = re.compile(r"/expand\s+(?:\d+\s+)?`?(\w+)`?", re.IGNORECASE)
+        _EXPAND_RE = re.compile(r"/expand\s+(?:\d+\s+)?`?([\w.]+)`?", re.IGNORECASE)
         matches = _EXPAND_RE.finditer(reasoning_text)
 
         seen: Set[str] = set()
@@ -2300,9 +2371,9 @@ class ContextBuilder:
 
         # ── Fast path for inventory / listing queries ────────────────────
         if self._LIST_INTENTS.search(query):
-            all_names = self._f._symbol_index.get_all_names(project_id)
-            if all_names:
-                return await self._format_full_symbol_inventory(all_names, project_id)
+            all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+            if all_qids:
+                return await self._format_full_symbol_inventory(all_qids, project_id)
 
         # ── Step 1: ActivationGraph ──────────────────────────────────────
         ag = self._f._activation.build_activation_graph(
@@ -2397,7 +2468,9 @@ class ContextBuilder:
                     for bh in self._f._symbol_index.find_blocks(node_id, project_id):
                         blk = state["active_blocks"].get(bh)
                         if blk and any(
-                            s.name == node_id and s.docstring for s in blk.symbols
+                            qualify_symbol_name(s.name, s.parent_symbol) == node_id
+                            and s.docstring
+                            for s in blk.symbols
                         ):
                             has_doc = True
                             break
@@ -2438,7 +2511,12 @@ class ContextBuilder:
 
                 if score < lod2:
                     sig = next(
-                        (sym.signature for sym in block.symbols if sym.name == node_id),
+                        (
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol_name(sym.name, sym.parent_symbol)
+                            == node_id
+                        ),
                         node_id,
                     )
                     tok = len(sig) // 4 + 2
@@ -2451,14 +2529,21 @@ class ContextBuilder:
 
                 elif score < lod3:
                     sig = next(
-                        (sym.signature for sym in block.symbols if sym.name == node_id),
+                        (
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol_name(sym.name, sym.parent_symbol)
+                            == node_id
+                        ),
                         node_id,
                     )
                     docstring = next(
                         (
                             sym.docstring
                             for sym in block.symbols
-                            if sym.name == node_id and sym.docstring
+                            if qualify_symbol_name(sym.name, sym.parent_symbol)
+                            == node_id
+                            and sym.docstring
                         ),
                         "",
                     )
@@ -2612,20 +2697,26 @@ class ContextBuilder:
 
     # ── Inventory listing helper ──────────────────────────────────
     async def _format_full_symbol_inventory(
-        self, all_names: set, project_id: str
+        self, all_qids: set, project_id: str
     ) -> str:
-        """Return a formatted inventory of all indexed symbols, grouped by file."""
+        """Return a formatted inventory of all indexed symbols, grouped by
+        file.
+
+        `all_qids` must be a set of QUALIFIED ids (from
+        get_all_qualified_names), not bare names — otherwise methods with
+        the same bare name across different classes would silently collapse
+        to a single inventory row."""
         state = self._f._state_store.get_state(project_id)
         if not state or not state.get("active_blocks"):
             return ""
 
         by_file: dict = {}
-        pending_docstrings: List[str] = []
-        for name in sorted(all_names):
-            meta = self._f._symbol_index.get_symbol_meta(name, project_id)
+        pending_docstrings: List[str] = []  # qualified ids
+        for qid in sorted(all_qids):
+            meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
 
             if meta is None:
-                for bh in self._f._symbol_index.find_blocks(name, project_id):
+                for bh in self._f._symbol_index.find_blocks(qid, project_id):
                     block = state["active_blocks"].get(bh)
                     if block is None and self._f._pager is not None:
                         if self._f._pager.is_paged(bh, project_id):
@@ -2636,9 +2727,19 @@ class ContextBuilder:
                                 db_conn=self._f._db_conn,
                             )
                     if block and not block.obsolete:
-                        sym = next((s for s in block.symbols if s.name == name), None)
+                        bare_name = qid.rsplit(".", 1)[-1]
+                        sym = next(
+                            (
+                                s
+                                for s in block.symbols
+                                if s.name == bare_name
+                                and qualify_symbol_name(s.name, s.parent_symbol) == qid
+                            ),
+                            None,
+                        )
                         meta = {
-                            "signature": sym.signature if sym else name,
+                            "name": bare_name,
+                            "signature": sym.signature if sym else bare_name,
                             "docstring": sym.docstring if sym else "",
                             "file_path": block.file_path,
                             "kind": sym.kind if sym else "function",
@@ -2651,31 +2752,29 @@ class ContextBuilder:
                 continue
 
             if not meta.get("docstring") and self._f.valves.enable_auto_docstrings:
-                pending_docstrings.append(name)
+                pending_docstrings.append(qid)
 
             file_key = meta.get("file_path") or "(unknown)"
-            by_file.setdefault(file_key, []).append((name, meta))
+            by_file.setdefault(file_key, []).append((qid, meta))
 
-        # ── Batched docstring resolution: a handful of LLM calls covering
-        # every missing docstring, instead of one call per symbol. ──
         if pending_docstrings:
             resolved = await self._f._enrichment.ensure_docstrings_batch(
                 pending_docstrings, project_id
             )
             if resolved:
                 for entries in by_file.values():
-                    for name, meta in entries:
-                        if name in resolved:
-                            meta["docstring"] = resolved[name]
+                    for qid, meta in entries:
+                        if qid in resolved:
+                            meta["docstring"] = resolved[qid]
 
         if not by_file:
             return ""
 
         if (
             self._f.valves.enable_hierarchical_inventory
-            and len(all_names) > self._f.valves.inventory_hierarchical_threshold
+            and len(all_qids) > self._f.valves.inventory_hierarchical_threshold
         ):
-            return self._format_inventory_hierarchical(by_file, all_names, project_id)
+            return self._format_inventory_hierarchical(by_file, all_qids, project_id)
 
         lines = ["## Full Symbol Inventory\n"]
         total_tokens = self._f._tokens.estimate_code_tokens(lines[0])
@@ -2690,9 +2789,9 @@ class ContextBuilder:
 
         for file_path in sorted(by_file.keys()):
             lines.append(f"### {file_path}")
-            for name, meta in by_file[file_path]:
-                # ── Qualified name (Class.method) ──
+            for qid, meta in by_file[file_path]:
                 parent = meta.get("parent_symbol", "")
+                name = meta.get("name", qid.rsplit(".", 1)[-1])
                 qualified = f"{parent}.{name}" if parent else name
                 sig = meta.get("signature") or name
                 doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
@@ -2700,7 +2799,7 @@ class ContextBuilder:
                 tok = self._f._tokens.estimate_code_tokens(line)
                 if total_tokens + tok > budget:
                     lines.append(
-                        f"\n_(Truncated at {budget} tokens — {len(all_names)} symbols total)_"
+                        f"\n_(Truncated at {budget} tokens — {len(all_qids)} symbols total)_"
                     )
                     return "\n".join(lines)
                 lines.append(line)
@@ -2708,7 +2807,7 @@ class ContextBuilder:
             lines.append("")
 
         lines.append(
-            f"\n_{len(all_names)} symbols indexed. Use `/expand <name>` for full body._"
+            f"\n_{len(all_qids)} symbols indexed. Use `/expand <name>` for full body._"
         )
         return "\n".join(lines)
 
@@ -3030,13 +3129,15 @@ class ContextBuilder:
         return out
 
     @staticmethod
-    def _skeletonize_node(node, docstring_provider=None) -> None:
+    def _skeletonize_node(
+        node, docstring_provider=None, parent_class: str = ""
+    ) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             body = []
             existing = ast.get_docstring(node, clean=True)
             doc = existing
             if not doc and docstring_provider is not None:
-                doc = docstring_provider(node.name)
+                doc = docstring_provider(node.name, parent_class)
             if doc:
                 one_line = doc.strip().split("\n")[0][:120]
                 body.append(ast.Expr(value=ast.Constant(value=one_line)))
@@ -3047,7 +3148,7 @@ class ContextBuilder:
             existing = ast.get_docstring(node, clean=True)
             doc = existing
             if not doc and docstring_provider is not None:
-                doc = docstring_provider(node.name)
+                doc = docstring_provider(node.name, "")
             if doc:
                 one_line = doc.strip().split("\n")[0][:120]
                 kept.append(ast.Expr(value=ast.Constant(value=one_line)))
@@ -3055,7 +3156,9 @@ class ContextBuilder:
                 if isinstance(
                     child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
                 ):
-                    ContextBuilder._skeletonize_node(child, docstring_provider)
+                    ContextBuilder._skeletonize_node(
+                        child, docstring_provider, parent_class=node.name
+                    )
                     kept.append(child)
             node.body = kept or [ast.Expr(value=ast.Constant(value=Ellipsis))]
 
@@ -3294,16 +3397,15 @@ class ContextBuilder:
     ) -> List[tuple]:
         """
         For each (content, file_path, is_primary) triple, parse the source and
-        keep only the top-level AST nodes (ClassDef / FunctionDef /
-        AsyncFunctionDef) whose name is in `activated`. Skeletonize each kept
-        node and unparse. Returns [(label, skeleton_code, is_primary)] in
-        primary-first order.
+        keep only the AST nodes (FunctionDef / AsyncFunctionDef / ClassDef)
+        whose name is in `activated`, searching recursively (not just top-level).
+        Skeletonize each kept node and unparse. Returns [(label, skeleton_code,
+        is_primary)] in primary-first order.
 
         Falls back to the regex-based flat signature list when ast.unparse is
         unavailable (Python < 3.9) or parsing fails.
         """
         results = []
-        # Primary block first so it appears at the top of the output.
         ordered = sorted(blocks_content, key=lambda t: (not t[2], t[1] or ""))
 
         for content, file_path, is_primary in ordered:
@@ -3320,7 +3422,8 @@ class ContextBuilder:
                     pass
 
             if parsed_ok:
-                for node in tree.body:
+                # Walk the whole AST so methods nested inside classes are found.
+                for node in ast.walk(tree):
                     node_name = getattr(node, "name", None)
                     if node_name not in activated:
                         continue
@@ -3608,35 +3711,69 @@ class ReentrantAsyncLock:
 # SymbolIndex – central name→block mapping and typed edges
 # ---------------------------------------------------------------------------
 class SymbolIndex:
-    """Maps symbol names to block hashes, tracks call edges, and computes centrality."""
+    """Maps qualified symbol identities to block hashes, tracks call edges,
+    and computes centrality.
+
+    Symbols are stored under a QUALIFIED identity
+    (qualify_symbol_name(name, parent_symbol), e.g. "ContextBuilder.__init__")
+    instead of the bare name.  This fixes a real, observed bug: dozens of
+    methods in typical Python code share bare names ("__init__", "__str__",
+    small private helpers...) across completely different classes.  Before
+    this change, every API here was indexed by bare name only, so the LAST
+    symbol indexed under a given name silently overwrote the
+    signature/docstring/parent_symbol of any other symbol with the same name
+    in the project, and the legacy call-edge storage also fused their
+    outgoing calls.
+
+    A `_bare_index` reverse mapping is maintained so that every existing
+    bare‑name lookup (used everywhere for text/query matching — a user typing
+    "fix call_llm" has no idea which class to qualify with) still works:
+    exact qualified matches are tried first, then bare‑name fallback, which
+    is INCLUSIVE (returns/affects every match) instead of the old silently-
+    overwriting-single-entry behaviour.
+    """
 
     MAX_ENTRIES = 10_000
 
     def __init__(self) -> None:
+        # Primary storage, indexed by (project_id, qualified_id).
         self._name_to_blocks: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
-        self._callee_to_callers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         self._stats: Counter = Counter()
-        # Typed edges (v7+)
+        self._symbol_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Reverse index: (project_id, bare_name) -> {qualified_id, ...}.
+        # Lets every bare‑name‑based consumer (query‑word matching,
+        # /expand <bare>, traceback frame names, ...) resolve to the full
+        # set of real symbols that share that name, instead of silently
+        # picking whichever was indexed last.
+        self._bare_index: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+
+        # Legacy call relationships, kept for compatibility with
+        # find_entry_points() and any external consumer of get_callers().
+        # Destinations remain bare (the callee's identity is generally not
+        # resolvable without type inference); values are now caller qualified
+        # ids instead of caller bare names.
+        self._callee_to_callers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+
+        # Typed edges (v7+).  Sources are qualified ids (we always know
+        # which symbol we are walking); destinations stay bare, best-effort
+        # (see class docstring + qualify_symbol_name()).
         self._edges_out: Dict[str, List[Edge]] = defaultdict(list)
         self._edges_in: Dict[str, List[Edge]] = defaultdict(list)
-        # Centrality cache (v8)
+
+        # Centrality cache (v8), now keyed by qualified id.
         self._centrality_cache: Dict[str, Dict[str, float]] = {}
-        # Per-symbol metadata (v8): (project_id, name) → {signature, summary,
-        # file_path, language, kind}. Feeds RAPTOR clustering, Block A file
-        # grouping, and inventory queries. Last writer wins for a name that
-        # appears in multiple blocks.
-        self._symbol_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     # ── Name ↔ block hash mapping ─────────────────────────────────────
     def add(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        key = (project_id, symbol.name)
+        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol)
+        key = (project_id, qid)
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
-        # Store metadata. Preserve a previously generated docstring when the
-        # freshly extracted symbol carries none — docstrings are filled in async
-        # after add() and we do not want a re-index to wipe a good one.
+        self._bare_index[(project_id, symbol.name)].add(qid)
+
         prev = self._symbol_meta.get(key)
         self._symbol_meta[key] = {
+            "name": symbol.name,
             "signature": symbol.signature,
             "docstring": symbol.docstring
             or (prev.get("docstring", "") if prev else ""),
@@ -3649,148 +3786,225 @@ class SymbolIndex:
         }
         for callee in symbol.calls:
             callee_key = (project_id, callee)
-            self._callee_to_callers[callee_key].add(symbol.name)
+            self._callee_to_callers[callee_key].add(qid)
         self._evict_if_needed()
 
     def remove(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        key = (project_id, symbol.name)
+        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol)
+        key = (project_id, qid)
         s = self._name_to_blocks.get(key)
         if s:
             s.discard(block_hash)
             if not s:
                 del self._name_to_blocks[key]
-                del self._stats[key]
+                self._stats.pop(key, None)
                 self._symbol_meta.pop(key, None)
+                bare_key = (project_id, symbol.name)
+                bare_set = self._bare_index.get(bare_key)
+                if bare_set:
+                    bare_set.discard(qid)
+                    if not bare_set:
+                        del self._bare_index[bare_key]
 
     def remove_all_for_block(
         self, block_hash: str, symbols: List["CodeSymbol"], project_id: str
     ) -> None:
         for sym in symbols:
             self.remove(sym, block_hash, project_id)
-            self.remove_edges_for_symbol(sym.name, project_id)
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            self.remove_edges_for_symbol(qid, project_id)
 
-    def find_blocks(self, name: str, project_id: str) -> Set[str]:
-        return self._name_to_blocks.get((project_id, name), set())
+    def find_blocks(self, name_or_qid: str, project_id: str) -> Set[str]:
+        """Block hashes for a symbol.  Exact qualified-id match first; if
+        not found, falls back to a bare‑name lookup that UNIONS all blocks
+        of every symbol sharing that bare name (e.g. every __init__ of every
+        class), instead of returning just one."""
+        exact = self._name_to_blocks.get((project_id, name_or_qid))
+        if exact is not None:
+            return exact
+        qids = self._bare_index.get((project_id, name_or_qid))
+        if not qids:
+            return set()
+        result: Set[str] = set()
+        for qid in qids:
+            result |= self._name_to_blocks.get((project_id, qid), set())
+        return result
 
     def get_all_names(self, project_id: str) -> Set[str]:
-        return {key[1] for key in self._name_to_blocks if key[0] == project_id}
+        """Bare names indexed in this project (deduplicated).  Use for
+        coarse text/query matching, where the caller doesn't know — and
+        doesn't need to know — which concrete class a name belongs to."""
+        return {bare for (pid, bare) in self._bare_index if pid == project_id}
+
+    def get_all_qualified_names(self, project_id: str) -> Set[str]:
+        """Every distinct symbol identity in the project (one entry per real
+        occurrence, e.g. each class's __init__ separately).  Use instead of
+        get_all_names() where every real symbol must be visible —
+        inventories, skeleton hash, centrality."""
+        return {qid for (pid, qid) in self._symbol_meta if pid == project_id}
+
+    def get_qualified_names_for(self, bare_name: str, project_id: str) -> Set[str]:
+        """All qualified ids that share this bare name (e.g. every class's
+        __init__).  If nothing is indexed under that bare name, returns
+        {bare_name} as-is — defensive, and also makes passing an ALREADY-
+        qualified id through here (not found as bare) a correct no-op,
+        returning it unchanged."""
+        qids = self._bare_index.get((project_id, bare_name))
+        return set(qids) if qids else {bare_name}
 
     # ── Call relationships (legacy) ────────────────────────────────────
     def get_callers(self, callee_name: str, project_id: str) -> Set[str]:
+        """Qualified caller ids for a callee name (necessarily bare)."""
         return self._callee_to_callers.get((project_id, callee_name), set())
 
-    # ── Per-symbol metadata (v8) ───────────────────────────────────────
-    def get_parent_symbol(self, name: str, project_id: str) -> str:
-        """Enclosing class name for a symbol, or '' if top-level/unknown."""
-        meta = self._symbol_meta.get((project_id, name))
+    # ── Per-symbol metadata ────────────────────────────────────────────
+    def _resolve_meta(
+        self, name_or_qid: str, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Exact qualified-id match first; if missing, a deterministic
+        choice among all symbols sharing that bare name.  Anyone who already
+        knows the qualified id (e.g. anything iterating
+        get_all_qualified_names(), or holding a CodeSymbol with its own
+        parent_symbol) should pass the qid directly for an unambiguous
+        answer.  Anyone with only a bare name (regex matches,
+        /expand <bare> typed by the user, ...) gets a single representative
+        entry — better than nothing, but inherently ambiguous when several
+        classes share that method name."""
+        key = (project_id, name_or_qid)
+        meta = self._symbol_meta.get(key)
+        if meta is not None:
+            return meta
+        qids = self._bare_index.get((project_id, name_or_qid))
+        if not qids:
+            return None
+        chosen = sorted(qids)[0]
+        return self._symbol_meta.get((project_id, chosen))
+
+    def get_parent_symbol(self, name_or_qid: str, project_id: str) -> str:
+        meta = self._resolve_meta(name_or_qid, project_id)
         return meta.get("parent_symbol", "") if meta else ""
 
     def get_class_members(self, class_name: str, project_id: str) -> List[str]:
-        """All symbol names whose parent_symbol == class_name, sorted by source
-        order (line_start) then name. Accumulates across blocks/chunks so a class
-        split across several pasted fragments resolves to ONE member set."""
+        """Qualified ids of every member of `class_name`, ordered by
+        source order (line_start) then by id.  Unlike before, this now
+        returns ALL members correctly even when other classes in the project
+        have methods sharing the same bare names."""
         members = []
-        for (pid, name), meta in self._symbol_meta.items():
+        for (pid, qid), meta in self._symbol_meta.items():
             if pid == project_id and meta.get("parent_symbol") == class_name:
-                members.append(name)
-        return sorted(
-            members,
-            key=lambda n: (
-                self._symbol_line_start(n, project_id),
-                n,
-            ),
-        )
+                members.append(qid)
+
+        def _line_start(qid: str) -> int:
+            meta = self._symbol_meta.get((project_id, qid), {})
+            val = meta.get("line_start")
+            return val if val is not None else 999999
+
+        return sorted(members, key=lambda q: (_line_start(q), q))
 
     def get_classes(self, project_id: str) -> Set[str]:
-        """All class names that have at least one indexed member, plus any symbol
-        whose kind == 'class'."""
         classes = set()
-        for (pid, name), meta in self._symbol_meta.items():
+        for (pid, qid), meta in self._symbol_meta.items():
             if pid != project_id:
                 continue
             if meta.get("kind") == "class":
-                classes.add(name)
+                classes.add(meta.get("name", qid))
             parent = meta.get("parent_symbol")
             if parent:
                 classes.add(parent)
         return classes
 
-    def _symbol_line_start(self, name: str, project_id: str) -> int:
-        """Return the line_start for a symbol, or 999999 if unknown."""
-        meta = self._symbol_meta.get((project_id, name))
+    def get_symbol_meta(
+        self, name_or_qid: str, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._resolve_meta(name_or_qid, project_id)
+
+    def get_signature(self, name_or_qid: str, project_id: str) -> Optional[str]:
+        meta = self._resolve_meta(name_or_qid, project_id)
+        return meta.get("signature") if meta else None
+
+    def get_docstring(self, name_or_qid: str, project_id: str) -> str:
+        meta = self._resolve_meta(name_or_qid, project_id)
+        return meta.get("docstring", "") if meta else ""
+
+    def get_file_for_symbol(self, name_or_qid: str, project_id: str) -> Optional[str]:
+        meta = self._resolve_meta(name_or_qid, project_id)
+        return meta.get("file_path") if meta else None
+
+    def update_docstring(
+        self, name_or_qid: str, project_id: str, docstring: str
+    ) -> None:
+        """Update a symbol's docstring.  An exact qid match updates only that
+        one occurrence — every new call site (background docstring
+        generation, batch generation) now passes a qualified id and gets
+        this precise behaviour.  A bare‑name call (legacy compatibility)
+        updates every symbol sharing that name, which is safer than the old
+        silent-overwrite-of-one but is still an approximation — prefer
+        passing the qualified id when you have it."""
+        key = (project_id, name_or_qid)
+        if key in self._symbol_meta:
+            self._symbol_meta[key]["docstring"] = docstring
+            return
+        qids = self._bare_index.get((project_id, name_or_qid))
+        if qids:
+            for qid in qids:
+                meta = self._symbol_meta.get((project_id, qid))
+                if meta is not None:
+                    meta["docstring"] = docstring
+
+    def _symbol_line_start(self, name_or_qid: str, project_id: str) -> int:
+        meta = self._resolve_meta(name_or_qid, project_id)
         if meta is None:
             return 999999
         val = meta.get("line_start")
         return val if val is not None else 999999
 
-    def get_symbol_meta(self, name: str, project_id: str) -> Optional[Dict[str, Any]]:
-        """Full metadata dict for a symbol, or None if unknown."""
-        return self._symbol_meta.get((project_id, name))
-
-    def get_signature(self, name: str, project_id: str) -> Optional[str]:
-        """Signature string for a symbol, or None. Consumed by RaptorCodeIndex."""
-        meta = self._symbol_meta.get((project_id, name))
-        return meta.get("signature") if meta else None
-
-    def get_docstring(self, name: str, project_id: str) -> str:
-        """One-line docstring for a symbol, or "". Consumed by RaptorCodeIndex."""
-        meta = self._symbol_meta.get((project_id, name))
-        return meta.get("docstring", "") if meta else ""
-
-    def get_file_for_symbol(self, name: str, project_id: str) -> Optional[str]:
-        """File path for a symbol, or None. Consumed by HubSymbolIndex._file_for."""
-        meta = self._symbol_meta.get((project_id, name))
-        return meta.get("file_path") if meta else None
-
-    def update_docstring(self, name: str, project_id: str, docstring: str) -> None:
-        """Actualiza el docstring almacenado de un símbolo (compatibilidad)."""
-        meta = self._symbol_meta.get((project_id, name))
-        if meta is not None:
-            meta["docstring"] = docstring
-
     # ── Typed edge storage (v7+) ───────────────────────────────────────
     def add_edge(self, edge: "Edge", project_id: str) -> None:
-        """Register a typed edge in the index. Deduplicates by (src, dst, type)."""
+        """Register a typed edge.  `edge.src` is expected to be the
+        qualified id of the symbol whose body contains the call (the caller
+        must qualify it themselves with qualify_symbol_name() before
+        building the Edge — SymbolIndex has no way to know a symbol's
+        parent_symbol from a bare string alone).  `edge.dst` stays whatever
+        the extractor produced (best-effort, normally bare)."""
         src_key = f"{project_id}:{edge.src}"
         dst_key = f"{project_id}:{edge.dst}"
         existing = self._edges_out.get(src_key, [])
         for e in existing:
             if e.dst == edge.dst and e.type == edge.type:
-                return  # already registered
+                return
         self._edges_out[src_key].append(edge)
         self._edges_in[dst_key].append(edge)
 
-    def remove_edges_for_symbol(self, symbol_name: str, project_id: str) -> None:
-        """Remove all edges where this symbol is source or destination."""
-        src_key = f"{project_id}:{symbol_name}"
-        # Remove outgoing edges
+    def remove_edges_for_symbol(self, symbol_id: str, project_id: str) -> None:
+        """Remove edges where `symbol_id` (qualified id for a class‑scoped
+        symbol, bare name for a module‑level one) is source or destination."""
+        src_key = f"{project_id}:{symbol_id}"
         for edge in self._edges_out.pop(src_key, []):
             dst_key = f"{project_id}:{edge.dst}"
             self._edges_in[dst_key] = [
-                e for e in self._edges_in.get(dst_key, []) if e.src != symbol_name
+                e for e in self._edges_in.get(dst_key, []) if e.src != symbol_id
             ]
-        # Remove incoming edges
-        dst_key = f"{project_id}:{symbol_name}"
+        dst_key = f"{project_id}:{symbol_id}"
         for edge in self._edges_in.pop(dst_key, []):
             src_key_in = f"{project_id}:{edge.src}"
             self._edges_out[src_key_in] = [
-                e for e in self._edges_out.get(src_key_in, []) if e.dst != symbol_name
+                e for e in self._edges_out.get(src_key_in, []) if e.dst != symbol_id
             ]
 
-    def get_edges_out(self, symbol_name: str, project_id: str) -> List["Edge"]:
-        """Outgoing edges for a given symbol."""
-        return self._edges_out.get(f"{project_id}:{symbol_name}", [])
+    def get_edges_out(self, symbol_id: str, project_id: str) -> List["Edge"]:
+        """Outgoing edges.  Pass a method's qualified id for precisely its
+        own calls; a module‑level function's bare name works as-is."""
+        return self._edges_out.get(f"{project_id}:{symbol_id}", [])
 
-    def get_edges_in(self, symbol_name: str, project_id: str) -> List["Edge"]:
-        """Incoming edges for a given symbol."""
-        return self._edges_in.get(f"{project_id}:{symbol_name}", [])
+    def get_edges_in(self, callee_name: str, project_id: str) -> List["Edge"]:
+        """Incoming edges for a callee name (necessarily bare, best-effort).
+        May include callers from an unrelated symbol that shares that bare
+        name — there is no general way to know which class's method a call
+        `obj.method()` actually resolves to without type inference; this is
+        the inherent and documented limitation."""
+        return self._edges_in.get(f"{project_id}:{callee_name}", [])
 
     def get_all_edges_out(self, project_id: str) -> Dict[str, List["Edge"]]:
-        """
-        Full outgoing edge map for a project.
-        Used by ActivationGraph.propagate() and RaptorCodeIndex.
-        Returns {symbol_name: [Edge, ...]}.
-        """
         prefix = f"{project_id}:"
         return {
             key[len(prefix) :]: edges
@@ -3799,15 +4013,6 @@ class SymbolIndex:
         }
 
     def get_all_edges_in(self, project_id: str) -> Dict[str, List["Edge"]]:
-        """
-        Inverted edge map: {symbol: [Edge(src=symbol, dst=caller), ...]}.
-
-        Built by reversing edges_out so it can feed ActivationGraph.propagate()
-        to activate CALLERS (multi-hop impact propagation for refactoring). The
-        default refactor path in build_block_b uses get_edges_in() for DIRECT
-        (1-hop) callers and does NOT need this; provided for an optional
-        caller-propagation mode.
-        """
         prefix = f"{project_id}:"
         inverted: Dict[str, List["Edge"]] = defaultdict(list)
         for key, edges in self._edges_out.items():
@@ -3826,47 +4031,35 @@ class SymbolIndex:
         return dict(inverted)
 
     def compute_signature_hash(self, project_id: str) -> str:
-        """
-        Hash of all symbol signatures (NOT bodies) for a project, sorted by name.
-
-        Changes only when symbols are added/removed/renamed or a signature
-        changes — NOT when a function body is edited. Gives the skeleton tier a
-        much longer cache lifetime than code_state_hash (which changes on any
-        edit). \x1f/\x1e separators avoid collisions when a signature contains
-        ':' or newlines.
-
-        Now includes parent_symbol so that moving a method to another class
-        (or promoting a function to a method) correctly invalidates the cache.
-        """
-        names = sorted(self.get_all_names(project_id))
-        if not names:
+        qids = sorted(self.get_all_qualified_names(project_id))
+        if not qids:
             return ""
         parts = []
-        for name in names:
-            sig = self.get_signature(name, project_id) or name
-            parent = self.get_parent_symbol(name, project_id)
+        for qid in qids:
+            meta = self._symbol_meta.get((project_id, qid), {})
+            name = meta.get("name", qid)
+            sig = meta.get("signature") or name
+            parent = meta.get("parent_symbol", "")
             parts.append(f"{parent}\x1f{name}\x1f{sig}")
         blob = "\x1e".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     def compute_skeleton_hash(self, project_id: str) -> str:
-        """Skeleton-tier cache key: signature structure + docstring coverage.
-        Distinct from signature_hash so the skeleton tier (which now renders
-        docstrings) invalidates as background docstrings land, then stabilizes,
-        WITHOUT churning the other signature_hash consumers."""
-        names = sorted(self.get_all_names(project_id))
-        if not names:
+        qids = sorted(self.get_all_qualified_names(project_id))
+        if not qids:
             return ""
         parts = []
-        for name in names:
-            sig = self.get_signature(name, project_id) or name
-            parent = self.get_parent_symbol(name, project_id)
-            doc = self.get_docstring(name, project_id)
+        for qid in qids:
+            meta = self._symbol_meta.get((project_id, qid), {})
+            name = meta.get("name", qid)
+            sig = meta.get("signature") or name
+            parent = meta.get("parent_symbol", "")
+            doc = meta.get("docstring", "")
             parts.append(f"{parent}\x1f{name}\x1f{sig}\x1f{doc}")
         blob = "\x1e".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
-    # ── Centrality (v8) ────────────────────────────────────────────────
+    # ── Centrality ──────────────────────────────────────────────────────
     def precompute_centrality(
         self,
         project_id: str,
@@ -3874,12 +4067,16 @@ class SymbolIndex:
         max_steps: int = 30,
         tolerance: float = 1e-7,
     ) -> Dict[str, float]:
-        """
-        Compute normalised PageRank centrality for all symbols in the project.
-        Returns {symbol_name: score in [0, 1]} where 1.0 = most central.
-        Cached in self._centrality_cache[project_id].
-        """
-        names = list(self._iter_names(project_id))
+        """PageRank over QUALIFIED symbol identities, so e.g. fifteen
+        __init__ with the same name are fifteen separate nodes instead of
+        one node whose edges were silently fused.
+
+        Each edge's destination (best-effort, normally bare) is resolved
+        against every qualified node sharing that bare name — if a name is
+        ambiguous (multiple classes with a method of that same name), the
+        contribution is split among all candidates instead of being silently
+        lost."""
+        names = list(self.get_all_qualified_names(project_id))
         n = len(names)
         if n == 0:
             return {}
@@ -3890,31 +4087,35 @@ class SymbolIndex:
 
         idx = {name: i for i, name in enumerate(names)}
 
-        # Build out-adjacency (only edges whose dst is a known symbol)
+        bare_to_indices: Dict[str, List[int]] = {}
+        for (pid, bare), qids in self._bare_index.items():
+            if pid != project_id:
+                continue
+            indices = [idx[q] for q in qids if q in idx]
+            if indices:
+                bare_to_indices[bare] = indices
+
         out_links: list = [[] for _ in range(n)]
         for name in names:
             i = idx[name]
             for edge in self._edges_out.get(f"{project_id}:{name}", []):
-                j = idx.get(edge.dst)
-                if j is not None and j != i:
-                    out_links[i].append(j)
+                if edge.dst in idx:
+                    out_links[i].append(idx[edge.dst])
+                else:
+                    for j in bare_to_indices.get(edge.dst, []):
+                        out_links[i].append(j)
 
-        # PageRank power iteration
         rank = [1.0 / n] * n
         base = (1.0 - alpha) / n
         dangling_nodes = [i for i in range(n) if not out_links[i]]
 
         for _ in range(max_steps):
             new_rank = [base] * n
-
-            # Distribute dangling mass uniformly
             dangling_sum = sum(rank[i] for i in dangling_nodes)
             if dangling_sum:
                 share = alpha * dangling_sum / n
                 for k in range(n):
                     new_rank[k] += share
-
-            # Distribute each node's rank to its out-neighbours
             for i in range(n):
                 links = out_links[i]
                 if not links:
@@ -3922,14 +4123,11 @@ class SymbolIndex:
                 contrib = alpha * rank[i] / len(links)
                 for j in links:
                     new_rank[j] += contrib
-
-            # Convergence check (L1 delta)
             delta = sum(abs(new_rank[k] - rank[k]) for k in range(n))
             rank = new_rank
             if delta < tolerance:
                 break
 
-        # Normalise to [0, 1] by the maximum score
         max_r = max(rank) if rank else 1.0
         if max_r <= 0:
             scores = {name: 0.0 for name in names}
@@ -3942,14 +4140,6 @@ class SymbolIndex:
     def get_hub_symbols(
         self, project_id: str, centrality: Dict[str, float], top_n: int
     ) -> List[Tuple[str, float]]:
-        """
-        Return [(symbol_name, score)] for the top_n symbols by centrality,
-        sorted by descending score (ties broken alphabetically for stable
-        output). Used by HubSymbolIndex.build().
-
-        If `centrality` is empty, falls back to the cached scores from the last
-        precompute_centrality() call for this project.
-        """
         if not centrality:
             centrality = getattr(self, "_centrality_cache", {}).get(project_id, {})
         if not centrality or top_n <= 0:
@@ -3957,44 +4147,50 @@ class SymbolIndex:
         ranked = sorted(centrality.items(), key=lambda kv: (-kv[1], kv[0]))
         return ranked[:top_n]
 
-    # ── Internal helpers ───────────────────────────────────────────────
+    # ── Internal helpers ────────────────────────────────────────────────
     def _evict_if_needed(self) -> None:
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
             least_common = self._stats.most_common()[-1][0]
-            project_id, symbol_name = least_common
-            self.remove_edges_for_symbol(symbol_name, project_id)
+            project_id, qid = least_common
+            self.remove_edges_for_symbol(qid, project_id)
+            meta = self._symbol_meta.get(least_common, {})
+            bare = meta.get("name", qid)
+            bare_key = (project_id, bare)
+            bare_set = self._bare_index.get(bare_key)
+            if bare_set:
+                bare_set.discard(qid)
+                if not bare_set:
+                    del self._bare_index[bare_key]
             del self._name_to_blocks[least_common]
-            del self._callee_to_callers[least_common]
-            del self._stats[least_common]
+            self._stats.pop(least_common, None)
+            self._symbol_meta.pop(least_common, None)
 
     def _store_centrality(self, project_id: str, scores: Dict[str, float]) -> None:
-        """Cache centrality scores for cheap re-reads by get_hub_symbols()."""
         self._centrality_cache[project_id] = scores
 
     def _iter_names(self, project_id: str):
-        """Yield every symbol name in the project."""
-        return iter(self.get_all_names(project_id))
+        return iter(self.get_all_qualified_names(project_id))
 
     def _iter_out_edges(self, project_id: str, name: str):
-        """Yield callee names (edge targets) for `name` in the project."""
         key = f"{project_id}:{name}"
         for edge in self._edges_out.get(key, []):
             yield edge.dst
 
     # ── Project lifecycle ──────────────────────────────────────────────
     def clear_project(self, project_id: str) -> None:
-        # Remove name-to-blocks mappings
         keys_to_remove = [key for key in self._name_to_blocks if key[0] == project_id]
         for key in keys_to_remove:
             del self._name_to_blocks[key]
-            del self._stats[key]
+            self._stats.pop(key, None)
 
-        # Remove callee-to-callers mappings
+        bare_keys = [key for key in self._bare_index if key[0] == project_id]
+        for key in bare_keys:
+            del self._bare_index[key]
+
         inv_keys = [key for key in self._callee_to_callers if key[0] == project_id]
         for key in inv_keys:
             del self._callee_to_callers[key]
 
-        # Remove typed edges for this project
         prefix = f"{project_id}:"
         for k in list(self._edges_out.keys()):
             if k.startswith(prefix):
@@ -4003,16 +4199,15 @@ class SymbolIndex:
             if k.startswith(prefix):
                 del self._edges_in[k]
 
-        # Remove centrality cache for this project
         self._centrality_cache.pop(project_id, None)
 
-        # Remove per-symbol metadata for this project
         meta_keys = [key for key in self._symbol_meta if key[0] == project_id]
         for key in meta_keys:
             del self._symbol_meta[key]
 
     def clear(self) -> None:
         self._name_to_blocks.clear()
+        self._bare_index.clear()
         self._callee_to_callers.clear()
         self._stats.clear()
         self._edges_out.clear()
@@ -4088,7 +4283,22 @@ class SignatureExtractor:
         call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
         del tree
         for sym in syms:
-            sym.calls = call_map.get(sym.name, [])
+            # call_map is indexed by the caller's qualified id
+            # ("Class.method" or a bare module-level name) — see
+            # _extract_calls_from_tree().  Resolve the SAME qualified id for
+            # this symbol, so it receives exactly its own calls, never the
+            # calls of another method with the same bare name.  The union
+            # with the bare lookup below is purely defensive: it should be a
+            # no-op whenever this symbol has a parent_symbol, because the
+            # class walk in _extract_calls_from_tree mirrors
+            # _extract_symbols_from_tree and should always agree.
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            calls = list(call_map.get(qid, []))
+            if qid != sym.name:
+                for c in call_map.get(sym.name, []):
+                    if c not in calls:
+                        calls.append(c)
+            sym.calls = calls
         if lang == "python" or (file_path and file_path.endswith(".py")):
             SignatureExtractor._extract_docstrings_python(code, syms)
         return syms
@@ -4291,6 +4501,22 @@ class SignatureExtractor:
             if lang == "python":
                 return SignatureExtractor._extract_calls_fallback_python(code)
             return SignatureExtractor._extract_calls_generic(code)
+
+        # Same class node types that _extract_symbols_from_tree() already
+        # walks up to resolve a symbol's enclosing class.  Also needed here:
+        # without this, any method sharing a bare name across different
+        # classes (__init__, __init__, __init__...) ends up with its outgoing
+        # calls fused into ONE call_map entry, and extract_async() hands
+        # that fused, incorrect list to every symbol with that bare name.
+        _class_node_types = (
+            "class_definition",
+            "class_declaration",
+            "type_spec",
+            "struct_item",
+            "enum_item",
+            "class_specifier",
+        )
+
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
@@ -4321,7 +4547,9 @@ class SignatureExtractor:
                         )
                     else:
                         callee_name = node.text.decode("utf-8")
+
                     caller = None
+                    caller_container = None
                     parent = node.parent
                     while parent:
                         if parent.type in (
@@ -4333,6 +4561,7 @@ class SignatureExtractor:
                             name_node = parent.child_by_field_name("name")
                             if name_node:
                                 caller = name_node.text.decode("utf-8")
+                            caller_container = parent
                             break
                         elif parent.type == "arrow_function":
                             if current_arrow_caller:
@@ -4348,10 +4577,27 @@ class SignatureExtractor:
                                     name_node = declarator.child_by_field_name("name")
                                     if name_node:
                                         caller = name_node.text.decode("utf-8")
+                            caller_container = parent
                             break
                         parent = parent.parent
+
                     if caller:
-                        call_map[caller].add(callee_name)
+                        # NEW — resolve the CALLER's enclosing class
+                        # (not the callee's — the callee stays best-effort,
+                        #  see document header).
+                        caller_class = ""
+                        class_walker = (
+                            caller_container.parent if caller_container else None
+                        )
+                        while class_walker:
+                            if class_walker.type in _class_node_types:
+                                cname_node = class_walker.child_by_field_name("name")
+                                if cname_node:
+                                    caller_class = cname_node.text.decode("utf-8")
+                                break
+                            class_walker = class_walker.parent
+                        caller_qid = qualify_symbol_name(caller, caller_class)
+                        call_map[caller_qid].add(callee_name)
             return {k: list(v) for k, v in call_map.items()}
         except Exception:
             return {}
@@ -4853,15 +5099,16 @@ class StateStore:
         return state
 
     def _rebuild_symbol_index(self, state: dict, project_id: str) -> None:
-        """Reconstruye el SymbolIndex al cargar un estado en frío."""
+        """Reconstruct the SymbolIndex when loading state from cold storage."""
         for block in state.get("active_blocks", {}).values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
                 self._f._symbol_index.add(sym, block.hash, project_id)
+                caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol)
                 for callee in sym.calls:
                     edge = Edge(
-                        src=sym.name,
+                        src=caller_qid,
                         dst=callee,
                         type="calls",
                         weight=EDGE_WEIGHTS["calls"],
@@ -7675,11 +7922,13 @@ class CommandRouter:
     # ----------------------------------------------------------------------
     def _resolve_expand_target(self, token: str, project_id: str):
         """Classify an /expand target.
-        Returns ('method', name) | ('class', name) | ('symbol', name).
-        """
+        Returns ('method', id) | ('class', name) | ('symbol', name)."""
         m = self._EXPAND_DOTTED.match(token)
         if m:
             cls, meth = m.group(1), m.group(2)
+            qid = qualify_symbol_name(meth, cls)
+            if self._f._symbol_index.find_blocks(qid, project_id):
+                return ("method", qid)
             if meth in self._f._symbol_index.get_all_names(project_id):
                 return ("method", meth)
         if token in self._f._symbol_index.get_classes(project_id):
@@ -7769,7 +8018,11 @@ class CommandRouter:
                         f"### `{current_name}` (depth {current_depth}){loc}\n```\n{block.content[:2000]}\n```"
                     )
                     for sym in block.symbols:
-                        if sym.name == current_name:
+                        if (
+                            sym.name == current_name
+                            or qualify_symbol_name(sym.name, sym.parent_symbol)
+                            == current_name
+                        ):
                             for callee in sym.calls:
                                 await recurse(callee, current_depth + 1)
                             break
@@ -9175,7 +9428,8 @@ class CodeBlockManager:
     def extract_data_flow_edges(
         self, code: str, file_path: Optional[str], project_id: str
     ) -> List["Edge"]:
-        """Extract data flow edges from Python code using ast, with regex fallback."""
+        """Extract data flow edges from Python code using ast, with regex
+        fallback."""
         if not file_path or not file_path.endswith(".py"):
             return self._extract_data_flow_edges_regex(code, project_id)
 
@@ -9189,12 +9443,37 @@ class CodeBlockManager:
         except SyntaxError:
             return []
 
+        # Map line numbers to their enclosing class, so the caller side of
+        # every data-flow edge is qualified the same way as __init__ calls
+        # — otherwise two classes with same‑named methods would fuse their
+        # data-flow edges exactly as happened with the call graph.
+        line_to_class: Dict[int, str] = {}
+
+        def _mark_classes(node, current_class: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    end = getattr(child, "end_lineno", child.lineno)
+                    for ln in range(child.lineno, end + 1):
+                        line_to_class[ln] = current_class
+                    _mark_classes(child, child.name)
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    end = getattr(child, "end_lineno", child.lineno)
+                    for ln in range(child.lineno, end + 1):
+                        line_to_class[ln] = current_class
+                    _mark_classes(child, current_class)
+                else:
+                    _mark_classes(child, current_class)
+
+        _mark_classes(tree, "")
+
         for func_node in ast.walk(tree):
             if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             caller_name = func_node.name
             if caller_name not in all_names:
                 continue
+            caller_class = line_to_class.get(func_node.lineno, "")
+            caller_qid = qualify_symbol_name(caller_name, caller_class)
             assigned_vars: Set[str] = set()
             for child in ast.walk(func_node):
                 if isinstance(child, ast.Assign):
@@ -9218,7 +9497,7 @@ class CodeBlockManager:
                 if args_are_local_vars or child.args:
                     edges.append(
                         Edge(
-                            src=caller_name,
+                            src=caller_qid,
                             dst=callee_name,
                             type="data_flow",
                             weight=EDGE_WEIGHTS["data_flow"],
@@ -9646,60 +9925,80 @@ class ActivationEngine:
         edges_out: dict,
         project_id: str,
     ) -> "ActivationGraph":
-        """Build activation graph when multi‑seed activation is disabled."""
+        """Build activation graph when multi‑seed activation is disabled.
+
+        Each seed is resolved from its bare name to the qualified id(s) of
+        the matching symbol(s) before being written into the graph, since
+        edges_out is now keyed by qualified id (see SymbolIndex).  A bare
+        name shared by several same‑named methods across classes (e.g. every
+        __init__) is split among all of them, with the score divided among
+        the matches — we don't know which one the user means, so each
+        plausible candidate gets a fair, bounded share instead of an
+        arbitrary winner."""
+        symbol_index = self._f._symbol_index
         ag = ActivationGraph()
 
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=score, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = score / len(qids)
+                for qid in qids:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         if partial_seeds:
             for sym_name in partial_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=score, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = score / len(qids)
+                for qid in qids:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         for sym_name, tb_score in tb_seeds:
-            existing = ag._activations.get(sym_name)
-            if existing:
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name,
-                    score=min(1.0, existing.score + tb_score * 0.4),
-                    depth=0,
-                    source="seed",
-                )
-            else:
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=tb_score, depth=0, source="seed"
-                )
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            share = tb_score / len(qids)
+            for qid in qids:
+                existing = ag._activations.get(qid)
+                if existing:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share * 0.4),
+                        depth=0,
+                        source="seed",
+                    )
+                else:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         for sym_name, boost in history_boosts.items():
-            existing = ag._activations.get(sym_name)
-            if existing:
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name,
-                    score=min(1.0, existing.score + boost),
-                    depth=0,
-                    source=existing.source,
-                )
-            else:
-                ag._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=boost, depth=0, source="seed"
-                )
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            share = boost / len(qids)
+            for qid in qids:
+                existing = ag._activations.get(qid)
+                if existing:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share),
+                        depth=0,
+                        source=existing.source,
+                    )
+                else:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
 
         if not ag._activations:
             entry_points = self._f._path_index.find_entry_points(
-                self._f._symbol_index, project_id
+                symbol_index, project_id
             )
             if entry_points:
                 centrality = self._f._node_centrality.get(project_id, {})
                 sorted_eps = sorted(
-                    entry_points,
-                    key=lambda ep: centrality.get(ep, 0.0),
-                    reverse=True,
+                    entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
                 )
                 for sym_name in sorted_eps[:3]:
                     cent_score = centrality.get(sym_name, 0.0)
@@ -9725,10 +10024,14 @@ class ActivationEngine:
         edges_out: dict,
         project_id: str,
     ) -> "ActivationGraph":
-        """Build activation graph combining lexical, structural and historical seed vectors."""
+        """Build activation graph combining lexical, structural and historical
+        seed vectors.  Like _build_single_seed_graph, each bare‑name seed is
+        split across its qualified id(s) before being written into any of
+        the three vectors, since edges_out is now qualified-id‑keyed."""
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
+        symbol_index = self._f._symbol_index
 
         # ── Vector 1: Lexical ──────────────────────────────────────────
         ag_lex = ActivationGraph()
@@ -9736,29 +10039,38 @@ class ActivationEngine:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                ag_lex._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=score, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = score / len(qids)
+                for qid in qids:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         if partial_seeds:
             for sym_name in partial_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                ag_lex._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=score, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = score / len(qids)
+                for qid in qids:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         for sym_name, tb_score in tb_seeds:
-            existing = ag_lex._activations.get(sym_name)
-            if existing:
-                ag_lex._activations[sym_name] = ActivationState(
-                    node_id=sym_name,
-                    score=min(1.0, existing.score + tb_score * 0.4),
-                    depth=0,
-                    source="seed",
-                )
-            else:
-                ag_lex._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=tb_score, depth=0, source="seed"
-                )
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            share = tb_score / len(qids)
+            for qid in qids:
+                existing = ag_lex._activations.get(qid)
+                if existing:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share * 0.4),
+                        depth=0,
+                        source="seed",
+                    )
+                else:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -9769,10 +10081,19 @@ class ActivationEngine:
 
         # ── Vector 2: Structural ───────────────────────────────────────
         ag_str = ActivationGraph()
-        lexical_seed_names = set(exact_seeds) | {s for s, _ in tb_seeds}
+        lexical_seed_qids: Set[str] = set()
+        for sym_name in exact_seeds:
+            lexical_seed_qids |= symbol_index.get_qualified_names_for(
+                sym_name, project_id
+            )
+        for sym_name, _ in tb_seeds:
+            lexical_seed_qids |= symbol_index.get_qualified_names_for(
+                sym_name, project_id
+            )
+
         structural_seeds: Set[str] = set()
         for view in self._f._path_index.get_all(project_id):
-            for lex_seed in lexical_seed_names:
+            for lex_seed in lexical_seed_qids:
                 if lex_seed in view.induced_nodes:
                     structural_seeds.add(view.entry_point)
                     break
@@ -9780,9 +10101,12 @@ class ActivationEngine:
             for sym_name in structural_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.8, 0.5 * min(specificity, 1.4))
-                ag_str._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=score, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = score / len(qids)
+                for qid in qids:
+                    ag_str._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
             ag_str.propagate(
                 edges_out=edges_out,
                 max_steps=20,
@@ -9794,9 +10118,12 @@ class ActivationEngine:
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
-                ag_his._activations[sym_name] = ActivationState(
-                    node_id=sym_name, score=boost, depth=0, source="seed"
-                )
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                share = boost / len(qids)
+                for qid in qids:
+                    ag_his._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
             ag_his.propagate(
                 edges_out=edges_out,
                 max_steps=20,
@@ -9814,7 +10141,7 @@ class ActivationEngine:
         ag_final = ActivationGraph()
         if not all_activated:
             entry_points = self._f._path_index.find_entry_points(
-                self._f._symbol_index, project_id
+                symbol_index, project_id
             )
             if entry_points:
                 centrality = self._f._node_centrality.get(project_id, {})
@@ -9837,7 +10164,7 @@ class ActivationEngine:
                     + w_his * ag_his.get_score(node)
                 )
                 if combined >= 0.01:
-                    source = "seed" if node in lexical_seed_names else "propagation"
+                    source = "seed" if node in lexical_seed_qids else "propagation"
                     depth = min(
                         ag_lex._activations.get(
                             node,
@@ -10079,8 +10406,9 @@ class ActivationEngine:
         for sym_name in candidates:
             if not self._f._symbol_index.find_blocks(sym_name, project_id):
                 continue
+            qids = self._f._symbol_index.get_qualified_names_for(sym_name, project_id)
             ag = ActivationGraph()
-            ag.seed([sym_name], initial_score=1.0)
+            ag.seed(list(qids), initial_score=1.0)
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
             await self._build_view_from_activation(sym_name, ag, project_id)
 
@@ -11052,14 +11380,16 @@ class EnrichmentTasks:
         if not last_lod_map:
             return
 
-        all_names = self._f._symbol_index.get_all_names(project_id)
+        bare_names = self._f._symbol_index.get_all_names(project_id)
         response_words = set(re.findall(r"\b\w+\b", response_text))
-        referenced = all_names.intersection(response_words)
+        bare_referenced = bare_names.intersection(response_words)
+        referenced: Set[str] = set()
+        for bare in bare_referenced:
+            referenced |= self._f._symbol_index.get_qualified_names_for(
+                bare, project_id
+            )
 
-        # Symbols mentioned in the response that only received docstring/signature
         underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
-
-        # Symbols that got full code but do not appear in the response
         overserved = [
             sym
             for sym in last_lod_map
@@ -11070,7 +11400,6 @@ class EnrichmentTasks:
         changed = False
 
         if len(underserved) >= self._f.valves.lod_adapt_underserved_min:
-            # Lower threshold → more full code next time
             self._f.valves.lod3_threshold = max(
                 self._f.valves.lod_adapt_min,
                 self._f.valves.lod3_threshold - self._f.valves.lod_adapt_rate,
@@ -11082,7 +11411,6 @@ class EnrichmentTasks:
                 f"({len(underserved)} underserved: {underserved[:3]})"
             )
         elif len(overserved) >= self._f.valves.lod_adapt_overserved_min:
-            # Raise threshold → fewer unnecessary expansions
             self._f.valves.lod3_threshold = min(
                 self._f.valves.lod_adapt_max,
                 self._f.valves.lod3_threshold + self._f.valves.lod_adapt_rate * 0.5,
@@ -11158,23 +11486,26 @@ class EnrichmentTasks:
         duplicate = results[2] if not isinstance(results[2], Exception) else None
         return contradiction, cached, duplicate
 
-    _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_]\w*)\s*:\s*(.+)$")
-
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
-        """items: list of (name, signature, snippet). Builds one prompt asking
-        for all of them at once."""
+        """items: list of (qid, signature, snippet).  `qid` may be a bare
+        function name or a qualified 'ClassName.method' id — it is always
+        repeated EXACTLY as given, dot included, so the response can be
+        matched back to the correct symbol without ambiguity."""
         parts = []
-        for name, signature, snippet in items:
-            parts.append(f"### {name}\n```\n{signature}\n{snippet[:300]}\n```")
+        for qid, signature, snippet in items:
+            parts.append(f"### {qid}\n```\n{signature}\n{snippet[:300]}\n```")
         listing = "\n\n".join(parts)
         return (
             f"For each of the following {len(items)} code symbols, write ONE "
             f"short sentence describing what it does.\n\n{listing}\n\n"
             f"Output exactly one line per symbol, in this exact format:\n"
-            f"<name>: <one short sentence>\n"
-            f"Use the exact symbol name as given above. Do not add numbering, "
+            f"<identifier>: <one short sentence>\n"
+            f"Use the EXACT identifier as given above, including any "
+            f"'ClassName.' prefix — do not drop it, do not add numbering, "
             f"headers, or any other text."
         )
+
+    _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
 
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
@@ -11190,66 +11521,60 @@ class EnrichmentTasks:
         return result
 
     async def ensure_docstrings_batch(
-        self, names: List[str], project_id: str
+        self, qids: List[str], project_id: str
     ) -> Dict[str, str]:
         """
-        Resolve docstrings for many symbols at once.
+        Resolve docstrings for many symbols at once, identified by their
+        QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name,
+        because dozens of methods in this codebase share bare names across
+        different classes.  Passing bare names here would silently resolve
+        and apply the SAME generated docstring to every symbol sharing that
+        name, exactly the bug this function used to have.
 
         Cache hits (already in memory or in SQLite) are resolved for free.
         Cache misses are generated in groups of `docstring_batch_size`,
-        ONE LLM call per group instead of one call per symbol — this is the
-        whole point: under --parallel 1 we cannot run multiple LLM calls
-        concurrently, so the only way to go faster is to make fewer calls.
+        ONE LLM call per group instead of one call per symbol.
 
-        Returns {name: docstring} for every name that has (or now has) a
-        non-empty docstring. A name absent from the result means it is still
-        undocumented this turn (cache miss, per-turn budget exhausted, or the
-        LLM skipped it in its batch response) — it will be picked up by the
-        existing background docstring loop on a later turn.
+        Returns {qid: docstring} for every qid that has (or now has) a
+        non-empty docstring.
         """
         state = self._f._state_store.get_state(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # 1. Memory + SQLite cache — no LLM call needed.
-        for name in names:
-            found = ""
+        def _find_symbol(qid: str):
             for block in state["active_blocks"].values():
                 for sym in block.symbols:
-                    if sym.name == name and sym.docstring:
-                        found = sym.docstring
-                        break
-                if found:
-                    break
+                    if qualify_symbol_name(sym.name, sym.parent_symbol) == qid:
+                        return sym, block
+            return None, None
+
+        for qid in qids:
+            sym, _ = _find_symbol(qid)
+            found = sym.docstring if sym and sym.docstring else ""
             if not found:
                 try:
                     row = await anyio.to_thread.run_sync(
-                        lambda n=name: self._f._db_conn.execute(
+                        lambda q=qid: self._f._db_conn.execute(
                             "SELECT docstring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
-                            (project_id, n),
+                            (project_id, q),
                         ).fetchone()
                     )
                 except Exception:
                     row = None
                 if row and row[0]:
                     found = row[0]
-                    for block in state["active_blocks"].values():
-                        for sym in block.symbols:
-                            if sym.name == name:
-                                sym.docstring = found
-                                self._f._symbol_index.update_docstring(
-                                    name, project_id, found
-                                )
-                                break
+                    if sym is not None:
+                        sym.docstring = found
+                    self._f._symbol_index.update_docstring(qid, project_id, found)
             if found:
-                resolved[name] = found
+                resolved[qid] = found
             else:
-                pending.append(name)
+                pending.append(qid)
 
         if not pending:
             return resolved
 
-        # 2. Respect the existing per-turn lazy generation budget.
         budget = self._f.valves.lazy_docstring_max_per_turn
         if budget > 0:
             remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
@@ -11257,25 +11582,26 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
-        # 3. Gather signature + snippet for each pending symbol.
         items: List[Tuple[str, str, str]] = []
-        for name in pending:
-            signature, snippet = name, ""
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if sym.name == name:
-                        signature = sym.signature
-                        snippet = block.content[:500]
-                        break
-                if snippet:
-                    break
-            items.append((name, signature, snippet))
+        for qid in pending:
+            sym, block = _find_symbol(qid)
+            if sym is not None and block is not None:
+                signature = sym.signature
+                if sym.line_start:
+                    lines = block.content.split("\n")
+                    start_idx = max(0, sym.line_start - 1)
+                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
+                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
+                else:
+                    snippet = block.content[:500]
+            else:
+                signature, snippet = qid, ""
+            items.append((qid, signature, snippet))
 
-        # 4. One LLM call per batch instead of one per symbol.
         batch_size = max(1, self._f.valves.docstring_batch_size)
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
-            expected = {n for n, _, _ in batch}
+            expected = {q for q, _, _ in batch}
             prompt = self._build_docstring_batch_prompt(batch)
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
@@ -11293,20 +11619,16 @@ class EnrichmentTasks:
                 continue
 
             parsed = self._parse_docstring_batch_response(response, expected)
-            for name, docstring in parsed.items():
-                resolved[name] = docstring
-                for block in state["active_blocks"].values():
-                    for sym in block.symbols:
-                        if sym.name == name:
-                            sym.docstring = docstring
-                            self._f._symbol_index.update_docstring(
-                                name, project_id, docstring
-                            )
-                            break
+            for qid, docstring in parsed.items():
+                resolved[qid] = docstring
+                sym, _ = _find_symbol(qid)
+                if sym is not None:
+                    sym.docstring = docstring
+                self._f._symbol_index.update_docstring(qid, project_id, docstring)
                 await self._f._state_store._db_enqueue(
-                    lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                    lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
                         "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                        (pid, n, d, time.time()),
+                        (pid, q, d, time.time()),
                     )
                 )
 
@@ -11497,16 +11819,17 @@ class EnrichmentTasks:
                     for sym in block.symbols:
                         if sym.name == name and sym.line_start == line_start:
                             sym.docstring = docstring
+                            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
                             self._f._symbol_index.update_docstring(
-                                name, project_id, docstring
+                                qid, project_id, docstring
                             )
                             break
                 self._f._state_store.set_state(project_id, state)
 
             await self._f._state_store._db_enqueue(
-                lambda n=name, d=docstring, pid=project_id: self._f._db_conn.execute(
+                lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
                     "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                    (pid, n, d, time.time()),
+                    (pid, q, d, time.time()),
                 )
             )
         except Exception as e:
@@ -11837,9 +12160,10 @@ class ActiveCodeUpdater:
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
+            caller_qid = qualify_symbol_name(s.name, s.parent_symbol)
             for callee_name in s.calls:
                 edge = Edge(
-                    src=s.name,
+                    src=caller_qid,
                     dst=callee_name,
                     type="calls",
                     weight=EDGE_WEIGHTS["calls"],
@@ -11872,10 +12196,10 @@ class ActiveCodeUpdater:
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
-
+            caller_qid = qualify_symbol_name(s.name, s.parent_symbol)
             for callee_name in s.calls:
                 edge = Edge(
-                    src=s.name,
+                    src=caller_qid,
                     dst=callee_name,
                     type="calls",
                     weight=EDGE_WEIGHTS["calls"],
@@ -11920,10 +12244,10 @@ class ActiveCodeUpdater:
         # Index symbols and call-graph edges (cheap, per-symbol is fine here)
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
-
+            caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol)
             for callee_name in sym.calls:
                 edge = Edge(
-                    src=sym.name,
+                    src=caller_qid,
                     dst=callee_name,
                     type="calls",
                     weight=EDGE_WEIGHTS["calls"],
@@ -14996,6 +15320,35 @@ class Filter:
         frequency_weight_factor: float = Field(default=0.3)
         min_mentions_for_boost: int = Field(default=3)
         frequency_decay_hours: float = Field(default=12.0)
+
+        # ═══════════════════════════════════════════════════════════════
+        #  Architecture Map
+        # ═══════════════════════════════════════════════════════════════
+        enable_architecture_map: bool = Field(
+            default=True,
+            description=(
+                "Inject a compact class→methods outline into Block A, on top "
+                "of the existing hub-symbols section. Cheap, deterministic, "
+                "cache-stable while code is unchanged."
+            ),
+        )
+        architecture_map_max_methods_per_class: int = Field(
+            default=15,
+            ge=1,
+            description="Truncate each class's method list in the outline to this many names.",
+        )
+        architecture_map_max_tokens: int = Field(
+            default=3000,
+            ge=0,
+            description="Token budget for the class outline section. 0 = unlimited.",
+        )
+        enable_hub_callees: bool = Field(
+            default=True,
+            description=(
+                "Show outgoing calls ('→ calls:') for hub symbols, alongside "
+                "the existing incoming-callers line ('← used by:')."
+            ),
+        )
 
     # --------------------------------------------------------------------------
     # Class-level constants
