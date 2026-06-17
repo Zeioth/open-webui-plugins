@@ -4385,69 +4385,36 @@ class SignatureExtractor:
         "h": "cpp",
         "hpp": "cpp",
     }
-    _parser_cache: Dict[str, Any] = {}
-    _parser_cache_lock = threading.Lock()
 
     @staticmethod
-    async def extract_async(
-        code: str, file_path: Optional[str] = None, language: Optional[str] = None
-    ) -> List["CodeSymbol"]:
+    def _guess_language(file_path: Optional[str], code: str) -> str:
         """
-        Extract symbols and call relationships from source code using tree-sitter.
+        Heuristically determine the programming language of a code block.
 
-        Returns symbols with qualified identities (``ClassName.method`` or
-        ``module.function``).  When tree-sitter is unavailable or fails, an
-        empty list is returned and a warning is logged — no fallback
-        extraction is attempted, to prevent unqualified data from entering
-        the symbol index.
+        Resolution order (first match wins):
+        1. tree-sitter extension detection if *file_path* is provided.
+        2. Extension‑to‑language map (``_LANG_MAP``).
+        3. Source‑code heuristics (``def`` → python, ``function`` → javascript).
+        4. ``"unknown"`` — callers will skip tree-sitter extraction.
         """
-        if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
-            return []
-        if not HAS_TREE_SITTER:
-            logger.warning(
-                "tree-sitter not available — skipping symbol extraction. "
-                "Install tree-sitter-language-pack to enable code-aware features."
-            )
-            return []
+        if file_path and HAS_TREE_SITTER:
+            try:
+                return detect_language_from_extension(
+                    file_path.rsplit(".", 1)[-1].lower()
+                )
+            except Exception:
+                pass
+        if file_path:
+            ext = file_path.rsplit(".", 1)[-1].lower()
+            return SignatureExtractor._LANG_MAP.get(ext, "unknown")
+        if re.search(r"\bdef\s+\w+\s*\(", code):
+            return "python"
+        if re.search(r"\bfunction\s+\w+\s*\(", code):
+            return "javascript"
+        return "unknown"
 
-        lang = language or SignatureExtractor._guess_language(file_path, code)
-        if lang == "unknown":
-            logger.warning(
-                "Could not detect language for code block — skipping symbol extraction."
-            )
-            return []
-
-        try:
-            loop = asyncio.get_event_loop()
-            tree = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, SignatureExtractor._parse_sync, code.encode(), lang
-                ),
-                timeout=30.0,
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(
-                f"tree-sitter parse failed for language '{lang}': {e} — "
-                "skipping symbol extraction to avoid corrupt fallback data."
-            )
-            return []
-
-        syms = SignatureExtractor._extract_symbols_from_tree(
-            tree, lang, code, file_path
-        )
-        call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
-        del tree
-        for sym in syms:
-            qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
-            calls = list(call_map.get(qid, []))
-            if qid != sym.name:
-                for c in call_map.get(sym.name, []):
-                    if c not in calls:
-                        calls.append(c)
-            sym.calls = calls
-        if lang == "python" or (file_path and file_path.endswith(".py")):
-            SignatureExtractor._extract_docstrings_python(code, syms)
-        return syms
+    _parser_cache: Dict[str, Any] = {}
+    _parser_cache_lock = threading.Lock()
 
     @staticmethod
     def enrich_symbols_with_parent_info(
