@@ -12645,27 +12645,36 @@ class EnrichmentTasks:
         project_id: str,
     ) -> None:
         """
-        Generate one docstring in background and persist it.
+        Generate one docstring in the background and persist it.
 
-        Matched by (block_hash, name, line_start) instead of name alone:
-        many symbols in this codebase share the same bare name across
-        different classes (e.g. every class's `__init__`), so matching by
-        name only would silently write the result onto the wrong symbol —
-        and the targeted one would never get marked done, looping forever.
+        This function is called once per pending symbol. If the block no longer
+        exists (e.g., was purged or expired), it logs and exits gracefully.
+        The database persistence happens only after the symbol is successfully
+        found and updated, ensuring `qid` is always defined.
         """
         try:
             state = self._f._state_store.get_state(project_id)
             snippet = ""
             target_block = state["active_blocks"].get(block_hash)
+
+            # Extract a code snippet for the LLM context
             if target_block and line_start:
                 lines = target_block.content.split("\n")
                 start_idx = max(0, line_start - 1)
                 end_idx = min(len(lines), (line_end or line_start + 30))
                 snippet = "\n".join(lines[start_idx:end_idx])[:500]
-            if not snippet and target_block:
+            elif target_block:
                 snippet = target_block.content[:500]
 
-            docstring = await self._f._llm_orchestrator.call_llm(
+            # If the block no longer exists, skip silently (no infinite loop)
+            if target_block is None:
+                self._f._log_debug(
+                    f"Background docstring: block {block_hash} not found, skipping '{name}'"
+                )
+                return
+
+            # Ask the LLM for a concise docstring
+            docstring_text = await self._f._llm_orchestrator.call_llm(
                 prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
                 system_prompt="You are a code summarization assistant. Output only one concise sentence.",
                 model_override=self._f.valves.llm_model,
@@ -12673,80 +12682,103 @@ class EnrichmentTasks:
                 temperature=0.1,
                 label="bg_docstring",
             )
-            if not docstring or not docstring.strip():
+
+            if not docstring_text or not docstring_text.strip():
                 return
 
-            docstring = docstring.strip()
+            docstring_text = docstring_text.strip()
 
+            # Acquire the project lock to safely update state and index
             lock = await self._f._state_store.get_project_lock(project_id)
             async with lock:
                 state = self._f._state_store.get_state(project_id)
                 block = state["active_blocks"].get(block_hash)
+
                 if block:
+                    # Find the exact symbol instance by name and line number
                     for sym in block.symbols:
                         if sym.name == name and sym.line_start == line_start:
-                            sym.docstring = docstring
+                            sym.docstring = docstring_text
                             qid = qualify_symbol_name(sym.name, sym.parent_symbol)
-                            self._f._symbol_index.update_docstring(
-                                qid, project_id, docstring
+
+                            # Update in-memory index
+                            self._f._symbol_index.update_docstring(qid, project_id, docstring_text)
+
+                            # Persist to SQLite (qid is guaranteed to be defined here)
+                            await self._f._state_store._db_enqueue(
+                                lambda q=qid, d=docstring_text, pid=project_id: self._f._db_conn.execute(
+                                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                                    (pid, q, d, time.time()),
+                                )
                             )
                             break
-                self._f._state_store.set_state(project_id, state)
 
-            await self._f._state_store._db_enqueue(
-                lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
-                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                    (pid, q, d, time.time()),
-                )
-            )
+                    self._f._state_store.set_state(project_id, state)
+                else:
+                    # Block disappeared between snapshot and execution
+                    self._f._log_debug(
+                        f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
+                    )
+
         except Exception as e:
+            # Log the error but do NOT retry — prevents infinite loops
             self._f._log_debug(
                 f"❌ Docstring generation failed for '{name}' (line {line_start}): {e}"
             )
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
-        Background loop that generates docstrings one at a time until no
-        pending symbols remain. Yields between generations to avoid
-        saturating the server.
+        Background loop that generates docstrings for all pending symbols.
 
-        Pending entries carry (block_hash, line_start) alongside name/signature
-        so the same symbol instance can be re-identified later — many symbols
-        in this codebase share the same bare name across different classes
-        (e.g. every class's `__init__`), so name alone is not a safe identifier.
+        Takes a snapshot of all symbols missing docstrings at the start,
+        then processes each one exactly once. This prevents infinite retries
+        on failing symbols and ensures the loop terminates naturally.
         """
-        while True:
-            state = self._f._state_store.get_state(project_id)
-            pending = []
-            for block in state["active_blocks"].values():
-                if block.obsolete:
-                    continue
-                for sym in block.symbols:
-                    if sym.kind in ("function", "method") and not sym.docstring:
-                        pending.append(
-                            (
-                                sym.name,
-                                sym.signature,
-                                block.hash,
-                                sym.line_start,
-                                sym.line_end,
-                            )
-                        )
-            if not pending:
-                break
+        # --- Snapshot: collect all symbols without docstrings ---
+        state = self._f._state_store.get_state(project_id)
+        pending = []
 
-            # Find the first symbol without a docstring
-            name, signature, block_hash, line_start, line_end = pending[0]
-            # Run the generation synchronously (one at a time inside the loop)
+        for block in state["active_blocks"].values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                if sym.kind in ("function", "method") and not sym.docstring:
+                    pending.append(
+                        (
+                            sym.name,
+                            sym.signature,
+                            block.hash,
+                            sym.line_start,
+                            sym.line_end,
+                        )
+                    )
+
+        if not pending:
+            self._f._log_debug("Background docstring loop: no pending symbols")
+            return
+
+        self._f._log_debug(
+            f"Background docstring loop: {len(pending)} symbol(s) to process"
+        )
+
+        # --- Process each symbol once ---
+        for idx, (name, signature, block_hash, line_start, line_end) in enumerate(pending, 1):
             await self._background_docstring(
-                name, signature, block_hash, line_start, line_end, project_id
+                name,
+                signature,
+                block_hash,
+                line_start,
+                line_end,
+                project_id,
             )
-            # Brief pause between tasks to avoid tight loop on cache hits
-            self._bg_docstring_count += 1
-            if self._bg_docstring_count % 10 == 0:
-                await asyncio.sleep(2)  # longer cooldown every 10 docstrings
+
+            # Throttle requests to avoid saturating the LLM server
+            if idx % 5 == 0:
+                await asyncio.sleep(1.0)
             else:
-                await asyncio.sleep(1)  # minimal pause between individual calls
+                await asyncio.sleep(0.3)
+
+        self._f._log_debug("Background docstring loop: finished")
 
     def start_docstring_loop(self, project_id: str) -> None:
         """
