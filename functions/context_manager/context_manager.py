@@ -2105,9 +2105,11 @@ class ContextBuilder:
 
         # Fast-path trigger for inventory / structural queries.
         self._LIST_INTENTS = re.compile(
-            r"\b(lista|lístame|listame|enumera|inventario|"
+            r"\b(?:dame\s+la\s+)?lista\s*(?:de\s+)?(?:clases|funciones)|"
+            r"lístame|listame|enumera|inventario|"
             r"todas las (clases|funciones)|qué (clases|funciones)|"
-            r"estructura del código|overview|list all|all (classes|functions))\b",
+            r"estructura del código|overview|list all|all (classes|functions)|"
+            r"muestra las clases|show classes|list classes",
             re.IGNORECASE,
         )
         # Fast-path for skeleton/scaffolding queries.
@@ -4697,7 +4699,7 @@ class SignatureExtractor:
         Resolution order (first match wins):
         1. tree-sitter extension detection if *file_path* is provided.
         2. Extension‑to‑language map (``_LANG_MAP``).
-        3. Source‑code heuristics: Python keywords (def, class, import, from)
+        3. Source‑code heuristics: Python keywords (def, class, import, from, async def)
            or JavaScript 'function' keyword.
         4. ``"unknown"`` — callers will skip tree-sitter extraction.
         """
@@ -4711,11 +4713,16 @@ class SignatureExtractor:
         if file_path:
             ext = file_path.rsplit(".", 1)[-1].lower()
             return SignatureExtractor._LANG_MAP.get(ext, "unknown")
-        # Check for multiple Python-specific patterns, not just 'def'
-        if re.search(r"\b(?:def|class|import|from)\s+\w+", code):
+
+        # ── Improved heuristics for code without an extension ──────────────
+        # Look for multiple Python-specific patterns, not just 'def'
+        if re.search(r"\b(?:def|class|import|from|async def)\s+\w+", code):
             return "python"
         if re.search(r"\bfunction\s+\w+\s*\(", code):
             return "javascript"
+
+        # Fallback: if it contains braces and semicolons, it could be C/Java,
+        # but we leave it as unknown for now to avoid misdetection.
         return "unknown"
 
     @staticmethod
@@ -4906,23 +4913,6 @@ class SignatureExtractor:
     def _extract_symbols_from_tree(
         tree, lang: str, code: str, file_path: Optional[str]
     ) -> List["CodeSymbol"]:
-        """
-        Extract ``CodeSymbol`` instances from a tree-sitter parse tree.
-
-        Returns a list of symbols with their **parent class** resolved (when
-        applicable) so that methods from different classes with the same bare
-        name never collide.  Symbols are returned with ``parent_symbol`` set
-        to the enclosing class name, or ``""`` for module-level definitions.
-
-        Fallback behaviour
-        ------------------
-        If no tree-sitter query is registered for *lang*, a warning is logged
-        and an empty list is returned.  The legacy fallback function
-        ``_extract_generic`` was removed in v9 because it produced symbols
-        without ``parent_symbol`` information, which could silently corrupt
-        the symbol index and call graph.  There are no remaining fallback
-        paths — this is intentional.
-        """
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
             logger.warning(
@@ -4933,77 +4923,76 @@ class SignatureExtractor:
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
-            # tree-sitter >= 0.22 removed cursor(); captures directly from query
-            try:
-                captures = query.captures(tree.root_node)
-            except AttributeError:
-                # Fallback for tree-sitter < 0.22
-                cursor = query.cursor()
-                captures = cursor.captures(tree.root_node)
+            from tree_sitter import QueryCursor
+
+            cursor = QueryCursor(query)
+            captures = cursor.captures(tree.root_node)  # dict: {capture_name: [nodes]}
+
             symbols = []
-            for cap_name, node in captures:
+            func_types = (
+                "function_definition",
+                "function_declaration",
+                "method_declaration",
+                "function_item",
+                "arrow_function",
+                "function_expression",
+            )
+            class_types = (
+                "class_definition",
+                "class_declaration",
+                "type_spec",
+                "struct_item",
+                "enum_item",
+                "class_specifier",
+            )
+
+            for cap_name, nodes in captures.items():
                 if cap_name != "name":
                     continue
-                parent = node.parent
-                kind = "unknown"
-                func_types = (
-                    "function_definition",
-                    "function_declaration",
-                    "method_declaration",
-                    "function_item",
-                    "arrow_function",
-                    "function_expression",
-                )
-                class_types = (
-                    "class_definition",
-                    "class_declaration",
-                    "type_spec",
-                    "struct_item",
-                    "enum_item",
-                    "class_specifier",
-                )
-                while parent:
-                    if parent.type in func_types:
-                        kind = "function"
-                        break
-                    elif parent.type in class_types:
-                        kind = "class"
-                        break
-                    parent = parent.parent
+                for node in nodes:
+                    parent = node.parent
+                    kind = "unknown"
+                    while parent:
+                        if parent.type in func_types:
+                            kind = "function"
+                            break
+                        elif parent.type in class_types:
+                            kind = "class"
+                            break
+                        parent = parent.parent
 
-                # Walk up from the symbol's own node to find an enclosing class.
-                parent_symbol = ""
-                walker = node.parent
-                if walker is not None:
-                    walker = walker.parent  # skip the symbol's own def node
-                while walker:
-                    if walker.type in class_types:
-                        name_node = walker.child_by_field_name("name")
-                        if name_node:
-                            parent_symbol = name_node.text.decode("utf-8")
-                        break
-                    walker = walker.parent
-                if kind == "function" and parent_symbol:
-                    kind = "method"
+                    parent_symbol = ""
+                    walker = node.parent
+                    if walker is not None:
+                        walker = walker.parent
+                    while walker:
+                        if walker.type in class_types:
+                            name_node = walker.child_by_field_name("name")
+                            if name_node:
+                                parent_symbol = name_node.text.decode("utf-8")
+                            break
+                        walker = walker.parent
+                    if kind == "function" and parent_symbol:
+                        kind = "method"
 
-                sig = (
-                    parent.text.decode("utf-8").split("\n")[0].strip()[:200]
-                    if parent
-                    else node.text.decode("utf-8")
-                )
-                name = node.text.decode("utf-8")
-                symbols.append(
-                    CodeSymbol(
-                        name=name,
-                        kind=kind,
-                        signature=sig,
-                        file_path=file_path,
-                        line_start=node.start_point[0] + 1,
-                        line_end=node.end_point[0] + 1,
-                        language=lang,
-                        parent_symbol=parent_symbol,
+                    sig = (
+                        parent.text.decode("utf-8").split("\n")[0].strip()[:200]
+                        if parent
+                        else node.text.decode("utf-8")
                     )
-                )
+                    name = node.text.decode("utf-8")
+                    symbols.append(
+                        CodeSymbol(
+                            name=name,
+                            kind=kind,
+                            signature=sig,
+                            file_path=file_path,
+                            line_start=node.start_point[0] + 1,
+                            line_end=node.end_point[0] + 1,
+                            language=lang,
+                            parent_symbol=parent_symbol,
+                        )
+                    )
             return symbols
         except Exception as e:
             logger.warning(
@@ -5018,31 +5007,6 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
-        """
-        Extract caller→callee relationships from a tree-sitter parse tree.
-
-        Returns a dict keyed by the **caller's qualified id** (e.g.
-        ``"ContextBuilder.__init__"`` or ``"utils.helper"``) so that same-named
-        methods in different classes, and same-named functions in different
-        modules, never fuse their outgoing calls into a single entry.
-
-        Callee names are stored bare (best-effort).  Resolving
-        ``self._pager.page_out_block()`` to ``ContextPager.page_out_block``
-        would require type inference, which is outside the scope of a static
-        tree-sitter pass.  Downstream components (centrality, ``← used by:``)
-        handle this by fanning out to every qualified symbol that shares the
-        bare callee name — the best approximation available without type
-        information.
-
-        Fallback behaviour
-        ------------------
-        If no tree-sitter query is registered for *lang*, a warning is logged
-        and an empty map is returned.  The legacy fallback functions
-        ``_extract_calls_fallback_python`` and ``_extract_calls_generic`` were
-        removed in v9 because they did not qualify callers and could silently
-        corrupt the call graph.  There are no remaining fallback paths — this
-        is intentional.
-        """
         query_str = FALLBACK_CALL_QUERIES.get(lang)
         if not query_str:
             logger.warning(
@@ -5063,20 +5027,22 @@ class SignatureExtractor:
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
-            # tree-sitter >= 0.22 removed cursor(); captures directly from query
-            try:
-                captures = query.captures(tree.root_node)
-            except AttributeError:
-                # Fallback for tree-sitter < 0.22
-                cursor = query.cursor()
-                captures = cursor.captures(tree.root_node)
+            from tree_sitter import QueryCursor
+
+            cursor = QueryCursor(query)
+            captures = cursor.captures(tree.root_node)  # dict: {capture_name: [nodes]}
+
             call_map: Dict[str, Set[str]] = defaultdict(set)
             current_arrow_caller = None
-            for cap_name, node in captures:
+
+            for cap_name, nodes in captures.items():
                 if cap_name == "caller_name":
-                    current_arrow_caller = node.text.decode("utf-8")
+                    if nodes:
+                        current_arrow_caller = nodes[0].text.decode("utf-8")
                     continue
-                if cap_name == "callee":
+                if cap_name != "callee":
+                    continue
+                for node in nodes:
                     if node.type in (
                         "attribute",
                         "field_access",
@@ -5140,6 +5106,7 @@ class SignatureExtractor:
                             class_walker = class_walker.parent
                         caller_qid = qualify_symbol_name(caller, caller_class)
                         call_map[caller_qid].add(callee_name)
+
             return {k: list(v) for k, v in call_map.items()}
         except Exception as e:
             logger.warning(
@@ -5148,36 +5115,8 @@ class SignatureExtractor:
             )
             return {}
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Docstring extraction (Python only)
-    # ═══════════════════════════════════════════════════════════════════════════
-
     @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
-        """
-        Extract one-line docstrings from Python source using the built-in ast
-        module and attach them to already-parsed CodeSymbols.
-
-        This runs **after** tree-sitter symbol extraction, purely as a static
-        enrichment pass.  It does NOT modify symbol names, call relationships,
-        or the call graph — only the ``docstring`` field of each CodeSymbol.
-
-        Why Python-only
-        ---------------
-        Python's standard library includes an ``ast`` module that makes
-        docstring extraction trivial and zero-cost (no LLM call, no I/O).
-        Equivalent static extraction for JavaScript, Go, Rust, etc. would
-        require bundling a parser for each language, which is left for a
-        future iteration.  For all other languages, missing docstrings are
-        filled in on demand by the LLM-driven ``ensure_docstrings_batch``
-        path.
-
-        Precedence
-        ----------
-        Only fills the docstring when the symbol does **not** already have one.
-        A docstring that was already extracted from source, loaded from the
-        SQLite cache, or generated by the LLM is never overwritten.
-        """
         try:
             tree = ast.parse(code)
             doc_map = {}
@@ -8427,6 +8366,42 @@ class CommandRouter:
 
     _EXPAND_DOTTED = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
 
+    # ── Silent-ingestion code-only detection ───────────────────────────────
+    # Lines that start a new statement/construct (multi-language, best-effort).
+    _STRUCTURAL_LINE_START = re.compile(
+        r"^\s*(?:"
+        r"def |async def |class |import |from |@\w|"
+        r"if |elif |else\b|for |while |try:|except|finally:|with |"
+        r"return |yield |raise |pass\b|break\b|continue\b|#|"
+        r"global |nonlocal |assert |del |lambda |"
+        r"function |const |let |var |export |interface |type |enum |"
+        r"func |struct |impl |use |pub |fn |trait |"
+        r"package |public |private |protected |static |void |"
+        r"#include |namespace |template "
+        r")"
+    )
+    # Lines that continue a multi-line statement (dict/list entries, wrapped
+    # calls, closing brackets, typed attributes...) rather than starting a
+    # new construct. Without this, normally-formatted code (Field(...) calls,
+    # multi-line regex, dataclass-style fields) gets misread as "prose".
+    _CONTINUATION_OR_LITERAL = re.compile(
+        r"^\s*(?:"
+        r"[\)\]\}]|"
+        r"[\"'`]|"
+        r"[,\.]|"
+        r"\*\*?\w|"
+        r"-?\d|"
+        r"[\w.\[\]]+\s*[:=\(\[{]"
+        r")"
+    )
+    # Noise-stripping patterns: blanked out (newlines preserved) before
+    # checking for a real '?' question, so docstrings and regex literals
+    # (`(?:...)`, `\?`) never get mistaken for an explicit user question.
+    _TRIPLE_QUOTE_RE = re.compile(r'("""|\'\'\')([\s\S]*?)\1')
+    _BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+    _STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'')
+    _LINE_COMMENT_RE = re.compile(r"(#|//).*")
+
     # ── Intent keywords ──────────────────────────────────────────────────
     INTENT_KEYWORDS = {
         "forget",
@@ -9429,100 +9404,95 @@ class CommandRouter:
 
     async def is_code_only_message(self, content: str) -> bool:
         """
-        Detect messages that contain only code without a question.
+        Detect if a message contains only code without a question.
 
-        Uses a fast path for large raw code pastes (no fences) based on
-        Python structural line ratio.  A high-confidence guard (structural
-        ratio > 95 %) bypasses the CrossEncoder for huge code dumps, preventing
-        false negatives caused by long docstrings / comments that look like
-        natural-language questions to the model.
+        Resolution order:
+          1. Whole-message ast.parse: if it succeeds, this is unambiguously
+             a complete, syntactically valid Python module — silent
+             ingestion fires regardless of size, regardless of any '?' that
+             happens to live inside a docstring, comment, or regex literal
+             (ast.parse only succeeds on real code, so this can't misfire
+             the way the old line-based '?' check did).
+          2. Large pastes that aren't valid standalone Python (other
+             languages, or an incomplete snippet): structural-line
+             heuristic, with comments/strings blanked out first so a
+             leftover '?' reflects genuine prose, not regex/docstring noise.
+          3. Smaller pastes / fenced messages: tree-sitter-based code-span
+             extraction (unchanged).
         """
         if not content or len(content.strip()) < 20:
             return False
 
-        # ── Fast path: large raw code paste without fences ──────────────
-        estimated_tokens = self._f._tokens.estimate_code_tokens(content)
-        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens:
+        stripped = content.strip()
 
-            _PY_STRUCTURAL = re.compile(
-                r"^\s*(?:def |async def |class |import |from |@\w|"
-                r"if |elif |else:|for |while |try:|except|with |"
-                r"return |yield |raise |pass\b|break\b|continue\b|#)"
+        # ── Step 1: unambiguous case — valid standalone Python ───────────
+        # Avoid blocking event loop on giant paste.
+        # if limit is surpassed, it falls to step 2 hueristic
+        if len(stripped.encode()) <= SignatureExtractor.MAX_PARSE_SIZE_BYTES:
+            try:
+                ast.parse(stripped)
+                self._f._log_debug(
+                    "is_code_only_message: Step1 (ast.parse) succeeded → code-only"
+                )
+                return True
+            except Exception:
+                # Fall through to Step 2
+                self._f._log_debug(
+                    "is_code_only_message: Step1 (ast.parse) failed, falling back to Step2 heuristic"
+                )
+                pass
+        else:
+            # Fall through to Step 2
+            self._f._log_debug(
+                f"is_code_only_message: content size ({len(stripped.encode())} bytes) exceeds MAX_PARSE_SIZE ({SignatureExtractor.MAX_PARSE_SIZE_BYTES}), skipping ast.parse, falling back to Step2 heuristic"
             )
-            non_blank = [l for l in content.splitlines() if l.strip()]
-            total_lines = len(non_blank)
 
-            # Structural ratio: how many non-blank lines look like Python
-            # control-flow / definition lines.
-            structural_lines = sum(1 for l in non_blank if _PY_STRUCTURAL.match(l))
-            structural_ratio = structural_lines / total_lines if total_lines > 0 else 0
+        estimated_tokens = self._f._tokens.estimate_code_tokens(content)
 
-            # High-confidence guard: > 95 % structural lines → almost
-            # certainly a code-only paste.  Skip the CrossEncoder entirely
-            # to avoid false negatives from long docstrings.
-            if structural_ratio > 0.95:
+        # ── Step 2: large paste, not valid standalone Python ─────────────
+        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens:
+            raw_lines = stripped.splitlines()
+            cleaned_lines = self._strip_code_noise(stripped).splitlines()
+            non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
+            total_lines = len(non_blank_idx)
+            if total_lines == 0:
+                return False
+
+            structural_lines = 0
+            prose_candidates: List[str] = []
+            for i in non_blank_idx:
+                raw_line = raw_lines[i]
+                if self._STRUCTURAL_LINE_START.match(
+                    raw_line
+                ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
+                    structural_lines += 1
+                    continue
+                cleaned_line = (
+                    cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
+                )
+                if not cleaned_line:
+                    # Entire line was a string/comment/docstring body — code.
+                    structural_lines += 1
+                    continue
+                prose_candidates.append(cleaned_line)
+
+            structural_ratio = structural_lines / total_lines
+            if structural_ratio > 0.70:
                 return True
 
-            # Extract the residual prose (comments, docstrings, assignments).
-            prose_lines = [
-                l
-                for l in non_blank
-                if not _PY_STRUCTURAL.match(l)
-                and not re.match(r'^\s*[\w.]+\s*[=({"\']', l)
-                and not re.match(r'^\s*"""', l)
-                and not re.match(r"^\s*'''", l)
-            ]
-            prose_text = " ".join(prose_lines).strip()
+            prose_text = " ".join(prose_candidates).strip()
+            if not prose_text or len(prose_text) < 30:
+                return True
 
-            if not prose_text or len(prose_text) < 3:
-                # Almost no prose → code ratio alone decides.
-                return structural_ratio > 0.07
-
-            # Explicit question mark → definitely not silent.
-            has_question = any(l.strip().endswith("?") for l in prose_lines)
-            if has_question:
+            if "?" in prose_text:
                 self._f._log_debug(
                     "_is_code_only_message: explicit question detected → not silent"
                 )
                 return False
 
-            # Only consult the CrossEncoder when there is a meaningful amount
-            # of non‑structural text AND the structural ratio is low enough
-            # that the paste could genuinely be a question with code.
-            if structural_ratio < 0.90:
-                pairs = [
-                    (prose_text, "The user is asking a question or making a request."),
-                    (prose_text, "This text contains no user question or request."),
-                ]
-                scores = await self._predict_cross_encoder(pairs)
-                if scores is None:
-                    self._f._log_debug(
-                        "_is_code_only_message: CrossEncoder not available, "
-                        "falling back to keyword intent detection"
-                    )
-                    _INTENT_RE = re.compile(
-                        r"\b(?:explain|describe|analyze|review|fix|refactor|optimize|"
-                        r"improve|rewrite|check|summarize|show|tell|what|how|why|"
-                        r"explica|analiza|revisa|corrige|refactoriza|optimiza|mejora|"
-                        r"reescribe|comprueba|resume|muestra|dime|qu[eé]|c[oó]mo|"
-                        r"por qu[eé])\b",
-                        re.IGNORECASE,
-                    )
-                    if _INTENT_RE.search(prose_text):
-                        return False
-                else:
-                    has_intent = scores[0] > scores[1]
-                    if has_intent:
-                        self._f._log_debug(
-                            f"_is_code_only_message: intent detected "
-                            f"('{prose_text[:60]}') → not silent"
-                        )
-                        return False
+            return True
 
-            # Final fallback: structural ratio still wins.
-            return structural_ratio > 0.07
-
-        # ── Original logic for fenced blocks or smaller messages ──
+        # ── Step 3: smaller pastes / fenced messages ──────────────────────
         code_blocks, _ = await self._f._code_blocks.extract_code_blocks(content)
         if not code_blocks:
             return False
@@ -9549,6 +9519,24 @@ class CommandRouter:
         ):
             return True
         return False
+
+    @classmethod
+    def _strip_code_noise(cls, text: str) -> str:
+        """
+        Blank out triple-quoted strings, block/line comments, and quoted
+        string literals while preserving every line break, so line counts
+        stay aligned with the original text and any leftover '?' reflects
+        real prose — never regex syntax, docstring text, or string content.
+        """
+
+        def _blank(m: "re.Match") -> str:
+            return "\n".join(" " * len(part) for part in m.group(0).split("\n"))
+
+        text = cls._TRIPLE_QUOTE_RE.sub(_blank, text)
+        text = cls._BLOCK_COMMENT_RE.sub(_blank, text)
+        text = cls._STRING_RE.sub(_blank, text)
+        text = cls._LINE_COMMENT_RE.sub(_blank, text)
+        return text
 
 
 class CodeBlockManager:
@@ -12148,6 +12136,7 @@ class EnrichmentTasks:
         self._f = filter_ref
         self._lazy_docstrings_generated_this_turn: int = 0
         self._active_bg_task: Optional[asyncio.Task] = None
+        self._bg_docstring_count: int = 0
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Change & session summaries
@@ -15728,7 +15717,7 @@ class Filter:
         )
         # ── Per‑block limits ───────────────────────────────────────
         max_code_block_tokens: int = Field(
-            default=6000,
+            default=0,
             description="Maximum tokens per individual code block. 0 = unlimited. See code_block_overflow_action.",
         )
         code_block_overflow_action: str = Field(
@@ -16714,7 +16703,6 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
-
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """Pre‑process the request before the LLM sees it.
 
@@ -16899,7 +16887,31 @@ class Filter:
                     project_id, "new chunk ingested"
                 )
 
-                # Forzar guardado del estado tras la ingesta (no hay outlet)
+                # Invalidate static block (new code → new Block A)
+                self._ctx_builder.invalidate_block_a_cache(
+                    project_id, "new chunk ingested"
+                )
+
+                # Eagerly rebuild Block A (hub symbols + architecture map +
+                # skeleton tier) right now. Silent ingestion's whole point
+                # is to make the new code instantly usable; the scaffolding
+                # is stable, low-volatility context, so it belongs
+                # pre-computed in Block A (KV-cache-anchoring), not deferred
+                # to whatever Block B does on the next real query.
+                try:
+                    await self._ctx_builder.build_block_a(
+                        project_id, is_code_session=True, is_continuation=False
+                    )
+                    self._log_debug(
+                        "🧱 Block A scaffold (hub symbols + skeleton tier) "
+                        "pre-built after silent ingestion"
+                    )
+                except Exception as _scaffold_err:
+                    self._log_debug(
+                        f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
+                    )
+
+                # Force state save after ingestion (there is no outlet)
                 self._state_dirty = True
                 await self._state_store.save_state_if_dirty(project_id)
 
@@ -16909,7 +16921,7 @@ class Filter:
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
-                # ── Mensaje enriquecido con conteo de clases ──
+                # ── Enriched message with class counting ──
                 response = (
                     f"✅ {num_symbols} símbolos en {num_classes} clases "
                     f"({num_blocks} bloques activos). El código está en el SymbolGraph. "
