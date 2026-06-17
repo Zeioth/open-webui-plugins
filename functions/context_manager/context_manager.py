@@ -11552,7 +11552,7 @@ class EnrichmentTasks:
                 name, signature, block_hash, line_start, line_end, project_id
             )
             # Brief pause between tasks to avoid tight loop on cache hits
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)
 
     def start_docstring_loop(self, project_id: str) -> None:
         """
