@@ -111,29 +111,41 @@ import tempfile
 # Models & Enums
 # ---------------------------------------------------------------------------
 class ContentType(str, Enum):
-    BASE_CODE = "base_code"
-    PROPOSED_CHANGE = "proposed_change"
-    COMMITTED_CHANGE = "committed_change"
-    GENERAL = "general"
-    TOOL_CALL = "tool_call"
-    ERROR = "error"
+    """Classification of a code block's role in the conversation."""
+
+    BASE_CODE = "base_code"  # Existing code provided by the user
+    PROPOSED_CHANGE = "proposed_change"  # Suggested modification (diff or snippet)
+    COMMITTED_CHANGE = "committed_change"  # Accepted / applied change
+    GENERAL = "general"  # Plain conversation text
+    TOOL_CALL = "tool_call"  # Structured tool / function call payload
+    ERROR = "error"  # Traceback or error message
 
 
 class CodeSymbol(BaseModel):
+    """A single function, method, or class extracted from source code."""
+
     name: str
-    kind: str  # function, class, method
+    kind: str  # "function", "class", or "method"
     signature: str
     file_path: Optional[str] = None
     line_start: Optional[int] = None
     line_end: Optional[int] = None
-    parent_block_hash: str = ""
-    parent_symbol: str = ""
+    parent_block_hash: str = ""  # Hash of the CodeBlock that owns this symbol
+    parent_symbol: str = ""  # Enclosing class name, or "" for top-level
     language: str = "unknown"
-    calls: List[str] = Field(default_factory=list)
+    calls: List[str] = Field(default_factory=list)  # Bare names called by this symbol
     docstring: str = ""
 
 
 class CodeBlock(BaseModel):
+    """A chunk of code managed by the context system.
+
+    Every code block carries a content hash for deduplication, an importance
+    score that decays over time, and a list of ``CodeSymbol`` entries
+    extracted from its content.  The importance score is recalculated
+    whenever ``_update_importance()`` is called.
+    """
+
     content: str
     content_type: ContentType
     file_path: Optional[str] = None
@@ -160,6 +172,8 @@ class CodeBlock(BaseModel):
         self._update_importance()
 
     def _update_importance(self):
+        """Recalculate the importance score from content type, keywords,
+        mention frequency, recency, and obsolete status."""
         base_score = {
             ContentType.BASE_CODE: 8.0,
             ContentType.ERROR: 7.0,
@@ -192,54 +206,71 @@ class CodeBlock(BaseModel):
 # Edge types and base weights
 # ---------------------------------------------------------------------------
 EDGE_WEIGHTS: Dict[str, float] = {
-    "calls": 1.0,
-    "imports": 0.6,
-    "reads": 0.7,
-    "writes": 0.9,
-    "inherits": 0.5,
-    "references": 0.4,
-    "data_flow": 0.8,
+    "calls": 1.0,  # A function/method calls another
+    "imports": 0.6,  # Module-level import relationship
+    "reads": 0.7,  # Data is read from a variable or field
+    "writes": 0.9,  # Data is written to a variable or field
+    "inherits": 0.5,  # Class inheritance
+    "references": 0.4,  # General reference (type annotation, parameter, etc.)
+    "data_flow": 0.8,  # Data passes from a producer to a consumer via arguments
 }
 
 
 class Edge(BaseModel):
+    """A directed relationship between two symbols in the call graph.
+
+    The source (``src``) is always a qualified symbol id
+    (``ClassName.method`` or ``module.function``).  The destination
+    (``dst``) is a bare name — resolving it to a concrete class would
+    require type inference, which is outside the scope of a static pass.
+    Downstream components handle this by fanning out to every qualified
+    symbol that shares the bare callee name.
+    """
+
     src: str
     dst: str
     type: str
-    weight: float = 1.0
-    confidence: float = 1.0
+    weight: float = 1.0  # Base importance of this edge type
+    confidence: float = 1.0  # 1.0 = confirmed, < 1.0 = inferred / provisional
 
     def effective_weight(self) -> float:
+        """Effective weight used in activation propagation (PPR)."""
         return self.weight * self.confidence
 
 
 # ---------------------------------------------------------------------------
 # Qualified symbol identity helper (v9)
 # ---------------------------------------------------------------------------
-def qualify_symbol_name(name: str, parent_symbol: str) -> str:
+def qualify_symbol_name(
+    name: str, parent_symbol: str, file_path: Optional[str] = None
+) -> str:
     """
-    Unique-within-class identity for a symbol: 'ClassName.method' when
-    it has an enclosing class, or the bare name for module-level functions.
+    Unique-within-project identity for a symbol.
+
+    - Class-scoped symbols: 'ClassName.method'
+    - Module-level functions: 'module.function' (derived from file_path)
+    - Fallback: bare name when neither parent nor file_path is available
 
     This is the central fix for the docstring / call-graph collision bug:
-    dozens of methods in this codebase share bare names like '__init__'
-    across completely unrelated classes.  SymbolIndex now stores every-
-    thing under this qualified id so that same-named methods in different
-    classes never stomp on or fuse with each other (signature, docstring,
-    call edges).
-
-    Module-level functions (parent_symbol == "") keep their bare name,
-    because they are unique within a project in the common case.  Two
-    module-level functions with the exact same bare name in different
-    files is a known edge-case, out of scope here.
+    same-named methods in different classes, and same-named functions in
+    different files, are now stored under distinct qualified ids so they
+    never stomp on or fuse with each other.
     """
-    return f"{parent_symbol}.{name}" if parent_symbol else name
+    if parent_symbol:
+        return f"{parent_symbol}.{name}"
+    if file_path:
+        module = os.path.splitext(os.path.basename(file_path))[0]
+        if module and module != name:
+            return f"{module}.{name}"
+    return name
 
 
 # ---------------------------------------------------------------------------
 # Activation Graph — query‑conditioned node activation
 # ---------------------------------------------------------------------------
 class ActivationState(BaseModel):
+    """Snapshot of a single node's activation during PPR propagation."""
+
     node_id: str
     score: float
     depth: int
@@ -247,12 +278,21 @@ class ActivationState(BaseModel):
 
 
 class ActivationGraph:
+    """Personalised PageRank (PPR) engine for the symbol call graph.
+
+    Seeds are set from user-query terms, tracebacks, and recent history.
+    ``propagate()`` runs the PPR power iteration over the directed edges
+    stored in ``SymbolIndex``, spreading activation to related symbols.
+    The resulting scores determine the LOD tiers in Block B.
+    """
+
     DECAY_BASE: float = 0.7
 
     def __init__(self):
         self._activations: Dict[str, ActivationState] = {}
 
     def seed(self, node_ids: List[str], initial_score: float = 1.0):
+        """Insert activation seeds.  Called once before ``propagate()``."""
         for nid in node_ids:
             self._activations[nid] = ActivationState(
                 node_id=nid,
@@ -269,6 +309,7 @@ class ActivationGraph:
         alpha: float = 0.85,
         tolerance: float = 1e-6,
     ):
+        """Run the PPR power iteration until convergence or ``max_steps``."""
         if not self._activations:
             return
         seed_total = sum(
@@ -315,15 +356,18 @@ class ActivationGraph:
             )
 
     def get_score(self, node_id: str) -> float:
+        """Return the final activation score of a node (0.0 if not activated)."""
         state = self._activations.get(node_id)
         return state.score if state else 0.0
 
     def get_activated_nodes(self, threshold: float = 0.1) -> Dict[str, float]:
+        """Return {node_id: score} for nodes whose score >= threshold."""
         return {
             nid: s.score for nid, s in self._activations.items() if s.score >= threshold
         }
 
     def aggregate_path_score(self, symbol_list: List[str]) -> float:
+        """Mean activation score of a list of symbols (ignoring inactive ones)."""
         scores = [self.get_score(s) for s in symbol_list]
         active = [s for s in scores if s > 0]
         if not active:
@@ -335,6 +379,14 @@ class ActivationGraph:
 # Query model and SubgraphExtractor skeleton
 # ---------------------------------------------------------------------------
 class SubgraphExtractor:
+    """Extract a connected subgraph induced by activated nodes.
+
+    Takes an ``ActivationGraph`` and the full edge set, then returns
+    the subset of nodes that are activated (above threshold) and the
+    edges among them.  Optionally expands the subgraph by one hop along
+    high-confidence ``calls`` edges.
+    """
+
     def __init__(self, activation_threshold: float = 0.1, expand_hops: int = 1):
         self.activation_threshold = activation_threshold
         self.expand_hops = expand_hops
@@ -345,6 +397,7 @@ class SubgraphExtractor:
         edges_out: Dict[str, List[Edge]],
         edges_in: Dict[str, List[Edge]],
     ) -> Tuple[Set[str], List[Edge]]:
+        """Return (activated_nodes, edges_among_them) after optional expansion."""
         activated = activation.get_activated_nodes(self.activation_threshold)
         included_nodes: Set[str] = set(activated.keys())
         if self.expand_hops > 0:
@@ -370,26 +423,32 @@ class SubgraphExtractor:
 # CodePathView — a cached projection of an activated subgraph
 # ---------------------------------------------------------------------------
 class CodePathView(BaseModel):
+    """A cached snapshot of an activated subgraph, used for speculative
+    prefetch and path tracking.  Holds the induced nodes (with scores),
+    edges, and structural hashes so staleness can be detected cheaply."""
+
     path_id: str
     entry_point: str
     seed_nodes: List[str]
-    induced_nodes: Dict[str, float]
+    induced_nodes: Dict[str, float]  # node_id → activation score
     induced_edges: List[Edge]
     activation_score: float
     business_label: str = ""
     summary: str = ""
     label_confidence: float = 0.0
-    structural_hash: str = ""
-    call_graph_hash: str = ""
+    structural_hash: str = ""  # Hash of block content for induced nodes
+    call_graph_hash: str = ""  # Hash of call relationships among them
     last_built: float = Field(default_factory=time.time)
 
     def is_stale(self, current_structural: str, current_call_graph: str) -> bool:
+        """True if the code or call graph has changed since this view was built."""
         return (
             self.structural_hash != current_structural
             or self.call_graph_hash != current_call_graph
         )
 
     def top_symbols(self, n: int = 10) -> List[str]:
+        """Return the *n* symbols with the highest activation score in this view."""
         return sorted(
             self.induced_nodes.keys(),
             key=lambda s: self.induced_nodes[s],
@@ -401,30 +460,44 @@ class CodePathView(BaseModel):
 # StaticEvidence – deterministic proof from the SymbolGraph
 # ---------------------------------------------------------------------------
 class StaticEvidence(BaseModel):
-    symbols_found: Dict[str, bool]
-    call_relations_valid: Dict[str, bool]
-    recent_changes: List[str]
-    entry_points_mentioned: List[str]
-    path_memberships: Dict[str, List[str]]
+    """Deterministic evidence gathered from the SymbolGraph to validate a
+    hypothesis during scientific Chain‑of‑Thought reasoning.
+
+    All fields are derived without an LLM call — they come directly from the
+    SymbolIndex, active blocks, and path index.  ``objective_score`` is the
+    fraction of verifiable claims that hold true."""
+
+    symbols_found: Dict[str, bool]  # Is each mentioned symbol in the index?
+    call_relations_valid: Dict[str, bool]  # Are claimed call edges actually present?
+    recent_changes: List[str]  # Mentioned symbols changed in the last hour
+    entry_points_mentioned: List[str]  # Entry points referenced in the hypothesis
+    path_memberships: Dict[str, List[str]]  # Path views each symbol belongs to
     data_flow_upstream: Dict[str, List[str]] = Field(default_factory=dict)
-    objective_score: float
+    objective_score: float  # Fraction of verifiable claims that hold
 
 
 # ---------------------------------------------------------------------------
 # PathIndex — index of CodePathViews
 # ---------------------------------------------------------------------------
 class PathIndex:
+    """Lightweight in‑memory index of ``CodePathView`` objects, organised by
+    project and symbol.  Used for speculative prefetch, staleness detection,
+    and entry‑point discovery.
+    """
+
     def __init__(self):
         self._views: Dict[str, CodePathView] = {}
         self._symbol_to_views: Dict[str, Set[str]] = defaultdict(set)
 
     def add(self, view: CodePathView, project_id: str):
+        """Register a view and cross‑reference all its induced symbols."""
         key = f"{project_id}:{view.path_id}"
         self._views[key] = view
         for sym_name in view.induced_nodes:
             self._symbol_to_views[f"{project_id}:{sym_name}"].add(view.path_id)
 
     def remove(self, path_id: str, project_id: str):
+        """Remove a view and its symbol cross‑references."""
         key = f"{project_id}:{path_id}"
         view = self._views.pop(key, None)
         if view:
@@ -433,13 +506,16 @@ class PathIndex:
                 self._symbol_to_views[sym_key].discard(path_id)
 
     def get(self, path_id: str, project_id: str) -> Optional[CodePathView]:
+        """Return a single view by path_id, or None."""
         return self._views.get(f"{project_id}:{path_id}")
 
     def get_all(self, project_id: str) -> List[CodePathView]:
+        """All views for a project (order undefined)."""
         prefix = f"{project_id}:"
         return [v for k, v in self._views.items() if k.startswith(prefix)]
 
     def clear_project(self, project_id: str):
+        """Drop every view and cross‑reference for a project."""
         prefix = f"{project_id}:"
         keys = [k for k in self._views if k.startswith(prefix)]
         for k in keys:
@@ -449,6 +525,7 @@ class PathIndex:
             del self._symbol_to_views[k]
 
     def mark_stale_for_symbol(self, symbol_name: str, project_id: str) -> List[str]:
+        """Return path_ids that reference a given symbol (to invalidate them later)."""
         key = f"{project_id}:{symbol_name}"
         return list(self._symbol_to_views.get(key, set()))
 
@@ -474,6 +551,12 @@ class PathIndex:
 # AppliedChangeFeedback
 # ---------------------------------------------------------------------------
 class AppliedChangeFeedback(BaseModel):
+    """Feedback record for a change that was applied (or rejected) by the user.
+
+    Kept in the conversation state so the system can learn from past changes
+    and surface context in Block A when ``inject_feedback_context`` is enabled.
+    """
+
     change_hash: str
     change_description: str
     file_path: Optional[str] = None
@@ -484,8 +567,14 @@ class AppliedChangeFeedback(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Tree‑sitter fallback queries (se mantienen igual que en v7)
+# Tree‑sitter fallback queries
 # ---------------------------------------------------------------------------
+# These S-expression patterns tell tree-sitter how to locate function / class
+# definitions and call sites for each supported programming language.
+# They are used by _extract_symbols_from_tree and _extract_calls_from_tree,
+# which together produce the qualified CodeSymbol list and the call graph.
+# If a language is missing from these maps, extraction is skipped with a
+# warning — there is no legacy fallback that could inject unqualified data.
 FALLBACK_LANGUAGE_QUERIES = {
     "python": """
         (function_definition name: (identifier) @name) @func
@@ -632,12 +721,15 @@ class HubSymbolIndex:
     # ── Public API ────────────────────────────────────────────────────────
 
     def get_hub_names(self, centrality: dict, top_n: int) -> list:
+        """Return symbol ids sorted by descending centrality, capped at *top_n*.
+        Ties are broken alphabetically for deterministic, cache-stable output."""
         if not centrality or top_n <= 0:
             return []
         ranked = sorted(centrality.items(), key=lambda kv: (-kv[1], kv[0]))
         return [name for name, _ in ranked[:top_n]]
 
     def is_hub(self, symbol_name: str, centrality: dict, top_n: int) -> bool:
+        """True if *symbol_name* would appear in Block A for the given *top_n*."""
         return symbol_name in set(self.get_hub_names(centrality, top_n))
 
     def build(
@@ -676,6 +768,10 @@ class HubSymbolIndex:
     # ── Class / function outline (NEW) ────────────────────────────────────
 
     def _build_class_outline(self, symbol_index, project_id, valves=None) -> str:
+        """Render the ``## Code Architecture Map`` section: one line per class
+        listing its methods, plus module-level functions if any.  Respects
+        ``architecture_map_max_tokens`` and
+        ``architecture_map_max_methods_per_class`` from *valves*."""
         if valves is not None and not getattr(valves, "enable_architecture_map", True):
             return ""
         max_per_class = (
@@ -751,6 +847,9 @@ class HubSymbolIndex:
     def _build_hub_section(
         self, hub_qids, centrality, symbol_index, project_id, enable_callees=True
     ) -> str:
+        """Render the ``## Code Symbol Index`` section listing each hub symbol
+        with its centrality score, incoming callers, and (when
+        *enable_callees* is True) outgoing callees."""
         by_file: dict = {}
         for qid in hub_qids:
             file_path = self._file_for(qid, project_id, symbol_index)
@@ -794,6 +893,7 @@ class HubSymbolIndex:
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _file_for(self, qid, project_id, symbol_index):
+        """Resolve a symbol's file path from the SymbolIndex, or None."""
         return symbol_index.get_file_for_symbol(qid, project_id)
 
     def _safe_callers(self, qid, project_id, symbol_index) -> set:
@@ -829,6 +929,9 @@ class HubSymbolIndex:
     def _format_symbol_line(
         self, qid, centrality, symbol_index, project_id, enable_callees=True
     ) -> str:
+        """Format one hub-symbol line: ``- `qid` (centrality: score)``
+        optionally followed by ``← used by:`` (top 5 callers) and
+        ``→ calls:`` (top 5 callees, when *enable_callees* is True)."""
         score = centrality.get(qid, 0.0)
         callers = self._safe_callers(qid, project_id, symbol_index)
 
@@ -1272,7 +1375,7 @@ class RaptorCodeIndex:
         """
         Build one RAPTOR level and store its cluster summaries.
 
-        level == 1: cluster raw symbols.
+        level == 1: cluster raw symbols (now using qualified ids).
         level >= 2: cluster the previous level's summaries (read back from the
                     store); graph features are not used at L2 (summaries have no
                     direct call edges), so the augmented vector degrades to the
@@ -1284,7 +1387,10 @@ class RaptorCodeIndex:
 
         # ── Gather items + embeddings for this level ──────────────────────
         if level == 1:
-            names = list(symbol_index.get_all_names(project_id))
+            # Use qualified ids so that every distinct symbol (e.g., each
+            # class's __init__) gets its own embedding, rather than collapsing
+            # all same‑named methods into a single point.
+            names = list(symbol_index.get_all_qualified_names(project_id))
             texts = []
             for n in names:
                 sig = self._safe(
@@ -3765,7 +3871,7 @@ class SymbolIndex:
 
     # ── Name ↔ block hash mapping ─────────────────────────────────────
     def add(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol)
+        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
@@ -3790,7 +3896,7 @@ class SymbolIndex:
         self._evict_if_needed()
 
     def remove(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol)
+        qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
         s = self._name_to_blocks.get(key)
         if s:
@@ -3811,7 +3917,7 @@ class SymbolIndex:
     ) -> None:
         for sym in symbols:
             self.remove(sym, block_hash, project_id)
-            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
             self.remove_edges_for_symbol(qid, project_id)
 
     def find_blocks(self, name_or_qid: str, project_id: str) -> Set[str]:
@@ -4245,22 +4351,30 @@ class SignatureExtractor:
     async def extract_async(
         code: str, file_path: Optional[str] = None, language: Optional[str] = None
     ) -> List["CodeSymbol"]:
+        """
+        Extract symbols and call relationships from source code using tree-sitter.
+
+        Returns symbols with qualified identities (``ClassName.method`` or
+        ``module.function``).  When tree-sitter is unavailable or fails, an
+        empty list is returned and a warning is logged — no fallback
+        extraction is attempted, to prevent unqualified data from entering
+        the symbol index.
+        """
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             return []
         if not HAS_TREE_SITTER:
-            syms = SignatureExtractor._extract_generic(code, file_path)
-            call_map = SignatureExtractor._extract_calls_generic(code)
-            for sym in syms:
-                sym.calls = call_map.get(sym.name, [])
-            return syms
+            logger.warning(
+                "tree-sitter not available — skipping symbol extraction. "
+                "Install tree-sitter-language-pack to enable code-aware features."
+            )
+            return []
 
         lang = language or SignatureExtractor._guess_language(file_path, code)
         if lang == "unknown":
-            syms = SignatureExtractor._extract_generic(code, file_path)
-            call_map = SignatureExtractor._extract_calls_generic(code)
-            for sym in syms:
-                sym.calls = call_map.get(sym.name, [])
-            return syms
+            logger.warning(
+                "Could not detect language for code block — skipping symbol extraction."
+            )
+            return []
 
         try:
             loop = asyncio.get_event_loop()
@@ -4270,12 +4384,12 @@ class SignatureExtractor:
                 ),
                 timeout=30.0,
             )
-        except (asyncio.TimeoutError, Exception):
-            syms = SignatureExtractor._extract_generic(code, file_path)
-            call_map = SignatureExtractor._extract_calls_generic(code)
-            for sym in syms:
-                sym.calls = call_map.get(sym.name, [])
-            return syms
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(
+                f"tree-sitter parse failed for language '{lang}': {e} — "
+                "skipping symbol extraction to avoid corrupt fallback data."
+            )
+            return []
 
         syms = SignatureExtractor._extract_symbols_from_tree(
             tree, lang, code, file_path
@@ -4283,16 +4397,7 @@ class SignatureExtractor:
         call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
         del tree
         for sym in syms:
-            # call_map is indexed by the caller's qualified id
-            # ("Class.method" or a bare module-level name) — see
-            # _extract_calls_from_tree().  Resolve the SAME qualified id for
-            # this symbol, so it receives exactly its own calls, never the
-            # calls of another method with the same bare name.  The union
-            # with the bare lookup below is purely defensive: it should be a
-            # no-op whenever this symbol has a parent_symbol, because the
-            # class walk in _extract_calls_from_tree mirrors
-            # _extract_symbols_from_tree and should always agree.
-            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
             calls = list(call_map.get(qid, []))
             if qid != sym.name:
                 for c in call_map.get(sym.name, []):
@@ -4380,25 +4485,79 @@ class SignatureExtractor:
         return symbols
 
     @staticmethod
-    def _guess_language(file_path: Optional[str], code: str) -> str:
-        if file_path and HAS_TREE_SITTER:
-            try:
-                return detect_language_from_extension(
-                    file_path.rsplit(".", 1)[-1].lower()
-                )
-            except Exception:
-                pass
-        if file_path:
-            ext = file_path.rsplit(".", 1)[-1].lower()
-            return SignatureExtractor._LANG_MAP.get(ext, "unknown")
-        if re.search(r"\bdef\s+\w+\s*\(", code):
-            return "python"
-        if re.search(r"\bfunction\s+\w+\s*\(", code):
-            return "javascript"
-        return "unknown"
+    async def extract_async(
+        code: str, file_path: Optional[str] = None, language: Optional[str] = None
+    ) -> List["CodeSymbol"]:
+        """
+        Extract symbols and call relationships from source code using tree-sitter.
+
+        Returns qualified symbols (``ClassName.method`` / ``module.function``).
+        Falls back to an empty list when tree-sitter is unavailable or fails,
+        logging a warning — no fallback extraction is attempted, to avoid
+        corrupting the symbol index with unqualified data.
+        """
+        if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
+            return []
+        if not HAS_TREE_SITTER:
+            logger.warning(
+                "tree-sitter not available — skipping symbol extraction. "
+                "Install tree-sitter-language-pack to enable code-aware features."
+            )
+            return []
+
+        lang = language or SignatureExtractor._guess_language(file_path, code)
+        if lang == "unknown":
+            logger.warning(
+                "Could not detect language for code block — skipping symbol extraction."
+            )
+            return []
+
+        try:
+            loop = asyncio.get_event_loop()
+            tree = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, SignatureExtractor._parse_sync, code.encode(), lang
+                ),
+                timeout=30.0,
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(
+                f"tree-sitter parse failed for language '{lang}': {e} — "
+                "skipping symbol extraction to avoid corrupt fallback data."
+            )
+            return []
+
+        syms = SignatureExtractor._extract_symbols_from_tree(
+            tree, lang, code, file_path
+        )
+        call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
+        del tree
+        for sym in syms:
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
+            calls = list(call_map.get(qid, []))
+            if qid != sym.name:
+                for c in call_map.get(sym.name, []):
+                    if c not in calls:
+                        calls.append(c)
+            sym.calls = calls
+        if lang == "python" or (file_path and file_path.endswith(".py")):
+            SignatureExtractor._extract_docstrings_python(code, syms)
+        return syms
 
     @staticmethod
     def _parse_sync(code_bytes: bytes, lang: str):
+        """
+        Parse source-code bytes synchronously with a cached tree-sitter parser.
+
+        Parser instances are expensive to create (language grammar must be
+        loaded and compiled), so a module-level ``_parser_cache`` keeps one
+        parser per language.  The cache is protected by a class-level lock
+        (``_parser_cache_lock``) because tree-sitter parsers are not
+        thread-safe by default and this method is called from worker threads
+        via ``run_in_executor``.
+
+        Returns the root ``tree_sitter.Node`` of the concrete syntax tree.
+        """
         from tree_sitter import Parser as TSParser
 
         with SignatureExtractor._parser_cache_lock:
@@ -4415,9 +4574,30 @@ class SignatureExtractor:
     def _extract_symbols_from_tree(
         tree, lang: str, code: str, file_path: Optional[str]
     ) -> List["CodeSymbol"]:
+        """
+        Extract ``CodeSymbol`` instances from a tree-sitter parse tree.
+
+        Returns a list of symbols with their **parent class** resolved (when
+        applicable) so that methods from different classes with the same bare
+        name never collide.  Symbols are returned with ``parent_symbol`` set
+        to the enclosing class name, or ``""`` for module-level definitions.
+
+        Fallback behaviour
+        ------------------
+        If no tree-sitter query is registered for *lang*, a warning is logged
+        and an empty list is returned.  The legacy fallback function
+        ``_extract_generic`` was removed in v9 because it produced symbols
+        without ``parent_symbol`` information, which could silently corrupt
+        the symbol index and call graph.  There are no remaining fallback
+        paths — this is intentional.
+        """
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
-            return SignatureExtractor._extract_generic(code, file_path)
+            logger.warning(
+                f"No tree-sitter query defined for language '{lang}' — "
+                "skipping symbol extraction to avoid corrupt fallback data."
+            )
+            return []
         try:
             lang_obj = get_language(lang)
             query = lang_obj.query(query_str)
@@ -4457,7 +4637,7 @@ class SignatureExtractor:
                         break
                     parent = parent.parent
 
-                # NEW — walk up from the symbol's own node to find an enclosing class.
+                # Walk up from the symbol's own node to find an enclosing class.
                 parent_symbol = ""
                 walker = node.parent
                 if walker is not None:
@@ -4487,27 +4667,52 @@ class SignatureExtractor:
                         line_start=node.start_point[0] + 1,
                         line_end=node.end_point[0] + 1,
                         language=lang,
-                        parent_symbol=parent_symbol,  # NEW
+                        parent_symbol=parent_symbol,
                     )
                 )
             return symbols
-        except Exception:
-            return SignatureExtractor._extract_generic(code, file_path)
+        except Exception as e:
+            logger.warning(
+                f"tree-sitter symbol extraction failed for language '{lang}': {e} — "
+                "skipping symbol extraction to avoid corrupt fallback data."
+            )
+            return []
 
     @staticmethod
     def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
+        """
+        Extract caller→callee relationships from a tree-sitter parse tree.
+
+        Returns a dict keyed by the **caller's qualified id** (e.g.
+        ``"ContextBuilder.__init__"`` or ``"utils.helper"``) so that same-named
+        methods in different classes, and same-named functions in different
+        modules, never fuse their outgoing calls into a single entry.
+
+        Callee names are stored bare (best-effort).  Resolving
+        ``self._pager.page_out_block()`` to ``ContextPager.page_out_block``
+        would require type inference, which is outside the scope of a static
+        tree-sitter pass.  Downstream components (centrality, ``← used by:``)
+        handle this by fanning out to every qualified symbol that shares the
+        bare callee name — the best approximation available without type
+        information.
+
+        Fallback behaviour
+        ------------------
+        If no tree-sitter query is registered for *lang*, a warning is logged
+        and an empty map is returned.  The legacy fallback functions
+        ``_extract_calls_fallback_python`` and ``_extract_calls_generic`` were
+        removed in v9 because they did not qualify callers and could silently
+        corrupt the call graph.  There are no remaining fallback paths — this
+        is intentional.
+        """
         query_str = FALLBACK_CALL_QUERIES.get(lang)
         if not query_str:
-            if lang == "python":
-                return SignatureExtractor._extract_calls_fallback_python(code)
-            return SignatureExtractor._extract_calls_generic(code)
+            logger.warning(
+                f"No tree-sitter call query defined for language '{lang}' — "
+                "returning empty call map to avoid corrupt fallback data."
+            )
+            return {}
 
-        # Same class node types that _extract_symbols_from_tree() already
-        # walks up to resolve a symbol's enclosing class.  Also needed here:
-        # without this, any method sharing a bare name across different
-        # classes (__init__, __init__, __init__...) ends up with its outgoing
-        # calls fused into ONE call_map entry, and extract_async() hands
-        # that fused, incorrect list to every symbol with that bare name.
         _class_node_types = (
             "class_definition",
             "class_declaration",
@@ -4582,9 +4787,6 @@ class SignatureExtractor:
                         parent = parent.parent
 
                     if caller:
-                        # NEW — resolve the CALLER's enclosing class
-                        # (not the callee's — the callee stays best-effort,
-                        #  see document header).
                         caller_class = ""
                         class_walker = (
                             caller_container.parent if caller_container else None
@@ -4599,11 +4801,39 @@ class SignatureExtractor:
                         caller_qid = qualify_symbol_name(caller, caller_class)
                         call_map[caller_qid].add(callee_name)
             return {k: list(v) for k, v in call_map.items()}
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"tree-sitter call extraction failed for language '{lang}': {e} — "
+                "returning empty call map to avoid corrupt fallback data."
+            )
             return {}
 
     @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
+        """
+        Extract one-line docstrings from Python source using the built-in ast
+        module and attach them to already-parsed CodeSymbols.
+
+        This runs **after** tree-sitter symbol extraction, purely as a static
+        enrichment pass.  It does NOT modify symbol names, call relationships,
+        or the call graph — only the ``docstring`` field of each CodeSymbol.
+
+        Why Python-only
+        ---------------
+        Python's standard library includes an ``ast`` module that makes
+        docstring extraction trivial and zero-cost (no LLM call, no I/O).
+        Equivalent static extraction for JavaScript, Go, Rust, etc. would
+        require bundling a parser for each language, which is left for a
+        future iteration.  For all other languages, missing docstrings are
+        filled in on demand by the LLM-driven ``ensure_docstrings_batch``
+        path.
+
+        Precedence
+        ----------
+        Only fills the docstring when the symbol does **not** already have one.
+        A docstring that was already extracted from source, loaded from the
+        SQLite cache, or generated by the LLM is never overwritten.
+        """
         try:
             tree = ast.parse(code)
             doc_map = {}
@@ -4621,106 +4851,6 @@ class SignatureExtractor:
                     sym.docstring = doc_map[sym.name]
         except SyntaxError:
             pass
-
-    @staticmethod
-    def _extract_calls_fallback_python(code: str) -> Dict[str, List[str]]:
-        call_map: Dict[str, Set[str]] = defaultdict(set)
-        try:
-            tree = ast.parse(code)
-            scope_stack = []
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    scope_stack.append(node.name)
-                elif isinstance(node, ast.Call) and scope_stack:
-                    if isinstance(node.func, ast.Name):
-                        callee = node.func.id
-                    elif isinstance(node.func, ast.Attribute):
-                        callee = node.func.attr
-                    else:
-                        callee = None
-                    if callee:
-                        for scope in reversed(scope_stack):
-                            call_map[scope].add(callee)
-            return {k: list(v) for k, v in call_map.items()}
-        except (SyntaxError, MemoryError, RecursionError, ValueError):
-            return {}
-
-    @staticmethod
-    def _extract_calls_generic(code: str) -> Dict[str, List[str]]:
-        call_map: Dict[str, Set[str]] = defaultdict(set)
-        func_pattern = (
-            r"^\s*(?:def|function|fn|func)\s+(\w+)\s*\([^)]*\)(?:\s*->\s*\S+)?\s*:?"
-        )
-        for match in re.finditer(func_pattern, code, re.MULTILINE | re.I):
-            func_name = match.group(1)
-            rest = code[match.end() :]
-            next_match = re.search(
-                r"^\s*(?:def|function|class|fn|func|export)\s+", rest, re.MULTILINE
-            )
-            body = rest[: next_match.start()] if next_match else rest
-            calls_simple = set(re.findall(r"\b(\w+)\s*\(", body))
-            calls_dotted = set(re.findall(r"\.(\w+)\s*\(", body))
-            calls = calls_simple | calls_dotted
-            keywords = {
-                "if",
-                "for",
-                "while",
-                "switch",
-                "return",
-                "print",
-                "assert",
-                "throw",
-                "new",
-                "typeof",
-                "instanceof",
-                "delete",
-                "void",
-                "in",
-                "of",
-                "catch",
-                "finally",
-                "class",
-                "import",
-                "export",
-                "from",
-                "as",
-                "try",
-                "except",
-                "raise",
-                "yield",
-                "await",
-                "async",
-                "break",
-                "continue",
-                "pass",
-            }
-            calls -= keywords
-            call_map[func_name] = calls
-        return {k: list(v) for k, v in call_map.items()}
-
-    @staticmethod
-    def _extract_generic(
-        code: str, file_path: Optional[str] = None
-    ) -> List["CodeSymbol"]:
-        symbols = []
-        for match in re.finditer(
-            r"^\s*(def|function|class|fn|func)\s+(\w+)", code, re.MULTILINE | re.I
-        ):
-            kind = (
-                "function"
-                if match.group(1).lower() in ("def", "function", "fn", "func")
-                else "class"
-            )
-            symbols.append(
-                CodeSymbol(
-                    name=match.group(2),
-                    kind=kind,
-                    signature=match.group(0).strip(),
-                    file_path=file_path,
-                    language="unknown",
-                )
-            )
-        return symbols
 
 
 class StateStore:
@@ -5105,7 +5235,9 @@ class StateStore:
                 continue
             for sym in block.symbols:
                 self._f._symbol_index.add(sym, block.hash, project_id)
-                caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                caller_qid = qualify_symbol_name(
+                    sym.name, sym.parent_symbol, sym.file_path
+                )
                 for callee in sym.calls:
                     edge = Edge(
                         src=caller_qid,
@@ -9328,7 +9460,7 @@ class CodeBlockManager:
                 return True
         return False
 
-    def apply_change_with_diff(
+    async def apply_change_with_diff(
         self, base_block: "CodeBlock", proposed_block: "CodeBlock"
     ) -> bool:
         """Apply a unified diff from a proposed change block onto a base block."""
@@ -9347,7 +9479,7 @@ class CodeBlockManager:
             )
             base_block.content = new_code
             base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
-            base_block.symbols = SignatureExtractor._extract_generic(
+            base_block.symbols = await SignatureExtractor.extract_async(
                 new_code, base_block.file_path
             )
             for sym in base_block.symbols:
@@ -12160,7 +12292,7 @@ class ActiveCodeUpdater:
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
-            caller_qid = qualify_symbol_name(s.name, s.parent_symbol)
+            caller_qid = qualify_symbol_name(s.name, s.parent_symbol, s.file_path)
             for callee_name in s.calls:
                 edge = Edge(
                     src=caller_qid,
@@ -12196,7 +12328,7 @@ class ActiveCodeUpdater:
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
-            caller_qid = qualify_symbol_name(s.name, s.parent_symbol)
+            caller_qid = qualify_symbol_name(s.name, s.parent_symbol, s.file_path)
             for callee_name in s.calls:
                 edge = Edge(
                     src=caller_qid,
@@ -12244,7 +12376,7 @@ class ActiveCodeUpdater:
         # Index symbols and call-graph edges (cheap, per-symbol is fine here)
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
-            caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
             for callee_name in sym.calls:
                 edge = Edge(
                     src=caller_qid,
@@ -12312,7 +12444,9 @@ class ActiveCodeUpdater:
                         base.content_type == ContentType.BASE_CODE
                         and base.file_path == new_block.file_path
                     ):
-                        if self._f._code_blocks.apply_change_with_diff(base, new_block):
+                        if await self._f._code_blocks.apply_change_with_diff(
+                            base, new_block
+                        ):
                             state["recent_changes"] = [
                                 c
                                 for c in state["recent_changes"]
