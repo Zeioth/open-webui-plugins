@@ -21,34 +21,64 @@ import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+# ============================================================================
+# SECTION 1: Embedding & Vector DB (sentence-transformers + ChromaDB)
+# ============================================================================
+
 # ---------------------------------------------------------------------------
-# 1. SentenceTransformer singleton (~80 MB VRAM, loaded once)
+# 1.1 SentenceTransformer singleton (~80 MB VRAM, loaded once)
 # ---------------------------------------------------------------------------
 _EMBEDDER_INSTANCE = None
 _EMBEDDER_LOCK = threading.Lock()
 
 
 def get_embedder(model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
-    """Return (or create) the SentenceTransformer singleton. Thread-safe."""
+    """
+    Return the SentenceTransformer embedder singleton, loading it once.
+
+    The embedder is used for semantic search, LTM retrieval, and RAPTOR
+    clustering. It is loaded on demand and cached globally across all
+    plugins that use this shared resource module.
+
+    Args:
+        model_name (str): The HuggingFace model name to load.
+                         Defaults to "Qwen/Qwen3-Embedding-0.6B".
+
+    Returns:
+        SentenceTransformer: The loaded embedder instance.
+    """
     global _EMBEDDER_INSTANCE
     if _EMBEDDER_INSTANCE is None:
         with _EMBEDDER_LOCK:
             if _EMBEDDER_INSTANCE is None:
                 from sentence_transformers import SentenceTransformer
-
-                _EMBEDDER_INSTANCE = SentenceTransformer(model_name)
+                # we now force CPU for the embedder
+                _EMBEDDER_INSTANCE = SentenceTransformer(model_name, device="cpu")
     return _EMBEDDER_INSTANCE
 
 
 # ---------------------------------------------------------------------------
-# 2. ChromaDB PersistentClient — registry by path
+# 1.2 ChromaDB PersistentClient — registry by path
 # ---------------------------------------------------------------------------
 _CHROMA_CLIENTS: Dict[str, Any] = {}
 _CHROMA_LOCK = threading.Lock()
 
 
 def get_chroma_client(path: str = "./chroma_cache"):
-    """Return a PersistentClient for `path`. Each distinct path gets its own client."""
+    """
+    Return a PersistentClient for `path`. Each distinct path gets its own client.
+
+    ChromaDB clients are expensive to create (they initialise the underlying
+    database and embedding index). This function caches clients by their
+    filesystem path, reusing them across calls.
+
+    Args:
+        path (str): The directory path where ChromaDB stores its data.
+                   Defaults to "./chroma_cache".
+
+    Returns:
+        chromadb.PersistentClient: The ChromaDB client for the given path.
+    """
     import os
 
     norm = os.path.normpath(os.path.abspath(path))
@@ -61,15 +91,33 @@ def get_chroma_client(path: str = "./chroma_cache"):
     return _CHROMA_CLIENTS[norm]
 
 
+# ============================================================================
+# SECTION 2: Tokenization & Caching (tiktoken + LRU + SQLite)
+# ============================================================================
+
 # ---------------------------------------------------------------------------
-# 3. tiktoken encoding cache
+# 2.1 tiktoken encoding cache
 # ---------------------------------------------------------------------------
 _TIKTOKEN_ENCODINGS: Dict[str, Any] = {}
 _TIKTOKEN_LOCK = threading.Lock()
 
 
 def get_tiktoken_encoding(model: str = "gpt-4"):
-    """Return a cached tiktoken encoding for the given model."""
+    """
+    Return a cached tiktoken encoding for the given model.
+
+    tiktoken encodings are model-specific and loading them repeatedly is
+    expensive. This function caches them globally so that multiple plugins
+    can share the same encoding instance.
+
+    Args:
+        model (str): The model name to get the encoding for.
+                    Defaults to "gpt-4". If the model is not recognised,
+                    falls back to "cl100k_base".
+
+    Returns:
+        tiktoken.Encoding: The tiktoken encoding for the specified model.
+    """
     if model not in _TIKTOKEN_ENCODINGS:
         with _TIKTOKEN_LOCK:
             if model not in _TIKTOKEN_ENCODINGS:
@@ -83,7 +131,224 @@ def get_tiktoken_encoding(model: str = "gpt-4"):
 
 
 # ---------------------------------------------------------------------------
-# 4. aiohttp ClientSession with connection pool (shared)
+# 2.2 Async-safe LRU Cache with TTL
+# ---------------------------------------------------------------------------
+class AsyncLRUCache:
+    """Async-safe cache with LRU eviction and TTL.
+
+    Provides thread-safe (asyncio-safe) in-memory caching with a maximum
+    size limit and time-to-live expiration. LRU eviction ensures that
+    the most recently accessed items are kept when the cache reaches its
+    maximum size.
+
+    Used for LLM response caching to avoid redundant inference calls.
+    """
+
+    def __init__(self, max_size: int = 1000, ttl: int = 1800):
+        """
+        Initialize the async LRU cache.
+
+        Args:
+            max_size (int): Maximum number of items to store. 0 = unlimited.
+            ttl (int): Time-to-live in seconds. 0 = never expire.
+        """
+        self.max_size = max_size
+        self.ttl = ttl
+        self._store: Dict[str, Tuple[Any, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[Any]:
+        """
+        Retrieve an item from the cache.
+
+        If the item exists and has not expired, it is moved to the front of
+        the LRU list and returned. Expired items are deleted.
+
+        Args:
+            key (str): The cache key.
+
+        Returns:
+            Optional[Any]: The cached value, or None if not found or expired.
+        """
+        async with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            value, ts = entry
+            if self.ttl > 0 and time.time() - ts > self.ttl:
+                del self._store[key]
+                return None
+            self._store[key] = self._store.pop(key)
+            return value
+
+    async def set(self, key: str, value: Any) -> None:
+        """
+        Store an item in the cache.
+
+        If the cache is at its maximum size, the least recently used item is
+        evicted. The new item is inserted and moved to the front.
+
+        Args:
+            key (str): The cache key.
+            value (Any): The value to cache.
+        """
+        async with self._lock:
+            if self.max_size > 0 and len(self._store) >= self.max_size and key not in self._store:
+                oldest = next(iter(self._store))
+                del self._store[oldest]
+            self._store[key] = (value, time.time())
+            self._store[key] = self._store.pop(key)
+
+    async def clear(self) -> None:
+        """Clear all items from the cache."""
+        async with self._lock:
+            self._store.clear()
+
+    def __len__(self) -> int:
+        """Return the number of items currently in the cache."""
+        return len(self._store)
+
+
+# ---------------------------------------------------------------------------
+# 2.3 Persistent SQLite cache (L1 RAM + L2 SQLite)
+# ---------------------------------------------------------------------------
+class SQLiteCache:
+    """Two-level cache: fast RAM (LRU) + persistent SQLite.
+
+    Provides a hybrid caching layer where the fastest lookups are served
+    from RAM (LRU) and persistent storage is kept in SQLite. Items are
+    automatically expired based on TTL.
+
+    Used for router caches and other persistent key-value stores where
+    data needs to survive process restarts.
+    """
+
+    def __init__(self, db_path: str = "/app/backend/data/router_cache.db",
+                 table: str = "cache", max_size: int = 500, ttl: int = 1800):
+        """
+        Initialize the SQLite cache.
+
+        Args:
+            db_path (str): Path to the SQLite database file.
+            table (str): Table name to store cache entries.
+            max_size (int): Maximum RAM cache size (LRU eviction).
+            ttl (int): Time-to-live in seconds for all entries.
+        """
+        self.table = table
+        self.ttl = ttl
+        self.max_size = max_size
+        self._ram = AsyncLRUCache(max_size=max_size, ttl=ttl)
+        self._db_path = db_path
+        self._conn: Optional[Any] = None
+        self._conn_lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        """Initialise the SQLite database and create the cache table if needed."""
+        self._get_conn()
+
+    def _get_conn(self):
+        """Return the SQLite connection, creating it if necessary."""
+        import sqlite3, os
+        with self._conn_lock:
+            if self._conn is None:
+                parent = os.path.dirname(os.path.abspath(self._db_path))
+                os.makedirs(parent, exist_ok=True)
+                self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                self._conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {self.table} (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        ts REAL NOT NULL
+                    )
+                """)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA cache_size=-8000")
+                self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table}_ts ON {self.table}(ts)")
+                self._conn.commit()
+            return self._conn
+
+    async def get(self, key: str) -> Optional[str]:
+        """
+        Retrieve a value from the cache.
+
+        First checks RAM cache, then falls back to SQLite. If found in
+        SQLite and not expired, the value is promoted to RAM cache.
+
+        Args:
+            key (str): The cache key.
+
+        Returns:
+            Optional[str]: The cached value, or None if not found.
+        """
+        hit = await self._ram.get(key)
+        if hit is not None:
+            return hit
+        def _read():
+            conn = self._get_conn()
+            return conn.execute(
+                f"SELECT value, ts FROM {self.table} WHERE key = ?", (key,)
+            ).fetchone()
+        import anyio
+        row = await anyio.to_thread.run_sync(_read)
+        if row is None:
+            return None
+        value, ts = row
+        if self.ttl > 0 and time.time() - ts > self.ttl:
+            await self._delete_from_db(key)
+            return None
+        await self._ram.set(key, value)
+        return value
+
+    async def set(self, key: str, value: str) -> None:
+        """
+        Store a value in the cache.
+
+        Writes to both RAM and SQLite. If the RAM cache is at capacity,
+        the least recently used item is evicted first.
+
+        Args:
+            key (str): The cache key.
+            value (str): The value to store.
+        """
+        await self._ram.set(key, value)
+        def _write():
+            conn = self._get_conn()
+            conn.execute(
+                f"REPLACE INTO {self.table} (key, value, ts) VALUES (?, ?, ?)",
+                (key, value, time.time()),
+            )
+            conn.commit()
+        import anyio
+        await anyio.to_thread.run_sync(_write)
+
+    async def _delete_from_db(self, key: str) -> None:
+        """Delete a single key from the SQLite database."""
+        def _del():
+            conn = self._get_conn()
+            conn.execute(f"DELETE FROM {self.table} WHERE key = ?", (key,))
+            conn.commit()
+        import anyio
+        await anyio.to_thread.run_sync(_del)
+
+    async def clear(self) -> None:
+        """Clear all entries from both RAM and SQLite."""
+        await self._ram.clear()
+        def _clr():
+            conn = self._get_conn()
+            conn.execute(f"DELETE FROM {self.table}")
+            conn.commit()
+        import anyio
+        await anyio.to_thread.run_sync(_clr)
+
+
+# ============================================================================
+# SECTION 3: HTTP & LLM (aiohttp session + LLM caller)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 3.1 aiohttp ClientSession with connection pool (shared)
 # ---------------------------------------------------------------------------
 _HTTP_SESSION: Optional[Any] = None
 _HTTP_TIMEOUT_SECONDS: int = 120
@@ -101,9 +366,17 @@ def _get_http_lock() -> asyncio.Lock:
 async def get_http_session(timeout_seconds: int = 120):
     """
     Return (or create) the shared aiohttp ClientSession.
-    If the requested timeout is larger than the current session's,
-    the session is recreated to avoid cutting off long calls.
-    Thread‑safe: guarded by an asyncio lock.
+
+    If the requested timeout is larger than the current session's timeout,
+    the session is recreated to avoid cutting off long calls. The session
+    uses a connection pool with connection limits and keepalive.
+
+    Args:
+        timeout_seconds (int): Total timeout for requests in seconds.
+                              Defaults to 120.
+
+    Returns:
+        aiohttp.ClientSession: The shared HTTP session.
     """
     global _HTTP_SESSION, _HTTP_TIMEOUT_SECONDS
     import aiohttp
@@ -142,7 +415,7 @@ async def close_http_session():
 
 
 # ---------------------------------------------------------------------------
-# 5. Shared LLM caller
+# 3.2 Shared LLM caller
 # ---------------------------------------------------------------------------
 async def call_llm(
     prompt: str,
@@ -158,7 +431,28 @@ async def call_llm(
 ) -> str:
     """
     Async LLM call. Reuses the shared HTTP session.
-    Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
+
+    Handles Ollama, llama.cpp and OpenAI-compatible endpoints. For Ollama,
+    uses the `/api/generate` endpoint. For OpenAI-compatible endpoints,
+    supports both `/v1/chat/completions` and `/v1/completions`.
+
+    Args:
+        prompt (str): The user prompt.
+        system (str): System prompt for chat completions.
+        base_url (str): The base URL of the LLM server.
+        model (Optional[str]): The model to use. Required.
+        api_token (str): API token for authenticated endpoints.
+        temperature (float): Sampling temperature. Defaults to 0.3.
+        max_tokens (Optional[int]): Maximum tokens to generate.
+        timeout (int): Request timeout in seconds. Defaults to 120.
+        endpoint_type (str): 'chat' or 'completion'. Defaults to 'chat'.
+
+    Returns:
+        str: The LLM response content.
+
+    Raises:
+        RuntimeError: If the model is not provided, the HTTP request fails,
+                      or the response is malformed.
     """
     if model is None:
         import logging
@@ -255,48 +549,12 @@ async def call_llm(
     return content.strip()
 
 
-# ---------------------------------------------------------------------------
-# 6. Async-safe LRU Cache with TTL
-# ---------------------------------------------------------------------------
-class AsyncLRUCache:
-    """Async-safe cache with LRU eviction and TTL."""
-
-    def __init__(self, max_size: int = 1000, ttl: int = 1800):
-        self.max_size = max_size
-        self.ttl = ttl
-        self._store: Dict[str, Tuple[Any, float]] = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
-            entry = self._store.get(key)
-            if entry is None:
-                return None
-            value, ts = entry
-            if self.ttl > 0 and time.time() - ts > self.ttl:
-                del self._store[key]
-                return None
-            self._store[key] = self._store.pop(key)
-            return value
-
-    async def set(self, key: str, value: Any) -> None:
-        async with self._lock:
-            if self.max_size > 0 and len(self._store) >= self.max_size and key not in self._store:
-                oldest = next(iter(self._store))
-                del self._store[oldest]
-            self._store[key] = (value, time.time())
-            self._store[key] = self._store.pop(key)
-
-    async def clear(self) -> None:
-        async with self._lock:
-            self._store.clear()
-
-    def __len__(self) -> int:
-        return len(self._store)
-
+# ============================================================================
+# SECTION 4: Conversation Compression (LLMLingua-2 for chat history)
+# ============================================================================
 
 # ---------------------------------------------------------------------------
-# 7. ConversationCompressor — tiered LLMLingua-2 compression of chat history (v8)
+# 4.1 ConversationCompressor — tiered LLMLingua-2 compression of chat history (v8)
 # ---------------------------------------------------------------------------
 class ConversationCompressor:
     """
@@ -332,8 +590,23 @@ class ConversationCompressor:
         re.DOTALL,
     )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4.1.1 Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def __init__(self, compressor_singleton: Any) -> None:
+        """
+        Initialise the conversation compressor with an LLMLingua-2 instance.
+
+        Args:
+            compressor_singleton (Any): An instance of PromptCompressor
+                                        from the llmlingua library.
+        """
         self.raw = compressor_singleton
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4.1.2 Main public method
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def compress_messages(
         self,
@@ -349,6 +622,29 @@ class ConversationCompressor:
         preserve_errors: bool = True,
         query: str = "",
     ) -> List[dict]:
+        """
+        Compress a list of conversation messages using tiered compression.
+
+        Each turn is classified into one of four tiers based on recency and
+        whether its code symbols are already indexed. Compression rates are
+        applied accordingly.
+
+        Args:
+            messages (List[dict]): List of message dicts with 'role' and 'content'.
+            project_id (str): The project ID for symbol index lookups.
+            symbol_index (Any): The SymbolIndex instance for checking indexed code.
+            current_msg_idx (int): Index of the current message in the conversation.
+            recent_lookback (int): Number of recent turns to keep lightly compressed.
+            old_rate (float): Compression rate for old turns (0.0-1.0).
+            recent_rate (float): Compression rate for recent turns (0.0-1.0).
+            indexed_rate (float): Compression rate for old indexed turns (0.0-1.0).
+            min_tokens_to_compress (int): Minimum tokens before compression is attempted.
+            preserve_errors (bool): Whether to preserve error/traceback messages verbatim.
+            query (str): The user query for question-aware compression.
+
+        Returns:
+            List[dict]: A new list of messages with compressed content where applicable.
+        """
         if self.raw is None or not messages:
             return messages
 
@@ -399,7 +695,17 @@ class ConversationCompressor:
             out.append({**msg, "content": new_content})
         return out
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4.1.3 Classification helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _classify_turn(self, conv_pos, last_conv_pos, recent_lookback, content, symbol_index, project_id):
+        """
+        Classify a conversation turn into a compression tier.
+
+        Returns:
+            str: 'current', 'recent', 'old', or 'old_indexed'
+        """
         if conv_pos >= last_conv_pos:
             return "current"
         distance = last_conv_pos - conv_pos
@@ -410,6 +716,13 @@ class ConversationCompressor:
         return "old"
 
     def _is_code_indexed(self, content, symbol_index, project_id):
+        """
+        Check if all code symbols in the content are indexed in the SymbolGraph.
+
+        Returns True if all defined classes and functions in code fences are
+        present in the symbol index. Returns False if any are missing or if
+        the index is unavailable.
+        """
         if symbol_index is None:
             return False
         defined = set()
@@ -425,7 +738,37 @@ class ConversationCompressor:
             return False
         return defined.issubset(indexed)
 
+    @classmethod
+    def _has_protocol_marker(cls, text):
+        """Check if the text contains a CodeAware protocol marker."""
+        norm = text.replace("▶️", "▶").replace("►", "▶")
+        return any(m in norm for m in cls._PROTOCOL_MARKERS)
+
+    @staticmethod
+    def _should_preserve(content, preserve_errors):
+        """Check if a message should be preserved verbatim (e.g., tracebacks)."""
+        if not preserve_errors:
+            return False
+        cl = content.lower()
+        return (
+            "traceback (most recent call last)" in cl
+            or "traceback:" in cl
+            or ("exception" in cl and 'file "' in cl)
+            or bool(re.search(r'file ".+", line \d+', cl))
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4.1.4 Compression helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _compress_turn(self, content, rate, query):
+        """
+        Compress a turn that is not fully indexed (recent or old tier).
+
+        Prose is compressed with LLMLingua. Code blocks are kept verbatim
+        because they contain structural information that would be corrupted
+        by language model compression.
+        """
         segments = self._split_segments(content)
         rebuilt = []
         for kind, text, lang in segments:
@@ -447,6 +790,13 @@ class ConversationCompressor:
         return "".join(rebuilt)
 
     async def _compress_indexed_turn(self, content, rate, query, symbol_index, project_id):
+        """
+        Compress a turn where all code symbols are already indexed.
+
+        Prose is compressed with LLMLingua. Code blocks are replaced with
+        stubs listing the defined symbols, since the full bodies are
+        recoverable via LOD or `/expand`.
+        """
         segments = self._split_segments(content)
         rebuilt = []
         for kind, text, lang in segments:
@@ -468,6 +818,18 @@ class ConversationCompressor:
         return "".join(rebuilt)
 
     async def _llmlingua(self, text, rate, query, code_mode=False):
+        """
+        Apply LLMLingua-2 compression to a text segment.
+
+        Args:
+            text (str): The text to compress.
+            rate (float): The compression rate (0.0-1.0).
+            query (str): The user query for question-aware compression.
+            code_mode (bool): Whether to treat the text as code.
+
+        Returns:
+            str: The compressed text.
+        """
         import anyio
         kwargs = {"rate": rate}
         if code_mode:
@@ -481,7 +843,18 @@ class ConversationCompressor:
         except Exception:
             return text
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4.1.5 Segment splitting & extraction utilities
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _split_segments(self, content):
+        """
+        Split content into text and code segments.
+
+        Returns:
+            List[Tuple[str, str, str]]: List of (kind, text, language) where
+                                        kind is 'text' or 'code'.
+        """
         segments = []
         last = 0
         for m in self._CODE_FENCE.finditer(content):
@@ -497,40 +870,36 @@ class ConversationCompressor:
 
     @staticmethod
     def _extract_defined_names(code):
+        """Extract class and function names defined in a code block."""
         names = re.findall(r"^class\s+([A-Za-z_]\w*)", code, re.MULTILINE)
         names += re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", code, re.MULTILINE)
         return names
 
     @staticmethod
-    def _should_preserve(content, preserve_errors):
-        if not preserve_errors:
-            return False
-        cl = content.lower()
-        return (
-            "traceback (most recent call last)" in cl
-            or "traceback:" in cl
-            or ("exception" in cl and 'file "' in cl)
-            or bool(re.search(r'file ".+", line \d+', cl))
-        )
-
-    @classmethod
-    def _has_protocol_marker(cls, text):
-        norm = text.replace("▶️", "▶").replace("►", "▶")
-        return any(m in norm for m in cls._PROTOCOL_MARKERS)
-
-    @staticmethod
     def _estimate_tokens(text):
+        """Estimate token count for a text string (rough approximation)."""
         return len(text) // 4
 
 
 # ---------------------------------------------------------------------------
-# Singleton factory for ConversationCompressor (v8)
+# 4.2 Singleton factory for ConversationCompressor
 # ---------------------------------------------------------------------------
 _CONVERSATION_COMPRESSOR_INSTANCE: Optional[ConversationCompressor] = None
 _CONVERSATION_COMPRESSOR_LOCK = None
 
 
 def get_conversation_compressor() -> Optional[ConversationCompressor]:
+    """
+    Return the ConversationCompressor singleton, loading it once.
+
+    The compressor uses LLMLingua-2 for history compression. It is loaded
+    on demand and cached globally. Returns None if the llmlingua library
+    is not available or initialisation fails.
+
+    Returns:
+        Optional[ConversationCompressor]: The compressor instance, or None
+                                         if it could not be initialised.
+    """
     global _CONVERSATION_COMPRESSOR_INSTANCE, _CONVERSATION_COMPRESSOR_LOCK
     import threading
 
@@ -558,118 +927,53 @@ def get_conversation_compressor() -> Optional[ConversationCompressor]:
     return _CONVERSATION_COMPRESSOR_INSTANCE
 
 
-# ---------------------------------------------------------------------------
-# 8. Persistent SQLite cache (L1 RAM + L2 SQLite)
-# ---------------------------------------------------------------------------
-class SQLiteCache:
-    """Two-level cache: fast RAM (LRU) + persistent SQLite."""
-
-    def __init__(self, db_path: str = "/app/backend/data/router_cache.db",
-                 table: str = "cache", max_size: int = 500, ttl: int = 1800):
-        self.table = table
-        self.ttl = ttl
-        self.max_size = max_size
-        self._ram = AsyncLRUCache(max_size=max_size, ttl=ttl)
-        self._db_path = db_path
-        self._conn: Optional[Any] = None
-        self._conn_lock = threading.Lock()
-        self._init_db()
-
-    def _init_db(self):
-        self._get_conn()
-
-    def _get_conn(self):
-        import sqlite3, os
-        with self._conn_lock:
-            if self._conn is None:
-                parent = os.path.dirname(os.path.abspath(self._db_path))
-                os.makedirs(parent, exist_ok=True)
-                self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-                self._conn.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {self.table} (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL,
-                        ts REAL NOT NULL
-                    )
-                """)
-                self._conn.execute("PRAGMA journal_mode=WAL")
-                self._conn.execute("PRAGMA synchronous=NORMAL")
-                self._conn.execute("PRAGMA cache_size=-8000")
-                self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table}_ts ON {self.table}(ts)")
-                self._conn.commit()
-            return self._conn
-
-    async def get(self, key: str) -> Optional[str]:
-        hit = await self._ram.get(key)
-        if hit is not None:
-            return hit
-        def _read():
-            conn = self._get_conn()
-            return conn.execute(
-                f"SELECT value, ts FROM {self.table} WHERE key = ?", (key,)
-            ).fetchone()
-        import anyio
-        row = await anyio.to_thread.run_sync(_read)
-        if row is None:
-            return None
-        value, ts = row
-        if self.ttl > 0 and time.time() - ts > self.ttl:
-            await self._delete_from_db(key)
-            return None
-        await self._ram.set(key, value)
-        return value
-
-    async def set(self, key: str, value: str) -> None:
-        await self._ram.set(key, value)
-        def _write():
-            conn = self._get_conn()
-            conn.execute(
-                f"REPLACE INTO {self.table} (key, value, ts) VALUES (?, ?, ?)",
-                (key, value, time.time()),
-            )
-            conn.commit()
-        import anyio
-        await anyio.to_thread.run_sync(_write)
-
-    async def _delete_from_db(self, key: str) -> None:
-        def _del():
-            conn = self._get_conn()
-            conn.execute(f"DELETE FROM {self.table} WHERE key = ?", (key,))
-            conn.commit()
-        import anyio
-        await anyio.to_thread.run_sync(_del)
-
-    async def clear(self) -> None:
-        await self._ram.clear()
-        def _clr():
-            conn = self._get_conn()
-            conn.execute(f"DELETE FROM {self.table}")
-            conn.commit()
-        import anyio
-        await anyio.to_thread.run_sync(_clr)
-
+# ============================================================================
+# SECTION 5: Utilities & Helpers
+# ============================================================================
 
 # ---------------------------------------------------------------------------
-# 9. Active expert tracker (used for sticky routing)
+# 5.1 Active expert tracker (used for sticky routing)
 # ---------------------------------------------------------------------------
 _ACTIVE_EXPERT: Optional[str] = None
 _ACTIVE_EXPERT_LOCK = threading.Lock()
 
 
 def get_active_expert() -> Optional[str]:
+    """
+    Get the currently active expert ID for sticky routing.
+
+    Returns:
+        Optional[str]: The active expert ID, or None if no expert is active.
+    """
     return _ACTIVE_EXPERT
 
 
 def set_active_expert(expert_id: str) -> None:
+    """
+    Set the active expert ID for sticky routing.
+
+    Args:
+        expert_id (str): The expert ID to set as active.
+    """
     global _ACTIVE_EXPERT
     with _ACTIVE_EXPERT_LOCK:
         _ACTIVE_EXPERT = expert_id
 
 
 # ---------------------------------------------------------------------------
-# 10. Helper to safely unload all models from a llama.cpp server
+# 5.2 Helper to safely unload all models from a llama.cpp server
 # ---------------------------------------------------------------------------
 async def unload_all_models(base_url: str) -> None:
+    """
+    Unload all currently loaded models from a llama.cpp server.
+
+    This is used when switching auxiliary models to free VRAM before
+    loading a different model. The function queries the server for loaded
+    models and unloads them one by one.
+
+    Args:
+        base_url (str): The base URL of the llama.cpp server.
+    """
     import aiohttp
     base_url = base_url.rstrip("/")
     if base_url.endswith("/v1"):
