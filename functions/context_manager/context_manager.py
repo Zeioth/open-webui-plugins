@@ -2860,11 +2860,10 @@ class ContextBuilder:
                 "\n### Directly relevant code (high activation)\n"
                 + "\n".join(_lod3_parts)
             )
-
+            
         if len(ordered) <= 1:
-            self._f._log_debug(
-                "build_block_b: empty output (un-filled ContextBuilder?) — FIX #11"
-            )
+            if self._f.valves.debug:
+                self._f._log_debug("build_block_b: no activated nodes or empty context")
             return ""
 
         summary_line = (
@@ -11799,7 +11798,9 @@ class ActivationEngine:
         # 3. Store scores for downstream consumers (LOD, prefetch, pager)
         self._store_activation_scores(ag, project_id)
 
-        activated = ag.get_activated_nodes(threshold=self._f.valves.path_activation_threshold)
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
+        )
         self._f._log_debug(
             f"[PPR] Activation complete: {len(activated)} nodes activated "
             f"(threshold={self._f.valves.path_activation_threshold})"
@@ -16860,7 +16861,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════════
         # ── Path activation ─────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
-        path_activation_threshold: float = Field(default=0.1, ge=0.01, le=1.0)
+        path_activation_threshold: float = Field(default=0.01, ge=0.01, le=1.0)
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=4, ge=1, le=8)
         path_summary_model: str = Field(
@@ -16868,9 +16869,9 @@ class Filter:
         )
         path_summary_max_tokens: int = Field(default=80)
         # ── LOD thresholds ──────────────────────────────────────────
-        lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
-        lod2_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
-        lod1_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
+        lod3_threshold: float = Field(default=0.99, ge=0.0, le=1.0)
+        lod2_threshold: float = Field(default=0.01, ge=0.0, le=1.0)
+        lod1_threshold: float = Field(default=0.01, ge=0.0, le=1.0)
         # ── LOD by use case (#17) ───────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
