@@ -2348,24 +2348,484 @@ class RaptorCodeIndex:
         except Exception:
             return default
 
+
+class ContextBuilder:
+    """
+    Builds Block A + Block B, owns KV slot lifecycle, and provides skeleton
+    and inventory utilities for the system prompt.
+
+    Block A is the static, KV‑cache‑anchoring part (hub symbols, architecture
+    map, guidelines, feedback context).  Block B is the dynamic, per‑query
+    part (LOD‑activated code, LTM, use‑case‑tuned policies).
+
+    Also handles:
+    * Skeleton tier (stable signatures) inside Block A.
+    * Scaffolding / skeleton responses for intent queries.
+    * Chain‑of‑Thought (CoT) expand resolution.
+    * Slot persistence (save / restore of KV cache state).
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+        # Per-project Block A cache: project_id → (static_hash, rendered_text).
+        self._block_a_cache: dict = {}
+        # Skeleton cache: project_id → (code_state_hash, skeleton_text).
+        self._skeleton_cache: Dict[str, Tuple[str, str]] = {}
+        # Skeleton tier cache: project_id → (signature_hash, tier_text).
+        self._skeleton_tier_cache: Dict[str, Tuple[str, str]] = {}
+
+        # Fast-path trigger for inventory / structural queries.
+        self._LIST_INTENTS = re.compile(
+            r"\b(?:dame\s+la\s+)?lista\s*(?:de\s+)?(?:clases|funciones)|"
+            r"lístame|listame|enumera|inventario|"
+            r"todas las (clases|funciones)|qué (clases|funciones)|"
+            r"estructura del código|overview|list all|all (classes|functions)|"
+            r"muestra las clases|show classes|list classes",
+            re.IGNORECASE,
+        )
+        # Fast-path for skeleton/scaffolding queries.
+        self._SKELETON_INTENTS = re.compile(
+            r"\b(esqueleto|skeleton|stubs?|scaffold(ing)?|"
+            r"(solo|sólo)\s+firmas|signatures?\s+only|"
+            r"plantilla\s+de\s+(clases|c[oó]digo))\b"
+            r"|estructura[^.\n]{0,40}(completar|rellenar|esqueleto|stub)",
+            re.IGNORECASE,
+        )
+        # Filtered skeleton: "esqueleto de ClassName" / "skeleton of FuncName".
+        self._SKELETON_SYMBOL_RE = re.compile(
+            r"\b(?:esqueleto|skeleton|stub|scaffolding?)\s+"
+            r"(?:de|of|para|for)?\s*`?(?P<sym>[A-Za-z_]\w*)`?",
+            re.IGNORECASE,
+        )
+
+        # ── #17: LOD policy per use case ─────────────────────────────
+        self.LOD_PROFILES: Dict[str, dict] = {
+            "A": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.4,
+                "lod3_mult": 2.5,
+                "activation_direction": "both",
+            },
+            "B": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.2,
+                "activation_direction": "callees",
+            },
+            "C": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.0,
+                "activation_direction": "callees",
+            },
+            "D": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 1.0,
+                "lod3_mult": 1.0,
+                "activation_direction": "callers",
+            },
+            "E": {
+                "lod1_mult": 1.0,
+                "lod2_mult": 2.0,
+                "lod3_mult": 4.0,
+                "activation_direction": "callees",
+            },
+        }
+        # Use-case detection. Refactor (D) is tested BEFORE architecture (A).
+        self._UC_COMMAND_RE = re.compile(
+            r"^\s*/(arch|plan|code|refactor|scaffold)\b", re.IGNORECASE
+        )
+        self._UC_SCAFFOLD_RE = re.compile(
+            r"\b(esqueleto|skeleton|stubs?|scaffold(?:ing)?|solo\s+firmas|"
+            r"signatures?\s+only|boilerplate|plantilla\s+de\s+(?:clase|c[oó]digo))\b",
+            re.IGNORECASE,
+        )
+        self._UC_REFACTOR_RE = re.compile(
+            r"\b(refactor(?:iza(?:r|ndo)?|ing|ed)?|renombr\w*|rename|"
+            r"extrae\s+(?:el\s+)?(?:m[eé]todo|funci[oó]n)|"
+            r"extract\s+(?:a\s+)?(?:method|function)|"
+            r"mueve\s+\w+\s+a|move\s+\w+\s+to|inline\b|deduplic\w*|"
+            r"reorganiz\w*|restructur\w*|split\s+(?:this|the|el|la)\b)\b",
+            re.IGNORECASE,
+        )
+        self._UC_ARCH_RE = re.compile(
+            r"\b(arquitectura|architecture|dise[ñn]o|design|"
+            r"c[oó]mo\s+(?:estructurar|organizar|dividir)|"
+            r"qu[eé]\s+(?:clases|m[oó]dulos|componentes)\s+"
+            r"(?:necesito|crear|a[ñn]adir)|"
+            r"abstract\s+(?:base\s+)?class|interface\s+design|"
+            r"propuesta\s+de\s+dise[ñn]o|API\s+surface)\b",
+            re.IGNORECASE,
+        )
+        self._UC_PLAN_RE = re.compile(
+            r"\b(plan\s+de\s+(?:implementaci[oó]n|cambios)|implementation\s+plan|"
+            r"pasos\s+para|steps\s+to|roadmap|"
+            r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
+            re.IGNORECASE,
+        )
+
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2.2 — Skeleton for a single symbol (filtered fast path)
+    # 1. Block A – static, KV‑cache‑anchoring content
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def build_block_a(
+        self,
+        project_id: str,
+        is_code_session: bool,
+        is_continuation: bool,
+    ) -> str:
+        """
+        Build Block A: stable, KV-cache-anchoring content.
+
+        MIGRATION: body is copied verbatim from Filter._get_static_context_block()
+        with exactly ONE change — the symbol-index section is produced by the
+        HubSymbolIndex (top-N by centrality) instead of _build_lightweight_context()
+        (all symbols). Everything else (confidence prompt, checklist, feedback
+        context, the static_hash cache key, the cache read/write) is identical.
+
+        Returns "" when not a code session.
+        """
+        if not is_code_session:
+            return ""
+
+        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
+        cached = self._block_a_cache.get(project_id)
+
+        if cached:
+            cached_hash, cached_text = cached
+            if cached_hash == current_code_hash:
+                return cached_text  # ✓ Hit: same code → same block
+            # ── Continuation: freeze Block A to prevent KV cache misses ──
+            if is_continuation:
+                self._f._log_debug(
+                    "🧱 Block A: frozen for AutoContinue (KV cache stability)"
+                )
+                return cached_text
+
+        # ── Build the static block ──────────────────────────────────────
+        parts: List[str] = []
+
+        # 1. Base instructions (completely static)
+        if is_code_session and self._f.valves.enable_confidence_scoring:
+            parts.append(self._f.valves.confidence_prompt.strip())
+
+        if is_code_session and self._f.valves.enable_code_awareness:
+            checklist = (
+                "## Code review checklist (apply when reviewing or fixing code):\n"
+                "1. Execute mentally with 3 different inputs including edge cases.\n"
+                "2. Identify every assumption and verify each one.\n"
+                "3. Test every regex or string match against 5 counter-examples.\n"
+                "4. Test collections with empty, single-element, and large inputs.\n"
+                "5. Consider the worst-case scenario.\n"
+                "6. Reason step by step, then provide the corrected code."
+            )
+            parts.append(checklist)
+
+            critical_guidelines = (
+                "## Critical reasoning guidelines\n"
+                "- Before diagnosing a bug, verify if the observed behavior matches the "
+                "expected behavior defined in the specification or codebase. "
+                "Do not confuse expected behavior with a bug.\n"
+                "- When you propose a fix, explicitly explain **why** the change resolves "
+                "the root cause and how it prevents the issue from recurring.\n"
+                "- When you propose a change (refactor, addition), explain **why** "
+                "the change is needed: what problem it solves, what benefits it brings, "
+                "and any trade-offs involved.\n"
+                "- Avoid magic numbers; define named constants with meaningful names "
+                "and derive them from a single source of truth whenever possible."
+            )
+            parts.append(critical_guidelines)
+
+        # 2. Symbol index (depth depends on call_graph_context_mode; the mode
+        # itself is resolved per-query in build_block_b and read here as
+        # already-decided state — Block A stays a passive consumer).
+        if is_code_session and self._f.valves.enable_code_awareness:
+            state = self._f._state_store.get_state(project_id)
+            if state and state.get("active_blocks"):
+                centrality = self._f._node_centrality.get(project_id, {})
+                resolved_mode = self._f._last_resolved_graph_mode.get(
+                    project_id, "hubs_only"
+                )
+                self._f._log_debug(
+                    f"Building Block A symbol section with mode='{resolved_mode}' "
+                    f"(project={project_id})"
+                )
+                symbol_section = self._f._hub_index.build(
+                    symbol_index=self._f._symbol_index,
+                    centrality=centrality,
+                    project_id=project_id,
+                    top_n=self._f.valves.symbol_index_max_in_block_a,
+                    valves=self._f.valves,
+                    mode=resolved_mode,
+                )
+                if symbol_section:
+                    parts.append(symbol_section)
+
+        # 2.5 Skeleton tier (#15): whole-project signatures as a STABLE cache
+        # prefix. Self-cached by signature_hash (survives body edits) inside
+        # _build_skeleton_tier; rendered here so the Block A prefix hash and the
+        # llama.cpp KV cache cover it. Auto-skipped when over budget.
+        if is_code_session and self._f.valves.enable_code_awareness:
+            skeleton_tier = self._build_skeleton_tier(project_id)
+            if skeleton_tier:
+                parts.append(skeleton_tier)
+
+        # 3. Feedback context (stable between requests barring new feedback)
+        if (
+            is_code_session
+            and self._f.valves.enable_feedback_tracking
+            and self._f.valves.inject_feedback_context
+        ):
+            feedback_ctx = self._f._enrichment.get_feedback_context(project_id)
+            if feedback_ctx:
+                parts.append(feedback_ctx)
+
+        static_block = "\n\n".join(p for p in parts if p.strip())
+
+        # ── Cache and track ─────────────────────────────────────────────
+        self._block_a_cache[project_id] = (current_code_hash, static_block)
+
+        # Detect and log prefix changes (= cache miss in llama.cpp).
+        # The real cacheable prefix is [user system prompt] + [static_block]
+        # (the user prompt is prepended at assembly time and is part of zone A),
+        # so the hash must change when EITHER changes — otherwise a mid-session
+        # edit of the user system prompt is invisible to KV-cache-miss detection
+        # and to slot persistence.
+        _user_sys = getattr(self._f, "_original_system_prompt", "") or ""
+        new_prefix_hash = hashlib.md5(
+            (_user_sys + "\x1e" + static_block).encode()
+        ).hexdigest()[:16]
+
+        last_hash = self._f._last_static_prefix_hash.get(project_id)
+        if last_hash and last_hash != new_prefix_hash:
+            self._f._log_debug(
+                f"⚠️  KV CACHE MISS detected: static block changed "
+                f"({last_hash} → {new_prefix_hash}). "
+                f"llama.cpp will do a full prefill on this request."
+            )
+        elif not last_hash:
+            self._f._log_debug(
+                f"KV Cache: first request for project, "
+                f"static prefix established ({new_prefix_hash})."
+            )
+        else:
+            self._f._log_debug(
+                f"✓ KV Cache: static prefix stable ({new_prefix_hash}). "
+                f"llama.cpp will reuse KV states for Block A."
+            )
+        self._f._last_static_prefix_hash[project_id] = new_prefix_hash
+
+        tokens = (
+            len(self._f.tokenizer.encode(static_block))
+            if self._f.tokenizer
+            else len(static_block) // 4
+        )
+        self._f._log_debug(f"Static Context Block: ~{tokens} tokens")
+
+        return static_block
+
+    def invalidate_block_a_cache(
+        self, project_id: str, reason: str = "", recompute_centrality: bool = True
+    ) -> None:
+        """
+        Force Block A rebuild on the next request, optionally refreshing
+        centrality scores.
+
+        MIGRATION: from Filter._invalidate_static_context_block(), plus one
+        addition — recompute centrality so HubSymbolIndex sees fresh scores.
+
+        recompute_centrality=False is used by call_graph_context_mode changes:
+        a mode flip (e.g. auto resolving "hubs_only" → "full_graph" because the
+        user's intent shifted) changes how much of the EXISTING graph is
+        rendered, not the graph itself. PageRank is O(V+E) per call and
+        recomputing it on every mode flip — which can happen every turn under
+        auto — is pure waste; only actual code changes (new/removed
+        symbols/edges) warrant a centrality refresh.
+        """
+        self._block_a_cache.pop(project_id, None)
+        self._skeleton_cache.pop(project_id, None)
+        if recompute_centrality:
+            try:
+                self._f._node_centrality[project_id] = (
+                    self._f._symbol_index.precompute_centrality(project_id)
+                )
+            except Exception:
+                pass
+        if reason:
+            self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Skeleton tier (stable signatures inside Block A)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_skeleton_tier(self, project_id: str) -> str:
+        """
+        Render the project skeleton (signatures only) as a STABLE context tier,
+        cached by signature_hash so body edits don't invalidate it. Returns ""
+        when disabled, empty, or over the tier budget (caller then injects no
+        tier and Block B keeps inline signatures).
+        """
+        if not self._f.valves.enable_skeleton_tier:
+            return ""
+        if self._f.valves.skeleton_include_docstrings:
+            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
+        else:
+            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+        if not sig_hash:
+            return ""
+        cached = self._skeleton_tier_cache.get(project_id)
+        if cached and cached[0] == sig_hash:
+            return cached[1]
+        skel = self._format_skeleton(project_id)
+        if not skel:
+            return ""
+        budget = self._f.valves.skeleton_tier_max_tokens
+        if budget > 0:
+            tok = self._f._tokens.estimate_code_tokens(skel)
+            if tok > budget:
+                self._f._log_debug(
+                    f"Skeleton tier skipped: {tok} tokens > budget {budget}. "
+                    "Block B keeps signatures inline."
+                )
+                self._skeleton_tier_cache[project_id] = (sig_hash, "")
+                return ""
+        tier = (
+            "## Project Skeleton (stable — signatures only)\n"
+            "_Contracts for the whole project. Bodies are shown on demand below "
+            "or via `/expand <name>`._\n\n"
+            f"{skel}"
+        )
+        self._skeleton_tier_cache[project_id] = (sig_hash, tier)
+        self._f._log_debug(
+            f"Skeleton tier rendered (sig_hash={sig_hash}, "
+            f"~{self._f._tokens.estimate_code_tokens(tier)} tokens)"
+        )
+        return tier
+
+    def _is_skeleton_tier_active(self, project_id: str) -> bool:
+        """
+        True only if the skeleton tier was actually rendered into Block A
+        THIS turn for the current signature hash — not just enabled with
+        symbols present. _build_skeleton_tier caches ("") under the current
+        hash when it skips rendering due to skeleton_tier_max_tokens; without
+        this check, suppress_sigs below would hide Block B's inline
+        signatures even though Block A ended up with none.
+
+        Args:
+            project_id: Current project identifier.
+
+        Returns:
+            True if the skeleton tier is active and contains content for the
+            current signature hash, False otherwise.
+        """
+        if not self._f.valves.enable_skeleton_tier:
+            return False
+        if self._f.valves.skeleton_include_docstrings:
+            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
+        else:
+            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+        if not sig_hash:
+            return False
+        cached = self._skeleton_tier_cache.get(project_id)
+        return bool(cached and cached[0] == sig_hash and cached[1])
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2.1 — Project skeleton rendering (signatures only)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _format_skeleton(self, project_id: str) -> str:
+        """
+        Render the project skeleton: signatures of all indexed symbols.
+
+        Generates a compact, human‑readable list of:
+        - Classes with their method signatures (indented).
+        - Module‑level functions (bulleted).
+
+        Optionally includes one‑line docstrings if the valve
+        `skeleton_include_docstrings` is True. This method is used by:
+        - `_build_skeleton_tier` (for the stable Block‑A cache).
+        - Fast‑path skeleton queries (`/esqueleto`, `/skeleton`, etc.).
+
+        Returns:
+            A formatted string ready for injection into the system prompt,
+            or an empty string if no symbols are indexed.
+        """
+        # ── 1. Early exit if no symbols ──────────────────────────────────
+        symbol_index = self._f._symbol_index
+        qids = sorted(symbol_index.get_all_qualified_names(project_id))
+        if not qids:
+            return ""
+
+        lines: List[str] = []
+        include_docstrings = self._f.valves.skeleton_include_docstrings
+
+        # ── 2. Render classes with their methods ──────────────────────────
+        classes = sorted(symbol_index.get_classes(project_id))
+        if classes:
+            lines.append("## Classes")
+            for cls_name in classes:
+                members = symbol_index.get_class_members(cls_name, project_id)
+                if not members:
+                    continue
+                lines.append(f"class {cls_name}:")
+                for member_qid in members:
+                    meta = symbol_index.get_symbol_meta(member_qid, project_id) or {}
+                    sig = meta.get("signature", member_qid)
+                    if include_docstrings:
+                        docstring = meta.get("docstring", "")
+                        if docstring:
+                            first_line = docstring.split("\n")[0]
+                            lines.append(f"    {sig}  # {first_line}")
+                        else:
+                            lines.append(f"    {sig}")
+                    else:
+                        lines.append(f"    {sig}")
+
+        # ── 3. Render module‑level functions ─────────────────────────────
+        module_funcs = [
+            qid
+            for qid in qids
+            if "." not in qid
+            and (symbol_index.get_symbol_meta(qid, project_id) or {}).get("kind")
+            == "function"
+        ]
+        if module_funcs:
+            if lines:
+                lines.append("")
+            lines.append("## Module-level functions")
+            for qid in module_funcs:
+                meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+                sig = meta.get("signature", qid)
+                if include_docstrings:
+                    docstring = meta.get("docstring", "")
+                    if docstring:
+                        first_line = docstring.split("\n")[0]
+                        lines.append(f"- `{sig}`  # {first_line}")
+                    else:
+                        lines.append(f"- `{sig}`")
+                else:
+                    lines.append(f"- `{sig}`")
+
+        return "\n".join(lines)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2.2 — Filtered skeleton for a single symbol
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _format_skeleton_for_symbol(
         self, symbol_name: str, project_id: str, query: str
     ) -> str:
         """
-        Render a filtered skeleton for a single symbol and its direct callers/callees.
+        Render a filtered skeleton for a single symbol and its direct neighbors.
 
-        Used when the user asks for "esqueleto de X" or "skeleton of X".
-        Returns signatures of the symbol itself plus its immediate neighbours
-        (callers and callees) to provide architectural context.
+        Used for fast‑path queries like "esqueleto de X" or "skeleton of X".
+        Returns the signature of the symbol itself plus its immediate callers
+        and callees (up to 10 each) to provide architectural context.
 
         Args:
             symbol_name: Bare or qualified symbol name.
             project_id: Current project identifier.
-            query: The user query (unused here, kept for signature compatibility).
+            query: The user query (unused, kept for signature compatibility).
 
         Returns:
             A formatted string with signatures, or empty if symbol not found.
@@ -2388,9 +2848,9 @@ class RaptorCodeIndex:
         if doc and self._f.valves.skeleton_include_docstrings:
             lines.append(f"# {doc.split(chr(10))[0]}")
 
-        # ── 1. Add direct callers ──────────────────────────────────────
-        callers = set()
+        # ── 1. Direct callers ──────────────────────────────────────
         bare = meta.get("name", target_qid.rsplit(".", 1)[-1])
+        callers = set()
         for edge in symbol_index.get_edges_in(bare, project_id):
             callers.add(edge.src)
         if callers:
@@ -2400,7 +2860,7 @@ class RaptorCodeIndex:
                 csig = cm.get("signature", c)
                 lines.append(f"- `{csig}`")
 
-        # ── 2. Add direct callees ──────────────────────────────────────
+        # ── 2. Direct callees ──────────────────────────────────────
         callees = set()
         for edge in symbol_index.get_edges_out(target_qid, project_id):
             callees.add(edge.dst)
@@ -2420,7 +2880,7 @@ class RaptorCodeIndex:
         return "\n".join(lines)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2.3 — Full symbol inventory (for /list, /inventory queries)
+    # 2.3 — Full symbol inventory
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _format_full_symbol_inventory(
@@ -2429,7 +2889,7 @@ class RaptorCodeIndex:
         """
         Render a complete inventory of all symbols in the project.
 
-        Used by the fast‑path inventory intent (e.g., "dame la lista de clases").
+        Used for fast‑path inventory intents (e.g., "dame la lista de clases").
         Groups symbols by type: classes with their methods, and module‑level functions.
 
         Args:
@@ -2488,22 +2948,17 @@ class RaptorCodeIndex:
         """
         Retrieve the project skeleton (signatures only) for use as CoT context.
 
-        This is identical to the skeleton tier content, but may include additional
-        context (like the user query) to tailor the skeleton. Currently just returns
-        the same as `_format_skeleton`, but kept as a separate method for future
-        customisation.
+        This is identical to the skeleton tier content, but kept as a separate
+        method for future customisation (e.g., filtering by query).
 
         Args:
             project_id: Current project identifier.
-            query: The user query (used for potential filtering in the future).
+            query: The user query (unused currently).
 
         Returns:
             The skeleton string, or empty if no symbols are indexed.
         """
-        # Use the same rendering as the skeleton tier, but without the
-        # surrounding header (the caller will add its own context).
-        skel = self._format_skeleton(project_id)
-        return skel
+        return self._format_skeleton(project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2.5 — Resolve /expand hints in CoT output
@@ -2589,6 +3044,771 @@ class RaptorCodeIndex:
             total_chars_added += len(body)
 
         return expanded
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2.6 — Docstring provider (used by skeleton renderer)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _make_docstring_provider(self, project_id: str):
+        """Return f(symbol_name, parent_class='') -> one-line docstring or ''.
+        Backed by the index (covers both source-extracted and LLM-generated
+        docstrings).  `parent_class` allows resolving the EXACT occurrence's
+        docstring (e.g. THIS class's __init__, not another's) instead of an
+        ambiguous one."""
+        if not self._f.valves.skeleton_include_docstrings:
+            return lambda _name, _parent="": ""
+
+        def _provider(symbol_name: str, parent_class: str = "") -> str:
+            qid = qualify_symbol_name(symbol_name, parent_class)
+            return self._f._symbol_index.get_docstring(qid, project_id) or ""
+
+        return _provider
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Block B – dynamic, per‑query LOD‑activated context
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_effective_context_budget(self, project_id: str) -> int:
+        """
+        Tokens available for history + user message after Block A + Block B.
+
+        Uses the token counts recorded for the last request
+        (self._f._last_system_tokens[project_id]).
+        """
+        window = self._f.valves.context_window_tokens
+        used = getattr(self._f, "_last_system_tokens", {}).get(project_id, 0)
+        reserve = self._f.valves.response_reserve_tokens
+        budget = max(0, window - used - reserve)
+
+        self._f._log_debug(
+            f"get_effective_context_budget: window={window}, used_system={used}, "
+            f"reserve={reserve} → {budget} tokens available for history + user message"
+        )
+        return budget
+
+    def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
+        """
+        Classify the query into one of five use cases and return its LOD profile.
+
+        A architecture · B plans · C programming · D refactor · E scaffolding.
+
+        Resolution order (first match wins):
+          1. Explicit command prefix (/arch /plan /code /refactor /scaffold),
+             when lod_intent_explicit_override is enabled.
+          2. Scaffolding regex (E).
+          3. Refactor regex (D) — BEFORE architecture, since the architecture
+             regex also matches "refactor".
+          4. Architecture/design regex (A).
+          5. Plan regex (B).
+          6. intent_vector tie-break: refactor-dominant → D, explain-dominant
+             → A; otherwise C (most common case).
+
+        Returns (case_label, profile_copy); the copy is safe to mutate.
+        """
+        q = query or ""
+
+        if self._f.valves.lod_intent_explicit_override:
+            m = self._UC_COMMAND_RE.match(q)
+            if m:
+                case = {
+                    "arch": "A",
+                    "plan": "B",
+                    "code": "C",
+                    "refactor": "D",
+                    "scaffold": "E",
+                }[m.group(1).lower()]
+                self._f._log_debug(
+                    f"classify_use_case: detected '{case}' via explicit command '/{m.group(1)}'"
+                )
+                return case, dict(self.LOD_PROFILES[case])
+
+        if self._UC_SCAFFOLD_RE.search(q):
+            self._f._log_debug(
+                "classify_use_case: detected 'E' (scaffolding) via regex"
+            )
+            return "E", dict(self.LOD_PROFILES["E"])
+
+        if self._UC_REFACTOR_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'D' (refactor) via regex")
+            return "D", dict(self.LOD_PROFILES["D"])
+
+        if self._UC_ARCH_RE.search(q):
+            self._f._log_debug(
+                "classify_use_case: detected 'A' (architecture) via regex"
+            )
+            return "A", dict(self.LOD_PROFILES["A"])
+
+        if self._UC_PLAN_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'B' (plan) via regex")
+            return "B", dict(self.LOD_PROFILES["B"])
+
+        iv = intent_vector or {}
+        refactor_w = iv.get("refactor", 0.0)
+        debug_w = iv.get("debug", 0.0)
+        modify_w = iv.get("modify", 0.0)
+        explain_w = iv.get("explain", 0.0)
+
+        if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
+            self._f._log_debug(
+                f"classify_use_case: detected 'D' (refactor) via intent_vector tie-break "
+                f"(refactor={refactor_w:.2f})"
+            )
+            return "D", dict(self.LOD_PROFILES["D"])
+
+        if explain_w >= 0.5 and explain_w > modify_w:
+            self._f._log_debug(
+                f"classify_use_case: detected 'A' (architecture) via intent_vector tie-break "
+                f"(explain={explain_w:.2f} > modify={modify_w:.2f})"
+            )
+            return "A", dict(self.LOD_PROFILES["A"])
+
+        self._f._log_debug(
+            "classify_use_case: default 'C' (programming) - no specific signals"
+        )
+        return "C", dict(self.LOD_PROFILES["C"])
+
+    def _resolve_call_graph_mode(
+        self,
+        query: str,
+        intent_vector: dict,
+        project_id: str,
+    ) -> str:
+        """
+        Resolve the effective call-graph depth for Block A.
+
+        Manual override (any valve value other than "auto") always wins — auto
+        is only consulted when the valve is literally "auto".
+
+        auto resolution:
+          1. Reuse classify_use_case(query, intent_vector) — already computed by
+             build_block_b for the same query; no duplicate regex work, and no
+             risk of drifting out of sync with its precedence rules (refactor
+             tested before architecture, explicit /command override, etc.).
+          2. use_case "A" (architecture) → prefer full_graph, else expanded_hubs.
+             use_case "D" (refactor)     → prefer expanded_hubs, else hubs_only.
+             "B"/"C"/"E"                 → hubs_only.
+          3. Every upgrade is gated by BOTH a project-size ceiling AND a
+             free-token-budget floor (qualified symbol count + effective context
+             budget). Both must pass or the mode is capped one level down. Hard
+             cap, not a preference: auto never exceeds what the guards allow.
+
+        Uses get_all_qualified_names() (not get_all_names) for the size count so
+        that same-named methods across classes (every __init__, build, ...) are
+        counted distinctly — otherwise the ceilings would be wildly miscalibrated
+        on codebases with heavy method-name duplication.
+        """
+        valve = self._f.valves.call_graph_context_mode
+        self._f._log_debug(f"Resolving call graph mode: valve='{valve}'")
+
+        if valve != "auto":
+            self._f._log_debug(f"  manual override → '{valve}'")
+            return valve
+
+        use_case, _ = self.classify_use_case(query, intent_vector)
+        total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
+        free_tokens = self.get_effective_context_budget(project_id)
+
+        self._f._log_debug(
+            f"  auto resolution: use_case={use_case}, total_symbols={total_symbols}, "
+            f"free_tokens={free_tokens}"
+        )
+
+        def _full_graph_allowed() -> bool:
+            symbol_ok = (
+                total_symbols
+                <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
+            )
+            token_ok = (
+                free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            )
+            self._f._log_debug(
+                f"    full_graph guard: symbol_ok={symbol_ok} "
+                f"({total_symbols} <= {self._f.valves.call_graph_auto_full_graph_symbol_ceiling}), "
+                f"token_ok={token_ok} "
+                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_full})"
+            )
+            return symbol_ok and token_ok
+
+        def _expanded_hubs_allowed() -> bool:
+            symbol_ok = (
+                total_symbols
+                <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
+            )
+            token_ok = (
+                free_tokens
+                >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            )
+            self._f._log_debug(
+                f"    expanded_hubs guard: symbol_ok={symbol_ok} "
+                f"({total_symbols} <= {self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling}), "
+                f"token_ok={token_ok} "
+                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_expanded})"
+            )
+            return symbol_ok and token_ok
+
+        if use_case == "A":
+            if _full_graph_allowed():
+                self._f._log_debug(
+                    "  resolved mode: full_graph (use_case A, guards passed)"
+                )
+                return "full_graph"
+            if _expanded_hubs_allowed():
+                self._f._log_debug(
+                    "  resolved mode: expanded_hubs (use_case A, full_graph blocked, expanded passed)"
+                )
+                return "expanded_hubs"
+            self._f._log_debug(
+                "  resolved mode: hubs_only (use_case A, neither full nor expanded allowed)"
+            )
+            return "hubs_only"
+
+        if use_case == "D":
+            if _expanded_hubs_allowed():
+                self._f._log_debug(
+                    "  resolved mode: expanded_hubs (use_case D, guards passed)"
+                )
+                return "expanded_hubs"
+            self._f._log_debug(
+                "  resolved mode: hubs_only (use_case D, expanded blocked)"
+            )
+            return "hubs_only"
+
+        self._f._log_debug(f"  resolved mode: hubs_only (use_case {use_case} default)")
+        return "hubs_only"
+
+    def prepare_call_graph_mode(
+        self, project_id: str, query: str, intent_vector: dict
+    ) -> str:
+        """
+        Resolve and apply the call-graph mode for this turn BEFORE Block A is
+        built, so an upgrade (e.g. hubs_only -> full_graph for an architecture
+        query) is visible in the very turn that triggered it instead of
+        lagging one turn behind. This used to live inline at the top of
+        build_block_b, which runs after Block A had already been rendered.
+
+        build_block_b no longer re-resolves the mode itself; it just reads
+        self._f._last_resolved_graph_mode (falling back to calling this
+        method only as a defensive no-op if somehow not yet resolved this
+        turn — see its call site).
+
+        Args:
+            project_id: Current project identifier.
+            query: The user's query text.
+            intent_vector: Pre-classified intent vector (explain/modify/debug/refactor).
+
+        Returns:
+            The resolved mode string: "hubs_only", "expanded_hubs", or "full_graph".
+        """
+        raw_resolved_mode = self._resolve_call_graph_mode(
+            query, intent_vector, project_id
+        )
+        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
+        previous_mode = self._f._last_resolved_graph_mode.get(project_id)
+
+        if previous_mode is None or _MODE_RANK.get(
+            raw_resolved_mode, 0
+        ) >= _MODE_RANK.get(previous_mode, 0):
+            # First resolution ever, or an upgrade/stay-equal: apply immediately.
+            resolved_graph_mode = raw_resolved_mode
+            self._f._graph_mode_downgrade_streak[project_id] = 0
+        else:
+            # Candidate downgrade: only commit after enough consecutive turns.
+            streak = self._f._graph_mode_downgrade_streak.get(project_id, 0) + 1
+            self._f._graph_mode_downgrade_streak[project_id] = streak
+            if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
+                resolved_graph_mode = raw_resolved_mode
+                self._f._graph_mode_downgrade_streak[project_id] = 0
+            else:
+                resolved_graph_mode = previous_mode
+                self._f._log_debug(
+                    f"Call graph mode: downgrade to {raw_resolved_mode} deferred "
+                    f"({streak}/{self._f.valves.call_graph_mode_downgrade_after_turns} "
+                    f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
+                )
+
+        if previous_mode != resolved_graph_mode:
+            self._f._log_debug(
+                f"Call graph mode: {previous_mode or '(none)'} → "
+                f"{resolved_graph_mode} (resolved before Block A build this turn)"
+            )
+            self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
+            # No explicit Block A cache pop needed: build_block_a's cache key
+            # now includes the mode directly (see 4.c), so a mode change
+            # misses the cache on its own.
+
+        return resolved_graph_mode
+
+    async def build_block_b(
+        self,
+        project_id: str,
+        query: str,
+        messages: list,
+        slot_free: bool,
+        intent_vector: dict,
+        is_continuation: bool,
+    ) -> str:
+        """
+        Build Block B: dynamic per-query content with SWA-aware ordering.
+        """
+        if not self._f.valves.enable_path_analysis:
+            active_ctx = self._f._activation.get_active_code_context(project_id, query)
+            return active_ctx if active_ctx else ""
+
+        state = self._f._state_store.get_state(project_id)
+        if not state or not state.get("active_blocks"):
+            return ""
+
+        # ── Fast path: FILTERED skeleton (single symbol + 1-hop deps) ────
+        if self._f.valves.enable_skeleton_intent:
+            _sym_match = self._SKELETON_SYMBOL_RE.search(query)
+            if _sym_match:
+                _sym_name = _sym_match.group("sym")
+                _all = self._f._symbol_index.get_all_names(project_id)
+                if _sym_name in _all:
+                    skel = await self._format_skeleton_for_symbol(
+                        _sym_name, project_id, query
+                    )
+                    if skel:
+                        return skel
+
+        # ── Fast path: skeleton / scaffolding queries (signatures only) ──
+        if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
+            query
+        ):
+            skel = self._format_skeleton(project_id)
+            if skel:
+                return skel
+
+        # ── Fast path for inventory / listing queries ────────────────────
+        if self._LIST_INTENTS.search(query):
+            all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+            if all_qids:
+                return await self._format_full_symbol_inventory(all_qids, project_id)
+
+        # ── Step 1: ActivationGraph ──────────────────────────────────────
+        ag = self._f._activation.build_activation_graph(
+            query, project_id, messages=messages
+        )
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
+        )
+        if not activated:
+            self._f._log_debug(
+                "build_block_b: no activated nodes, falling back to full context"
+            )
+            return self._f._activation.get_active_code_context(project_id, query)
+
+        # ── Step 2: Adjust LOD thresholds by intent ───────────────────────
+        debug_weight = intent_vector.get("debug", 0.2)
+        modify_weight = intent_vector.get("modify", 0.3)
+        refactor_weight = intent_vector.get("refactor", 0.1)
+
+        lod3 = self._f.valves.lod3_threshold
+        lod2 = self._f.valves.lod2_threshold
+        lod1 = self._f.valves.lod1_threshold
+
+        # ── Cambio A: Move classify_use_case here (was near the end) ──
+        active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
+
+        if self._f.valves.enable_lod_by_intent:
+            # Per-use-case LOD profile (previously computed and discarded —
+            # use_case_profile never reached this point, LOD_PROFILES was
+            # dead code). Multipliers > 1.0 raise the bar (less LOD-3 detail,
+            # e.g. case E scaffolding); < 1.0 lowers it.
+            lod1 *= use_case_profile.get("lod1_mult", 1.0)
+            lod2 *= use_case_profile.get("lod2_mult", 1.0)
+            lod3 *= use_case_profile.get("lod3_mult", 1.0)
+        else:
+            # Legacy flat scaling (pre-fix behavior), kept as an off-switch.
+            if debug_weight + modify_weight > 0.6:
+                scale = 0.7
+            elif refactor_weight > 0.4:
+                scale = 0.0
+            else:
+                scale = 1.0
+            lod3 *= scale
+            lod2 *= scale
+            lod1 *= scale
+
+        # ── Case D (refactor): pull in direct callers of the seed symbols ──
+        if (
+            self._f.valves.enable_lod_by_intent
+            and active_use_case == "D"
+            and self._f.valves.lod_intent_refactor_callers_max != 0
+        ):
+            max_callers = self._f.valves.lod_intent_refactor_callers_max
+            pulled = 0
+            for seed_qid in ag.get_seed_nodes():
+                meta = self._f._symbol_index.get_symbol_meta(seed_qid, project_id) or {}
+                bare = meta.get("name", seed_qid.rsplit(".", 1)[-1])
+                for edge in self._f._symbol_index.get_edges_in(bare, project_id):
+                    if max_callers > 0 and pulled >= max_callers:
+                        break
+                    caller_qid = edge.src
+                    if activated.get(caller_qid, 0.0) < lod1:
+                        activated[caller_qid] = max(
+                            activated.get(caller_qid, 0.0), lod1
+                        )
+                        pulled += 1
+                if max_callers > 0 and pulled >= max_callers:
+                    break
+            if pulled:
+                self._f._log_debug(
+                    f"Case D: pulled {pulled} direct caller(s) of seed symbol(s) "
+                    f"into Block B at LOD-1 (impact analysis)."
+                )
+
+        # ── Mode is resolved BEFORE Block A is built this turn ────────────
+        resolved_graph_mode = self._f._last_resolved_graph_mode.get(project_id)
+        if resolved_graph_mode is None:
+            resolved_graph_mode = self.prepare_call_graph_mode(
+                project_id, query, intent_vector
+            )
+
+        # ── Step 3: Build LOD tiers as separate accumulators ──────────────
+        total_tokens = 0
+        budget = self._f.valves.active_context_max_tokens or 32000
+
+        # Auto-budget for multi-phase
+        if (
+            self._f.valves.auto_budget_context_for_parts
+            and (
+                self._f.valves.enable_multi_phase_response
+                or self._f.valves.force_multi_phase_response
+            )
+            and self._f.valves.context_window_tokens > 0
+        ):
+            _SYSTEM_OVERHEAD = 2000
+            _available_for_context = (
+                self._f.valves.context_window_tokens
+                - self._f.valves.multi_phase_effective_max_tokens
+                - _SYSTEM_OVERHEAD
+            )
+            budget = min(budget, max(8000, _available_for_context))
+
+        injected_blocks: Set[str] = set()
+        sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
+
+        # Centrality LOD bump
+        if self._f.valves.enable_centrality_lod_bump:
+            centrality = self._f._node_centrality.get(project_id, {})
+            threshold = self._f.valves.centrality_lod_bump_threshold
+            adjusted = []
+            for node_id, score in sorted_nodes:
+                cent = centrality.get(node_id, 0.0)
+                if cent >= threshold:
+                    effective = min(
+                        1.0, score + cent * self._f.valves.centrality_lod_bump_weight
+                    )
+                else:
+                    effective = score
+                adjusted.append((node_id, effective))
+            sorted_nodes = adjusted
+
+        _lod0_parts: List[str] = []
+        _lod1_parts: List[str] = []
+        _lod2_parts: List[str] = []
+        _lod3_parts: List[str] = []
+
+        # ── Batched LOD-2 docstring pre-resolution ──
+        if self._f.valves.enable_auto_docstrings:
+            lod2_candidates = [
+                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+            ]
+            if lod2_candidates:
+                missing = []
+                for node_id in lod2_candidates:
+                    has_doc = False
+                    for bh in self._f._symbol_index.find_blocks(node_id, project_id):
+                        blk = state["active_blocks"].get(bh)
+                        if blk and any(
+                            qualify_symbol_name(s.name, s.parent_symbol) == node_id
+                            and s.docstring
+                            for s in blk.symbols
+                        ):
+                            has_doc = True
+                            break
+                    if not has_doc:
+                        missing.append(node_id)
+                if missing:
+                    await self._f._enrichment.ensure_docstrings_batch(
+                        missing, project_id
+                    )
+
+        # ── Cambio B: Batched LOD-2.5 CFG pre-resolution ──
+        if self._f.valves.enable_cfg_skeletons and (
+            active_use_case == "D"
+            or intent_vector.get("debug", 0.0)
+            >= self._f.valves.cfg_skeleton_debug_intent_threshold
+        ):
+            cfg_candidates = [
+                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+            ]
+            self._f._log_debug(
+                f"CFG gate TRIGGERED: use_case={active_use_case}, "
+                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"candidates={cfg_candidates}"
+            )
+            if cfg_candidates:
+                await self._f._enrichment.ensure_cfg_batch(cfg_candidates, project_id)
+        else:
+            self._f._log_debug(
+                f"CFG gate NOT triggered: use_case={active_use_case}, "
+                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
+            )
+
+        # ── Iterate over activated nodes and build LOD tiers ──────────────
+        for node_id, score in sorted_nodes:
+            if total_tokens >= budget:
+                break
+
+            if score < lod1:
+                _lod0_parts.append(f"`{node_id}`")
+                total_tokens += 2
+                continue
+
+            block_hashes = self._f._symbol_index.find_blocks(node_id, project_id)
+            for bh in block_hashes:
+                if bh in injected_blocks:
+                    continue
+                block = state["active_blocks"].get(bh)
+
+                # Page-in support for evicted blocks
+                if block is None and self._f._pager is not None:
+                    if self._f._pager.is_paged(bh, project_id):
+                        block = await self._f._pager.page_in_block(
+                            block_hash=bh,
+                            project_id=project_id,
+                            chroma_collection=self._f.memory_collection,
+                            db_conn=self._f._db_conn,
+                        )
+
+                if not block or block.obsolete:
+                    continue
+
+                # ── LOD-1: Signatures only ──────────────────────────────────
+                if score < lod2:
+                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
+                    sig = next(
+                        (
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == node_id
+                        ),
+                        node_id,
+                    )
+                    tok = len(sig) // 4 + 2
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    _lod1_parts.append(f"- `{sig}`{loc} _(score: {score:.2f})_")
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                # ── LOD-2: Signatures + docstrings ──────────────────────────
+                elif score < lod3:
+                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
+                    sig = next(
+                        (
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == node_id
+                        ),
+                        node_id,
+                    )
+                    docstring = next(
+                        (
+                            sym.docstring
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == node_id and sym.docstring
+                        ),
+                        "",
+                    )
+
+                    # ── Cambio C: Use CFG if available ──
+                    cfg_skeleton = ""
+                    if self._f.valves.enable_cfg_skeletons and (
+                        active_use_case == "D"
+                        or intent_vector.get("debug", 0.0)
+                        >= self._f.valves.cfg_skeleton_debug_intent_threshold
+                    ):
+                        cfg_skeleton = (
+                            self._f._symbol_index.get_cfg(node_id, project_id) or ""
+                        )
+
+                    if cfg_skeleton:
+                        self._f._log_debug(f"💉 CFG injected for '{node_id}' (LOD2)")
+                        text = f"`{sig}`"
+                        if docstring:
+                            text += f": {docstring}"
+                        text += f"\n```python\n{cfg_skeleton}\n```"
+                    else:
+                        text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
+
+                    tok = self._f._tokens.estimate_code_tokens(text)
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                # ── LOD-3: Full code body ──────────────────────────────────
+                else:
+                    # ── FIX 2: Extract only the symbol body, not the whole block ──
+                    content_to_inject = CodeBlockManager.extract_symbol_body(
+                        block, node_id
+                    )
+                    tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
+                    _is_oversized = (
+                        self._f.valves.max_code_block_tokens > 0
+                        and tok > self._f.valves.max_code_block_tokens
+                    )
+                    if (
+                        _is_oversized
+                        and self._f.valves.code_block_overflow_action == "warn"
+                    ):
+                        content_to_inject = self._f.valves.code_block_warn_message
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+                    elif (
+                        _is_oversized
+                        and self._f.valves.code_block_overflow_action == "summarize"
+                        and block.block_summary
+                    ):
+                        content_to_inject = (
+                            f"[Summary of {tok}-token block]\n{block.block_summary}"
+                        )
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
+                    if (
+                        slot_free
+                        and self._f.valves.enable_code_compression
+                        and self._f._llmlingua_compressor
+                        and tok > self._f.valves.code_compression_min_tokens
+                    ):
+                        content_to_inject = (
+                            await self._f._history_compressor.compress_code_block(
+                                content_to_inject,
+                                language=(
+                                    block.symbols[0].language
+                                    if block.symbols
+                                    else "unknown"
+                                ),
+                                rate=self._f.valves.code_compression_rate,
+                                query=query,
+                            )
+                        )
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+                    if total_tokens + tok > budget:
+                        break
+                    loc = f" ({block.file_path})" if block.file_path else ""
+                    _lod3_parts.append(
+                        f"### `{node_id}`{loc} [activation: {score:.2f}]\n"
+                        f"```\n{content_to_inject}\n```\n"
+                    )
+                    total_tokens += tok
+                    injected_blocks.add(bh)
+
+                break
+
+        # ── RAPTOR cluster summaries → LOD-2 tier ─────────────────────────
+        if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
+            try:
+                raptor_hits = await self._f._raptor.retrieve(
+                    query=query,
+                    project_id=project_id,
+                    top_k=3,
+                    embedder=self._f.embedder,
+                    chroma_collection=self._f.memory_collection,
+                )
+            except Exception:
+                raptor_hits = []
+            if raptor_hits:
+                raptor_section = (
+                    "### Related subsystems (RAPTOR)\n"
+                    + "\n".join(f"- {h}" for h in raptor_hits)
+                    + "\n\n"
+                )
+                _lod2_parts.insert(0, raptor_section)
+
+        # ── Step 4: SWA-aware assembly ────────────────────────────────────
+        suppress_sigs = (
+            self._f.valves.skeleton_tier_suppresses_block_b_signatures
+            and active_use_case != "D"
+            and self._is_skeleton_tier_active(project_id)
+        )
+
+        ordered = []
+        ordered.append("## Code Context (activation-based LOD)\n")
+        if _lod0_parts and not suppress_sigs:
+            ordered.append(
+                "**Known symbols** (minimal activation):\n" + ", ".join(_lod0_parts)
+            )
+        if _lod1_parts and not suppress_sigs:
+            ordered.append(
+                "\n**Signatures** (low activation):\n" + "\n".join(_lod1_parts)
+            )
+        if _lod2_parts:
+            ordered.append(
+                "\n**Signatures + docstrings** (medium activation):\n"
+                + "\n".join(_lod2_parts)
+            )
+        if _lod3_parts:
+            ordered.append(
+                "\n### Directly relevant code (high activation)\n"
+                + "\n".join(_lod3_parts)
+            )
+
+        if len(ordered) <= 1:
+            if self._f.valves.debug:
+                self._f._log_debug("build_block_b: no activated nodes or empty context")
+            return ""
+
+        summary_line = (
+            f"\n_(Context: {len(injected_blocks)} symbols, "
+            f"~{total_tokens} tokens, "
+            f"{len(activated)} nodes activated)_\n"
+        )
+        ordered.append(summary_line)
+
+        # ── LOD tracking for adaptive feedback ────────────────────────────
+        if self._f.valves.enable_lod_adaptive:
+            if not hasattr(self._f, "_last_lod_levels"):
+                self._f._last_lod_levels: Dict[str, Dict[str, int]] = {}
+            lod_map: Dict[str, int] = {}
+            for node_id, score in activated.items():
+                if score < lod1:
+                    lod_map[node_id] = 0
+                elif score < lod2:
+                    lod_map[node_id] = 1
+                elif score < lod3:
+                    lod_map[node_id] = 2
+                else:
+                    lod_map[node_id] = 3
+            self._f._last_lod_levels[project_id] = lod_map
+
+        return "\n".join(ordered)
+
+    async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
+        """
+        Delete stale slot files, keeping only the current one.
+
+        MIGRATE-VERBATIM: Filter._cleanup_old_slot_files().
+        """
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.isdir(slot_dir):
+            return
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
+        try:
+            for fname in os.listdir(slot_dir):
+                if fname.startswith(prefix) and fname != keep:
+                    os.remove(os.path.join(slot_dir, fname))
+                    self._f._log_debug(f"Removed obsolete slot file: {fname}")
+        except Exception as e:
+            self._f._log_debug(f"Slot cleanup error: {e}")
 
 
 # ---------------------------------------------------------------------------
