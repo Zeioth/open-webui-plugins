@@ -1012,7 +1012,7 @@ class HubSymbolIndex:
         enable_callees = getattr(valves, "enable_hub_callees", True) if valves else True
         hub_qids = self.get_hub_names(centrality, top_n)
         if not hub_qids:
-            self._f._log_debug("Expanded hubs: no hubs found, returning empty.")
+            logger.debug("Expanded hubs: no hubs found, returning empty.")
             return ""
 
         hub_section = self._build_hub_section(
@@ -1029,7 +1029,7 @@ class HubSymbolIndex:
                 neighbor_lines.append(f"- `{qid}` neighbors: {', '.join(extra)}")
 
         if not neighbor_lines:
-            self._f._log_debug("Expanded hubs: no neighbor lines to add.")
+            logger.debug("Expanded hubs: no neighbor lines to add.")
             return hub_section
 
         budget_chars = self.valves_expanded_hubs_budget_chars(valves)
@@ -1047,7 +1047,7 @@ class HubSymbolIndex:
                 break
             kept_lines.append(line)
 
-        self._f._log_debug(
+        logger.debug(
             f"Expanded hubs: {len(hub_qids)} hubs, {len(neighbor_lines)} neighbor entries total, "
             f"{len(kept_lines) - (1 if omitted else 0)} shown, {omitted} omitted due to budget."
         )
@@ -2552,8 +2552,17 @@ class ContextBuilder:
         # ── Cache and track ─────────────────────────────────────────────
         self._block_a_cache[project_id] = (current_code_hash, static_block)
 
-        # Detect and log prefix changes (= cache miss in llama.cpp)
-        new_prefix_hash = hashlib.md5(static_block.encode()).hexdigest()[:16]
+        # Detect and log prefix changes (= cache miss in llama.cpp).
+        # The real cacheable prefix is [user system prompt] + [static_block]
+        # (the user prompt is prepended at assembly time and is part of zone A),
+        # so the hash must change when EITHER changes — otherwise a mid-session
+        # edit of the user system prompt is invisible to KV-cache-miss detection
+        # and to slot persistence.
+        _user_sys = getattr(self._f, "_original_system_prompt", "") or ""
+        new_prefix_hash = hashlib.md5(
+            (_user_sys + "\x1e" + static_block).encode()
+        ).hexdigest()[:16]
+
         last_hash = self._f._last_static_prefix_hash.get(project_id)
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
@@ -3212,8 +3221,11 @@ class ContextBuilder:
                     injected_blocks.add(bh)
 
                 else:
-                    content_to_inject = block.content
-                    tok = block._cached_token_count or (len(block.content) // 4)
+                    # ── FIX 2: Extract only the symbol body, not the whole block ──
+                    content_to_inject = CodeBlockManager.extract_symbol_body(
+                        block, node_id
+                    )
+                    tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
                     _is_oversized = (
                         self._f.valves.max_code_block_tokens > 0
@@ -3243,7 +3255,7 @@ class ContextBuilder:
                     ):
                         content_to_inject = (
                             await self._f._history_compressor.compress_code_block(
-                                block.content,
+                                content_to_inject,
                                 language=(
                                     block.symbols[0].language
                                     if block.symbols
@@ -5487,10 +5499,20 @@ class StateStore:
                     if block.obsolete:
                         continue
                     for sym in block.symbols:
-                        if sym.name in doc_map and not sym.docstring:
-                            sym.docstring = doc_map[sym.name]
+                        if sym.docstring:
+                            continue
+                        # ── FIX 10: Resolve qualified id and try exact match first ──
+                        qid = qualify_symbol_name(
+                            sym.name, sym.parent_symbol, sym.file_path
+                        )
+                        # qid covers methods (Class.method); the bare-name fallback
+                        # covers module functions persisted under their bare name
+                        # (silent ingestion, file_path=None).
+                        doc = doc_map.get(qid) or doc_map.get(sym.name)
+                        if doc:
+                            sym.docstring = doc
                             self._f._symbol_index.update_docstring(
-                                sym.name, project_id, doc_map[sym.name]
+                                qid, project_id, doc
                             )
         except Exception as e:
             self._f._log_debug(f"Failed to load persisted docstrings: {e}")
@@ -6153,8 +6175,22 @@ class LongTermMemory:
                 {"code_symbols": {"$contains": f",{symbol},"}},
             ]
         }
+
+        # ── FIX 11: Expiration filter with OR for summaries ──
+        # Apply the same OR logic here so that summaries are not excluded.
         if self._f.valves.long_term_memory_expiration_days > 0:
-            where["$and"].append({"expires_at": {"$gt": now}})
+            where["$and"].append(
+                {
+                    "$or": [
+                        {"expires_at": {"$gt": now}},
+                        {"is_session_summary": {"$eq": True}},
+                        {"is_turn_summary": {"$eq": True}},
+                        {"is_raptor_summary": {"$eq": True}},
+                        {"is_hierarchical_summary": {"$eq": True}},
+                    ]
+                }
+            )
+
         q_emb = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode(cleaned_query[:1000]).tolist()
         )
@@ -6205,8 +6241,24 @@ class LongTermMemory:
         try:
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+
+            # ── FIX 11: Expiration filter with OR for summaries ──
+            # Summaries (session/turn/RAPTOR/hierarchical) are persisted without
+            # an expires_at field; a bare {"expires_at": {"$gt": now}} filter
+            # silently excludes them in ChromaDB. OR them back in so they remain
+            # retrievable.
             if self._f.valves.long_term_memory_expiration_days > 0:
-                where_filter["$and"].append({"expires_at": {"$gt": now}})
+                where_filter["$and"].append(
+                    {
+                        "$or": [
+                            {"expires_at": {"$gt": now}},
+                            {"is_session_summary": {"$eq": True}},
+                            {"is_turn_summary": {"$eq": True}},
+                            {"is_raptor_summary": {"$eq": True}},
+                            {"is_hierarchical_summary": {"$eq": True}},
+                        ]
+                    }
+                )
 
             query_variants = await self._expand_query_for_retrieval(
                 query, slot_free=slot_free
@@ -6340,7 +6392,7 @@ class LongTermMemory:
                 if len(entry) == 5:
                     doc, score, ts, meta_dict, _ = entry
                 elif len(entry) == 4:
-                    # Post-reranking format (edición 1): (doc, score, ts, meta_dict)
+                    # Post-reranking format: (doc, score, ts, meta_dict)
                     doc, score, ts, meta_dict = entry
                 elif len(entry) == 3:
                     doc, score, ts = entry
@@ -6381,8 +6433,21 @@ class LongTermMemory:
             )
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+
+            # ── FIX 11: Expiration filter with OR for summaries ──
+            # Same as in retrieve_memories_unified: include summaries explicitly.
             if self._f.valves.long_term_memory_expiration_days > 0:
-                where_filter["$and"].append({"expires_at": {"$gt": now}})
+                where_filter["$and"].append(
+                    {
+                        "$or": [
+                            {"expires_at": {"$gt": now}},
+                            {"is_session_summary": {"$eq": True}},
+                            {"is_turn_summary": {"$eq": True}},
+                            {"is_raptor_summary": {"$eq": True}},
+                            {"is_hierarchical_summary": {"$eq": True}},
+                        ]
+                    }
+                )
 
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
@@ -6489,8 +6554,9 @@ class LongTermMemory:
             ctx_symbols: List[str] = []
             for blk in extracted[:3]:
                 try:
+                    # ── FIX 9: Pass language as keyword argument ──
                     syms = await SignatureExtractor.extract_async(
-                        blk["code"], blk.get("language")
+                        blk["code"], language=blk.get("language")
                     )
                     for sym in syms:
                         if self._is_symbol_indexable(sym):
@@ -6531,8 +6597,9 @@ class LongTermMemory:
                 all_syms = set()
                 for blk in extracted:
                     try:
+                        # ── FIX 9: Pass language as keyword argument ──
                         syms = await SignatureExtractor.extract_async(
-                            blk["code"], blk.get("language")
+                            blk["code"], language=blk.get("language")
                         )
                         for sym in syms:
                             if self._is_symbol_indexable(sym):
@@ -6596,8 +6663,9 @@ class LongTermMemory:
         ctx_symbols: List[str] = []
         for blk in extracted[:3]:
             try:
+                # ── FIX 9: Pass language as keyword argument ──
                 syms = await SignatureExtractor.extract_async(
-                    blk["code"], blk.get("language")
+                    blk["code"], language=blk.get("language")
                 )
                 for sym in syms:
                     if self._is_symbol_indexable(sym):
@@ -6642,8 +6710,9 @@ class LongTermMemory:
             all_syms = set()
             for blk in extracted:
                 try:
+                    # ── FIX 9: Pass language as keyword argument ──
                     syms = await SignatureExtractor.extract_async(
-                        blk["code"], blk.get("language")
+                        blk["code"], language=blk.get("language")
                     )
                     for sym in syms:
                         if self._is_symbol_indexable(sym):
@@ -8586,8 +8655,17 @@ class CommandRouter:
         return ("symbol", token)
 
     async def _handle_expand_command(self, content: str, project_id: str) -> str:
-        """Process /expand [depth] <symbol|Class|Class.method>.
+        """
+        Process /expand [depth] <symbol|Class|Class.method>.
         Returns the expanded code or an error message.
+
+        Supports three target types:
+        - Class: expands all methods of the class, each extracted individually.
+        - Method: expands the method and its callees up to the specified depth.
+        - Symbol: falls back to method expansion (legacy bare-name support).
+
+        The class expansion now uses extract_symbol_body to show only the method
+        bodies, not the entire file content.
         """
         parts = content.strip().split()
         if len(parts) < 2:
@@ -8605,6 +8683,7 @@ class CommandRouter:
 
         target_type, target_name = self._resolve_expand_target(token, project_id)
 
+        # ── Branch 1: Class expansion ──────────────────────────────────────
         if target_type == "class":
             members = self._f._symbol_index.get_class_members(target_name, project_id)
             if not members:
@@ -8620,13 +8699,14 @@ class CommandRouter:
                     block = state["active_blocks"].get(bh)
                     if block and not block.obsolete:
                         lang = block.symbols[0].language if block.symbols else ""
-                        parts_out.append(
-                            f"### `{mname}`\n```{lang}\n{block.content}\n```\n"
-                        )
+                        # ── FIX 2d: Extract method body, not whole block ──
+                        body = CodeBlockManager.extract_symbol_body(block, mname)
+                        parts_out.append(f"### `{mname}`\n```{lang}\n{body}\n```\n")
             if len(parts_out) == 1:
                 return f"Class `{target_name}` found but no code blocks available."
             return "\n".join(parts_out)
 
+        # ── Branch 2: Method expansion (qualified id) ──────────────────────
         elif target_type == "method":
             expanded = await self._expand_symbol_dependencies(
                 target_name, depth, project_id
@@ -8635,6 +8715,7 @@ class CommandRouter:
                 return f"[Retrieved `{target_name}`]\n{expanded}"
             return f"Symbol `{target_name}` not found or has no code."
 
+        # ── Branch 3: Bare symbol expansion (fallback) ─────────────────────
         else:
             expanded = await self._expand_symbol_dependencies(
                 target_name, depth, project_id
@@ -8643,10 +8724,30 @@ class CommandRouter:
                 return f"[Retrieved `{target_name}`]\n{expanded}"
             return f"Symbol `{target_name}` not found or has no code."
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Expand command dependencies (recursive symbol expansion)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _expand_symbol_dependencies(
         self, name: str, max_depth: int, project_id: str
     ) -> str:
-        """Recursively expand a symbol and its callees up to max_depth."""
+        """
+        Recursively expand a symbol and its callees up to max_depth.
+
+        For each symbol found, this method extracts only the symbol's body
+        (not the whole file) using CodeBlockManager.extract_symbol_body,
+        ensuring that `/expand` returns the exact implementation of the
+        requested function or method.
+
+        Args:
+            name: The symbol name (qualified id or bare name) to expand.
+            max_depth: Maximum recursion depth for following callees.
+            project_id: The current project identifier.
+
+        Returns:
+            A formatted string containing the expanded code blocks for the
+            symbol and its callees, or an empty string if no blocks are found.
+        """
         state = self._f._state_store.get_state(project_id)
         if not state:
             return ""
@@ -8662,9 +8763,13 @@ class CommandRouter:
                 block = state["active_blocks"].get(h)
                 if block and not block.obsolete:
                     loc = f" (file: {block.file_path})" if block.file_path else ""
+                    # ── FIX 2c: Extract symbol body instead of whole block ──
+                    body = CodeBlockManager.extract_symbol_body(block, current_name)
                     lines.append(
-                        f"### `{current_name}` (depth {current_depth}){loc}\n```\n{block.content[:2000]}\n```"
+                        f"### `{current_name}` (depth {current_depth}){loc}\n"
+                        f"```\n{body}\n```"
                     )
+                    # Find the actual symbol in the block to follow its callees
                     for sym in block.symbols:
                         if (
                             sym.name == current_name
@@ -8687,9 +8792,22 @@ class CommandRouter:
         """
         Intercept /expand commands in the assistant's response and replace them
         with the actual expanded symbol code from the SymbolIndex.
-        Now supports `/expand Class`, `/expand Class.method`, and the legacy
-        `/expand symbol` forms.
-        Returns (modified_content, did_expand).
+
+        Supports:
+        - `/expand Class` → expands all methods of the class, each with its own body.
+        - `/expand Class.method` → expands the method and its callees up to depth.
+        - `/expand symbol` (legacy) → expands the symbol as a method.
+
+        When expanding a class, this method uses CodeBlockManager.extract_symbol_body
+        to show only the method bodies, not the entire file content.
+
+        Args:
+            assistant_content: The raw assistant response text.
+            project_id: Current project identifier.
+
+        Returns:
+            A tuple (modified_content, did_expand) indicating whether any
+            expansion was performed.
         """
         if not self._f.valves.outlet_expand_intercept_enabled:
             return assistant_content, False
@@ -8719,6 +8837,7 @@ class CommandRouter:
 
             target_type, target_name = self._resolve_expand_target(token, project_id)
 
+            # ── Class expansion: aggregate all methods ──────────────────────
             if target_type == "class":
                 members = self._f._symbol_index.get_class_members(
                     target_name, project_id
@@ -8735,14 +8854,15 @@ class CommandRouter:
                         block = state["active_blocks"].get(bh)
                         if block and not block.obsolete:
                             lang = block.symbols[0].language if block.symbols else ""
-                            buf.append(
-                                f"### `{mname}`\n```{lang}\n{block.content}\n```\n"
-                            )
+                            # ── FIX 2e: Extract method body, not whole block ──
+                            body = CodeBlockManager.extract_symbol_body(block, mname)
+                            buf.append(f"### `{mname}`\n```{lang}\n{body}\n```\n")
                 if len(buf) > 1:
                     replacement = "\n".join(buf)
                 else:
                     continue
 
+            # ── Method or symbol expansion: follow callees ──────────────────
             elif target_type in ("method", "symbol"):
                 expanded = await self._expand_symbol_dependencies(
                     target_name, depth, project_id
@@ -8751,10 +8871,11 @@ class CommandRouter:
                     continue
                 replacement = f"[Retrieved `{target_name}`]\n{expanded}"
 
+            # ── Apply replacement ───────────────────────────────────────────
             did_any = True
             replaced_content = replaced_content.replace(match.group(0), replacement, 1)
 
-            # Pin the block if it exists (only for method/symbol, not for class aggregates)
+            # ── Pin the block if it exists (only for method/symbol) ────────
             if target_type != "class":
                 lock = await self._f._state_store.get_project_lock(project_id)
                 async with lock:
@@ -10112,6 +10233,66 @@ class CodeBlockManager:
         language = block.symbols[0].language if block.symbols else ""
         header = f"#### Block {block.hash[:8]}{location}{latest_tag}"
         return f"{header}\n```{language}\n{block.content}\n```"
+
+    # ── Symbol body extraction (slice by line range) ────────────────────────
+
+    @staticmethod
+    def extract_symbol_body(
+        block: "CodeBlock", node_id: str, max_chars: int = 0
+    ) -> str:
+        """
+        Extract the source body of the symbol identified by `node_id` (qualified id)
+        from `block.content` using the symbol's line range.
+
+        Falls back to the whole block content when:
+        - The symbol cannot be located in `block.symbols`.
+        - The line range is missing or does not fit within the block's line count.
+        - The sliced result is empty (defensive).
+
+        The triple match on node_id tolerates the `qualify_symbol_name` file_path
+        inconsistency until that is unified (see Lote 2, fix 17). `max_chars` (>0)
+        caps the result to that many characters, appending a truncation notice.
+
+        Args:
+            block: The CodeBlock containing the symbol.
+            node_id: The qualified symbol id (e.g. "ClassName.method" or "module.func").
+            max_chars: Optional maximum character length of the returned body.
+                       If 0, no truncation is applied.
+
+        Returns:
+            The sliced source body of the symbol, or the whole block content
+            if slicing is not possible.
+        """
+        # ── 1. Locate the symbol in the block ──────────────────────────────
+        target = None
+        for sym in block.symbols:
+            # Match by qualified id (with and without file_path) and by bare name
+            if (
+                qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
+                == node_id
+                or qualify_symbol_name(sym.name, sym.parent_symbol) == node_id
+                or sym.name == node_id
+            ):
+                target = sym
+                break
+
+        # ── 2. Slice the block content by the symbol's line range ──────────
+        body = block.content
+        if target is not None and target.line_start and target.line_end:
+            lines = block.content.split("\n")
+            # Defensive: ensure line numbers are within the document bounds.
+            if 1 <= target.line_start <= len(lines) and target.line_end <= len(lines):
+                sliced = "\n".join(
+                    lines[target.line_start - 1 : target.line_end]
+                ).strip()
+                if sliced:
+                    body = sliced
+
+        # ── 3. Apply character limit if requested ──────────────────────────
+        if max_chars and len(body) > max_chars:
+            body = body[:max_chars] + "\n# ... [truncated]"
+
+        return body
 
     # ── Proposed changes & diffs ─────────────────────────────────────────
 
