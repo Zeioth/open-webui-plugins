@@ -1111,7 +1111,9 @@ class HubSymbolIndex:
                     f"(budget {max_tokens} tokens)"
                 )
 
-        logger.debug(f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens.")
+        logger.debug(
+            f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens."
+        )
 
         lines = [
             f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
@@ -1141,7 +1143,9 @@ class HubSymbolIndex:
             total_chars += len(line)
 
         if not truncated:
-            logger.debug(f"Full graph: successfully rendered all {len(all_qids)} symbols.")
+            logger.debug(
+                f"Full graph: successfully rendered all {len(all_qids)} symbols."
+            )
 
         return "\n".join(lines)
 
@@ -1160,9 +1164,9 @@ class HubSymbolIndex:
         caller list as precise for those symbols.
         """
         bare_name = qid.rsplit(".", 1)[-1]
-        is_ambiguous_name = len(
-            symbol_index.get_qualified_names_for(bare_name, project_id)
-        ) > 1
+        is_ambiguous_name = (
+            len(symbol_index.get_qualified_names_for(bare_name, project_id)) > 1
+        )
 
         callers = self._safe_callers(qid, project_id, symbol_index)
         callees = self._safe_callees(qid, project_id, symbol_index)
@@ -1389,6 +1393,21 @@ class ContextPager:
         self._f = filter_ref
         # project_id → set of block hashes currently paged out.
         self._paged_hashes: dict = {}
+        # Bounds concurrent background embedding tasks during page-out so a
+        # mass eviction can't spawn one embedder.encode per block at once.
+        # valves already exist at this point (Filter.__init__ sets self.valves
+        # before constructing the pager). Semaphore creation does not bind to
+        # an event loop until first use, so building it here is safe.
+        self._page_out_semaphore = asyncio.Semaphore(
+            max(
+                1,
+                getattr(
+                    filter_ref.valves,
+                    "block_paging_max_concurrent_embeddings",
+                    2,
+                ),
+            )
+        )
 
     def is_paged(self, block_hash: str, project_id: str) -> bool:
         """True if block_hash has been paged out to ChromaDB for this project."""
@@ -1524,22 +1543,29 @@ class ContextPager:
         embedder,
         chroma_collection,
     ) -> None:
-        """Background task for embedding and upserting a paged block."""
-        try:
-            embedding = await anyio.to_thread.run_sync(
-                lambda: embedder.encode(safe_text).tolist()
-            )
-            await anyio.to_thread.run_sync(
-                lambda: chroma_collection.upsert(
-                    ids=[entry_id],
-                    embeddings=[embedding],
-                    documents=[excerpt],
-                    metadatas=[metadata],
+        """Background task for embedding and upserting a paged block.
+
+        The embedding is serialized through _page_out_semaphore so a burst of
+        evictions can't run many encodes concurrently and spike embedder
+        memory. The block has already been removed from active_blocks by the
+        synchronous caller; this only affects how fast cold storage catches up.
+        """
+        async with self._page_out_semaphore:
+            try:
+                embedding = await anyio.to_thread.run_sync(
+                    lambda: embedder.encode(safe_text).tolist()
                 )
-            )
-        except Exception:
-            # Best effort; the block content is still in SQLite
-            pass
+                await anyio.to_thread.run_sync(
+                    lambda: chroma_collection.upsert(
+                        ids=[entry_id],
+                        embeddings=[embedding],
+                        documents=[excerpt],
+                        metadatas=[metadata],
+                    )
+                )
+            except Exception:
+                # Best effort; the block content is still in SQLite
+                pass
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Purge old versions (per-file version limit)
@@ -10496,7 +10522,7 @@ class ActivationEngine:
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
 
-        # Presupuesto dinámico (Fix 4 con guard contra negativo)
+        # Dynamic budget (Fix 4 with guard against negative)
         effective_budget = max(
             4000,
             self._f.valves.context_window_tokens
@@ -10508,24 +10534,27 @@ class ActivationEngine:
             effective_budget,
         )
 
-        # Truncado convergente con detección de fences línea a línea (Fix 3)
+        # Convergent truncation with line-by-line fence detection.
+        # Perf: token counts are computed ONCE per part and maintained
+        # incrementally. The previous implementation re-encoded every part
+        # inside the inner loop AND re-encoded the full joined text at the
+        # bottom of every while-iteration — O(passes × total_text) tokenizer
+        # work, a real CPU spike on the request hot path for large contexts.
+        # The running total is the sum of per-part encodes (exactly the metric
+        # the old inner loop already used to pick the largest part), so the
+        # truncation decision is unchanged; only the redundant encoding is gone.
         if max_tokens > 0 and self._f.tokenizer:
-            full_text = "\n".join(parts)
-            current_tokens = len(self._f.tokenizer.encode(full_text))
+            part_tokens = [len(self._f.tokenizer.encode(p)) for p in parts]
+            current_tokens = sum(part_tokens)
             truncation_done = False
 
             while current_tokens > max_tokens and len(parts) > 2:
                 excess = current_tokens - max_tokens
 
-                largest_idx = -1
-                largest_tok = 0
-                for i, part in enumerate(parts):
-                    part_tok = len(self._f.tokenizer.encode(part))
-                    if part_tok > largest_tok:
-                        largest_tok = part_tok
-                        largest_idx = i
+                largest_idx = max(range(len(parts)), key=lambda i: part_tokens[i])
+                largest_tok = part_tokens[largest_idx]
 
-                if largest_idx >= 0 and largest_tok >= excess + 100:
+                if largest_tok >= excess + 100:
                     target = max(100, largest_tok - excess - 50)
                     truncated_text = self._f._tokens.truncate_text_to_tokens(
                         parts[largest_idx], target
@@ -10533,12 +10562,15 @@ class ActivationEngine:
                     if self._has_open_fence(truncated_text):
                         truncated_text += "\n```"
                     parts[largest_idx] = truncated_text + "\n[...truncado...]"
+                    part_tokens[largest_idx] = len(
+                        self._f.tokenizer.encode(parts[largest_idx])
+                    )
+                    current_tokens = sum(part_tokens)
                     truncation_done = True
                 else:
                     parts.pop()
-
-                full_text = "\n".join(parts)
-                current_tokens = len(self._f.tokenizer.encode(full_text))
+                    part_tokens.pop()
+                    current_tokens = sum(part_tokens)
 
             if not truncation_done and current_tokens > max_tokens:
                 parts.append(f"[Context truncated to fit token limit ({max_tokens})]")
@@ -12479,12 +12511,22 @@ class EnrichmentTasks:
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
+        # Build a qid → (sym, block) index ONCE instead of scanning every
+        # block/symbol on each _find_symbol call. _find_symbol is called
+        # several times per qid (cache check, snippet build, result apply),
+        # so the old per-call O(active symbols) scan was effectively quadratic
+        # per turn. First-match-wins ordering is preserved. Snapshot is taken
+        # at entry — see Bug 3 snapshot note (no new race vs. the lock-free
+        # original).
+        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+        for _block in state["active_blocks"].values():
+            for _sym in _block.symbols:
+                _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
+                if _q not in _qid_index:
+                    _qid_index[_q] = (_sym, _block)
+
         def _find_symbol(qid: str):
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if qualify_symbol_name(sym.name, sym.parent_symbol) == qid:
-                        return sym, block
-            return None, None
+            return _qid_index.get(qid, (None, None))
 
         for qid in qids:
             sym, _ = _find_symbol(qid)
@@ -12594,13 +12636,20 @@ class EnrichmentTasks:
         state = self._f._state_store.get_state(project_id)
         resolved: Dict[str, str] = {}
 
+        # Build a qid → (sym, block) index ONCE instead of re-scanning every
+        # block/symbol per lookup (same quadratic-per-turn issue as
+        # ensure_docstrings_batch). First-match-wins ordering preserved;
+        # snapshot semantics per Bug 3 note.
+        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+        for _block in state["active_blocks"].values():
+            for _sym in _block.symbols:
+                _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
+                if _q not in _qid_index:
+                    _qid_index[_q] = (_sym, _block)
+
         def _find_symbol_and_block(qid: str):
-            """Locate the CodeSymbol and its block by qualified id."""
-            for block in state["active_blocks"].values():
-                for sym in block.symbols:
-                    if qualify_symbol_name(sym.name, sym.parent_symbol) == qid:
-                        return sym, block
-            return None, None
+            """Locate the CodeSymbol and its block by qualified id (dict lookup)."""
+            return _qid_index.get(qid, (None, None))
 
         for qid in qids:
             sym, block = _find_symbol_and_block(qid)
@@ -16237,6 +16286,19 @@ class Filter:
             ge=0.01,
             le=0.5,
             description="PPR activation score below which a block becomes a paging candidate.",
+        )
+        block_paging_max_concurrent_embeddings: int = Field(
+            default=2,
+            ge=1,
+            le=16,
+            description=(
+                "Max concurrent background embedding tasks during block page-out. "
+                "Mass eviction (e.g. a large paste overflowing max_active_blocks) "
+                "would otherwise spawn one embedder.encode per evicted block at "
+                "once — an unbounded RAM/VRAM spike on the embedder. The block is "
+                "removed from active_blocks immediately regardless; only the "
+                "background embedding is rate-limited."
+            ),
         )
         # ── Purge old versions ──────────────────────────────────────
         purge_old_code_versions_enabled: bool = Field(
