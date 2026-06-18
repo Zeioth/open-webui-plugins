@@ -274,6 +274,18 @@ def qualify_symbol_name(
     return name
 
 
+def qualify_symbol(sym: "CodeSymbol") -> str:
+    """
+    Convenience wrapper: qualify a CodeSymbol using ALL the identity
+    fields the indexing side already uses (name, parent_symbol, file_path).
+    Prefer this over calling qualify_symbol_name(sym.name, sym.parent_symbol)
+    directly — the two-arg form silently drops file_path, which only matters
+    for module-level functions with a detected file path, but is exactly the
+    inconsistency that caused them to go unmatched in several lookups.
+    """
+    return qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
+
+
 def _get_cross_encoder(
     model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
 ) -> Optional[Any]:
@@ -604,6 +616,16 @@ class ActivationGraph:
         return {
             nid: s.score for nid, s in self._activations.items() if s.score >= threshold
         }
+
+    def get_seed_nodes(self) -> List[str]:
+        """
+        Return node_ids that were seeded directly (source == 'seed'), as
+        opposed to nodes that only received score via PPR propagation. Used
+        by the case-D (refactor) caller pull-in: only the literal seeds —
+        the symbols the user is actually asking about — should gain forced
+        caller visibility, not every propagated neighbor.
+        """
+        return [nid for nid, s in self._activations.items() if s.source == "seed"]
 
     def aggregate_path_score(self, symbol_list: List[str]) -> float:
         """Mean activation score of a list of symbols (ignoring inactive ones)."""
@@ -1105,10 +1127,11 @@ class HubSymbolIndex:
         if budget_chars is not None:
             max_renderable_lines = max(10, budget_chars // 80)
             if len(all_qids) > max_renderable_lines:
+                original_count = len(all_qids)
                 all_qids = all_qids[:max_renderable_lines]
                 logger.debug(
-                    f"Full graph: capped candidate list from {len(all_qids)} to {max_renderable_lines} "
-                    f"(budget {max_tokens} tokens)"
+                    f"Full graph: capped candidate list from {original_count} to "
+                    f"{max_renderable_lines} (budget {max_tokens} tokens)"
                 )
 
         logger.debug(
@@ -1441,6 +1464,17 @@ class ContextPager:
         of its symbols' scores — any hot symbol keeps the whole block in RAM:
             block_activation = max(scores.get(s.name, 0.0)
                                    for s in block.symbols) or 0.0
+
+        Args:
+            state: The current conversation state.
+            project_id: Current project identifier.
+            activation_scores: Dict mapping qualified symbol ids to activation scores.
+            paging_threshold: Active block count above which paging starts.
+            min_activation: Minimum activation score to keep a block in RAM.
+
+        Returns:
+            A list of block hashes eligible for page-out, sorted by
+            (activation, importance) ascending (coldest first).
         """
         active = state.get("active_blocks", {})
         if len(active) <= paging_threshold:
@@ -1451,11 +1485,10 @@ class ContextPager:
             if block.pinned or block.obsolete:
                 continue
             if block.symbols:
+                # ── FIX 17.c: Use qualify_symbol to include file_path ──
                 block_activation = max(
                     (
-                        activation_scores.get(
-                            qualify_symbol_name(s.name, s.parent_symbol), 0.0
-                        )
+                        activation_scores.get(qualify_symbol(s), 0.0)
                         for s in block.symbols
                     ),
                     default=0.0,
@@ -2669,6 +2702,33 @@ class ContextBuilder:
         )
         return tier
 
+    def _is_skeleton_tier_active(self, project_id: str) -> bool:
+        """
+        True only if the skeleton tier was actually rendered into Block A
+        THIS turn for the current signature hash — not just enabled with
+        symbols present. _build_skeleton_tier caches ("") under the current
+        hash when it skips rendering due to skeleton_tier_max_tokens; without
+        this check, suppress_sigs below would hide Block B's inline
+        signatures even though Block A ended up with none.
+
+        Args:
+            project_id: Current project identifier.
+
+        Returns:
+            True if the skeleton tier is active and contains content for the
+            current signature hash, False otherwise.
+        """
+        if not self._f.valves.enable_skeleton_tier:
+            return False
+        if self._f.valves.skeleton_include_docstrings:
+            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
+        else:
+            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+        if not sig_hash:
+            return False
+        cached = self._skeleton_tier_cache.get(project_id)
+        return bool(cached and cached[0] == sig_hash and cached[1])
+
     def _make_docstring_provider(self, project_id: str):
         """Return f(symbol_name, parent_class='') -> one-line docstring or ''.
         Backed by the index (covers both source-extracted and LLM-generated
@@ -2896,6 +2956,68 @@ class ContextBuilder:
         self._f._log_debug(f"  resolved mode: hubs_only (use_case {use_case} default)")
         return "hubs_only"
 
+    def prepare_call_graph_mode(
+        self, project_id: str, query: str, intent_vector: dict
+    ) -> str:
+        """
+        Resolve and apply the call-graph mode for this turn BEFORE Block A is
+        built, so an upgrade (e.g. hubs_only -> full_graph for an architecture
+        query) is visible in the very turn that triggered it instead of
+        lagging one turn behind. This used to live inline at the top of
+        build_block_b, which runs after Block A had already been rendered.
+
+        build_block_b no longer re-resolves the mode itself; it just reads
+        self._f._last_resolved_graph_mode (falling back to calling this
+        method only as a defensive no-op if somehow not yet resolved this
+        turn — see its call site).
+
+        Args:
+            project_id: Current project identifier.
+            query: The user's query text.
+            intent_vector: Pre-classified intent vector (explain/modify/debug/refactor).
+
+        Returns:
+            The resolved mode string: "hubs_only", "expanded_hubs", or "full_graph".
+        """
+        raw_resolved_mode = self._resolve_call_graph_mode(
+            query, intent_vector, project_id
+        )
+        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
+        previous_mode = self._f._last_resolved_graph_mode.get(project_id)
+
+        if previous_mode is None or _MODE_RANK.get(
+            raw_resolved_mode, 0
+        ) >= _MODE_RANK.get(previous_mode, 0):
+            # First resolution ever, or an upgrade/stay-equal: apply immediately.
+            resolved_graph_mode = raw_resolved_mode
+            self._f._graph_mode_downgrade_streak[project_id] = 0
+        else:
+            # Candidate downgrade: only commit after enough consecutive turns.
+            streak = self._f._graph_mode_downgrade_streak.get(project_id, 0) + 1
+            self._f._graph_mode_downgrade_streak[project_id] = streak
+            if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
+                resolved_graph_mode = raw_resolved_mode
+                self._f._graph_mode_downgrade_streak[project_id] = 0
+            else:
+                resolved_graph_mode = previous_mode
+                self._f._log_debug(
+                    f"Call graph mode: downgrade to {raw_resolved_mode} deferred "
+                    f"({streak}/{self._f.valves.call_graph_mode_downgrade_after_turns} "
+                    f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
+                )
+
+        if previous_mode != resolved_graph_mode:
+            self._f._log_debug(
+                f"Call graph mode: {previous_mode or '(none)'} → "
+                f"{resolved_graph_mode} (resolved before Block A build this turn)"
+            )
+            self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
+            # No explicit Block A cache pop needed: build_block_a's cache key
+            # now includes the mode directly (see 4.c), so a mode change
+            # misses the cache on its own.
+
+        return resolved_graph_mode
+
     async def build_block_b(
         self,
         project_id: str,
@@ -2965,71 +3087,62 @@ class ContextBuilder:
         lod2 = self._f.valves.lod2_threshold
         lod1 = self._f.valves.lod1_threshold
 
-        if debug_weight + modify_weight > 0.6:
-            scale = 0.7
-        elif refactor_weight > 0.4:
-            scale = 0.0
-        else:
-            scale = 1.0
-
-        lod3 *= scale
-        lod2 *= scale
-        lod1 *= scale
-
         # ── Cambio A: Move classify_use_case here (was near the end) ──
-        active_use_case, _ = self.classify_use_case(query, intent_vector)
+        active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
 
-        # ── Resolve call-graph depth for Block A (KV-cache-aware) ──
-        # The mode is decided here (Block B has the query + intent), but the
-        # graph itself is rendered into Block A. A change of resolved mode
-        # invalidates Block A exactly like any other content change; a stable
-        # mode across turns leaves Block A a normal cache hit.
-        #
-        # Hysteresis: in "auto", a single off-topic turn (e.g. a bugfix
-        # question in the middle of an architecture discussion) should not
-        # immediately collapse Block A back to hubs_only and force another
-        # full prefill on the very next architecture follow-up. Upgrades
-        # (more graph detail requested) apply immediately — under-serving
-        # context is worse than an extra cache miss. Downgrades only apply
-        # after call_graph_mode_downgrade_after_turns consecutive turns that
-        # would resolve to a lower level.
-        raw_resolved_mode = self._resolve_call_graph_mode(
-            query, intent_vector, project_id
-        )
-        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
-        previous_mode = self._f._last_resolved_graph_mode.get(project_id)
-
-        if previous_mode is None or _MODE_RANK.get(
-            raw_resolved_mode, 0
-        ) >= _MODE_RANK.get(previous_mode, 0):
-            # First resolution ever, or an upgrade/stay-equal: apply immediately.
-            resolved_graph_mode = raw_resolved_mode
-            self._f._graph_mode_downgrade_streak[project_id] = 0
+        if self._f.valves.enable_lod_by_intent:
+            # Per-use-case LOD profile (previously computed and discarded —
+            # use_case_profile never reached this point, LOD_PROFILES was
+            # dead code). Multipliers > 1.0 raise the bar (less LOD-3 detail,
+            # e.g. case E scaffolding); < 1.0 lowers it.
+            lod1 *= use_case_profile.get("lod1_mult", 1.0)
+            lod2 *= use_case_profile.get("lod2_mult", 1.0)
+            lod3 *= use_case_profile.get("lod3_mult", 1.0)
         else:
-            # Candidate downgrade: only commit after enough consecutive turns.
-            streak = self._f._graph_mode_downgrade_streak.get(project_id, 0) + 1
-            self._f._graph_mode_downgrade_streak[project_id] = streak
-            if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
-                resolved_graph_mode = raw_resolved_mode
-                self._f._graph_mode_downgrade_streak[project_id] = 0
+            # Legacy flat scaling (pre-fix behavior), kept as an off-switch.
+            if debug_weight + modify_weight > 0.6:
+                scale = 0.7
+            elif refactor_weight > 0.4:
+                scale = 0.0
             else:
-                resolved_graph_mode = previous_mode
+                scale = 1.0
+            lod3 *= scale
+            lod2 *= scale
+            lod1 *= scale
+
+        # ── Case D (refactor): pull in direct callers of the seed symbols ──
+        if (
+            self._f.valves.enable_lod_by_intent
+            and active_use_case == "D"
+            and self._f.valves.lod_intent_refactor_callers_max != 0
+        ):
+            max_callers = self._f.valves.lod_intent_refactor_callers_max
+            pulled = 0
+            for seed_qid in ag.get_seed_nodes():
+                meta = self._f._symbol_index.get_symbol_meta(seed_qid, project_id) or {}
+                bare = meta.get("name", seed_qid.rsplit(".", 1)[-1])
+                for edge in self._f._symbol_index.get_edges_in(bare, project_id):
+                    if max_callers > 0 and pulled >= max_callers:
+                        break
+                    caller_qid = edge.src
+                    if activated.get(caller_qid, 0.0) < lod1:
+                        activated[caller_qid] = max(
+                            activated.get(caller_qid, 0.0), lod1
+                        )
+                        pulled += 1
+                if max_callers > 0 and pulled >= max_callers:
+                    break
+            if pulled:
                 self._f._log_debug(
-                    f"Call graph mode: downgrade to {raw_resolved_mode} deferred "
-                    f"({streak}/{self._f.valves.call_graph_mode_downgrade_after_turns} "
-                    f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
+                    f"Case D: pulled {pulled} direct caller(s) of seed symbol(s) "
+                    f"into Block B at LOD-1 (impact analysis)."
                 )
 
-        if previous_mode != resolved_graph_mode:
-            self._f._log_debug(
-                f"Call graph mode: {previous_mode or '(none)'} → "
-                f"{resolved_graph_mode} (triggers Block A rebuild, no centrality recompute)"
-            )
-            self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
-            self.invalidate_block_a_cache(
-                project_id,
-                f"call_graph_context_mode resolved to {resolved_graph_mode}",
-                recompute_centrality=False,
+        # ── Mode is resolved BEFORE Block A is built this turn ────────────
+        resolved_graph_mode = self._f._last_resolved_graph_mode.get(project_id)
+        if resolved_graph_mode is None:
+            resolved_graph_mode = self.prepare_call_graph_mode(
+                project_id, query, intent_vector
             )
 
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
@@ -3125,6 +3238,7 @@ class ContextBuilder:
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
+        # ── Iterate over activated nodes and build LOD tiers ──────────────
         for node_id, score in sorted_nodes:
             if total_tokens >= budget:
                 break
@@ -3153,13 +3267,14 @@ class ContextBuilder:
                 if not block or block.obsolete:
                     continue
 
+                # ── LOD-1: Signatures only ──────────────────────────────────
                 if score < lod2:
+                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
                     sig = next(
                         (
                             sym.signature
                             for sym in block.symbols
-                            if qualify_symbol_name(sym.name, sym.parent_symbol)
-                            == node_id
+                            if qualify_symbol(sym) == node_id
                         ),
                         node_id,
                     )
@@ -3171,13 +3286,14 @@ class ContextBuilder:
                     total_tokens += tok
                     injected_blocks.add(bh)
 
+                # ── LOD-2: Signatures + docstrings ──────────────────────────
                 elif score < lod3:
+                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
                     sig = next(
                         (
                             sym.signature
                             for sym in block.symbols
-                            if qualify_symbol_name(sym.name, sym.parent_symbol)
-                            == node_id
+                            if qualify_symbol(sym) == node_id
                         ),
                         node_id,
                     )
@@ -3185,9 +3301,7 @@ class ContextBuilder:
                         (
                             sym.docstring
                             for sym in block.symbols
-                            if qualify_symbol_name(sym.name, sym.parent_symbol)
-                            == node_id
-                            and sym.docstring
+                            if qualify_symbol(sym) == node_id and sym.docstring
                         ),
                         "",
                     )
@@ -3220,6 +3334,7 @@ class ContextBuilder:
                     total_tokens += tok
                     injected_blocks.add(bh)
 
+                # ── LOD-3: Full code body ──────────────────────────────────
                 else:
                     # ── FIX 2: Extract only the symbol body, not the whole block ──
                     content_to_inject = CodeBlockManager.extract_symbol_body(
@@ -3298,18 +3413,13 @@ class ContextBuilder:
                 )
                 _lod2_parts.insert(0, raptor_section)
 
-        # Determine active use case for skeleton tier suppression logic
-        # (Cambio A: this line is now unused because active_use_case was
-        # already defined above, so we remove the duplicate assignment)
-        # active_use_case, _ = self.classify_use_case(query, intent_vector)  # ← ELIMINADA
-
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
         suppress_sigs = (
-            self._f.valves.enable_skeleton_tier
-            and self._f.valves.skeleton_tier_suppresses_block_b_signatures
+            self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
-            and bool(self._f._symbol_index.compute_signature_hash(project_id))
+            and self._is_skeleton_tier_active(project_id)
         )
+
         ordered = []
         ordered.append("## Code Context (activation-based LOD)\n")
         if _lod0_parts and not suppress_sigs:
@@ -4208,24 +4318,40 @@ class SignatureExtractor:
         thread-safe by default and this method is called from worker threads
         via ``run_in_executor``.
 
+        The lock now also guards parser.parse() itself, not just the cache
+        lookup/creation. tree-sitter Parser instances are not guaranteed
+        thread-safe for concurrent parse() calls on the SAME shared
+        instance — and this method is reachable from more than one thread
+        at once (e.g. an outlet background LTM store task overlapping
+        with the next inlet's own parsing, both via run_in_executor).
+        Parsing itself is fast, so serializing it here is cheap insurance
+        against a corrupted tree or worse.
+
         Returns the root ``tree_sitter.Node`` of the concrete syntax tree.
         """
         from tree_sitter import Parser as TSParser
 
+        # The lock now also guards parser.parse() itself, not just the cache
+        # lookup/creation. tree-sitter Parser instances are not guaranteed
+        # thread-safe for concurrent parse() calls on the SAME shared
+        # instance — and this method is reachable from more than one thread
+        # at once (e.g. an outlet background LTM store task overlapping
+        # with the next inlet's own parsing, both via run_in_executor).
+        # Parsing itself is fast, so serializing it here is cheap insurance
+        # against a corrupted tree or worse.
         with SignatureExtractor._parser_cache_lock:
             parser = SignatureExtractor._parser_cache.get(lang)
-        if parser is None:
-            lang_obj = get_language(lang)
-            # tree-sitter >= 0.21 removed set_language(); the language is now
-            # passed directly to the Parser constructor.
-            try:
-                parser = TSParser(lang_obj)
-            except TypeError:
-                parser = TSParser()
-                parser.set_language(lang_obj)
-            with SignatureExtractor._parser_cache_lock:
+            if parser is None:
+                lang_obj = get_language(lang)
+                # tree-sitter >= 0.21 removed set_language(); the language is now
+                # passed directly to the Parser constructor.
+                try:
+                    parser = TSParser(lang_obj)
+                except TypeError:
+                    parser = TSParser()
+                    parser.set_language(lang_obj)
                 SignatureExtractor._parser_cache[lang] = parser
-        return parser.parse(code_bytes)
+            return parser.parse(code_bytes)
 
     @staticmethod
     def enrich_symbols_with_parent_info(
@@ -5139,6 +5265,7 @@ class StateStore:
         self._f._conversation_state[project_id] = state
         self._f._conversation_state.move_to_end(project_id)
 
+        # LRU eviction: keep only max_cached_projects
         while len(self._f._conversation_state) > self._f.valves.max_cached_projects:
             oldest_pid = next(iter(self._f._conversation_state))
             oldest_state = self._f._conversation_state[oldest_pid]
@@ -5157,6 +5284,13 @@ class StateStore:
             self._f._last_processed_message_idx.pop(oldest_pid, None)
             self._f._response_cache_count.pop(oldest_pid, None)
             self._f._summarize_inactive_in_progress.pop(oldest_pid, None)
+            self._f._cached_code_state_hash.pop(oldest_pid, None)
+            # ── FIX 20: Clean ContextBuilder caches and token trackers ──
+            self._f._ctx_builder._block_a_cache.pop(oldest_pid, None)
+            self._f._ctx_builder._skeleton_tier_cache.pop(oldest_pid, None)
+            self._f._ctx_builder._skeleton_cache.pop(oldest_pid, None)
+            self._f._last_system_tokens.pop(oldest_pid, None)
+            self._f._last_total_context_tokens.pop(oldest_pid, None)
             getattr(self._f, "_last_activation_scores", {}).pop(oldest_pid, None)
             getattr(self._f, "_last_lod_levels", {}).pop(oldest_pid, None)
 
@@ -5225,7 +5359,6 @@ class StateStore:
             "feedback_history": [fb.dict() for fb in state["feedback_history"]],
             "message_count": state["message_count"],
             "last_compression_timestamp": state.get("last_compression_timestamp", 0),
-            "response_cache": state.get("response_cache", []),
             "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
             "last_cleanup_suggestion_msg_idx": state.get(
                 "last_cleanup_suggestion_msg_idx", 0
@@ -5375,13 +5508,10 @@ class StateStore:
             "feedback_history",
             "last_compression_timestamp",
             "last_suggestion_timestamp",
-            "response_cache",
             "has_any_calls",
             "last_cot_level",
         ]:
-            data.setdefault(
-                key, [] if key in ("feedback_history", "response_cache") else 0
-            )
+            data.setdefault(key, [] if key == "feedback_history" else 0)
         data.setdefault("last_cleanup_suggestion_msg_idx", 0)
 
         # Detection of corruption in active_blocks
@@ -5464,7 +5594,6 @@ class StateStore:
             "feedback_history": feedback,
             "message_count": data.get("message_count", 0),
             "last_compression_timestamp": data.get("last_compression_timestamp", 0),
-            "response_cache": data.get("response_cache", []),
             "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
             "has_any_calls": data.get("has_any_calls", False),
             "last_cleanup_suggestion_msg_idx": data.get(
@@ -5511,9 +5640,7 @@ class StateStore:
                         doc = doc_map.get(qid) or doc_map.get(sym.name)
                         if doc:
                             sym.docstring = doc
-                            self._f._symbol_index.update_docstring(
-                                qid, project_id, doc
-                            )
+                            self._f._symbol_index.update_docstring(qid, project_id, doc)
         except Exception as e:
             self._f._log_debug(f"Failed to load persisted docstrings: {e}")
 
@@ -7104,6 +7231,16 @@ class LLMOrchestrator:
         """
         Unload models only if switching to a *different* auxiliary model.
         The main model (self._f.valves.llm_model) is NEVER unloaded to preserve its KV cache.
+
+        The whole read-decide-unload-write sequence now runs under
+        self._f._model_lock (a separate, cheap lock — NOT the inference
+        semaphore, so this doesn't hold up the single inference slot any
+        longer than before). Previously only the initial read and the final
+        write were individually locked, leaving a window where two
+        concurrent auxiliary-model calls could both decide based on the
+        same stale snapshot. Dormant in this stack today: every aux-model
+        valve points at the same model as llm_model, so the early-return
+        branch always fires before unload logic is reached.
         """
         if is_ollama:
             return
@@ -7113,42 +7250,41 @@ class LLMOrchestrator:
         async with self._f._model_lock:
             current_model = self._f._last_used_model
 
-        if model_name == main_model:
-            if current_model is None:
+            if model_name == main_model:
+                if current_model is None:
+                    self._f._log_debug(
+                        f"Loading main model '{model_name}' for the first time"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"Keeping main model '{model_name}' loaded (no unload)"
+                    )
+                return
+
+            if current_model == main_model:
                 self._f._log_debug(
-                    f"Loading main model '{model_name}' for the first time"
+                    f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
+                )
+                return
+
+            if current_model is not None and model_name != current_model:
+                self._f._log_debug(
+                    f"Switching auxiliary model from '{current_model}' to '{model_name}'"
+                )
+                try:
+                    await _shared_unload_all_models(base_url)
+                    self._f._log_debug("Auxiliary model unloaded before switching")
+                    self._f._last_used_model = None
+                except Exception as e:
+                    self._f._log_debug(f"Unload via shared_resources failed: {e}")
+            elif current_model is None:
+                self._f._log_debug(
+                    f"Loading auxiliary model '{model_name}' (no model was loaded)"
                 )
             else:
                 self._f._log_debug(
-                    f"Keeping main model '{model_name}' loaded (no unload)"
+                    f"Reusing auxiliary model '{model_name}' (already loaded)"
                 )
-            return
-
-        if current_model == main_model:
-            self._f._log_debug(
-                f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
-            )
-            return
-
-        if current_model is not None and model_name != current_model:
-            self._f._log_debug(
-                f"Switching auxiliary model from '{current_model}' to '{model_name}'"
-            )
-            try:
-                await _shared_unload_all_models(base_url)
-                self._f._log_debug("Auxiliary model unloaded before switching")
-                async with self._f._model_lock:
-                    self._f._last_used_model = None
-            except Exception as e:
-                self._f._log_debug(f"Unload via shared_resources failed: {e}")
-        elif current_model is None:
-            self._f._log_debug(
-                f"Loading auxiliary model '{model_name}' (no model was loaded)"
-            )
-        else:
-            self._f._log_debug(
-                f"Reusing auxiliary model '{model_name}' (already loaded)"
-            )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. CrossEncoder helper (keep full code decision)
@@ -9619,56 +9755,101 @@ class CommandRouter:
 
 
 class CodeBlockManager:
-    """Extracts code blocks from messages, classifies their content type,
-    deduplicates near‑identical code, and applies unified diffs.
+    """
+    Extract, classify, and manage code blocks throughout the conversation lifecycle.
 
-    Provides:
-    * ``extract_code_blocks(content)`` — returns fenced/indented code blocks
-      with language detection and optional tree‑sitter processing.
-    * ``classify_content(content, blocks)`` — labels a message as base code,
-      proposed change, error, tool call, or general text.
-    * ``remove_duplicate_blocks(state, project_id)`` — evicts duplicate or
-      near‑duplicate code blocks using AST similarity and content‑hash
-      deduplication.
-    * ``apply_change_with_diff(base, proposed)`` — applies a unified diff
-      onto a base block, re‑extracting symbols afterward.
-    * ``extract_file_paths(content)`` — returns all file paths matching the
-      configured pattern.
-    * ``format_block_context(block, is_latest)`` — renders a single active
-      CodeBlock for injection into the system prompt.
-    * ``has_conflicting_proposed_changes(state, new_block)`` — detects
-      whether a new proposed change conflicts with an existing one.
+    This class handles the full pipeline for code blocks:
+    - Extraction from user/assistant messages (fenced or indented)
+    - Language detection via tree-sitter with heuristics
+    - Classification by content type (base code, diffs, errors, etc.)
+    - Deduplication using AST similarity (Python) or fuzzy matching
+    - Symbol body extraction via line-range slicing
+    - Unified diff application onto existing blocks
+    - Data-flow edge extraction for the call graph
+
+    All methods are designed to be deterministic and avoid LLM calls unless
+    explicitly noted. Caching is used where parsing is expensive.
+
+    Attributes:
+        _code_spans_cache: Cache of tree-sitter byte spans by content hash.
+        _ast_signature_cache: Cache of AST signatures (dump + node-type Counter)
+            by content hash for deduplication.
+        _f: Reference to the parent Filter, for valves and shared state.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the CodeBlockManager with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+        # Memoizes (stripped-AST dump, node-type Counter) by content hash
+        self._ast_signature_cache: "OrderedDict[str, Tuple[str, Counter]]" = (
+            OrderedDict()
+        )
         self._f = filter_ref
 
-    # ── Block extraction ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Block extraction
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def get_code_spans(self, content: str) -> List[Tuple[int, int]]:
-        """Return tree‑sitter code spans for the given content (cached)."""
+        """
+        Return tree-sitter code spans for the given content, with caching.
+
+        Uses tree-sitter to identify code regions in the text. Results are cached
+        by MD5 hash of the content to avoid re-parsing the same text repeatedly.
+
+        Args:
+            content: The raw text to scan for code spans.
+
+        Returns:
+            A list of (start_byte, end_byte) tuples identifying code regions.
+            Returns an empty list if tree-sitter is unavailable or parsing fails.
+        """
+        # ── 1. Early exit: tree-sitter unavailable ─────────────────────────
         if not HAS_TREE_SITTER:
             return []
+
+        # ── 2. Check cache ───────────────────────────────────────────────────
         cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
         if cache_key in self._code_spans_cache:
             return self._code_spans_cache[cache_key]
+
+        # ── 3. Parse with tree-sitter ──────────────────────────────────────
         try:
             config = ProcessConfig()
             blocks = process(content, config)
             spans = [(b.start_byte, b.end_byte) for b in blocks]
         except Exception:
             spans = []
+
+        # ── 4. Store in cache with LRU eviction ─────────────────────────────
         if len(self._code_spans_cache) >= 200:
             keys_to_evict = list(self._code_spans_cache.keys())[:50]
             for key in keys_to_evict:
                 del self._code_spans_cache[key]
         self._code_spans_cache[cache_key] = spans
+
         return spans
 
     @staticmethod
     def remove_code_spans(content: str, spans: List[Tuple[int, int]]) -> str:
-        """Replace code regions with spaces."""
+        """
+        Replace code regions with spaces, preserving line lengths.
+
+        This blanking approach ensures that the surrounding text keeps its
+        character positions, which is useful for line-number sensitive operations.
+
+        Args:
+            content: The original text containing code.
+            spans: A list of (start_byte, end_byte) tuples identifying code regions.
+
+        Returns:
+            The text with code regions replaced by spaces.
+        """
         chars = list(content)
         for start, end in spans:
             for i in range(start, min(end, len(chars))):
@@ -9678,28 +9859,39 @@ class CodeBlockManager:
     async def _extract_full_document_symbols(
         self, content: str, file_path: Optional[str]
     ) -> Tuple[List["CodeSymbol"], str]:
-        """Parse the ENTIRE content once with tree-sitter so nested class
-        context is never lost, regardless of how the content is later
-        chunked for CodeBlock storage.
-
-        Mirrors what Silent Ingestion already does for the single-mega-block
-        case, but generalized for reuse by both ingestion paths.
-
-        Returns (symbols, detected_language).  *symbols* is empty when the
-        language cannot be detected or tree-sitter fails.
         """
+        Parse the entire document once to preserve nested class context.
+
+        This is the key method that enables parent_symbol resolution. Unlike
+        chunked parsing, this parses the whole document so that methods know
+        which class they belong to, even when later split into separate blocks.
+
+        Args:
+            content: The full document source code.
+            file_path: Optional file path for language detection.
+
+        Returns:
+            A tuple of (symbols_list, detected_language). symbols_list may be
+            empty if language detection fails or tree-sitter is unavailable.
+        """
+        # ── 1. Detect language ──────────────────────────────────────────────
         lang = getattr(
             self._f, "_ingested_lang", None
         ) or SignatureExtractor._guess_language(file_path, content)
         if lang == "unknown":
             return [], lang
+
+        # ── 2. Extract symbols ──────────────────────────────────────────────
         symbols = await SignatureExtractor.extract_async(
             content, file_path, language=lang
         )
+
+        # ── 3. Enrich with parent symbol info ──────────────────────────────
         if symbols:
             symbols = SignatureExtractor.enrich_symbols_with_parent_info(
                 symbols, content
             )
+
         return symbols, lang
 
     def _assign_symbols_to_span(
@@ -9708,12 +9900,20 @@ class CodeBlockManager:
         chunk_start_line: int,
         chunk_end_line: int,
     ) -> List["CodeSymbol"]:
-        """Return the subset of *full_doc_symbols* whose ``line_start``
-        falls inside ``[chunk_start_line, chunk_end_line]``.
+        """
+        Filter symbols to those whose definition falls within a line range.
 
-        Symbols keep the ``parent_symbol`` resolved from the FULL document
-        parse — splitting into chunks afterward is now harmless because
-        the class context was captured upfront.
+        Used when splitting a document into chunks: we pre-parse the whole
+        document (so class context is preserved), then assign each symbol to
+        the chunk that contains its definition line.
+
+        Args:
+            full_doc_symbols: Symbols extracted from the full document.
+            chunk_start_line: Start line of the chunk (1-indexed).
+            chunk_end_line: End line of the chunk (1-indexed).
+
+        Returns:
+            A subset of symbols whose line_start falls within the chunk range.
         """
         return [
             s
@@ -9725,63 +9925,74 @@ class CodeBlockManager:
     async def extract_code_blocks(
         self, content: str
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-        """Extract fenced and indented code blocks from message content.
-        When the inlet has already extracted full‑document symbols (silent
-        ingestion), we return a single block with all symbols – no need to
-        chunk with process().  This avoids process() failures and correctly
-        preserves parent_symbol for every method.
+        """
+        Extract fenced and indented code blocks from message content.
+
+        This method handles three extraction paths in order of preference:
+        1. Pre-extracted symbols (silent ingestion path) — returns a single block.
+        2. Tree-sitter processing (recommended) — uses AST for accurate symbol extraction.
+        3. Regex fallback — handles fenced blocks and indented code.
+
+        Args:
+            content: The raw message content.
+
+        Returns:
+            A tuple of (blocks_list, spans_list) where each block is a dict with:
+                - language: Detected programming language.
+                - code: The source code string.
+                - type: "fenced" or "indented".
+                - precomputed_symbols: Optional list of pre-extracted symbols.
+                - file_path: Optional file path associated with the block.
         """
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # ── Pre‑extracted symbols from the inlet (silent ingestion) ──
+        # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
         raw = getattr(self._f, "_raw_ingested_symbols", None)
         if raw is not None:
-            self._f._raw_ingested_symbols = None  # use only once
+            self._f._raw_ingested_symbols = None  # consume once
             lang = getattr(self._f, "_ingested_lang", None) or "python"
-            # Single block containing the whole document
+
             block = {
                 "language": lang,
                 "code": content,
                 "type": "indented",
                 "precomputed_symbols": raw,
             }
-            # Apply minimal post‑processing (file path & internal filter)
+
+            # ── 1a. Extract file path ──────────────────────────────────────
             blk_file = None
             if self._f.valves.track_file_paths:
-                # Try to extract a file path from the beginning of the content
                 blk_file = self.extract_file_paths(content)
                 blk_file = blk_file[0] if blk_file else None
+
+            # ── 1b. Filter internal code ──────────────────────────────────
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
-                    return [], []  # ignore internal code
+                    return [], []
+
             block["file_path"] = blk_file
             return [block], [(0, len(content))]
 
-        # ── Full-document symbol extraction (once, before chunking) ──
-        # Pre-compute line offsets ONCE so every chunk can translate its
-        # byte span to a line span without rescanning the content.
+        # ── Path 2: Full-document parse with tree-sitter ───────────────────
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line) + 1)
 
-        # Parse the ENTIRE document once so that class context is never
-        # lost when process() later splits methods into separate chunks.
+        # Parse the whole document once so class context is never lost.
         full_doc_symbols, full_doc_lang = await self._extract_full_document_symbols(
             content, None
         )
 
-        # If we reach here, there are no pre‑extracted symbols.
-        # Perform the normal tree‑sitter / regex extraction.
         ingested_lang = getattr(self._f, "_ingested_lang", None)
 
-        # tree‑sitter attempt
+        # ── 2a. Tree-sitter processing ──────────────────────────────────────
         if HAS_TREE_SITTER:
             try:
                 config = ProcessConfig()
@@ -9790,6 +10001,7 @@ class CodeBlockManager:
                         config.language = ingested_lang
                     except Exception:
                         pass
+
                 ts_blocks = await anyio.to_thread.run_sync(
                     lambda: process(content, config)
                 )
@@ -9800,6 +10012,7 @@ class CodeBlockManager:
                     start, end = tsb.start_byte, tsb.end_byte
                     raw = content[start:end].strip()
 
+                    # ── 2a.i. Detect language ──────────────────────────────
                     lang = tsb.language or "text"
                     if ingested_lang:
                         lang = ingested_lang
@@ -9810,6 +10023,7 @@ class CodeBlockManager:
                         else:
                             lang = await self._infer_code_language(raw)
 
+                    # ── 2a.ii. Extract code content ─────────────────────────
                     lines_in_block = raw.splitlines()
                     if lines_in_block and lines_in_block[0].startswith("```"):
                         lines_in_block = lines_in_block[1:]
@@ -9821,8 +10035,7 @@ class CodeBlockManager:
                         code = raw
                         block_type = "indented"
 
-                    # Compute line range for this chunk and assign
-                    # precomputed symbols from the full-document parse.
+                    # ── 2a.iii. Assign symbols from full-document parse ────
                     start_line = next(
                         (i for i, off in enumerate(line_offsets) if off > start),
                         len(lines),
@@ -9838,6 +10051,7 @@ class CodeBlockManager:
                         if full_doc_symbols
                         else []
                     )
+
                     blocks.append(
                         {
                             "language": lang,
@@ -9851,8 +10065,8 @@ class CodeBlockManager:
                 if hasattr(self._f, "_ingested_lang"):
                     self._f._ingested_lang = None
 
+                # ── 2a.iv. Post-process blocks ─────────────────────────────
                 if blocks:
-                    # Post‑process (file path, internal filter)
                     processed_blocks = []
                     processed_spans = []
                     for idx, block in enumerate(blocks):
@@ -9875,11 +10089,15 @@ class CodeBlockManager:
                         block["file_path"] = blk_file
                         processed_blocks.append(block)
                         processed_spans.append(spans[idx])
+
                     return processed_blocks, processed_spans
+
             except Exception:
+                # Fall through to regex fallback
                 pass
 
-        # Regex fallback (unchanged logic, now also enriched)
+        # ── Path 3: Regex fallback ──────────────────────────────────────────
+        # 3a. Fenced blocks
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
@@ -9906,6 +10124,7 @@ class CodeBlockManager:
             )
             spans.append((match.start(), match.end()))
 
+        # 3b. Indented blocks
         indented = []
         i = 0
         while i < len(lines):
@@ -9960,6 +10179,7 @@ class CodeBlockManager:
             end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
             spans.append((start_offset, end_offset))
 
+        # ── 3c. Post-process fallback blocks ───────────────────────────────
         processed_blocks = []
         processed_spans = []
         for idx, block in enumerate(blocks):
@@ -9984,34 +10204,73 @@ class CodeBlockManager:
         return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
-        """Simple heuristic language detection for a code snippet."""
+        """
+        Simple heuristic language detection for a code snippet.
+
+        Used as a fallback when tree-sitter language detection fails or
+        returns "unknown". Only detects Python and JavaScript currently.
+
+        Args:
+            code_snippet: The source code to analyze.
+
+        Returns:
+            A language string ("python", "javascript", or "unknown").
+        """
         if re.search(r"\bdef\s+\w+\s*\(", code_snippet):
             return "python"
         if re.search(r"\bfunction\s+\w+\s*\(", code_snippet):
             return "javascript"
         return "unknown"
 
-    # ── Content classification ───────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Content classification
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def classify_content(self, content: str, extracted_blocks: list) -> "ContentType":
-        """Classify a user/assistant message into one of the ContentType categories."""
+        """
+        Classify a message's content into one of the ContentType categories.
+
+        Detection order (first match wins):
+        1. Diff pattern (unified diff) → PROPOSED_CHANGE
+        2. Commit pattern (hash) → COMMITTED_CHANGE if "applied/committed/merged"
+           in text, otherwise PROPOSED_CHANGE
+        3. Traceback/error indicators → ERROR
+        4. Tool/function call indicators → TOOL_CALL
+        5. Structural code in extracted blocks (def/class/function) → BASE_CODE
+        6. Default → GENERAL
+
+        Args:
+            content: The raw message content.
+            extracted_blocks: List of code blocks extracted from the content.
+
+        Returns:
+            A ContentType enum value.
+        """
         cl = content.lower()
+
+        # ── 1. Diff pattern ──────────────────────────────────────────────────
         if self._f.diff_pattern.search(content) or "diff --git" in content:
             return ContentType.PROPOSED_CHANGE
+
+        # ── 2. Commit pattern ───────────────────────────────────────────────
         if self._f.commit_pattern.search(content):
-            return (
-                ContentType.COMMITTED_CHANGE
-                if ("applied" in cl or "committed" in cl or "merged" in cl)
-                else ContentType.PROPOSED_CHANGE
-            )
+            if ("applied" in cl or "committed" in cl or "merged" in cl):
+                return ContentType.COMMITTED_CHANGE
+            return ContentType.PROPOSED_CHANGE
+
+        # ── 3. Error / traceback ────────────────────────────────────────────
         if (
             "traceback" in cl
             or ('file "' in cl and "line " in cl)
             or ("exception" in cl and ("traceback" in cl or 'file "' in cl))
         ):
             return ContentType.ERROR
+
+        # ── 4. Tool call ────────────────────────────────────────────────────
         if '"tool_calls"' in content or '"function"' in content:
             return ContentType.TOOL_CALL
+
+        # ── 5. Base code ────────────────────────────────────────────────────
         for blk in extracted_blocks:
             if blk["language"] in [
                 "python",
@@ -10028,145 +10287,27 @@ class CodeBlockManager:
                     or "function " in blk["code"]
                 ):
                     return ContentType.BASE_CODE
+
+        # ── 6. Default ──────────────────────────────────────────────────────
         return ContentType.GENERAL
 
-    # ── Similarity & deduplication ───────────────────────────────────────
-
-    def calculate_code_similarity(self, code1: str, code2: str) -> float:
-        """Compute structural (AST) similarity for Python, fallback to token-sort ratio."""
-        if (
-            self._f.valves.enable_ast_deduplication
-            and len(code1) > 30
-            and len(code2) > 30
-        ):
-            ast_sim = self._ast_similarity(code1, code2)
-            if ast_sim is not None:
-                return ast_sim
-        if not HAS_FUZZ:
-            min_len = min(len(code1), len(code2))
-            if min_len == 0:
-                return 0.0
-            common = sum(1 for a, b in zip(code1[:min_len], code2[:min_len]) if a == b)
-            return common / max(len(code1), len(code2))
-        return fuzz.token_sort_ratio(code1, code2) / 100.0
-
-    def _ast_similarity(self, code1: str, code2: str) -> Optional[float]:
-        """Compute Jaccard similarity on AST node type distributions for Python code."""
-        if not (
-            re.search(r"\bdef\s+\w+\s*\(", code1) or re.search(r"\bclass\s+\w+", code1)
-        ):
-            return None
-        try:
-            tree1 = ast.parse(code1)
-            tree2 = ast.parse(code2)
-        except (SyntaxError, MemoryError, RecursionError, ValueError):
-            return None
-
-        def _strip_docstrings(tree: ast.AST) -> ast.AST:
-            for node in ast.walk(tree):
-                if not isinstance(
-                    node,
-                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module),
-                ):
-                    continue
-                if (
-                    node.body
-                    and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)
-                ):
-                    node.body = node.body[1:]
-                    if not node.body:
-                        node.body = [ast.Pass()]
-            return tree
-
-        clean1 = _strip_docstrings(tree1)
-        clean2 = _strip_docstrings(tree2)
-
-        if ast.dump(clean1) == ast.dump(clean2):
-            return 1.0
-
-        def _node_type_counts(tree: ast.AST) -> Counter:
-            return Counter(type(node).__name__ for node in ast.walk(tree))
-
-        c1 = _node_type_counts(clean1)
-        c2 = _node_type_counts(clean2)
-        all_types = set(c1.keys()) | set(c2.keys())
-        if not all_types:
-            return 0.0
-        intersection = sum(min(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
-        union = sum(max(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
-        return intersection / union if union > 0 else 0.0
-
-    def remove_duplicate_blocks(self, state: dict, project_id: str) -> None:
-        """Remove duplicate or near‑duplicate code blocks from the active set."""
-        if not self._f.valves.auto_remove_duplicate_blocks:
-            return
-        blocks = list(state["active_blocks"].values())
-        to_remove = set()
-        for i, block in enumerate(blocks):
-            if block.hash in to_remove or block.pinned or block.obsolete:
-                continue
-            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
-                if other.hash in to_remove or other.pinned or other.obsolete:
-                    continue
-                sim = self.calculate_code_similarity(block.content, other.content)
-                if sim >= self._f.valves.code_similarity_threshold:
-                    age_diff = abs(block.timestamp - other.timestamp) / 3600
-                    if age_diff > self._f.valves.max_duplicate_age_hours:
-                        if (
-                            block.timestamp < other.timestamp
-                            and block.importance_score < 5.0
-                        ):
-                            to_remove.add(block.hash)
-                        elif (
-                            other.timestamp < block.timestamp
-                            and other.importance_score < 5.0
-                        ):
-                            to_remove.add(other.hash)
-                        continue
-                    score_diff = abs(block.importance_score - other.importance_score)
-                    if score_diff < 1.0:
-                        if block.timestamp >= other.timestamp:
-                            to_remove.add(other.hash)
-                        else:
-                            to_remove.add(block.hash)
-                    elif block.importance_score >= other.importance_score:
-                        to_remove.add(other.hash)
-                    else:
-                        to_remove.add(block.hash)
-        blocks_by_file = defaultdict(list)
-        for b in blocks:
-            if b.file_path and not b.pinned:
-                blocks_by_file[b.file_path].append(b)
-        for file_path, blks in blocks_by_file.items():
-            if len(blks) > 1:
-                blks.sort(key=lambda b: b.timestamp, reverse=True)
-                for b in blks[1:]:
-                    to_remove.add(b.hash)
-        for h in to_remove:
-            if h in state["active_blocks"]:
-                block = state["active_blocks"][h]
-                self._f._symbol_index.remove_all_for_block(
-                    block.hash, block.symbols, project_id
-                )
-                del state["active_blocks"][h]
-        state["recent_changes"] = [
-            b for b in state["recent_changes"] if b.hash not in to_remove
-        ]
-        state["committed_changes"] = [
-            b for b in state["committed_changes"] if b.hash not in to_remove
-        ]
-        if to_remove:
-            state["has_any_calls"] = any(
-                any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
-            )
-            self._f._activation.invalidate_lightweight_cache(project_id)
-
-    # ── File path extraction ─────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. File path extraction
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def extract_file_paths(self, content: str) -> list:
-        """Extract all file paths matching the configured pattern from content."""
+        """
+        Extract all file paths matching the configured pattern from content.
+
+        Uses the regex pattern defined in `valves.file_path_pattern` to find
+        file paths. Returns them as strings (unwraps tuple captures if present).
+
+        Args:
+            content: The text to scan for file paths.
+
+        Returns:
+            A list of file path strings (may be empty).
+        """
         if not self._f.valves.track_file_paths:
             return []
         matches = re.findall(self._f.valves.file_path_pattern, content)
@@ -10175,29 +10316,63 @@ class CodeBlockManager:
     def extract_file_path_for_block(
         self, content: str, block_start: int
     ) -> Optional[str]:
-        """Try to find a file path associated with a code block by scanning backwards."""
+        """
+        Try to find a file path associated with a code block by scanning backwards.
+
+        Searches the text immediately preceding the block for a file path pattern.
+        Used to infer the file that a code snippet belongs to.
+
+        Args:
+            content: The full text content.
+            block_start: The byte offset where the block begins.
+
+        Returns:
+            The file path if found, otherwise None.
+        """
         if block_start <= 0:
             return None
+
+        # ── 1. Scan backwards from the block start ──────────────────────────
         before = content[:block_start]
         lines = before.splitlines()
+
         for line in reversed(lines):
             line = line.strip()
             if not line:
                 continue
+
+            # ── 1a. Try direct file path pattern ────────────────────────────
             match = re.search(self._f.valves.file_path_pattern, line)
             if match:
                 return match.group(1) if match.lastindex else match.group(0)
+
+            # ── 1b. Try line-range extraction ──────────────────────────────
             file_path, _, _ = self._extract_line_range(line)
             if file_path:
                 return file_path
-            break
+
+            break  # Only look at the nearest non-empty line
+
         return None
 
     def _extract_line_range(
         self, content: str
     ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        """
+        Extract file path and line numbers from a reference string.
+
+        Matches patterns like "file.py:42" or "file.py:10-20" to extract
+        the file path, start line, and end line.
+
+        Args:
+            content: A string that may contain a file:line reference.
+
+        Returns:
+            A tuple of (file_path, start_line, end_line). Any field may be None.
+        """
         if not self._f.valves.track_line_numbers:
             return None, None, None
+
         pattern = r"(?:^|\s)([^\s:]+\.\w+):(\d+)(?:-(\d+))?"
         match = re.search(pattern, content)
         if match:
@@ -10208,11 +10383,24 @@ class CodeBlockManager:
             )
         return None, None, None
 
-    # ── Utilities ────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. General utilities
+    # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
     def sanitize_text(text: str) -> str:
-        """Remove non-printable characters and replace backticks."""
+        """
+        Remove non-printable characters and replace backticks with single quotes.
+
+        This prevents control characters from breaking the prompt formatting
+        and ensures backticks don't interfere with fenced code blocks.
+
+        Args:
+            text: The text to sanitize.
+
+        Returns:
+            Sanitized text with no control characters and backticks replaced.
+        """
         cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
         cleaned = cleaned.replace("`", "'")
         return cleaned
@@ -10220,13 +10408,18 @@ class CodeBlockManager:
     @staticmethod
     def format_block_context(block: "CodeBlock", is_latest: bool) -> str:
         """
-        Render a single active CodeBlock for get_active_code_context().
+        Render a single active CodeBlock for injection into the system prompt.
 
-        Emits an optional file header (with a [LATEST] marker for the most
-        recent version of a file) followed by the fenced code body. The token
-        budgeting loop in get_active_code_context() truncates the combined
-        output afterwards, so the full body is emitted here without per-block
-        trimming. Language is taken from the first symbol when available.
+        Produces a formatted block with:
+        - A header line with block hash, file path (if available), and a [LATEST] marker.
+        - A fenced code block with the language tag and the full code body.
+
+        Args:
+            block: The CodeBlock to render.
+            is_latest: Whether this is the most recent version of the file.
+
+        Returns:
+            A formatted string ready for inclusion in the system prompt.
         """
         latest_tag = " [LATEST]" if is_latest else ""
         location = f" `{block.file_path}`" if block.file_path else ""
@@ -10234,39 +10427,38 @@ class CodeBlockManager:
         header = f"#### Block {block.hash[:8]}{location}{latest_tag}"
         return f"{header}\n```{language}\n{block.content}\n```"
 
-    # ── Symbol body extraction (slice by line range) ────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Symbol body extraction
+    # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
     def extract_symbol_body(
         block: "CodeBlock", node_id: str, max_chars: int = 0
     ) -> str:
         """
-        Extract the source body of the symbol identified by `node_id` (qualified id)
-        from `block.content` using the symbol's line range.
+        Extract the source body of a symbol using its line range.
 
-        Falls back to the whole block content when:
-        - The symbol cannot be located in `block.symbols`.
-        - The line range is missing or does not fit within the block's line count.
-        - The sliced result is empty (defensive).
+        This is the key method for precise symbol extraction: given a block
+        and a symbol identifier, it finds the symbol's line range and slices
+        the block content to return only that symbol's code.
 
-        The triple match on node_id tolerates the `qualify_symbol_name` file_path
-        inconsistency until that is unified (see Lote 2, fix 17). `max_chars` (>0)
-        caps the result to that many characters, appending a truncation notice.
+        The method handles three matching strategies:
+        1. Full qualified id (with file_path) — most precise.
+        2. Qualified id (without file_path) — for cross-file consistency.
+        3. Bare name — fallback for when only the name is known.
 
         Args:
             block: The CodeBlock containing the symbol.
-            node_id: The qualified symbol id (e.g. "ClassName.method" or "module.func").
-            max_chars: Optional maximum character length of the returned body.
-                       If 0, no truncation is applied.
+            node_id: The qualified symbol id (e.g. "ClassName.method").
+            max_chars: Optional character limit for the returned body.
 
         Returns:
-            The sliced source body of the symbol, or the whole block content
-            if slicing is not possible.
+            The sliced source body, or the whole block content if slicing fails.
         """
         # ── 1. Locate the symbol in the block ──────────────────────────────
         target = None
         for sym in block.symbols:
-            # Match by qualified id (with and without file_path) and by bare name
+            # Try full qualified id (with file_path), then without, then bare name.
             if (
                 qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
                 == node_id
@@ -10280,7 +10472,7 @@ class CodeBlockManager:
         body = block.content
         if target is not None and target.line_start and target.line_end:
             lines = block.content.split("\n")
-            # Defensive: ensure line numbers are within the document bounds.
+            # Defensive bounds check to ensure line numbers are valid.
             if 1 <= target.line_start <= len(lines) and target.line_end <= len(lines):
                 sliced = "\n".join(
                     lines[target.line_start - 1 : target.line_end]
@@ -10294,37 +10486,306 @@ class CodeBlockManager:
 
         return body
 
-    # ── Proposed changes & diffs ─────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 6. Similarity & deduplication
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def calculate_code_similarity(self, code1: str, code2: str) -> float:
+        """
+        Compute similarity between two code snippets.
+
+        Uses two strategies in order:
+        1. AST-based structural similarity for Python code (if enabled).
+        2. Fuzzy matching (token sort ratio) as fallback.
+
+        Args:
+            code1: First code snippet.
+            code2: Second code snippet.
+
+        Returns:
+            A similarity score in [0.0, 1.0]. Higher = more similar.
+        """
+        # ── 1. AST similarity (Python only) ─────────────────────────────────
+        if (
+            self._f.valves.enable_ast_deduplication
+            and len(code1) > 30
+            and len(code2) > 30
+        ):
+            ast_sim = self._ast_similarity(code1, code2)
+            if ast_sim is not None:
+                return ast_sim
+
+        # ── 2. Fallback: token-sort ratio or character-level similarity ────
+        if not HAS_FUZZ:
+            min_len = min(len(code1), len(code2))
+            if min_len == 0:
+                return 0.0
+            common = sum(1 for a, b in zip(code1[:min_len], code2[:min_len]) if a == b)
+            return common / max(len(code1), len(code2))
+
+        return fuzz.token_sort_ratio(code1, code2) / 100.0
+
+    def _ast_similarity(self, code1: str, code2: str) -> Optional[float]:
+        """
+        Compute Jaccard similarity on AST node type distributions.
+
+        For Python code only. Uses memoized AST signatures to avoid re-parsing
+        the same code multiple times within a single deduplication pass.
+
+        Args:
+            code1: First Python code snippet.
+            code2: Second Python code snippet.
+
+        Returns:
+            A similarity score in [0.0, 1.0], or None if either snippet
+            is not Python or parsing fails.
+        """
+        # ── 1. Quick check: both snippets look like Python ──────────────────
+        if not (
+            re.search(r"\bdef\s+\w+\s*\(", code1) or re.search(r"\bclass\s+\w+", code1)
+        ):
+            return None
+
+        # ── 2. Get memoized AST signatures ──────────────────────────────────
+        sig1 = self._parsed_ast_signature(code1)
+        sig2 = self._parsed_ast_signature(code2)
+        if sig1 is None or sig2 is None:
+            return None
+
+        dump1, c1 = sig1
+        dump2, c2 = sig2
+
+        # ── 3. Quick exit: structurally identical ──────────────────────────
+        if dump1 == dump2:
+            return 1.0
+
+        # ── 4. Compute Jaccard similarity on node types ─────────────────────
+        all_types = set(c1.keys()) | set(c2.keys())
+        if not all_types:
+            return 0.0
+
+        intersection = sum(min(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
+        union = sum(max(c1.get(t, 0), c2.get(t, 0)) for t in all_types)
+
+        return intersection / union if union > 0 else 0.0
+
+    def _parsed_ast_signature(self, code: str) -> Optional[Tuple[str, Counter]]:
+        """
+        Parse code into its AST signature: stripped dump + node-type Counter.
+
+        Memoized by content hash so the same code is never parsed twice within
+        a single deduplication pass. Docstrings are stripped from the AST dump
+        because they don't affect structural similarity.
+
+        Args:
+            code: The source code to parse.
+
+        Returns:
+            A tuple of (stripped_ast_dump, node_type_counter), or None
+            if parsing fails. The result is cached for future calls.
+        """
+        # ── 1. Check cache ───────────────────────────────────────────────────
+        key = hashlib.md5(code.encode()).hexdigest()
+        cached = self._ast_signature_cache.get(key)
+        if cached is not None:
+            self._ast_signature_cache.move_to_end(key)
+            return cached
+
+        # ── 2. Parse the code ───────────────────────────────────────────────
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, MemoryError, RecursionError, ValueError):
+            return None
+
+        # ── 3. Strip docstrings from the AST ────────────────────────────────
+        for node in ast.walk(tree):
+            if not isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+            ):
+                continue
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                node.body = node.body[1:]
+                if not node.body:
+                    node.body = [ast.Pass()]
+
+        # ── 4. Build signature ──────────────────────────────────────────────
+        result = (
+            ast.dump(tree),
+            Counter(type(node).__name__ for node in ast.walk(tree)),
+        )
+
+        # ── 5. Cache with LRU eviction ──────────────────────────────────────
+        self._ast_signature_cache[key] = result
+        if len(self._ast_signature_cache) > 200:
+            self._ast_signature_cache.popitem(last=False)
+
+        return result
+
+    def remove_duplicate_blocks(self, state: dict, project_id: str) -> None:
+        """
+        Remove duplicate or near-duplicate code blocks from the active set.
+
+        Uses three strategies:
+        1. Pairwise similarity comparison (AST or fuzzy matching).
+        2. Age-based: keep newer blocks if similarity threshold is met.
+        3. Per-file version limiting: keep only the most recent version.
+
+        Args:
+            state: The conversation state containing active_blocks.
+            project_id: The current project identifier.
+        """
+        if not self._f.valves.auto_remove_duplicate_blocks:
+            return
+
+        blocks = list(state["active_blocks"].values())
+        to_remove = set()
+
+        # ── 1. Pairwise similarity comparison ──────────────────────────────
+        for i, block in enumerate(blocks):
+            if block.hash in to_remove or block.pinned or block.obsolete:
+                continue
+
+            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
+                if other.hash in to_remove or other.pinned or other.obsolete:
+                    continue
+
+                sim = self.calculate_code_similarity(block.content, other.content)
+                if sim >= self._f.valves.code_similarity_threshold:
+                    age_diff = abs(block.timestamp - other.timestamp) / 3600
+
+                    # ── 1a. If age difference is significant ──────────────
+                    if age_diff > self._f.valves.max_duplicate_age_hours:
+                        if (
+                            block.timestamp < other.timestamp
+                            and block.importance_score < 5.0
+                        ):
+                            to_remove.add(block.hash)
+                        elif (
+                            other.timestamp < block.timestamp
+                            and other.importance_score < 5.0
+                        ):
+                            to_remove.add(other.hash)
+                        continue
+
+                    # ── 1b. Compare by importance score ─────────────────────
+                    score_diff = abs(block.importance_score - other.importance_score)
+                    if score_diff < 1.0:
+                        # If scores are similar, keep the newer one.
+                        if block.timestamp >= other.timestamp:
+                            to_remove.add(other.hash)
+                        else:
+                            to_remove.add(block.hash)
+                    elif block.importance_score >= other.importance_score:
+                        to_remove.add(other.hash)
+                    else:
+                        to_remove.add(block.hash)
+
+        # ── 2. Per-file version limiting ────────────────────────────────────
+        blocks_by_file = defaultdict(list)
+        for b in blocks:
+            if b.file_path and not b.pinned:
+                blocks_by_file[b.file_path].append(b)
+
+        for file_path, blks in blocks_by_file.items():
+            if len(blks) > 1:
+                blks.sort(key=lambda b: b.timestamp, reverse=True)
+                for b in blks[1:]:
+                    to_remove.add(b.hash)
+
+        # ── 3. Apply removal ────────────────────────────────────────────────
+        for h in to_remove:
+            if h in state["active_blocks"]:
+                block = state["active_blocks"][h]
+                self._f._symbol_index.remove_all_for_block(
+                    block.hash, block.symbols, project_id
+                )
+                del state["active_blocks"][h]
+
+        # ── 4. Clean up dependent lists ─────────────────────────────────────
+        state["recent_changes"] = [
+            b for b in state["recent_changes"] if b.hash not in to_remove
+        ]
+        state["committed_changes"] = [
+            b for b in state["committed_changes"] if b.hash not in to_remove
+        ]
+
+        # ── 5. Update state and invalidate cache ───────────────────────────
+        if to_remove:
+            state["has_any_calls"] = any(
+                any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
+            )
+            self._f._activation.invalidate_lightweight_cache(project_id)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. Proposed changes & diffs
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def has_conflicting_proposed_changes(
         self, state: dict, new_block: "CodeBlock"
     ) -> bool:
-        """Check if a proposed change conflicts with an existing recent change."""
+        """
+        Check if a proposed change conflicts with an existing recent change.
+
+        Conflict is detected when:
+        - Two proposed changes affect the same file, OR
+        - They have high content similarity (>80%).
+
+        Args:
+            state: The conversation state containing recent_changes.
+            new_block: The proposed change block to check.
+
+        Returns:
+            True if there is a conflict with an existing proposed change.
+        """
         if new_block.content_type != ContentType.PROPOSED_CHANGE:
             return False
+
         for existing in state["recent_changes"]:
             if existing.hash == new_block.hash:
                 continue
+
             same_file = (
                 existing.file_path
                 and new_block.file_path
                 and existing.file_path == new_block.file_path
             )
+
             if (
                 same_file
                 or self.calculate_code_similarity(existing.content, new_block.content)
                 > 0.8
             ):
                 return True
+
         return False
 
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
-        """Apply a unified diff patch to original text. Returns new text or None."""
+        """
+        Apply a unified diff patch to original text.
+
+        Parses the diff hunks and applies them in reverse order (so line
+        numbers remain correct as earlier hunks are applied).
+
+        Args:
+            original: The original source code.
+            diff_text: The unified diff content (from `git diff` or similar).
+
+        Returns:
+            The patched source code, or None if the diff cannot be applied.
+        """
         if not self._f.valves.enable_diff_application:
             return None
+
         lines = original.splitlines(keepends=False)
         result_lines = lines[:]
         hunks = []
+
+        # ── 1. Parse diff hunks ─────────────────────────────────────────────
         for match in re.finditer(
             r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
         ):
@@ -10335,6 +10796,7 @@ class CodeBlockManager:
             new_count_str = match.group(4)
             new_count = int(new_count_str) if new_count_str else 1
             hunk_body = match.group(5).strip("\n")
+
             old_lines, new_lines = [], []
             for line in hunk_body.split("\n"):
                 if line.startswith("-"):
@@ -10344,89 +10806,153 @@ class CodeBlockManager:
                 elif line.startswith(" "):
                     old_lines.append(line[1:])
                     new_lines.append(line[1:])
+
             if old_count == 0:
                 old_start_idx = old_start
             else:
                 old_start_idx = old_start - 1
+
             if new_count == 0:
                 new_lines = []
+
             hunks.append((old_start_idx, old_lines, new_lines))
+
+        # ── 2. Apply hunks in reverse order ─────────────────────────────────
         applied_any = False
         for old_start_idx, old_lines, new_lines in reversed(hunks):
+            # ── 2a. Bounds check ─────────────────────────────────────────────
             if old_start_idx < 0 or old_start_idx + len(old_lines) > len(result_lines):
                 logger.warning(
                     f"Unified diff hunk out of bounds (start={old_start_idx}, "
                     f"lines={len(old_lines)}, total={len(result_lines)})"
                 )
                 continue
+
+            # ── 2b. Verify context matches ──────────────────────────────────
             if (
                 result_lines[old_start_idx : old_start_idx + len(old_lines)]
                 != old_lines
             ):
                 logger.warning(f"Unified diff hunk mismatch at line {old_start_idx}")
                 continue
+
+            # ── 2c. Apply hunk ──────────────────────────────────────────────
             result_lines = (
                 result_lines[:old_start_idx]
                 + new_lines
                 + result_lines[old_start_idx + len(old_lines) :]
             )
             applied_any = True
+
         if not applied_any and hunks:
             logger.warning("No hunks were applied from the unified diff")
             return None
+
         return "\n".join(result_lines)
 
     async def apply_change_with_diff(
         self, base_block: "CodeBlock", proposed_block: "CodeBlock"
     ) -> bool:
-        """Apply a unified diff from a proposed change block onto a base block."""
+        """
+        Apply a unified diff from a proposed change onto a base block.
+
+        If the diff applies successfully, the base block is updated with the
+        new content, symbols are re-extracted, and the symbol index is updated.
+
+        Args:
+            base_block: The original code block to patch.
+            proposed_block: The diff-containing proposed change.
+
+        Returns:
+            True if the diff was applied successfully, False otherwise.
+        """
+        # ── 1. Validate inputs ──────────────────────────────────────────────
         if proposed_block.content_type != ContentType.PROPOSED_CHANGE:
             return False
+
         if not (
             "@@" in proposed_block.content
             and ("-" in proposed_block.content or "+" in proposed_block.content)
         ):
             return False
-        new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
-        if new_code and new_code != base_block.content:
-            project_id = self._f.valves.project_id
-            self._f._symbol_index.remove_all_for_block(
-                base_block.hash, base_block.symbols, project_id
-            )
-            base_block.content = new_code
-            base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
-            base_block.symbols = await SignatureExtractor.extract_async(
-                new_code, base_block.file_path
-            )
-            for sym in base_block.symbols:
-                sym.parent_block_hash = base_block.hash
-                self._f._symbol_index.add(sym, base_block.hash, project_id)
-            if self._f.tokenizer:
-                base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
-            else:
-                base_block._cached_token_count = len(new_code) // 4
-            base_block.timestamp = time.time()
-            base_block.is_active = True
-            base_block.potentially_affected = False
-            base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
-            self._f._activation.invalidate_lightweight_cache(project_id)
-            return True
-        return False
 
-    # ── Data flow edges ──────────────────────────────────────────────────
+        # ── 2. Apply the diff ───────────────────────────────────────────────
+        new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
+        if not new_code or new_code == base_block.content:
+            return False
+
+        project_id = self._f.valves.project_id
+
+        # ── 3. Remove old symbols from index ───────────────────────────────
+        self._f._symbol_index.remove_all_for_block(
+            base_block.hash, base_block.symbols, project_id
+        )
+
+        # ── 4. Update block content and hash ───────────────────────────────
+        base_block.content = new_code
+        base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
+
+        # ── 5. Re-extract symbols ───────────────────────────────────────────
+        base_block.symbols = await SignatureExtractor.extract_async(
+            new_code, base_block.file_path
+        )
+
+        # ── 6. Re-index symbols ─────────────────────────────────────────────
+        for sym in base_block.symbols:
+            sym.parent_block_hash = base_block.hash
+            self._f._symbol_index.add(sym, base_block.hash, project_id)
+
+        # ── 7. Update cached token count ───────────────────────────────────
+        if self._f.tokenizer:
+            base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
+        else:
+            base_block._cached_token_count = len(new_code) // 4
+
+        # ── 8. Update metadata ─────────────────────────────────────────────
+        base_block.timestamp = time.time()
+        base_block.is_active = True
+        base_block.potentially_affected = False
+        base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
+
+        # ── 9. Invalidate cache ─────────────────────────────────────────────
+        self._f._activation.invalidate_lightweight_cache(project_id)
+
+        return True
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. Data flow edges
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _extract_data_flow_edges_regex(
         self, code: str, project_id: str
     ) -> List["Edge"]:
-        """Fallback data flow extraction for non‑Python languages via regex."""
+        """
+        Fallback data flow extraction for non-Python languages via regex.
+
+        This is a best-effort heuristic that identifies:
+        1. Assignments to variables from function calls.
+        2. Subsequent usage of those variables as function arguments.
+
+        Args:
+            code: The source code to analyze.
+            project_id: The current project identifier.
+
+        Returns:
+            A list of Edge objects representing data flow relationships.
+        """
         all_names = self._f._symbol_index.get_all_names(project_id)
         edges: List[Edge] = []
+
+        # ── 1. Find assignments from function calls ─────────────────────────
         pattern = re.compile(
             r"\b(\w+)\s*=\s*(" + "|".join(re.escape(n) for n in all_names) + r")\s*\("
         )
+
         for match in pattern.finditer(code):
             callee = match.group(2)
             var_name = match.group(1)
+
+            # ── 2. Find subsequent usage of the variable ────────────────────
             use_pattern = re.compile(
                 r"\b("
                 + "|".join(re.escape(n) for n in all_names)
@@ -10434,6 +10960,7 @@ class CodeBlockManager:
                 + re.escape(var_name)
                 + r"\b"
             )
+
             for use_match in use_pattern.finditer(code):
                 consumer = use_match.group(1)
                 if consumer != callee:
@@ -10446,13 +10973,33 @@ class CodeBlockManager:
                             confidence=0.5,
                         )
                     )
+
         return edges
 
     def extract_data_flow_edges(
         self, code: str, file_path: Optional[str], project_id: str
     ) -> List["Edge"]:
-        """Extract data flow edges from Python code using ast, with regex
-        fallback."""
+        """
+        Extract data flow edges from Python code using AST, with regex fallback.
+
+        For Python code, this uses AST analysis to track:
+        1. Variable assignments.
+        2. Which variables are passed as arguments to function calls.
+        3. The flow of data from producers to consumers.
+
+        The key insight is that if a variable is assigned from a function call
+        and later passed to another function, there's a data flow edge from
+        the producer to the consumer.
+
+        Args:
+            code: The source code to analyze.
+            file_path: The file path (used to determine language).
+            project_id: The current project identifier.
+
+        Returns:
+            A list of Edge objects representing data flow relationships.
+        """
+        # ── 1. Non-Python: use regex fallback ──────────────────────────────
         if not file_path or not file_path.endswith(".py"):
             return self._extract_data_flow_edges_regex(code, project_id)
 
@@ -10461,18 +11008,18 @@ class CodeBlockManager:
             return []
 
         edges: List[Edge] = []
+
+        # ── 2. Parse Python AST ─────────────────────────────────────────────
         try:
             tree = ast.parse(code)
         except SyntaxError:
             return []
 
-        # Map line numbers to their enclosing class, so the caller side of
-        # every data-flow edge is qualified the same way as __init__ calls
-        # — otherwise two classes with same‑named methods would fuse their
-        # data-flow edges exactly as happened with the call graph.
+        # ── 3. Map line numbers to enclosing classes ────────────────────────
         line_to_class: Dict[int, str] = {}
 
         def _mark_classes(node, current_class: str) -> None:
+            """Recursively mark lines with their enclosing class name."""
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.ClassDef):
                     end = getattr(child, "end_lineno", child.lineno)
@@ -10489,34 +11036,46 @@ class CodeBlockManager:
 
         _mark_classes(tree, "")
 
+        # ── 4. Analyze each function for data flow ──────────────────────────
         for func_node in ast.walk(tree):
             if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+
             caller_name = func_node.name
             if caller_name not in all_names:
                 continue
+
             caller_class = line_to_class.get(func_node.lineno, "")
             caller_qid = qualify_symbol_name(caller_name, caller_class)
+
+            # ── 4a. Collect variables assigned in this function ────────────
             assigned_vars: Set[str] = set()
             for child in ast.walk(func_node):
                 if isinstance(child, ast.Assign):
                     for target in child.targets:
                         if isinstance(target, ast.Name):
                             assigned_vars.add(target.id)
+
+            # ── 4b. Find calls that use assigned variables as arguments ────
             for child in ast.walk(func_node):
                 if not isinstance(child, ast.Call):
                     continue
+
                 callee_name = None
                 if isinstance(child.func, ast.Name):
                     callee_name = child.func.id
                 elif isinstance(child.func, ast.Attribute):
                     callee_name = child.func.attr
+
                 if callee_name not in all_names or callee_name == caller_name:
                     continue
+
+                # Check if any argument is a variable assigned earlier.
                 args_are_local_vars = any(
                     isinstance(arg, ast.Name) and arg.id in assigned_vars
                     for arg in child.args
                 )
+
                 if args_are_local_vars or child.args:
                     edges.append(
                         Edge(
@@ -10527,6 +11086,7 @@ class CodeBlockManager:
                             confidence=0.7,
                         )
                     )
+
         return edges
 
 
@@ -12596,6 +13156,7 @@ class EnrichmentTasks:
         state: dict,
         skip_contradiction: bool = False,
         skip_cache: bool = False,
+        skip_duplicate: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
         """
         Run contradiction detection, response cache lookup, and duplicate question
@@ -12622,7 +13183,11 @@ class EnrichmentTasks:
             ),
             (
                 self._f._ltm.find_duplicate_question(query, project_id)
-                if (self._f.valves.duplicate_question_threshold and HAS_SENTENCE)
+                if (
+                    self._f.valves.duplicate_question_threshold
+                    and HAS_SENTENCE
+                    and not skip_duplicate
+                )
                 else asyncio.sleep(0, result=None)
             ),
         ]
@@ -16072,6 +16637,26 @@ class Filter:
         }
     )
 
+    # Read via getattr(self._f, "_SYMBOL_BLACKLIST", set()) in
+    # LongTermMemory._is_symbol_indexable() — was referenced but never
+    # defined, so the blacklist check was a permanent no-op. Minimal
+    # starting point: low-retrieval-value dunders every class has, which
+    # add noise to LTM "code_symbols" metadata without being meaningful
+    # call-graph targets. __init__ deliberately excluded — constructors
+    # carry real signal for symbol-boosted retrieval. Adjust freely; this
+    # only affects what counts as a "symbol mention" in LTM, not the
+    # SymbolIndex itself (those symbols stay fully indexed there).
+    _SYMBOL_BLACKLIST: frozenset = frozenset(
+        {
+            "__repr__",
+            "__str__",
+            "__eq__",
+            "__hash__",
+            "__len__",
+            "__iter__",
+        }
+    )
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Configuration valves (nested class)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -16120,7 +16705,7 @@ class Filter:
         )
         # ── Per‑block limits ───────────────────────────────────────
         max_code_block_tokens: int = Field(
-            default=0,
+            default=12000,
             description="Maximum tokens per individual code block. 0 = unlimited. See code_block_overflow_action.",
         )
         code_block_overflow_action: str = Field(
@@ -16983,7 +17568,6 @@ class Filter:
             "feedback_history": [],
             "last_compression_timestamp": 0,
             "last_suggestion_timestamp": 0,
-            "response_cache": [],
             "has_any_calls": False,
             "last_cleanup_suggestion_msg_idx": 0,
             "last_cot_level": 0,
