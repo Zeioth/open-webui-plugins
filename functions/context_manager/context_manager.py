@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 9.0.0
 license: GPL3
-requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
+requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter>=0.21.0, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
 """
 
 import os
