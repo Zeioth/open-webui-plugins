@@ -1,6 +1,10 @@
 # open-webui-plugins
 All my openwebui plugins. So we can have a shared library for further optimization.
 
+* Hierarchical Symbol Graph Retrieval context manager
+* Search engine
+* Router → Pretty useless in the current meta let's be honest.
+
 ## NOTA
 My current system prompt:
 
