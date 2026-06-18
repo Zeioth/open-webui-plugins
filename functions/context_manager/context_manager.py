@@ -941,12 +941,22 @@ class HubSymbolIndex:
         project_id: str,
         top_n: int = 30,
         valves=None,
+        mode: str = "hubs_only",
     ) -> str:
         """
-        Build the full Block A symbol text: class outline + hub symbols
-        section with bidirectional call graph.  Deterministic while the code
-        is unchanged (alphabetical / centrality order), so llama.cpp's KV
-        cache stays stable.
+        Build the full Block A symbol text: class outline (unchanged across
+        modes) + a call-graph section whose depth depends on *mode*:
+
+          hubs_only      → existing behavior: top_n hubs by centrality only.
+          expanded_hubs  → top_n hubs + every direct caller/callee of each hub
+                           (depth 1, deduplicated, non-hub only).
+          full_graph     → every qualified symbol with its direct
+                           callers/callees, alphabetically sorted.
+
+        *mode* is resolved by the CALLER (ContextBuilder._resolve_call_graph_mode)
+        and passed in already-decided — this method does no query/intent logic,
+        it only renders. Deterministic while the code is unchanged (alphabetical /
+        centrality order), so llama.cpp's KV cache stays stable.
         """
         sections = []
 
@@ -954,18 +964,162 @@ class HubSymbolIndex:
         if outline:
             sections.append(outline)
 
-        hub_qids = self.get_hub_names(centrality, top_n)
-        if hub_qids:
-            enable_callees = (
-                getattr(valves, "enable_hub_callees", True) if valves else True
+        if mode == "expanded_hubs":
+            section = self._build_expanded_hubs_section(
+                symbol_index, centrality, project_id, top_n, valves
             )
-            sections.append(
-                self._build_hub_section(
-                    hub_qids, centrality, symbol_index, project_id, enable_callees
+            if section:
+                sections.append(section)
+        elif mode == "full_graph":
+            section = self._build_full_graph_section(symbol_index, project_id, valves)
+            if section:
+                sections.append(section)
+        else:
+            # "hubs_only" and any unexpected value: render the stable hub
+            # section. Defensive fallback for an invalid valve never crashes
+            # and never renders nothing.
+            hub_qids = self.get_hub_names(centrality, top_n)
+            if hub_qids:
+                enable_callees = (
+                    getattr(valves, "enable_hub_callees", True) if valves else True
                 )
-            )
+                sections.append(
+                    self._build_hub_section(
+                        hub_qids, centrality, symbol_index, project_id, enable_callees
+                    )
+                )
 
         return "\n\n".join(s for s in sections if s.strip())
+
+    def _build_expanded_hubs_section(
+        self, symbol_index, centrality, project_id, top_n, valves=None
+    ) -> str:
+        """
+        Top-N hubs (rendered exactly as in hubs_only) PLUS a sub-section
+        listing every direct neighbor (caller or callee) of any hub that is
+        not itself a hub — one hop beyond the hub set without the full
+        O(all symbols) cost.
+
+        Neighbors are a flat qid list grouped by hub (NOT full
+        _format_symbol_line entries — that would recursively pull in THEIR
+        neighbors and balloon token cost, blowing the ~2k-5k budget).
+        Truncated by expanded_hubs_max_tokens with an explicit notice.
+        """
+        enable_callees = getattr(valves, "enable_hub_callees", True) if valves else True
+        hub_qids = self.get_hub_names(centrality, top_n)
+        if not hub_qids:
+            return ""
+
+        hub_section = self._build_hub_section(
+            hub_qids, centrality, symbol_index, project_id, enable_callees
+        )
+
+        hub_set = set(hub_qids)
+        neighbor_lines = []
+        for qid in hub_qids:
+            callers = self._safe_callers(qid, project_id, symbol_index) - hub_set
+            callees = self._safe_callees(qid, project_id, symbol_index) - hub_set
+            extra = sorted(callers | callees)
+            if extra:
+                neighbor_lines.append(f"- `{qid}` neighbors: {', '.join(extra)}")
+
+        if not neighbor_lines:
+            return hub_section
+
+        budget_chars = self.valves_expanded_hubs_budget_chars(valves)
+        kept_lines = []
+        total = 0
+        for idx, line in enumerate(neighbor_lines):
+            total += len(line)
+            if budget_chars and total > budget_chars:
+                kept_lines.append(
+                    f"_(Neighbor list truncated to fit budget — "
+                    f"{len(neighbor_lines) - idx} hub(s) omitted)_"
+                )
+                break
+            kept_lines.append(line)
+
+        neighbor_section = (
+            "### Direct neighbors of hub symbols (depth 1, non-hub only)\n"
+            + "\n".join(kept_lines)
+        )
+        return hub_section + "\n\n" + neighbor_section
+
+    @staticmethod
+    def valves_expanded_hubs_budget_chars(valves) -> int:
+        """expanded_hubs_max_tokens → char budget (4 chars/token heuristic).
+        Returns 0 (no limit) if valves is None or the field is absent."""
+        if valves is None:
+            return 0
+        tok = getattr(valves, "expanded_hubs_max_tokens", 0)
+        return tok * 4 if tok > 0 else 0
+
+    def _build_full_graph_section(self, symbol_index, project_id, valves=None) -> str:
+        """
+        Every qualified symbol in the project, alphabetically sorted, each with
+        its direct callers/callees (no centrality score — in full_graph every
+        symbol is shown regardless of rank, so a score column is misleading
+        noise).
+
+        Alphabetical order (not centrality order) is deliberate: centrality
+        ties at 0.0 for every leaf symbol, so centrality-based ordering is not
+        stable across rebuilds and would cause spurious Block A cache misses
+        from pure reordering. Alphabetical order is stable as long as the
+        symbol set is unchanged — exactly what Block A's code_state_hash key
+        already tracks.
+
+        Hard-truncates at full_graph_max_tokens with an explicit notice. Never
+        falls back to a different mode — truncation is the only degradation path.
+        """
+        all_qids = sorted(symbol_index.get_all_qualified_names(project_id))
+        if not all_qids:
+            return ""
+
+        max_tokens = (
+            getattr(valves, "full_graph_max_tokens", 20000) if valves else 20000
+        )
+        budget_chars = max_tokens * 4 if max_tokens > 0 else None
+
+        lines = [
+            f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
+            "_Every indexed symbol with its direct callers/callees. "
+            "Use `/expand <name>` for full bodies._",
+            "",
+        ]
+        total_chars = sum(len(l) for l in lines)
+
+        for idx, qid in enumerate(all_qids):
+            line = self._format_symbol_line_no_score(qid, project_id, symbol_index)
+            if budget_chars is not None and total_chars + len(line) > budget_chars:
+                remaining = len(all_qids) - idx
+                lines.append(
+                    f"\n_(Truncated to fit {max_tokens}-token budget — "
+                    f"{remaining} symbol(s) omitted. Consider expanded_hubs "
+                    f"or raising full_graph_max_tokens.)_"
+                )
+                break
+            lines.append(line)
+            total_chars += len(line)
+
+        return "\n".join(lines)
+
+    def _format_symbol_line_no_score(self, qid, project_id, symbol_index) -> str:
+        """Same as _format_symbol_line but without the centrality score column.
+        full_graph forces callees on: showing the bidirectional edge set is the
+        whole point of this mode."""
+        callers = self._safe_callers(qid, project_id, symbol_index)
+        callees = self._safe_callees(qid, project_id, symbol_index)
+
+        parts = [f"- `{qid}`"]
+        if callers:
+            shown = sorted(callers)[:5]
+            extra = f", ... (+{len(callers) - 5} more)" if len(callers) > 5 else ""
+            parts.append(f"\n  ← used by: {', '.join(shown)}{extra}")
+        if callees:
+            shown = sorted(callees)[:5]
+            extra = f", ... (+{len(callees) - 5} more)" if len(callees) > 5 else ""
+            parts.append(f"\n  → calls: {', '.join(shown)}{extra}")
+        return "".join(parts)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Class / function outline (Architecture Map)
@@ -2265,17 +2419,23 @@ class ContextBuilder:
             )
             parts.append(critical_guidelines)
 
-        # 2. Symbol index (hub symbols only — stable while code unchanged)
+        # 2. Symbol index (depth depends on call_graph_context_mode; the mode
+        # itself is resolved per-query in build_block_b and read here as
+        # already-decided state — Block A stays a passive consumer).
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
                 centrality = self._f._node_centrality.get(project_id, {})
+                resolved_mode = self._f._last_resolved_graph_mode.get(
+                    project_id, "hubs_only"
+                )
                 symbol_section = self._f._hub_index.build(
                     symbol_index=self._f._symbol_index,
                     centrality=centrality,
                     project_id=project_id,
                     top_n=self._f.valves.symbol_index_max_in_block_a,
                     valves=self._f.valves,
+                    mode=resolved_mode,
                 )
                 if symbol_section:
                     parts.append(symbol_section)
@@ -2482,6 +2642,124 @@ class ContextBuilder:
             return "A", dict(self.LOD_PROFILES["A"])
         return "C", dict(self.LOD_PROFILES["C"])
 
+    def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
+        """
+        Classify the query into one of five use cases and return its LOD profile.
+
+        A architecture · B plans · C programming · D refactor · E scaffolding.
+
+        Resolution order (first match wins):
+          1. Explicit command prefix (/arch /plan /code /refactor /scaffold),
+             when lod_intent_explicit_override is enabled.
+          2. Scaffolding regex (E).
+          3. Refactor regex (D) — BEFORE architecture, since the architecture
+             regex also matches "refactor".
+          4. Architecture/design regex (A).
+          5. Plan regex (B).
+          6. intent_vector tie-break: refactor-dominant → D, explain-dominant
+             → A; otherwise C (most common case).
+
+        Returns (case_label, profile_copy); the copy is safe to mutate.
+        """
+        q = query or ""
+        if self._f.valves.lod_intent_explicit_override:
+            m = self._UC_COMMAND_RE.match(q)
+            if m:
+                case = {
+                    "arch": "A",
+                    "plan": "B",
+                    "code": "C",
+                    "refactor": "D",
+                    "scaffold": "E",
+                }[m.group(1).lower()]
+                return case, dict(self.LOD_PROFILES[case])
+        if self._UC_SCAFFOLD_RE.search(q):
+            return "E", dict(self.LOD_PROFILES["E"])
+        if self._UC_REFACTOR_RE.search(q):
+            return "D", dict(self.LOD_PROFILES["D"])
+        if self._UC_ARCH_RE.search(q):
+            return "A", dict(self.LOD_PROFILES["A"])
+        if self._UC_PLAN_RE.search(q):
+            return "B", dict(self.LOD_PROFILES["B"])
+        iv = intent_vector or {}
+        refactor_w = iv.get("refactor", 0.0)
+        debug_w = iv.get("debug", 0.0)
+        modify_w = iv.get("modify", 0.0)
+        explain_w = iv.get("explain", 0.0)
+        if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
+            return "D", dict(self.LOD_PROFILES["D"])
+        if explain_w >= 0.5 and explain_w > modify_w:
+            return "A", dict(self.LOD_PROFILES["A"])
+        return "C", dict(self.LOD_PROFILES["C"])
+
+    def _resolve_call_graph_mode(
+        self,
+        query: str,
+        intent_vector: dict,
+        project_id: str,
+    ) -> str:
+        """
+        Resolve the effective call-graph depth for Block A.
+
+        Manual override (any valve value other than "auto") always wins — auto
+        is only consulted when the valve is literally "auto".
+
+        auto resolution:
+          1. Reuse classify_use_case(query, intent_vector) — already computed by
+             build_block_b for the same query; no duplicate regex work, and no
+             risk of drifting out of sync with its precedence rules (refactor
+             tested before architecture, explicit /command override, etc.).
+          2. use_case "A" (architecture) → prefer full_graph, else expanded_hubs.
+             use_case "D" (refactor)     → prefer expanded_hubs, else hubs_only.
+             "B"/"C"/"E"                 → hubs_only.
+          3. Every upgrade is gated by BOTH a project-size ceiling AND a
+             free-token-budget floor (qualified symbol count + effective context
+             budget). Both must pass or the mode is capped one level down. Hard
+             cap, not a preference: auto never exceeds what the guards allow.
+
+        Uses get_all_qualified_names() (not get_all_names) for the size count so
+        that same-named methods across classes (every __init__, build, ...) are
+        counted distinctly — otherwise the ceilings would be wildly miscalibrated
+        on codebases with heavy method-name duplication.
+        """
+        if self._f.valves.call_graph_context_mode != "auto":
+            return self._f.valves.call_graph_context_mode
+
+        use_case, _ = self.classify_use_case(query, intent_vector)
+
+        total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
+        free_tokens = self.get_effective_context_budget(project_id)
+
+        def _full_graph_allowed() -> bool:
+            return (
+                total_symbols
+                <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
+                and free_tokens
+                >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            )
+
+        def _expanded_hubs_allowed() -> bool:
+            return (
+                total_symbols
+                <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
+                and free_tokens
+                >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            )
+
+        if use_case == "A":
+            if _full_graph_allowed():
+                return "full_graph"
+            if _expanded_hubs_allowed():
+                return "expanded_hubs"
+            return "hubs_only"
+
+        if use_case == "D":
+            if _expanded_hubs_allowed():
+                return "expanded_hubs"
+            return "hubs_only"
+
+        return "hubs_only"
+
     async def build_block_b(
         self,
         project_id: str,
@@ -2564,6 +2842,26 @@ class ContextBuilder:
 
         # ── Cambio A: Move classify_use_case here (was near the end) ──
         active_use_case, _ = self.classify_use_case(query, intent_vector)
+
+        # ── Resolve call-graph depth for Block A (KV-cache-aware) ──
+        # The mode is decided here (Block B has the query + intent), but the
+        # graph itself is rendered into Block A. A change of resolved mode
+        # invalidates Block A exactly like any other content change; a stable
+        # mode across turns leaves Block A a normal cache hit.
+        resolved_graph_mode = self._resolve_call_graph_mode(
+            query, intent_vector, project_id
+        )
+        previous_mode = self._f._last_resolved_graph_mode.get(project_id)
+        if previous_mode != resolved_graph_mode:
+            self._f._log_debug(
+                f"Call graph mode: {previous_mode or '(none)'} → "
+                f"{resolved_graph_mode} (triggers Block A rebuild)"
+            )
+            self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
+            self.invalidate_block_a_cache(
+                project_id,
+                f"call_graph_context_mode resolved to {resolved_graph_mode}",
+            )
 
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
         total_tokens = 0
@@ -2890,1171 +3188,6 @@ class ContextBuilder:
             self._f._last_lod_levels[project_id] = lod_map
 
         return "\n".join(ordered)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 4. CoT expansion resolution (/expand hints)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _resolve_cot_expands(
-        self,
-        reasoning_text: str,
-        project_id: str,
-    ) -> str:
-        """
-        Find /expand <Name> hints in `reasoning_text`, retrieve the full symbol
-        body for each (with page-in fallback for evicted blocks), and append an
-        annotated expansion section.
-
-        Returns the original reasoning_text when:
-          - enable_cot_expand_resolution is False.
-          - No /expand hints found.
-          - All symbols are unknown or their blocks are unavailable.
-
-        Budget enforcement:
-          - At most cot_expand_max_symbols expansions per call.
-          - Combined token total capped at cot_expand_max_tokens; symbols that
-            would exceed the budget are left as manual hints.
-        """
-        if not self._f.valves.enable_cot_expand_resolution:
-            return reasoning_text
-
-        # Reuse the same pattern as CommandRouter.outlet_intercept_expand.
-        _EXPAND_RE = re.compile(r"/expand\s+(?:\d+\s+)?`?([\w.]+)`?", re.IGNORECASE)
-        matches = _EXPAND_RE.finditer(reasoning_text)
-
-        seen: Set[str] = set()
-        candidates: List[str] = []
-        for m in matches:
-            name = m.group(1)
-            if name not in seen:
-                seen.add(name)
-                candidates.append(name)
-            if len(candidates) >= self._f.valves.cot_expand_max_symbols:
-                break
-
-        if not candidates:
-            return reasoning_text
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        state = self._f._state_store.get_state(project_id)
-
-        expansions: List[str] = []
-        total_tokens = 0
-        budget = self._f.valves.cot_expand_max_tokens
-        resolved: List[str] = []
-
-        for name in candidates:
-            if name not in all_names:
-                self._f._log_debug(
-                    f"CoT /expand '{name}': not in index, left as manual hint"
-                )
-                continue
-
-            block = None
-            for bh in self._f._symbol_index.find_blocks(name, project_id):
-                candidate_block = state["active_blocks"].get(bh)
-                if candidate_block and not candidate_block.obsolete:
-                    block = candidate_block
-                    break
-                # Page-in fallback
-                if (
-                    candidate_block is None
-                    and self._f._pager is not None
-                    and self._f._pager.is_paged(bh, project_id)
-                ):
-                    block = await self._f._pager.page_in_block(
-                        block_hash=bh,
-                        project_id=project_id,
-                        chroma_collection=self._f.memory_collection,
-                        db_conn=self._f._db_conn,
-                    )
-                    if block and not block.obsolete:
-                        break
-                    block = None
-
-            if not block:
-                self._f._log_debug(
-                    f"CoT /expand '{name}': block unavailable, left as manual hint"
-                )
-                continue
-
-            lang = block.symbols[0].language if block.symbols else ""
-            file_tag = f"  # {block.file_path}" if block.file_path else ""
-            expansion = f"#### `{name}`{file_tag}\n" f"```{lang}\n{block.content}\n```"
-            tok = self._f._tokens.estimate_code_tokens(expansion)
-            if total_tokens + tok > budget:
-                self._f._log_debug(
-                    f"CoT /expand '{name}': skipped (budget {budget} tokens "
-                    f"would be exceeded by {tok})"
-                )
-                break
-
-            expansions.append(expansion)
-            total_tokens += tok
-            resolved.append(name)
-
-        if not expansions:
-            return reasoning_text
-
-        self._f._log_debug(
-            f"CoT auto-expand: resolved {len(resolved)} symbol(s) "
-            f"({resolved}) — ~{total_tokens} tokens"
-        )
-
-        separator = (
-            "\n\n---\n"
-            "### 🔍 Auto-expansions (requested by architecture reasoning)\n"
-            "_Full bodies retrieved automatically. "
-            "Use `/expand <name>` for any symbol not shown here._\n\n"
-        )
-        return reasoning_text + separator + "\n\n".join(expansions)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Skeleton & scaffolding helpers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _get_skeleton_for_cot(
-        self,
-        project_id: str,
-        query: str,
-        top_n_symbols: int = 6,
-    ) -> str:
-        """
-        Return a skeleton string suitable for use as CoT context.
-
-        Cache hit: skeleton is fresh (same code_state_hash) → instant.
-        Cache miss: derive from the top-N activated symbols and store.
-
-        top_n_symbols caps the skeleton so CoT context stays under
-        skeleton_cot_max_tokens even for large codebases.
-        """
-        current_hash = self._f._activation.compute_code_state_hash(project_id)
-        if not current_hash:
-            return ""
-
-        # Cache hit
-        cached = self._skeleton_cache.get(project_id)
-        if cached:
-            cached_hash, cached_skel = cached
-            if cached_hash == current_hash:
-                self._f._log_debug(
-                    "Skeleton cache HIT for CoT "
-                    f"(hash={current_hash}, "
-                    f"~{self._f._tokens.estimate_code_tokens(cached_skel)} tokens)"
-                )
-                return cached_skel
-
-        # Cache miss: activate top-N symbols for this query and skeletonize
-        self._f._log_debug(
-            f"Skeleton cache MISS — deriving from top-{top_n_symbols} activated "
-            f"symbols for query: '{query[:60]}'"
-        )
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        if not all_names:
-            return ""
-
-        # Use centrality-ranked symbols as seeds when no query-seed activates
-        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-        ag = ActivationGraph()
-
-        # Seed from query tokens first
-        query_words = set(re.findall(r"\b\w+\b", query))
-        exact_seeds = list(all_names.intersection(query_words))
-        if exact_seeds:
-            ag.seed(exact_seeds[:top_n_symbols], initial_score=1.0)
-            ag.propagate(
-                edges_out, max_steps=2, min_score=0.1, alpha=self._f.valves.ppr_alpha
-            )
-            activated = ag.get_activated_nodes(
-                threshold=self._f.valves.path_activation_threshold
-            )
-        else:
-            activated = {}
-
-        # Fall back to top-N by centrality (architecture overview)
-        if len(activated) < top_n_symbols:
-            centrality = self._f._node_centrality.get(project_id, {})
-            ranked = sorted(centrality, key=lambda n: -centrality[n])
-            for name in ranked:
-                if name not in activated:
-                    activated[name] = centrality[name]
-                if len(activated) >= top_n_symbols:
-                    break
-
-        if not activated:
-            return ""
-
-        # Build skeleton for each activated symbol (primary = highest score)
-        primary = max(activated, key=lambda n: activated[n])
-        skel = await self._format_skeleton_for_symbol(primary, project_id, query)
-        if not skel:
-            # Fallback: full module skeleton capped to budget
-            skel = self._format_skeleton(project_id)
-
-        if not skel:
-            return ""
-
-        # Store in cache
-        self._skeleton_cache[project_id] = (current_hash, skel)
-        self._f._log_debug(
-            f"Skeleton cached for CoT "
-            f"(~{self._f._tokens.estimate_code_tokens(skel)} tokens, "
-            f"primary='{primary}')"
-        )
-        return skel
-
-    def _format_skeleton(self, project_id: str) -> str:
-        """
-        Emit a copy-pasteable signature-only skeleton of the active code: classes
-        with their methods, functions, type hints, decorators and defaults
-        intact, every body replaced by `...`. Derived from the latest source per
-        file, so nesting and signatures are exact. Budget-bounded; truncates by
-        whole files or, for path-less blocks grouped by class, elides the
-        lowest-centrality methods within each class.
-        """
-        state = self._f._state_store.get_state(project_id)
-        if not state or not state.get("active_blocks"):
-            return ""
-
-        # Latest non-obsolete block per file (the skeleton reflects current code).
-        latest_per_file: dict = {}
-        no_file: list = []
-        for block in state["active_blocks"].values():
-            if block.obsolete:
-                continue
-            if block.file_path:
-                cur = latest_per_file.get(block.file_path)
-                if cur is None or block.timestamp > cur.timestamp:
-                    latest_per_file[block.file_path] = block
-            else:
-                no_file.append(block)
-
-        if not latest_per_file and not no_file:
-            return ""
-
-        effective_budget = max(
-            4000,
-            self._f.valves.context_window_tokens
-            - self._f._last_system_tokens.get(project_id, 0)
-            - self._f.valves.response_reserve_tokens,
-        )
-        budget = min(effective_budget // 2, 16000)
-
-        parts = ["## Code Skeleton (signatures only — fill in the bodies)\n"]
-        total = self._f._tokens.estimate_code_tokens(parts[0])
-        truncated = False
-
-        docstring_provider = self._make_docstring_provider(project_id)
-
-        def _emit(label: str, code: str, fence: str = "python") -> None:
-            nonlocal total, truncated
-            chunk = f"### {label}\n```{fence}\n{code}\n```\n"
-            tok = self._f._tokens.estimate_code_tokens(chunk)
-            if total + tok > budget:
-                truncated = True
-                return
-            parts.append(chunk)
-            total += tok
-
-        # 1) Files with a real path (deterministic order by path).
-        for fpath in sorted(latest_per_file.keys()):
-            if truncated:
-                break
-            block = latest_per_file[fpath]
-            skel = self._skeleton_from_code(
-                block.content, block.file_path, docstring_provider
-            )
-            if skel:
-                fence = (
-                    "python"
-                    if (block.file_path or "").endswith(".py")
-                    else (block.symbols[0].language if block.symbols else "")
-                )
-                _emit(fpath, skel, fence)
-
-        # 2) Path-less blocks grouped by REAL class (cross-chunk merge).
-        grouped_by_class: Dict[str, List["CodeBlock"]] = defaultdict(list)
-        truly_unnamed: List["CodeBlock"] = []
-        class_header_blocks: Dict[str, "CodeBlock"] = {}  # NEW: class X: blocks
-
-        for block in no_file:
-            parent = next(
-                (s.parent_symbol for s in block.symbols if s.parent_symbol), ""
-            )
-            # Check if this block IS a class definition
-            block_is_class_def = any(s.kind == "class" for s in block.symbols)
-            if block_is_class_def:
-                # Store the class header block for later use
-                class_name = next(
-                    (s.name for s in block.symbols if s.kind == "class"), ""
-                )
-                if class_name:
-                    class_header_blocks[class_name] = block
-                    # Also ensure the class appears in grouped_by_class
-                    if class_name not in grouped_by_class:
-                        grouped_by_class[class_name] = []
-                    continue  # Don't add to truly_unnamed
-
-            if parent:
-                grouped_by_class[parent].append(block)
-            else:
-                truly_unnamed.append(block)
-
-        # Merge class header blocks into their groups (at the beginning)
-        for class_name, header_block in class_header_blocks.items():
-            grouped_by_class[class_name].insert(0, header_block)
-
-        for class_name in sorted(grouped_by_class.keys()):  # deterministic
-            if truncated:
-                break
-            _emit(
-                f"class `{class_name}`",
-                self._render_class_skeleton(
-                    class_name,
-                    grouped_by_class[class_name],
-                    project_id,
-                    docstring_provider,
-                    budget - total,
-                ),
-            )
-
-        # 3) Genuine top-level functions (no class).
-        for block in sorted(truly_unnamed, key=lambda b: b.timestamp):
-            if truncated:
-                break
-            skel = self._skeleton_from_code(
-                block.content, block.file_path, docstring_provider
-            )
-            if not skel:
-                continue
-            label = block.symbols[0].name if block.symbols else "(unnamed)"
-            fence = block.symbols[0].language if block.symbols else ""
-            _emit(f"`{label}`", skel, fence)
-
-        if truncated:
-            parts.append("_[skeleton truncated to fit budget — ask per file]_")
-
-        if len(parts) <= 1:
-            return ""
-        return "\n".join(parts)
-
-    def _render_class_skeleton(
-        self,
-        class_name: str,
-        blocks: List["CodeBlock"],
-        project_id: str,
-        docstring_provider,
-        remaining_budget: int,
-    ) -> str:
-        """Render `class X:` followed by method signatures (indented), ordered by
-        source line. If the class exceeds its share of the budget, keep the
-        highest-centrality methods and append a `# (+N more, /expand {class})`
-        elision line."""
-        centrality = self._f._node_centrality.get(project_id, {})
-
-        # Find the class header block (first block whose symbol kind == "class")
-        class_header = ""
-        method_lines: List[Tuple[str, str]] = []
-
-        for block in sorted(blocks, key=lambda b: b.timestamp):
-            # Check if this block contains the class definition
-            has_class_sym = any(
-                s.kind == "class" and s.name == class_name for s in block.symbols
-            )
-            if has_class_sym:
-                # Extract just the class signature line from this block
-                skel = self._skeleton_from_code(
-                    block.content, block.file_path, docstring_provider
-                )
-                if skel:
-                    # The skeleton starts with "class X(...):", keep only that line
-                    class_header = skel.split("\n")[0].rstrip(":")
-                break
-
-        # If no explicit class header found, synthesize one
-        if not class_header:
-            class_header = f"class {class_name}"
-
-        # Collect method lines from all blocks
-        for block in sorted(blocks, key=lambda b: b.timestamp):
-            skel = self._skeleton_from_code(
-                block.content, block.file_path, docstring_provider
-            )
-            if not skel:
-                continue
-            # For the class header block, extract method signatures from inside it
-            has_class_sym = any(
-                s.kind == "class" and s.name == class_name for s in block.symbols
-            )
-            if has_class_sym:
-                # Extract method signatures from inside the class block
-                # by parsing the skeleton lines and taking only def lines
-                for line in skel.split("\n"):
-                    stripped = line.strip()
-                    if stripped.startswith("def ") or stripped.startswith("async def "):
-                        method_name = (
-                            stripped.split("(")[0]
-                            .replace("def ", "")
-                            .replace("async def ", "")
-                            .strip()
-                        )
-                        method_lines.append((method_name, stripped))
-                continue
-
-            # Pure method block
-            for sym in block.symbols:
-                method_lines.append((sym.name, skel))
-                break  # one representative skeleton per method block
-
-        # Budget-aware elision: rank by centrality, keep what fits.
-        per_class_budget = max(400, remaining_budget)
-        ranked = sorted(method_lines, key=lambda ml: -centrality.get(ml[0], 0.0))
-        kept, used, dropped = [], 0, 0
-        for mname, line in ranked:
-            tok = self._f._tokens.estimate_code_tokens(line)
-            if used + tok <= per_class_budget:
-                kept.append((mname, line))
-                used += tok
-            else:
-                dropped += 1
-        # Re-sort kept back into source order for readability.
-        kept_names = {m for m, _ in kept}
-        body = "\n".join(
-            textwrap.indent(line, "    ")
-            for mname, line in method_lines
-            if mname in kept_names
-        )
-        out = f"{class_header}:\n{body}" if body else f"{class_header}:\n    ..."
-        if dropped:
-            out += f"\n    # (+{dropped} more method(s) — /expand {class_name})"
-        return out
-
-    @staticmethod
-    def _skeletonize_node(
-        node, docstring_provider=None, parent_class: str = ""
-    ) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = []
-            existing = ast.get_docstring(node, clean=True)
-            doc = existing
-            if not doc and docstring_provider is not None:
-                doc = docstring_provider(node.name, parent_class)
-            if doc:
-                one_line = doc.strip().split("\n")[0][:120]
-                body.append(ast.Expr(value=ast.Constant(value=one_line)))
-            body.append(ast.Expr(value=ast.Constant(value=Ellipsis)))
-            node.body = body
-        elif isinstance(node, ast.ClassDef):
-            kept = []
-            existing = ast.get_docstring(node, clean=True)
-            doc = existing
-            if not doc and docstring_provider is not None:
-                doc = docstring_provider(node.name, "")
-            if doc:
-                one_line = doc.strip().split("\n")[0][:120]
-                kept.append(ast.Expr(value=ast.Constant(value=one_line)))
-            for child in node.body:
-                if isinstance(
-                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                ):
-                    ContextBuilder._skeletonize_node(
-                        child, docstring_provider, parent_class=node.name
-                    )
-                    kept.append(child)
-            node.body = kept or [ast.Expr(value=ast.Constant(value=Ellipsis))]
-
-    @staticmethod
-    def _skeleton_from_code(
-        code: str, file_path: Optional[str], docstring_provider=None
-    ) -> str:
-        """
-        Build a signature-only skeleton from source.
-
-        Python (.py, or `def`-bearing code with no path): ast-based — bodies
-        become `...`, nesting and signatures preserved exactly via ast.unparse
-        (Python 3.9+). Other languages fall back to a flat list of signature
-        lines via regex (not guaranteed valid syntax, but a usable reference).
-
-        When docstring_provider is given, docstrings from the source are kept
-        and missing ones are filled from the provider (e.g. LLM-generated).
-        """
-        is_python = (file_path or "").endswith(".py") or (
-            not file_path and bool(re.search(r"\bdef\s+\w+\s*\(", code))
-        )
-        if is_python and hasattr(ast, "unparse"):
-            try:
-                tree = ast.parse(code)
-            except SyntaxError:
-                tree = None
-            if tree is not None:
-                nodes = []
-                for node in tree.body:
-                    if isinstance(
-                        node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-                    ):
-                        ContextBuilder._skeletonize_node(node, docstring_provider)
-                        nodes.append(node)
-                if nodes:
-                    module = ast.Module(body=nodes, type_ignores=[])
-                    ast.fix_missing_locations(module)
-                    try:
-                        return ast.unparse(module)
-                    except Exception:
-                        pass
-        # Fallback: flat signature lines (unchanged, no docstrings available)
-        sigs = []
-        for m in re.finditer(
-            r"^[ \t]*((?:async\s+)?(?:def|class|function|fn|func)\s+\w+[^\n:{]*)",
-            code,
-            re.MULTILINE,
-        ):
-            sigs.append(m.group(1).strip())
-        return "\n".join(f"{s} ..." for s in sigs) if sigs else ""
-
-    async def _persist_skeleton_to_ltm(
-        self,
-        skeleton_text: str,
-        project_id: str,
-        symbol: Optional[str],
-    ) -> None:
-        """
-        Store a skeleton snapshot in ChromaDB so future sessions can retrieve
-        the architecture without re-deriving it from source.
-
-        Tagged with is_skeleton=True and code_state_hash for freshness checking.
-        Deduplicates by code_state_hash+symbol: if the code hasn't changed since
-        last storage, the upsert is a no-op (same id → overwrites with same data).
-        """
-        if not (
-            HAS_SENTENCE
-            and HAS_CHROMA
-            and self._f.memory_collection is not None
-            and self._f.embedder is not None
-        ):
-            return
-        try:
-            code_hash = self._f._activation.compute_code_state_hash(project_id)
-            if not code_hash:
-                return
-            sym_tag = symbol or "__full__"
-            entry_id = f"{project_id}_skeleton_{sym_tag}_{code_hash}"
-            now = time.time()
-            expires_at = (
-                now + self._f.valves.skeleton_ltm_expiration_days * 86400
-                if self._f.valves.skeleton_ltm_expiration_days > 0
-                else None
-            )
-            # Requires an embedder supporting 32768 context or more.
-            safe_text = self._f._tokens.truncate_text_to_tokens(skeleton_text, 32768)
-            embedding = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(safe_text).tolist()
-            )
-            await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.upsert(
-                    ids=[entry_id],
-                    embeddings=[embedding],
-                    documents=[skeleton_text],
-                    metadatas=[
-                        {
-                            "project_id": project_id,
-                            "role": "assistant",
-                            "timestamp": now,
-                            "expires_at": expires_at,
-                            "is_skeleton": True,
-                            "skeleton_symbol": sym_tag,
-                            "code_state_hash": code_hash,
-                            "content_type": ContentType.BASE_CODE.value,
-                            "has_code": True,
-                        }
-                    ],
-                )
-            )
-            self._f._log_debug(
-                f"Skeleton persisted to LTM " f"(symbol={sym_tag}, hash={code_hash})"
-            )
-        except Exception as exc:
-            self._f._log_debug(f"Skeleton LTM persist failed: {exc}")
-
-    async def _format_skeleton_for_symbol(
-        self,
-        symbol_name: str,
-        project_id: str,
-        query: str,
-    ) -> str:
-        """
-        Emit a signature-only skeleton scoped to `symbol_name` plus its direct
-        callees (1-hop neighbours in the call graph).
-
-        Strategy:
-          1. Build an ActivationGraph seeded on `symbol_name` with 1 propagation
-             step so direct callees light up.
-          2. Collect the block hashes of every activated symbol; page-in evicted
-             blocks when needed.
-          3. Re-skeletonize: extract the AST nodes that match the activated
-             symbols, build a synthetic module, and unparse it — so the output
-             is a valid, minimal Python file containing only the relevant
-             skeletons, in class-first order.
-          4. If no activated symbols can be reconstructed, return "".
-        """
-        state = self._f._state_store.get_state(project_id)
-        if not state or not state.get("active_blocks"):
-            return ""
-
-        # 1. Seed activation on the target symbol + 1 hop
-        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-        ag = ActivationGraph()
-        ag.seed([symbol_name], initial_score=1.0)
-        ag.propagate(
-            edges_out, max_steps=2, min_score=0.1, alpha=self._f.valves.ppr_alpha
-        )
-        activated = ag.get_activated_nodes(
-            threshold=self._f.valves.path_activation_threshold
-        )
-        if not activated:
-            activated = {symbol_name: 1.0}
-
-        # 2. Resolve activated symbols → blocks (with page-in fallback)
-        block_hashes: Set[str] = set()
-        for sym in activated:
-            for bh in self._f._symbol_index.find_blocks(sym, project_id):
-                block_hashes.add(bh)
-
-        blocks_content: List[tuple] = []  # (content, file_path, is_primary)
-        seen_hashes: Set[str] = set()
-        for bh in block_hashes:
-            if bh in seen_hashes:
-                continue
-            seen_hashes.add(bh)
-            block = state["active_blocks"].get(bh)
-            if block is None and self._f._pager is not None:
-                if self._f._pager.is_paged(bh, project_id):
-                    block = await self._f._pager.page_in_block(
-                        block_hash=bh,
-                        project_id=project_id,
-                        chroma_collection=self._f.memory_collection,
-                        db_conn=self._f._db_conn,
-                    )
-            if block and not block.obsolete:
-                is_primary = any(s.name == symbol_name for s in block.symbols)
-                blocks_content.append((block.content, block.file_path, is_primary))
-
-        if not blocks_content:
-            return ""
-
-        # 3. Re-skeletonize: filter AST nodes to only the activated set
-        skel_parts = self._extract_filtered_skeleton(
-            blocks_content, activated, symbol_name
-        )
-        if not skel_parts:
-            return ""
-
-        # 4. Format output
-        effective_budget = max(
-            4000,
-            self._f.valves.context_window_tokens
-            - self._f._last_system_tokens.get(project_id, 0)
-            - self._f.valves.response_reserve_tokens,
-        )
-        budget = min(effective_budget // 2, 16000)
-
-        hop_count = len(activated) - 1
-        header = (
-            f"## Skeleton of `{symbol_name}` "
-            f"(+{hop_count} direct dep(s))\n"
-            "_Signatures only — bodies as `...` — fill in to implement._\n"
-        )
-        total = self._f._tokens.estimate_code_tokens(header)
-        lines = [header]
-        truncated = False
-
-        for label, code, is_primary in skel_parts:
-            if truncated:
-                break
-            fence_lang = "python" if (label or "").endswith(".py") else ""
-            tag = " _(primary)_" if is_primary else ""
-            chunk = f"### `{label}`{tag}\n```{fence_lang}\n{code}\n```\n"
-            tok = self._f._tokens.estimate_code_tokens(chunk)
-            if total + tok > budget:
-                truncated = True
-                break
-            lines.append(chunk)
-            total += tok
-
-        if truncated:
-            lines.append("_[skeleton truncated — use `/expand <name>` for full body]_")
-
-        hint = (
-            f"\n_Use `/expand {symbol_name}` for the full implementation. "
-            "Mention any symbol name in your next message to activate its LOD context._"
-        )
-        lines.append(hint)
-        return "\n".join(lines)
-
-    @staticmethod
-    def _extract_filtered_skeleton(
-        blocks_content: List[tuple],
-        activated: dict,
-        primary_name: str,
-    ) -> List[tuple]:
-        """
-        For each (content, file_path, is_primary) triple, parse the source and
-        keep only the AST nodes (FunctionDef / AsyncFunctionDef / ClassDef)
-        whose name is in `activated`, searching recursively (not just top-level).
-        Skeletonize each kept node and unparse. Returns [(label, skeleton_code,
-        is_primary)] in primary-first order.
-
-        Falls back to the regex-based flat signature list when ast.unparse is
-        unavailable (Python < 3.9) or parsing fails.
-        """
-        results = []
-        ordered = sorted(blocks_content, key=lambda t: (not t[2], t[1] or ""))
-
-        for content, file_path, is_primary in ordered:
-            label = file_path or "(inline)"
-            if not content:
-                continue
-            kept_nodes = []
-            parsed_ok = False
-            if hasattr(ast, "unparse"):
-                try:
-                    tree = ast.parse(content)
-                    parsed_ok = True
-                except SyntaxError:
-                    pass
-
-            if parsed_ok:
-                # Walk the whole AST so methods nested inside classes are found.
-                for node in ast.walk(tree):
-                    node_name = getattr(node, "name", None)
-                    if node_name not in activated:
-                        continue
-                    if isinstance(
-                        node,
-                        (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
-                    ):
-                        ContextBuilder._skeletonize_node(node)
-                        kept_nodes.append(node)
-
-                if kept_nodes:
-                    module = ast.Module(body=kept_nodes, type_ignores=[])
-                    ast.fix_missing_locations(module)
-                    try:
-                        skel_code = ast.unparse(module)
-                        results.append((label, skel_code, is_primary))
-                        continue
-                    except Exception:
-                        pass
-
-            # Fallback: regex flat signatures filtered by activated set
-            sigs = []
-            for m in re.finditer(
-                r"^[ \t]*((?:async\s+)?(?:def|class)\s+(\w+)[^\n:{]*)",
-                content,
-                re.MULTILINE,
-            ):
-                if m.group(2) in activated:
-                    sigs.append(m.group(1).strip() + " ...")
-            if sigs:
-                results.append((label, "\n".join(sigs), is_primary))
-
-        return results
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Inventory / listing helpers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _format_full_symbol_inventory(
-        self, all_qids: set, project_id: str
-    ) -> str:
-        """Return a formatted inventory of all indexed symbols, grouped by
-        file.
-
-        `all_qids` must be a set of QUALIFIED ids (from
-        get_all_qualified_names), not bare names — otherwise methods with
-        the same bare name across different classes would silently collapse
-        to a single inventory row."""
-        state = self._f._state_store.get_state(project_id)
-        if not state or not state.get("active_blocks"):
-            return ""
-
-        by_file: dict = {}
-        pending_docstrings: List[str] = []  # qualified ids
-        for qid in sorted(all_qids):
-            meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
-
-            if meta is None:
-                for bh in self._f._symbol_index.find_blocks(qid, project_id):
-                    block = state["active_blocks"].get(bh)
-                    if block is None and self._f._pager is not None:
-                        if self._f._pager.is_paged(bh, project_id):
-                            block = await self._f._pager.page_in_block(
-                                block_hash=bh,
-                                project_id=project_id,
-                                chroma_collection=self._f.memory_collection,
-                                db_conn=self._f._db_conn,
-                            )
-                    if block and not block.obsolete:
-                        bare_name = qid.rsplit(".", 1)[-1]
-                        sym = next(
-                            (
-                                s
-                                for s in block.symbols
-                                if s.name == bare_name
-                                and qualify_symbol_name(s.name, s.parent_symbol) == qid
-                            ),
-                            None,
-                        )
-                        meta = {
-                            "name": bare_name,
-                            "signature": sym.signature if sym else bare_name,
-                            "docstring": sym.docstring if sym else "",
-                            "file_path": block.file_path,
-                            "kind": sym.kind if sym else "function",
-                            "language": sym.language if sym else "unknown",
-                            "parent_symbol": sym.parent_symbol if sym else "",
-                        }
-                        break
-
-            if meta is None:
-                continue
-
-            if not meta.get("docstring") and self._f.valves.enable_auto_docstrings:
-                pending_docstrings.append(qid)
-
-            file_key = meta.get("file_path") or "(unknown)"
-            by_file.setdefault(file_key, []).append((qid, meta))
-
-        if pending_docstrings:
-            resolved = await self._f._enrichment.ensure_docstrings_batch(
-                pending_docstrings, project_id
-            )
-            if resolved:
-                for entries in by_file.values():
-                    for qid, meta in entries:
-                        if qid in resolved:
-                            meta["docstring"] = resolved[qid]
-
-        if not by_file:
-            return ""
-
-        if (
-            self._f.valves.enable_hierarchical_inventory
-            and len(all_qids) > self._f.valves.inventory_hierarchical_threshold
-        ):
-            return self._format_inventory_hierarchical(by_file, all_qids, project_id)
-
-        lines = ["## Full Symbol Inventory\n"]
-        total_tokens = self._f._tokens.estimate_code_tokens(lines[0])
-
-        effective_budget = max(
-            4000,
-            self._f.valves.context_window_tokens
-            - self._f._last_system_tokens.get(project_id, 0)
-            - self._f.valves.response_reserve_tokens,
-        )
-        budget = min(effective_budget // 2, 16000)
-
-        for file_path in sorted(by_file.keys()):
-            lines.append(f"### {file_path}")
-            for qid, meta in by_file[file_path]:
-                parent = meta.get("parent_symbol", "")
-                name = meta.get("name", qid.rsplit(".", 1)[-1])
-                qualified = f"{parent}.{name}" if parent else name
-                sig = meta.get("signature") or name
-                doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
-                line = f"- `{qualified}` `{sig}`{doc}"
-                tok = self._f._tokens.estimate_code_tokens(line)
-                if total_tokens + tok > budget:
-                    lines.append(
-                        f"\n_(Truncated at {budget} tokens — {len(all_qids)} symbols total)_"
-                    )
-                    return "\n".join(lines)
-                lines.append(line)
-                total_tokens += tok
-            lines.append("")
-
-        lines.append(
-            f"\n_{len(all_qids)} symbols indexed. Use `/expand <name>` for full body._"
-        )
-        return "\n".join(lines)
-
-    def _format_inventory_hierarchical(
-        self, by_file: dict, all_names: set, project_id: str
-    ) -> str:
-        effective_budget = max(
-            4000,
-            self._f.valves.context_window_tokens
-            - self._f._last_system_tokens.get(project_id, 0)
-            - self._f.valves.response_reserve_tokens,
-        )
-        budget = min(effective_budget // 2, 16000)
-
-        classes_by_file: dict = {}
-        funcs_by_file: dict = {}
-        for fpath, entries in by_file.items():
-            for name, meta in entries:
-                kind = meta.get("kind", "function")
-                target = classes_by_file if kind == "class" else funcs_by_file
-                target.setdefault(fpath, []).append((name, meta))
-
-        lines = ["## Code Inventory (architecture view)\n"]
-        total = self._f._tokens.estimate_code_tokens(lines[0])
-
-        lines.append("### Files")
-        for fpath in sorted(by_file.keys()):
-            n_cls = len(classes_by_file.get(fpath, []))
-            n_fn = len(funcs_by_file.get(fpath, []))
-            toc = f"- `{fpath}` — {n_cls} class(es), {n_fn} function(s)"
-            total += self._f._tokens.estimate_code_tokens(toc)
-            lines.append(toc)
-        lines.append("")
-
-        if classes_by_file:
-            lines.append("### Classes")
-            for fpath in sorted(classes_by_file.keys()):
-                for name, meta in classes_by_file[fpath]:
-                    doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
-                    line = f"- `{name}`{doc}  ({fpath})"
-                    total += self._f._tokens.estimate_code_tokens(line)
-                    lines.append(line)
-            lines.append("")
-
-        truncated = False
-        if funcs_by_file:
-            lines.append("### Functions")
-            for fpath in sorted(funcs_by_file.keys()):
-                bucket: list = []
-                for name, meta in funcs_by_file[fpath]:
-                    sig = meta.get("signature") or name
-                    doc = f" — {meta['docstring']}" if meta.get("docstring") else ""
-                    full = f"- `{sig}`{doc}"
-                    tok = self._f._tokens.estimate_code_tokens(full)
-                    if total + tok <= budget:
-                        bucket.append(full)
-                        total += tok
-                        continue
-                    short = f"- `{name}`"
-                    stok = self._f._tokens.estimate_code_tokens(short)
-                    if total + stok <= budget:
-                        bucket.append(short)
-                        total += stok
-                    else:
-                        truncated = True
-                        break
-                if bucket:
-                    lines.append(f"#### {fpath}")
-                    lines.extend(bucket)
-                if truncated:
-                    break
-
-        footer = f"\n_{len(all_names)} symbols indexed."
-        if truncated:
-            footer += " Function list truncated to fit budget;"
-        footer += " use `/expand <name>` for any full body._"
-        lines.append(footer)
-        return "\n".join(lines)
-
-    def _build_swa_ordered_lod_parts(
-        self, lod0: list, lod1: list, lod2: list, lod3: list
-    ) -> str:
-        """
-        Helper: join LOD tier lists in SWA order (LOD-3 last).
-        Each argument is a list of already-rendered section strings.
-        """
-        sections = []
-        for tier in (lod0, lod1, lod2, lod3):
-            if tier:
-                sections.append("\n".join(tier))
-        return "\n".join(s for s in sections if s.strip())
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 7. KV slot persistence (save / restore of llama.cpp KV cache)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def slot_save(self, project_id: str, force: bool = False) -> bool:
-        """
-        Save the KV slot after a turn.
-
-        force=True ignores the static-hash guard (used after monotonic
-        compaction, when the history prefix changed but Block A did not — #16).
-        The token-threshold guard (P5) is always respected.
-
-        MIGRATE-VERBATIM: Filter._slot_save_if_needed().
-        """
-        if not self._f.valves.enable_slot_persistence:
-            return False
-
-        # Fix P5: skip oversized KV writes — slot save writes the whole KV state
-        # to disk under the server mutex, stalling all inference (~1.5GB stall).
-        _max_ctx = self._f.valves.slot_save_max_context_tokens
-        if _max_ctx > 0:
-            _ctx_tok = self._f._last_total_context_tokens.get(project_id, 0)
-            if _ctx_tok > _max_ctx:
-                self._f._log_debug(
-                    f"Slot save skipped: context {_ctx_tok} tokens > threshold "
-                    f"{_max_ctx} (avoids large KV write under mutex)"
-                )
-                return False
-
-        cached = self._block_a_cache.get(project_id)
-        if not cached:
-            return False
-        _, static_text = cached
-        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
-
-        if not force and self._f._last_saved_slot_hash.get(project_id) == static_hash:
-            return False
-
-        filename = self._slot_filename(project_id, static_hash)
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        try:
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "save"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
-            ) as resp:
-                if resp.status == 200:
-                    self._f._last_saved_slot_hash[project_id] = static_hash
-                    data = await resp.json()
-                    self._f._log_debug(
-                        f"✓ Slot saved → {filename} "
-                        f"({data.get('n_saved', '?')} tokens, "
-                        f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
-                    )
-                    await self._cleanup_old_slot_files(project_id, filename)
-                    return True
-                else:
-                    body = await resp.text()
-                    self._f._log_debug(f"Slot save failed: HTTP {resp.status} — {body}")
-                    return False
-        except Exception as e:
-            self._f._log_debug(f"Slot save error: {e}")
-            return False
-
-    async def slot_restore(self, project_id: str) -> bool:
-        """
-        Restore the KV slot at session start.
-
-        MIGRATE-VERBATIM: Filter._slot_restore_if_available().
-        """
-        if not self._f.valves.enable_slot_persistence:
-            return False
-        if self._f._slot_restore_attempted.get(project_id):
-            return self._f._slot_restored.get(project_id, False)
-
-        self._f._slot_restore_attempted[project_id] = True
-
-        cached = self._block_a_cache.get(project_id)
-        if not cached:
-            return False
-        _, static_text = cached
-        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
-        filename = self._slot_filename(project_id, static_hash)
-
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.exists(os.path.join(slot_dir, filename)):
-            self._f._log_debug(f"Slot restore: no file found for {filename}")
-            return False
-
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        try:
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "restore"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
-            ) as resp:
-                if resp.status == 200:
-                    self._f._slot_restored[project_id] = True
-                    data = await resp.json()
-                    self._f._log_debug(
-                        f"✓ Slot restored ← {filename} "
-                        f"({data.get('n_restored', '?')} tokens)"
-                    )
-                    return True
-                else:
-                    body = await resp.text()
-                    self._f._log_debug(
-                        f"Slot restore failed: HTTP {resp.status} — {body}"
-                    )
-                    return False
-        except Exception as e:
-            self._f._log_debug(f"Slot restore error: {e}")
-            return False
-
-    async def slot_restore_for_continuity(self, project_id: str) -> bool:
-        """
-        Restore KV cache after auxiliary LLM calls (CoT, contradiction) have
-        dirtied the slot due to SWA architecture. Called at the end of every
-        inlet when slot_free=True.
-
-        MIGRATE-VERBATIM: Filter._slot_restore_for_continuity().
-        """
-        if not self._f.valves.enable_slot_persistence:
-            return False
-
-        cached = self._block_a_cache.get(project_id)
-        if not cached:
-            return False
-        _, static_text = cached
-        static_hash = hashlib.md5(static_text.encode()).hexdigest()[:16]
-        filename = self._slot_filename(project_id, static_hash)
-
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.exists(os.path.join(slot_dir, filename)):
-            return False
-
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        try:
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "restore"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    self._f._log_debug(
-                        f"✓ KV cache restored post-aux ← {filename} "
-                        f"({data.get('n_restored', '?')} tokens)"
-                    )
-                    return True
-                body = await resp.text()
-                self._f._log_debug(
-                    f"KV cache continuity restore failed: HTTP {resp.status} — {body}"
-                )
-                return False
-        except Exception as e:
-            self._f._log_debug(f"KV cache continuity restore error: {e}")
-            return False
-
-    def _slot_filename(self, project_id: str, static_hash: str) -> str:
-        """
-        Deterministic slot file name.
-        Encodes: project + static block hash + model hash.
-        If any of the three changes → different name → no stale restore.
-
-        MIGRATE-VERBATIM: Filter._slot_filename().
-        """
-        model_hash = hashlib.md5(self._f.valves.llm_model.encode()).hexdigest()[:8]
-        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
-        return f"slot{self._f.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
 
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """
@@ -5843,6 +4976,7 @@ class StateStore:
             self._f._path_index.clear_project(oldest_pid)
             self._f._pager.clear_project(oldest_pid)
             self._f._node_centrality.pop(oldest_pid, None)
+            self._f._last_resolved_graph_mode.pop(oldest_pid, None)
             self._f._last_static_prefix_hash.pop(oldest_pid, None)
             self._f._last_saved_slot_hash.pop(oldest_pid, None)
             self._f._slot_restored.pop(oldest_pid, None)
@@ -16817,6 +15951,61 @@ class Filter:
             le=200,
             description="Maximum hub symbols (top‑N by centrality) kept in Block A.",
         )
+        # ── Call graph depth in Block A ─────────────────────────────
+        call_graph_context_mode: str = Field(
+            default="auto",
+            description=(
+                "Control the depth of call graph injected into Block A.\n"
+                "- 'auto': resolved per-query from use_case/intent/project size/token budget (default).\n"
+                "- 'hubs_only': only top-N hub symbols (~300-500 tokens).\n"
+                "- 'expanded_hubs': top-N hubs + all direct callers/callees, depth 1 (~2k-5k tokens).\n"
+                "- 'full_graph': every symbol in the project with direct callers/callees (~8k-20k+ tokens)."
+            ),
+        )
+        full_graph_max_tokens: int = Field(
+            default=20000,
+            ge=1000,
+            description=(
+                "Token budget for full_graph mode. If the rendered graph would exceed "
+                "this, it is truncated (alphabetical cutoff) with an explicit notice — "
+                "never silently downgraded to a different mode."
+            ),
+        )
+        expanded_hubs_max_tokens: int = Field(
+            default=6000,
+            ge=500,
+            description="Token budget for expanded_hubs mode. Same truncation behavior as full_graph_max_tokens.",
+        )
+        call_graph_auto_full_graph_symbol_ceiling: int = Field(
+            default=300,
+            ge=20,
+            description=(
+                "In auto mode, full_graph is only considered when get_all_qualified_names() "
+                "count is at or below this ceiling. Above it, auto caps at expanded_hubs."
+            ),
+        )
+        call_graph_auto_expanded_hubs_symbol_ceiling: int = Field(
+            default=600,
+            ge=50,
+            description=(
+                "In auto mode, expanded_hubs is only considered when symbol count is at or "
+                "below this ceiling. Above it, auto caps at hubs_only regardless of intent."
+            ),
+        )
+        call_graph_auto_min_free_tokens_for_full: int = Field(
+            default=100000,
+            ge=0,
+            description=(
+                "In auto mode, full_graph additionally requires this many free tokens in "
+                "the effective context budget. Prevents auto from injecting 20k tokens "
+                "into an already-tight window."
+            ),
+        )
+        call_graph_auto_min_free_tokens_for_expanded: int = Field(
+            default=20000,
+            ge=0,
+            description="Same guard as above, applied to expanded_hubs in auto mode.",
+        )
         # ── Inventory (structural / listing queries) ────────────────
         enable_hierarchical_inventory: bool = Field(
             default=True,
@@ -17417,6 +16606,9 @@ class Filter:
         self._symbol_index = SymbolIndex()
         self._path_index = PathIndex()
         self._node_centrality: Dict[str, Dict[str, float]] = {}
+        # project_id → last resolved call_graph_context_mode (for KV-cache-aware
+        # Block A rebuilds: a mode change invalidates Block A, a stable mode does not).
+        self._last_resolved_graph_mode: Dict[str, str] = {}
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
 
