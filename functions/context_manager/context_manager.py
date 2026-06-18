@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 9.0.0
 license: GPL3
-requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter>=0.21.0, tree-sitter-language-pack>=1.5.0, llmlingua>=0.2.0
+requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2
 """
 
 import os
@@ -4651,7 +4651,7 @@ class SignatureExtractor:
         except TypeError:
             # Old API (py-tree-sitter < 0.23.0): use set_language().
             parser = TSParser()
-            if hasattr(parser, 'set_language'):
+            if hasattr(parser, "set_language"):
                 parser.set_language(lang_obj)
             else:
                 raise RuntimeError(
