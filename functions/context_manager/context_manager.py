@@ -958,7 +958,9 @@ class HubSymbolIndex:
         it only renders. Deterministic while the code is unchanged (alphabetical /
         centrality order), so llama.cpp's KV cache stays stable.
         """
-        logger.debug(f"HubSymbolIndex.build: rendering mode='{mode}' for project='{project_id}'")
+        logger.debug(
+            f"HubSymbolIndex.build: rendering mode='{mode}' for project='{project_id}'"
+        )
 
         sections = []
 
@@ -1092,9 +1094,24 @@ class HubSymbolIndex:
         )
         budget_chars = max_tokens * 4 if max_tokens > 0 else None
 
-        logger.debug(
-            f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens."
-        )
+        # Defense in depth: a manual override of full_graph bypasses the
+        # auto-mode symbol-count ceiling entirely. Cap the candidate list
+        # itself (not just the rendered text) so an oversized manually-forced
+        # project never allocates per-symbol caller/callee sets it will
+        # immediately discard via truncation. ~4 chars/token, ~80 chars/line
+        # average for a symbol-with-edges line ⇒ budget_chars // 80 is a safe
+        # upper bound on how many lines could possibly fit regardless of
+        # actual edge density.
+        if budget_chars is not None:
+            max_renderable_lines = max(10, budget_chars // 80)
+            if len(all_qids) > max_renderable_lines:
+                all_qids = all_qids[:max_renderable_lines]
+                logger.debug(
+                    f"Full graph: capped candidate list from {len(all_qids)} to {max_renderable_lines} "
+                    f"(budget {max_tokens} tokens)"
+                )
+
+        logger.debug(f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens.")
 
         lines = [
             f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
@@ -1124,16 +1141,29 @@ class HubSymbolIndex:
             total_chars += len(line)
 
         if not truncated:
-            logger.debug(
-                f"Full graph: successfully rendered all {len(all_qids)} symbols."
-            )
+            logger.debug(f"Full graph: successfully rendered all {len(all_qids)} symbols.")
 
         return "\n".join(lines)
 
     def _format_symbol_line_no_score(self, qid, project_id, symbol_index) -> str:
         """Same as _format_symbol_line but without the centrality score column.
         full_graph forces callees on: showing the bidirectional edge set is the
-        whole point of this mode."""
+        whole point of this mode.
+
+        Caller attribution caveat: get_edges_in() resolves by bare name —
+        a method shared across multiple classes (every __init__, etc.) shows
+        the union of callers of ANY same-named method, not specifically this
+        occurrence. hubs_only/expanded_hubs limit this ambiguity to ≤top_n
+        symbols; full_graph surfaces it for every repeated bare name in the
+        project. Lines affected by this are marked '(ambiguous: shared name)'
+        so the model — and a human reading the dump — doesn't treat the
+        caller list as precise for those symbols.
+        """
+        bare_name = qid.rsplit(".", 1)[-1]
+        is_ambiguous_name = len(
+            symbol_index.get_qualified_names_for(bare_name, project_id)
+        ) > 1
+
         callers = self._safe_callers(qid, project_id, symbol_index)
         callees = self._safe_callees(qid, project_id, symbol_index)
 
@@ -1141,7 +1171,8 @@ class HubSymbolIndex:
         if callers:
             shown = sorted(callers)[:5]
             extra = f", ... (+{len(callers) - 5} more)" if len(callers) > 5 else ""
-            parts.append(f"\n  ← used by: {', '.join(shown)}{extra}")
+            tag = " (ambiguous: shared name)" if is_ambiguous_name else ""
+            parts.append(f"\n  ← used by{tag}: {', '.join(shown)}{extra}")
         if callees:
             shown = sorted(callees)[:5]
             extra = f", ... (+{len(callees) - 5} more)" if len(callees) > 5 else ""
@@ -2525,22 +2556,33 @@ class ContextBuilder:
 
         return static_block
 
-    def invalidate_block_a_cache(self, project_id: str, reason: str = "") -> None:
+    def invalidate_block_a_cache(
+        self, project_id: str, reason: str = "", recompute_centrality: bool = True
+    ) -> None:
         """
-        Force Block A rebuild on the next request and refresh centrality scores.
+        Force Block A rebuild on the next request, optionally refreshing
+        centrality scores.
 
         MIGRATION: from Filter._invalidate_static_context_block(), plus one
         addition — recompute centrality so HubSymbolIndex sees fresh scores.
+
+        recompute_centrality=False is used by call_graph_context_mode changes:
+        a mode flip (e.g. auto resolving "hubs_only" → "full_graph" because the
+        user's intent shifted) changes how much of the EXISTING graph is
+        rendered, not the graph itself. PageRank is O(V+E) per call and
+        recomputing it on every mode flip — which can happen every turn under
+        auto — is pure waste; only actual code changes (new/removed
+        symbols/edges) warrant a centrality refresh.
         """
         self._block_a_cache.pop(project_id, None)
         self._skeleton_cache.pop(project_id, None)
-        # Refresh centrality so the next build_block_a() ranks hubs correctly.
-        try:
-            self._f._node_centrality[project_id] = (
-                self._f._symbol_index.precompute_centrality(project_id)
-            )
-        except Exception:
-            pass
+        if recompute_centrality:
+            try:
+                self._f._node_centrality[project_id] = (
+                    self._f._symbol_index.precompute_centrality(project_id)
+                )
+            except Exception:
+                pass
         if reason:
             self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
 
@@ -2660,11 +2702,15 @@ class ContextBuilder:
                     "refactor": "D",
                     "scaffold": "E",
                 }[m.group(1).lower()]
-                self._f._log_debug(f"classify_use_case: detected '{case}' via explicit command '/{m.group(1)}'")
+                self._f._log_debug(
+                    f"classify_use_case: detected '{case}' via explicit command '/{m.group(1)}'"
+                )
                 return case, dict(self.LOD_PROFILES[case])
 
         if self._UC_SCAFFOLD_RE.search(q):
-            self._f._log_debug("classify_use_case: detected 'E' (scaffolding) via regex")
+            self._f._log_debug(
+                "classify_use_case: detected 'E' (scaffolding) via regex"
+            )
             return "E", dict(self.LOD_PROFILES["E"])
 
         if self._UC_REFACTOR_RE.search(q):
@@ -2672,7 +2718,9 @@ class ContextBuilder:
             return "D", dict(self.LOD_PROFILES["D"])
 
         if self._UC_ARCH_RE.search(q):
-            self._f._log_debug("classify_use_case: detected 'A' (architecture) via regex")
+            self._f._log_debug(
+                "classify_use_case: detected 'A' (architecture) via regex"
+            )
             return "A", dict(self.LOD_PROFILES["A"])
 
         if self._UC_PLAN_RE.search(q):
@@ -2699,7 +2747,9 @@ class ContextBuilder:
             )
             return "A", dict(self.LOD_PROFILES["A"])
 
-        self._f._log_debug("classify_use_case: default 'C' (programming) - no specific signals")
+        self._f._log_debug(
+            "classify_use_case: default 'C' (programming) - no specific signals"
+        )
         return "C", dict(self.LOD_PROFILES["C"])
 
     def _resolve_call_graph_mode(
@@ -2899,19 +2949,52 @@ class ContextBuilder:
         # graph itself is rendered into Block A. A change of resolved mode
         # invalidates Block A exactly like any other content change; a stable
         # mode across turns leaves Block A a normal cache hit.
-        resolved_graph_mode = self._resolve_call_graph_mode(
+        #
+        # Hysteresis: in "auto", a single off-topic turn (e.g. a bugfix
+        # question in the middle of an architecture discussion) should not
+        # immediately collapse Block A back to hubs_only and force another
+        # full prefill on the very next architecture follow-up. Upgrades
+        # (more graph detail requested) apply immediately — under-serving
+        # context is worse than an extra cache miss. Downgrades only apply
+        # after call_graph_mode_downgrade_after_turns consecutive turns that
+        # would resolve to a lower level.
+        raw_resolved_mode = self._resolve_call_graph_mode(
             query, intent_vector, project_id
         )
+        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
         previous_mode = self._f._last_resolved_graph_mode.get(project_id)
+
+        if previous_mode is None or _MODE_RANK.get(
+            raw_resolved_mode, 0
+        ) >= _MODE_RANK.get(previous_mode, 0):
+            # First resolution ever, or an upgrade/stay-equal: apply immediately.
+            resolved_graph_mode = raw_resolved_mode
+            self._f._graph_mode_downgrade_streak[project_id] = 0
+        else:
+            # Candidate downgrade: only commit after enough consecutive turns.
+            streak = self._f._graph_mode_downgrade_streak.get(project_id, 0) + 1
+            self._f._graph_mode_downgrade_streak[project_id] = streak
+            if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
+                resolved_graph_mode = raw_resolved_mode
+                self._f._graph_mode_downgrade_streak[project_id] = 0
+            else:
+                resolved_graph_mode = previous_mode
+                self._f._log_debug(
+                    f"Call graph mode: downgrade to {raw_resolved_mode} deferred "
+                    f"({streak}/{self._f.valves.call_graph_mode_downgrade_after_turns} "
+                    f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
+                )
+
         if previous_mode != resolved_graph_mode:
             self._f._log_debug(
                 f"Call graph mode: {previous_mode or '(none)'} → "
-                f"{resolved_graph_mode} (triggers Block A rebuild)"
+                f"{resolved_graph_mode} (triggers Block A rebuild, no centrality recompute)"
             )
             self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
             self.invalidate_block_a_cache(
                 project_id,
                 f"call_graph_context_mode resolved to {resolved_graph_mode}",
+                recompute_centrality=False,
             )
 
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
@@ -5028,6 +5111,7 @@ class StateStore:
             self._f._pager.clear_project(oldest_pid)
             self._f._node_centrality.pop(oldest_pid, None)
             self._f._last_resolved_graph_mode.pop(oldest_pid, None)
+            self._f._graph_mode_downgrade_streak.pop(oldest_pid, None)
             self._f._last_static_prefix_hash.pop(oldest_pid, None)
             self._f._last_saved_slot_hash.pop(oldest_pid, None)
             self._f._slot_restored.pop(oldest_pid, None)
@@ -13565,7 +13649,16 @@ class InletOrchestrator:
         self,
         messages: list,
     ) -> Tuple[Optional[dict], str, str, bool, bool]:
-        """Extract last user message, query, and detect explicit commands."""
+        """Extract last user message, query, and detect explicit commands.
+
+        IMPORTANT: this is the canonical point where the user's own system
+        message(s) are captured. Every downstream step (code-history
+        compression, LLMLingua history compression, turn-based eviction,
+        adaptive trim) operates on `messages` and may rewrite or drop system
+        entries — capturing here, before any of that runs, guarantees the
+        original user instructions are preserved verbatim regardless of what
+        happens to `messages` afterward. See Filter._original_system_prompt.
+        """
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -13602,6 +13695,18 @@ class InletOrchestrator:
         is_explicit_command = last_user_msg and last_user_msg.get(
             "content", ""
         ).startswith("/")
+
+        # Capture EVERY system message now, joined in order, before any
+        # downstream compression/trim step can touch them. This is the only
+        # read of the user's original system prompt(s) in the whole pipeline;
+        # everywhere else, the captured string is passed through explicitly.
+        system_msgs_now = [m for m in messages if m.get("role") == "system"]
+        original_system_prompt = "\n\n".join(
+            m.get("content", "")
+            for m in system_msgs_now
+            if m.get("content", "").strip()
+        )
+        self._f._original_system_prompt = original_system_prompt
 
         return (
             last_user_msg,
@@ -15215,7 +15320,20 @@ class MessageAssembler:
             static_tokens = (
                 len(self._f.tokenizer.encode(static_block)) if static_block else 0
             )
-            dyn_budget = max(0, budget - static_tokens)
+            user_prompt_tokens = (
+                len(
+                    self._f.tokenizer.encode(
+                        getattr(self._f, "_original_system_prompt", "") or ""
+                    )
+                )
+                if getattr(self._f, "_original_system_prompt", "")
+                else 0
+            )
+            # The user's system prompt is never truncated or dropped to fit
+            # the budget — only CodeAware's own dynamic injections are
+            # rationed against what remains after static block + user prompt.
+            dyn_budget = max(0, budget - static_tokens - user_prompt_tokens)
+
             for prio, text in dynamic_injections:
                 if not text:
                     continue
@@ -15233,13 +15351,25 @@ class MessageAssembler:
             dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
         separator = "\n\n---\n\n" if static_block and dynamic_block else ""
-        final_system = static_block + separator + dynamic_block
+        codeaware_block = static_block + separator + dynamic_block
 
-        # Append base system content (from original message)
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
+        # The user's own system prompt was captured ONCE at the start of
+        # inlet (InletOrchestrator.inlet_extract_user_info), before any
+        # compression/trim step could touch it. Re-reading `messages` here
+        # would risk picking up a mangled/stripped version if an upstream
+        # step rewrote the system role (e.g. history LLMLingua compression),
+        # and would only preserve the first of several system messages.
+        # Inject it FIRST, clearly delimited, so user instructions are not
+        # buried under CodeAware's own injections and so the model's
+        # instruction-following sees them at the top of the system turn.
+        base_content = getattr(self._f, "_original_system_prompt", "") or ""
+
+        final_system_parts = []
         if base_content.strip():
-            final_system = final_system + "\n\n" + base_content
+            final_system_parts.append("## User instructions\n" + base_content.strip())
+        if codeaware_block.strip():
+            final_system_parts.append(codeaware_block)
+        final_system = "\n\n---\n\n".join(final_system_parts)
 
         # Append pending summary if any
         if pending_summary:
@@ -15270,6 +15400,15 @@ class MessageAssembler:
             dynamic_tok = (
                 len(self._f.tokenizer.encode(dynamic_block)) if dynamic_block else 0
             )
+            base_tok = (
+                len(
+                    self._f.tokenizer.encode(
+                        getattr(self._f, "_original_system_prompt", "") or ""
+                    )
+                )
+                if getattr(self._f, "_original_system_prompt", "")
+                else 0
+            )
             total_system_tok = len(self._f.tokenizer.encode(final_system))
 
             self._f._last_system_tokens[project_id] = total_system_tok
@@ -15277,6 +15416,9 @@ class MessageAssembler:
             prefix_hash = self._f._last_static_prefix_hash.get(project_id, "N/A")
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
+            self._f._log_debug(
+                f"  User system prompt (captured): ~{base_tok} tokens (first)"
+            )
             self._f._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
             self._f._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
             self._f._log_debug(
@@ -16057,6 +16199,18 @@ class Filter:
             ge=0,
             description="Same guard as above, applied to expanded_hubs in auto mode.",
         )
+        call_graph_mode_downgrade_after_turns: int = Field(
+            default=3,
+            ge=1,
+            le=20,
+            description=(
+                "In auto mode, a resolved downgrade (e.g. full_graph → hubs_only) "
+                "only commits after this many consecutive turns that would "
+                "resolve lower than the currently active mode. Upgrades always "
+                "apply immediately. Prevents Block A from flip-flopping (and "
+                "forcing a full KV-cache prefill) on every topic switch."
+            ),
+        )
         # ── Inventory (structural / listing queries) ────────────────
         enable_hierarchical_inventory: bool = Field(
             default=True,
@@ -16660,6 +16814,10 @@ class Filter:
         # project_id → last resolved call_graph_context_mode (for KV-cache-aware
         # Block A rebuilds: a mode change invalidates Block A, a stable mode does not).
         self._last_resolved_graph_mode: Dict[str, str] = {}
+        # project_id → consecutive turns whose raw auto-resolution is below the
+        # currently active mode. Used to apply hysteresis to downgrades only
+        # (see ContextBuilder.build_block_b, Group B bugfix).
+        self._graph_mode_downgrade_streak: Dict[str, int] = {}
         self._cached_lightweight_context: Dict[str, str] = {}
         self._cached_code_state_hash: Optional[str] = None
 
@@ -16710,6 +16868,9 @@ class Filter:
 
         # ── Silent ingestion guard ──
         self._is_silent_ingestion = False
+
+        # ── Original user system prompt, captured once per turn ──
+        self._original_system_prompt: str = ""
 
         print("[CodeAware] Filter loaded")
 
