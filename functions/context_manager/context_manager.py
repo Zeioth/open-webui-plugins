@@ -1005,9 +1005,12 @@ class HubSymbolIndex:
         neighbors and balloon token cost, blowing the ~2k-5k budget).
         Truncated by expanded_hubs_max_tokens with an explicit notice.
         """
-        enable_callees = getattr(valves, "enable_hub_callees", True) if valves else True
+        enable_callees = (
+            getattr(valves, "enable_hub_callees", True) if valves else True
+        )
         hub_qids = self.get_hub_names(centrality, top_n)
         if not hub_qids:
+            self._f._log_debug("Expanded hubs: no hubs found, returning empty.")
             return ""
 
         hub_section = self._build_hub_section(
@@ -1024,20 +1027,28 @@ class HubSymbolIndex:
                 neighbor_lines.append(f"- `{qid}` neighbors: {', '.join(extra)}")
 
         if not neighbor_lines:
+            self._f._log_debug("Expanded hubs: no neighbor lines to add.")
             return hub_section
 
         budget_chars = self.valves_expanded_hubs_budget_chars(valves)
         kept_lines = []
         total = 0
+        omitted = 0
         for idx, line in enumerate(neighbor_lines):
             total += len(line)
             if budget_chars and total > budget_chars:
+                omitted = len(neighbor_lines) - idx
                 kept_lines.append(
                     f"_(Neighbor list truncated to fit budget — "
-                    f"{len(neighbor_lines) - idx} hub(s) omitted)_"
+                    f"{omitted} hub(s) omitted)_"
                 )
                 break
             kept_lines.append(line)
+
+        self._f._log_debug(
+            f"Expanded hubs: {len(hub_qids)} hubs, {len(neighbor_lines)} neighbor entries total, "
+            f"{len(kept_lines) - (1 if omitted else 0)} shown, {omitted} omitted due to budget."
+        )
 
         neighbor_section = (
             "### Direct neighbors of hub symbols (depth 1, non-hub only)\n"
@@ -1073,12 +1084,15 @@ class HubSymbolIndex:
         """
         all_qids = sorted(symbol_index.get_all_qualified_names(project_id))
         if not all_qids:
+            logger.debug("Full graph: no symbols found, returning empty.")
             return ""
 
         max_tokens = (
             getattr(valves, "full_graph_max_tokens", 20000) if valves else 20000
         )
         budget_chars = max_tokens * 4 if max_tokens > 0 else None
+
+        logger.debug(f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens.")
 
         lines = [
             f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
@@ -1088,6 +1102,7 @@ class HubSymbolIndex:
         ]
         total_chars = sum(len(l) for l in lines)
 
+        truncated = False
         for idx, qid in enumerate(all_qids):
             line = self._format_symbol_line_no_score(qid, project_id, symbol_index)
             if budget_chars is not None and total_chars + len(line) > budget_chars:
@@ -1097,9 +1112,17 @@ class HubSymbolIndex:
                     f"{remaining} symbol(s) omitted. Consider expanded_hubs "
                     f"or raising full_graph_max_tokens.)_"
                 )
+                truncated = True
+                logger.debug(
+                    f"Full graph truncated: kept {idx} symbols out of {len(all_qids)}, "
+                    f"omitted {remaining} due to budget {max_tokens} tokens."
+                )
                 break
             lines.append(line)
             total_chars += len(line)
+
+        if not truncated:
+            logger.debug(f"Full graph: successfully rendered all {len(all_qids)} symbols.")
 
         return "\n".join(lines)
 
@@ -2429,6 +2452,10 @@ class ContextBuilder:
                 resolved_mode = self._f._last_resolved_graph_mode.get(
                     project_id, "hubs_only"
                 )
+                self._f._log_debug(
+                    f"Building Block A symbol section with mode='{resolved_mode}' "
+                    f"(project={project_id})"
+                )
                 symbol_section = self._f._hub_index.build(
                     symbol_index=self._f._symbol_index,
                     centrality=centrality,
@@ -2722,42 +2749,62 @@ class ContextBuilder:
         counted distinctly — otherwise the ceilings would be wildly miscalibrated
         on codebases with heavy method-name duplication.
         """
-        if self._f.valves.call_graph_context_mode != "auto":
-            return self._f.valves.call_graph_context_mode
+        valve = self._f.valves.call_graph_context_mode
+        self._f._log_debug(f"Resolving call graph mode: valve='{valve}'")
+
+        if valve != "auto":
+            self._f._log_debug(f"  manual override → '{valve}'")
+            return valve
 
         use_case, _ = self.classify_use_case(query, intent_vector)
-
         total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
         free_tokens = self.get_effective_context_budget(project_id)
 
+        self._f._log_debug(
+            f"  auto resolution: use_case={use_case}, total_symbols={total_symbols}, "
+            f"free_tokens={free_tokens}"
+        )
+
         def _full_graph_allowed() -> bool:
-            return (
-                total_symbols
-                <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
-                and free_tokens
-                >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            symbol_ok = total_symbols <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
+            token_ok = free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            self._f._log_debug(
+                f"    full_graph guard: symbol_ok={symbol_ok} "
+                f"({total_symbols} <= {self._f.valves.call_graph_auto_full_graph_symbol_ceiling}), "
+                f"token_ok={token_ok} "
+                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_full})"
             )
+            return symbol_ok and token_ok
 
         def _expanded_hubs_allowed() -> bool:
-            return (
-                total_symbols
-                <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
-                and free_tokens
-                >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            symbol_ok = total_symbols <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
+            token_ok = free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            self._f._log_debug(
+                f"    expanded_hubs guard: symbol_ok={symbol_ok} "
+                f"({total_symbols} <= {self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling}), "
+                f"token_ok={token_ok} "
+                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_expanded})"
             )
+            return symbol_ok and token_ok
 
         if use_case == "A":
             if _full_graph_allowed():
+                self._f._log_debug("  resolved mode: full_graph (use_case A, guards passed)")
                 return "full_graph"
             if _expanded_hubs_allowed():
+                self._f._log_debug("  resolved mode: expanded_hubs (use_case A, full_graph blocked, expanded passed)")
                 return "expanded_hubs"
+            self._f._log_debug("  resolved mode: hubs_only (use_case A, neither full nor expanded allowed)")
             return "hubs_only"
 
         if use_case == "D":
             if _expanded_hubs_allowed():
+                self._f._log_debug("  resolved mode: expanded_hubs (use_case D, guards passed)")
                 return "expanded_hubs"
+            self._f._log_debug("  resolved mode: hubs_only (use_case D, expanded blocked)")
             return "hubs_only"
 
+        self._f._log_debug(f"  resolved mode: hubs_only (use_case {use_case} default)")
         return "hubs_only"
 
     async def build_block_b(
