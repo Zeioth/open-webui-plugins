@@ -958,6 +958,8 @@ class HubSymbolIndex:
         it only renders. Deterministic while the code is unchanged (alphabetical /
         centrality order), so llama.cpp's KV cache stays stable.
         """
+        logger.debug(f"HubSymbolIndex.build: rendering mode='{mode}' for project='{project_id}'")
+
         sections = []
 
         outline = self._build_class_outline(symbol_index, project_id, valves)
@@ -1005,9 +1007,7 @@ class HubSymbolIndex:
         neighbors and balloon token cost, blowing the ~2k-5k budget).
         Truncated by expanded_hubs_max_tokens with an explicit notice.
         """
-        enable_callees = (
-            getattr(valves, "enable_hub_callees", True) if valves else True
-        )
+        enable_callees = getattr(valves, "enable_hub_callees", True) if valves else True
         hub_qids = self.get_hub_names(centrality, top_n)
         if not hub_qids:
             self._f._log_debug("Expanded hubs: no hubs found, returning empty.")
@@ -1092,7 +1092,9 @@ class HubSymbolIndex:
         )
         budget_chars = max_tokens * 4 if max_tokens > 0 else None
 
-        logger.debug(f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens.")
+        logger.debug(
+            f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens."
+        )
 
         lines = [
             f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
@@ -1122,7 +1124,9 @@ class HubSymbolIndex:
             total_chars += len(line)
 
         if not truncated:
-            logger.debug(f"Full graph: successfully rendered all {len(all_qids)} symbols.")
+            logger.debug(
+                f"Full graph: successfully rendered all {len(all_qids)} symbols."
+            )
 
         return "\n".join(lines)
 
@@ -2617,7 +2621,13 @@ class ContextBuilder:
         window = self._f.valves.context_window_tokens
         used = getattr(self._f, "_last_system_tokens", {}).get(project_id, 0)
         reserve = self._f.valves.response_reserve_tokens
-        return max(0, window - used - reserve)
+        budget = max(0, window - used - reserve)
+
+        self._f._log_debug(
+            f"get_effective_context_budget: window={window}, used_system={used}, "
+            f"reserve={reserve} → {budget} tokens available for history + user message"
+        )
+        return budget
 
     def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
         """
@@ -2639,6 +2649,7 @@ class ContextBuilder:
         Returns (case_label, profile_copy); the copy is safe to mutate.
         """
         q = query or ""
+
         if self._f.valves.lod_intent_explicit_override:
             m = self._UC_COMMAND_RE.match(q)
             if m:
@@ -2649,74 +2660,46 @@ class ContextBuilder:
                     "refactor": "D",
                     "scaffold": "E",
                 }[m.group(1).lower()]
+                self._f._log_debug(f"classify_use_case: detected '{case}' via explicit command '/{m.group(1)}'")
                 return case, dict(self.LOD_PROFILES[case])
+
         if self._UC_SCAFFOLD_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'E' (scaffolding) via regex")
             return "E", dict(self.LOD_PROFILES["E"])
+
         if self._UC_REFACTOR_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'D' (refactor) via regex")
             return "D", dict(self.LOD_PROFILES["D"])
+
         if self._UC_ARCH_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'A' (architecture) via regex")
             return "A", dict(self.LOD_PROFILES["A"])
+
         if self._UC_PLAN_RE.search(q):
+            self._f._log_debug("classify_use_case: detected 'B' (plan) via regex")
             return "B", dict(self.LOD_PROFILES["B"])
+
         iv = intent_vector or {}
         refactor_w = iv.get("refactor", 0.0)
         debug_w = iv.get("debug", 0.0)
         modify_w = iv.get("modify", 0.0)
         explain_w = iv.get("explain", 0.0)
+
         if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
+            self._f._log_debug(
+                f"classify_use_case: detected 'D' (refactor) via intent_vector tie-break "
+                f"(refactor={refactor_w:.2f})"
+            )
             return "D", dict(self.LOD_PROFILES["D"])
+
         if explain_w >= 0.5 and explain_w > modify_w:
+            self._f._log_debug(
+                f"classify_use_case: detected 'A' (architecture) via intent_vector tie-break "
+                f"(explain={explain_w:.2f} > modify={modify_w:.2f})"
+            )
             return "A", dict(self.LOD_PROFILES["A"])
-        return "C", dict(self.LOD_PROFILES["C"])
 
-    def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
-        """
-        Classify the query into one of five use cases and return its LOD profile.
-
-        A architecture · B plans · C programming · D refactor · E scaffolding.
-
-        Resolution order (first match wins):
-          1. Explicit command prefix (/arch /plan /code /refactor /scaffold),
-             when lod_intent_explicit_override is enabled.
-          2. Scaffolding regex (E).
-          3. Refactor regex (D) — BEFORE architecture, since the architecture
-             regex also matches "refactor".
-          4. Architecture/design regex (A).
-          5. Plan regex (B).
-          6. intent_vector tie-break: refactor-dominant → D, explain-dominant
-             → A; otherwise C (most common case).
-
-        Returns (case_label, profile_copy); the copy is safe to mutate.
-        """
-        q = query or ""
-        if self._f.valves.lod_intent_explicit_override:
-            m = self._UC_COMMAND_RE.match(q)
-            if m:
-                case = {
-                    "arch": "A",
-                    "plan": "B",
-                    "code": "C",
-                    "refactor": "D",
-                    "scaffold": "E",
-                }[m.group(1).lower()]
-                return case, dict(self.LOD_PROFILES[case])
-        if self._UC_SCAFFOLD_RE.search(q):
-            return "E", dict(self.LOD_PROFILES["E"])
-        if self._UC_REFACTOR_RE.search(q):
-            return "D", dict(self.LOD_PROFILES["D"])
-        if self._UC_ARCH_RE.search(q):
-            return "A", dict(self.LOD_PROFILES["A"])
-        if self._UC_PLAN_RE.search(q):
-            return "B", dict(self.LOD_PROFILES["B"])
-        iv = intent_vector or {}
-        refactor_w = iv.get("refactor", 0.0)
-        debug_w = iv.get("debug", 0.0)
-        modify_w = iv.get("modify", 0.0)
-        explain_w = iv.get("explain", 0.0)
-        if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
-            return "D", dict(self.LOD_PROFILES["D"])
-        if explain_w >= 0.5 and explain_w > modify_w:
-            return "A", dict(self.LOD_PROFILES["A"])
+        self._f._log_debug("classify_use_case: default 'C' (programming) - no specific signals")
         return "C", dict(self.LOD_PROFILES["C"])
 
     def _resolve_call_graph_mode(
@@ -2766,8 +2749,13 @@ class ContextBuilder:
         )
 
         def _full_graph_allowed() -> bool:
-            symbol_ok = total_symbols <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
-            token_ok = free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            symbol_ok = (
+                total_symbols
+                <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
+            )
+            token_ok = (
+                free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_full
+            )
             self._f._log_debug(
                 f"    full_graph guard: symbol_ok={symbol_ok} "
                 f"({total_symbols} <= {self._f.valves.call_graph_auto_full_graph_symbol_ceiling}), "
@@ -2777,8 +2765,14 @@ class ContextBuilder:
             return symbol_ok and token_ok
 
         def _expanded_hubs_allowed() -> bool:
-            symbol_ok = total_symbols <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
-            token_ok = free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            symbol_ok = (
+                total_symbols
+                <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
+            )
+            token_ok = (
+                free_tokens
+                >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
+            )
             self._f._log_debug(
                 f"    expanded_hubs guard: symbol_ok={symbol_ok} "
                 f"({total_symbols} <= {self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling}), "
@@ -2789,19 +2783,29 @@ class ContextBuilder:
 
         if use_case == "A":
             if _full_graph_allowed():
-                self._f._log_debug("  resolved mode: full_graph (use_case A, guards passed)")
+                self._f._log_debug(
+                    "  resolved mode: full_graph (use_case A, guards passed)"
+                )
                 return "full_graph"
             if _expanded_hubs_allowed():
-                self._f._log_debug("  resolved mode: expanded_hubs (use_case A, full_graph blocked, expanded passed)")
+                self._f._log_debug(
+                    "  resolved mode: expanded_hubs (use_case A, full_graph blocked, expanded passed)"
+                )
                 return "expanded_hubs"
-            self._f._log_debug("  resolved mode: hubs_only (use_case A, neither full nor expanded allowed)")
+            self._f._log_debug(
+                "  resolved mode: hubs_only (use_case A, neither full nor expanded allowed)"
+            )
             return "hubs_only"
 
         if use_case == "D":
             if _expanded_hubs_allowed():
-                self._f._log_debug("  resolved mode: expanded_hubs (use_case D, guards passed)")
+                self._f._log_debug(
+                    "  resolved mode: expanded_hubs (use_case D, guards passed)"
+                )
                 return "expanded_hubs"
-            self._f._log_debug("  resolved mode: hubs_only (use_case D, expanded blocked)")
+            self._f._log_debug(
+                "  resolved mode: hubs_only (use_case D, expanded blocked)"
+            )
             return "hubs_only"
 
         self._f._log_debug(f"  resolved mode: hubs_only (use_case {use_case} default)")
