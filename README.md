@@ -65,5 +65,5 @@ The average cost of each turn is **[constant]**. In order to be mathematically p
 - Even though it's true web content is quickly outdated, it would be interesting at lest generating an interactive knowledge of a certain size. For example, if we use search to search for papers about AI context compression techniques, it would be valuable to create a knoledge base (at last in sqlite). For single user it's unlikely to hit in a meaningful way, but it's ok to consider this feature.
 
 ## Future techniques
-* State space models like mamba or nanotron: Once they perform well, they will be allow bigger context sizes. 1m+ with sub quadratic performance degradation. Allowing more complex inferences. This tech already exists, but still do not perform as well as the alternatives.
+* State space models like mamba or nanotron: Once they perform well, they will allow bigger context sizes. 1m+ with sub quadratic performance degradation. Allowing more complex inferences. This tech already exists, but still do not perform as well as the alternatives.
 * H20: Models implementing this technique will have x4 filling performance. This is lab science atm.
