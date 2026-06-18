@@ -2729,6 +2729,85 @@ class ContextBuilder:
         cached = self._skeleton_tier_cache.get(project_id)
         return bool(cached and cached[0] == sig_hash and cached[1])
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2.1 — Project skeleton rendering (signatures only)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _format_skeleton(self, project_id: str) -> str:
+        """
+        Render the project skeleton: signatures of all indexed symbols.
+
+        Generates a compact, human‑readable list of:
+        - Classes with their method signatures (indented).
+        - Module‑level functions (bulleted).
+
+        Optionally includes one‑line docstrings if the valve
+        `skeleton_include_docstrings` is True. This method is used by:
+        - `_build_skeleton_tier` (for the stable Block‑A cache).
+        - Fast‑path skeleton queries (`/esqueleto`, `/skeleton`, etc.).
+
+        Returns:
+            A formatted string ready for injection into the system prompt,
+            or an empty string if no symbols are indexed.
+        """
+        # ── 1. Early exit if no symbols ──────────────────────────────────
+        symbol_index = self._f._symbol_index
+        qids = sorted(symbol_index.get_all_qualified_names(project_id))
+        if not qids:
+            return ""
+
+        lines: List[str] = []
+        include_docstrings = self._f.valves.skeleton_include_docstrings
+
+        # ── 2. Render classes with their methods ──────────────────────────
+        classes = sorted(symbol_index.get_classes(project_id))
+        if classes:
+            lines.append("## Classes")
+            for cls_name in classes:
+                members = symbol_index.get_class_members(cls_name, project_id)
+                if not members:
+                    continue
+                lines.append(f"class {cls_name}:")
+                for member_qid in members:
+                    meta = symbol_index.get_symbol_meta(member_qid, project_id) or {}
+                    sig = meta.get("signature", member_qid)
+                    if include_docstrings:
+                        docstring = meta.get("docstring", "")
+                        if docstring:
+                            first_line = docstring.split("\n")[0]
+                            lines.append(f"    {sig}  # {first_line}")
+                        else:
+                            lines.append(f"    {sig}")
+                    else:
+                        lines.append(f"    {sig}")
+
+        # ── 3. Render module‑level functions ─────────────────────────────
+        module_funcs = [
+            qid
+            for qid in qids
+            if "." not in qid
+            and (symbol_index.get_symbol_meta(qid, project_id) or {}).get("kind")
+            == "function"
+        ]
+        if module_funcs:
+            if lines:
+                lines.append("")
+            lines.append("## Module-level functions")
+            for qid in module_funcs:
+                meta = symbol_index.get_symbol_meta(qid, project_id) or {}
+                sig = meta.get("signature", qid)
+                if include_docstrings:
+                    docstring = meta.get("docstring", "")
+                    if docstring:
+                        first_line = docstring.split("\n")[0]
+                        lines.append(f"- `{sig}`  # {first_line}")
+                    else:
+                        lines.append(f"- `{sig}`")
+                else:
+                    lines.append(f"- `{sig}`")
+
+        return "\n".join(lines)
+
     def _make_docstring_provider(self, project_id: str):
         """Return f(symbol_name, parent_class='') -> one-line docstring or ''.
         Backed by the index (covers both source-extracted and LLM-generated
@@ -10254,7 +10333,7 @@ class CodeBlockManager:
 
         # ── 2. Commit pattern ───────────────────────────────────────────────
         if self._f.commit_pattern.search(content):
-            if ("applied" in cl or "committed" in cl or "merged" in cl):
+            if "applied" in cl or "committed" in cl or "merged" in cl:
                 return ContentType.COMMITTED_CHANGE
             return ContentType.PROPOSED_CHANGE
 
