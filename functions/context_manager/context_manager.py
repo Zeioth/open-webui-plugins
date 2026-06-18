@@ -4629,49 +4629,36 @@ class SignatureExtractor:
     @staticmethod
     def _parse_sync(code_bytes: bytes, lang: str):
         """
-        Parse source-code bytes synchronously with a cached tree-sitter parser.
+        Parse source-code bytes synchronously with a fresh tree-sitter parser.
 
-        Parser instances are expensive to create (language grammar must be
-        loaded and compiled), so a module-level ``_parser_cache`` keeps one
-        parser per language.  The cache is protected by a class-level lock
-        (``_parser_cache_lock``) because tree-sitter parsers are not
-        thread-safe by default and this method is called from worker threads
-        via ``run_in_executor``.
+        Creates a new parser instance on every call. This avoids thread-safety
+        issues: tree-sitter Parser is not Send/Sync and cannot be shared across
+        threads [2†L11]. Creating a parser is cheap compared to parsing.
 
-        The lock now also guards parser.parse() itself, not just the cache
-        lookup/creation. tree-sitter Parser instances are not guaranteed
-        thread-safe for concurrent parse() calls on the SAME shared
-        instance — and this method is reachable from more than one thread
-        at once (e.g. an outlet background LTM store task overlapping
-        with the next inlet's own parsing, both via run_in_executor).
-        Parsing itself is fast, so serializing it here is cheap insurance
-        against a corrupted tree or worse.
+        Supports both old API (set_language) and new API (language in constructor).
+        See: https://tree-sitter.github.io/tree-sitter/ [3†L19-L22]
 
         Returns the root ``tree_sitter.Node`` of the concrete syntax tree.
         """
         from tree_sitter import Parser as TSParser
+        from tree_sitter_language_pack import get_language
 
-        # The lock now also guards parser.parse() itself, not just the cache
-        # lookup/creation. tree-sitter Parser instances are not guaranteed
-        # thread-safe for concurrent parse() calls on the SAME shared
-        # instance — and this method is reachable from more than one thread
-        # at once (e.g. an outlet background LTM store task overlapping
-        # with the next inlet's own parsing, both via run_in_executor).
-        # Parsing itself is fast, so serializing it here is cheap insurance
-        # against a corrupted tree or worse.
-        with SignatureExtractor._parser_cache_lock:
-            parser = SignatureExtractor._parser_cache.get(lang)
-            if parser is None:
-                lang_obj = get_language(lang)
-                # tree-sitter >= 0.21 removed set_language(); the language is now
-                # passed directly to the Parser constructor.
-                try:
-                    parser = TSParser(lang_obj)
-                except TypeError:
-                    parser = TSParser()
-                    parser.set_language(lang_obj)
-                SignatureExtractor._parser_cache[lang] = parser
-            return parser.parse(code_bytes)
+        lang_obj = get_language(lang)
+
+        # New API (py-tree-sitter >= 0.23.0): language passed to constructor.
+        try:
+            parser = TSParser(lang_obj)
+        except TypeError:
+            # Old API (py-tree-sitter < 0.23.0): use set_language().
+            parser = TSParser()
+            if hasattr(parser, 'set_language'):
+                parser.set_language(lang_obj)
+            else:
+                raise RuntimeError(
+                    f"Unsupported tree-sitter version: cannot set language '{lang}'"
+                )
+
+        return parser.parse(code_bytes)
 
     @staticmethod
     def enrich_symbols_with_parent_info(
