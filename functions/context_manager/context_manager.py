@@ -2488,12 +2488,15 @@ class ContextBuilder:
         if not is_code_session:
             return ""
 
-        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-        cached = self._block_a_cache.get(project_id)
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        if cached:
-            cached_hash, cached_text = cached
-            if cached_hash == current_code_hash:
+        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
+        cache_key = pstate.get("block_a_cache_key")
+        cached_text = pstate.get("block_a_cached")
+
+        if cache_key and cache_key == current_code_hash:
+            if cached_text:
                 return cached_text  # ✓ Hit: same code → same block
             # ── Continuation: freeze Block A to prevent KV cache misses ──
             if is_continuation:
@@ -2542,10 +2545,8 @@ class ContextBuilder:
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
-                centrality = self._f._node_centrality.get(project_id, {})
-                resolved_mode = self._f._last_resolved_graph_mode.get(
-                    project_id, "hubs_only"
-                )
+                centrality = pstate.get("node_centrality", {})
+                resolved_mode = pstate.get("resolved_call_graph_mode", "hubs_only")
                 self._f._log_debug(
                     f"Building Block A symbol section with mode='{resolved_mode}' "
                     f"(project={project_id})"
@@ -2583,7 +2584,9 @@ class ContextBuilder:
         static_block = "\n\n".join(p for p in parts if p.strip())
 
         # ── Cache and track ─────────────────────────────────────────────
-        self._block_a_cache[project_id] = (current_code_hash, static_block)
+        # MIGRATED: store cache key and rendered block in pstate
+        pstate["block_a_cache_key"] = current_code_hash
+        pstate["block_a_cached"] = static_block
 
         # Detect and log prefix changes (= cache miss in llama.cpp).
         # The real cacheable prefix is [user system prompt] + [static_block]
@@ -2596,7 +2599,8 @@ class ContextBuilder:
             (_user_sys + "\x1e" + static_block).encode()
         ).hexdigest()[:16]
 
-        last_hash = self._f._last_static_prefix_hash.get(project_id)
+        # MIGRATED: store prefix hash in pstate
+        last_hash = pstate.get("last_static_prefix_hash")
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
                 f"⚠️  KV CACHE MISS detected: static block changed "
@@ -2613,7 +2617,7 @@ class ContextBuilder:
                 f"✓ KV Cache: static prefix stable ({new_prefix_hash}). "
                 f"llama.cpp will reuse KV states for Block A."
             )
-        self._f._last_static_prefix_hash[project_id] = new_prefix_hash
+        pstate["last_static_prefix_hash"] = new_prefix_hash
 
         tokens = (
             len(self._f.tokenizer.encode(static_block))
@@ -2631,26 +2635,41 @@ class ContextBuilder:
         Force Block A rebuild on the next request, optionally refreshing
         centrality scores.
 
-        MIGRATION: from Filter._invalidate_static_context_block(), plus one
-        addition — recompute centrality so HubSymbolIndex sees fresh scores.
+        MIGRATED: all caches now live in ProjectStateManager. This method
+        clears the per-project Block A, skeleton, and skeleton tier caches,
+        and optionally recomputes centrality scores.
 
-        recompute_centrality=False is used by call_graph_context_mode changes:
-        a mode flip (e.g. auto resolving "hubs_only" → "full_graph" because the
-        user's intent shifted) changes how much of the EXISTING graph is
-        rendered, not the graph itself. PageRank is O(V+E) per call and
-        recomputing it on every mode flip — which can happen every turn under
-        auto — is pure waste; only actual code changes (new/removed
-        symbols/edges) warrant a centrality refresh.
+        Args:
+            project_id (str): The project whose cache should be invalidated.
+            reason (str): Optional reason for logging.
+            recompute_centrality (bool): Whether to recompute PageRank centrality.
         """
-        self._block_a_cache.pop(project_id, None)
-        self._skeleton_cache.pop(project_id, None)
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Clear all per-project caches ---
+        # Block A cache
+        pstate["block_a_cache_key"] = None
+        pstate["block_a_cached"] = None
+
+        # Skeleton cache (whole-project signatures only)
+        pstate["skeleton_cache_key"] = None
+        pstate["skeleton_cached"] = None
+
+        # Skeleton tier cache (stable signature tier inside Block A)
+        pstate["skeleton_tier_cache_key"] = None
+        pstate["skeleton_tier_cached"] = None
+
+        # --- 3. Optionally recompute centrality (PageRank) ---
         if recompute_centrality:
             try:
-                self._f._node_centrality[project_id] = (
-                    self._f._symbol_index.precompute_centrality(project_id)
+                pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
+                    project_id
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self._f._log_debug(f"Centrality recomputation failed: {e}")
+
+        # --- 4. Log the invalidation ---
         if reason:
             self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
 
@@ -2664,21 +2683,44 @@ class ContextBuilder:
         cached by signature_hash so body edits don't invalidate it. Returns ""
         when disabled, empty, or over the tier budget (caller then injects no
         tier and Block B keeps inline signatures).
+
+        MIGRATED: cache now lives in ProjectStateManager.
+
+        Args:
+            project_id (str): The current project identifier.
+
+        Returns:
+            str: The rendered skeleton tier, or an empty string if not available.
         """
         if not self._f.valves.enable_skeleton_tier:
             return ""
+
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Compute current signature hash ---
         if self._f.valves.skeleton_include_docstrings:
             sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
         else:
             sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+
         if not sig_hash:
             return ""
-        cached = self._skeleton_tier_cache.get(project_id)
-        if cached and cached[0] == sig_hash:
-            return cached[1]
+
+        # --- 3. Check cache ---
+        cached_hash = pstate.get("skeleton_tier_cache_key")
+        cached_tier = pstate.get("skeleton_tier_cached")
+        if cached_hash and cached_hash == sig_hash and cached_tier is not None:
+            return cached_tier
+
+        # --- 4. Render the skeleton ---
         skel = self._format_skeleton(project_id)
         if not skel:
+            pstate["skeleton_tier_cache_key"] = sig_hash
+            pstate["skeleton_tier_cached"] = ""
             return ""
+
+        # --- 5. Check token budget ---
         budget = self._f.valves.skeleton_tier_max_tokens
         if budget > 0:
             tok = self._f._tokens.estimate_code_tokens(skel)
@@ -2687,19 +2729,27 @@ class ContextBuilder:
                     f"Skeleton tier skipped: {tok} tokens > budget {budget}. "
                     "Block B keeps signatures inline."
                 )
-                self._skeleton_tier_cache[project_id] = (sig_hash, "")
+                pstate["skeleton_tier_cache_key"] = sig_hash
+                pstate["skeleton_tier_cached"] = ""
                 return ""
+
+        # --- 6. Build the tier text ---
         tier = (
             "## Project Skeleton (stable — signatures only)\n"
             "_Contracts for the whole project. Bodies are shown on demand below "
             "or via `/expand <name>`._\n\n"
             f"{skel}"
         )
-        self._skeleton_tier_cache[project_id] = (sig_hash, tier)
+
+        # --- 7. Store in cache ---
+        pstate["skeleton_tier_cache_key"] = sig_hash
+        pstate["skeleton_tier_cached"] = tier
+
         self._f._log_debug(
             f"Skeleton tier rendered (sig_hash={sig_hash}, "
             f"~{self._f._tokens.estimate_code_tokens(tier)} tokens)"
         )
+
         return tier
 
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
@@ -2711,23 +2761,34 @@ class ContextBuilder:
         this check, suppress_sigs below would hide Block B's inline
         signatures even though Block A ended up with none.
 
+        MIGRATED: state now lives in ProjectStateManager.
+
         Args:
-            project_id: Current project identifier.
+            project_id (str): Current project identifier.
 
         Returns:
-            True if the skeleton tier is active and contains content for the
-            current signature hash, False otherwise.
+            bool: True if the skeleton tier is active and contains content for
+                  the current signature hash, False otherwise.
         """
         if not self._f.valves.enable_skeleton_tier:
             return False
+
+        # --- 1. Compute current signature hash ---
         if self._f.valves.skeleton_include_docstrings:
             sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
         else:
             sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
+
         if not sig_hash:
             return False
-        cached = self._skeleton_tier_cache.get(project_id)
-        return bool(cached and cached[0] == sig_hash and cached[1])
+
+        # --- 2. Resolve per-project state and check cache ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        cached_hash = pstate.get("skeleton_tier_cache_key")
+        cached_tier = pstate.get("skeleton_tier_cached")
+
+        # Active only if the key matches and the cached tier is non-empty.
+        return bool(cached_hash and cached_hash == sig_hash and cached_tier)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2.1 — Project skeleton rendering (signatures only)
@@ -3283,41 +3344,44 @@ class ContextBuilder:
         Resolve and apply the call-graph mode for this turn BEFORE Block A is
         built, so an upgrade (e.g. hubs_only -> full_graph for an architecture
         query) is visible in the very turn that triggered it instead of
-        lagging one turn behind. This used to live inline at the top of
-        build_block_b, which runs after Block A had already been rendered.
-
-        build_block_b no longer re-resolves the mode itself; it just reads
-        self._f._last_resolved_graph_mode (falling back to calling this
-        method only as a defensive no-op if somehow not yet resolved this
-        turn — see its call site).
+        lagging one turn behind.
 
         Args:
-            project_id: Current project identifier.
-            query: The user's query text.
-            intent_vector: Pre-classified intent vector (explain/modify/debug/refactor).
+            project_id (str): Current project identifier.
+            query (str): The user's query text.
+            intent_vector (dict): Pre-classified intent vector.
 
         Returns:
-            The resolved mode string: "hubs_only", "expanded_hubs", or "full_graph".
+            str: The resolved mode string: "hubs_only", "expanded_hubs", or "full_graph".
         """
+        # --- 1. Resolve project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Resolve the raw mode from intent and budget ---
         raw_resolved_mode = self._resolve_call_graph_mode(
             query, intent_vector, project_id
         )
-        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
-        previous_mode = self._f._last_resolved_graph_mode.get(project_id)
 
+        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
+
+        # --- 3. Read previous mode and downgrade streak ---
+        previous_mode = pstate.get("resolved_call_graph_mode")
+        streak = pstate.get("graph_mode_downgrade_streak", 0)
+
+        # --- 4. Apply hysteresis: upgrades apply immediately, downgrades need streak ---
         if previous_mode is None or _MODE_RANK.get(
             raw_resolved_mode, 0
         ) >= _MODE_RANK.get(previous_mode, 0):
             # First resolution ever, or an upgrade/stay-equal: apply immediately.
             resolved_graph_mode = raw_resolved_mode
-            self._f._graph_mode_downgrade_streak[project_id] = 0
+            pstate["graph_mode_downgrade_streak"] = 0
         else:
             # Candidate downgrade: only commit after enough consecutive turns.
-            streak = self._f._graph_mode_downgrade_streak.get(project_id, 0) + 1
-            self._f._graph_mode_downgrade_streak[project_id] = streak
+            streak += 1
+            pstate["graph_mode_downgrade_streak"] = streak
             if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
                 resolved_graph_mode = raw_resolved_mode
-                self._f._graph_mode_downgrade_streak[project_id] = 0
+                pstate["graph_mode_downgrade_streak"] = 0
             else:
                 resolved_graph_mode = previous_mode
                 self._f._log_debug(
@@ -3326,15 +3390,13 @@ class ContextBuilder:
                     f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
                 )
 
+        # --- 5. Store the resolved mode in project state ---
         if previous_mode != resolved_graph_mode:
             self._f._log_debug(
                 f"Call graph mode: {previous_mode or '(none)'} → "
                 f"{resolved_graph_mode} (resolved before Block A build this turn)"
             )
-            self._f._last_resolved_graph_mode[project_id] = resolved_graph_mode
-            # No explicit Block A cache pop needed: build_block_a's cache key
-            # now includes the mode directly (see 4.c), so a mode change
-            # misses the cache on its own.
+            pstate["resolved_call_graph_mode"] = resolved_graph_mode
 
         return resolved_graph_mode
 
@@ -3349,6 +3411,17 @@ class ContextBuilder:
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
+
+        Args:
+            project_id (str): Current project identifier.
+            query (str): The user's query text.
+            messages (list): The conversation messages.
+            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
+            intent_vector (dict): Pre-classified intent vector.
+            is_continuation (bool): Whether this is an AutoContinue continuation.
+
+        Returns:
+            str: The assembled Block B content, or an empty string if no context.
         """
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
@@ -3411,15 +3484,12 @@ class ContextBuilder:
         active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
 
         if self._f.valves.enable_lod_by_intent:
-            # Per-use-case LOD profile (previously computed and discarded —
-            # use_case_profile never reached this point, LOD_PROFILES was
-            # dead code). Multipliers > 1.0 raise the bar (less LOD-3 detail,
-            # e.g. case E scaffolding); < 1.0 lowers it.
+            # Per-use-case LOD profile
             lod1 *= use_case_profile.get("lod1_mult", 1.0)
             lod2 *= use_case_profile.get("lod2_mult", 1.0)
             lod3 *= use_case_profile.get("lod3_mult", 1.0)
         else:
-            # Legacy flat scaling (pre-fix behavior), kept as an off-switch.
+            # Legacy flat scaling
             if debug_weight + modify_weight > 0.6:
                 scale = 0.7
             elif refactor_weight > 0.4:
@@ -3459,7 +3529,9 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
-        resolved_graph_mode = self._f._last_resolved_graph_mode.get(project_id)
+        # MIGRATED: use ProjectStateManager for resolved mode
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        resolved_graph_mode = pstate.get("resolved_call_graph_mode")
         if resolved_graph_mode is None:
             resolved_graph_mode = self.prepare_call_graph_mode(
                 project_id, query, intent_vector
@@ -3589,7 +3661,6 @@ class ContextBuilder:
 
                 # ── LOD-1: Signatures only ──────────────────────────────────
                 if score < lod2:
-                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
                     sig = next(
                         (
                             sym.signature
@@ -3608,7 +3679,6 @@ class ContextBuilder:
 
                 # ── LOD-2: Signatures + docstrings ──────────────────────────
                 elif score < lod3:
-                    # ── FIX 17.b: Use qualify_symbol to include file_path ──
                     sig = next(
                         (
                             sym.signature
@@ -3626,7 +3696,6 @@ class ContextBuilder:
                         "",
                     )
 
-                    # ── Cambio C: Use CFG if available ──
                     cfg_skeleton = ""
                     if self._f.valves.enable_cfg_skeletons and (
                         active_use_case == "D"
@@ -3656,7 +3725,6 @@ class ContextBuilder:
 
                 # ── LOD-3: Full code body ──────────────────────────────────
                 else:
-                    # ── FIX 2: Extract only the symbol body, not the whole block ──
                     content_to_inject = CodeBlockManager.extract_symbol_body(
                         block, node_id
                     )
@@ -5560,47 +5628,51 @@ class StateStore:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def get_state(self, project_id: str) -> dict:
-        """Return the conversation state for the given project, loading from DB if needed."""
+        """
+        Return the conversation state for the given project, loading from DB if needed.
+
+        Args:
+            project_id (str): The project identifier.
+
+        Returns:
+            dict: The conversation state dictionary for the project.
+        """
+        # --- 1. Check in-memory cache ---
         if project_id in self._f._conversation_state:
             self._f._conversation_state.move_to_end(project_id)
             return self._f._conversation_state[project_id]
 
+        # --- 2. Load from database if not in cache ---
         state = self._load_state_from_db(project_id)
         if not state:
             state = self._f._state_factory()
 
+        # --- 3. Store in cache and move to end (most recently used) ---
         self._f._conversation_state[project_id] = state
         self._f._conversation_state.move_to_end(project_id)
 
-        # LRU eviction: keep only max_cached_projects
+        # --- 4. LRU eviction: keep only max_cached_projects ---
         while len(self._f._conversation_state) > self._f.valves.max_cached_projects:
             oldest_pid = next(iter(self._f._conversation_state))
             oldest_state = self._f._conversation_state[oldest_pid]
+
+            # Clean up symbol index and conversation state
             self._f._symbol_index.clear_project(oldest_pid)
             del self._f._conversation_state[oldest_pid]
-            self._f._cached_lightweight_context.pop(oldest_pid, None)
+
+            # Clean up core indexes (path, pager)
             self._f._path_index.clear_project(oldest_pid)
             self._f._pager.clear_project(oldest_pid)
-            self._f._node_centrality.pop(oldest_pid, None)
-            self._f._last_resolved_graph_mode.pop(oldest_pid, None)
-            self._f._graph_mode_downgrade_streak.pop(oldest_pid, None)
-            self._f._last_static_prefix_hash.pop(oldest_pid, None)
-            self._f._last_saved_slot_hash.pop(oldest_pid, None)
-            self._f._slot_restored.pop(oldest_pid, None)
-            self._f._slot_restore_attempted.pop(oldest_pid, None)
-            self._f._last_processed_message_idx.pop(oldest_pid, None)
-            self._f._response_cache_count.pop(oldest_pid, None)
-            self._f._summarize_inactive_in_progress.pop(oldest_pid, None)
-            self._f._cached_code_state_hash.pop(oldest_pid, None)
-            # ── FIX 20: Clean ContextBuilder caches and token trackers ──
+
+            # Clean up ALL per-project volatile state at once via ProjectStateManager
+            self._f._project_state_manager.clear_project(oldest_pid)
+
+            # Clean up ContextBuilder caches (these live inside the builder instance)
             self._f._ctx_builder._block_a_cache.pop(oldest_pid, None)
             self._f._ctx_builder._skeleton_tier_cache.pop(oldest_pid, None)
             self._f._ctx_builder._skeleton_cache.pop(oldest_pid, None)
-            self._f._last_system_tokens.pop(oldest_pid, None)
-            self._f._last_total_context_tokens.pop(oldest_pid, None)
-            getattr(self._f, "_last_activation_scores", {}).pop(oldest_pid, None)
-            getattr(self._f, "_last_lod_levels", {}).pop(oldest_pid, None)
 
+        # --- 5. Rebuild symbol index from active blocks if needed ---
         if state.get("active_blocks"):
             self._rebuild_symbol_index(state, project_id)
 
@@ -10164,7 +10236,10 @@ class CodeBlockManager:
         return "".join(chars)
 
     async def _extract_full_document_symbols(
-        self, content: str, file_path: Optional[str]
+        self,
+        content: str,
+        file_path: Optional[str],
+        project_id: Optional[str] = None,
     ) -> Tuple[List["CodeSymbol"], str]:
         """
         Parse the entire document once to preserve nested class context.
@@ -10174,26 +10249,34 @@ class CodeBlockManager:
         which class they belong to, even when later split into separate blocks.
 
         Args:
-            content: The full document source code.
-            file_path: Optional file path for language detection.
+            content (str): The full document source code.
+            file_path (Optional[str]): Optional file path for language detection.
+            project_id (Optional[str]): The project ID for per-project state.
+                                        If None, uses self._f.valves.project_id.
 
         Returns:
-            A tuple of (symbols_list, detected_language). symbols_list may be
-            empty if language detection fails or tree-sitter is unavailable.
+            Tuple[List[CodeSymbol], str]: A tuple of (symbols_list, detected_language).
+                                          symbols_list may be empty if language
+                                          detection fails or tree-sitter is unavailable.
         """
-        # ── 1. Detect language ──────────────────────────────────────────────
-        lang = getattr(
-            self._f, "_ingested_lang", None
-        ) or SignatureExtractor._guess_language(file_path, content)
+        # --- 1. Resolve project state ---
+        if project_id is None:
+            project_id = self._f.valves.project_id
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Detect language ---
+        lang = pstate.get("ingested_lang") or SignatureExtractor._guess_language(
+            file_path, content
+        )
         if lang == "unknown":
             return [], lang
 
-        # ── 2. Extract symbols ──────────────────────────────────────────────
+        # --- 3. Extract symbols ---
         symbols = await SignatureExtractor.extract_async(
             content, file_path, language=lang
         )
 
-        # ── 3. Enrich with parent symbol info ──────────────────────────────
+        # --- 4. Enrich with parent symbol info ---
         if symbols:
             symbols = SignatureExtractor.enrich_symbols_with_parent_info(
                 symbols, content
@@ -10230,7 +10313,7 @@ class CodeBlockManager:
         ]
 
     async def extract_code_blocks(
-        self, content: str
+        self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
         Extract fenced and indented code blocks from message content.
@@ -10241,26 +10324,35 @@ class CodeBlockManager:
         3. Regex fallback — handles fenced blocks and indented code.
 
         Args:
-            content: The raw message content.
+            content (str): The raw message content.
+            project_id (Optional[str]): The project ID for per-project state.
+                                        If None, uses self._f.valves.project_id.
 
         Returns:
-            A tuple of (blocks_list, spans_list) where each block is a dict with:
-                - language: Detected programming language.
-                - code: The source code string.
-                - type: "fenced" or "indented".
-                - precomputed_symbols: Optional list of pre-extracted symbols.
-                - file_path: Optional file path associated with the block.
+            Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+                A tuple of (blocks_list, spans_list) where each block is a dict with:
+                    - language: Detected programming language.
+                    - code: The source code string.
+                    - type: "fenced" or "indented".
+                    - precomputed_symbols: Optional list of pre-extracted symbols.
+                    - file_path: Optional file path associated with the block.
         """
+        # --- 0. Resolve project ID and state ---
+        if project_id is None:
+            project_id = self._f.valves.project_id
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
         # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
-        raw = getattr(self._f, "_raw_ingested_symbols", None)
+        raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
-            self._f._raw_ingested_symbols = None  # consume once
-            lang = getattr(self._f, "_ingested_lang", None) or "python"
+            # Consume the symbols so they are not used again in the same turn.
+            pstate["raw_ingested_symbols"] = None
+            lang = pstate.get("ingested_lang") or "python"
 
             block = {
                 "language": lang,
@@ -10294,10 +10386,10 @@ class CodeBlockManager:
 
         # Parse the whole document once so class context is never lost.
         full_doc_symbols, full_doc_lang = await self._extract_full_document_symbols(
-            content, None
+            content, None, project_id
         )
 
-        ingested_lang = getattr(self._f, "_ingested_lang", None)
+        ingested_lang = pstate.get("ingested_lang")
 
         # ── 2a. Tree-sitter processing ──────────────────────────────────────
         if HAS_TREE_SITTER:
@@ -10317,21 +10409,21 @@ class CodeBlockManager:
 
                 for tsb in ts_blocks:
                     start, end = tsb.start_byte, tsb.end_byte
-                    raw = content[start:end].strip()
+                    raw_text = content[start:end].strip()
 
                     # ── 2a.i. Detect language ──────────────────────────────
                     lang = tsb.language or "text"
                     if ingested_lang:
                         lang = ingested_lang
                     elif lang in ("text", ""):
-                        guessed = SignatureExtractor._guess_language(None, raw)
+                        guessed = SignatureExtractor._guess_language(None, raw_text)
                         if guessed != "unknown":
                             lang = guessed
                         else:
-                            lang = await self._infer_code_language(raw)
+                            lang = await self._infer_code_language(raw_text)
 
                     # ── 2a.ii. Extract code content ─────────────────────────
-                    lines_in_block = raw.splitlines()
+                    lines_in_block = raw_text.splitlines()
                     if lines_in_block and lines_in_block[0].startswith("```"):
                         lines_in_block = lines_in_block[1:]
                         if lines_in_block and lines_in_block[-1].startswith("```"):
@@ -10339,7 +10431,7 @@ class CodeBlockManager:
                         code = "\n".join(lines_in_block).strip()
                         block_type = "fenced"
                     else:
-                        code = raw
+                        code = raw_text
                         block_type = "indented"
 
                     # ── 2a.iii. Assign symbols from full-document parse ────
@@ -10369,8 +10461,8 @@ class CodeBlockManager:
                     )
                     spans.append((start, end))
 
-                if hasattr(self._f, "_ingested_lang"):
-                    self._f._ingested_lang = None
+                if pstate.get("ingested_lang") is not None:
+                    pstate["ingested_lang"] = None
 
                 # ── 2a.iv. Post-process blocks ─────────────────────────────
                 if blocks:
@@ -16884,6 +16976,85 @@ class ContextDumper:
 
 
 # ---------------------------------------------------------------------------
+# ProjectStateManager — per‑project volatile state (SRP)
+# ---------------------------------------------------------------------------
+class ProjectStateManager:
+    """Manages per‑project volatile state that lives in memory only.
+
+    This class holds all attributes that vary by project (call‑graph mode,
+    ingested language, cache keys, invalidation flags, etc.) in a dictionary
+    keyed by project_id. It provides a clean accessor and factory, and will
+    support project‑state cleanup on eviction (subsystem 05).
+
+    This decouples project‑scoped state from the singleton Filter instance,
+    preventing cross‑project corruption when alternating between projects.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict] = {}
+
+    def _new_pstate(self) -> dict:
+        """Factory for a fresh per‑project state bag with all defaults."""
+        return {
+            # Call‑graph mode (subsystem 02)
+            "resolved_call_graph_mode": None,
+            "current_call_graph_mode": None,
+            # Silent ingestion (subsystem 01 / paso 3)
+            "ingested_lang": None,
+            "raw_ingested_symbols": None,
+            # Block A / skeleton cache keys and invalidation flags
+            "block_a_cache_key": None,
+            "block_a_cached": None,
+            "skeleton_cache_key": None,
+            "skeleton_cached": None,
+            "skeleton_tier_cache_key": None,
+            "skeleton_tier_cached": None,
+            "skeleton_invalidated": False,
+            "block_a_invalidated": False,
+            # Centrality and lightweight context
+            "node_centrality": {},
+            "cached_lightweight_context": "",
+            "cached_code_state_hash": None,
+            # Token accounting
+            "last_system_tokens": 0,
+            "last_total_context_tokens": 0,
+            # KV slot persistence
+            "last_static_prefix_hash": "",
+            "last_saved_slot_hash": "",
+            "slot_restored": False,
+            "slot_restore_attempted": False,
+            # Message processing tracking
+            "last_processed_message_idx": -1,
+            "response_cache_count": 0,
+            "summarize_inactive_in_progress": False,
+            # Graph mode downgrade streak (subsystem 02)
+            "graph_mode_downgrade_streak": 0,
+            # LOD adaptive tracking
+            "last_activation_scores": {},
+            "last_lod_levels": {},
+        }
+
+    def get_pstate(self, project_id: str) -> dict:
+        """Return the mutable per‑project state bag, creating it on first access.
+
+        Args:
+            project_id (str): The project identifier.
+
+        Returns:
+            dict: The per‑project state bag for the given project.
+        """
+        st = self._store.get(project_id)
+        if st is None:
+            st = self._new_pstate()
+            self._store[project_id] = st
+        return st
+
+    def clear_project(self, project_id: str) -> None:
+        """Remove the state bag for a project (called on eviction)."""
+        self._store.pop(project_id, None)
+
+
+# ---------------------------------------------------------------------------
 # Valves
 # ---------------------------------------------------------------------------
 class Filter:
@@ -17940,43 +18111,15 @@ class Filter:
         # Session classification cache
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
         self._session_classify_ttl: float = 1800.0
+        self._project_state_manager = ProjectStateManager()
 
-        # Symbol index and lightweight context
+        # Symbol index and path index (shared across projects, but their
+        # contents are keyed by project_id internally)
         self._symbol_index = SymbolIndex()
         self._path_index = PathIndex()
-        self._node_centrality: Dict[str, Dict[str, float]] = {}
-        # project_id → last resolved call_graph_context_mode (for KV-cache-aware
-        # Block A rebuilds: a mode change invalidates Block A, a stable mode does not).
-        self._last_resolved_graph_mode: Dict[str, str] = {}
-        # project_id → consecutive turns whose raw auto-resolution is below the
-        # currently active mode. Used to apply hysteresis to downgrades only
-        # (see ContextBuilder.build_block_b, Group B bugfix).
-        self._graph_mode_downgrade_streak: Dict[str, int] = {}
-        self._cached_lightweight_context: Dict[str, str] = {}
-        self._cached_code_state_hash: Optional[str] = None
 
-        self._last_system_tokens: Dict[str, int] = {}
-        self._last_total_context_tokens: Dict[str, int] = {}
-
-        # ── KV Cache Stability ──
-        self._static_context_block_cache: Dict[str, Tuple[str, str]] = {}
-        self._last_static_prefix_hash: Dict[str, str] = {}
-
-        # ── KV Cache Slot Persistence ──
-        self._last_saved_slot_hash: Dict[str, str] = {}
-        self._slot_restored: Dict[str, bool] = {}
-        self._slot_restore_attempted: Dict[str, bool] = {}
-
-        # Project tracking
-        self._last_processed_message_idx: Dict[str, int] = {}
-        self._last_project_id: str = ""
-        self._code_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
-
-        # Response cache counter
-        self._response_cache_count: Dict[str, int] = {}
-        self._summarize_inactive_in_progress: Dict[str, bool] = {}
-        self._write_counter = 0
-
+        # ── FIX 20: Clean ContextBuilder caches and token trackers ──
+        # (These are inside ContextBuilder instance, not in Filter)
         # Block change summaries LRU
         self._block_change_summaries: OrderedDict = OrderedDict()
         self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
@@ -18250,10 +18393,14 @@ class Filter:
             if await self._commands.is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
 
+                # --- 0. Resolve project state for silent ingestion ---
+                pstate = self._project_state_manager.get_pstate(project_id)
+
                 # ── Guardamos el lenguaje para que extract_code_blocks lo use ──
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
                 _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                self._ingested_lang = _lang
+                # MIGRATED: use pstate instead of self._ingested_lang
+                pstate["ingested_lang"] = _lang
 
                 # ── Extraemos los símbolos del documento completo AHORA,
                 #     antes de que extract_code_blocks trocee el código.
@@ -18272,7 +18419,8 @@ class Filter:
                         raw_symbols, user_query
                     )
 
-                self._raw_ingested_symbols = raw_symbols
+                # MIGRATED: use pstate instead of self._raw_ingested_symbols
+                pstate["raw_ingested_symbols"] = raw_symbols
 
                 # Pasamos el mensaje SIN envolver (el código crudo mantiene los
                 # números de línea correctos para la asignación de símbolos).
@@ -18292,11 +18440,6 @@ class Filter:
                 # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._activation.rebuild_path_index(project_id)
-
-                # Invalidate static block (new code → new Block A)
-                self._ctx_builder.invalidate_block_a_cache(
-                    project_id, "new chunk ingested"
-                )
 
                 # Invalidate static block (new code → new Block A)
                 self._ctx_builder.invalidate_block_a_cache(
