@@ -2437,11 +2437,19 @@ class ContextBuilder:
             re.IGNORECASE,
         )
         self._UC_REFACTOR_RE = re.compile(
-            r"\b(refactor(?:iza(?:r|ndo)?|ing|ed)?|renombr\w*|rename|"
+            r"\brefactor\w*|"
+            r"\brenombr\w*|\brename\w*|"
+            r"extrae\s+la\s+(?:validaci[oó]n|l[oó]gica)|"
             r"extrae\s+(?:el\s+)?(?:m[eé]todo|funci[oó]n)|"
             r"extract\s+(?:a\s+)?(?:method|function)|"
-            r"mueve\s+\w+\s+a|move\s+\w+\s+to|inline\b|deduplic\w*|"
-            r"reorganiz\w*|restructur\w*|split\s+(?:this|the|el|la)\b)\b",
+            r"mueve\s+\w+\s+a|move\s+\w+\s+to|\binline\b|deduplic\w*|"
+            r"reorganiz\w*|restructur\w*|"
+            r"split\s+(?:this|the|el|la)\b|"
+            r"an[aá]lisis\s+de\s+impacto|"
+            r"nueva\s+estructura|"
+            r"demasiado\s+larg[oa]|"
+            r"limpiar\s+(?:el\s+)?(?:m[eé]todo|c[oó]digo)|"
+            r"separar\s+responsabilidades",
             re.IGNORECASE,
         )
         self._UC_ARCH_RE = re.compile(
@@ -3222,7 +3230,7 @@ class ContextBuilder:
         modify_w = iv.get("modify", 0.0)
         explain_w = iv.get("explain", 0.0)
 
-        if refactor_w >= 0.4 and refactor_w >= max(debug_w, modify_w, explain_w):
+        if refactor_w >= 0.30 and refactor_w >= max(debug_w, modify_w, explain_w):
             self._f._log_debug(
                 f"classify_use_case: detected 'D' (refactor) via intent_vector tie-break "
                 f"(refactor={refactor_w:.2f})"
@@ -14206,6 +14214,21 @@ class EnrichmentTasks:
                             break
 
             if not docstring:
+                # Last‑resort fallback: take the last non‑empty line that is not
+                # a bad‑pattern preamble fragment. Models that ignore the
+                # "one sentence only" instruction often still END with the
+                # actual answer after a numbered reasoning preamble.
+                for line in reversed(lines):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if _BAD_PATTERNS.search(stripped):
+                        continue
+                    if len(stripped) > 10 and "**" not in stripped:
+                        docstring = stripped[:200]
+                        break
+
+            if not docstring:
                 self._f._log_debug(
                     f"Background docstring: no valid docstring extracted for '{name}' "
                     f"(raw: {docstring_text[:100]}...)"
@@ -17941,7 +17964,9 @@ class Filter:
             description="Replace old multi‑phase code parts with compact commit summaries.",
         )
         code_history_keep_last_n_parts: int = Field(
-            default=3, ge=1, le=5,
+            default=3,
+            ge=1,
+            le=5,
             description="Steps to remember in multi phase processes.",
         )
         code_history_symbol_index_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
