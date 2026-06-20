@@ -2692,7 +2692,10 @@ class ContextBuilder:
         when disabled, empty, or over the tier budget (caller then injects no
         tier and Block B keeps inline signatures).
 
-        MIGRATED: cache now lives in ProjectStateManager.
+        MIGRATED (step 15): Confirmed that no fixed token reservation exists.
+        The `skeleton_tier_max_tokens` valve acts as a hard cap: if the rendered
+        skeleton exceeds it, the tier is skipped entirely. There is no upfront
+        budget reservation, so no "unused tokens" to return to the global pool.
 
         Args:
             project_id (str): The current project identifier.
@@ -2729,6 +2732,8 @@ class ContextBuilder:
             return ""
 
         # --- 5. Check token budget ---
+        # NOTE: This is a hard cap, not a pre-reservation. If the skeleton exceeds
+        # the cap, we skip injection entirely. No tokens are reserved in advance.
         budget = self._f.valves.skeleton_tier_max_tokens
         if budget > 0:
             tok = self._f._tokens.estimate_code_tokens(skel)
@@ -14460,6 +14465,11 @@ class ActiveCodeUpdater:
         """
         Register a brand‑new block: symbols, edges, conflict/obsolete checks,
         and hard eviction if max_active_blocks is exceeded.
+
+        MIGRATED (step 13): Obsolete blocks are now capped via
+        `max_obsolete_versions_per_file`. When a new block supersedes older
+        ones, the obsolete blocks are either removed immediately (default) or
+        limited to N per file.
         """
         for sym in syms:
             sym.parent_block_hash = new_block.hash
@@ -14506,16 +14516,52 @@ class ActiveCodeUpdater:
 
         state["active_blocks"][new_block.hash] = new_block
 
-        # Mark older blocks for the same file as obsolete
+        # ── Mark older blocks for the same file as obsolete (step 13) ──
+        obsolete_hashes = []
         if new_block.file_path and self._f.valves.enable_obsolete_marking:
             for h, blk in list(state["active_blocks"].items()):
                 if h == new_block.hash:
                     continue
                 if blk.file_path == new_block.file_path and not blk.pinned:
-                    blk.obsolete = True
-                    blk._update_importance()
+                    # Remove from symbol index
                     self._f._symbol_index.remove_all_for_block(
                         blk.hash, blk.symbols, project_id
+                    )
+                    # Mark obsolete (for any downstream logic that checks the flag)
+                    blk.obsolete = True
+                    blk._update_importance()
+                    obsolete_hashes.append(h)
+
+            # ── Cap obsolete versions per file ──────────────────────────
+            # If max_obsolete_versions_per_file is 0, remove all immediately.
+            # Otherwise, keep the most recent N (by timestamp) and drop the rest.
+            max_keep = self._f.valves.max_obsolete_versions_per_file
+            if obsolete_hashes:
+                if max_keep == 0:
+                    # Remove all obsolete blocks immediately.
+                    for h in obsolete_hashes:
+                        del state["active_blocks"][h]
+                    self._f._log_debug(
+                        f"Removed {len(obsolete_hashes)} obsolete block(s) for '{new_block.file_path}' "
+                        f"(max_obsolete_versions_per_file=0)."
+                    )
+                else:
+                    # Sort obsolete blocks by timestamp (newest first), keep only max_keep.
+                    obsolete_blocks = [
+                        (h, state["active_blocks"][h])
+                        for h in obsolete_hashes
+                        if h in state["active_blocks"]
+                    ]
+                    obsolete_blocks.sort(key=lambda x: x[1].timestamp, reverse=True)
+
+                    to_remove = [h for h, _ in obsolete_blocks[max_keep:]]
+                    for h in to_remove:
+                        del state["active_blocks"][h]
+
+                    kept = len(obsolete_blocks) - len(to_remove)
+                    self._f._log_debug(
+                        f"Obsolete cap for '{new_block.file_path}': kept {kept} most recent "
+                        f"out of {len(obsolete_blocks)} (max_obsolete_versions_per_file={max_keep})."
                     )
 
         # Handle content-type specific actions
@@ -14569,8 +14615,8 @@ class ActiveCodeUpdater:
             keep_hashes = {
                 b.hash for b in sorted_blocks[: self._f.valves.max_active_blocks]
             }
-            to_remove = [h for h in state["active_blocks"] if h not in keep_hashes]
-            for h in to_remove:
+            to_remove_hard = [h for h in state["active_blocks"] if h not in keep_hashes]
+            for h in to_remove_hard:
                 block = state["active_blocks"].get(h)
                 if (
                     block
@@ -14591,9 +14637,9 @@ class ActiveCodeUpdater:
                 # Fallback: remove without paging
                 if h in state["active_blocks"]:
                     del state["active_blocks"][h]
-            if to_remove:
+            if to_remove_hard:
                 self._f._log_debug(
-                    f"Evicted {len(to_remove)} blocks due to max_active_blocks limit. "
+                    f"Evicted {len(to_remove_hard)} blocks due to max_active_blocks limit. "
                     f"Their symbols remain in the index for lightweight context."
                 )
 
@@ -15947,15 +15993,69 @@ class MessageAssembler:
         project_id: str,
         user_question: str,
     ) -> List[dict]:
-        """Apply LLMLingua-2 compression to conversation history, with hard cap."""
+        """
+        Apply LLMLingua-2 compression to conversation history, with hard cap.
+
+        MIGRATED (step 12): Now gated by `enable_secondary_compaction`. When
+        enabled, it only compresses messages that were NOT already compressed
+        by the primary compactor (looks for markers like `[🗜️ PARTE` or
+        `## Código — Parte`). This prevents double-compression in cascade.
+
+        Args:
+            messages (List[dict]): The conversation messages.
+            project_id (str): The current project ID.
+            user_question (str): The user's query for question-aware compression.
+
+        Returns:
+            List[dict]: The messages with secondary compression applied (or unchanged).
+        """
+        # --- 1. Gate: secondary compaction is off by default ---
+        if not self._f.valves.enable_secondary_compaction:
+            self._f._log_debug(
+                "Secondary compaction disabled (enable_secondary_compaction=False)."
+            )
+            return messages
+
+        # --- 2. Check prerequisites ---
         if not (
             self._f.valves.enable_history_llmlingua
             and self._f._conv_compressor is not None
         ):
             return messages
 
+        # --- 3. Filter out messages already compressed by the primary compactor ---
+        # Primary compactor marks messages with patterns like:
+        #   "[🗜️ PARTE ..." or "## Código — Parte ..."
+        _PRIMARY_COMPACTED_MARKERS = (
+            "[🗜️ PARTE",
+            "## Código — Parte",
+            "## Código - Parte",
+        )
+
+        def _is_primary_compacted(content: str) -> bool:
+            return any(marker in content for marker in _PRIMARY_COMPACTED_MARKERS)
+
+        # Separate messages into those already compacted and those to compress.
+        to_compress = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                if not _is_primary_compacted(content):
+                    to_compress.append(msg)
+
+        if not to_compress:
+            self._f._log_debug(
+                "Secondary compaction: no eligible messages (all already primary-compacted)."
+            )
+            return messages
+
+        # --- 4. Apply secondary compression (LLMLingua) on eligible messages ---
+        # We need to preserve the original order, so we rebuild the list.
+        # The compressor expects a full list, so we pass only the eligible ones
+        # and then merge back.
         compressed = await self._f._conv_compressor.compress_messages(
-            messages=messages,
+            messages=to_compress,
             project_id=project_id,
             symbol_index=self._f._symbol_index,
             current_msg_idx=len(messages) - 1,
@@ -15966,27 +16066,29 @@ class MessageAssembler:
             query=user_question,
         )
 
-        # ── v2.0: Hard cap post‑compresión ────────────────────────────
-        if self._f.tokenizer and self._f.valves.history_max_tokens > 0:
-            budget = self._f.valves.history_max_tokens
-            history_msgs = [m for m in compressed if m.get("role") != "system"]
-            total = sum(
-                len(self._f.tokenizer.encode(m.get("content", "")))
-                for m in history_msgs
-            )
-            if total > budget:
-                kept, used = [], 0
-                for msg in reversed(history_msgs):
-                    tok = len(self._f.tokenizer.encode(msg.get("content", "")))
-                    if used + tok <= budget:
-                        kept.insert(0, msg)
-                        used += tok
-                    else:
-                        break
-                sys_msgs = [m for m in compressed if m.get("role") == "system"]
-                compressed = sys_msgs + kept
+        # --- 5. Merge back: replace the original eligible messages with the compressed ones ---
+        # Build a mapping from original index to compressed message.
+        # Since we only compressed a subset, we need to iterate and replace.
+        comp_iter = iter(compressed)
+        out = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if (
+                role in ("user", "assistant")
+                and content
+                and not _is_primary_compacted(content)
+            ):
+                out.append(next(comp_iter))
+            else:
+                out.append(msg)
 
-        return compressed
+        self._f._log_debug(
+            f"Secondary compaction: compressed {len(to_compress)} message(s) "
+            f"(skipped {len(messages) - len(to_compress)} already primary-compacted)."
+        )
+
+        return out
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Turn‑based window management
@@ -16266,7 +16368,13 @@ class MessageAssembler:
         user_question: str,
         slot_free: bool,
     ) -> None:
-        """Inject multi‑phase protocol if the token budget is tight."""
+        """
+        Inject multi‑phase protocol if the token budget is tight.
+
+        MIGRATED (step 14): The budget branch is now always evaluated.
+        `force_multi_phase_response` is an additive override, not a short-circuit.
+        Default is False, so multi-phase only triggers when the budget is actually tight.
+        """
         if not (
             self._f.valves.enable_multi_phase_response
             and self._f.tokenizer
@@ -16282,10 +16390,8 @@ class MessageAssembler:
             0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
         )
 
-        if (
-            _mp_available < self._f.valves.multi_phase_response_budget_warn
-            and not self._f.valves.force_multi_phase_response
-        ):
+        # --- Critical budget warning: append a wrap-up hint to the user message ---
+        if _mp_available < self._f.valves.multi_phase_response_budget_warn:
             self._f._log_debug(
                 f"Multi-phase CRITICAL ({_mp_available} tokens): "
                 "wrap-up hint appended to user message (0 system tokens used)."
@@ -16293,10 +16399,11 @@ class MessageAssembler:
             self._f._multi_phase.append_critical_wrap_up_hint(messages)
             return
 
-        if (
-            _mp_available < self._f.valves.multi_phase_response_threshold
-            or self._f.valves.force_multi_phase_response
-        ):
+        # --- Always evaluate the budget branch; force is an additive override ---
+        budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
+        use_multi_phase = self._f.valves.force_multi_phase_response or budget_tight
+
+        if use_multi_phase:
             _INSTRUCTION_OVERHEAD = 450
             _mp_budget_reported = max(500, _mp_available - _INSTRUCTION_OVERHEAD)
             _mp_instructions = self._f._multi_phase.build_multi_phase_instructions(
@@ -16309,12 +16416,13 @@ class MessageAssembler:
             self._f._log_debug(
                 f"Multi-phase injected (priority=critical): "
                 f"{_mp_available} available, reporting {_mp_budget_reported} to model "
-                f"(overhead={_INSTRUCTION_OVERHEAD})."
+                f"(overhead={_INSTRUCTION_OVERHEAD}). "
+                f"force={self._f.valves.force_multi_phase_response}, budget_tight={budget_tight}"
             )
         else:
             self._f._log_debug(
                 f"Multi-phase: not needed ({_mp_available} tokens > threshold "
-                f"{self._f.valves.multi_phase_response_threshold})."
+                f"{self._f.valves.multi_phase_response_threshold} and force=False)."
             )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -17304,6 +17412,17 @@ class Filter:
             le=20,
             description="Number of recent turns exempt from aggressive compression.",
         )
+
+        # ── Secondary compaction gate ─────────────────────
+        enable_secondary_compaction: bool = Field(
+            default=False,
+            description=(
+                "If True, run the secondary ConversationCompressor (LLMLingua) after the "
+                "primary compactor, restricted to prose the primary did not summarize. "
+                "Off by default to avoid double-compaction in cascade."
+            ),
+        )
+
         # ── Code compression with LLMLingua ─────────────────────────
         enable_code_compression: bool = Field(
             default=True,
@@ -17440,6 +17559,17 @@ class Filter:
         max_committed_changes: int = Field(default=10)
         prioritize_recent_code: bool = Field(default=True)
         enable_obsolete_marking: bool = Field(default=True)
+        # ── Obsolete version cap ──────────────────────────
+        max_obsolete_versions_per_file: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Maximum number of obsolete code versions to keep per file. "
+                "0 (default) removes them immediately. Values > 0 keep the "
+                "N most recent obsolete versions for potential rollback, "
+                "evicting older ones."
+            ),
+        )
         # ── Diffs & commits ─────────────────────────────────────────
         enable_diff_application: bool = Field(default=True)
         diff_pattern: str = Field(
@@ -17756,7 +17886,10 @@ class Filter:
         )
         # ── Multi‑phase response ────────────────────────────────────
         enable_multi_phase_response: bool = Field(default=True)
-        force_multi_phase_response: bool = Field(default=True)
+        force_multi_phase_response: bool = Field(
+            default=False,
+            description="Force multi-phase response protocol even when budget is not tight.",
+        )
         multi_phase_effective_max_tokens: int = Field(default=8000, ge=1000, le=200000)
         multi_phase_response_threshold: int = Field(default=7000, ge=0, le=200000)
         multi_phase_response_budget_warn: int = Field(default=800, ge=500, le=40000)
