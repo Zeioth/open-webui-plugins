@@ -3152,7 +3152,8 @@ class ContextBuilder:
         (self._f._last_system_tokens[project_id]).
         """
         window = self._f.valves.context_window_tokens
-        used = getattr(self._f, "_last_system_tokens", {}).get(project_id, 0)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        used = pstate.get("last_system_tokens", 0)
         reserve = self._f.valves.response_reserve_tokens
         budget = max(0, window - used - reserve)
 
@@ -3433,9 +3434,6 @@ class ContextBuilder:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
 
-        MIGRATED (step 7): Mode is now re-resolved every turn. The guard that
-        froze the mode after the first turn has been removed.
-
         Args:
             project_id (str): Current project identifier.
             query (str): The user's query text.
@@ -3553,9 +3551,6 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
-        # MIGRATED (step 7): Always re-resolve the mode per turn.
-        # The previous guard (if resolved_graph_mode is None) has been removed.
-        # prepare_call_graph_mode handles hysteresis (step 10) internally.
         resolved_graph_mode = self.prepare_call_graph_mode(
             project_id, query, intent_vector
         )
@@ -3584,9 +3579,10 @@ class ContextBuilder:
         injected_blocks: Set[str] = set()
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
-        # Centrality LOD bump
+        # ── Centrality LOD bump (MIGRATED: use pstate) ────────────────────
         if self._f.valves.enable_centrality_lod_bump:
-            centrality = self._f._node_centrality.get(project_id, {})
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            centrality = pstate.get("node_centrality", {})
             threshold = self._f.valves.centrality_lod_bump_threshold
             adjusted = []
             for node_id, score in sorted_nodes:
@@ -3864,10 +3860,9 @@ class ContextBuilder:
         )
         ordered.append(summary_line)
 
-        # ── LOD tracking for adaptive feedback ────────────────────────────
+        # ── LOD tracking for adaptive feedback (MIGRATED: use pstate) ─────
         if self._f.valves.enable_lod_adaptive:
-            if not hasattr(self._f, "_last_lod_levels"):
-                self._f._last_lod_levels: Dict[str, Dict[str, int]] = {}
+            pstate = self._f._project_state_manager.get_pstate(project_id)
             lod_map: Dict[str, int] = {}
             for node_id, score in activated.items():
                 if score < lod1:
@@ -3878,7 +3873,7 @@ class ContextBuilder:
                     lod_map[node_id] = 2
                 else:
                     lod_map[node_id] = 3
-            self._f._last_lod_levels[project_id] = lod_map
+            pstate["last_lod_levels"] = lod_map
 
         return "\n".join(ordered)
 
@@ -7368,7 +7363,10 @@ class LongTermMemory:
         ).hexdigest()[:32]
         max_entries = self._f.valves.response_cache_max_entries
         project = self._f.valves.project_id
-        current_size = self._f._response_cache_count.get(project, 0)
+
+        pstate = self._f._project_state_manager.get_pstate(project)
+        current_size = pstate.get("response_cache_count", 0)
+
         if current_size >= max_entries:
             to_delete_count = max(1, max_entries // 10)
             try:
@@ -7383,7 +7381,9 @@ class LongTermMemory:
                     await anyio.to_thread.run_sync(
                         lambda: col.delete(ids=old_entries["ids"])
                     )
-                    self._f._response_cache_count[project] -= len(old_entries["ids"])
+                    pstate["response_cache_count"] = max(
+                        0, current_size - len(old_entries["ids"])
+                    )
             except Exception:
                 pass
 
@@ -7403,9 +7403,7 @@ class LongTermMemory:
                 ],
             )
         )
-        self._f._response_cache_count[project] = (
-            self._f._response_cache_count.get(project, 0) + 1
-        )
+        pstate["response_cache_count"] = pstate.get("response_cache_count", 0) + 1
 
     async def _store_response_in_cache_async(
         self,
@@ -12000,7 +11998,7 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = score / len(qids)
+                share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
@@ -12010,14 +12008,14 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = score / len(qids)
+                share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
                     )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            share = tb_score / len(qids)
+            share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag._activations.get(qid)
                 if existing:
@@ -12033,7 +12031,7 @@ class ActivationEngine:
                     )
         for sym_name, boost in history_boosts.items():
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            share = boost / len(qids)
+            share = boost / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag._activations.get(qid)
                 if existing:
@@ -12049,11 +12047,12 @@ class ActivationEngine:
                     )
 
         if not ag._activations:
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            centrality = pstate.get("node_centrality", {})
             entry_points = self._f._path_index.find_entry_points(
                 symbol_index, project_id
             )
             if entry_points:
-                centrality = self._f._node_centrality.get(project_id, {})
                 sorted_eps = sorted(
                     entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
                 )
@@ -12097,7 +12096,7 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = score / len(qids)
+                share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_lex._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
@@ -12107,14 +12106,14 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = score / len(qids)
+                share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_lex._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
                     )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            share = tb_score / len(qids)
+            share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag_lex._activations.get(qid)
                 if existing:
@@ -12159,7 +12158,7 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.8, 0.5 * min(specificity, 1.4))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = score / len(qids)
+                share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_str._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
@@ -12176,7 +12175,7 @@ class ActivationEngine:
         if history_boosts:
             for sym_name, boost in history_boosts.items():
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                share = boost / len(qids)
+                share = boost / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_his._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
@@ -12197,11 +12196,12 @@ class ActivationEngine:
 
         ag_final = ActivationGraph()
         if not all_activated:
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            centrality = pstate.get("node_centrality", {})
             entry_points = self._f._path_index.find_entry_points(
                 symbol_index, project_id
             )
             if entry_points:
-                centrality = self._f._node_centrality.get(project_id, {})
                 sorted_eps = sorted(
                     entry_points,
                     key=lambda ep: centrality.get(ep, 0.0),
@@ -12401,8 +12401,9 @@ class ActivationEngine:
             await self._build_view_from_activation(ep, ag, project_id)
 
         if self._f.valves.enable_centrality_prior:
-            self._f._node_centrality[project_id] = (
-                self._f._symbol_index.precompute_centrality(project_id)
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
+                project_id
             )
 
     async def resolve_dangling_edges(self, project_id: str) -> int:
@@ -12524,11 +12525,13 @@ class ActivationEngine:
 
     def compute_code_state_hash(self, project_id: str) -> str:
         """Return a hash that changes when the set of active blocks changes."""
-        if self._f._cached_code_state_hash is not None:
-            return self._f._cached_code_state_hash
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        cached = pstate.get("cached_code_state_hash")
+        if cached is not None:
+            return cached
         state = self._f._state_store.get_state(project_id)
         h = self._compute_code_state_hash_from_state(state)
-        self._f._cached_code_state_hash = h
+        pstate["cached_code_state_hash"] = h
         return h
 
     def _compute_code_state_hash_from_state(self, state: dict) -> str:
@@ -12578,9 +12581,10 @@ class ActivationEngine:
 
     def invalidate_lightweight_cache(self, project_id: str) -> None:
         """Clear cached lightweight context and centrality so the next request rebuilds them."""
-        self._f._cached_lightweight_context.pop(project_id, None)
-        self._f._cached_code_state_hash = None
-        self._f._node_centrality.pop(project_id, None)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        pstate["cached_lightweight_context"] = ""
+        pstate["cached_code_state_hash"] = None
+        pstate["node_centrality"] = {}
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Static evidence (for scientific CoT)
@@ -13550,23 +13554,31 @@ class EnrichmentTasks:
 
         Adjustments are small (lod_adapt_rate) and bounded [min, max].
         Threshold state is NOT persisted across server restarts.
+
+        MIGRATED: uses pstate for `last_lod_levels`.
         """
         if not self._f.valves.enable_lod_adaptive:
             return
 
-        last_lod_map = getattr(self._f, "_last_lod_levels", {}).get(project_id, {})
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        last_lod_map = pstate.get("last_lod_levels", {})
         if not last_lod_map:
             return
 
+        # --- 2. Extract symbols mentioned in the response ---
         bare_names = self._f._symbol_index.get_all_names(project_id)
         response_words = set(re.findall(r"\b\w+\b", response_text))
         bare_referenced = bare_names.intersection(response_words)
+
+        # --- 3. Resolve bare names to qualified ids ---
         referenced: Set[str] = set()
         for bare in bare_referenced:
             referenced |= self._f._symbol_index.get_qualified_names_for(
                 bare, project_id
             )
 
+        # --- 4. Classify as underserved (needed LOD3 but got ≤ LOD2) or overserved ---
         underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
         overserved = [
             sym
@@ -13574,10 +13586,12 @@ class EnrichmentTasks:
             if last_lod_map[sym] == 3 and sym not in referenced
         ]
 
+        # --- 5. Apply adjustments ---
         old_threshold = self._f.valves.lod3_threshold
         changed = False
 
         if len(underserved) >= self._f.valves.lod_adapt_underserved_min:
+            # Lower threshold: give more full code next time.
             self._f.valves.lod3_threshold = max(
                 self._f.valves.lod_adapt_min,
                 self._f.valves.lod3_threshold - self._f.valves.lod_adapt_rate,
@@ -13588,7 +13602,9 @@ class EnrichmentTasks:
                 f"{self._f.valves.lod3_threshold:.2f} "
                 f"({len(underserved)} underserved: {underserved[:3]})"
             )
+
         elif len(overserved) >= self._f.valves.lod_adapt_overserved_min:
+            # Raise threshold: those expansions were unnecessary.
             self._f.valves.lod3_threshold = min(
                 self._f.valves.lod_adapt_max,
                 self._f.valves.lod3_threshold + self._f.valves.lod_adapt_rate * 0.5,
@@ -15056,7 +15072,9 @@ class InletOrchestrator:
                     user_question = user_query
             else:
                 user_question = user_query
-            self._f._last_processed_message_idx[project_id] = last_idx
+
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            pstate["last_processed_message_idx"] = last_idx
         else:
             user_question = user_query
 
@@ -17235,7 +17253,7 @@ class ProjectStateManager:
         Save the KV slot after a turn.
 
         force=True ignores the static-hash guard (used after monotonic
-        compaction, when the history prefix changed but Block A did not — #16).
+        compaction, when the history prefix changed but Block A did not).
         The token-threshold guard (P5) is always respected.
         """
         if not self._f.valves.enable_slot_persistence:
@@ -17418,7 +17436,6 @@ class ProjectStateManager:
         Deterministic slot file name.
         Encodes: project + static block hash + model hash.
         If any of the three changes → different name → no stale restore.
-
         """
         model_hash = hashlib.md5(self._f.valves.llm_model.encode()).hexdigest()[:8]
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
@@ -18536,6 +18553,9 @@ class Filter:
         self._session_classify_ttl: float = 1800.0
         self._project_state_manager = ProjectStateManager()
 
+        # ── Project tracking (global) ──
+        self._last_project_id: str = ""
+
         # Symbol index and path index (shared across projects, but their
         # contents are keyed by project_id internally)
         self._symbol_index = SymbolIndex()
@@ -18785,6 +18805,7 @@ class Filter:
             )
             return body
 
+        # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
         #   4. Natural language intents (forget, remember, obsolete)
         # ─────────────────────────────────────────────────────────────────
@@ -18954,9 +18975,9 @@ class Filter:
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
 
-        # ── v9: Restore KV slot after Block A has been built ──
+        # ── Restore KV slot after Block A has been built ──
         if self.valves.enable_slot_persistence:
-            await self._ctx_builder.slot_restore(project_id)
+            await self._project_state_manager.slot_restore(project_id)
 
         if cached_response:
             messages.pop()
@@ -19041,9 +19062,12 @@ class Filter:
             )
             last_msg = messages[-1] if messages else None
 
+            # --- Resolve per-project state ---
+            pstate = self._project_state_manager.get_pstate(project_id)
+
             if last_msg:
                 last_idx = len(messages) - 1
-                if last_idx <= self._last_processed_message_idx.get(project_id, -1):
+                if last_idx <= pstate.get("last_processed_message_idx", -1):
                     self._log_debug(
                         "outlet: last message already processed in inlet, skipping"
                     )
@@ -19172,11 +19196,10 @@ class Filter:
                             project_id, last_assistant["content"]
                         )
 
-            # ── Speculative prefetch ───────────────────────────────────
+            # ── Speculative prefetch (MIGRATED: uses pstate) ──────────────
             if self.valves.enable_speculative_prefetch and is_code_session:
-                last_activated = getattr(self, "_last_activation_scores", {}).get(
-                    project_id, {}
-                )
+                pstate = self._project_state_manager.get_pstate(project_id)
+                last_activated = pstate.get("last_activation_scores", {})
                 if last_activated:
                     await self._activation.speculative_prefetch(
                         project_id, last_activated
@@ -19224,7 +19247,6 @@ class Filter:
             if self.valves.enable_slot_persistence:
                 # Track total context tokens for the threshold guard
                 try:
-                    pstate = self._project_state_manager.get_pstate(project_id)
                     pstate["last_total_context_tokens"] = self._tokens.estimate_tokens(
                         messages
                     )
@@ -19232,7 +19254,9 @@ class Filter:
                     pass
 
                 if state and state.get("_pending_slot_resave"):
-                    saved = await self._ctx_builder.slot_save(project_id, force=True)
+                    saved = await self._project_state_manager.slot_save(
+                        project_id, force=True
+                    )
                     if saved:
                         self._log_debug(
                             "Slot re-saved after compaction (stable new prefix)"
@@ -19240,7 +19264,7 @@ class Filter:
                     state["_pending_slot_resave"] = False
                     self._state_store.set_state(project_id, state)
                 else:
-                    await self._ctx_builder.slot_save(project_id)
+                    await self._project_state_manager.slot_save(project_id)
 
             # ── Purge old versions ─────────────────────────────────────
             if (
