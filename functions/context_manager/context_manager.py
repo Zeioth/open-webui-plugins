@@ -3548,10 +3548,17 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
-        # Always re-resolve the mode per turn.
-        resolved_graph_mode = self.prepare_call_graph_mode(
-            project_id, query, intent_vector
-        )
+        #  Use the already-resolved mode from pstate.
+        # The resolution was already done in Filter.inlet() before Block A was built.
+        # Calling prepare_call_graph_mode again would double-increment the
+        # downgrade streak.
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        resolved_graph_mode = pstate.get("resolved_call_graph_mode")
+        if resolved_graph_mode is None:
+            # Fallback defensivo (no debería ocurrir porque inlet ya lo resolvió)
+            resolved_graph_mode = self.prepare_call_graph_mode(
+                project_id, query, intent_vector
+            )
 
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
         total_tokens = 0
@@ -3579,7 +3586,6 @@ class ContextBuilder:
 
         # ── Centrality LOD bump (MIGRATED: use pstate) ────────────────────
         if self._f.valves.enable_centrality_lod_bump:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
             centrality = pstate.get("node_centrality", {})
             threshold = self._f.valves.centrality_lod_bump_threshold
             adjusted = []
@@ -3872,9 +3878,8 @@ class ContextBuilder:
         )
         ordered.append(summary_line)
 
-        # ── LOD tracking for adaptive feedback (MIGRATED: use pstate) ─────
+        # ── LOD tracking for adaptive feedback (use pstate) ─────
         if self._f.valves.enable_lod_adaptive:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
             lod_map: Dict[str, int] = {}
             for node_id, score in activated.items():
                 if score < lod1:
@@ -15565,9 +15570,33 @@ class SystemPromptBuilder:
                 intent_vector=intent_vector,
                 is_continuation=not slot_free,
             )
-            return active_ctx or self._f._activation.get_active_code_context(
-                project_id, user_query
+
+            # --- Check suppression before falling back ---
+            # Replicate the suppression check from build_block_b to avoid
+            # falling back to full context when the skeleton tier is active.
+            active_use_case, _ = self._f._ctx_builder.classify_use_case(
+                user_query, intent_vector
             )
+            suppress_sigs = (
+                self._f.valves.skeleton_tier_suppresses_block_b_signatures
+                and active_use_case != "D"
+                and self._f._ctx_builder._is_skeleton_tier_active(project_id)
+            )
+
+            if active_ctx:
+                return active_ctx
+            elif suppress_sigs:
+                # If suppression is active, don't fall back to full context
+                self._f._log_debug(
+                    "Skeleton tier active and suppress_sigs=True, "
+                    "skipping fallback to active_code_context to avoid duplication"
+                )
+                return ""
+            else:
+                # Fallback to full context
+                return self._f._activation.get_active_code_context(
+                    project_id, user_query
+                )
 
         return self._f._activation.get_active_code_context(project_id, user_query)
 
@@ -19190,6 +19219,8 @@ class Filter:
           and runs SQLite + ChromaDB checkpoints.
         * Persists symbol edges, path views, and dirty conversation state.
         * Saves the KV slot (slot persistence) for future session restores.
+        * Waits for background LLM tasks (docstrings, etc.) to finish before
+          exiting, to prevent them from blocking the next request.
 
         Returns the (possibly modified) body unchanged.
         """
@@ -19215,16 +19246,17 @@ class Filter:
 
             if last_msg:
                 last_idx = len(messages) - 1
-                if last_idx <= pstate.get("last_processed_message_idx", -1):
+
+                # --- Always process assistant messages for indexing ---
+                # The previous guard (last_idx <= pstate.get("last_processed_message_idx"))
+                # was incorrectly skipping assistant messages because the index didn't
+                # advance in the way the guard expected. Now we process based on role.
+                if last_msg.get("role") == "assistant":
                     self._log_debug(
-                        "outlet: last message already processed in inlet, skipping"
+                        "outlet: processing assistant message for indexing and expansion"
                     )
-                else:
-                    if (
-                        last_msg.get("role") == "assistant"
-                        and is_code_session
-                        and "/expand" in last_msg.get("content", "")
-                    ):
+                    # Process /expand commands first
+                    if is_code_session and "/expand" in last_msg.get("content", ""):
                         self._log_debug(
                             "🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code"
                         )
@@ -19240,37 +19272,57 @@ class Filter:
                                 "outlet: /expand intercepted — history rewritten with real code"
                             )
 
-                    if last_msg.get("role") in ("user", "assistant"):
-                        self._log_debug("outlet: waiting for LLM tasks to complete")
-                        await self._llm_orchestrator.wait_for_llm_tasks()
-                        if is_code_session:
+                    # Index assistant code and store in LTM
+                    await self._llm_orchestrator.wait_for_llm_tasks()
+                    if is_code_session:
+                        self._log_debug(
+                            "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
+                        )
+                        await self._update_active_code(last_msg, project_id)
+                        await self._ltm.store_messages(
+                            project_id, [last_msg], wait=False
+                        )
+
+                        if self.valves.enable_auto_docstrings_background:
+                            state = self._state_store.get_state(project_id)
+                            pending = []
+                            for block in state["active_blocks"].values():
+                                if block.obsolete:
+                                    continue
+                                for sym in block.symbols:
+                                    if (
+                                        sym.kind in ("function", "method")
+                                        and not sym.docstring
+                                    ):
+                                        pending.append((sym.name, sym.signature))
+                            if pending:
+                                self._enrichment.start_docstring_loop(project_id)
+                    else:
+                        if not self.valves.ltm_store_only_code_sessions:
                             self._log_debug(
-                                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (new code detected)"
+                                "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
                             )
-                            await self._update_active_code(last_msg, project_id)
                             await self._ltm.store_messages(
                                 project_id, [last_msg], wait=False
                             )
 
-                            if self.valves.enable_auto_docstrings_background:
-                                state = self._state_store.get_state(project_id)
-                                pending = []
-                                for block in state["active_blocks"].values():
-                                    if block.obsolete:
-                                        continue
-                                    for sym in block.symbols:
-                                        if (
-                                            sym.kind in ("function", "method")
-                                            and not sym.docstring
-                                        ):
-                                            pending.append((sym.name, sym.signature))
-                                if pending:
-                                    self._enrichment.start_docstring_loop(project_id)
+                else:
+                    # For user messages, use the existing guard to avoid double-processing
+                    if last_idx <= pstate.get("last_processed_message_idx", -1):
+                        self._log_debug(
+                            "outlet: last user message already processed in inlet, skipping"
+                        )
+                    else:
+                        # Process user message (mainly LTM and background docstrings)
+                        await self._llm_orchestrator.wait_for_llm_tasks()
+                        if is_code_session:
+                            await self._ltm.store_messages(
+                                project_id, [last_msg], wait=False
+                            )
+                            # If there's code in the user message, index it
+                            await self._update_active_code(last_msg, project_id)
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
-                                self._log_debug(
-                                    "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
-                                )
                                 await self._ltm.store_messages(
                                     project_id, [last_msg], wait=False
                                 )
@@ -19483,10 +19535,16 @@ class Filter:
             import traceback
 
             self._log_debug(traceback.format_exc())
+
         finally:
             # ── Release silent ingestion flag at the very end ──
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
+
+            # ── Wait for background LLM tasks to complete before exiting ──
+            self._log_debug("outlet: waiting for background LLM tasks to complete")
+            await self._llm_orchestrator.wait_for_llm_tasks()
+            self._log_debug("outlet: background LLM tasks completed")
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
