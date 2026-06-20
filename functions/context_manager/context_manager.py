@@ -17217,7 +17217,9 @@ class ProjectStateManager:
     preventing cross‑project corruption when alternating between projects.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, filter_ref: "Filter") -> None:
+        """Initialize with a reference to the parent Filter for logging and valve access."""
+        self._f = filter_ref
         self._store: dict[str, dict] = {}
 
     def _new_pstate(self) -> dict:
@@ -18586,7 +18588,7 @@ class Filter:
         # Session classification cache
         self._session_classify_cache: Dict[str, Tuple[bool, float]] = {}
         self._session_classify_ttl: float = 1800.0
-        self._project_state_manager = ProjectStateManager()
+        self._project_state_manager = ProjectStateManager(self)
 
         # ── Project tracking (global) ──
         self._last_project_id: str = ""
