@@ -12788,8 +12788,22 @@ class HistoryCompressor:
         if not self._f.valves.enable_code_history_compression:
             return messages
 
+        # --- Standard multi-phase marker (legacy) ---
         _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
         _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
+
+        # --- NEW: Broader pattern for "Fase X", "Parte X", "Phase X", "Step X" ---
+        # This matches lines like:
+        #   "Fase 1: EmailSender" or "Fase 1 — EmailSender"
+        #   "Parte 2: NotificationQueue"
+        #   "Step 3: Worker"
+        #   "Phase 4: Integration"
+        # The group (1) is the number, group (2) is the optional label.
+        _PHASE_HEADER = re.compile(
+            r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
+            re.IGNORECASE,
+        )
+
         keep = self._f.valves.code_history_keep_last_n_parts
 
         # Collect indices of uncompressed code-part messages
@@ -12802,7 +12816,70 @@ class HistoryCompressor:
                 continue  # already compressed, skip
             m = _PART_HEADER.search(content)
             if m:
+                # Standard multi-phase marker
                 code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
+                continue
+            # --- NEW: try the broader phase/part pattern ---
+            # We need to find the total number of parts to know the denominator.
+            # For simplicity, we assume that if there's a "Fase X" line, it's part
+            # of a sequence. We'll collect all such lines and infer the total
+            # from the highest number seen.
+            # But for compression, we only need to know the part number and total.
+            # We'll store the part number and infer the total from the max seen later.
+            # Instead, we can look for a pattern like "Fase 1/5" or "Parte 2/3"
+            # But the user's prompt didn't have that, they had "Fase 1:" without total.
+            # We'll assume that if we see "Fase X", it's part of a sequence and we'll
+            # treat it as a part, but we need to know the total to compress.
+            # We'll use a heuristic: if we find multiple "Fase X" lines, we take
+            # the maximum X as the total.
+            # But we can't know the total from a single message. We'll need to
+            # look across the conversation. However, for compression we only
+            # need to know if this message is "old enough" and its symbols are
+            # indexed. The total is only used for the summary label.
+            # We can approximate the total by looking at the highest part number
+            # in the conversation so far.
+            # For simplicity, we'll skip the total number and just mark it as
+            # a compressed part without denominator. The summary will show
+            # "Parte X" without the total, which is acceptable.
+            # But we also want to avoid compressing the same message multiple times.
+            # We'll use the message content as a key for deduplication.
+            # Let's just detect if the message contains a phase header and has
+            # a substantial code block.
+            if _PHASE_HEADER.search(content):
+                # Check if it's a large code block (estimated tokens > 300)
+                est_tokens = self._f._tokens.estimate_code_tokens(content)
+                if est_tokens > 300:
+                    # We'll treat it as a part, but we need a part number and total.
+                    # Use the phase number as the part number, and assume total = phase number + 1
+                    # (or we can set total = keep + 1 to avoid compression issues)
+                    # Actually, we should use a conservative total: if we see phase 5,
+                    # we can assume total = 5 (or higher). We'll just use part number = phase number,
+                    # total = phase number (so it shows "Parte 5/5").
+                    # But this is not accurate. A better way: we can count the number
+                    # of phase headers in the entire conversation and use that as total.
+                    # However, for simplicity, we'll set total = 0 and the summary will
+                    # show "Parte X" without "/Y". This is a minor detail.
+                    # I'll implement a more robust approach: I'll scan the whole
+                    # conversation to find the maximum phase number, and use that as total.
+                    # But that's expensive. We can do it once per call.
+                    # Let's implement a scan for max phase number.
+                    max_phase = 0
+                    for msg2 in messages:
+                        if msg2.get("role") != "assistant":
+                            continue
+                        m2 = _PHASE_HEADER.search(msg2.get("content", ""))
+                        if m2:
+                            max_phase = max(max_phase, int(m2.group(1)))
+                    # Now we know the total (max_phase). We can set total = max_phase.
+                    # We'll also get the phase number for this message.
+                    m_phase = _PHASE_HEADER.search(content)
+                    if m_phase:
+                        part_num = int(m_phase.group(1))
+                        total_parts = max_phase if max_phase >= part_num else part_num
+                        code_part_indices.append((i, part_num, total_parts))
+                    else:
+                        # This shouldn't happen, but fallback to part_num=1, total=1
+                        code_part_indices.append((i, 1, 1))
 
         if len(code_part_indices) <= keep:
             return messages  # Nothing old enough to compress
@@ -12815,6 +12892,7 @@ class HistoryCompressor:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
 
+            # Verify symbols are indexed (same as before)
             safe, ratio = self._verify_code_symbols_indexed(content, project_id)
             if not safe:
                 self._f._log_debug(
