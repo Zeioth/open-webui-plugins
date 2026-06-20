@@ -2473,10 +2473,6 @@ class ContextBuilder:
         """
         Build Block A: stable, KV-cache-anchoring content.
 
-        MIGRATED (step 8): The cache key now includes `resolved_call_graph_mode`
-        so that a mode change invalidates Block A and forces a rebuild, while
-        the same mode reuses the cached content.
-
         Returns "" when not a code session.
         """
         if not is_code_session:
@@ -2486,7 +2482,8 @@ class ContextBuilder:
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-        mode = pstate.get("resolved_call_graph_mode", "hubs_only")
+        # If resolved_call_graph_mode is None, default to "hubs_only"
+        mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
 
         # --- 2. Build the cache key including the mode ---
         # The cache key is a combination of the code state hash and the resolved mode.
@@ -2546,7 +2543,7 @@ class ContextBuilder:
             state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
                 centrality = pstate.get("node_centrality", {})
-                resolved_mode = pstate.get("resolved_call_graph_mode", "hubs_only")
+                resolved_mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
                 self._f._log_debug(
                     f"Building Block A symbol section with mode='{resolved_mode}' "
                     f"(project={project_id})"
@@ -2562,7 +2559,7 @@ class ContextBuilder:
                 if symbol_section:
                     parts.append(symbol_section)
 
-        # 3.3 Skeleton tier (#15)
+        # 3.3 Skeleton tier
         if is_code_session and self._f.valves.enable_code_awareness:
             skeleton_tier = self._build_skeleton_tier(project_id)
             if skeleton_tier:
@@ -3551,6 +3548,7 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
+        # Always re-resolve the mode per turn.
         resolved_graph_mode = self.prepare_call_graph_mode(
             project_id, query, intent_vector
         )
@@ -3848,10 +3846,24 @@ class ContextBuilder:
                 + "\n".join(_lod3_parts)
             )
 
+        # ── Avoid fallback when skeleton tier is active ──
+        # When suppress_sigs is True and ordered has only the header, the
+        # skeleton tier already covers signatures in Block A. Falling back to
+        # get_active_code_context would duplicate context unnecessarily.
+        # Instead, return an empty string to let the skeleton tier serve as the
+        # only context for architectural queries.
         if len(ordered) <= 1:
             if self._f.valves.debug:
                 self._f._log_debug("build_block_b: no activated nodes or empty context")
-            return ""
+            # If the skeleton tier is active and we're suppressing signatures,
+            # the skeleton tier in Block A already provides the necessary context.
+            if suppress_sigs:
+                self._f._log_debug(
+                    "build_block_b: skeleton tier active and suppress_sigs=True, "
+                    "skipping fallback to avoid duplication"
+                )
+                return ""
+            return self._f._activation.get_active_code_context(project_id, query)
 
         summary_line = (
             f"\n_(Context: {len(injected_blocks)} symbols, "
@@ -6607,7 +6619,16 @@ class LongTermMemory:
     async def _expand_query_for_retrieval(
         self, query: str, slot_free: bool = True
     ) -> List[str]:
-        """Generate alternative phrasings of the query for LTM retrieval."""
+        """
+        Generate alternative phrasings of the query for LTM retrieval.
+
+        Args:
+            query (str): The original user query.
+            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
+
+        Returns:
+            List[str]: A list of query variants, including the original.
+        """
         if not self._f.valves.enable_multi_query_retrieval:
             return [query]
         if not slot_free:
@@ -6636,10 +6657,22 @@ class LongTermMemory:
 
         queries = [query]
         if response:
+            # Filter out lines that contain reasoning artifacts or markdown.
+            # These are not valid alternative phrasings and would pollute the
+            # retrieval query set, degrading LTM quality.
+            _BAD_PATTERNS = re.compile(
+                r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:|"
+                r"^\s*\d+\.\s+.*?(?:Analyze|Request|Task|Step)|"
+                r"^\s*\*\*.*?\*\*|"
+                r"^\s*[-*]\s+Task:)"
+            )
+
             alternatives = [
                 line.strip()
                 for line in response.strip().split("\n")
-                if line.strip() and len(line.strip()) > 5
+                if line.strip()
+                and len(line.strip()) > 5
+                and not _BAD_PATTERNS.search(line.strip())
             ]
             queries.extend(alternatives[: self._f.valves.multi_query_variants])
             self._f._log_debug(
@@ -14002,6 +14035,10 @@ class EnrichmentTasks:
         exists (e.g., was purged or expired), it logs and exits gracefully.
         The database persistence happens only after the symbol is successfully
         found and updated, ensuring `qid` is always defined.
+
+        FIX (hallazgo 3): Strict docstring parsing to avoid persisting reasoning
+        artifacts like "1. **Analyze the Request:**". Only accept lines that
+        match the expected format or are clean natural-language descriptions.
         """
         try:
             state = self._f._state_store.get_state(project_id)
@@ -14037,31 +14074,62 @@ class EnrichmentTasks:
             if not docstring_text or not docstring_text.strip():
                 return
 
-            # ── FIX: parse the response to extract only the docstring ──
-            # The LLM may include reasoning or extra text. Extract the first
-            # line that matches the expected format, or use the first non-empty line.
+            # --- Strict docstring parsing ---
+            # Only accept lines that match the expected format or are clean
+            # natural-language descriptions. Reject lines that contain reasoning
+            # artifacts like "1. **Analyze the Request:**", "Task:", "Step:", etc.
+            #
+            # Pattern for the expected format: "name: description" or "- name: description"
+            _DOCSTRING_LINE_RE = re.compile(
+                r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$"
+            )
+            # Pattern for reasoning artifacts to reject
+            _BAD_PATTERNS = re.compile(
+                r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:)"
+            )
+
             lines = docstring_text.strip().splitlines()
             docstring = None
+
             for line in lines:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                # If it matches "name: description", use it directly
-                if re.match(r"^\s*[A-Za-z_][\w.]*\s*:", stripped):
-                    docstring = stripped
-                    break
-                # Otherwise, treat the first meaningful line as the docstring
-                if len(stripped) > 10:
-                    docstring = stripped
-                    break
+
+                # 1. Reject lines with reasoning artifacts
+                if _BAD_PATTERNS.search(stripped):
+                    continue
+
+                # 2. Try to match the strict format "name: description"
+                m = _DOCSTRING_LINE_RE.match(stripped)
+                if m:
+                    # Extract the description part (group 2)
+                    desc = m.group(2).strip()
+                    if desc and len(desc) > 5:
+                        docstring = desc
+                        break
+
+                # 3. Fallback: accept a plain sentence if it looks like a natural-language
+                # description (starts with a capital letter, contains a verb, no markdown).
+                # But only if it's not a bullet point or numbered list.
+                if (stripped[0].isupper() or stripped[0].isalpha()) and len(
+                    stripped
+                ) > 10:
+                    # Reject if it starts with a number followed by a dot (numbered list)
+                    if not re.match(r"^\d+\.\s+", stripped):
+                        # Reject if it contains markdown bold/italic
+                        if "**" not in stripped and "*" not in stripped:
+                            docstring = stripped
+                            break
 
             if not docstring:
                 self._f._log_debug(
-                    f"Background docstring: no valid docstring extracted for '{name}'"
+                    f"Background docstring: no valid docstring extracted for '{name}' "
+                    f"(raw: {docstring_text[:100]}...)"
                 )
                 return
 
-            # Clean up: remove any leading "name:" prefix if present (batch format)
+            # Clean up: remove any leading "name:" prefix if still present
             if re.match(r"^\s*[A-Za-z_][\w.]*\s*:", docstring):
                 docstring = re.sub(
                     r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1
@@ -18617,6 +18685,9 @@ class Filter:
         self.ENABLE_KEYWORD_COUNT_WEIGHT = True
         self.ENABLE_COT_STICKY = False
 
+        # ── Write counter for periodic tasks (RAPTOR, checkpoints) ──
+        self._write_counter = 0
+
         # State debounce
         self._state_dirty = False
         self._state_last_saved = 0.0
@@ -19127,6 +19198,7 @@ class Filter:
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
+            self._log_debug("outlet: prerequisites not met, returning body unchanged")
             return body
 
         try:
@@ -19169,6 +19241,7 @@ class Filter:
                             )
 
                     if last_msg.get("role") in ("user", "assistant"):
+                        self._log_debug("outlet: waiting for LLM tasks to complete")
                         await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
                             self._log_debug(
@@ -19203,6 +19276,7 @@ class Filter:
                                 )
 
             # ── Response cache ─────────────────────────────────────────
+            self._log_debug("outlet: before cache store")
             if (
                 self.valves.enable_response_cache
                 and HAS_SENTENCE
@@ -19242,8 +19316,10 @@ class Filter:
                             code_state_hash,
                             wait=False,
                         )
+            self._log_debug("outlet: after cache store")
 
             # ── LOD adaptive ───────────────────────────────────────────
+            self._log_debug("outlet: before LOD adaptive")
             if self.valves.enable_lod_adaptive and is_code_session:
                 last_assistant = next(
                     (m for m in reversed(messages) if m.get("role") == "assistant"),
@@ -19271,21 +19347,36 @@ class Filter:
                         await self._enrichment.update_lod_thresholds_from_response(
                             project_id, last_assistant["content"]
                         )
+            self._log_debug("outlet: after LOD adaptive")
 
-            # ── Speculative prefetch (MIGRATED: uses pstate) ──────────────
+            # ── Speculative prefetch ───────────────────────────────────
+            self._log_debug("outlet: before speculative prefetch")
             if self.valves.enable_speculative_prefetch and is_code_session:
                 last_activated = pstate.get("last_activation_scores", {})
                 if last_activated:
+                    self._log_debug(
+                        f"outlet: speculative prefetch with {len(last_activated)} activated nodes"
+                    )
                     await self._activation.speculative_prefetch(
                         project_id, last_activated
                     )
+                else:
+                    self._log_debug("outlet: no activation scores, skipping prefetch")
+            self._log_debug("outlet: after speculative prefetch")
 
             # ── Purge expired memories ─────────────────────────────────
+            self._log_debug("outlet: before purge expired memories")
             await self._ltm.purge_expired_memories()
+            self._log_debug("outlet: after purge expired memories")
 
+            # ── Increment write counter (with defensive check) ────────
+            if not hasattr(self, "_write_counter"):
+                self._write_counter = 0
             self._write_counter += 1
+            self._log_debug(f"outlet: write_counter={self._write_counter}")
 
             # ── RAPTOR rebuild ─────────────────────────────────────────
+            self._log_debug("outlet: before RAPTOR rebuild")
             if (
                 self.valves.enable_raptor
                 and self._write_counter % self.valves.raptor_rebuild_interval == 0
@@ -19310,23 +19401,27 @@ class Filter:
                     embedder=self.embedder,
                     graph_weight=graph_weight,
                 )
+            self._log_debug("outlet: after RAPTOR rebuild")
 
             # ── DB checkpoints ─────────────────────────────────────────
+            self._log_debug("outlet: before DB checkpoints")
             if self._write_counter % 100 == 0:
                 self._log_debug(
                     "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
                 )
                 await self._state_store.run_db_checkpoints()
+            self._log_debug("outlet: after DB checkpoints")
 
             # ── Slot save ──────────────────────────────────────────────
+            self._log_debug("outlet: before slot save")
             if self.valves.enable_slot_persistence:
                 # Track total context tokens for the threshold guard
                 try:
                     pstate["last_total_context_tokens"] = self._tokens.estimate_tokens(
                         messages
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log_debug(f"outlet: token estimation failed: {e}")
 
                 if state and state.get("_pending_slot_resave"):
                     saved = await self._project_state_manager.slot_save(
@@ -19340,8 +19435,10 @@ class Filter:
                     self._state_store.set_state(project_id, state)
                 else:
                     await self._project_state_manager.slot_save(project_id)
+            self._log_debug("outlet: after slot save")
 
             # ── Purge old versions ─────────────────────────────────────
+            self._log_debug("outlet: before purge old versions")
             if (
                 self.valves.purge_old_code_versions_enabled
                 and self.valves.enable_block_paging
@@ -19355,16 +19452,21 @@ class Filter:
                     embedder=self.embedder,
                     max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
                 )
+            self._log_debug("outlet: after purge old versions")
 
             # ── Save edges ─────────────────────────────────────────────
+            self._log_debug("outlet: before save edges")
             if self.valves.enable_edge_persistence:
                 await self._state_store.save_symbol_edges_to_db(project_id)
+            self._log_debug("outlet: after save edges")
 
             # ── Save path views ───────────────────────────────────────
+            self._log_debug("outlet: before save path views")
             if self.valves.enable_path_analysis:
                 await self._state_store.save_path_views_to_db(
                     project_id, self._path_index.get_all(project_id)
                 )
+            self._log_debug("outlet: after save path views")
 
             # ── Save state if dirty ───────────────────────────────────
             self._log_debug(
@@ -19375,6 +19477,12 @@ class Filter:
             self._log_debug(
                 "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
             )
+
+        except Exception as e:
+            self._log_debug(f"❌ outlet error: {e}")
+            import traceback
+
+            self._log_debug(traceback.format_exc())
         finally:
             # ── Release silent ingestion flag at the very end ──
             if getattr(self, "_is_silent_ingestion", False):
