@@ -6378,6 +6378,57 @@ class StateStore:
                 self._f._log_debug(f"Skipping corrupt CodePathView: {e}")
         return views
 
+    async def purge_orphaned_data(self, project_id: str) -> int:
+        """
+        Remove rows from code_contents, symbol_docstrings, and symbol_cfg
+        that no longer correspond to active blocks or symbols.
+        Returns the total number of rows deleted.
+        """
+        state = self._f._conversation_state.get(project_id)
+        if not state:
+            return 0
+
+        active_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+        active_hashes = set(state.get("active_blocks", {}).keys())
+
+        total_deleted = 0
+
+        def _purge():
+            nonlocal total_deleted
+            conn = self._f._db_conn
+
+            # Purge code_contents
+            if active_hashes:
+                placeholders = ",".join("?" * len(active_hashes))
+                cursor = conn.execute(
+                    f"DELETE FROM code_contents WHERE hash NOT IN ({placeholders})",
+                    tuple(active_hashes),
+                )
+                total_deleted += cursor.rowcount
+
+            # Purge symbol_docstrings
+            if active_qids:
+                placeholders = ",".join("?" * len(active_qids))
+                cursor = conn.execute(
+                    f"DELETE FROM symbol_docstrings WHERE project_id = ? AND symbol_name NOT IN ({placeholders})",
+                    (project_id,) + tuple(active_qids),
+                )
+                total_deleted += cursor.rowcount
+
+                # Purge symbol_cfg
+                cursor = conn.execute(
+                    f"DELETE FROM symbol_cfg WHERE project_id = ? AND symbol_name NOT IN ({placeholders})",
+                    (project_id,) + tuple(active_qids),
+                )
+                total_deleted += cursor.rowcount
+
+            conn.commit()
+
+        await self._db_enqueue(_purge)
+        if total_deleted > 0:
+            self._f._log_debug(f"Purged {total_deleted} orphaned rows from DB")
+        return total_deleted
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. Project locks (reentrant async locks per project)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -14157,7 +14208,7 @@ class EnrichmentTasks:
                 prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
                 system_prompt="You are a code summarization assistant. Output only one concise sentence.",
                 model_override=self._f.valves.llm_model,
-                max_tokens=50,
+                max_tokens=500,  # Big room, but protect us against the unexpected.
                 temperature=0.1,
                 label="bg_docstring",
             )
@@ -18546,7 +18597,7 @@ class Filter:
                 "stalling all inference for huge contexts. 0 = no guard."
             ),
         )
-        # ── Volatility-tiered context (#15) ─────────────────────────
+        # ── Volatility-tiered context ─────────────────────────
         enable_skeleton_tier: bool = Field(
             default=True,
             description=(
@@ -18596,6 +18647,12 @@ class Filter:
         speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
         # ── Silent ingestion ────────────────────────────────────────
         enable_silent_ingestion: bool = Field(default=True)
+        # ── DB orphans cleanup ────────────────────────────────────────
+        purge_orphaned_data_interval: int = Field(
+            default=50,
+            ge=0,
+            description="Number of turns between automatic purges of orphaned DB rows (0 = disabled).",
+        )
 
         # ═══════════════════════════════════════════════════════════════════
         #  Utilities & tuning
@@ -19532,6 +19589,11 @@ class Filter:
                 self._write_counter = 0
             self._write_counter += 1
             self._log_debug(f"outlet: write_counter={self._write_counter}")
+
+            # ── Purge orphaned DB rows periodically ──
+            interval = self.valves.purge_orphaned_data_interval
+            if interval > 0 and self._write_counter % interval == 0:
+                await self._state_store.purge_orphaned_data(project_id)
 
             # ── RAPTOR rebuild ─────────────────────────────────────────
             self._log_debug("outlet: before RAPTOR rebuild")
