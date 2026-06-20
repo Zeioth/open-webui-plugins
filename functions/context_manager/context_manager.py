@@ -17940,7 +17940,10 @@ class Filter:
             default=True,
             description="Replace old multi‑phase code parts with compact commit summaries.",
         )
-        code_history_keep_last_n_parts: int = Field(default=2, ge=1, le=5)
+        code_history_keep_last_n_parts: int = Field(
+            default=3, ge=1, le=5,
+            description="Steps to remember in multi phase processes.",
+        )
         code_history_symbol_index_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
         # ── User code in history ────────────────────────────────────
         enable_lean_user_code: bool = Field(
