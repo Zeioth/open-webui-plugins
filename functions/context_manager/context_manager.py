@@ -15249,6 +15249,7 @@ class SystemPromptBuilder:
         last_user_msg: Optional[dict],
         state: dict,
         slot_free: bool = True,
+        intent_vector: Optional[dict] = None,
     ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
         """
         Orchestrate the construction of the two-block system prompt.
@@ -18649,16 +18650,21 @@ class Filter:
         last_user_msg,
         state,
         slot_free=True,
+        intent_vector=None,
     ):
+        """
+        Build system injections (Block A + Block B) via SystemPromptBuilder.
+        """
         return await self._system_prompt_builder.build(
-            messages,
-            project_id,
-            user_query,
-            user_question,
-            is_code_session,
-            last_user_msg,
-            state,
-            slot_free,
+            messages=messages,
+            project_id=project_id,
+            user_query=user_query,
+            user_question=user_question,
+            is_code_session=is_code_session,
+            last_user_msg=last_user_msg,
+            state=state,
+            slot_free=slot_free,
+            intent_vector=intent_vector,
         )
 
     async def _inlet_assemble_final_messages(
@@ -18676,6 +18682,40 @@ class Filter:
         has_code_blocks,
         slot_free=True,
     ):
+        """
+        Delegate final message assembly to MessageAssembler.
+
+        This method is a thin wrapper that forwards all arguments to
+        `MessageAssembler.assemble`, which orchestrates the final steps of
+        message preparation before sending to the LLM:
+          - Chain‑of‑Thought detection and reasoning generation
+          - Code‑history compression and lean‑user‑code stubbing
+          - LLMLingua‑2 compression of conversation prose
+          - Turn‑based window management (summarise/evict)
+          - Multi‑phase protocol injection when the token budget is tight
+          - Adaptive trimming of old messages with optional summarisation
+          - Assembly of the final system prompt (Block A + Block B) and injection
+
+        This separation keeps `inlet` focused on orchestration, delegating the
+        complex message‑assembly pipeline to a dedicated component.
+
+        Args:
+            messages (list): The current list of conversation messages.
+            project_id (str): The project identifier.
+            static_block (str): The rendered Block A (static, KV‑cacheable).
+            dynamic_injections (list): List of (priority, text) dynamic content.
+            prelim_system (str): The preliminary system prompt (Block A + Block B).
+            last_user_msg (dict|None): The last user message, if any.
+            is_code_session (bool): Whether the session is code‑aware.
+            state (dict): The conversation state for the project.
+            __user__ (dict|None): The user context from OpenWebUI.
+            user_question (str): The extracted question from the user message.
+            has_code_blocks (bool): Whether the user message contained code fences.
+            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
+
+        Returns:
+            list: The final message list ready for the LLM.
+        """
         return await self._message_assembler.assemble(
             messages,
             project_id,
