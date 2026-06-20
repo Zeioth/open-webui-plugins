@@ -393,6 +393,8 @@ class CodeBlock(BaseModel):
     obsolete: bool = False
     is_raw: bool = False
 
+    # REMOVED: potentially_affected: bool = False
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Importance & recency
     # ═══════════════════════════════════════════════════════════════════════════
@@ -4081,12 +4083,21 @@ class SymbolIndex:
             self.remove_edges_for_symbol(qid, project_id)
 
     def _evict_if_needed(self) -> None:
-        """Drop the least‑frequently‑added entry when the index exceeds
-        ``MAX_ENTRIES``, keeping memory bounded."""
+        """
+        Drop the least‑frequently‑added entry when the index exceeds
+        ``MAX_ENTRIES``, keeping memory bounded.
+        """
         while len(self._name_to_blocks) > self.MAX_ENTRIES:
+            # Get the least common entry (by add count)
             least_common = self._stats.most_common()[-1][0]
             project_id, qid = least_common
+
+            # --- 1. Remove all edges (in/out) that reference this symbol ---
+            # This must be done before deleting the symbol entry, otherwise
+            # edges would dangle. remove_edges_for_symbol uses qid (subsystem 04).
             self.remove_edges_for_symbol(qid, project_id)
+
+            # --- 2. Remove the symbol entry itself ---
             meta = self._symbol_meta.get(least_common, {})
             bare = meta.get("name", qid)
             bare_key = (project_id, bare)
@@ -4095,6 +4106,7 @@ class SymbolIndex:
                 bare_set.discard(qid)
                 if not bare_set:
                     del self._bare_index[bare_key]
+
             del self._name_to_blocks[least_common]
             self._stats.pop(least_common, None)
             self._symbol_meta.pop(least_common, None)
@@ -4833,6 +4845,25 @@ class SignatureExtractor:
     def _extract_symbols_from_tree(
         tree, lang: str, code: str, file_path: Optional[str]
     ) -> List["CodeSymbol"]:
+        """
+        Extract symbols from the tree-sitter AST.
+
+        MIGRATED (step 18): Now uses the parent function/class definition node
+        to obtain `line_start` and `line_end`, ensuring that multi-line symbols
+        (e.g., functions with bodies) have a range larger than one line.
+        Previously the name-capture node (one line) was used, causing
+        `line_start == line_end` for every symbol, breaking docstring and CFG
+        generation.
+
+        Args:
+            tree: The tree-sitter parse tree.
+            lang (str): The programming language.
+            code (str): The source code.
+            file_path (Optional[str]): The file path, if available.
+
+        Returns:
+            List[CodeSymbol]: The extracted symbols with correct line ranges.
+        """
         query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
         if not query_str:
             logger.warning(
@@ -4865,6 +4896,8 @@ class SignatureExtractor:
                 "enum_item",
                 "class_specifier",
             )
+            # Combined types for the walk-up
+            definition_types = func_types + class_types
 
             for cap_name, nodes in captures.items():
                 if cap_name != "name":
@@ -4902,21 +4935,28 @@ class SignatureExtractor:
                     )
                     name = node.text.decode("utf-8")
 
-                    # --- FIX: usar parent para line_start/line_end ---
-                    # FIX original: node solo es el token @name (una línea)
-                    # parent es el nodo de definición completo.
-                    if parent:
-                        line_start = parent.start_point[0] + 1
-                        line_end = parent.end_point[0] + 1
-                    else:
-                        line_start = node.start_point[0] + 1
-                        line_end = node.end_point[0] + 1
+                    # --- Find the definition node (function or class) for the line range ---
+                    # Walk up from the name node until we hit a definition node.
+                    # If none is found, fall back to the name node itself.
+                    span_node = node
+                    while (
+                        span_node.parent is not None
+                        and span_node.parent.type not in definition_types
+                    ):
+                        span_node = span_node.parent
+                    if span_node.parent is not None:
+                        span_node = span_node.parent  # Now it's the definition node
 
-                    # Log para depuración – muestra qué rango de líneas se está asignando
+                    # Use the definition node's start/end points for the line range.
+                    # tree-sitter points are 0-indexed; convert to 1-indexed for storage.
+                    line_start = span_node.start_point[0] + 1
+                    line_end = span_node.end_point[0] + 1
+
+                    # Debug log to confirm the change
                     logger.debug(
                         f"[EXTRACT] Symbol '{name}' kind={kind}: "
                         f"line_start={line_start}, line_end={line_end} "
-                        f"(parent type={parent.type if parent else 'None'})"
+                        f"(span_node type={span_node.type})"
                     )
 
                     symbols.append(
@@ -6508,16 +6548,20 @@ class LongTermMemory:
                 sim = 1.0 - (dist / 2.0)
                 if sim >= self._f.valves.duplicate_question_threshold and doc != query:
                     pairs = [(query[:500], doc[:500])]
-                    ce_score = await self._f._commands._predict_cross_encoder(pairs)
-                    if ce_score is None:
+                    raw_score = await self._f._commands._predict_cross_encoder(pairs)
+                    if raw_score is None:
                         self._f._log_debug(
                             "_find_duplicate_question: CrossEncoder not loaded, "
                             "using cosine similarity only (higher false positive risk)."
                         )
                         best_candidate = (sim, doc, None)
                         break
-                    if ce_score[0] > 0.85:
-                        best_candidate = (sim, doc, ce_score[0])
+                    # Normalize CrossEncoder logit to [0,1] before comparing to threshold
+                    ce_prob = self._f._commands._normalize_cross_encoder_score(
+                        raw_score[0]
+                    )
+                    if ce_prob > 0.85:
+                        best_candidate = (sim, doc, ce_prob)
                         break
 
             if best_candidate:
@@ -9002,7 +9046,7 @@ class CommandRouter:
 
     async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
         """Run the CrossEncoder on (text_a, text_b) pairs.
-        Returns raw scores or None if the model is not loaded.
+        Returns raw scores (logits) or None if the model is not loaded.
         """
         if self._f._cross_encoder is None:
             if not self._f._cross_encoder_unavailable_logged:
@@ -9013,6 +9057,18 @@ class CommandRouter:
             return None
         async with self._f._cross_encoder_lock:
             return await anyio.to_thread.run_sync(self._f._cross_encoder.predict, pairs)
+
+    @staticmethod
+    def _normalize_cross_encoder_score(raw_score: float) -> float:
+        """
+        Convert a raw CrossEncoder logit to a probability in [0,1] via sigmoid.
+
+        sentence-transformers CrossEncoder returns logits by default.
+        This normalization is needed when thresholds are calibrated for [0,1].
+        """
+        import math
+
+        return 1.0 / (1.0 + math.exp(-raw_score))
 
     async def _detect_contradictions(self, messages: list) -> Optional[str]:
         """Check if the last user message contradicts recent conversation history.
@@ -10326,6 +10382,10 @@ class CodeBlockManager:
         Returns:
             A subset of symbols whose line_start falls within the chunk range.
         """
+        # --- 1. Filter symbols by line range ---
+        # Since both symbol line numbers and chunk boundaries are in document
+        # coordinates, direct comparison is sufficient. No offset arithmetic
+        # is needed.
         return [
             s
             for s in full_doc_symbols
@@ -14465,18 +14525,13 @@ class ActiveCodeUpdater:
         """
         Register a brand‑new block: symbols, edges, conflict/obsolete checks,
         and hard eviction if max_active_blocks is exceeded.
-
-        MIGRATED (step 13): Obsolete blocks are now capped via
-        `max_obsolete_versions_per_file`. When a new block supersedes older
-        ones, the obsolete blocks are either removed immediately (default) or
-        limited to N per file.
         """
         for sym in syms:
             sym.parent_block_hash = new_block.hash
         new_block.symbols = syms
         new_block.last_mentioned_msg_idx = state["message_count"]
 
-        # Index symbols and call-graph edges (cheap, per-symbol is fine here)
+        # --- 1. Index symbols and call-graph edges ---
         for sym in syms:
             self._f._symbol_index.add(sym, new_block.hash, project_id)
             caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
@@ -14490,7 +14545,7 @@ class ActiveCodeUpdater:
                 )
                 self._f._symbol_index.add_edge(edge, project_id)
 
-        # Data-flow edges: ONE full-file AST pass per block, not per symbol.
+        # --- 2. Data-flow edges: ONE full-file AST pass per block ---
         if self._f.valves.enable_data_flow_analysis and new_block.file_path:
             df_edges = self._f._code_blocks.extract_data_flow_edges(
                 new_block.content, new_block.file_path, project_id
@@ -14505,7 +14560,7 @@ class ActiveCodeUpdater:
         if any(s.calls for s in syms):
             state["has_any_calls"] = True
 
-        # Check for conflicting proposed changes
+        # --- 3. Check for conflicting proposed changes ---
         is_conflicting = False
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             is_conflicting = self._f._code_blocks.has_conflicting_proposed_changes(
@@ -14514,9 +14569,10 @@ class ActiveCodeUpdater:
             if is_conflicting:
                 new_block.importance_score = max(new_block.importance_score, 7.0)
 
+        # --- 4. Insert the new block into active_blocks ---
         state["active_blocks"][new_block.hash] = new_block
 
-        # ── Mark older blocks for the same file as obsolete (step 13) ──
+        # --- 5. Mark older blocks for the same file as obsolete (step 13) ---
         obsolete_hashes = []
         if new_block.file_path and self._f.valves.enable_obsolete_marking:
             for h, blk in list(state["active_blocks"].items()):
@@ -14527,18 +14583,16 @@ class ActiveCodeUpdater:
                     self._f._symbol_index.remove_all_for_block(
                         blk.hash, blk.symbols, project_id
                     )
-                    # Mark obsolete (for any downstream logic that checks the flag)
+                    # Mark obsolete
                     blk.obsolete = True
                     blk._update_importance()
                     obsolete_hashes.append(h)
 
-            # ── Cap obsolete versions per file ──────────────────────────
-            # If max_obsolete_versions_per_file is 0, remove all immediately.
-            # Otherwise, keep the most recent N (by timestamp) and drop the rest.
+            # --- Cap obsolete versions per file ---
             max_keep = self._f.valves.max_obsolete_versions_per_file
             if obsolete_hashes:
                 if max_keep == 0:
-                    # Remove all obsolete blocks immediately.
+                    # Remove all obsolete blocks immediately
                     for h in obsolete_hashes:
                         del state["active_blocks"][h]
                     self._f._log_debug(
@@ -14546,7 +14600,7 @@ class ActiveCodeUpdater:
                         f"(max_obsolete_versions_per_file=0)."
                     )
                 else:
-                    # Sort obsolete blocks by timestamp (newest first), keep only max_keep.
+                    # Keep the most recent max_keep versions
                     obsolete_blocks = [
                         (h, state["active_blocks"][h])
                         for h in obsolete_hashes
@@ -14564,7 +14618,7 @@ class ActiveCodeUpdater:
                         f"out of {len(obsolete_blocks)} (max_obsolete_versions_per_file={max_keep})."
                     )
 
-        # Handle content-type specific actions
+        # --- 6. Handle content-type specific actions ---
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             if new_block.file_path:
                 state["recent_changes"] = [
@@ -14601,7 +14655,7 @@ class ActiveCodeUpdater:
         ):
             new_block.importance_score = min(new_block.importance_score + 3.0, 10.0)
 
-        # Hard eviction if too many active blocks
+        # --- 7. Hard eviction if too many active blocks ---
         if (
             self._f.valves.max_active_blocks > 0
             and len(state["active_blocks"]) > self._f.valves.max_active_blocks
@@ -17120,10 +17174,10 @@ class ProjectStateManager:
     def _new_pstate(self) -> dict:
         """Factory for a fresh per‑project state bag with all defaults."""
         return {
-            # Call‑graph mode (subsystem 02)
+            # Call‑graph mode
             "resolved_call_graph_mode": None,
             "current_call_graph_mode": None,
-            # Silent ingestion (subsystem 01 / paso 3)
+            # Silent ingestion
             "ingested_lang": None,
             "raw_ingested_symbols": None,
             # Block A / skeleton cache keys and invalidation flags
@@ -17142,16 +17196,10 @@ class ProjectStateManager:
             # Token accounting
             "last_system_tokens": 0,
             "last_total_context_tokens": 0,
-            # KV slot persistence
-            "last_static_prefix_hash": "",
-            "last_saved_slot_hash": "",
-            "slot_restored": False,
-            "slot_restore_attempted": False,
-            # Message processing tracking
             "last_processed_message_idx": -1,
             "response_cache_count": 0,
             "summarize_inactive_in_progress": False,
-            # Graph mode downgrade streak (subsystem 02)
+            # Graph mode downgrade streak
             "graph_mode_downgrade_streak": 0,
             # LOD adaptive tracking
             "last_activation_scores": {},
@@ -18211,8 +18259,6 @@ class Filter:
             "last_cot_level": 0,
             "conversation_summaries": [],
             "summarized_turn_hwm": 0,
-            "_pending_slot_resave": False,
-            "_last_evict_target": 0,
         }
 
         # Patterns
@@ -18258,7 +18304,6 @@ class Filter:
         self._pending_llm_lock = asyncio.Lock()
         self._llm_orchestrator.init_cache()
         self._last_used_model: Optional[str] = None
-        self._main_model_ready = False
 
         # ── Tracking of active LLM tasks (prevents model switching conflicts) ──
         self._active_llm_tasks: Set[asyncio.Task] = set()
@@ -18553,16 +18598,12 @@ class Filter:
             if await self._commands.is_code_only_message(user_query):
                 self._log_section("SILENT INGESTION MODE")
 
-                # --- 0. Resolve project state for silent ingestion ---
                 pstate = self._project_state_manager.get_pstate(project_id)
 
-                # ── Guardamos el lenguaje para que extract_code_blocks lo use ──
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
                 _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
                 pstate["ingested_lang"] = _lang
 
-                # ── Extraemos los símbolos del documento completo AHORA,
-                #     antes de que extract_code_blocks trocee el código.
                 raw_symbols = []
                 if HAS_TREE_SITTER:
                     try:
@@ -18572,7 +18613,6 @@ class Filter:
                     except Exception:
                         raw_symbols = []
 
-                # ── Enriquecer con parent_symbol usando el AST ──
                 if raw_symbols:
                     raw_symbols = SignatureExtractor.enrich_symbols_with_parent_info(
                         raw_symbols, user_query
@@ -18580,36 +18620,23 @@ class Filter:
 
                 pstate["raw_ingested_symbols"] = raw_symbols
 
-                # Pasamos el mensaje SIN envolver (el código crudo mantiene los
-                # números de línea correctos para la asignación de símbolos).
                 _msg_to_index = last_user_msg
 
-                # ── Evitar cualquier llamada al LLM durante la ingesta ─
                 self._is_silent_ingestion = True
                 try:
-                    # Process code into SymbolGraph without invoking main LLM
                     await self._update_active_code(_msg_to_index, project_id)
                 finally:
-                    pass  # flag stays active until outlet clears it
+                    pass
 
-                # Resolve cross‑references with previous chunks
                 await self._activation.resolve_dangling_edges(project_id)
 
-                # Rebuild PathIndex with new symbols
                 if self.valves.enable_path_analysis:
                     await self._activation.rebuild_path_index(project_id)
 
-                # Invalidate static block (new code → new Block A)
                 self._ctx_builder.invalidate_block_a_cache(
                     project_id, "new chunk ingested", recompute_centrality=True
                 )
 
-                # Eagerly rebuild Block A (hub symbols + architecture map +
-                # skeleton tier) right now. Silent ingestion's whole point
-                # is to make the new code instantly usable; the scaffolding
-                # is stable, low-volatility context, so it belongs
-                # pre-computed in Block A (KV-cache-anchoring), not deferred
-                # to whatever Block B does on the next real query.
                 try:
                     static_block = await self._ctx_builder.build_block_a(
                         project_id, is_code_session=True, is_continuation=False
@@ -18624,17 +18651,14 @@ class Filter:
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
 
-                # Force state save after ingestion (there is no outlet)
                 self._state_dirty = True
                 await self._state_store.save_state_if_dirty(project_id)
 
-                # Statistics for the user
                 state = self._state_store.get_state(project_id)
                 num_blocks = len(state.get("active_blocks", {}))
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
-                # ── Enriched message with class counting ──
                 response = (
                     f"✅ {num_symbols} símbolos en {num_classes} clases "
                     f"({num_blocks} bloques activos). El código está en el SymbolGraph. "
@@ -18651,11 +18675,6 @@ class Filter:
                 messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
 
-                # ── Context dump: silent ingestion never passes through
-                # MessageAssembler._assemble_final_system_and_log, which is the
-                # only place where the snapshot is normally scheduled.
-                # Without this, ingestion turns — precisely where the SymbolGraph
-                # grows the most — remain invisible in evolution.jsonl.
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -18694,9 +18713,6 @@ class Filter:
         # 🧠 ENRICHMENT (Critical for call‑graph mode resolution)
         #   Resolve call‑graph mode BEFORE Block A is built.
         # ─────────────────────────────────────────────────────────────────
-        # --- 5.5: Classify intent and resolve the call-graph mode ---
-        # This must happen before build_block_a so that Block A renders the
-        # correct depth for the current query.
         intent_vector = await self._commands.classify_intent(user_query, project_id)
         self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
 
@@ -18721,13 +18737,6 @@ class Filter:
             )
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
-
-        # ── v8: Restore KV slot after Block A has been built (fix #20) ──
-        if (
-            self.valves.enable_slot_persistence
-            and project_id not in self._slot_restore_attempted
-        ):
-            await self._ctx_builder.slot_restore(project_id)
 
         if cached_response:
             messages.pop()
@@ -18778,7 +18787,6 @@ class Filter:
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ═══════════════════════════════════════════════════════════════════════════
-
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """Post‑process the response after the LLM has generated it.
 
@@ -18792,8 +18800,7 @@ class Filter:
         * Runs speculative prefetch for the next likely query.
         * Purges expired memories, rebuilds RAPTOR clusters periodically,
           and runs SQLite + ChromaDB checkpoints.
-        * Persists the KV‑cache slot, symbol edges, path views, and dirty
-          conversation state.
+        * Persists symbol edges, path views, and dirty conversation state.
 
         Returns the (possibly modified) body unchanged.
         """
@@ -18991,26 +18998,6 @@ class Filter:
                     "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
                 )
                 await self._state_store.run_db_checkpoints()
-
-            # ── Slot save ──────────────────────────────────────────────
-            if self.valves.enable_slot_persistence:
-                try:
-                    self._last_total_context_tokens[project_id] = (
-                        self._tokens.estimate_tokens(messages)
-                    )
-                except Exception:
-                    pass
-
-                if state and state.get("_pending_slot_resave"):
-                    saved = await self._ctx_builder.slot_save(project_id, force=True)
-                    if saved:
-                        self._log_debug(
-                            "Slot re-saved after compaction (stable new prefix)"
-                        )
-                    state["_pending_slot_resave"] = False
-                    self._state_store.set_state(project_id, state)
-                else:
-                    await self._ctx_builder.slot_save(project_id)
 
             # ── Purge old versions ─────────────────────────────────────
             if (
