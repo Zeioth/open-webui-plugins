@@ -16424,10 +16424,6 @@ class MessageAssembler:
     ) -> None:
         """
         Inject multi‑phase protocol if the token budget is tight.
-
-        MIGRATED (step 14): The budget branch is now always evaluated.
-        `force_multi_phase_response` is an additive override, not a short-circuit.
-        Default is False, so multi-phase only triggers when the budget is actually tight.
         """
         if not (
             self._f.valves.enable_multi_phase_response
@@ -17196,6 +17192,11 @@ class ProjectStateManager:
             # Token accounting
             "last_system_tokens": 0,
             "last_total_context_tokens": 0,
+            # KVCache persistence
+            "last_saved_slot_hash": "",
+            "slot_restored": False,
+            "slot_restore_attempted": False,
+            # Misc
             "last_processed_message_idx": -1,
             "response_cache_count": 0,
             "summarize_inactive_in_progress": False,
@@ -17224,6 +17225,221 @@ class ProjectStateManager:
     def clear_project(self, project_id: str) -> None:
         """Remove the state bag for a project (called on eviction)."""
         self._store.pop(project_id, None)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3 — KVCache persistence
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def slot_save(self, project_id: str, force: bool = False) -> bool:
+        """
+        Save the KV slot after a turn.
+
+        force=True ignores the static-hash guard (used after monotonic
+        compaction, when the history prefix changed but Block A did not — #16).
+        The token-threshold guard (P5) is always respected.
+        """
+        if not self._f.valves.enable_slot_persistence:
+            return False
+
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Token threshold guard (skip oversized KV writes) ---
+        _max_ctx = self._f.valves.slot_save_max_context_tokens
+        if _max_ctx > 0:
+            _ctx_tok = pstate.get("last_total_context_tokens", 0)
+            if _ctx_tok > _max_ctx:
+                self._f._log_debug(
+                    f"Slot save skipped: context {_ctx_tok} tokens > threshold "
+                    f"{_max_ctx} (avoids large KV write under mutex)"
+                )
+                return False
+
+        # --- 3. Get current static hash ---
+        cached = pstate.get("block_a_cached")
+        if not cached:
+            return False
+        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+
+        # --- 4. Skip if already saved and not forced ---
+        if not force and pstate.get("last_saved_slot_hash") == static_hash:
+            return False
+
+        # --- 5. Build filename and call llama.cpp API ---
+        filename = self._slot_filename(project_id, static_hash)
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
+            )
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "save"},
+                json={"filename": filename, "model": self._f.valves.llm_model},
+            ) as resp:
+                if resp.status == 200:
+                    pstate["last_saved_slot_hash"] = static_hash
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ Slot saved → {filename} "
+                        f"({data.get('n_saved', '?')} tokens, "
+                        f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
+                    )
+                    await self._cleanup_old_slot_files(project_id, filename)
+                    return True
+                else:
+                    body = await resp.text()
+                    self._f._log_debug(f"Slot save failed: HTTP {resp.status} — {body}")
+                    return False
+        except Exception as e:
+            self._f._log_debug(f"Slot save error: {e}")
+            return False
+
+    async def slot_restore(self, project_id: str) -> bool:
+        """
+        Restore the KV slot at session start.
+        """
+        if not self._f.valves.enable_slot_persistence:
+            return False
+
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Skip if already attempted ---
+        if pstate.get("slot_restore_attempted", False):
+            return pstate.get("slot_restored", False)
+
+        pstate["slot_restore_attempted"] = True
+
+        # --- 3. Get current static hash ---
+        cached = pstate.get("block_a_cached")
+        if not cached:
+            return False
+        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+        filename = self._slot_filename(project_id, static_hash)
+
+        # --- 4. Check if file exists ---
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.exists(os.path.join(slot_dir, filename)):
+            self._f._log_debug(f"Slot restore: no file found for {filename}")
+            return False
+
+        # --- 5. Call llama.cpp API to restore ---
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
+            )
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "restore"},
+                json={"filename": filename, "model": self._f.valves.llm_model},
+            ) as resp:
+                if resp.status == 200:
+                    pstate["slot_restored"] = True
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ Slot restored ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
+                    )
+                    return True
+                else:
+                    body = await resp.text()
+                    self._f._log_debug(
+                        f"Slot restore failed: HTTP {resp.status} — {body}"
+                    )
+                    return False
+        except Exception as e:
+            self._f._log_debug(f"Slot restore error: {e}")
+            return False
+
+    async def slot_restore_for_continuity(self, project_id: str) -> bool:
+        """
+        Restore KV cache after auxiliary LLM calls (CoT, contradiction) have
+        dirtied the slot due to SWA architecture. Called at the end of every
+        inlet when slot_free=True.
+        """
+        if not self._f.valves.enable_slot_persistence:
+            return False
+
+        # --- 1. Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # --- 2. Get current static hash ---
+        cached = pstate.get("block_a_cached")
+        if not cached:
+            return False
+        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+        filename = self._slot_filename(project_id, static_hash)
+
+        # --- 3. Check if file exists ---
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.exists(os.path.join(slot_dir, filename)):
+            return False
+
+        # --- 4. Call llama.cpp API to restore ---
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
+            )
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "restore"},
+                json={"filename": filename, "model": self._f.valves.llm_model},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ KV cache restored post-aux ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
+                    )
+                    return True
+                body = await resp.text()
+                self._f._log_debug(
+                    f"KV cache continuity restore failed: HTTP {resp.status} — {body}"
+                )
+                return False
+        except Exception as e:
+            self._f._log_debug(f"KV cache continuity restore error: {e}")
+            return False
+
+    def _slot_filename(self, project_id: str, static_hash: str) -> str:
+        """
+        Deterministic slot file name.
+        Encodes: project + static block hash + model hash.
+        If any of the three changes → different name → no stale restore.
+
+        """
+        model_hash = hashlib.md5(self._f.valves.llm_model.encode()).hexdigest()[:8]
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        return f"slot{self._f.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
+
+    async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
+        """
+        Delete stale slot files, keeping only the current one.
+        """
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.isdir(slot_dir):
+            return
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
+        try:
+            for fname in os.listdir(slot_dir):
+                if fname.startswith(prefix) and fname != keep:
+                    os.remove(os.path.join(slot_dir, fname))
+                    self._f._log_debug(f"Removed obsolete slot file: {fname}")
+        except Exception as e:
+            self._f._log_debug(f"Slot cleanup error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -17608,8 +17824,9 @@ class Filter:
         prioritize_recent_code: bool = Field(default=True)
         enable_obsolete_marking: bool = Field(default=True)
         # ── Obsolete version cap ──────────────────────────
+        # increase to improve backtracing over code changes
         max_obsolete_versions_per_file: int = Field(
-            default=0,
+            default=3,
             ge=0,
             description=(
                 "Maximum number of obsolete code versions to keep per file. "
@@ -18259,6 +18476,7 @@ class Filter:
             "last_cot_level": 0,
             "conversation_summaries": [],
             "summarized_turn_hwm": 0,
+            "_pending_slot_resave": False,
         }
 
         # Patterns
@@ -18323,8 +18541,6 @@ class Filter:
         self._symbol_index = SymbolIndex()
         self._path_index = PathIndex()
 
-        # ── FIX 20: Clean ContextBuilder caches and token trackers ──
-        # (These are inside ContextBuilder instance, not in Filter)
         # Block change summaries LRU
         self._block_change_summaries: OrderedDict = OrderedDict()
         self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
@@ -18738,6 +18954,10 @@ class Filter:
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
 
+        # ── v9: Restore KV slot after Block A has been built ──
+        if self.valves.enable_slot_persistence:
+            await self._ctx_builder.slot_restore(project_id)
+
         if cached_response:
             messages.pop()
             messages.append(
@@ -18801,6 +19021,7 @@ class Filter:
         * Purges expired memories, rebuilds RAPTOR clusters periodically,
           and runs SQLite + ChromaDB checkpoints.
         * Persists symbol edges, path views, and dirty conversation state.
+        * Saves the KV slot (slot persistence) for future session restores.
 
         Returns the (possibly modified) body unchanged.
         """
@@ -18998,6 +19219,28 @@ class Filter:
                     "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
                 )
                 await self._state_store.run_db_checkpoints()
+
+            # ── Slot save ──────────────────────────────────────────────
+            if self.valves.enable_slot_persistence:
+                # Track total context tokens for the threshold guard
+                try:
+                    pstate = self._project_state_manager.get_pstate(project_id)
+                    pstate["last_total_context_tokens"] = self._tokens.estimate_tokens(
+                        messages
+                    )
+                except Exception:
+                    pass
+
+                if state and state.get("_pending_slot_resave"):
+                    saved = await self._ctx_builder.slot_save(project_id, force=True)
+                    if saved:
+                        self._log_debug(
+                            "Slot re-saved after compaction (stable new prefix)"
+                        )
+                    state["_pending_slot_resave"] = False
+                    self._state_store.set_state(project_id, state)
+                else:
+                    await self._ctx_builder.slot_save(project_id)
 
             # ── Purge old versions ─────────────────────────────────────
             if (
