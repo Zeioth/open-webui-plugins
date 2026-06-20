@@ -16955,12 +16955,18 @@ class ContextDumper:
                     )
                 msg_copy.append((role, content))
 
+        # --- Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
         try:
             code_state_hash = self._f._activation.compute_code_state_hash(project_id)
         except Exception:
             code_state_hash = ""
-        block_a_hash = self._f._last_static_prefix_hash.get(project_id, "")
-        slot_hash = self._f._last_saved_slot_hash.get(project_id, "")
+
+        # --- get hashes from pstate ---
+        block_a_hash = pstate.get("last_static_prefix_hash", "")
+        slot_hash = pstate.get("last_saved_slot_hash", "")
+
         try:
             state = self._f._state_store.get_state(project_id)
             turn = state.get("message_count", 0)
@@ -16968,6 +16974,7 @@ class ContextDumper:
         except Exception:
             turn = 0
             n_active_blocks = 0
+
         try:
             n_symbols = len(self._f._symbol_index.get_all_names(project_id))
         except Exception:
@@ -17002,8 +17009,8 @@ class ContextDumper:
             "slot_saved_hash": slot_hash,
             "n_active_blocks": n_active_blocks,
             "n_symbols": n_symbols,
-            "n_symbols_with_parent": n_with_parent,  # NEW
-            "n_classes": n_classes,  # NEW
+            "n_symbols_with_parent": n_with_parent,
+            "n_classes": n_classes,
         }
 
     # ═══════════════════════════════════════════════════════════════════════════
