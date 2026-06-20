@@ -3142,12 +3142,18 @@ class ContextBuilder:
         """
         Tokens available for history + user message after Block A + Block B.
 
-        Uses the token counts recorded for the last request
-        (self._f._last_system_tokens[project_id]).
+        Args:
+            project_id (str): The current project identifier.
+
+        Returns:
+            int: The number of tokens available for the history and user message.
         """
         window = self._f.valves.context_window_tokens
+
+        # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
         used = pstate.get("last_system_tokens", 0)
+
         reserve = self._f.valves.response_reserve_tokens
         budget = max(0, window - used - reserve)
 
@@ -14930,11 +14936,15 @@ class InletOrchestrator:
             old_state = self._f._conversation_state.get(self._f._last_project_id)
             if old_state:
                 self._f._symbol_index.clear_project(self._f._last_project_id)
-            self._f._cached_lightweight_context.pop(self._f._last_project_id, None)
+
+            self._f._project_state_manager.clear_project(self._f._last_project_id)
+
+            # _block_change_summaries is global (LRU); keep it as is.
             self._f._block_change_summaries.clear()
+
         self._f._last_project_id = project_id
 
-        # ── v7 (PASO-15): load persisted CodePathViews if index is empty ──
+        # ── load persisted CodePathViews if index is empty ──
         if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
             existing_views = self._f._path_index.get_all(project_id)
             all_names = self._f._symbol_index.get_all_names(project_id)
@@ -14948,7 +14958,7 @@ class InletOrchestrator:
                 for view in db_views:
                     self._f._path_index.add(view, project_id)
 
-        # ── v7 Phase 5 (PASO-28): restore typed edges from DB ─────────
+        # ── restore typed edges from DB ─────────
         if self._f.valves.enable_edge_persistence:
             restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
             if restored > 0:
