@@ -2477,11 +2477,9 @@ class ContextBuilder:
         """
         Build Block A: stable, KV-cache-anchoring content.
 
-        MIGRATION: body is copied verbatim from Filter._get_static_context_block()
-        with exactly ONE change — the symbol-index section is produced by the
-        HubSymbolIndex (top-N by centrality) instead of _build_lightweight_context()
-        (all symbols). Everything else (confidence prompt, checklist, feedback
-        context, the static_hash cache key, the cache read/write) is identical.
+        MIGRATED (step 8): The cache key now includes `resolved_call_graph_mode`
+        so that a mode change invalidates Block A and forces a rebuild, while
+        the same mode reuses the cached content.
 
         Returns "" when not a code session.
         """
@@ -2492,23 +2490,31 @@ class ContextBuilder:
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-        cache_key = pstate.get("block_a_cache_key")
+        mode = pstate.get("resolved_call_graph_mode", "hubs_only")
+
+        # --- 2. Build the cache key including the mode ---
+        # The cache key is a combination of the code state hash and the resolved mode.
+        # When either changes, Block A must be rebuilt.
+        cache_key = f"{current_code_hash}__{mode}"
         cached_text = pstate.get("block_a_cached")
+        stored_key = pstate.get("block_a_cache_key")
 
-        if cache_key and cache_key == current_code_hash:
-            if cached_text:
-                return cached_text  # ✓ Hit: same code → same block
-            # ── Continuation: freeze Block A to prevent KV cache misses ──
-            if is_continuation:
-                self._f._log_debug(
-                    "🧱 Block A: frozen for AutoContinue (KV cache stability)"
-                )
-                return cached_text
+        if stored_key and stored_key == cache_key and cached_text is not None:
+            # --- 2a. Cache hit: same code + same mode ---
+            return cached_text
 
-        # ── Build the static block ──────────────────────────────────────
+        # --- 2b. Cache miss or continuation freeze ---
+        if is_continuation and cached_text is not None:
+            # Continuation: freeze Block A to prevent KV cache misses
+            self._f._log_debug(
+                "🧱 Block A: frozen for AutoContinue (KV cache stability)"
+            )
+            return cached_text
+
+        # --- 3. Build the static block ---
         parts: List[str] = []
 
-        # 1. Base instructions (completely static)
+        # 3.1 Base instructions (completely static)
         if is_code_session and self._f.valves.enable_confidence_scoring:
             parts.append(self._f.valves.confidence_prompt.strip())
 
@@ -2539,9 +2545,7 @@ class ContextBuilder:
             )
             parts.append(critical_guidelines)
 
-        # 2. Symbol index (depth depends on call_graph_context_mode; the mode
-        # itself is resolved per-query in build_block_b and read here as
-        # already-decided state — Block A stays a passive consumer).
+        # 3.2 Symbol index (depth depends on call_graph_context_mode)
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
@@ -2562,16 +2566,13 @@ class ContextBuilder:
                 if symbol_section:
                     parts.append(symbol_section)
 
-        # 2.5 Skeleton tier (#15): whole-project signatures as a STABLE cache
-        # prefix. Self-cached by signature_hash (survives body edits) inside
-        # _build_skeleton_tier; rendered here so the Block A prefix hash and the
-        # llama.cpp KV cache cover it. Auto-skipped when over budget.
+        # 3.3 Skeleton tier (#15)
         if is_code_session and self._f.valves.enable_code_awareness:
             skeleton_tier = self._build_skeleton_tier(project_id)
             if skeleton_tier:
                 parts.append(skeleton_tier)
 
-        # 3. Feedback context (stable between requests barring new feedback)
+        # 3.4 Feedback context
         if (
             is_code_session
             and self._f.valves.enable_feedback_tracking
@@ -2583,23 +2584,16 @@ class ContextBuilder:
 
         static_block = "\n\n".join(p for p in parts if p.strip())
 
-        # ── Cache and track ─────────────────────────────────────────────
-        # MIGRATED: store cache key and rendered block in pstate
-        pstate["block_a_cache_key"] = current_code_hash
+        # --- 4. Store in cache with the mode-aware key ---
+        pstate["block_a_cache_key"] = cache_key
         pstate["block_a_cached"] = static_block
 
-        # Detect and log prefix changes (= cache miss in llama.cpp).
-        # The real cacheable prefix is [user system prompt] + [static_block]
-        # (the user prompt is prepended at assembly time and is part of zone A),
-        # so the hash must change when EITHER changes — otherwise a mid-session
-        # edit of the user system prompt is invisible to KV-cache-miss detection
-        # and to slot persistence.
+        # --- 5. Detect and log prefix changes (KV cache miss) ---
         _user_sys = getattr(self._f, "_original_system_prompt", "") or ""
         new_prefix_hash = hashlib.md5(
             (_user_sys + "\x1e" + static_block).encode()
         ).hexdigest()[:16]
 
-        # MIGRATED: store prefix hash in pstate
         last_hash = pstate.get("last_static_prefix_hash")
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
@@ -2629,20 +2623,26 @@ class ContextBuilder:
         return static_block
 
     def invalidate_block_a_cache(
-        self, project_id: str, reason: str = "", recompute_centrality: bool = True
+        self, project_id: str, reason: str = "", recompute_centrality: bool = False
     ) -> None:
         """
         Force Block A rebuild on the next request, optionally refreshing
         centrality scores.
 
-        MIGRATED: all caches now live in ProjectStateManager. This method
-        clears the per-project Block A, skeleton, and skeleton tier caches,
-        and optionally recomputes centrality scores.
+        MIGRATED (step 9): PageRank recomputation is now decoupled from mode
+        changes. `recompute_centrality` defaults to False because changing the
+        call-graph mode does not alter the graph topology. Only graph mutations
+        (new code ingestion, new edges) should set this to True.
+
+        The valve `call_graph_mode_recompute_pagerank` (step 11) provides an
+        opt-in override for debugging/emergency recomputation on mode changes.
 
         Args:
             project_id (str): The project whose cache should be invalidated.
             reason (str): Optional reason for logging.
             recompute_centrality (bool): Whether to recompute PageRank centrality.
+                                         Default False; pass True only when the
+                                         graph has actually mutated.
         """
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
@@ -2661,6 +2661,8 @@ class ContextBuilder:
         pstate["skeleton_tier_cached"] = None
 
         # --- 3. Optionally recompute centrality (PageRank) ---
+        # PageRank only depends on graph topology, not on the display mode.
+        # Therefore we only recompute when explicitly requested (graph mutation).
         if recompute_centrality:
             try:
                 pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
@@ -2668,6 +2670,12 @@ class ContextBuilder:
                 )
             except Exception as e:
                 self._f._log_debug(f"Centrality recomputation failed: {e}")
+        else:
+            # Log that we skipped recompute on a non-graph invalidation.
+            self._f._log_debug(
+                f"Skipped PageRank recompute for '{project_id}' (not a graph mutation). "
+                "Set call_graph_mode_recompute_pagerank=True to force."
+            )
 
         # --- 4. Log the invalidation ---
         if reason:
@@ -3346,6 +3354,11 @@ class ContextBuilder:
         query) is visible in the very turn that triggered it instead of
         lagging one turn behind.
 
+        Implements hysteresis (step 10) to avoid mode flip-flop:
+        - Upgrades (hubs_only → expanded_hubs → full_graph) apply immediately.
+        - Downgrades are deferred until N consecutive turns request the lower mode,
+          where N is `call_graph_mode_downgrade_after_turns`.
+
         Args:
             project_id (str): Current project identifier.
             query (str): The user's query text.
@@ -3377,6 +3390,7 @@ class ContextBuilder:
             pstate["graph_mode_downgrade_streak"] = 0
         else:
             # Candidate downgrade: only commit after enough consecutive turns.
+            # This implements the hysteresis to avoid flip-flop (step 10).
             streak += 1
             pstate["graph_mode_downgrade_streak"] = streak
             if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
@@ -3411,6 +3425,9 @@ class ContextBuilder:
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
+
+        MIGRATED (step 7): Mode is now re-resolved every turn. The guard that
+        froze the mode after the first turn has been removed.
 
         Args:
             project_id (str): Current project identifier.
@@ -3529,13 +3546,12 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
-        # MIGRATED: use ProjectStateManager for resolved mode
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        resolved_graph_mode = pstate.get("resolved_call_graph_mode")
-        if resolved_graph_mode is None:
-            resolved_graph_mode = self.prepare_call_graph_mode(
-                project_id, query, intent_vector
-            )
+        # MIGRATED (step 7): Always re-resolve the mode per turn.
+        # The previous guard (if resolved_graph_mode is None) has been removed.
+        # prepare_call_graph_mode handles hysteresis (step 10) internally.
+        resolved_graph_mode = self.prepare_call_graph_mode(
+            project_id, query, intent_vector
+        )
 
         # ── Step 3: Build LOD tiers as separate accumulators ──────────────
         total_tokens = 0
@@ -17504,6 +17520,17 @@ class Filter:
                 "forcing a full KV-cache prefill) on every topic switch."
             ),
         )
+
+        # ── PageRank recomputation on mode change (step 11) ──────────
+        call_graph_mode_recompute_pagerank: bool = Field(
+            default=False,
+            description=(
+                "If True, recompute PageRank when the call-graph mode changes. "
+                "Mode does not alter graph topology, so this is normally unnecessary; "
+                "kept as an opt-in safety/debug switch."
+            ),
+        )
+
         # ── Inventory (structural / listing queries) ────────────────
         enable_hierarchical_inventory: bool = Field(
             default=True,
@@ -18399,7 +18426,6 @@ class Filter:
                 # ── Guardamos el lenguaje para que extract_code_blocks lo use ──
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
                 _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                # MIGRATED: use pstate instead of self._ingested_lang
                 pstate["ingested_lang"] = _lang
 
                 # ── Extraemos los símbolos del documento completo AHORA,
@@ -18419,7 +18445,6 @@ class Filter:
                         raw_symbols, user_query
                     )
 
-                # MIGRATED: use pstate instead of self._raw_ingested_symbols
                 pstate["raw_ingested_symbols"] = raw_symbols
 
                 # Pasamos el mensaje SIN envolver (el código crudo mantiene los
@@ -18443,7 +18468,7 @@ class Filter:
 
                 # Invalidate static block (new code → new Block A)
                 self._ctx_builder.invalidate_block_a_cache(
-                    project_id, "new chunk ingested"
+                    project_id, "new chunk ingested", recompute_centrality=True
                 )
 
                 # Eagerly rebuild Block A (hub symbols + architecture map +
@@ -18533,6 +18558,16 @@ class Filter:
         _inlet_timing("Step 5/7: Prepare code session", step_start)
 
         # ─────────────────────────────────────────────────────────────────
+        # 🧠 ENRICHMENT (Critical for call‑graph mode resolution)
+        #   Resolve call‑graph mode BEFORE Block A is built.
+        # ─────────────────────────────────────────────────────────────────
+        # --- 5.5: Classify intent and resolve the call-graph mode ---
+        # This must happen before build_block_a so that Block A renders the
+        # correct depth for the current query.
+        intent_vector = await self._commands.classify_intent(user_query, project_id)
+        self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
+
+        # ─────────────────────────────────────────────────────────────────
         # 🧠 ENRICHMENT (High value)
         #   6. Build system injections and assemble final messages
         #      (delegates Block A/B construction to ContextBuilder)
@@ -18549,6 +18584,7 @@ class Filter:
                 last_user_msg,
                 state,
                 slot_free=slot_free,
+                intent_vector=intent_vector,
             )
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
