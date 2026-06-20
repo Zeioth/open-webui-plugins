@@ -2369,12 +2369,6 @@ class ContextBuilder:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
-        # Per-project Block A cache: project_id → (static_hash, rendered_text).
-        self._block_a_cache: dict = {}
-        # Skeleton cache: project_id → (code_state_hash, skeleton_text).
-        self._skeleton_cache: Dict[str, Tuple[str, str]] = {}
-        # Skeleton tier cache: project_id → (signature_hash, tier_text).
-        self._skeleton_tier_cache: Dict[str, Tuple[str, str]] = {}
 
         # Fast-path trigger for inventory / structural queries.
         self._LIST_INTENTS = re.compile(
@@ -2400,7 +2394,7 @@ class ContextBuilder:
             re.IGNORECASE,
         )
 
-        # ── #17: LOD policy per use case ─────────────────────────────
+        # ── LOD policy per use case ─────────────────────────────
         self.LOD_PROFILES: Dict[str, dict] = {
             "A": {
                 "lod1_mult": 1.0,
@@ -5723,10 +5717,8 @@ class StateStore:
             # Clean up ALL per-project volatile state at once via ProjectStateManager
             self._f._project_state_manager.clear_project(oldest_pid)
 
-            # Clean up ContextBuilder caches (these live inside the builder instance)
-            self._f._ctx_builder._block_a_cache.pop(oldest_pid, None)
-            self._f._ctx_builder._skeleton_tier_cache.pop(oldest_pid, None)
-            self._f._ctx_builder._skeleton_cache.pop(oldest_pid, None)
+            # REMOVED: ContextBuilder caches are now managed by ProjectStateManager
+            # No need to manually pop _block_a_cache, _skeleton_tier_cache, etc.
 
         # --- 5. Rebuild symbol index from active blocks if needed ---
         if state.get("active_blocks"):
@@ -16699,6 +16691,9 @@ class MessageAssembler:
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
+        # --- Resolve per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
             selected_dynamic: List[str] = []
@@ -16797,9 +16792,10 @@ class MessageAssembler:
             )
             total_system_tok = len(self._f.tokenizer.encode(final_system))
 
-            self._f._last_system_tokens[project_id] = total_system_tok
+            # --- store in pstate ---
+            pstate["last_system_tokens"] = total_system_tok
 
-            prefix_hash = self._f._last_static_prefix_hash.get(project_id, "N/A")
+            prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
             self._f._log_debug(
@@ -19205,7 +19201,6 @@ class Filter:
 
             # ── Speculative prefetch (MIGRATED: uses pstate) ──────────────
             if self.valves.enable_speculative_prefetch and is_code_session:
-                pstate = self._project_state_manager.get_pstate(project_id)
                 last_activated = pstate.get("last_activation_scores", {})
                 if last_activated:
                     await self._activation.speculative_prefetch(
