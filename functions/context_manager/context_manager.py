@@ -11599,9 +11599,14 @@ class ActivationEngine:
 
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 1 — Load state & filter active blocks
+        # ═══════════════════════════════════════════════════════════════════════════
         state = self._f._state_store.get_state(project_id)
         if not state or not state["active_blocks"]:
             return ""
+
         now = time.time()
         active = []
         for block in state["active_blocks"].values():
@@ -11614,9 +11619,13 @@ class ActivationEngine:
                 ):
                     continue
             active.append(block)
+
         if not active:
             return ""
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 2 — Recent activity & mentioned files
+        # ═══════════════════════════════════════════════════════════════════════════
         recent_window = self._f.valves.recent_activity_window_minutes * 60
         recent_files = {}
         for b in active:
@@ -11626,6 +11635,7 @@ class ActivationEngine:
                     or b.timestamp > recent_files[b.file_path]
                 ):
                     recent_files[b.file_path] = b.timestamp
+
         recent_lines = []
         for file_path, ts in recent_files.items():
             age_seconds = now - ts
@@ -11633,6 +11643,7 @@ class ActivationEngine:
                 minutes_ago = int(age_seconds / 60)
                 time_str = f"{minutes_ago} min ago" if minutes_ago > 0 else "just now"
                 recent_lines.append(f"- `{file_path}` ({time_str})")
+
         recent_section = ""
         if recent_lines:
             recent_section = (
@@ -11641,6 +11652,9 @@ class ActivationEngine:
                 + "\n\n"
             )
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 3 — Compute relevance boost (file + symbol mentions)
+        # ═══════════════════════════════════════════════════════════════════════════
         mentioned_files = set()
         mentioned_symbols = set()
         if user_query:
@@ -11667,6 +11681,10 @@ class ActivationEngine:
         for b in active:
             boost = relevance_boost(b)
             boosted_active.append((b, boost))
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 4 — Sort and group blocks by type
+        # ═══════════════════════════════════════════════════════════════════════════
         boost_priority = self._f.valves.raw_file_priority_boost
         boosted_active.sort(
             key=lambda pair: (
@@ -11706,6 +11724,9 @@ class ActivationEngine:
             else []
         )
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 5 — Build the context sections (Base, Proposed, Committed, Errors)
+        # ═══════════════════════════════════════════════════════════════════════════
         parts = ["## Currently Active Code Context (by importance)\n"]
         parts.insert(
             1,
@@ -11720,18 +11741,21 @@ class ActivationEngine:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
+
         if proposed:
             parts.append("### Proposed Changes (pending review):")
             for b in proposed:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
+
         if committed:
             parts.append("### Recently Committed Changes:")
             for b in committed:
                 is_latest = b.hash in latest_hashes
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
+
         if errors:
             parts.append("### Recent Errors:")
             for b in errors:
@@ -11739,11 +11763,16 @@ class ActivationEngine:
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
 
-        # Dynamic budget (Fix 4 with guard against negative)
+        # ═══════════════════════════════════════════════════════════════════════════
+        # REGION 6 — Dynamic budget & truncation (uses pstate)
+        # ═══════════════════════════════════════════════════════════════════════════
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        used_system = pstate.get("last_system_tokens", 0)
+
         effective_budget = max(
             4000,
             self._f.valves.context_window_tokens
-            - self._f._last_system_tokens.get(project_id, 0)
+            - used_system
             - self._f.valves.response_reserve_tokens,
         )
         max_tokens = min(
@@ -11752,14 +11781,6 @@ class ActivationEngine:
         )
 
         # Convergent truncation with line-by-line fence detection.
-        # Perf: token counts are computed ONCE per part and maintained
-        # incrementally. The previous implementation re-encoded every part
-        # inside the inner loop AND re-encoded the full joined text at the
-        # bottom of every while-iteration — O(passes × total_text) tokenizer
-        # work, a real CPU spike on the request hot path for large contexts.
-        # The running total is the sum of per-part encodes (exactly the metric
-        # the old inner loop already used to pick the largest part), so the
-        # truncation decision is unchanged; only the redundant encoding is gone.
         if max_tokens > 0 and self._f.tokenizer:
             part_tokens = [len(self._f.tokenizer.encode(p)) for p in parts]
             current_tokens = sum(part_tokens)
