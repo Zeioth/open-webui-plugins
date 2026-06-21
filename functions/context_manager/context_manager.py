@@ -18521,7 +18521,7 @@ class Filter:
         # ── Multi‑phase response ────────────────────────────────────
         enable_multi_phase_response: bool = Field(default=True)
         force_multi_phase_response: bool = Field(
-            default=True,
+            default=False,
             description="Force multi-phase response protocol even when budget is not tight.",
         )
         multi_phase_effective_max_tokens: int = Field(default=8000, ge=1000, le=200000)
