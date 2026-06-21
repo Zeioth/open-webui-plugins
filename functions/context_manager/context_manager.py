@@ -18038,6 +18038,19 @@ class Filter:
             default=True,
             description="Replace old multi‑phase code parts with compact commit summaries.",
         )
+        code_history_force_compress_after_turns: int = Field(
+            default=8,
+            ge=0,
+            description=(
+                "If a code-bearing history message stays compression-eligible "
+                "but blocked by the symbol-index ratio for more than this many "
+                "turns, compress it anyway WITHOUT an /expand guarantee "
+                "(marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]'). Prevents the "
+                "history anti-growth guarantee from being silently disabled "
+                "when assistant-code indexing degrades or the ratio threshold "
+                "is set high. 0 = never force (legacy: ratio gate is absolute)."
+            ),
+        )
         code_history_keep_last_n_parts: int = Field(
             default=3,
             ge=1,
