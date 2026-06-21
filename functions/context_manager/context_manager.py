@@ -7592,13 +7592,10 @@ class LLMOrchestrator:
         total_timeout: Optional[float] = None,
     ) -> Optional[str]:
         """
-        Call the LLM with automatic retries for transient errors.
-        Retries continue until *total_timeout* seconds have passed since the
-        first attempt.  If *total_timeout* is None, the valve default
-        ``llm_retry_total_timeout`` is used.
-        Between retries, a fixed 1‑second pause is applied.
+        Call the LLM with cache and deduplication. Retries are handled by
+        shared_resources.call_llm internally.
         """
-        # ── Silent ingestion guard: only allow background docstring calls ──
+        # ── Silent ingestion guard ──
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
         ):
@@ -7620,13 +7617,6 @@ class LLMOrchestrator:
 
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
-
-        effective_total_timeout = (
-            total_timeout
-            if total_timeout is not None
-            else self._f.valves.llm_retry_total_timeout
-        )
-        deadline = t_start + effective_total_timeout
 
         try:
             base_url = self._f.valves.LLM_BASE_URL.rstrip("/")
@@ -7656,8 +7646,6 @@ class LLMOrchestrator:
             if model.startswith("llamacpp/"):
                 ep_type = self._f.valves.llamacpp_endpoint_type
 
-            RETRY_DELAY = 1.0
-
             if self._f.tokenizer:
                 prompt_tokens = len(self._f.tokenizer.encode(prompt))
                 self._f._log_debug(
@@ -7668,89 +7656,50 @@ class LLMOrchestrator:
             async with self._f._active_llm_tasks_lock:
                 self._f._active_llm_tasks.add(task)
             try:
-                try:
-                    # Unload/load management fuera del semáforo de concurrencia
-                    await self._maybe_unload_for_model(model, base_url, is_ollama)
+                # Unload/load management (shared_resources handles retries)
+                await self._maybe_unload_for_model(model, base_url, is_ollama)
 
-                    attempt = 0
-                    while time.monotonic() < deadline:
-                        attempt += 1
-                        try:
-                            async with self._f._llm_semaphore:
-                                content = await _shared_call_llm(
-                                    prompt=prompt,
-                                    system=system_prompt,
-                                    base_url=self._f.valves.LLM_BASE_URL,
-                                    model=model,
-                                    api_token=self._f.valves.LLM_API_TOKEN,
-                                    temperature=temperature,
-                                    max_tokens=max_tokens,
-                                    timeout=self._f.valves.llm_request_timeout,
-                                    endpoint_type=ep_type,
-                                )
-                            if content:
-                                await self._f._llm_cache.set(cache_key, content)
-                                future.set_result(content)
-                                async with self._f._model_lock:
-                                    self._f._last_used_model = model
-                                in_tokens = (
-                                    len(self._f.tokenizer.encode(prompt))
-                                    if self._f.tokenizer
-                                    else "?"
-                                )
-                                out_tokens = (
-                                    len(self._f.tokenizer.encode(content))
-                                    if self._f.tokenizer
-                                    else "?"
-                                )
-                                self._f._log_debug(
-                                    f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
-                                    f" took {time.monotonic() - t_start:.3f}s"
-                                )
-                                return content
-                            else:
-                                reason = "empty response"
-                        except asyncio.CancelledError:
-                            raise
-                        except RuntimeError as exc:
-                            reason = f"RuntimeError: {exc}"
-                            if not any(
-                                c in str(exc)
-                                for c in ("429", "500", "502", "503", "504")
-                            ):
-                                self._f._log_debug(
-                                    f"[LLM] {model}{label_str} attempt {attempt} failed "
-                                    f"with non-retryable error: {exc}"
-                                )
-                                break
-                        except Exception as exc:
-                            reason = f"{type(exc).__name__}: {exc}"
+                # Single call to shared_resources.call_llm (retries internally)
+                content = await _shared_call_llm(
+                    prompt=prompt,
+                    system=system_prompt,
+                    base_url=self._f.valves.LLM_BASE_URL,
+                    model=model,
+                    api_token=self._f.valves.LLM_API_TOKEN,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=self._f.valves.llm_request_timeout,
+                    endpoint_type=ep_type,
+                )
 
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        wait = min(RETRY_DELAY, remaining)
-                        self._f._log_debug(
-                            f"[LLM] {model}{label_str} attempt {attempt} failed ({reason}), "
-                            f"retrying in {wait:.1f}s (deadline in {remaining:.0f}s)"
-                        )
-                        await asyncio.sleep(wait)
-                finally:
-                    pass
+                if content:
+                    await self._f._llm_cache.set(cache_key, content)
+                    future.set_result(content)
+                    async with self._f._model_lock:
+                        self._f._last_used_model = model
+                    in_tokens = (
+                        len(self._f.tokenizer.encode(prompt))
+                        if self._f.tokenizer
+                        else "?"
+                    )
+                    out_tokens = (
+                        len(self._f.tokenizer.encode(content))
+                        if self._f.tokenizer
+                        else "?"
+                    )
+                    self._f._log_debug(
+                        f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
+                        f" took {time.monotonic() - t_start:.3f}s"
+                    )
+                    return content
+                else:
+                    future.set_result(None)
+                    return None
+
             finally:
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.discard(task)
 
-            logger.warning(f"[LLM] {model}{label_str} failed: {prompt[:100]}...")
-            future.set_result(None)
-            self._f._log_debug(
-                f"[LLM] {model}{label_str} (failed) after {time.monotonic() - t_start:.3f}s"
-            )
-            return None
-
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
         except Exception as e:
             future.set_exception(e)
             raise
@@ -8402,15 +8351,7 @@ class ReasoningEngine:
     ) -> str:
         """
         Architecture-mode CoT: reason on the code skeleton (contracts only).
-
-        Different from generate_cot_reasoning in three ways:
-          1. Context is the skeleton, not the system prompt → compact, precise.
-          2. Reasoning focuses on contracts, dependency changes, and invariants,
-             not on implementation steps.
-          3. Output includes /expand hints so the main model knows which symbols
-             need full bodies if it decides to implement them.
-
-        Falls back to generate_cot_reasoning if skeleton is empty or LLM fails.
+        Falls back to standard CoT if skeleton is empty or LLM fails.
         """
         if not skeleton_context.strip():
             return await self.generate_cot_reasoning(question, "", label=label)
@@ -8432,6 +8373,7 @@ class ReasoningEngine:
             "4. Which existing bodies need to change? List as `/expand <name>`.\n"
             "Be specific about signatures; avoid implementation details."
         )
+
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -18649,7 +18591,7 @@ class Filter:
         enable_silent_ingestion: bool = Field(default=True)
         # ── DB orphans cleanup ────────────────────────────────────────
         purge_orphaned_data_interval: int = Field(
-            default=50,
+            default=10,
             ge=0,
             description="Number of turns between automatic purges of orphaned DB rows (0 = disabled).",
         )
