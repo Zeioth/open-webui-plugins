@@ -2489,22 +2489,25 @@ class ContextBuilder:
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-        # If resolved_call_graph_mode is None, default to "hubs_only"
+        # --- 2. Compute structure-only hash (stable across docstring enrichment) ---
+        structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        if not structure_hash:
+            structure_hash = hashlib.md5("no_symbols".encode()).hexdigest()[:16]
+        pstate["structure_hash_for_cache"] = structure_hash
+
+        # --- 3. Resolved call graph mode ---
         mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
 
-        # --- 2. Build the cache key including the mode ---
-        # The cache key is a combination of the code state hash and the resolved mode.
-        # When either changes, Block A must be rebuilt.
-        cache_key = f"{current_code_hash}__{mode}"
+        # --- 4. Build cache key using structure hash (not the rendered text) ---
+        cache_key = f"{structure_hash}__{mode}"
         cached_text = pstate.get("block_a_cached")
         stored_key = pstate.get("block_a_cache_key")
 
         if stored_key and stored_key == cache_key and cached_text is not None:
-            # --- 2a. Cache hit: same code + same mode ---
+            # --- 4a. Cache hit: same code + same mode ---
             return cached_text
 
-        # --- 2b. Cache miss or continuation freeze ---
+        # --- 4b. Cache miss or continuation freeze ---
         if is_continuation and cached_text is not None:
             # Continuation: freeze Block A to prevent KV cache misses
             self._f._log_debug(
@@ -2512,10 +2515,10 @@ class ContextBuilder:
             )
             return cached_text
 
-        # --- 3. Build the static block ---
+        # --- 5. Build the static block ---
         parts: List[str] = []
 
-        # 3.1 Base instructions (completely static)
+        # 5.1 Base instructions (completely static)
         if is_code_session and self._f.valves.enable_confidence_scoring:
             parts.append(self._f.valves.confidence_prompt.strip())
 
@@ -2546,7 +2549,8 @@ class ContextBuilder:
             )
             parts.append(critical_guidelines)
 
-        # 3.2 Symbol index (depth depends on call_graph_context_mode)
+        # 5.2 Symbol index (depth depends on call_graph_context_mode)
+        symbol_section_rendered = False
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._state_store.get_state(project_id)
             if state and state.get("active_blocks"):
@@ -2566,14 +2570,17 @@ class ContextBuilder:
                 )
                 if symbol_section:
                     parts.append(symbol_section)
+                    symbol_section_rendered = True
 
-        # 3.3 Skeleton tier
+        # 5.3 Skeleton tier
+        skeleton_rendered_this_turn = False
         if is_code_session and self._f.valves.enable_code_awareness:
             skeleton_tier = self._build_skeleton_tier(project_id)
             if skeleton_tier:
                 parts.append(skeleton_tier)
+                skeleton_rendered_this_turn = True
 
-        # 3.4 Feedback context
+        # 5.4 Feedback context
         if (
             is_code_session
             and self._f.valves.enable_feedback_tracking
@@ -2585,16 +2592,18 @@ class ContextBuilder:
 
         static_block = "\n\n".join(p for p in parts if p.strip())
 
-        # --- 4. Store in cache with the mode-aware key ---
+        # --- 6. Store in cache with the mode-aware key (using structure hash) ---
         pstate["block_a_cache_key"] = cache_key
         pstate["block_a_cached"] = static_block
 
-        # --- 5. Detect and log prefix changes (KV cache miss) ---
-        _user_sys = getattr(self._f, "_original_system_prompt", "") or ""
-        new_prefix_hash = hashlib.md5(
-            (_user_sys + "\x1e" + static_block).encode()
-        ).hexdigest()[:16]
+        # --- 7. Record whether skeleton was actually rendered (for suppression gating) ---
+        pstate["skeleton_rendered_this_turn"] = skeleton_rendered_this_turn
+        # Also record the render mode for diagnostic use
+        pstate["skeleton_render_mode"] = mode
 
+        # --- 8. Detect and log prefix changes (KV cache miss) ---
+        # Use the structure hash as the stable prefix hash
+        new_prefix_hash = structure_hash
         last_hash = pstate.get("last_static_prefix_hash")
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
@@ -2689,20 +2698,12 @@ class ContextBuilder:
     def _build_skeleton_tier(self, project_id: str) -> str:
         """
         Render the project skeleton (signatures only) as a STABLE context tier,
-        cached by signature_hash so body edits don't invalidate it. Returns ""
-        when disabled, empty, or over the tier budget (caller then injects no
-        tier and Block B keeps inline signatures).
+        cached by structure_hash so body edits and docstring additions don't
+        invalidate it. Returns "" when disabled, empty, or over the tier budget.
 
-        MIGRATED (step 15): Confirmed that no fixed token reservation exists.
-        The `skeleton_tier_max_tokens` valve acts as a hard cap: if the rendered
-        skeleton exceeds it, the tier is skipped entirely. There is no upfront
-        budget reservation, so no "unused tokens" to return to the global pool.
-
-        Args:
-            project_id (str): The current project identifier.
-
-        Returns:
-            str: The rendered skeleton tier, or an empty string if not available.
+        The cache key is based on the structural hash (signatures + parent
+        relationships, excluding docstrings) so that background docstring
+        population doesn't cause spurious rebuilds and KV-cache misses.
         """
         if not self._f.valves.enable_skeleton_tier:
             return ""
@@ -2710,31 +2711,26 @@ class ContextBuilder:
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # --- 2. Compute current signature hash ---
-        if self._f.valves.skeleton_include_docstrings:
-            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
-        else:
-            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
-
-        if not sig_hash:
+        # --- 2. Compute structure-only hash (stable across docstring enrichment) ---
+        structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        if not structure_hash:
             return ""
 
-        # --- 3. Check cache ---
+        # --- 3. Check cache using the structure hash ---
         cached_hash = pstate.get("skeleton_tier_cache_key")
         cached_tier = pstate.get("skeleton_tier_cached")
-        if cached_hash and cached_hash == sig_hash and cached_tier is not None:
+        if cached_hash and cached_hash == structure_hash and cached_tier is not None:
             return cached_tier
 
-        # --- 4. Render the skeleton ---
+        # --- 4. Render the skeleton (docstrings included if valve allows) ---
         skel = self._format_skeleton(project_id)
         if not skel:
-            pstate["skeleton_tier_cache_key"] = sig_hash
+            pstate["skeleton_tier_cache_key"] = structure_hash
             pstate["skeleton_tier_cached"] = ""
             return ""
 
         # --- 5. Check token budget ---
-        # NOTE: This is a hard cap, not a pre-reservation. If the skeleton exceeds
-        # the cap, we skip injection entirely. No tokens are reserved in advance.
+        # NOTE: This is a hard cap, not a pre-reservation.
         budget = self._f.valves.skeleton_tier_max_tokens
         if budget > 0:
             tok = self._f._tokens.estimate_code_tokens(skel)
@@ -2743,7 +2739,7 @@ class ContextBuilder:
                     f"Skeleton tier skipped: {tok} tokens > budget {budget}. "
                     "Block B keeps signatures inline."
                 )
-                pstate["skeleton_tier_cache_key"] = sig_hash
+                pstate["skeleton_tier_cache_key"] = structure_hash
                 pstate["skeleton_tier_cached"] = ""
                 return ""
 
@@ -2756,11 +2752,11 @@ class ContextBuilder:
         )
 
         # --- 7. Store in cache ---
-        pstate["skeleton_tier_cache_key"] = sig_hash
+        pstate["skeleton_tier_cache_key"] = structure_hash
         pstate["skeleton_tier_cached"] = tier
 
         self._f._log_debug(
-            f"Skeleton tier rendered (sig_hash={sig_hash}, "
+            f"Skeleton tier rendered (structure_hash={structure_hash}, "
             f"~{self._f._tokens.estimate_code_tokens(tier)} tokens)"
         )
 
@@ -2769,40 +2765,19 @@ class ContextBuilder:
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
         """
         True only if the skeleton tier was actually rendered into Block A
-        THIS turn for the current signature hash — not just enabled with
-        symbols present. _build_skeleton_tier caches ("") under the current
-        hash when it skips rendering due to skeleton_tier_max_tokens; without
-        this check, suppress_sigs below would hide Block B's inline
-        signatures even though Block A ended up with none.
+        THIS turn for the current structural hash — not just enabled with
+        symbols present. Uses the per-turn state set by build_block_a.
 
-        MIGRATED: state now lives in ProjectStateManager.
-
-        Args:
-            project_id (str): Current project identifier.
-
-        Returns:
-            bool: True if the skeleton tier is active and contains content for
-                  the current signature hash, False otherwise.
+        This replaces the previous cache-key comparison, which was brittle
+        because the cache could be empty (due to budget) while the tier was
+        enabled, leading to false negatives.
         """
         if not self._f.valves.enable_skeleton_tier:
             return False
 
-        # --- 1. Compute current signature hash ---
-        if self._f.valves.skeleton_include_docstrings:
-            sig_hash = self._f._symbol_index.compute_skeleton_hash(project_id)
-        else:
-            sig_hash = self._f._symbol_index.compute_signature_hash(project_id)
-
-        if not sig_hash:
-            return False
-
-        # --- 2. Resolve per-project state and check cache ---
+        # --- Resolve per-project state and check the per-turn flag ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
-        cached_hash = pstate.get("skeleton_tier_cache_key")
-        cached_tier = pstate.get("skeleton_tier_cached")
-
-        # Active only if the key matches and the cached tier is non-empty.
-        return bool(cached_hash and cached_hash == sig_hash and cached_tier)
+        return pstate.get("skeleton_rendered_this_turn", False)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2.1 — Project skeleton rendering (signatures only)
@@ -3295,19 +3270,23 @@ class ContextBuilder:
             f"free_tokens={free_tokens}"
         )
 
+        # --- window-relative token floors ---
+        window = self._f.valves.context_window_tokens
+        full_graph_floor = int(window * self._f.valves.full_graph_min_free_token_ratio)
+        expanded_hubs_floor = int(
+            window * self._f.valves.expanded_hubs_min_free_token_ratio
+        )
+
         def _full_graph_allowed() -> bool:
             symbol_ok = (
                 total_symbols
                 <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
             )
-            token_ok = (
-                free_tokens >= self._f.valves.call_graph_auto_min_free_tokens_for_full
-            )
+            token_ok = free_tokens >= full_graph_floor
             self._f._log_debug(
                 f"    full_graph guard: symbol_ok={symbol_ok} "
                 f"({total_symbols} <= {self._f.valves.call_graph_auto_full_graph_symbol_ceiling}), "
-                f"token_ok={token_ok} "
-                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_full})"
+                f"token_ok={token_ok} ({free_tokens} >= {full_graph_floor})"
             )
             return symbol_ok and token_ok
 
@@ -3316,15 +3295,11 @@ class ContextBuilder:
                 total_symbols
                 <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
             )
-            token_ok = (
-                free_tokens
-                >= self._f.valves.call_graph_auto_min_free_tokens_for_expanded
-            )
+            token_ok = free_tokens >= expanded_hubs_floor
             self._f._log_debug(
                 f"    expanded_hubs guard: symbol_ok={symbol_ok} "
                 f"({total_symbols} <= {self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling}), "
-                f"token_ok={token_ok} "
-                f"({free_tokens} >= {self._f.valves.call_graph_auto_min_free_tokens_for_expanded})"
+                f"token_ok={token_ok} ({free_tokens} >= {expanded_hubs_floor})"
             )
             return symbol_ok and token_ok
 
@@ -3556,14 +3531,9 @@ class ContextBuilder:
                 )
 
         # ── Mode is resolved BEFORE Block A is built this turn ────────────
-        #  Use the already-resolved mode from pstate.
-        # The resolution was already done in Filter.inlet() before Block A was built.
-        # Calling prepare_call_graph_mode again would double-increment the
-        # downgrade streak.
         pstate = self._f._project_state_manager.get_pstate(project_id)
         resolved_graph_mode = pstate.get("resolved_call_graph_mode")
         if resolved_graph_mode is None:
-            # Fallback defensivo (no debería ocurrir porque inlet ya lo resolvió)
             resolved_graph_mode = self.prepare_call_graph_mode(
                 project_id, query, intent_vector
             )
@@ -3592,7 +3562,7 @@ class ContextBuilder:
         injected_blocks: Set[str] = set()
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
-        # ── Centrality LOD bump (MIGRATED: use pstate) ────────────────────
+        # ── Centrality LOD bump ────────────────────────────────────────────
         if self._f.valves.enable_centrality_lod_bump:
             centrality = pstate.get("node_centrality", {})
             threshold = self._f.valves.centrality_lod_bump_threshold
@@ -3638,7 +3608,7 @@ class ContextBuilder:
                         missing, project_id
                     )
 
-        # ── Cambio B: Batched LOD-2.5 CFG pre-resolution ──
+        # ── Batched LOD-2.5 CFG pre-resolution ──
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
@@ -3833,6 +3803,7 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
+        # --- UPDATED: Suppression gate uses the per-turn render state ---
         suppress_sigs = (
             self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
@@ -3861,11 +3832,6 @@ class ContextBuilder:
             )
 
         # ── Avoid fallback when skeleton tier is active ──
-        # When suppress_sigs is True and ordered has only the header, the
-        # skeleton tier already covers signatures in Block A. Falling back to
-        # get_active_code_context would duplicate context unnecessarily.
-        # Instead, return an empty string to let the skeleton tier serve as the
-        # only context for architectural queries.
         if len(ordered) <= 1:
             if self._f.valves.debug:
                 self._f._log_debug("build_block_b: no activated nodes or empty context")
@@ -3886,7 +3852,7 @@ class ContextBuilder:
         )
         ordered.append(summary_line)
 
-        # ── LOD tracking for adaptive feedback (use pstate) ─────
+        # ── LOD tracking for adaptive feedback ──────────────────────────
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
             for node_id, score in activated.items():
@@ -4531,6 +4497,37 @@ class SymbolIndex:
             parent = meta.get("parent_symbol", "")
             doc = meta.get("docstring", "")
             parts.append(f"{parent}\x1f{name}\x1f{sig}\x1f{doc}")
+        blob = "\x1e".join(parts)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+    def compute_structure_hash(self, project_id: str) -> str:
+        """
+        Hash of symbol signatures and structure only, excluding docstrings.
+        Used for KV‑cache and slot persistence stability.
+
+        This hash changes only when the symbol set or signatures change,
+        not when docstrings are added/updated. This keeps the Block A
+        prefix hash stable across the docstring-fill-in period, preventing
+        spurious KV-cache misses and slot-restore failures.
+
+        Args:
+            project_id (str): The project identifier.
+
+        Returns:
+            str: A 16-character hex hash, or empty string if no symbols exist.
+        """
+        qids = sorted(self.get_all_qualified_names(project_id))
+        if not qids:
+            return ""
+        parts = []
+        for qid in qids:
+            meta = self._symbol_meta.get((project_id, qid), {})
+            name = meta.get("name", qid)
+            sig = meta.get("signature") or name
+            parent = meta.get("parent_symbol", "")
+            # Include only structure: parent, name, signature.
+            # Docstrings are excluded deliberately.
+            parts.append(f"{parent}\x1f{name}\x1f{sig}")
         blob = "\x1e".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -12783,8 +12780,9 @@ class HistoryCompressor:
           2. Keep the last `code_history_keep_last_n_parts` in full.
           3. For each older part, verify symbols are indexed in the SymbolGraph.
           4. If indexed (ratio >= threshold): replace with commit summary.
-          5. If NOT indexed: keep full (defensive — never lose code that isn't
-             safely retrievable from the graph).
+          5. If NOT indexed: increment blocked age; if age exceeds
+             code_history_force_compress_after_turns, force compression
+             WITHOUT an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
@@ -12794,18 +12792,18 @@ class HistoryCompressor:
         _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
 
         # --- NEW: Broader pattern for "Fase X", "Parte X", "Phase X", "Step X" ---
-        # This matches lines like:
-        #   "Fase 1: EmailSender" or "Fase 1 — EmailSender"
-        #   "Parte 2: NotificationQueue"
-        #   "Step 3: Worker"
-        #   "Phase 4: Integration"
-        # The group (1) is the number, group (2) is the optional label.
         _PHASE_HEADER = re.compile(
             r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
             re.IGNORECASE,
         )
 
         keep = self._f.valves.code_history_keep_last_n_parts
+        force_after = self._f.valves.code_history_force_compress_after_turns
+
+        # --- Load blocked-age tracking from per-project state ---
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        blocked_age = pstate.get("history_blocked_age", {})
+        modified_blocked = False
 
         # Collect indices of uncompressed code-part messages
         code_part_indices: List[Tuple[int, int, int]] = []
@@ -12814,56 +12812,17 @@ class HistoryCompressor:
                 continue
             content = msg.get("content", "")
             if _ALREADY_COMPRESSED.search(content):
-                continue  # already compressed, skip
+                continue
             m = _PART_HEADER.search(content)
             if m:
-                # Standard multi-phase marker
                 code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
                 continue
-            # --- NEW: try the broader phase/part pattern ---
-            # We need to find the total number of parts to know the denominator.
-            # For simplicity, we assume that if there's a "Fase X" line, it's part
-            # of a sequence. We'll collect all such lines and infer the total
-            # from the highest number seen.
-            # But for compression, we only need to know the part number and total.
-            # We'll store the part number and infer the total from the max seen later.
-            # Instead, we can look for a pattern like "Fase 1/5" or "Parte 2/3"
-            # But the user's prompt didn't have that, they had "Fase 1:" without total.
-            # We'll assume that if we see "Fase X", it's part of a sequence and we'll
-            # treat it as a part, but we need to know the total to compress.
-            # We'll use a heuristic: if we find multiple "Fase X" lines, we take
-            # the maximum X as the total.
-            # But we can't know the total from a single message. We'll need to
-            # look across the conversation. However, for compression we only
-            # need to know if this message is "old enough" and its symbols are
-            # indexed. The total is only used for the summary label.
-            # We can approximate the total by looking at the highest part number
-            # in the conversation so far.
-            # For simplicity, we'll skip the total number and just mark it as
-            # a compressed part without denominator. The summary will show
-            # "Parte X" without the total, which is acceptable.
-            # But we also want to avoid compressing the same message multiple times.
-            # We'll use the message content as a key for deduplication.
-            # Let's just detect if the message contains a phase header and has
-            # a substantial code block.
+            # Try the broader phase/part pattern
             if _PHASE_HEADER.search(content):
                 # Check if it's a large code block (estimated tokens > 300)
                 est_tokens = self._f._tokens.estimate_code_tokens(content)
                 if est_tokens > 300:
-                    # We'll treat it as a part, but we need a part number and total.
-                    # Use the phase number as the part number, and assume total = phase number + 1
-                    # (or we can set total = keep + 1 to avoid compression issues)
-                    # Actually, we should use a conservative total: if we see phase 5,
-                    # we can assume total = 5 (or higher). We'll just use part number = phase number,
-                    # total = phase number (so it shows "Parte 5/5").
-                    # But this is not accurate. A better way: we can count the number
-                    # of phase headers in the entire conversation and use that as total.
-                    # However, for simplicity, we'll set total = 0 and the summary will
-                    # show "Parte X" without "/Y". This is a minor detail.
-                    # I'll implement a more robust approach: I'll scan the whole
-                    # conversation to find the maximum phase number, and use that as total.
-                    # But that's expensive. We can do it once per call.
-                    # Let's implement a scan for max phase number.
+                    # Find max phase number in conversation
                     max_phase = 0
                     for msg2 in messages:
                         if msg2.get("role") != "assistant":
@@ -12871,55 +12830,112 @@ class HistoryCompressor:
                         m2 = _PHASE_HEADER.search(msg2.get("content", ""))
                         if m2:
                             max_phase = max(max_phase, int(m2.group(1)))
-                    # Now we know the total (max_phase). We can set total = max_phase.
-                    # We'll also get the phase number for this message.
                     m_phase = _PHASE_HEADER.search(content)
                     if m_phase:
                         part_num = int(m_phase.group(1))
                         total_parts = max_phase if max_phase >= part_num else part_num
                         code_part_indices.append((i, part_num, total_parts))
                     else:
-                        # This shouldn't happen, but fallback to part_num=1, total=1
                         code_part_indices.append((i, 1, 1))
 
         if len(code_part_indices) <= keep:
-            return messages  # Nothing old enough to compress
+            # No old parts to compress; still save blocked_age if modified
+            if modified_blocked:
+                pstate["history_blocked_age"] = blocked_age
+            return messages
 
         to_compress = code_part_indices[:-keep]
         new_messages = list(messages)
         compressed_n = 0
+        blocked_by_ratio = 0
+        forced_no_expand = 0
 
         for msg_idx, part_num, total_parts in to_compress:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
 
-            # Verify symbols are indexed (same as before)
-            safe, ratio = self._verify_code_symbols_indexed(content, project_id)
-            if not safe:
-                self._f._log_debug(
-                    f"Code history: skipping compression of Part {part_num}/{total_parts} "
-                    f"(symbol ratio {ratio:.0%} < threshold "
-                    f"{self._f.valves.code_history_symbol_index_threshold:.0%})"
-                )
-                continue
+            # --- Generate a stable key for this message ---
+            msg_key = hashlib.md5(f"{msg.get('role')}|{content}".encode()).hexdigest()[
+                :16
+            ]
 
+            # --- Verify symbols are indexed ---
+            safe, ratio = self._verify_code_symbols_indexed(content, project_id)
+
+            force_no_expand = False
+
+            if not safe:
+                # Increment blocked age
+                blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
+                modified_blocked = True
+                age = blocked_age[msg_key]
+
+                # Log the block with more detail
+                part_label_for_log = (
+                    f"Part {part_num}/{total_parts}"
+                    if total_parts > 0
+                    else f"message {msg_idx}"
+                )
+                self._f._log_debug(
+                    f"Code history: WANTED to compress {part_label_for_log} but "
+                    f"BLOCKED — symbol ratio {ratio:.0%} < threshold "
+                    f"{self._f.valves.code_history_symbol_index_threshold:.0%}. "
+                    f"Blocked age: {age} turn(s)."
+                )
+                blocked_by_ratio += 1
+
+                # Force compression if age exceeds threshold
+                if force_after > 0 and age >= force_after:
+                    self._f._log_debug(
+                        f"Code history: FORCING compression of {part_label_for_log} "
+                        f"after {age} blocked turns (force_after={force_after}). "
+                        f"Compressing WITHOUT /expand guarantee."
+                    )
+                    force_no_expand = True
+                    safe = True  # Proceed with compression
+                    forced_no_expand += 1
+                else:
+                    continue
+
+            # If safe (either verified or forced), compress
             summary = self._build_code_commit_summary(
-                content, project_id, part_num, total_parts
+                content,
+                project_id,
+                part_num,
+                total_parts,
+                force_no_expand=force_no_expand,
             )
             tokens_before = self._f._tokens.estimate_tokens(content)
             tokens_after = self._f._tokens.estimate_tokens(summary)
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
+
+            # Reset blocked age for this message since it was successfully compressed
+            if msg_key in blocked_age:
+                del blocked_age[msg_key]
+                modified_blocked = True
+
             self._f._log_debug(
                 f"Code history: compressed Part {part_num}/{total_parts} — "
                 f"{tokens_before:,} → {tokens_after:,} tokens "
                 f"(ratio {ratio:.0%})"
+                + (" [FORCED NO-EXPAND]" if force_no_expand else "")
             )
+
+        # Save updated blocked_age if modified
+        if modified_blocked:
+            pstate["history_blocked_age"] = blocked_age
 
         if compressed_n:
             self._f._log_debug(
                 f"Code history: {compressed_n} part(s) compressed, "
-                f"last {keep} kept in full."
+                f"last {keep} kept in full. "
+                f"(blocked_by_ratio={blocked_by_ratio}, forced_no_expand={forced_no_expand})"
+            )
+        elif blocked_by_ratio > 0:
+            self._f._log_debug(
+                f"Code history: {blocked_by_ratio} part(s) blocked by ratio, "
+                f"none compressed (force_after={force_after})."
             )
 
         return new_messages
@@ -12955,8 +12971,23 @@ class HistoryCompressor:
         project_id: str,
         part_num: int,
         total_parts: int,
+        force_no_expand: bool = False,
     ) -> str:
-        """Generate a compact commit summary for a compressed code message."""
+        """
+        Generate a compact commit summary for a compressed code message.
+
+        Args:
+            content: The original code message content.
+            project_id: The current project identifier.
+            part_num: Part number in the multi-phase sequence.
+            total_parts: Total number of parts in the sequence.
+            force_no_expand: If True, omit /expand affordance and mark as
+                non-indexed. Used when compression is forced despite the
+                symbol-index ratio being too low.
+
+        Returns:
+            A formatted summary string.
+        """
         classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         methods = re.findall(
@@ -12982,6 +13013,26 @@ class HistoryCompressor:
             dep_symbols.extend(s.strip() for s in imp.split(","))
         dep_symbols = dep_symbols[:6]
 
+        # --- Build title based on force_no_expand ---
+        if force_no_expand:
+            title = f"[🗜️ CÓDIGO COMPRIMIDO — sin índice]"
+            # Omit /expand affordance and the "use /expand" line
+            lines = [title]
+            if classes:
+                lines.append(f"Clases:    {', '.join(classes)}")
+            if top_fns:
+                lines.append(f"Funciones: {', '.join(top_fns[:6])}")
+            if methods:
+                lines.append(f"Métodos:   {len(methods)} implementados")
+            lines.append(f"Volumen:   ~{code_lines} líneas / ~{code_tokens} tokens")
+            if dep_symbols:
+                lines.append(f"Deps usadas: {', '.join(dep_symbols)}")
+            lines.append(
+                "[CÓDIGO NO INDEXADO — la implementación no es recuperable via /expand]"
+            )
+            return "\n".join(lines)
+
+        # --- Normal (indexed) compression title ---
         title = f"[🗜️ PARTE {part_num}/{total_parts}"
         if part_label:
             title += f": {part_label}"
@@ -17483,6 +17534,9 @@ class ProjectStateManager:
         force=True ignores the static-hash guard (used after monotonic
         compaction, when the history prefix changed but Block A did not).
         The token-threshold guard (P5) is always respected.
+
+        Uses the structural hash (signatures only) for the filename so
+        docstring population does not cause slot file proliferation.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -17501,11 +17555,15 @@ class ProjectStateManager:
                 )
                 return False
 
-        # --- 3. Get current static hash ---
-        cached = pstate.get("block_a_cached")
-        if not cached:
-            return False
-        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+        # --- 3. Get the structural hash from pstate (set by build_block_a) ---
+        static_hash = pstate.get("structure_hash_for_cache")
+        if not static_hash:
+            # Fallback: compute from cache if available (should not happen in normal flow)
+            cached = pstate.get("block_a_cached")
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                return False
 
         # --- 4. Skip if already saved and not forced ---
         if not force and pstate.get("last_saved_slot_hash") == static_hash:
@@ -17547,6 +17605,9 @@ class ProjectStateManager:
     async def slot_restore(self, project_id: str) -> bool:
         """
         Restore the KV slot at session start.
+
+        Uses the structural hash (signatures only) to locate the correct
+        slot file, ensuring that docstring population does not cause a miss.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -17560,11 +17621,16 @@ class ProjectStateManager:
 
         pstate["slot_restore_attempted"] = True
 
-        # --- 3. Get current static hash ---
-        cached = pstate.get("block_a_cached")
-        if not cached:
-            return False
-        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+        # --- 3. Get the structural hash from pstate ---
+        static_hash = pstate.get("structure_hash_for_cache")
+        if not static_hash:
+            # Fallback: compute from cache if available
+            cached = pstate.get("block_a_cached")
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                return False
+
         filename = self._slot_filename(project_id, static_hash)
 
         # --- 4. Check if file exists ---
@@ -17610,6 +17676,8 @@ class ProjectStateManager:
         Restore KV cache after auxiliary LLM calls (CoT, contradiction) have
         dirtied the slot due to SWA architecture. Called at the end of every
         inlet when slot_free=True.
+
+        Uses the structural hash for consistency with the slot filename.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -17617,11 +17685,15 @@ class ProjectStateManager:
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # --- 2. Get current static hash ---
-        cached = pstate.get("block_a_cached")
-        if not cached:
-            return False
-        static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+        # --- 2. Get the structural hash ---
+        static_hash = pstate.get("structure_hash_for_cache")
+        if not static_hash:
+            cached = pstate.get("block_a_cached")
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                return False
+
         filename = self._slot_filename(project_id, static_hash)
 
         # --- 3. Check if file exists ---
@@ -17664,6 +17736,16 @@ class ProjectStateManager:
         Deterministic slot file name.
         Encodes: project + static block hash + model hash.
         If any of the three changes → different name → no stale restore.
+
+        The static_hash must be the structural hash (signatures only, no docstrings)
+        to ensure slot persistence survives docstring population.
+
+        Args:
+            project_id (str): The project identifier.
+            static_hash (str): The structural hash of the code state.
+
+        Returns:
+            str: The filename for the slot file.
         """
         model_hash = hashlib.md5(self._f.valves.llm_model.encode()).hexdigest()[:8]
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
@@ -18129,6 +18211,30 @@ class Filter:
             description=(
                 "In auto mode, full_graph is only considered when get_all_qualified_names() "
                 "count is at or below this ceiling. Above it, auto caps at expanded_hubs."
+            ),
+        )
+        # ── Window-relative guard floors ────────────
+        full_graph_min_free_token_ratio: float = Field(
+            default=0.38,
+            ge=0.05,
+            le=0.95,
+            description=(
+                "Minimum fraction of context_window_tokens that must remain "
+                "free for 'full_graph' call-graph mode to be allowed. "
+                "Replaces a previously hardcoded absolute floor so the guard "
+                "scales with the window instead of becoming unreachable on "
+                "small-window models. 0.38 * 262000 ≈ 100k, matching prior "
+                "behavior at the default window."
+            ),
+        )
+        expanded_hubs_min_free_token_ratio: float = Field(
+            default=0.076,
+            ge=0.01,
+            le=0.95,
+            description=(
+                "Minimum fraction of context_window_tokens that must remain "
+                "free for 'expanded_hubs' mode. 0.076 * 262000 ≈ 20k, matching "
+                "prior behavior at the default window."
             ),
         )
         call_graph_auto_expanded_hubs_symbol_ceiling: int = Field(
@@ -18832,6 +18938,9 @@ class Filter:
         # ── Original user system prompt, captured once per turn ──
         self._original_system_prompt: str = ""
 
+        # --- Validate valve coherence at startup ---
+        self._validate_valve_coherence()
+
         print("[CodeAware] Filter loaded")
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -18863,6 +18972,171 @@ class Filter:
         right = remaining - left
         line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
+
+    def _validate_valve_coherence(self) -> None:
+        """
+        Warn about individually-legal valve combinations that silently
+        disable or degrade a context guarantee. Pure diagnostics: never
+        mutates behavior, only logs. Each check names the guarantee at risk.
+
+        Called once at startup from __init__ to surface misconfigurations
+        early. Does not raise exceptions.
+        """
+        v = self.valves
+        warnings: List[str] = []
+
+        window = v.context_window_tokens
+
+        # ------------------------------------------------------------------
+        # 1. Mode guards unreachable for the window (Section 1)
+        # ------------------------------------------------------------------
+        if hasattr(v, "full_graph_min_free_token_ratio"):
+            fg_floor = int(window * v.full_graph_min_free_token_ratio)
+        else:
+            fg_floor = int(window * 0.38)  # fallback default
+
+        if hasattr(v, "expanded_hubs_min_free_token_ratio"):
+            eh_floor = int(window * v.expanded_hubs_min_free_token_ratio)
+        else:
+            eh_floor = int(window * 0.076)  # fallback default
+
+        usable_window = window - v.response_reserve_tokens
+
+        if fg_floor >= usable_window:
+            warnings.append(
+                f"full_graph mode is effectively unreachable: floor {fg_floor} "
+                f">= usable window ({usable_window}). Architecture queries will "
+                f"never get the full call graph. Lower full_graph_min_free_token_ratio "
+                f"or raise context_window_tokens."
+            )
+
+        if eh_floor >= usable_window:
+            warnings.append(
+                f"expanded_hubs mode is effectively unreachable: floor {eh_floor} "
+                f">= usable window ({usable_window}). Refactor queries may be "
+                f"limited to hubs_only. Lower expanded_hubs_min_free_token_ratio "
+                f"or raise context_window_tokens."
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Budget arithmetic can underflow
+        # ------------------------------------------------------------------
+        if hasattr(v, "active_context_max_tokens") and hasattr(
+            v, "global_injection_token_budget"
+        ):
+            if v.active_context_max_tokens > v.global_injection_token_budget:
+                warnings.append(
+                    "active_context_max_tokens > global_injection_token_budget: "
+                    "per-query active context can exceed the total injection "
+                    "budget; Block B may be trimmed unpredictably."
+                )
+
+        if v.response_reserve_tokens >= window:
+            warnings.append(
+                f"response_reserve_tokens ({v.response_reserve_tokens}) >= "
+                f"context_window_tokens ({window}): effective budget is negative; "
+                f"mode guards will always fail."
+            )
+
+        # ------------------------------------------------------------------
+        # 3. Suppression without guaranteed coverage (Section 3)
+        # ------------------------------------------------------------------
+        if hasattr(v, "skeleton_tier_suppresses_block_b_signatures") and hasattr(
+            v, "call_graph_context_mode"
+        ):
+            if (
+                v.skeleton_tier_suppresses_block_b_signatures
+                and v.call_graph_context_mode == "hubs_only"
+            ):
+                warnings.append(
+                    "skeleton_tier_suppresses_block_b_signatures=True with "
+                    "call_graph_context_mode='hubs_only': Block A renders no full "
+                    "skeleton, so suppressing Block B signatures can hide symbols "
+                    "entirely. (Mitigated at runtime by the render-gated "
+                    "suppression, but the static combination is still suspicious.)"
+                )
+
+        # ------------------------------------------------------------------
+        # 4. Compression anti-growth disabled (Section 4)
+        # ------------------------------------------------------------------
+        if hasattr(v, "code_history_symbol_index_threshold") and hasattr(
+            v, "code_history_force_compress_after_turns"
+        ):
+            if (
+                v.code_history_symbol_index_threshold >= 0.95
+                and v.code_history_force_compress_after_turns == 0
+            ):
+                warnings.append(
+                    "code_history_symbol_index_threshold is very high and "
+                    "code_history_force_compress_after_turns=0: if assistant-code "
+                    "indexing dips below the threshold, history compression never "
+                    "fires and history grows unbounded. Consider setting "
+                    "code_history_force_compress_after_turns > 0."
+                )
+
+        # ------------------------------------------------------------------
+        # 5. Lazy docstrings vs Block A stability (informational hint)
+        # ------------------------------------------------------------------
+        if hasattr(v, "skeleton_include_docstrings") and hasattr(
+            v, "enable_auto_docstrings"
+        ):
+            if v.skeleton_include_docstrings and v.enable_auto_docstrings:
+                self._log_debug(
+                    "Note: docstrings are included in the skeleton and generated "
+                    "lazily. The Block A prefix hash is computed over a "
+                    "docstring-stripped projection (structure hash), so KV cache "
+                    "and slot restore remain stable across docstring population."
+                )
+
+        # ------------------------------------------------------------------
+        # 6. Slot persistence guard threshold sanity
+        # ------------------------------------------------------------------
+        if (
+            hasattr(v, "slot_save_max_context_tokens")
+            and v.slot_save_max_context_tokens > 0
+        ):
+            if v.slot_save_max_context_tokens < v.context_window_tokens // 2:
+                warnings.append(
+                    f"slot_save_max_context_tokens ({v.slot_save_max_context_tokens}) "
+                    f"is less than half the window ({v.context_window_tokens}). "
+                    f"KV slot saves will be skipped even when there is plenty "
+                    f"of room, reducing cross-session performance."
+                )
+
+        # ------------------------------------------------------------------
+        # 7. Multi-phase response thresholds sanity
+        # ------------------------------------------------------------------
+        if hasattr(v, "multi_phase_response_threshold") and hasattr(
+            v, "multi_phase_response_budget_warn"
+        ):
+            if v.multi_phase_response_budget_warn >= v.multi_phase_response_threshold:
+                warnings.append(
+                    f"multi_phase_response_budget_warn ({v.multi_phase_response_budget_warn}) "
+                    f">= multi_phase_response_threshold ({v.multi_phase_response_threshold}). "
+                    f"The critical warning may never fire because the tight budget "
+                    f"threshold triggers first."
+                )
+
+        # ------------------------------------------------------------------
+        # 8. Block paging threshold vs max_active_blocks
+        # ------------------------------------------------------------------
+        if hasattr(v, "block_paging_threshold") and hasattr(v, "max_active_blocks"):
+            if (
+                v.max_active_blocks > 0
+                and v.block_paging_threshold >= v.max_active_blocks
+            ):
+                warnings.append(
+                    f"block_paging_threshold ({v.block_paging_threshold}) >= "
+                    f"max_active_blocks ({v.max_active_blocks}). Paging will never "
+                    f"activate because the hard eviction cap is reached first."
+                )
+
+        # Log all warnings
+        for w in warnings:
+            self._log_debug(f"⚠️ VALVE COHERENCE: {w}")
+
+        if not warnings:
+            self._log_debug("Valve coherence check: no issues detected.")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Code update helper
