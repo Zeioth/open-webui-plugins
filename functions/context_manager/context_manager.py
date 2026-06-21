@@ -8384,7 +8384,7 @@ class ReasoningEngine:
             ),
             model_override=self._f.valves.cot_model_level2,
             max_tokens=effective_max_tokens,
-            temperature=0.3,
+            temperature=0.0,
             label=label or "arch_cot",
         )
 
