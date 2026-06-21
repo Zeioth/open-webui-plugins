@@ -18195,7 +18195,7 @@ class Filter:
         )
         # ── Call graph depth in Block A ─────────────────────────────
         call_graph_context_mode: str = Field(
-            default="auto",
+            default="full_graph",
             description=(
                 "Control the depth of call graph injected into Block A.\n"
                 "- 'auto': resolved per-query from use_case/intent/project size/token budget (default).\n"
@@ -18205,7 +18205,7 @@ class Filter:
             ),
         )
         full_graph_max_tokens: int = Field(
-            default=20000,
+            default=60000,
             ge=1000,
             description=(
                 "Token budget for full_graph mode. If the rendered graph would exceed "
@@ -18214,7 +18214,7 @@ class Filter:
             ),
         )
         expanded_hubs_max_tokens: int = Field(
-            default=6000,
+            default=10000,
             ge=500,
             description="Token budget for expanded_hubs mode. Same truncation behavior as full_graph_max_tokens.",
         )
@@ -18650,7 +18650,7 @@ class Filter:
         slot_id: int = Field(default=0, ge=0)
         # ── Slot save threshold guard ────────────────────────────────
         slot_save_max_context_tokens: int = Field(
-            default=60000,
+            default=0,
             ge=0,
             description=(
                 "Skip slot save when the total context exceeds this many tokens. "
