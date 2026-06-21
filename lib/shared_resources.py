@@ -434,11 +434,11 @@ async def call_llm(
     endpoint_type: str = "chat",
 ) -> str:
     """
-    Async LLM call. Reuses the shared HTTP session.
+    Async LLM call with automatic retries for empty responses and transient errors.
 
-    Handles Ollama, llama.cpp and OpenAI-compatible endpoints. For Ollama,
-    uses the `/api/generate` endpoint. For OpenAI-compatible endpoints,
-    supports both `/v1/chat/completions` and `/v1/completions`.
+    Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
+    Retries up to 3 times with exponential backoff (1s, 2s, 4s).
+    Only logs when retries are exhausted or on non-retryable errors.
 
     Args:
         prompt (str): The user prompt.
@@ -455,96 +455,126 @@ async def call_llm(
         str: The LLM response content.
 
     Raises:
-        RuntimeError: If the model is not provided, the HTTP request fails,
+        RuntimeError: If all retry attempts fail, or the model is not provided,
                       or the response is malformed.
     """
     if model is None:
         _logger.error("LLM call requested but no model was provided. Please specify a model.")
         raise RuntimeError("No model provided for LLM call.")
 
-    session = await get_http_session(timeout)
+    max_retries = 3
+    base_delay = 1.0
+    last_exception = None
 
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3].rstrip("/")
+    for attempt in range(1, max_retries + 1):
+        try:
+            session = await get_http_session(timeout)
 
-    is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-    is_llamacpp = model.startswith("llamacpp/")
-    if is_llamacpp:
-        is_ollama = False
+            base_url_clean = base_url.rstrip("/")
+            if base_url_clean.endswith("/v1"):
+                base_url_clean = base_url_clean[:-3].rstrip("/")
 
-    model_str = model.split("/", 1)[1] if "/" in model else model
+            is_ollama = "ollama" in base_url_clean.lower() or ":11434" in base_url_clean
+            is_llamacpp = model.startswith("llamacpp/")
+            if is_llamacpp:
+                is_ollama = False
 
-    headers = {"Content-Type": "application/json"}
-    if api_token and api_token.strip():
-        headers["Authorization"] = f"Bearer {api_token.strip()}"
+            model_str = model.split("/", 1)[1] if "/" in model else model
 
-    if is_ollama:
-        url = f"{base_url}/api/generate"
-        payload: Dict[str, Any] = {
-            "model": model_str,
-            "prompt": prompt,
-            "system": system,
-            "stream": False,
-            "options": {"temperature": temperature},
-        }
-        if max_tokens is not None:
-            payload["options"]["num_predict"] = max_tokens
-    else:
-        if endpoint_type == "completion":
-            url = f"{base_url}/v1/completions"
-            payload = {
-                "model": model_str,
-                "prompt": prompt if not system else f"{system}\n\n{prompt}",
-                "temperature": temperature,
-            }
-        else:
-            url = f"{base_url}/v1/chat/completions"
-            payload = {
-                "model": model_str,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": temperature,
-            }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+            headers = {"Content-Type": "application/json"}
+            if api_token and api_token.strip():
+                headers["Authorization"] = f"Bearer {api_token.strip()}"
 
-    import aiohttp
+            if is_ollama:
+                url = f"{base_url_clean}/api/generate"
+                payload: Dict[str, Any] = {
+                    "model": model_str,
+                    "prompt": prompt,
+                    "system": system,
+                    "stream": False,
+                    "options": {"temperature": temperature},
+                }
+                if max_tokens is not None:
+                    payload["options"]["num_predict"] = max_tokens
+            else:
+                if endpoint_type == "completion":
+                    url = f"{base_url_clean}/v1/completions"
+                    payload = {
+                        "model": model_str,
+                        "prompt": prompt if not system else f"{system}\n\n{prompt}",
+                        "temperature": temperature,
+                    }
+                else:
+                    url = f"{base_url_clean}/v1/chat/completions"
+                    payload = {
+                        "model": model_str,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": temperature,
+                    }
+                if max_tokens is not None:
+                    payload["max_tokens"] = max_tokens
 
-    try:
-        async with session.post(url, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"LLM HTTP {resp.status}: {text[:300]}")
-            data = await resp.json()
-    except aiohttp.ClientError as exc:
-        raise RuntimeError(f"LLM connection error: {exc}") from exc
+            import aiohttp
 
-    if is_ollama:
-        content = data.get("response", "")
-        if not content:
-            err = data.get("error", "")
-            if err:
-                raise RuntimeError(f"Ollama model error: {err}")
-    else:
-        choices = data.get("choices", [])
-        if not choices:
-            raise RuntimeError("OpenAI response has no choices")
-        if endpoint_type == "completion":
-            content = choices[0].get("text", "")
-        else:
-            content = choices[0].get("message", {}).get("content", "")
-            if not content:
-                reasoning = choices[0].get("message", {}).get("reasoning_content", "")
-                if reasoning:
-                    content = reasoning.strip()
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    if 500 <= resp.status < 600 or resp.status == 429:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    else:
+                        raise RuntimeError(f"HTTP {resp.status}: {text[:300]}") from None
+                data = await resp.json()
 
-    if not content:
-        _logger.warning("LLM response with empty content. Full response: %s", data)
+            if is_ollama:
+                content = data.get("response", "")
+                if not content:
+                    err = data.get("error", "")
+                    if err:
+                        raise RuntimeError(f"Ollama error: {err}")
+                    raise RuntimeError("Empty response")
+            else:
+                choices = data.get("choices", [])
+                if not choices:
+                    raise RuntimeError("No choices")
+                if endpoint_type == "completion":
+                    content = choices[0].get("text", "")
+                else:
+                    content = choices[0].get("message", {}).get("content", "")
+                    if not content:
+                        reasoning = choices[0].get("message", {}).get("reasoning_content", "")
+                        if reasoning:
+                            content = reasoning.strip()
+                        else:
+                            raise RuntimeError("Empty content")
 
-    return content.strip()
+            return content.strip()
+
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            last_exception = exc
+
+            # Non-retryable: 4xx (except 429) -> fail immediately
+            if isinstance(exc, RuntimeError) and "HTTP" in str(exc):
+                status_str = str(exc).split()[1] if len(str(exc).split()) > 1 else ""
+                if status_str.isdigit() and 400 <= int(status_str) < 500 and int(status_str) != 429:
+                    _logger.warning(f"LLM call failed: {exc}")
+                    raise
+
+            # Last attempt -> log error and raise
+            if attempt == max_retries:
+                _logger.error(f"LLM call failed after {max_retries} attempts: {last_exception}")
+                raise RuntimeError(f"LLM call failed after {max_retries} attempts") from last_exception
+
+            # Otherwise, wait and retry (silently)
+            delay = base_delay * (2 ** (attempt - 1))
+            await asyncio.sleep(delay)
+
+    # Should never reach here
+    raise RuntimeError(f"LLM call failed after {max_retries} attempts")
 
 
 # ============================================================================
