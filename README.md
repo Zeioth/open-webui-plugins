@@ -32,7 +32,7 @@ per message.
 ## Current complexity
 Our performance and complexity are state of the art right now. As close to linear complexity as humanly possible in 2026 without any degradation.
 
-| Component | ~v1.9.0 (Current State) | ≥ v2.0.0 |
+| Component | ~v8.0.0 (Previous) | ≥ v9.0.0 (current) |
 |------------|-------------------------|--------------------------------------------|
 | Turn 1 prefill (cold) | O(K₁²) with K₁ ≈ 20k → ~400M ops [constant] | O(K₂²) with K₂ ≈ 11k → ~121M ops [constant] |
 | Turn N prefill (warm) | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] | O(Δ²) with Δ ≈ 3k → ~9M ops [constant] |
