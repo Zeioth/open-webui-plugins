@@ -5115,21 +5115,56 @@ class SignatureExtractor:
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
         try:
             tree = ast.parse(code)
-            doc_map = {}
-            for node in ast.walk(tree):
-                if isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                ):
-                    docstring = ast.get_docstring(node)
-                    if docstring:
-                        first_line = docstring.strip().split("\n")[0].strip()
-                        if first_line:
-                            doc_map[node.name] = first_line[:120]
-            for sym in symbols:
-                if sym.name in doc_map and not sym.docstring:
-                    sym.docstring = doc_map[sym.name]
         except SyntaxError:
-            pass
+            return
+
+        doc_map: Dict[str, str] = {}
+
+        @staticmethod
+        def _first_complete_line(docstring: str) -> str:
+            """Return the first line; if it doesn't end with sentence punctuation,
+            append the next non-empty line until punctuation is found."""
+            raw_lines = [l.strip() for l in docstring.strip().splitlines()]
+            result = ""
+            for line in raw_lines:
+                if not line:
+                    break
+                result = (result + " " + line).strip() if result else line
+                if result and result[-1] in ".!?:":
+                    break
+            return result[:200]
+
+        def _visit(node: ast.AST, class_name: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    _visit(child, child.name)
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    ds = ast.get_docstring(child)
+                    if ds:
+                        first = _first_complete_line(ds)
+                        if first:
+                            key = (
+                                f"{class_name}.{child.name}"
+                                if class_name
+                                else child.name
+                            )
+                            # Only set if not already present — first definition wins
+                            if key not in doc_map:
+                                doc_map[key] = first
+                    _visit(child, class_name)  # allow nested functions to inherit class
+                else:
+                    _visit(child, class_name)
+
+        _visit(tree, "")
+
+        for sym in symbols:
+            if sym.docstring:
+                continue
+            # Try qualified key first, then bare name
+            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+            doc = doc_map.get(qid) or doc_map.get(sym.name)
+            if doc:
+                sym.docstring = doc
 
 
 class ControlFlowExtractor:
@@ -9314,12 +9349,13 @@ class CommandRouter:
                 return f"Class `{target_name}` has no indexed members."
             state = self._f._state_store.get_state(project_id)
             parts_out = [f"## class `{target_name}` ({len(members)} methods)\n"]
-            seen_hashes = set()
+            seen_pairs: Set[Tuple[str, str]] = set()  # (block_hash, method_qid)
             for mname in members:
                 for bh in self._f._symbol_index.find_blocks(mname, project_id):
-                    if bh in seen_hashes:
+                    pair = (bh, mname)
+                    if pair in seen_pairs:
                         continue
-                    seen_hashes.add(bh)
+                    seen_pairs.add(pair)
                     block = state["active_blocks"].get(bh)
                     if block and not block.obsolete:
                         lang = block.symbols[0].language if block.symbols else ""
@@ -9468,13 +9504,14 @@ class CommandRouter:
                 )
                 if not members:
                     continue
-                seen_hashes = set()
+                seen_pairs: Set[Tuple[str, str]] = set()  # (block_hash, method_qid)
                 buf = [f"## class `{target_name}` ({len(members)} methods)\n"]
                 for mname in members:
                     for bh in self._f._symbol_index.find_blocks(mname, project_id):
-                        if bh in seen_hashes:
+                        pair = (bh, mname)
+                        if pair in seen_pairs:
                             continue
-                        seen_hashes.add(bh)
+                        seen_pairs.add(pair)
                         block = state["active_blocks"].get(bh)
                         if block and not block.obsolete:
                             lang = block.symbols[0].language if block.symbols else ""
