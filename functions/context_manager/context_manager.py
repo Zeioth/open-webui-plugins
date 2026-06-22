@@ -5113,6 +5113,12 @@ class SignatureExtractor:
 
     @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
+        """
+        Extract docstrings from Python source code using AST with class context awareness.
+        Uses a DFS visitor that tracks the current class name, so docstrings are keyed by qualified name
+        (ClassName.method) to avoid collisions. Also handles line-wrapped docstrings by joining lines
+        until sentence punctuation is found.
+        """
         try:
             tree = ast.parse(code)
         except SyntaxError:
@@ -5120,10 +5126,8 @@ class SignatureExtractor:
 
         doc_map: Dict[str, str] = {}
 
-        @staticmethod
         def _first_complete_line(docstring: str) -> str:
-            """Return the first line; if it doesn't end with sentence punctuation,
-            append the next non-empty line until punctuation is found."""
+            """Return the first complete sentence from a docstring, joining wrapped lines."""
             raw_lines = [l.strip() for l in docstring.strip().splitlines()]
             result = ""
             for line in raw_lines:
@@ -5135,6 +5139,7 @@ class SignatureExtractor:
             return result[:200]
 
         def _visit(node: ast.AST, class_name: str) -> None:
+            """DFS visitor that carries the current class name."""
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.ClassDef):
                     _visit(child, child.name)
@@ -5148,19 +5153,20 @@ class SignatureExtractor:
                                 if class_name
                                 else child.name
                             )
-                            # Only set if not already present — first definition wins
+                            # First definition wins (preserve the most representative one)
                             if key not in doc_map:
                                 doc_map[key] = first
-                    _visit(child, class_name)  # allow nested functions to inherit class
+                    # Continue visiting nested functions (e.g., inside methods)
+                    _visit(child, class_name)
                 else:
                     _visit(child, class_name)
 
         _visit(tree, "")
 
+        # Assign docstrings to symbols, preferring qualified key
         for sym in symbols:
             if sym.docstring:
                 continue
-            # Try qualified key first, then bare name
             qid = qualify_symbol_name(sym.name, sym.parent_symbol)
             doc = doc_map.get(qid) or doc_map.get(sym.name)
             if doc:
@@ -9342,7 +9348,7 @@ class CommandRouter:
 
         target_type, target_name = self._resolve_expand_target(token, project_id)
 
-        # ── Branch 1: Class expansion ──────────────────────────────────────
+        # --- Branch 1: Class expansion ---
         if target_type == "class":
             members = self._f._symbol_index.get_class_members(target_name, project_id)
             if not members:
@@ -9359,14 +9365,13 @@ class CommandRouter:
                     block = state["active_blocks"].get(bh)
                     if block and not block.obsolete:
                         lang = block.symbols[0].language if block.symbols else ""
-                        # ── FIX 2d: Extract method body, not whole block ──
                         body = CodeBlockManager.extract_symbol_body(block, mname)
                         parts_out.append(f"### `{mname}`\n```{lang}\n{body}\n```\n")
             if len(parts_out) == 1:
                 return f"Class `{target_name}` found but no code blocks available."
             return "\n".join(parts_out)
 
-        # ── Branch 2: Method expansion (qualified id) ──────────────────────
+        # --- Branch 2: Method expansion (qualified id) ---
         elif target_type == "method":
             expanded = await self._expand_symbol_dependencies(
                 target_name, depth, project_id
@@ -9375,7 +9380,7 @@ class CommandRouter:
                 return f"[Retrieved `{target_name}`]\n{expanded}"
             return f"Symbol `{target_name}` not found or has no code."
 
-        # ── Branch 3: Bare symbol expansion (fallback) ─────────────────────
+        # --- Branch 3: Bare symbol expansion (fallback) ---
         else:
             expanded = await self._expand_symbol_dependencies(
                 target_name, depth, project_id
@@ -9497,7 +9502,7 @@ class CommandRouter:
 
             target_type, target_name = self._resolve_expand_target(token, project_id)
 
-            # ── Class expansion: aggregate all methods ──────────────────────
+            # --- Class expansion: aggregate all methods ---
             if target_type == "class":
                 members = self._f._symbol_index.get_class_members(
                     target_name, project_id
@@ -9515,7 +9520,6 @@ class CommandRouter:
                         block = state["active_blocks"].get(bh)
                         if block and not block.obsolete:
                             lang = block.symbols[0].language if block.symbols else ""
-                            # ── FIX 2e: Extract method body, not whole block ──
                             body = CodeBlockManager.extract_symbol_body(block, mname)
                             buf.append(f"### `{mname}`\n```{lang}\n{body}\n```\n")
                 if len(buf) > 1:
@@ -9523,7 +9527,7 @@ class CommandRouter:
                 else:
                     continue
 
-            # ── Method or symbol expansion: follow callees ──────────────────
+            # --- Method or symbol expansion: follow callees ---
             elif target_type in ("method", "symbol"):
                 expanded = await self._expand_symbol_dependencies(
                     target_name, depth, project_id
@@ -9532,11 +9536,11 @@ class CommandRouter:
                     continue
                 replacement = f"[Retrieved `{target_name}`]\n{expanded}"
 
-            # ── Apply replacement ───────────────────────────────────────────
+            # --- Apply replacement ---
             did_any = True
             replaced_content = replaced_content.replace(match.group(0), replacement, 1)
 
-            # ── Pin the block if it exists (only for method/symbol) ────────
+            # --- Pin the block if it exists (only for method/symbol) ---
             if target_type != "class":
                 lock = await self._f._state_store.get_project_lock(project_id)
                 async with lock:
@@ -14193,211 +14197,254 @@ class EnrichmentTasks:
 
     async def _background_docstring(
         self,
-        name: str,
-        signature: str,
-        block_hash: str,
-        line_start: Optional[int],
-        line_end: Optional[int],
+        sym: "CodeSymbol",
+        block: "CodeBlock",
         project_id: str,
     ) -> None:
         """
-        Generate one docstring in the background and persist it.
-
-        This function is called once per pending symbol. If the block no longer
-        exists (e.g., was purged or expired), it logs and exits gracefully.
-        The database persistence happens only after the symbol is successfully
-        found and updated, ensuring `qid` is always defined.
-
-        FIX (hallazgo 3): Strict docstring parsing to avoid persisting reasoning
-        artifacts like "1. **Analyze the Request:**". Only accept lines that
-        match the expected format or are clean natural-language descriptions.
+        Generate a one-line docstring for a symbol (function, method, or class) in the background,
+        and persist it to the SymbolIndex and SQLite. For classes, it builds a structural mini-skeleton
+        from method signatures and section comments to provide better context.
         """
-        try:
-            state = self._f._state_store.get_state(project_id)
-            snippet = ""
-            target_block = state["active_blocks"].get(block_hash)
+        name = sym.name
+        kind = sym.kind
+        signature = sym.signature
+        line_start = sym.line_start
+        line_end = sym.line_end
+        block_hash = block.hash
 
-            # Extract a code snippet for the LLM context
-            if target_block and line_start:
+        # --- 1. Ensure the block still exists ---
+        state = self._f._state_store.get_state(project_id)
+        target_block = state["active_blocks"].get(block_hash)
+        if target_block is None:
+            self._f._log_debug(
+                f"Background docstring: block {block_hash} not found, skipping '{name}'"
+            )
+            return
+
+        # --- 2. Build the snippet for the LLM prompt ---
+        snippet = ""
+        if kind == "class":
+            # Build a structural skeleton for the class
+            members_qids = self._f._symbol_index.get_class_members(name, project_id)
+            members_meta = []
+            for qid in members_qids:
+                meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
+                if meta:
+                    members_meta.append(
+                        {
+                            "qid": qid,
+                            "signature": meta.get("signature", qid),
+                            "line_start": meta.get("line_start"),
+                        }
+                    )
+            section_headers = self._extract_section_comments(block, sym)
+            snippet = self._build_class_skeleton(
+                class_name=name,
+                members_meta=members_meta,
+                section_headers=section_headers,
+                block=block,
+                line_start=line_start or 1,
+                line_end=line_end or len(block.content.splitlines()),
+            )
+        else:
+            # For functions and methods: use signature + first few lines of body
+            if line_start and target_block:
                 lines = target_block.content.split("\n")
                 start_idx = max(0, line_start - 1)
                 end_idx = min(len(lines), (line_end or line_start + 30))
                 snippet = "\n".join(lines[start_idx:end_idx])[:500]
-            elif target_block:
+            else:
                 snippet = target_block.content[:500]
 
-            # If the block no longer exists, skip silently (no infinite loop)
-            if target_block is None:
-                self._f._log_debug(
-                    f"Background docstring: block {block_hash} not found, skipping '{name}'"
-                )
-                return
+        # --- 3. Generate prompt based on kind ---
+        if kind == "class":
+            prompt = f"In one sentence, describe the single responsibility of this class based on its method names and structure:\n\n```\n{snippet}\n```"
+        else:
+            prompt = f"Summarize in one short sentence what this code does:\n\n```\n{signature}\n{snippet}\n```"
 
-            # Ask the LLM for a concise docstring
-            docstring_text = await self._f._llm_orchestrator.call_llm(
-                prompt=f"Summarize in one short sentence what this code does:\n\n```{signature}\n{snippet}```",
-                system_prompt="You are a code summarization assistant. Output only one concise sentence.",
-                model_override=self._f.valves.llm_model,
-                max_tokens=500,  # Big room, but protect us against the unexpected.
-                temperature=0.1,
-                label="bg_docstring",
-            )
+        # --- 4. Call LLM ---
+        docstring_text = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+            model_override=self._f.valves.llm_model,
+            max_tokens=500,
+            temperature=0.1,
+            label="bg_docstring",
+        )
 
-            if not docstring_text or not docstring_text.strip():
-                return
+        if not docstring_text or not docstring_text.strip():
+            return
 
-            # --- Strict docstring parsing ---
-            # Only accept lines that match the expected format or are clean
-            # natural-language descriptions. Reject lines that contain reasoning
-            # artifacts like "1. **Analyze the Request:**", "Task:", "Step:", etc.
-            #
-            # Pattern for the expected format: "name: description" or "- name: description"
-            _DOCSTRING_LINE_RE = re.compile(
-                r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$"
-            )
-            # Pattern for reasoning artifacts to reject
-            _BAD_PATTERNS = re.compile(
-                r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:)"
-            )
-
-            lines = docstring_text.strip().splitlines()
-            docstring = None
-
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-
-                # 1. Reject lines with reasoning artifacts
-                if _BAD_PATTERNS.search(stripped):
-                    continue
-
-                # 2. Try to match the strict format "name: description"
-                m = _DOCSTRING_LINE_RE.match(stripped)
-                if m:
-                    # Extract the description part (group 2)
-                    desc = m.group(2).strip()
-                    if desc and len(desc) > 5:
-                        docstring = desc
-                        break
-
-                # 3. Fallback: accept a plain sentence if it looks like a natural-language
-                # description (starts with a capital letter, contains a verb, no markdown).
-                # But only if it's not a bullet point or numbered list.
-                if (stripped[0].isupper() or stripped[0].isalpha()) and len(
-                    stripped
-                ) > 10:
-                    # Reject if it starts with a number followed by a dot (numbered list)
-                    if not re.match(r"^\d+\.\s+", stripped):
-                        # Reject if it contains markdown bold/italic
-                        if "**" not in stripped and "*" not in stripped:
-                            docstring = stripped
-                            break
-
-            if not docstring:
-                # Last‑resort fallback: take the last non‑empty line that is not
-                # a bad‑pattern preamble fragment. Models that ignore the
-                # "one sentence only" instruction often still END with the
-                # actual answer after a numbered reasoning preamble.
-                for line in reversed(lines):
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if _BAD_PATTERNS.search(stripped):
-                        continue
-                    if len(stripped) > 10 and "**" not in stripped:
-                        docstring = stripped[:200]
-                        break
-
-            if not docstring:
-                self._f._log_debug(
-                    f"Background docstring: no valid docstring extracted for '{name}' "
-                    f"(raw: {docstring_text[:100]}...)"
-                )
-                return
-
-            # Clean up: remove any leading "name:" prefix if still present
-            if re.match(r"^\s*[A-Za-z_][\w.]*\s*:", docstring):
-                docstring = re.sub(
-                    r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1
-                )
-
-            # Truncate to one sentence (first sentence, max 200 chars)
-            docstring = docstring[:200].strip()
-            if docstring.endswith("."):
-                pass  # keep it
-            else:
-                # Try to split on . or ? or ! but keep it safe
-                first_sentence = re.split(r"[.!?]\s", docstring, maxsplit=1)[0]
-                if first_sentence and len(first_sentence) > 10:
-                    docstring = first_sentence + "."
-
-            docstring_text = docstring
-
-            # Acquire the project lock to safely update state and index
-            lock = await self._f._state_store.get_project_lock(project_id)
-            async with lock:
-                state = self._f._state_store.get_state(project_id)
-                block = state["active_blocks"].get(block_hash)
-
-                if block:
-                    # Find the exact symbol instance by name and line number
-                    for sym in block.symbols:
-                        if sym.name == name and sym.line_start == line_start:
-                            sym.docstring = docstring_text
-                            qid = qualify_symbol_name(sym.name, sym.parent_symbol)
-
-                            # Update in-memory index
-                            self._f._symbol_index.update_docstring(
-                                qid, project_id, docstring_text
-                            )
-
-                            # Persist to SQLite
-                            await self._f._state_store._db_enqueue(
-                                lambda q=qid, d=docstring_text, pid=project_id: self._f._db_conn.execute(
-                                    "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                                    (pid, q, d, time.time()),
-                                )
-                            )
-                            break
-
-                    self._f._state_store.set_state(project_id, state)
-                else:
-                    self._f._log_debug(
-                        f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
-                    )
-
-        except Exception as e:
+        # --- 5. Parse and clean the response ---
+        docstring = self._clean_single_docstring(docstring_text, name)
+        if not docstring:
             self._f._log_debug(
-                f"❌ Docstring generation failed for '{name}' (line {line_start}): {e}"
+                f"Background docstring: no valid docstring extracted for '{name}'"
             )
+            return
+
+        # --- 6. Acquire project lock to update state and index ---
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            state = self._f._state_store.get_state(project_id)
+            block = state["active_blocks"].get(block_hash)
+            if block:
+                # Find the exact symbol instance
+                for s in block.symbols:
+                    if s.name == name and s.line_start == line_start:
+                        s.docstring = docstring
+                        qid = qualify_symbol_name(s.name, s.parent_symbol)
+                        self._f._symbol_index.update_docstring(
+                            qid, project_id, docstring
+                        )
+                        await self._f._state_store._db_enqueue(
+                            lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
+                                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                                (pid, q, d, time.time()),
+                            )
+                        )
+                        break
+                self._f._state_store.set_state(project_id, state)
+            else:
+                self._f._log_debug(
+                    f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
+                )
+
+    def _clean_single_docstring(
+        self, raw_response: str, symbol_name: str
+    ) -> Optional[str]:
+        """
+        Parse the LLM response to extract a single docstring sentence.
+        Returns None if no valid docstring found.
+        """
+        # --- 1. Define patterns for filtering ---
+        _BAD_PATTERNS = re.compile(
+            r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:)"
+        )
+        _DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
+
+        lines = raw_response.strip().splitlines()
+        docstring = None
+
+        # --- 2. Try to find a valid line ---
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _BAD_PATTERNS.search(stripped):
+                continue
+            m = _DOCSTRING_LINE_RE.match(stripped)
+            if m:
+                desc = m.group(2).strip()
+                if desc and len(desc) > 5:
+                    docstring = desc
+                    break
+            # Fallback: accept a plain sentence
+            if (stripped[0].isupper() or stripped[0].isalpha()) and len(stripped) > 10:
+                if not re.match(r"^\d+\.\s+", stripped) and "**" not in stripped:
+                    docstring = stripped
+                    break
+
+        # --- 3. If still nothing, take the last non-bad line as a fallback ---
+        if not docstring:
+            for line in reversed(lines):
+                stripped = line.strip()
+                if (
+                    stripped
+                    and not _BAD_PATTERNS.search(stripped)
+                    and len(stripped) > 10
+                    and "**" not in stripped
+                ):
+                    docstring = stripped[:200]
+                    break
+
+        # --- 4. Clean up: remove leading "name:" prefix, truncate to first sentence ---
+        if docstring:
+            docstring = re.sub(r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1)
+            docstring = re.split(r"[.!?]\s", docstring, maxsplit=1)[0] + "."
+            docstring = docstring[:200]
+
+        return docstring
+
+    def _extract_section_comments(
+        self, block: "CodeBlock", class_sym: "CodeSymbol"
+    ) -> List[Tuple[int, str]]:
+        """
+        Extract section header comments (e.g., '# ── Initialization ──') from within a class body.
+        Returns a list of (line_number, comment_text) for lines that look like section markers.
+        """
+        SECTION_RE = re.compile(
+            r"^\s*#\s*[─━=\-]{2,}.*[─━=\-]{0,}\s*$|^\s*#\s*[─━=\-\s]*\w+[─━=\-\s]*$"
+        )
+        lines = block.content.split("\n")
+        start = (class_sym.line_start or 1) - 1
+        end = class_sym.line_end or len(lines)
+        result = []
+        for i, line in enumerate(lines[start:end], start=start):
+            if SECTION_RE.match(line):
+                result.append((i + 1, line.strip()))
+        return result
+
+    def _build_class_skeleton(
+        self,
+        class_name: str,
+        members_meta: List[Dict],
+        section_headers: List[Tuple[int, str]],
+        block: "CodeBlock",
+        line_start: int,
+        line_end: int,
+    ) -> str:
+        """
+        Build a structural skeleton for a class, interleaving method signatures and section comments
+        in order of appearance. Used as context for generating a class docstring.
+        """
+        # --- 1. Build mapping of line number to signature for methods ---
+        method_lines = {}
+        for m in members_meta:
+            if m.get("line_start"):
+                method_lines[m["line_start"]] = m.get("signature", m.get("qid", ""))
+
+        # --- 2. Set of header lines ---
+        header_lines = {h[0] for h in section_headers}
+
+        # --- 3. Get all lines of the class body ---
+        lines = block.content.split("\n")
+        start_idx = max(0, line_start - 1)
+        end_idx = min(len(lines), line_end)
+
+        # --- 4. Build the skeleton ---
+        buf = [f"class {class_name}:"]
+        for i in range(start_idx, end_idx):
+            line_num = i + 1
+            line = lines[i].rstrip()
+            if line_num in header_lines:
+                buf.append("    " + line.strip())
+            elif line_num in method_lines:
+                buf.append("    " + method_lines[line_num])
+            # else ignore other lines (bodies, etc.)
+
+        if len(buf) == 1:
+            buf.append("    ...")
+
+        skeleton = "\n".join(buf)
+        return skeleton[:800]  # limit size
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
-        Background loop that generates docstrings for all pending symbols.
-
-        Takes a snapshot of all symbols missing docstrings at the start,
-        then processes each one exactly once. This prevents infinite retries
-        on failing symbols and ensures the loop terminates naturally.
+        Background loop that generates docstrings for all pending symbols (functions, methods, and classes)
+        that lack one. Takes a snapshot of all symbols without docstrings at the start, then processes
+        each one exactly once. This prevents infinite retries on failing symbols and ensures termination.
         """
-        # --- Snapshot: collect all symbols without docstrings ---
+        # --- 1. Snapshot: collect all symbols without docstrings ---
         state = self._f._state_store.get_state(project_id)
         pending = []
-
         for block in state["active_blocks"].values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
-                if sym.kind in ("function", "method") and not sym.docstring:
-                    pending.append(
-                        (
-                            sym.name,
-                            sym.signature,
-                            block.hash,
-                            sym.line_start,
-                            sym.line_end,
-                        )
-                    )
+                if sym.kind in ("function", "method", "class") and not sym.docstring:
+                    pending.append((sym, block))
 
         if not pending:
             self._f._log_debug("Background docstring loop: no pending symbols")
@@ -14407,19 +14454,9 @@ class EnrichmentTasks:
             f"Background docstring loop: {len(pending)} symbol(s) to process"
         )
 
-        # --- Process each symbol once ---
-        for idx, (name, signature, block_hash, line_start, line_end) in enumerate(
-            pending, 1
-        ):
-            await self._background_docstring(
-                name,
-                signature,
-                block_hash,
-                line_start,
-                line_end,
-                project_id,
-            )
-
+        # --- 2. Process each symbol once ---
+        for idx, (sym, block) in enumerate(pending, 1):
+            await self._background_docstring(sym, block, project_id)
             # Throttle requests to avoid saturating the LLM server
             if idx % 5 == 0:
                 await asyncio.sleep(1.0)
