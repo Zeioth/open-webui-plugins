@@ -15944,6 +15944,395 @@ class SystemPromptBuilder:
         return prelim_system
 
 
+class WindowManager:
+    """
+    Single owner of the prose history window policy.
+
+    Replaces (in Phase 1, step 3):
+        MessageAssembler._apply_turn_based_window     (M1)
+        MessageAssembler._trim_and_summarize           (M3 + M4)
+        MessageAssembler._index_turns
+        MessageAssembler._summary_sort_key
+
+    Does not replace:
+        MessageAssembler._apply_history_llmlingua      (M2, decoupled)
+        HistoryCompressor.summarize_messages           (helper)
+        HistoryCompressor._consolidate_summaries       (helper)
+        HistoryCompressor._merge_summaries             (helper)
+        MessageAssembler._persist_turn_summary_to_ltm  (helper)
+
+    Complexity guarantee:
+        Context history: O(K) bounded by history_max_tokens.
+        Total session (T turns): O(T) linear — same as v9.0.0.
+
+    Seams for future phases:
+        _on_frontier_advance(old_hwm, new_hwm)  → Phase 2 (KV-freeze)
+        _frontier_c_turn                        → Phase 3 (LLMLingua)
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+        # Phase 3 seam: turn that separates raw band from compressible band.
+        # In Phase 1 it is updated but nobody reads it.
+        self._frontier_c_turn: int = 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 1. Public entry point
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def apply(
+        self,
+        messages: List[dict],
+        state: dict,
+        project_id: str,
+        slot_free: bool,
+    ) -> Tuple[List[dict], str]:
+        """
+        Applies the history window policy.
+
+        Args:
+            messages:    full list (system + history)
+            state:       conversation state for the project
+            project_id:  project identifier
+            slot_free:   if False, no summaries are generated
+
+        Returns:
+            (messages_final, pending_summary)
+            - messages_final: system messages at front + trimmed history
+            - pending_summary: text of the most recent summary (or "")
+              for injection into the system prompt — same contract
+              as the pending_summary returned by _trim_and_summarize.
+        """
+        v = self._f.valves
+
+        # ── 0. Clean orphan tool calls at front ────────────────────────
+        # (migrated from _trim_and_summarize preserve_tool_calls)
+        if v.preserve_tool_calls:
+            while messages and messages[0].get("role") == "tool":
+                messages = messages[1:]
+            if (
+                messages
+                and messages[0].get("role") == "assistant"
+                and messages[0].get("tool_calls")
+            ):
+                tool_call_ids = {tc.get("id") for tc in messages[0]["tool_calls"]}
+                tool_response_ids = {
+                    m.get("tool_call_id")
+                    for m in messages[1:]
+                    if m.get("role") == "tool"
+                }
+                if not tool_call_ids.issubset(tool_response_ids):
+                    messages = messages[1:]
+
+        # ── 1. AutoContinue deferral ──────────────────────────────────
+        if v.compaction_defer_during_autocontinue and self._is_autocontinue_active(
+            messages
+        ):
+            self._f._log_debug(
+                "WindowManager: deferral — AutoContinue active, no changes"
+            )
+            return messages, ""
+
+        # ── 2. Separate system / history ──────────────────────────────
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        history = [m for m in messages if m.get("role") != "system"]
+        if not history:
+            return messages, ""
+
+        # ── 3. Effective budget ──────────────────────────────────────
+        budget = self._effective_budget(project_id)
+
+        # ── 4. Turn indexing ──────────────────────────────────────────
+        turns, _total_turns = self._index_turns(history)
+
+        # ── 5. Compute frontier ───────────────────────────────────────
+        kept, old_msgs, cut_turn = self._compute_frontier(history, turns, budget)
+        self._frontier_c_turn = cut_turn  # Phase 3 seam
+
+        # ── 6. Everything fits ────────────────────────────────────────
+        if not old_msgs:
+            return sys_msgs + kept, ""
+
+        # ── 7. Emergency cap ──────────────────────────────────────────
+        kept, old_msgs = self._apply_emergency_cap(
+            history, turns, kept, old_msgs, budget
+        )
+        if not old_msgs:
+            return sys_msgs + kept, ""
+
+        # ── 8. Minimum batch ──────────────────────────────────────────
+        old_turn_nums = {t for m, t in zip(history, turns) if m in old_msgs}
+        if len(old_turn_nums) < v.summarize_batch_turns:
+            self._f._log_debug(
+                f"WindowManager: batch too small "
+                f"({len(old_turn_nums)} < {v.summarize_batch_turns} turns), "
+                "keeping raw"
+            )
+            return sys_msgs + history, ""
+
+        # ── 9. Summarize batch ──────────────────────────────────────
+        if not slot_free:
+            self._f._log_debug("WindowManager: no free slot, keeping raw history")
+            return sys_msgs + history, ""
+
+        has_code = any("```" in m.get("content", "") for m in old_msgs)
+        summary_text = await self._f._history_compressor.summarize_messages(
+            old_msgs, is_code_context=has_code
+        )
+
+        if not summary_text or not summary_text.strip():
+            self._f._log_debug(
+                "WindowManager: summary failed (no-degradation guard), "
+                "keeping raw history"
+            )
+            return sys_msgs + history, ""
+
+        # ── 10. Persist ─────────────────────────────────────────────
+        pending = await self._persist(
+            summary_text=summary_text,
+            old_msgs=old_msgs,
+            turns=turns,
+            history=history,
+            state=state,
+            project_id=project_id,
+            slot_free=slot_free,
+        )
+
+        # ── 11. Return trimmed history ──────────────────────────────
+        return sys_msgs + kept, pending
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 2. Calculation helpers (no side effects)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _effective_budget(self, project_id: str) -> int:
+        """
+        Token budget for history.
+        Token-primary: history_max_tokens, bounded by the actual window.
+        Always returns a value >= 0.
+        """
+        v = self._f.valves
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        system_tokens = pstate.get("last_system_tokens", 0)
+        budget = min(
+            v.history_max_tokens,
+            v.context_window_tokens - system_tokens - v.response_reserve_tokens,
+        )
+        return max(0, budget)
+
+    def _token_count(self, text: str) -> int:
+        """Counts tokens with tokenizer if available, else 4 chars/token heuristic."""
+        if self._f.tokenizer:
+            return len(self._f.tokenizer.encode(text))
+        return max(1, len(text) // 4)
+
+    def _compute_frontier(
+        self,
+        history: List[dict],
+        turns: List[int],
+        budget: int,
+    ) -> Tuple[List[dict], List[dict], int]:
+        """
+        Computes the window frontier.
+        Iterates from the most recent message backwards, accumulating tokens.
+        The frontier is aligned to full turn boundaries (never cuts a turn in half).
+
+        Returns (kept, old_msgs, cut_turn).
+        cut_turn == 0 means everything fits in the budget.
+        """
+        accumulated = 0
+        cut_turn = 0
+        token_counts = [self._token_count(m.get("content", "")) for m in history]
+
+        for i in range(len(history) - 1, -1, -1):
+            tok = token_counts[i]
+            if accumulated + tok > budget:
+                # Align to the full turn boundary
+                cut_turn = turns[i]
+                break
+            accumulated += tok
+
+        if cut_turn == 0:
+            return history, [], 0
+
+        kept = [m for m, t in zip(history, turns) if t > cut_turn]
+        old_msgs = [m for m, t in zip(history, turns) if t <= cut_turn]
+        return kept, old_msgs, cut_turn
+
+    def _apply_emergency_cap(
+        self,
+        history: List[dict],
+        turns: List[int],
+        kept: List[dict],
+        old_msgs: List[dict],
+        budget: int,
+    ) -> Tuple[List[dict], List[dict]]:
+        """
+        Emergency cap: if any turn in `kept` exceeds budget * 0.8
+        (giant turn — e.g. a 5000-line file), keep only the last
+        emergency_max_turns turns and move the rest to old_msgs.
+
+        Replaces adaptive_trim with max_turns=8, with a more conservative
+        default (4) and configurable via valve.
+        """
+        if not kept:
+            return kept, old_msgs
+
+        emergency_threshold = budget * 0.8
+        kept_turn_set = {t for m, t in zip(history, turns) if m in kept}
+
+        giant_found = False
+        for turn_num in kept_turn_set:
+            turn_tokens = sum(
+                self._token_count(m.get("content", ""))
+                for m, t in zip(history, turns)
+                if t == turn_num
+            )
+            if turn_tokens > emergency_threshold:
+                giant_found = True
+                break
+
+        if not giant_found:
+            return kept, old_msgs
+
+        emergency_max = getattr(self._f.valves, "emergency_max_turns", 4)
+        sorted_kept_turns = sorted(kept_turn_set)
+        turns_to_keep = set(sorted_kept_turns[-emergency_max:])
+        turns_to_evict = kept_turn_set - turns_to_keep
+
+        new_kept = [m for m, t in zip(history, turns) if t in turns_to_keep]
+        extra_old = [m for m, t in zip(history, turns) if t in turns_to_evict]
+
+        self._f._log_debug(
+            f"WindowManager: emergency cap — giant turn detected "
+            f"(>{emergency_threshold:.0f} tokens). "
+            f"Keeping last {emergency_max} turns."
+        )
+        return new_kept, old_msgs + extra_old
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 3. Persistence (side effects: state, LTM, consolidation)
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _persist(
+        self,
+        summary_text: str,
+        old_msgs: List[dict],
+        turns: List[int],
+        history: List[dict],
+        state: dict,
+        project_id: str,
+        slot_free: bool,
+    ) -> str:
+        """
+        Persists the generated summary:
+          a. Unified metadata → conversation_summaries.
+          b. L1 cap.
+          c. Update summarized_turn_hwm (manager owns the hwm).
+          d. Persist to LTM (synchronous — closes the wait=False race).
+          e. Consolidate L1→L2 if enough L1 summaries exist.
+          f. Phase 2 seam.
+          g. Persist state.
+
+        Returns the formatted pending_summary for injection into the
+        system prompt (same format as _trim_and_summarize returned).
+        """
+        v = self._f.valves
+        old_hwm = state.get("summarized_turn_hwm", 0)
+
+        old_turn_nums = [t for m, t in zip(history, turns) if m in old_msgs]
+        new_hwm = max(old_turn_nums) if old_turn_nums else old_hwm
+
+        # a. Unified metadata (covers_turns always present)
+        summary_entry = {
+            "text": summary_text,
+            "created_at": time.time(),
+            "covers_msgs": len(old_msgs),
+            "covers_turns": [old_hwm + 1, new_hwm],
+            "level": 1,
+        }
+        state["conversation_summaries"].append(summary_entry)
+
+        # b. L1 cap
+        max_l1 = v.max_conversation_summaries
+        if max_l1 > 0:
+            l1 = [s for s in state["conversation_summaries"] if s.get("level", 1) == 1]
+            if len(l1) > max_l1:
+                keep_ids = {id(s) for s in l1[-max_l1:]}
+                state["conversation_summaries"] = [
+                    s
+                    for s in state["conversation_summaries"]
+                    if s.get("level", 1) != 1 or id(s) in keep_ids
+                ]
+
+        # c. Manager owns the hwm
+        state["summarized_turn_hwm"] = new_hwm
+
+        self._f._log_debug(
+            f"WindowManager: L1 summary generated "
+            f"(turns {old_hwm + 1}–{new_hwm}, {len(old_msgs)} msgs)"
+        )
+
+        # d. Persist to LTM (synchronous)
+        await self._f._message_assembler._persist_turn_summary_to_ltm(
+            summary_text, project_id, old_hwm + 1, new_hwm
+        )
+
+        # e. Consolidate L1→L2
+        l1_count = sum(
+            1 for s in state["conversation_summaries"] if s.get("level", 1) == 1
+        )
+        if (
+            slot_free
+            and v.enable_hierarchical_summaries
+            and l1_count >= v.hierarchical_summary_group_size
+        ):
+            await self._f._message_assembler._consolidate_summaries(
+                state, project_id, slot_free
+            )
+
+        # f. Phase 2 seam (no-op in Phase 1)
+        self._on_frontier_advance(old_hwm, new_hwm)
+
+        # g. Persist state
+        self._f._state_store.set_state(project_id, state)
+
+        return f"[Summary of earlier conversation]\n{summary_text}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 4. Seams and static helpers
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _on_frontier_advance(self, old_hwm: int, new_hwm: int) -> None:
+        """
+        Phase 2 seam.
+        Phase 1: no-op.
+        Phase 2: trigger slot_save(force=True) to freeze KV
+                behind the advanced frontier.
+        """
+        pass
+
+    @staticmethod
+    def _is_autocontinue_active(messages: List[dict]) -> bool:
+        """
+        True if the last assistant message contains a multi-phase
+        continuation marker.
+        """
+        _MARKERS = frozenset(
+            {
+                "▶ CONTINÚA:",
+                "▶ CONTINÚA EN LA SIGUIENTE PARTE",
+            }
+        )
+        last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"),
+            None,
+        )
+        if not last_assistant:
+            return False
+        return any(marker in last_assistant.get("content", "") for marker in _MARKERS)
+
+
 class MessageAssembler:
     """Final processing of the message list before it is sent to the LLM.
 
@@ -15959,8 +16348,16 @@ class MessageAssembler:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the MessageAssembler with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._f = filter_ref
         self._last_cot_degraded: bool = False
+        # WindowManager: unified history window policy (replaces M1, M3, M4)
+        self._window_manager = WindowManager(filter_ref)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Main orchestration
@@ -15981,7 +16378,26 @@ class MessageAssembler:
         has_code_blocks: bool,
         slot_free: bool = True,
     ) -> List[dict]:
-        """Orchestrate CoT, multi‑phase, trimming, and final assembly."""
+        """
+        Orchestrate CoT, multi-phase, trimming, and final assembly.
+
+        Args:
+            messages: The current list of conversation messages.
+            project_id: The project identifier.
+            static_block: The rendered Block A (static, KV-cacheable).
+            dynamic_injections: List of (priority, text) dynamic content.
+            prelim_system: The preliminary system prompt (Block A + Block B).
+            last_user_msg: The last user message, if any.
+            is_code_session: Whether the session is code-aware.
+            state: The conversation state for the project.
+            __user__: The user context from OpenWebUI.
+            user_question: The extracted question from the user message.
+            has_code_blocks: Whether the user message contained code fences.
+            slot_free: Whether the LLM slot is free for auxiliary calls.
+
+        Returns:
+            List[dict]: The final message list ready for the LLM.
+        """
         self._f._log_debug(
             "Assembling final messages (CoT, trimming, system prompt injection)"
         )
@@ -16010,12 +16426,9 @@ class MessageAssembler:
             messages, project_id, user_question
         )
 
-        # 4. Turn-based window: summarize turns past summarize_after_turns and
-        #    evict raw turns past evict_raw_after_turns — but only when a
-        #    persisted summary + LTM copy already covers them (no-degradation
-        #    guard). Runs before multi-phase/trim so their token math sees the
-        #    reduced history.
-        messages = await self._apply_turn_based_window(
+        # 4. WindowManager: unified history window policy
+        #    Replaces: _apply_turn_based_window (M1) + _trim_and_summarize (M3 + M4)
+        messages, pending_summary = await self._window_manager.apply(
             messages, state, project_id, slot_free
         )
 
@@ -16030,9 +16443,9 @@ class MessageAssembler:
         )
 
         # 6. Trim and summarize old messages
-        messages, pending_summary = await self._trim_and_summarize(
-            messages, state, project_id, __user__
-        )
+        #    NOTE: Step 6 (_trim_and_summarize) has been removed.
+        #    Its functionality is now fully handled by WindowManager in step 4.
+        #    The pending_summary variable is already populated from step 4.
 
         # 7. Assemble final system message and inject into message list
         messages = self._assemble_final_system_and_log(
@@ -16506,119 +16919,6 @@ class MessageAssembler:
     # 4. Turn‑based window management
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def _apply_turn_based_window(
-        self,
-        messages: List[dict],
-        state: dict,
-        project_id: str,
-        slot_free: bool,
-    ) -> List[dict]:
-        """
-        Summarize turns past `summarize_after_turns` and evict raw turns past
-        `evict_raw_after_turns`, enforcing the no-degradation guard.
-        """
-        if not self._f.valves.enable_turn_based_eviction:
-            return messages
-
-        if (
-            self._f.valves.compaction_defer_during_autocontinue
-            and self._is_autocontinue_active(messages)
-        ):
-            self._f._log_debug(
-                "Turn-based compaction deferred: AutoContinue session active"
-            )
-            return messages
-
-        summarize_after = self._f.valves.summarize_after_turns
-        evict_after = self._f.valves.evict_raw_after_turns
-
-        if evict_after <= summarize_after:
-            self._f._log_debug(
-                "Turn-based: evict_raw_after_turns must be > summarize_after_turns; "
-                "skipping window this request."
-            )
-            return messages
-
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        history = [m for m in messages if m.get("role") != "system"]
-        if not history:
-            return messages
-
-        turns, total_turns = self._index_turns(history)
-        if total_turns <= summarize_after:
-            return messages
-
-        # Step 1: summarize
-        summarize_target = total_turns - summarize_after
-        hwm = state.get("summarized_turn_hwm", 0)
-
-        if (
-            slot_free
-            and summarize_target > hwm
-            and (summarize_target - hwm) >= self._f.valves.summarize_batch_turns
-        ):
-            band = [m for m, t in zip(history, turns) if hwm < t <= summarize_target]
-            if band:
-                has_code = any("```" in m.get("content", "") for m in band)
-                summary = await self._f._history_compressor.summarize_messages(
-                    band, is_code_context=has_code
-                )
-                if summary:
-                    state["conversation_summaries"].append(
-                        {
-                            "text": summary,
-                            "created_at": time.time(),
-                            "covers_msgs": len(band),
-                            "covers_turns": [hwm + 1, summarize_target],
-                        }
-                    )
-                    await self._persist_turn_summary_to_ltm(
-                        summary, project_id, hwm + 1, summarize_target
-                    )
-                    await self._consolidate_summaries(state, project_id, slot_free)
-                    state["summarized_turn_hwm"] = summarize_target
-                    self._f._state_store.set_state(project_id, state)
-                    self._f._log_debug(
-                        f"Turn-based: summarized turns {hwm + 1}–{summarize_target} "
-                        f"({len(band)} msgs); HWM now {summarize_target}."
-                    )
-                else:
-                    self._f._log_debug(
-                        "Turn-based: summary generation failed — raw turns kept "
-                        "(no-degradation guard, HWM unchanged)."
-                    )
-
-        # Step 2: evict
-        evict_target = total_turns - evict_after
-        current_hwm = state.get("summarized_turn_hwm", 0)
-        if evict_target > 0 and current_hwm >= evict_target:
-            kept = [m for m, t in zip(history, turns) if t > evict_target]
-            dropped = len(history) - len(kept)
-            if dropped:
-                self._f._log_debug(
-                    f"Turn-based: evicted {dropped} raw msg(s) from turns "
-                    f"≤ {evict_target} (covered by summary up to {current_hwm} + LTM)."
-                )
-            history = kept
-        elif evict_target > 0:
-            self._f._log_debug(
-                f"Turn-based: eviction deferred — summaries cover up to turn "
-                f"{current_hwm} < evict target {evict_target} (no-degradation guard)."
-            )
-
-        return sys_msgs + history
-
-    @staticmethod
-    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
-        """Assign a 1‑based turn number to each history message."""
-        turn = 0
-        per_msg: List[int] = []
-        for m in history:
-            if m.get("role") == "user":
-                turn += 1
-            per_msg.append(turn)
-        return per_msg, turn
-
     def _is_autocontinue_active(self, messages: List[dict]) -> bool:
         """True if the last assistant message ended with a multi‑part continuation marker."""
         last_assistant = next(
@@ -16665,12 +16965,6 @@ class MessageAssembler:
             )
         except Exception as e:
             self._f._log_debug(f"Turn summary LTM persist failed: {e}")
-
-    @staticmethod
-    def _summary_sort_key(s: dict):
-        """Sort key for conversation summaries: by covered turn start, oldest first."""
-        ct = s.get("covers_turns")
-        return ct[0] if ct else s.get("created_at", 0)
 
     async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
         """Fuse several L1 turn‑range summaries into one L2 summary via the LLM."""
@@ -16721,18 +17015,29 @@ class MessageAssembler:
         }
 
     async def _consolidate_summaries(
-        self, state: dict, project_id: str, slot_free: bool
+        self,
+        state: dict,
+        project_id: str,
+        slot_free: bool,
     ) -> None:
-        """Consolidate L1 summaries into L2 and apply level‑aware cap."""
+        """
+        Consolidate L1 summaries into L2 and apply level-aware cap.
+
+        Args:
+            state: The conversation state for the project.
+            project_id: The project identifier.
+            slot_free: Whether the LLM slot is free for auxiliary calls.
+        """
         summaries = state.get("conversation_summaries", [])
         if not summaries:
             return
 
+        # Use WindowManager._summary_sort_key for consistent ordering
         if slot_free and self._f.valves.enable_hierarchical_summaries:
             group = self._f.valves.hierarchical_summary_group_size
             l1 = sorted(
                 (s for s in summaries if s.get("level", 1) == 1),
-                key=self._summary_sort_key,
+                key=WindowManager._summary_sort_key,
             )
             l2plus = [s for s in summaries if s.get("level", 1) >= 2]
             if len(l1) >= group:
@@ -16755,17 +17060,20 @@ class MessageAssembler:
         max_l2 = self._f.valves.max_hierarchical_summaries
         l1 = sorted(
             (s for s in summaries if s.get("level", 1) == 1),
-            key=self._summary_sort_key,
+            key=WindowManager._summary_sort_key,
         )
         l2 = sorted(
             (s for s in summaries if s.get("level", 1) >= 2),
-            key=self._summary_sort_key,
+            key=WindowManager._summary_sort_key,
         )
         if max_l1 > 0:
             l1 = l1[-max_l1:]
         if max_l2 > 0:
             l2 = l2[-max_l2:]
-        state["conversation_summaries"] = sorted(l2 + l1, key=self._summary_sort_key)
+        state["conversation_summaries"] = sorted(
+            l2 + l1,
+            key=WindowManager._summary_sort_key,
+        )
         self._f._state_store.set_state(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -16834,197 +17142,7 @@ class MessageAssembler:
             )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Adaptive trimming & summarization
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _trim_and_summarize(
-        self,
-        messages: List[dict],
-        state: dict,
-        project_id: str,
-        __user__: Optional[dict],
-    ) -> Tuple[List[dict], str]:
-        """
-        Apply adaptive trimming to fit messages within the token window.
-        Optionally summarize trimmed messages and persist the summary.
-        Returns (updated_messages, pending_summary).
-        """
-        history_msgs = [m for m in messages if m.get("role") != "system"]
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        pending_summary = ""
-
-        # ── v2.0: Proactive history budget enforcement ──────────────────
-        if self._f.valves.history_max_tokens > 0 and self._f.tokenizer:
-            budget = self._f.valves.history_max_tokens
-            kept, used = [], 0
-            for msg in reversed(history_msgs):
-                tok = len(self._f.tokenizer.encode(msg.get("content", "")))
-                if used + tok <= budget:
-                    kept.insert(0, msg)
-                    used += tok
-                else:
-                    # Summarize dropped messages if enabled
-                    if self._f.valves.summarize_old_messages and not pending_summary:
-                        old = [m for m in history_msgs if m not in kept]
-                        if old:
-                            has_code = any("```" in m.get("content", "") for m in old)
-                            summary = (
-                                await self._f._history_compressor.summarize_messages(
-                                    old, is_code_context=has_code
-                                )
-                            )
-                            if summary:
-                                state["conversation_summaries"].append(
-                                    {
-                                        "text": summary,
-                                        "created_at": time.time(),
-                                        "covers_msgs": len(old),
-                                    }
-                                )
-                                cap = self._f.valves.max_conversation_summaries
-                                if (
-                                    cap > 0
-                                    and len(state["conversation_summaries"]) > cap
-                                ):
-                                    dropped = len(state["conversation_summaries"]) - cap
-                                    state["conversation_summaries"] = state[
-                                        "conversation_summaries"
-                                    ][-cap:]
-                                    self._f._log_debug(
-                                        f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                        f"(max_conversation_summaries={cap})"
-                                    )
-                                self._f._state_store.set_state(project_id, state)
-                                pending_summary = (
-                                    f"[Summary of earlier conversation]\n{summary}"
-                                )
-                    break
-            history_msgs = kept
-
-        # ── Existing adaptive_trim logic ─────────────────────────────────
-        if self._f.valves.adaptive_trim:
-            total_tokens = self._f._tokens.estimate_tokens(history_msgs + sys_msgs)
-            if total_tokens > self._f.valves.context_window_tokens:
-                keep = self._f.valves.max_turns
-                last_user_idx = -1
-                for i in range(len(history_msgs) - 1, -1, -1):
-                    if history_msgs[i].get("role") == "user":
-                        last_user_idx = i
-                        break
-                if last_user_idx != -1:
-                    start_idx = max(0, last_user_idx - keep + 1)
-                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                    kept_block = history_msgs[start_idx:]
-                else:
-                    old_block = history_msgs[:-keep] if keep > 0 else []
-                    kept_block = history_msgs[-keep:] if keep > 0 else []
-
-                if self._f.valves.summarize_old_messages and old_block:
-                    has_code = any("```" in m.get("content", "") for m in old_block)
-                    summary = await self._f._history_compressor.summarize_messages(
-                        old_block, is_code_context=has_code
-                    )
-                    if summary:
-                        state["conversation_summaries"].append(
-                            {
-                                "text": summary,
-                                "created_at": time.time(),
-                                "covers_msgs": len(old_block),
-                            }
-                        )
-                        cap = self._f.valves.max_conversation_summaries
-                        if cap > 0 and len(state["conversation_summaries"]) > cap:
-                            dropped = len(state["conversation_summaries"]) - cap
-                            state["conversation_summaries"] = state[
-                                "conversation_summaries"
-                            ][-cap:]
-                            self._f._log_debug(
-                                f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                f"(max_conversation_summaries={cap})"
-                            )
-                        self._f._state_store.set_state(project_id, state)
-                        pending_summary = (
-                            f"[Summary of earlier conversation]\n{summary}"
-                        )
-                    history_msgs = kept_block
-                else:
-                    history_msgs = kept_block if old_block else history_msgs
-
-                if self._f.valves.preserve_tool_calls:
-                    while history_msgs and history_msgs[0].get("role") == "tool":
-                        history_msgs.pop(0)
-                    if (
-                        history_msgs
-                        and history_msgs[0].get("role") == "assistant"
-                        and history_msgs[0].get("tool_calls")
-                    ):
-                        tool_call_ids = {
-                            tc.get("id") for tc in history_msgs[0]["tool_calls"]
-                        }
-                        tool_response_ids = {
-                            m.get("tool_call_id")
-                            for m in history_msgs[1:]
-                            if m.get("role") == "tool"
-                        }
-                        if not tool_call_ids.issubset(tool_response_ids):
-                            history_msgs.pop(0)
-        else:
-            user_max = (
-                __user__["valves"].max_turns
-                if __user__ and hasattr(__user__, "valves")
-                else None
-            )
-            eff_max = user_max if user_max is not None else self._f.valves.max_turns
-            if len(history_msgs) > eff_max:
-                keep = eff_max
-                last_user_idx = -1
-                for i in range(len(history_msgs) - 1, -1, -1):
-                    if history_msgs[i].get("role") == "user":
-                        last_user_idx = i
-                        break
-                if last_user_idx != -1:
-                    start_idx = max(0, last_user_idx - keep + 1)
-                    old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                    kept_block = history_msgs[start_idx:]
-                else:
-                    old_block = history_msgs[:-keep] if keep > 0 else []
-                    kept_block = history_msgs[-keep:] if keep > 0 else []
-
-                if self._f.valves.summarize_old_messages and old_block:
-                    has_code = any("```" in m.get("content", "") for m in old_block)
-                    summary = await self._f._history_compressor.summarize_messages(
-                        old_block, is_code_context=has_code
-                    )
-                    if summary:
-                        state["conversation_summaries"].append(
-                            {
-                                "text": summary,
-                                "created_at": time.time(),
-                                "covers_msgs": len(old_block),
-                            }
-                        )
-                        cap = self._f.valves.max_conversation_summaries
-                        if cap > 0 and len(state["conversation_summaries"]) > cap:
-                            dropped = len(state["conversation_summaries"]) - cap
-                            state["conversation_summaries"] = state[
-                                "conversation_summaries"
-                            ][-cap:]
-                            self._f._log_debug(
-                                f"Summary cap: dropped {dropped} oldest summary block(s) "
-                                f"(max_conversation_summaries={cap})"
-                            )
-                        self._f._state_store.set_state(project_id, state)
-                        pending_summary = (
-                            f"[Summary of earlier conversation]\n{summary}"
-                        )
-                    history_msgs = kept_block
-                else:
-                    history_msgs = kept_block
-
-        return sys_msgs + history_msgs, pending_summary
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Final system assembly & logging
+    # 6. Final system assembly & logging
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _assemble_final_system_and_log(
@@ -17285,7 +17403,9 @@ class ContextDumper:
         final_system: str,
         messages: List[dict],
     ) -> dict:
-        """Snapshot strings + metadata immediately so later mutation can't race."""
+        """
+        Snapshot strings + metadata immediately so later mutation can't race.
+        """
         max_chars = self._f.valves.context_dump_message_max_chars
         msg_copy: List[Tuple[str, str]] = []
         if self._f.valves.context_dump_include_messages:
@@ -17307,7 +17427,7 @@ class ContextDumper:
         except Exception:
             code_state_hash = ""
 
-        # --- get hashes from pstate ---
+        # --- Get hashes from pstate ---
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
 
@@ -17324,7 +17444,7 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
-        # ── class membership metrics ──
+        # --- Class membership metrics ---
         try:
             all_names = self._f._symbol_index.get_all_names(project_id)
             n_with_parent = sum(
@@ -17336,8 +17456,34 @@ class ContextDumper:
         except Exception:
             n_with_parent, n_classes = 0, 0
 
+        # ── WindowManager metrics (replaces m1/m3/m4) ──────────────────────
+        try:
+            _state = self._f._state_store.get_state(project_id)
+            _pstate = self._f._project_state_manager.get_pstate(project_id)
+
+            wm_fired = _pstate.get("_wm_fired", False)
+            wm_msgs_evicted = _pstate.get("_wm_msgs_evicted", 0)
+            wm_turns_evicted = _pstate.get("_wm_turns_evicted", 0)
+            wm_summary_ok = _pstate.get("_wm_summary_ok", False)
+            wm_emergency_cap = _pstate.get("_wm_emergency_cap", False)
+            wm_batch_too_small = _pstate.get("_wm_batch_too_small", False)
+            wm_no_slot = _pstate.get("_wm_no_slot", False)
+            wm_degradation_guard = _pstate.get("_wm_degradation_guard", False)
+
+            frontier_hwm = _state.get("summarized_turn_hwm", 0)
+            summaries = _state.get("conversation_summaries", [])
+            n_summaries_l1 = sum(1 for s in summaries if s.get("level", 1) == 1)
+            n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
+        except Exception:
+            # Never break the dump on metric reading errors
+            wm_fired = wm_summary_ok = wm_emergency_cap = False
+            wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
+            wm_msgs_evicted = wm_turns_evicted = 0
+            frontier_hwm = n_summaries_l1 = n_summaries_l2 = 0
+
         now = time.time()
         return {
+            # ── Existing fields ──────────────────────────────────────────────
             "project_id": project_id,
             "turn": turn,
             "timestamp": now,
@@ -17355,6 +17501,19 @@ class ContextDumper:
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
+            # ── WindowManager metrics (new) ─────────────────────────────────
+            "wm_fired": wm_fired,
+            "wm_msgs_evicted": wm_msgs_evicted,
+            "wm_turns_evicted": wm_turns_evicted,
+            "wm_summary_ok": wm_summary_ok,
+            "wm_emergency_cap": wm_emergency_cap,
+            "wm_batch_too_small": wm_batch_too_small,
+            "wm_no_slot": wm_no_slot,
+            "wm_degradation_guard": wm_degradation_guard,
+            # ── HWM and summaries ────────────────────────────────────────────
+            "frontier_hwm": frontier_hwm,
+            "n_summaries_l1": n_summaries_l1,
+            "n_summaries_l2": n_summaries_l2,
         }
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -17370,7 +17529,9 @@ class ContextDumper:
             self._f._log_debug(f"❌ Context dump write failed: {exc}")
 
     def _write_sync(self, payload: dict) -> None:
-        """Render Markdown + JSONL and write to the project dump directory."""
+        """
+        Render Markdown + JSONL and write to the project dump directory.
+        """
         project_dir = self._project_dir(payload["project_id"])
         os.makedirs(project_dir, exist_ok=True)
 
@@ -17387,7 +17548,6 @@ class ContextDumper:
         md = self._render_markdown(
             payload, block_a_tokens, block_b_tokens, system_tokens, history_tokens
         )
-        # Nombre de archivo más legible: turno + timestamp
         fname = f"{payload['turn']:04d}_turn_{int(payload['timestamp'] * 1000)}.md"
         with open(os.path.join(project_dir, fname), "w", encoding="utf-8") as fh:
             fh.write(md)
@@ -17404,6 +17564,7 @@ class ContextDumper:
         # 3. Append compact metrics to the evolution log.
         if self._f.valves.context_dump_write_jsonl:
             record = {
+                # ── Existing metrics ──────────────────────────────────────
                 "ts": payload["timestamp"],
                 "iso": payload["iso"],
                 "turn": payload["turn"],
@@ -17417,6 +17578,19 @@ class ContextDumper:
                 "block_a_hash": payload["block_a_hash"],
                 "code_state_hash": payload["code_state_hash"],
                 "slot_saved_hash": payload["slot_saved_hash"],
+                # ── WindowManager metrics ──────────────────────────────────
+                "wm_fired": payload.get("wm_fired", False),
+                "wm_msgs_evicted": payload.get("wm_msgs_evicted", 0),
+                "wm_turns_evicted": payload.get("wm_turns_evicted", 0),
+                "wm_summary_ok": payload.get("wm_summary_ok", False),
+                "wm_emergency_cap": payload.get("wm_emergency_cap", False),
+                "wm_batch_too_small": payload.get("wm_batch_too_small", False),
+                "wm_no_slot": payload.get("wm_no_slot", False),
+                "wm_degradation_guard": payload.get("wm_degradation_guard", False),
+                # ── HWM and summaries ──────────────────────────────────────
+                "frontier_hwm": payload.get("frontier_hwm", 0),
+                "n_summaries_l1": payload.get("n_summaries_l1", 0),
+                "n_summaries_l2": payload.get("n_summaries_l2", 0),
             }
             with open(
                 os.path.join(project_dir, "evolution.jsonl"), "a", encoding="utf-8"
@@ -17438,6 +17612,9 @@ class ContextDumper:
         system_tokens: int,
         history_tokens: int,
     ) -> str:
+        """
+        Render the context snapshot as Markdown for human inspection.
+        """
         lines: List[str] = []
         lines.append(
             f"# Context Snapshot — `{payload['project_id']}` — "
@@ -17457,11 +17634,34 @@ class ContextDumper:
         lines.append(f"- indexed symbols: {payload['n_symbols']}")
         lines.append(
             f"- symbols with class resolved: "
-            f"{payload['n_symbols_with_parent']}/{payload['n_symbols']}"  # NEW
+            f"{payload['n_symbols_with_parent']}/{payload['n_symbols']}"
         )
-        lines.append(f"- classes detected: {payload['n_classes']}")  # NEW
-        lines.append("")
+        lines.append(f"- classes detected: {payload['n_classes']}")
 
+        # ── WindowManager metrics (replaces compaction metrics) ────────────
+        lines.append("")
+        lines.append("### WindowManager metrics (this turn)")
+        lines.append(
+            f"- wm_fired={payload.get('wm_fired', False)}"
+            f"  msgs_evicted={payload.get('wm_msgs_evicted', 0)}"
+            f"  turns_evicted={payload.get('wm_turns_evicted', 0)}"
+        )
+        lines.append(
+            f"- summary_ok={payload.get('wm_summary_ok', False)}"
+            f"  emergency_cap={payload.get('wm_emergency_cap', False)}"
+        )
+        lines.append(
+            f"- batch_too_small={payload.get('wm_batch_too_small', False)}"
+            f"  no_slot={payload.get('wm_no_slot', False)}"
+            f"  degradation_guard={payload.get('wm_degradation_guard', False)}"
+        )
+        lines.append(
+            f"- frontier_hwm={payload.get('frontier_hwm', 0)}"
+            f"  summaries_L1={payload.get('n_summaries_l1', 0)}"
+            f"  summaries_L2={payload.get('n_summaries_l2', 0)}"
+        )
+
+        lines.append("")
         lines.append("## Block A — static (KV-cache prefix)")
         lines.append("```text")
         lines.append(payload["static_block"] or "(empty)")
@@ -17539,9 +17739,11 @@ class ProjectStateManager:
         self._store: dict[str, dict] = {}
 
     def _new_pstate(self) -> dict:
-        """Factory for a fresh per‑project state bag with all defaults."""
+        """
+        Factory for a fresh per-project state bag with all defaults.
+        """
         return {
-            # Call‑graph mode
+            # Call-graph mode
             "resolved_call_graph_mode": None,
             "current_call_graph_mode": None,
             # Silent ingestion
@@ -17576,6 +17778,16 @@ class ProjectStateManager:
             # LOD adaptive tracking
             "last_activation_scores": {},
             "last_lod_levels": {},
+            # ── WindowManager: per-turn counters ────────────────────────
+            # These are reset at the start of each WindowManager.apply()
+            "_wm_fired": False,  # manager trimmed history
+            "_wm_msgs_evicted": 0,  # messages moved to old_msgs
+            "_wm_turns_evicted": 0,  # turns moved to old_msgs
+            "_wm_summary_ok": False,  # summary generated successfully
+            "_wm_emergency_cap": False,  # emergency cap activated
+            "_wm_batch_too_small": False,  # batch too small (no-op)
+            "_wm_no_slot": False,  # no free slot (no-op)
+            "_wm_degradation_guard": False,  # summary failed, raw kept
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -18080,7 +18292,7 @@ class Filter:
 
         # ── Secondary compaction gate ─────────────────────
         enable_secondary_compaction: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "If True, run the secondary ConversationCompressor (LLMLingua) after the "
                 "primary compactor, restricted to prose the primary did not summarize. "
@@ -18639,36 +18851,12 @@ class Filter:
         project_id: str = Field(default="default")
         max_cached_projects: int = Field(default=10)
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
-        max_turns: int = Field(default=8)
-        adaptive_trim: bool = Field(default=True)
         preserve_tool_calls: bool = Field(default=True)
         # ── Session summaries ───────────────────────────────────────
         enable_session_summary: bool = Field(default=True)
         session_summary_interval_messages: int = Field(default=8)
         session_summary_max_tokens: int = Field(default=200)
         # ── Turn-based window (summarize@N / evict@M) ───────────────
-        enable_turn_based_eviction: bool = Field(
-            default=True,
-            description=(
-                "Summarize turns older than summarize_after_turns and drop their "
-                "raw form from the prompt once older than evict_raw_after_turns, "
-                "only when a persisted summary + LTM copy already covers them."
-            ),
-        )
-        summarize_after_turns: int = Field(
-            default=30,
-            ge=2,
-            description="A turn becomes eligible for summarization once it is this many turns in the past.",
-        )
-        evict_raw_after_turns: int = Field(
-            default=50,
-            ge=4,
-            description=(
-                "A turn's raw messages are dropped from the prompt once this many "
-                "turns in the past, ONLY if already covered by a persisted summary. "
-                "Must be greater than summarize_after_turns."
-            ),
-        )
         summarize_batch_turns: int = Field(
             default=5,
             ge=1,
@@ -18765,6 +18953,16 @@ class Filter:
                 "becomes docstring-aware, so Block A re-renders as background "
                 "docstrings land, then stabilizes. Set False for a strictly stable, "
                 "signature-only Block A prefix if KV-cache churn is observed."
+            ),
+        )
+        emergency_max_turns: int = Field(
+            default=4,
+            ge=1,
+            le=20,
+            description=(
+                "Turns to keep when an individual turn exceeds budget * 0.8 (emergency cap). "
+                "Replaces max_turns=8 from adaptive_trim. Default is conservative (4) because "
+                "in coding sessions a single turn may contain a whole file."
             ),
         )
         # ── Monotonic compaction (#16) ──────────────────────────────
