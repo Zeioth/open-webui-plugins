@@ -13119,31 +13119,66 @@ class HistoryCompressor:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def lean_user_code_messages(self, messages: list, project_id: str) -> list:
+        """
+        Replace large user code blocks with compact stubs to save context space.
+
+        The stub is hardcoded with a fixed message indicating the code has been
+        compressed. The original code is stored in LTM and SymbolIndex, recoverable
+        via /expand or LOD activation. The stub length is capped by the
+        `lean_user_code_stub_max_tokens` valve.
+
+        Two detection paths:
+        1. Fenced code blocks (```language ... ```): Replaced individually.
+        2. Raw pastes (no backticks): Entire message replaced if it looks like code.
+
+        Args:
+            messages (list): List of conversation message dicts.
+            project_id (str): Current project identifier.
+
+        Returns:
+            list: Updated messages with compressed user messages.
+        """
+        # ── 1. Early exit if feature is disabled ──────────────────────────
         if not self._f.valves.enable_lean_user_code:
             return messages
 
+        # ── 2. Get max stub tokens ────────────────────────────────────────
+        max_stub_tokens = self._f.valves.lean_user_code_stub_max_tokens
+
+        # ── 3. Count indexed symbols ──────────────────────────────────────
         try:
             symbol_count = len(self._f._symbol_index.get_all_names(project_id))
         except Exception:
             symbol_count = 0
 
+        # Skip if symbol index is too sparse (stub would be misleading)
         if symbol_count < 20:
             return messages
 
+        # ── 4. Compile regex and constants ────────────────────────────────
         _CODE_BLOCK = re.compile(r"```(?P<lang>\w*)\n(?P<body>.*?)```", re.DOTALL)
         _ALREADY_LEAN = "[CÓDIGO COMPRIMIDO"
         min_tokens = self._f.valves.lean_user_code_min_tokens
 
+        # Hardcoded stub template
+        STUB_TEMPLATE = (
+            "[CÓDIGO COMPRIMIDO — {tokens:,} tokens — "
+            "{symbol_count} símbolos indexados en SymbolGraph. "
+            "Recuperar implementaciones con /expand <nombre> o via LOD.]"
+        )
+
         new_messages = list(messages)
 
+        # ── 5. Iterate over messages ─────────────────────────────────────
         for i, msg in enumerate(new_messages):
             if msg.get("role") != "user":
                 continue
+
             content = msg.get("content", "")
             if _ALREADY_LEAN in content:
-                continue
+                continue  # Already compressed, skip
 
-            # ── Caso 1: fenced blocks (comportamiento existente) ──────────
+            # ── 5a. Case 1: Fenced code blocks ───────────────────────────
             total_fenced_tokens = sum(
                 self._f._tokens.estimate_tokens(m.group("body"))
                 for m in _CODE_BLOCK.finditer(content)
@@ -13155,26 +13190,31 @@ class HistoryCompressor:
                     body = match.group("body")
                     lang = match.group("lang") or "code"
                     blk_tokens = self._f._tokens.estimate_tokens(body)
+
                     if blk_tokens < min_tokens:
                         return match.group(0)
-                    return (
-                        f"```{lang}\n"
-                        f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens — "
-                        f"{symbol_count} símbolos indexados en SymbolGraph. "
-                        f"Recuperar implementaciones con /expand <nombre> o via LOD.]\n"
-                        f"```"
+
+                    # Generate stub from hardcoded template
+                    stub_text = STUB_TEMPLATE.format(
+                        tokens=blk_tokens, symbol_count=symbol_count
                     )
+
+                    # Apply token limit if configured
+                    if max_stub_tokens > 0:
+                        stub_text = self._f._tokens.truncate_text_to_tokens(
+                            stub_text, max_stub_tokens
+                        )
+
+                    return f"```{lang}\n{stub_text}\n```"
 
                 new_content = _CODE_BLOCK.sub(_replace, content)
                 if new_content != content:
                     new_messages[i] = {**msg, "content": new_content}
                 continue
 
-            # ── Caso 2: mensaje grande sin fences (código pegado raw) ─────
+            # ── 5b. Case 2: Raw paste without fences ─────────────────────
             total_msg_tokens = self._f._tokens.estimate_code_tokens(content)
             if total_msg_tokens >= min_tokens:
-                # Verificar que es código, no prosa
-                non_code_chars = len(re.sub(r"\s", "", content[:500]))
                 code_indicators = any(
                     kw in content[:2000]
                     for kw in (
@@ -13187,12 +13227,16 @@ class HistoryCompressor:
                     )
                 )
                 if code_indicators:
-                    stub = (
-                        f"[CÓDIGO COMPRIMIDO — {total_msg_tokens:,} tokens — "
-                        f"{symbol_count} símbolos indexados en SymbolGraph. "
-                        f"Recuperar implementaciones con /expand <nombre> o via LOD.]"
+                    stub_text = STUB_TEMPLATE.format(
+                        tokens=total_msg_tokens, symbol_count=symbol_count
                     )
-                    new_messages[i] = {**msg, "content": stub}
+
+                    if max_stub_tokens > 0:
+                        stub_text = self._f._tokens.truncate_text_to_tokens(
+                            stub_text, max_stub_tokens
+                        )
+
+                    new_messages[i] = {**msg, "content": stub_text}
                     self._f._log_debug(
                         f"Lean user code (raw paste): message {i} — "
                         f"replaced ~{total_msg_tokens:,} tokens with stub"
@@ -18399,11 +18443,29 @@ class Filter:
         # ── User code in history ────────────────────────────────────
         enable_lean_user_code: bool = Field(
             default=True,
-            description="Replace large code blocks in user messages with stubs when symbols are already indexed.",
+            description=(
+                "If enabled, large code blocks in user messages are replaced with a compact "
+                "stub. The full code is stored in LTM and SymbolIndex, and remains recoverable "
+                "via `/expand` or LOD activation. Only the stub stays in the conversation "
+                "history, saving context tokens.\n\n"
+                "If disabled, all user code blocks are kept in the conversation history "
+                "verbatim (may increase token usage and context size)."
+            ),
         )
         lean_user_code_min_tokens: int = Field(
             default=12000,
-            description="Minimum tokens a user code block must have before it is replaced by a stub.",
+            description=(
+                "After this many tokens, compress a code block"
+                "into a stub in the expanded code context."
+                "In real life applies to LOD3 mostly."
+            ),
+        )
+        lean_user_code_stub_max_tokens: int = Field(
+            default=60,
+            description=(
+                "After this many tokens, truncade the code in the chat history. "
+                "Set to 0 for unlimited (use with caution)."
+            ),
         )
         # ── Conversation summaries ──────────────────────────────────
         summarize_old_messages: bool = Field(
