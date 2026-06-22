@@ -16126,6 +16126,22 @@ class WindowManager:
             return len(self._f.tokenizer.encode(text))
         return max(1, len(text) // 4)
 
+    @staticmethod
+    def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
+        """
+        Assigns a 1-based turn number to each message.
+        Each user message increments the counter.
+        Assistant/tool messages share the turn number of the preceding user.
+        Returns (turns_per_message, total_turns).
+        """
+        turn = 0
+        per_msg: List[int] = []
+        for m in history:
+            if m.get("role") == "user":
+                turn += 1
+            per_msg.append(max(turn, 1))
+        return per_msg, turn
+
     def _compute_frontier(
         self,
         history: List[dict],
@@ -16209,6 +16225,12 @@ class WindowManager:
             f"Keeping last {emergency_max} turns."
         )
         return new_kept, old_msgs + extra_old
+
+    @staticmethod
+    def _summary_sort_key(s: dict) -> float:
+        """Chronological order by covered band start."""
+        ct = s.get("covers_turns")
+        return float(ct[0]) if ct else float(s.get("created_at", 0))
 
     # ═══════════════════════════════════════════════════════════════════
     # 3. Persistence (side effects: state, LTM, consolidation)
