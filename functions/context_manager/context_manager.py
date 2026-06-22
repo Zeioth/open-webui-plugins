@@ -16364,6 +16364,12 @@ class WindowManager:
         # c. Manager owns the hwm
         state["summarized_turn_hwm"] = new_hwm
 
+        # ── Instrumentación persistente: escribir en state, no en pstate ──
+        state["_wm_fired"] = True
+        state["_wm_summary_ok"] = True
+        state["_wm_msgs_evicted"] = len(old_msgs)
+        state["_wm_turns_evicted"] = new_hwm - old_hwm
+
         self._f._log_debug(
             f"WindowManager: L1 summary generated "
             f"(turns {old_hwm + 1}–{new_hwm}, {len(old_msgs)} msgs)"
@@ -16390,7 +16396,7 @@ class WindowManager:
         # f. Phase 2 seam (no-op in Phase 1)
         self._on_frontier_advance(old_hwm, new_hwm)
 
-        # g. Persist state
+        # g. Persist state (esto guarda las métricas _wm_* en SQLite)
         self._f._state_store.set_state(project_id, state)
 
         return f"[Summary of earlier conversation]\n{summary_text}"
@@ -17552,26 +17558,27 @@ class ContextDumper:
         except Exception:
             n_with_parent, n_classes = 0, 0
 
-        # ── WindowManager metrics (replaces m1/m3/m4) ──────────────────────
+        # ── WindowManager metrics ──────────────────────────────────────────
+        # Ahora se leen de state, no de pstate, para que sean persistentes.
         try:
             _state = self._f._state_store.get_state(project_id)
-            _pstate = self._f._project_state_manager.get_pstate(project_id)
 
-            wm_fired = _pstate.get("_wm_fired", False)
-            wm_msgs_evicted = _pstate.get("_wm_msgs_evicted", 0)
-            wm_turns_evicted = _pstate.get("_wm_turns_evicted", 0)
-            wm_summary_ok = _pstate.get("_wm_summary_ok", False)
-            wm_emergency_cap = _pstate.get("_wm_emergency_cap", False)
-            wm_batch_too_small = _pstate.get("_wm_batch_too_small", False)
-            wm_no_slot = _pstate.get("_wm_no_slot", False)
-            wm_degradation_guard = _pstate.get("_wm_degradation_guard", False)
+            # Leer todas las métricas desde state (no desde pstate)
+            wm_fired = _state.get("_wm_fired", False)
+            wm_msgs_evicted = _state.get("_wm_msgs_evicted", 0)
+            wm_turns_evicted = _state.get("_wm_turns_evicted", 0)
+            wm_summary_ok = _state.get("_wm_summary_ok", False)
+            wm_emergency_cap = _state.get("_wm_emergency_cap", False)
+            wm_batch_too_small = _state.get("_wm_batch_too_small", False)
+            wm_no_slot = _state.get("_wm_no_slot", False)
+            wm_degradation_guard = _state.get("_wm_degradation_guard", False)
 
             frontier_hwm = _state.get("summarized_turn_hwm", 0)
             summaries = _state.get("conversation_summaries", [])
             n_summaries_l1 = sum(1 for s in summaries if s.get("level", 1) == 1)
             n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
         except Exception:
-            # Never break the dump on metric reading errors
+            # Nunca romper el dump por errores de lectura de métricas
             wm_fired = wm_summary_ok = wm_emergency_cap = False
             wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
             wm_msgs_evicted = wm_turns_evicted = 0
@@ -17597,7 +17604,7 @@ class ContextDumper:
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
-            # ── WindowManager metrics (new) ─────────────────────────────────
+            # ── WindowManager metrics (leídas de state) ─────────────────────
             "wm_fired": wm_fired,
             "wm_msgs_evicted": wm_msgs_evicted,
             "wm_turns_evicted": wm_turns_evicted,
@@ -17837,6 +17844,10 @@ class ProjectStateManager:
     def _new_pstate(self) -> dict:
         """
         Factory for a fresh per-project state bag with all defaults.
+
+        Note: The `_wm_*` metrics have been moved to the persistent `state`
+        (conversation_state) to survive server restarts. They are no longer
+        stored in pstate.
         """
         return {
             # Call-graph mode
@@ -17874,16 +17885,11 @@ class ProjectStateManager:
             # LOD adaptive tracking
             "last_activation_scores": {},
             "last_lod_levels": {},
-            # ── WindowManager: per-turn counters ────────────────────────
-            # These are reset at the start of each WindowManager.apply()
-            "_wm_fired": False,  # manager trimmed history
-            "_wm_msgs_evicted": 0,  # messages moved to old_msgs
-            "_wm_turns_evicted": 0,  # turns moved to old_msgs
-            "_wm_summary_ok": False,  # summary generated successfully
-            "_wm_emergency_cap": False,  # emergency cap activated
-            "_wm_batch_too_small": False,  # batch too small (no-op)
-            "_wm_no_slot": False,  # no free slot (no-op)
-            "_wm_degradation_guard": False,  # summary failed, raw kept
+            # ── WindowManager metrics have been moved to state, to survive server restarts ──
+            # The following keys are no longer used:
+            # "_wm_fired", "_wm_msgs_evicted", "_wm_turns_evicted",
+            # "_wm_summary_ok", "_wm_emergency_cap", "_wm_batch_too_small",
+            # "_wm_no_slot", "_wm_degradation_guard"
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -18398,7 +18404,7 @@ class Filter:
 
         # ── Code compression with LLMLingua ─────────────────────────
         enable_code_compression: bool = Field(
-            default=True,
+            default=False,
             description="Apply LLMLingua‑2 compression to individual code blocks in Block B (LOD‑3).",
         )
         code_compression_rate: float = Field(
@@ -18972,7 +18978,7 @@ class Filter:
         session_summary_max_tokens: int = Field(default=200)
         # ── Turn-based window (summarize@N / evict@M) ───────────────
         summarize_batch_turns: int = Field(
-            default=2,
+            default=1,
             ge=1,
             le=30,
             description="Minimum number of unsummarized turns to accumulate before generating one summary (limits fragmentation).",
@@ -19233,6 +19239,15 @@ class Filter:
             "conversation_summaries": [],
             "summarized_turn_hwm": 0,
             "_pending_slot_resave": False,
+            # ── instrumentation metrics ──
+            "_wm_fired": False,
+            "_wm_msgs_evicted": 0,
+            "_wm_turns_evicted": 0,
+            "_wm_summary_ok": False,
+            "_wm_emergency_cap": False,
+            "_wm_batch_too_small": False,
+            "_wm_no_slot": False,
+            "_wm_degradation_guard": False,
         }
 
         # Patterns
