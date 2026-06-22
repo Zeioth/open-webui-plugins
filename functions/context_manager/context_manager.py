@@ -558,7 +558,12 @@ class ActivationGraph:
         alpha: float = 0.85,
         tolerance: float = 1e-6,
     ):
-        """Run the PPR power iteration until convergence or ``max_steps``."""
+        """
+        Run the PPR power iteration until convergence or ``max_steps``.
+
+        Seeds keep their original high score (they are not overwritten by the
+        converged PPR score). Propagated nodes receive the PPR score as usual.
+        """
         if not self._activations:
             return
         seed_total = sum(
@@ -593,13 +598,21 @@ class ActivationGraph:
             r = r_new
             if delta < tolerance:
                 break
+
+        # Update activations: seeds keep their original score, propagated nodes get the PPR score
         for node_id, score in r.items():
             if score < min_score:
                 continue
             existing = self._activations.get(node_id)
+            # Seeds keep their initial high score — PPR only lowers propagated neighbors
+            final_score = (
+                max(score, existing.score)
+                if (existing and existing.source == "seed")
+                else score
+            )
             self._activations[node_id] = ActivationState(
                 node_id=node_id,
-                score=score,
+                score=final_score,
                 depth=existing.depth if existing else 99,
                 source=existing.source if existing else "propagation",
             )
@@ -1215,15 +1228,10 @@ class HubSymbolIndex:
     def _build_class_outline(self, symbol_index, project_id, valves=None) -> str:
         """Render the ``## Code Architecture Map`` section: one line per class
         listing its methods, plus module-level functions if any.  Respects
-        ``architecture_map_max_tokens`` and
-        ``architecture_map_max_methods_per_class`` from *valves*."""
+        ``architecture_map_max_tokens`` for the overall section budget.
+        """
         if valves is not None and not getattr(valves, "enable_architecture_map", True):
             return ""
-        max_per_class = (
-            getattr(valves, "architecture_map_max_methods_per_class", 15)
-            if valves
-            else 15
-        )
         max_tokens = (
             getattr(valves, "architecture_map_max_tokens", 3000) if valves else 3000
         )
@@ -1251,12 +1259,9 @@ class HubSymbolIndex:
             for qid in member_qids:
                 meta = symbol_index.get_symbol_meta(qid, project_id) or {}
                 bare_members.append(meta.get("name", qid.rsplit(".", 1)[-1]))
-            shown = bare_members[:max_per_class]
-            extra = len(bare_members) - len(shown)
-            extra_txt = f", ... (+{extra} more)" if extra > 0 else ""
             line = (
                 f"- **{class_name}** ({len(bare_members)} methods): "
-                f"{', '.join(shown)}{extra_txt}"
+                f"{', '.join(bare_members)}"
             )
             if budget_chars is not None and total_chars + len(line) > budget_chars:
                 lines.append(
@@ -1276,10 +1281,7 @@ class HubSymbolIndex:
                 == "function"
             )
             if top_level:
-                shown = top_level[:max_per_class]
-                extra = len(top_level) - len(shown)
-                extra_txt = f", ... (+{extra} more)" if extra > 0 else ""
-                line = f"- **(module-level functions)**: {', '.join(shown)}{extra_txt}"
+                line = f"- **(module-level functions)**: {', '.join(top_level)}"
                 if budget_chars is None or total_chars + len(line) <= budget_chars:
                     lines.append(line)
 
@@ -3559,7 +3561,8 @@ class ContextBuilder:
             )
             budget = min(budget, max(8000, _available_for_context))
 
-        injected_blocks: Set[str] = set()
+        # ── FIX: track injected symbols, not blocks ──────────────────────
+        injected_symbols: Set[str] = set()
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
         # ── Centrality LOD bump ────────────────────────────────────────────
@@ -3636,15 +3639,18 @@ class ContextBuilder:
             if total_tokens >= budget:
                 break
 
+            # ── FIX: deduplicate by symbol, not block ─────────────────────
+            if node_id in injected_symbols:
+                continue
+
             if score < lod1:
                 _lod0_parts.append(f"`{node_id}`")
                 total_tokens += 2
+                injected_symbols.add(node_id)
                 continue
 
             block_hashes = self._f._symbol_index.find_blocks(node_id, project_id)
             for bh in block_hashes:
-                if bh in injected_blocks:
-                    continue
                 block = state["active_blocks"].get(bh)
 
                 # Page-in support for evicted blocks
@@ -3676,7 +3682,7 @@ class ContextBuilder:
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod1_parts.append(f"- `{sig}`{loc} _(score: {score:.2f})_")
                     total_tokens += tok
-                    injected_blocks.add(bh)
+                    injected_symbols.add(node_id)
 
                 # ── LOD-2: Signatures + docstrings ──────────────────────────
                 elif score < lod3:
@@ -3722,7 +3728,7 @@ class ContextBuilder:
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
                     total_tokens += tok
-                    injected_blocks.add(bh)
+                    injected_symbols.add(node_id)
 
                 # ── LOD-3: Full code body ──────────────────────────────────
                 else:
@@ -3744,11 +3750,20 @@ class ContextBuilder:
                     elif (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "summarize"
-                        and block.block_summary
                     ):
-                        content_to_inject = (
-                            f"[Summary of {tok}-token block]\n{block.block_summary}"
-                        )
+                        if block.block_summary:
+                            content_to_inject = (
+                                f"[Summary of {tok}-token block]\n{block.block_summary}"
+                            )
+                        else:
+                            # ── FIX: hard truncate when summary not ready ──
+                            content_to_inject = (
+                                self._f._tokens.truncate_text_to_tokens(
+                                    content_to_inject,
+                                    self._f.valves.max_code_block_tokens,
+                                )
+                                + "\n# ... [truncated — use /expand for full body]"
+                            )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
                     if (
@@ -3770,6 +3785,7 @@ class ContextBuilder:
                             )
                         )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
                     if total_tokens + tok > budget:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
@@ -3778,9 +3794,9 @@ class ContextBuilder:
                         f"```\n{content_to_inject}\n```\n"
                     )
                     total_tokens += tok
-                    injected_blocks.add(bh)
+                    injected_symbols.add(node_id)
 
-                break
+                break  # inner loop: found the block, done
 
         # ── RAPTOR cluster summaries → LOD-2 tier ─────────────────────────
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
@@ -3845,8 +3861,9 @@ class ContextBuilder:
                 return ""
             return self._f._activation.get_active_code_context(project_id, query)
 
+        # ── FIX: summary line uses injected_symbols ──────────────────────
         summary_line = (
-            f"\n_(Context: {len(injected_blocks)} symbols, "
+            f"\n_(Context: {len(injected_symbols)} symbols, "
             f"~{total_tokens} tokens, "
             f"{len(activated)} nodes activated)_\n"
         )
@@ -13102,11 +13119,6 @@ class HistoryCompressor:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def lean_user_code_messages(self, messages: list, project_id: str) -> list:
-        """
-        Replace code blocks in user messages with compressed stubs when the
-        SymbolGraph already indexes the symbols, and the code exceeds the
-        minimum token threshold.
-        """
         if not self._f.valves.enable_lean_user_code:
             return messages
 
@@ -13116,9 +13128,6 @@ class HistoryCompressor:
             symbol_count = 0
 
         if symbol_count < 20:
-            self._f._log_debug(
-                f"Lean user code: SymbolGraph too sparse ({symbol_count} symbols) — skipping."
-            )
             return messages
 
         _CODE_BLOCK = re.compile(r"```(?P<lang>\w*)\n(?P<body>.*?)```", re.DOTALL)
@@ -13126,7 +13135,6 @@ class HistoryCompressor:
         min_tokens = self._f.valves.lean_user_code_min_tokens
 
         new_messages = list(messages)
-        lean_n = 0
 
         for i, msg in enumerate(new_messages):
             if msg.get("role") != "user":
@@ -13135,38 +13143,60 @@ class HistoryCompressor:
             if _ALREADY_LEAN in content:
                 continue
 
-            total_code_tokens = sum(
+            # ── Caso 1: fenced blocks (comportamiento existente) ──────────
+            total_fenced_tokens = sum(
                 self._f._tokens.estimate_tokens(m.group("body"))
                 for m in _CODE_BLOCK.finditer(content)
             )
-            if total_code_tokens < min_tokens:
+
+            if total_fenced_tokens >= min_tokens:
+
+                def _replace(match: re.Match) -> str:
+                    body = match.group("body")
+                    lang = match.group("lang") or "code"
+                    blk_tokens = self._f._tokens.estimate_tokens(body)
+                    if blk_tokens < min_tokens:
+                        return match.group(0)
+                    return (
+                        f"```{lang}\n"
+                        f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens — "
+                        f"{symbol_count} símbolos indexados en SymbolGraph. "
+                        f"Recuperar implementaciones con /expand <nombre> o via LOD.]\n"
+                        f"```"
+                    )
+
+                new_content = _CODE_BLOCK.sub(_replace, content)
+                if new_content != content:
+                    new_messages[i] = {**msg, "content": new_content}
                 continue
 
-            def _replace(match: re.Match) -> str:
-                body = match.group("body")
-                lang = match.group("lang") or "code"
-                blk_tokens = self._f._tokens.estimate_tokens(body)
-                if blk_tokens < min_tokens:
-                    return match.group(0)
-                return (
-                    f"```{lang}\n"
-                    f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens — "
-                    f"{symbol_count} símbolos indexados en SymbolGraph. "
-                    f"Recuperar implementaciones con /expand <nombre> o via LOD.]\n"
-                    f"```"
+            # ── Caso 2: mensaje grande sin fences (código pegado raw) ─────
+            total_msg_tokens = self._f._tokens.estimate_code_tokens(content)
+            if total_msg_tokens >= min_tokens:
+                # Verificar que es código, no prosa
+                non_code_chars = len(re.sub(r"\s", "", content[:500]))
+                code_indicators = any(
+                    kw in content[:2000]
+                    for kw in (
+                        "def ",
+                        "class ",
+                        "import ",
+                        "async def ",
+                        "return ",
+                        "function ",
+                    )
                 )
-
-            new_content = _CODE_BLOCK.sub(_replace, content)
-            if new_content != content:
-                new_messages[i] = {**msg, "content": new_content}
-                lean_n += 1
-                self._f._log_debug(
-                    f"Lean user code: message {i} — replaced ~{total_code_tokens:,} tokens "
-                    f"({symbol_count} symbols available via LOD)"
-                )
-
-        if lean_n:
-            self._f._log_debug(f"Lean user code: applied to {lean_n} message(s).")
+                if code_indicators:
+                    stub = (
+                        f"[CÓDIGO COMPRIMIDO — {total_msg_tokens:,} tokens — "
+                        f"{symbol_count} símbolos indexados en SymbolGraph. "
+                        f"Recuperar implementaciones con /expand <nombre> o via LOD.]"
+                    )
+                    new_messages[i] = {**msg, "content": stub}
+                    self._f._log_debug(
+                        f"Lean user code (raw paste): message {i} — "
+                        f"replaced ~{total_msg_tokens:,} tokens with stub"
+                    )
 
         return new_messages
 
@@ -18175,11 +18205,11 @@ class Filter:
             description="Total token capacity of the LLM server. Must match the llama.cpp --ctx-size exactly.",
         )
         active_context_max_tokens: int = Field(
-            default=40000,
+            default=8000,
             description="Maximum tokens for code context injected in Block B (LOD‑activated code).",
         )
         history_max_tokens: int = Field(
-            default=24000,
+            default=1500,
             description=(
                 "Maximum tokens for conversation history (non‑system messages). "
                 "Only operates over conversation messages, not code. "
@@ -18195,7 +18225,7 @@ class Filter:
             description="Maximum tokens for Chain‑of‑Thought reasoning responses. 0 = unlimited.",
         )
         response_reserve_tokens: int = Field(
-            default=8192,
+            default=4096,
             ge=256,
             le=16384,
             description="Minimum tokens reserved for the LLM's response when computing the effective context budget.",
@@ -18206,7 +18236,7 @@ class Filter:
         )
         # ── Per‑block limits ───────────────────────────────────────
         max_code_block_tokens: int = Field(
-            default=12000,
+            default=4000,
             description="Maximum tokens per individual code block. 0 = unlimited. See code_block_overflow_action.",
         )
         code_block_overflow_action: str = Field(
@@ -18660,9 +18690,9 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════════
         # ── Path activation ─────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
-        path_activation_threshold: float = Field(default=0.1, ge=0.01, le=1.0)
+        path_activation_threshold: float = Field(default=0.3, ge=0.01, le=1.0)
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-        path_propagation_steps: int = Field(default=4, ge=1, le=8)
+        path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
             default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
@@ -18670,7 +18700,7 @@ class Filter:
         # ── LOD thresholds ──────────────────────────────────────────
         lod1_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
         lod2_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
-        lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+        lod3_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
         # ── LOD by use case ───────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
@@ -18711,7 +18741,7 @@ class Filter:
         multi_seed_weight_lexical: float = Field(default=0.5, ge=0.0, le=1.0)
         multi_seed_weight_structural: float = Field(default=0.3, ge=0.0, le=1.0)
         multi_seed_weight_historical: float = Field(default=0.2, ge=0.0, le=1.0)
-        ppr_alpha: float = Field(default=0.85, ge=0.5, le=0.99)
+        ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
         # ── LOD adaptation ──────────────────────────────────────────
         enable_lod_adaptive: bool = Field(default=True)
         lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
@@ -18880,7 +18910,7 @@ class Filter:
         session_summary_max_tokens: int = Field(default=200)
         # ── Turn-based window (summarize@N / evict@M) ───────────────
         summarize_batch_turns: int = Field(
-            default=5,
+            default=2,
             ge=1,
             le=30,
             description="Minimum number of unsummarized turns to accumulate before generating one summary (limits fragmentation).",
@@ -18930,7 +18960,7 @@ class Filter:
         # ── KV cache ────────────────────────────────────────────────
         enable_kv_cache_stability: bool = Field(default=True)
         enable_slot_persistence: bool = Field(default=True)
-        slot_save_path: str = Field(default="/tmp/llama_slots")
+        slot_save_path: str = Field(default="/kvcache")
         slot_id: int = Field(default=0, ge=0)
         # ── Slot save threshold guard ────────────────────────────────
         slot_save_max_context_tokens: int = Field(
@@ -19072,13 +19102,8 @@ class Filter:
                 "cache-stable while code is unchanged."
             ),
         )
-        architecture_map_max_methods_per_class: int = Field(
-            default=15,
-            ge=1,
-            description="Truncate each class's method list in the outline to this many names.",
-        )
         architecture_map_max_tokens: int = Field(
-            default=3000,
+            default=0,
             ge=0,
             description="Token budget for the class outline section. 0 = unlimited.",
         )
