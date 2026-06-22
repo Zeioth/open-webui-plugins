@@ -18259,7 +18259,7 @@ class Filter:
             description="Maximum tokens for code context injected in Block B (LOD‑activated code).",
         )
         history_max_tokens: int = Field(
-            default=1500,
+            default=24000,
             description=(
                 "Maximum tokens for conversation history (non‑system messages). "
                 "Only operates over conversation messages, not code. "
@@ -18978,7 +18978,7 @@ class Filter:
         session_summary_max_tokens: int = Field(default=200)
         # ── Turn-based window (summarize@N / evict@M) ───────────────
         summarize_batch_turns: int = Field(
-            default=1,
+            default=5,
             ge=1,
             le=30,
             description="Minimum number of unsummarized turns to accumulate before generating one summary (limits fragmentation).",
