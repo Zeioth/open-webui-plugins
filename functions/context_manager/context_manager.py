@@ -6597,14 +6597,38 @@ class StateStore:
         """
         Create all necessary tables and indexes (idempotent).
 
-        Called once during Filter initialization.
+        Called once during Filter initialization. In addition to creating the
+        schema, this method tunes SQLite's runtime behaviour to minimise
+        contention:
+          - `busy_timeout` – tells SQLite to wait up to `llm_per_call_timeout`
+            seconds before giving up on a locked database.
+          - `synchronous = NORMAL` – reduces the number of `fsync()` calls,
+            increasing throughput under write-heavy workloads (background
+            docstrings, edge persistence, etc.) without compromising crash
+            safety, because WAL already guarantees durability.
         """
         db_path = self._f.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        # ------------------------------------------------------------------
+        # REGION 1 — Connect and set busy_timeout
+        # ------------------------------------------------------------------
         self._f._db_conn = sqlite3.connect(db_path, check_same_thread=False)
         self._f._db_conn.execute(
             f"PRAGMA busy_timeout = {self._f.valves.llm_per_call_timeout * 1000}"
         )
+
+        # ------------------------------------------------------------------
+        # REGION 2 — Reduce fsync pressure to lower lock contention
+        # ------------------------------------------------------------------
+        # 'NORMAL' syncs at critical moments (e.g., WAL checkpoint) but not
+        # on every transaction commit. This is safe with WAL and dramatically
+        # reduces the chance of "database is locked" under concurrent writes.
+        self._f._db_conn.execute("PRAGMA synchronous = NORMAL")
+
+        # ------------------------------------------------------------------
+        # REGION 3 — Create all tables and indexes (idempotent)
+        # ------------------------------------------------------------------
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 project_id TEXT PRIMARY KEY,
@@ -6738,25 +6762,54 @@ class StateStore:
                 await asyncio.sleep(2)
 
     async def _db_worker_loop(self) -> None:
-        """Single run of the DB write loop. Exits on CancelledError."""
+        """
+        Single run of the DB write loop. Exits on CancelledError.
+
+        Each job is executed with a retry loop that uses **exponential backoff**
+        when encountering a `database is locked` error. This gives SQLite's WAL
+        mechanism enough time to resolve contention, especially when many
+        background docstring writes are flushed at the same time.
+
+        The backoff sequence is: 0.1s, 0.2s, 0.4s, 0.8s – much more effective
+        than the old linear sleep (0.5s, 1s, 1.5s, 2s) because it starts small
+        and grows quickly, reducing latency for short locks while still
+        giving space for long ones.
+        """
         while True:
+            # --------------------------------------------------------------
+            # REGION 1 — Fetch the next write job from the queue
+            # --------------------------------------------------------------
             try:
                 job = await asyncio.wait_for(self._f._db_write_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 raise
+
             func, args, kwargs = job
+
+            # --------------------------------------------------------------
+            # REGION 2 — Execute with exponential backoff on lock errors
+            # --------------------------------------------------------------
             with _db_global_lock:
                 for attempt in range(5):
                     try:
                         await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
-                        break
+                        break  # success – exit retry loop
                     except sqlite3.OperationalError as e:
                         if "locked" in str(e).lower() and attempt < 4:
-                            await asyncio.sleep(0.5 * (attempt + 1))
+                            # Exponential backoff: 0.1, 0.2, 0.4, 0.8 seconds
+                            backoff = 0.1 * (2**attempt)
+                            self._f._log_debug(
+                                f"DB worker: locked (attempt {attempt+1}/5), "
+                                f"retrying in {backoff:.1f}s"
+                            )
+                            await asyncio.sleep(backoff)
                         else:
-                            raise
+                            self._f._log_debug(
+                                f"DB worker: giving up after {attempt+1} attempts: {e}"
+                            )
+                            raise  # re-raise after exhausting retries
 
     def _db_conn_write_sync(self, project_id: str, state: ConversationState) -> None:
         """
@@ -14905,9 +14958,22 @@ class EnrichmentTasks:
 
     async def cancel_docstring_tasks(self) -> None:
         """
-        Cancel the background docstring generation loop gracefully,
-        then wait until the inference slot is free before returning.
+        Cancel the background docstring generation loop gracefully, drain any
+        pending DB writes from cancelled tasks, then wait until the inference
+        slot is free before returning.
+
+        This method is called at the start of every inlet to ensure that no
+        background SQLite writes remain in flight when the new turn begins.
+        Without the drain, cancelled docstring tasks leave write operations
+        in `_db_write_queue` that continue executing concurrently with the
+        new inlet's reads, causing `database is locked` errors.
+
+        The drain has a 5‑second timeout to avoid hanging the inlet if the
+        queue is stuck; after that, we proceed anyway (best effort).
         """
+        # ------------------------------------------------------------------
+        # REGION 1 — Cancel the background task and wait for its cancellation
+        # ------------------------------------------------------------------
         if self._active_bg_task is not None and not self._active_bg_task.done():
             self._active_bg_task.cancel()
             try:
@@ -14916,7 +14982,28 @@ class EnrichmentTasks:
                 pass
         self._active_bg_task = None
 
-        # Wait for the inference slot to be released
+        # ------------------------------------------------------------------
+        # REGION 2 — Drain pending DB write operations from the queue
+        # ------------------------------------------------------------------
+        # Cancelled docstring tasks may have enqueued INSERT/REPLACE operations
+        # for symbol_docstrings. If we don't drain them here, they will keep
+        # executing in the worker thread while the new inlet does heavy reads,
+        # causing contention and "database is locked" even in WAL mode.
+        drain_deadline = time.monotonic() + 5.0
+        while not self._f._db_write_queue.empty():
+            if time.monotonic() > drain_deadline:
+                self._f._log_debug(
+                    "cancel_docstring_tasks: drain timeout (5s), proceeding anyway"
+                )
+                break
+            await asyncio.sleep(0.05)
+
+        # ------------------------------------------------------------------
+        # REGION 3 — Wait for the inference slot to be released
+        # ------------------------------------------------------------------
+        # Ensure that any auxiliary LLM calls (CoT, contradiction detection,
+        # etc.) have finished before the new inlet continues, so they don't
+        # dirty the KV cache.
         await self._f._llm_orchestrator.wait_for_slot()
 
     async def _background_docstring(
