@@ -3150,7 +3150,7 @@ class ContextBuilder:
         # 5.2 Symbol index (depth depends on call_graph_context_mode)
         symbol_section_rendered = False
         if is_code_session and self._f.valves.enable_code_awareness:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if state and state.get("active_blocks"):
                 centrality = pstate.get("node_centrality", {})
                 resolved_mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
@@ -3887,7 +3887,7 @@ class ContextBuilder:
             block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
             if not block_hashes:
                 continue
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             block = None
             for bh in block_hashes:
                 blk = state["active_blocks"].get(bh)
@@ -9923,7 +9923,7 @@ class CommandRouter:
                     f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last "
                     f"{self._f.valves.cleanup_inactive_threshold_messages} messages):"
                 ]
-                state = self._f._state_store.get_state(project_id)
+                state = self._f._conversation_state_manager.get(project_id)
                 for h in candidates:
                     blk = state["active_blocks"].get(h)
                     if blk:
@@ -10010,7 +10010,7 @@ class CommandRouter:
             members = self._f._symbol_index.get_class_members(target_name, project_id)
             if not members:
                 return f"Class `{target_name}` has no indexed members."
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             parts_out = [f"## class `{target_name}` ({len(members)} methods)\n"]
             seen_pairs: Set[Tuple[str, str]] = set()  # (block_hash, method_qid)
             for mname in members:
@@ -10070,7 +10070,7 @@ class CommandRouter:
             A formatted string containing the expanded code blocks for the
             symbol and its callees, or an empty string if no blocks are found.
         """
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not state:
             return ""
         visited = set()
@@ -10141,7 +10141,7 @@ class CommandRouter:
 
         replaced_content = assistant_content
         did_any = False
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
 
         max_syms = self._f.valves.outlet_expand_intercept_max_symbols
         matches_to_process = matches if max_syms == 0 else matches[:max_syms]
@@ -10214,7 +10214,7 @@ class CommandRouter:
                             block.last_mentioned_msg_idx = state["message_count"]
                             break
                     self._f._activation.invalidate_lightweight_cache(project_id)
-                    self._f._state_store.set_state(project_id, state)
+                    self._f._conversation_state_manager.set(project_id, state)
 
         return replaced_content, did_any
 
@@ -10242,7 +10242,7 @@ class CommandRouter:
         if self._f.valves.enable_forget_command and content.startswith("/forget"):
             parts = content.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else ""
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if not state:
                 return messages, False
             if target == "all":
@@ -10289,7 +10289,7 @@ class CommandRouter:
                 confirmation = (
                     f"Forgotten {len(to_remove)} block(s) matching '{target}'."
                 )
-            self._f._state_store.set_state(project_id, state)
+            self._f._conversation_state_manager.set(project_id, state)
             messages.pop()
             messages.append({"role": "assistant", "content": confirmation})
             return messages, True
@@ -10299,7 +10299,7 @@ class CommandRouter:
         """Execute a natural-language forget intent. Returns a user message."""
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if not state:
                 return "No active context to forget."
 
@@ -10396,7 +10396,7 @@ class CommandRouter:
         """Execute a natural-language remember/pin intent."""
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if not state:
                 return "No active context to pin."
 
@@ -10478,7 +10478,7 @@ class CommandRouter:
         """Execute a natural-language obsolete/revive intent."""
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if not state:
                 return "No active context to mark as obsolete."
 
@@ -10713,7 +10713,7 @@ class CommandRouter:
 
     def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
         """Return hashes of blocks that haven't been mentioned recently."""
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not state or not state["active_blocks"]:
             return []
         threshold = self._f.valves.cleanup_inactive_threshold_messages
@@ -10741,7 +10741,7 @@ class CommandRouter:
             return "Cleanup is disabled."
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             candidates = self._get_inactive_block_candidates(project_id)
             parts = command_text.split(maxsplit=1)
             subcommand = parts[1].strip() if len(parts) > 1 else ""
@@ -10777,7 +10777,7 @@ class CommandRouter:
                     c for c in state["committed_changes"] if c.hash not in candidates
                 ]
                 self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
+                self._f._conversation_state_manager.set(project_id, state)
                 return f"✅ Cleaned {len(candidates)} inactive block(s)."
             target_hash = subcommand.strip()
             if target_hash in candidates:
@@ -10787,7 +10787,7 @@ class CommandRouter:
                         block.hash, block.symbols, project_id
                     )
                 self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
+                self._f._conversation_state_manager.set(project_id, state)
                 return f"✅ Cleaned block `{target_hash[:8]}...`."
             else:
                 matched = [h for h in state["active_blocks"] if target_hash in h]
@@ -10799,7 +10799,7 @@ class CommandRouter:
                                 block.hash, block.symbols, project_id
                             )
                         self._f._activation.invalidate_lightweight_cache(project_id)
-                        self._f._state_store.set_state(project_id, state)
+                        self._f._conversation_state_manager.set(project_id, state)
                         return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
                 return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
 
@@ -12337,7 +12337,7 @@ class ActivationEngine:
         # ═══════════════════════════════════════════════════════════════════════════
         # REGION 1 — Load state & filter active blocks
         # ═══════════════════════════════════════════════════════════════════════════
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not state or not state["active_blocks"]:
             return ""
 
@@ -13143,7 +13143,7 @@ class ActivationEngine:
 
     async def rebuild_path_index(self, project_id: str) -> None:
         """Reconstruct PathIndex from SymbolIndex for all entry points."""
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.get("active_blocks"):
             return
         entry_points = self._f._path_index.find_entry_points(
@@ -13255,7 +13255,7 @@ class ActivationEngine:
         self, symbol_names: Iterable[str], project_id: str
     ) -> str:
         """Hash of the symbols' content blocks (changes when code changes)."""
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         hashes = []
         for name in sorted(symbol_names):
             for bh in sorted(self._f._symbol_index.find_blocks(name, project_id)):
@@ -13282,7 +13282,7 @@ class ActivationEngine:
         cached = pstate.get("cached_code_state_hash")
         if cached is not None:
             return cached
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         h = self._compute_code_state_hash_from_state(state)
         pstate["cached_code_state_hash"] = h
         return h
@@ -13313,7 +13313,7 @@ class ActivationEngine:
         `cleanup_inactive_threshold_messages` messages, excluding pinned,
         obsolete, and content types listed in `cleanup_excluded_content_types`.
         """
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.get("active_blocks"):
             return []
         threshold = self._f.valves.cleanup_inactive_threshold_messages
@@ -13351,7 +13351,7 @@ class ActivationEngine:
         No LLM. No GPU. Instant.
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
 
         words = set(re.findall(r"\b\w+\b", hypothesis_text))
         mentioned = all_names.intersection(words)
@@ -14443,7 +14443,7 @@ class EnrichmentTasks:
         """Remove blocks that have not been mentioned recently, based on configured timeouts."""
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             if not state:
                 return
             now = time.time()
@@ -14483,7 +14483,7 @@ class EnrichmentTasks:
                     for b in state["active_blocks"].values()
                 )
                 self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._state_store.set_state(project_id, state)
+                self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. LOD adaptive adjustment
@@ -14580,7 +14580,7 @@ class EnrichmentTasks:
 
     def get_feedback_context(self, project_id: str) -> str:
         """Return a formatted string of recent feedback for the given project."""
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         feedback = state.get("feedback_history", [])
         if not feedback:
             return ""
@@ -14701,7 +14701,7 @@ class EnrichmentTasks:
         Returns {qid: docstring} for every qid that has (or now has) a
         non-empty docstring.
         """
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
@@ -14827,7 +14827,7 @@ class EnrichmentTasks:
         existing LOD2 tier (signature + docstring) for those.
         """
         self._f._log_debug(f"CFG batch: invoked with {len(qids)} candidate(s): {qids}")
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
 
         # Build a qid → (sym, block) index ONCE instead of re-scanning every
@@ -14938,7 +14938,7 @@ class EnrichmentTasks:
         block_hash = block.hash
 
         # --- 1. Ensure the block still exists ---
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         target_block = state["active_blocks"].get(block_hash)
         if target_block is None:
             self._f._log_debug(
@@ -15011,7 +15011,7 @@ class EnrichmentTasks:
         # --- 6. Acquire project lock to update state and index ---
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
             block = state["active_blocks"].get(block_hash)
             if block:
                 # Find the exact symbol instance
@@ -15029,7 +15029,7 @@ class EnrichmentTasks:
                             )
                         )
                         break
-                self._f._state_store.set_state(project_id, state)
+                self._f._conversation_state_manager.set(project_id, state)
             else:
                 self._f._log_debug(
                     f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
@@ -15161,7 +15161,7 @@ class EnrichmentTasks:
         each one exactly once. This prevents infinite retries on failing symbols and ensures termination.
         """
         # --- 1. Snapshot: collect all symbols without docstrings ---
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         pending = []
         for block in state["active_blocks"].values():
             if block.obsolete:
@@ -15241,13 +15241,13 @@ class ActiveCodeUpdater:
 
         # 2. Get project lock and current state
         lock = await self._f._state_store.get_project_lock(project_id)
-        state_before = self._f._state_store.get_state(project_id)
+        state_before = self._f._conversation_state_manager.get(project_id)
 
         # 3. Detect duplicates
         duplicate_info = self._detect_duplicates(new_blocks_pending, state_before)
 
         async with lock:
-            state = self._f._state_store.get_state(project_id)
+            state = self._f._conversation_state_manager.get(project_id)
 
             # 4. Housekeeping
             self._f._enrichment.update_mentions_from_message(state, content, project_id)
@@ -15305,7 +15305,7 @@ class ActiveCodeUpdater:
                 state, project_id, new_blocks_pending, is_continuation
             )
 
-            self._f._state_store.set_state(project_id, state)
+            self._f._conversation_state_manager.set(project_id, state)
 
         # ── Invalidate session classification cache whenever active blocks change ──
         # (ensures that subsequent queries remain code sessions if code exists)
@@ -15970,7 +15970,7 @@ class InletOrchestrator:
             self._f._log_debug(
                 f"Project changed from {self._f._last_project_id} to {project_id}"
             )
-            old_state = self._f._conversation_state.get(self._f._last_project_id)
+            self._f._conversation_state_manager.clear_project(self._f._last_project_id)
             if old_state:
                 self._f._symbol_index.clear_project(self._f._last_project_id)
 
@@ -16117,14 +16117,14 @@ class InletOrchestrator:
         else:
             user_question = user_query
 
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if not isinstance(state.get("active_blocks"), dict):
             self._f._log_debug(
                 "CRITICAL: active_blocks corrupted even after load; resetting to empty. "
                 "Delete %s if this recurs." % self._f.valves.state_db_path
             )
             state["active_blocks"] = {}
-            self._f._state_store.set_state(project_id, state)
+            self._f._conversation_state_manager.set(project_id, state)
 
         return is_code_session, user_question
 
@@ -16154,7 +16154,7 @@ class InletOrchestrator:
                     return result
                 del self._f._session_classify_cache[cache_key]
 
-        state = self._f._state_store.get_state(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
         if state and state.get("active_blocks"):
             if cache_key:
                 self._f._session_classify_cache[cache_key] = (True, time.time())
@@ -16595,7 +16595,7 @@ class SystemPromptBuilder:
                         )
                     )
                     state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
-                    self._f._state_store.set_state(project_id, state)
+                    self._f._conversation_state_manager.set(project_id, state)
 
         # ── Token pressure suggestion ──────────────────────────────────
         sys_msgs = [m for m in messages if m.get("role") == "system"]
