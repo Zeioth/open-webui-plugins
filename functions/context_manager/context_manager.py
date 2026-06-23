@@ -8342,7 +8342,7 @@ class LLMOrchestrator:
         """
         Call the LLM with cache and deduplication. Retries are handled by
         shared_resources.call_llm internally.
-
+    
         All calls to this method are serialized via `_llm_semaphore` to prevent
         concurrent LLM requests, which avoids cancellation issues when using
         `--parallel 1` in llama.cpp.
@@ -8352,7 +8352,7 @@ class LLMOrchestrator:
             "bg_docstring",
         ):
             return None
-
+    
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -8364,31 +8364,31 @@ class LLMOrchestrator:
                 future = asyncio.Future()
                 self._f._pending_llm[dedup_key] = future
                 is_producer = True
-
+    
         if not is_producer:
             return await future
-
+    
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
-
-        # ── SERIALIZACIÓN CON EL SEMÁFORO ────────────────────────────────────
-        # Todas las llamadas LLM (respuesta principal, CoT, docstrings, resúmenes...)
-        # se serializan aquí. Esto garantiza que solo una se ejecute a la vez,
-        # evitando cancelaciones por concurrencia cuando el servidor usa --parallel 1.
+    
+        # ── SERIALIZATION WITH THE SEMAPHORE ──────────────────────────────────
+        # All LLM calls (main response, CoT, docstrings, summaries...)
+        # are serialized here. This guarantees that only one executes at a time,
+        # preventing concurrency cancellations when the server uses --parallel 1.
         async with self._f._llm_semaphore:
             try:
                 base_url = self._f.valves.LLM_BASE_URL.rstrip("/")
                 if base_url.endswith("/v1"):
                     base_url = base_url[:-3].rstrip("/")
-
+    
                 is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-
+    
                 model = model_override or self._f.valves.llm_model
                 if not model:
                     logger.warning(f"[LLM]{label_str} No model available")
                     future.set_result(None)
                     return None
-
+    
                 # ── Cache LLM ──
                 cache_key = hashlib.md5(
                     f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
@@ -8400,25 +8400,22 @@ class LLMOrchestrator:
                         f"[LLM] {model}{label_str} (cached) took {time.monotonic() - t_start:.3f}s"
                     )
                     return cached
-
+    
                 ep_type = "chat"
                 if model.startswith("llamacpp/"):
                     ep_type = self._f.valves.llamacpp_endpoint_type
-
+    
                 if self._f.tokenizer:
                     prompt_tokens = len(self._f.tokenizer.encode(prompt))
                     self._f._log_debug(
                         f"LLM call to {model}{label_str} – prompt size: ~{prompt_tokens} tokens"
                     )
-
-                # ── Llamada real (con retries internos en shared_resources) ──
+    
+                # ── Real call (with internal retries in shared_resources) ──
                 task = asyncio.current_task()
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.add(task)
                 try:
-                    # Unload/load management (shared_resources handles retries)
-                    await self._maybe_unload_for_model(model, base_url, is_ollama)
-
                     content = await _shared_call_llm(
                         prompt=prompt,
                         system=system_prompt,
@@ -8430,21 +8427,17 @@ class LLMOrchestrator:
                         timeout=self._f.valves.llm_request_timeout,
                         endpoint_type=ep_type,
                     )
-
+    
                     if content:
                         await self._f._llm_cache.set(cache_key, content)
                         future.set_result(content)
                         async with self._f._model_lock:
                             self._f._last_used_model = model
                         in_tokens = (
-                            len(self._f.tokenizer.encode(prompt))
-                            if self._f.tokenizer
-                            else "?"
+                            len(self._f.tokenizer.encode(prompt)) if self._f.tokenizer else "?"
                         )
                         out_tokens = (
-                            len(self._f.tokenizer.encode(content))
-                            if self._f.tokenizer
-                            else "?"
+                            len(self._f.tokenizer.encode(content)) if self._f.tokenizer else "?"
                         )
                         self._f._log_debug(
                             f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
@@ -8454,132 +8447,17 @@ class LLMOrchestrator:
                     else:
                         future.set_result(None)
                         return None
-
+    
                 finally:
                     async with self._f._active_llm_tasks_lock:
                         self._f._active_llm_tasks.discard(task)
-
+    
             except Exception as e:
                 future.set_exception(e)
                 raise
             finally:
                 async with self._f._pending_llm_lock:
                     self._f._pending_llm.pop(dedup_key, None)
-
-        # ═══════════════════════════════════════════════════════════════════════════
-        # 3. Model switching (auxiliary model unload/load)
-        # ═══════════════════════════════════════════════════════════════════════════
-
-        async def _maybe_unload_for_model(
-            self, model_name: str, base_url: str, is_ollama: bool
-        ) -> None:
-            """
-            Unload models only if switching to a *different* auxiliary model.
-            The main model (self._f.valves.llm_model) is NEVER unloaded to preserve its KV cache.
-
-            The whole read-decide-unload-write sequence now runs under
-            self._f._model_lock (a separate, cheap lock — NOT the inference
-            semaphore, so this doesn't hold up the single inference slot any
-            longer than before). Previously only the initial read and the final
-            write were individually locked, leaving a window where two
-            concurrent auxiliary-model calls could both decide based on the
-            same stale snapshot. Dormant in this stack today: every aux-model
-            valve points at the same model as llm_model, so the early-return
-            branch always fires before unload logic is reached.
-            """
-            if is_ollama:
-                return
-
-            main_model = self._f.valves.llm_model
-
-            async with self._f._model_lock:
-                current_model = self._f._last_used_model
-
-                if model_name == main_model:
-                    if current_model is None:
-                        self._f._log_debug(
-                            f"Loading main model '{model_name}' for the first time"
-                        )
-                    else:
-                        self._f._log_debug(
-                            f"Keeping main model '{model_name}' loaded (no unload)"
-                        )
-                    return
-
-                if current_model == main_model:
-                    self._f._log_debug(
-                        f"Keeping main model '{main_model}' loaded while loading auxiliary '{model_name}'"
-                    )
-                    return
-
-                if current_model is not None and model_name != current_model:
-                    self._f._log_debug(
-                        f"Switching auxiliary model from '{current_model}' to '{model_name}'"
-                    )
-                    try:
-                        await _shared_unload_all_models(base_url)
-                        self._f._log_debug("Auxiliary model unloaded before switching")
-                        self._f._last_used_model = None
-                    except Exception as e:
-                        self._f._log_debug(f"Unload via shared_resources failed: {e}")
-                elif current_model is None:
-                    self._f._log_debug(
-                        f"Loading auxiliary model '{model_name}' (no model was loaded)"
-                    )
-                else:
-                    self._f._log_debug(
-                        f"Reusing auxiliary model '{model_name}' (already loaded)"
-                    )
-
-        # ═══════════════════════════════════════════════════════════════════════════
-        # 4. CrossEncoder helper (keep full code decision)
-        # ═══════════════════════════════════════════════════════════════════════════
-
-        async def should_keep_full_code(self, user_question: str) -> bool:
-            """
-            Decide whether to keep the full code in context or provide only a summary.
-            Uses the CrossEncoder for fast CPU inference.
-            Returns True if full code should be kept.
-            """
-            if not user_question.strip():
-                return False
-
-            pairs = [
-                (
-                    user_question[:500],
-                    "The user wants the full code, complete implementation, or exact details.",
-                ),
-                (
-                    user_question[:500],
-                    "The user only needs a summary, brief explanation, or high-level overview.",
-                ),
-            ]
-            scores = await self._f._commands._predict_cross_encoder(pairs)
-            if scores is None:
-                self._f._log_debug(
-                    "_should_keep_full_code: CrossEncoder not loaded, keeping full code by default."
-                )
-                return True
-            return scores[0] > scores[1]
-
-        # ═══════════════════════════════════════════════════════════════════════════
-        # 5. Coordination primitives (slot & task waiting)
-        # ═══════════════════════════════════════════════════════════════════════════
-
-        async def wait_for_llm_tasks(self) -> None:
-            """Block until all LLM-using tasks have completed."""
-            while True:
-                async with self._f._active_llm_tasks_lock:
-                    if not self._f._active_llm_tasks:
-                        break
-                    tasks = list(self._f._active_llm_tasks)
-                if tasks:
-                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-        async def wait_for_slot(self) -> None:
-            """Wait until the inference slot is free, then return immediately."""
-            async with self._f._llm_semaphore:
-                pass
 
 
 class ReasoningEngine:
