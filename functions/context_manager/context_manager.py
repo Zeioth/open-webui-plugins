@@ -514,6 +514,558 @@ class ActivationState(BaseModel):
     source: str
 
 
+class ConversationState(BaseModel):
+    """
+    Persistent conversation state for a single project.
+
+    This model replaces the raw dictionary previously returned by _state_factory.
+    All fields have sensible defaults equivalent to the initial empty state.
+
+    Advantages:
+    - Complete inventory of all persistent flags in one place.
+    - Attribute access (state.message_count) instead of dict keys.
+    - Type validation via Pydantic v2.
+    - Parallel structure with ProjectStateManager (volatile state).
+
+    Serialization notes (Phase 1):
+    StateStore._save_state_to_db and _load_from_db continue to use dict
+    serialization internally; they are adapted to read/write attributes rather
+    than dict keys. Full SQLite layer refactoring is Phase 2.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    # ── Active code blocks ─────────────────────────────────────────────────
+    active_blocks: Dict[str, "CodeBlock"] = Field(default_factory=dict)
+    recent_changes: List["CodeBlock"] = Field(default_factory=list)
+    committed_changes: List["CodeBlock"] = Field(default_factory=list)
+
+    # ── Conversation counters ─────────────────────────────────────────────
+    message_count: int = 0
+    last_cot_level: int = 0
+
+    # ── Feedback and suggestions ──────────────────────────────────────────
+    feedback_history: List["AppliedChangeFeedback"] = Field(default_factory=list)
+    last_compression_timestamp: float = 0.0
+    last_suggestion_timestamp: float = 0.0
+    last_cleanup_suggestion_msg_idx: int = 0
+
+    # ── Call graph state ──────────────────────────────────────────────────
+    has_any_calls: bool = False
+
+    # ── Conversation summaries ────────────────────────────────────────────
+    conversation_summaries: List[Dict[str, Any]] = Field(default_factory=list)
+    summarized_turn_hwm: int = 0
+
+    # ── History compression tracker ──────────────────────────────────────
+    # Migrated from pstate: persists across restarts so that
+    # force_compress_after_turns works correctly.
+    history_blocked_age: Dict[str, int] = Field(default_factory=dict)
+
+    # ── KV slot persistence ───────────────────────────────────────────────
+    pending_slot_resave: bool = False
+
+    # ── WindowManager instrumentation (persistent metrics) ───────────────
+    # These are not stored in pstate; they survive server restarts so that
+    # evolution.jsonl reflects real history.
+    wm_fired: bool = False
+    wm_msgs_evicted: int = 0
+    wm_turns_evicted: int = 0
+    wm_summary_ok: bool = False
+    wm_emergency_cap: bool = False
+    wm_batch_too_small: bool = False
+    wm_no_slot: bool = False
+    wm_degradation_guard: bool = False
+
+    def reset_wm_metrics(self) -> None:
+        """Reset all WindowManager instrumentation flags at the start of each turn."""
+        self.wm_fired = False
+        self.wm_msgs_evicted = 0
+        self.wm_turns_evicted = 0
+        self.wm_summary_ok = False
+        self.wm_emergency_cap = False
+        self.wm_batch_too_small = False
+        self.wm_no_slot = False
+        self.wm_degradation_guard = False
+
+
+class ConversationStateManager:
+    """
+    Centralized manager for persistent conversation state.
+
+    Parallel to ProjectStateManager (volatile per-project state):
+    ConversationStateManager handles PERSISTENT state across sessions,
+    backed by SQLite through StateStore's write queue.
+
+    Responsibilities:
+      - LRU cache of ConversationState per project_id.
+      - Load from DB (_load_from_db) with CodeBlock reconstruction and docstring restoration.
+      - Async save (_save_to_db) with 2-second debounce.
+      - SymbolIndex rebuild after cold load.
+      - LRU eviction when max_cached_projects is exceeded.
+
+    Delegated to StateStore:
+      - SQLite write queue       → StateStore._db_enqueue()
+      - DDL table creation       → StateStore.init_db()
+      - Per-project locks        → StateStore.get_project_lock()
+      - Edges/path views/docstrings/CFG persistence → StateStore
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the manager with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
+        self._f = filter_ref
+        self._cache: OrderedDict[str, ConversationState] = OrderedDict()
+        self._dirty: Set[str] = set()
+        self._last_saved: Dict[str, float] = {}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. Public API
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def get(self, project_id: str) -> ConversationState:
+        """
+        Return the ConversationState for the given project.
+
+        Loads from DB if not cached; creates a fresh empty state if not in DB either.
+
+        Replaces: StateStore.get_state(project_id)
+        """
+        if project_id in self._cache:
+            self._cache.move_to_end(project_id)
+            return self._cache[project_id]
+
+        state = self._load_from_db(project_id)
+        if state is None:
+            state = ConversationState()
+
+        self._cache[project_id] = state
+        self._cache.move_to_end(project_id)
+        self._evict_lru()
+
+        if state.active_blocks:
+            self._rebuild_symbol_index(state, project_id)
+
+        return state
+
+    def set(self, project_id: str, state: ConversationState) -> None:
+        """
+        Update the state in cache and mark it as dirty (pending save).
+
+        Replaces: StateStore.set_state(project_id, state)
+
+        Invariant: In existing code, set() is always preceded by get() for the
+        same project_id in the same turn, so the project is already in cache.
+        If future code adds a set() without a prior get(), call _evict_lru() here.
+        """
+        self._cache[project_id] = state
+        self._cache.move_to_end(project_id)
+        self.mark_dirty(project_id)
+
+    def mark_dirty(self, project_id: str) -> None:
+        """Mark the state for a project as modified (pending save)."""
+        self._dirty.add(project_id)
+
+    async def save_if_dirty(self, project_id: str) -> None:
+        """
+        Persist the state if dirty and at least 2 seconds have passed since last save.
+
+        Replaces: StateStore.save_state_if_dirty(project_id)
+
+        Debounce: if called within 2 seconds of the previous save, it returns
+        without saving but leaves the dirty flag active, so the next turn will retry.
+        To guarantee persistence on shutdown, call _save_to_db_async directly or
+        ignore debounce.
+        """
+        if project_id not in self._dirty:
+            return
+        now = time.time()
+        if now - self._last_saved.get(project_id, 0.0) < 2.0:
+            return
+
+        self._last_saved[project_id] = now
+        self._dirty.discard(project_id)
+
+        state = self._cache.get(project_id)
+        if state is None:
+            return
+
+        try:
+            await self._save_to_db_async(project_id, state)
+        except Exception as e:
+            import traceback
+
+            self._f._log_debug(
+                f"ConversationStateManager.save_if_dirty: failed for "
+                f"'{project_id}': {e}\n{traceback.format_exc()}"
+            )
+            # Re-mark dirty to retry on the next turn.
+            self._dirty.add(project_id)
+
+    def clear_project(self, project_id: str) -> None:
+        """Remove the cached state for a project (LRU eviction or project switch)."""
+        self._cache.pop(project_id, None)
+        self._dirty.discard(project_id)
+        self._last_saved.pop(project_id, None)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 2. Load from SQLite
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _load_from_db(self, project_id: str) -> Optional[ConversationState]:
+        """
+        Load ConversationState from SQLite.
+
+        Migrated from StateStore._load_state_from_db().
+        Differences:
+          - Returns ConversationState instead of a dict.
+          - Uses wm_* aliases for compatibility with pre-Phase-1 DBs (names with '_').
+          - Reads history_blocked_age (migrated from pstate in Phase 1).
+        """
+        try:
+            cur = self._f._db_conn.execute(
+                "SELECT state_json FROM conversation_state WHERE project_id = ?",
+                (project_id,),
+            )
+            row = cur.fetchone()
+        except Exception as e:
+            self._f._log_debug(
+                f"ConversationStateManager._load_from_db: DB read error "
+                f"for '{project_id}': {e}"
+            )
+            return None
+
+        if not row:
+            return None
+
+        try:
+            data = json.loads(row[0])
+        except Exception as e:
+            self._f._log_debug(
+                f"ConversationStateManager._load_from_db: invalid JSON: {e}"
+            )
+            return None
+
+        # Defaults for keys that may be absent in old DBs are handled by the
+        # explicit data.get() fallbacks in the constructor below.
+
+        # ── Validate active_blocks ─────────────────────────────────────────
+        raw_active = data.get("active_blocks")
+        if raw_active is None:
+            self._f._log_debug(
+                f"⚠️  CORRUPT STATE: 'active_blocks' missing for "
+                f"'{project_id}'. Resetting. "
+                f"If this persists, delete: {self._f.valves.state_db_path}"
+            )
+            raw_active = {}
+        elif not isinstance(raw_active, dict):
+            self._f._log_debug(
+                f"⚠️  CORRUPT STATE: 'active_blocks' is "
+                f"{type(raw_active).__name__} for '{project_id}'. Resetting."
+            )
+            raw_active = {}
+
+        # ── Rebuild active_blocks ──────────────────────────────────────────
+        active: Dict[str, CodeBlock] = {}
+        for k, v in raw_active.items():
+            try:
+                content_field = v.get("content", "")
+                if content_field.startswith("@@hash:"):
+                    content_hash = content_field[7:]
+                    cur2 = self._f._db_conn.execute(
+                        "SELECT content FROM code_contents WHERE hash = ?",
+                        (content_hash,),
+                    )
+                    row2 = cur2.fetchone()
+                    v["content"] = (
+                        row2[0]
+                        if row2
+                        else f"[Content not found for hash {content_hash}]"
+                    )
+                v["content_type"] = (
+                    ContentType(v["content_type"])
+                    if "content_type" in v
+                    else ContentType.GENERAL
+                )
+                blk = CodeBlock(**v)
+                if blk.last_mentioned_msg_idx is None:
+                    blk.last_mentioned_msg_idx = data.get("message_count", 0)
+                active[k] = blk
+            except Exception:
+                self._f._log_debug(f"Skipping corrupted block {k} in state DB")
+
+        # ── Rebuild recent and committed lists ─────────────────────────────
+        recent: List[CodeBlock] = []
+        for b in data.get("recent_changes", []):
+            try:
+                b["content_type"] = (
+                    ContentType(b["content_type"])
+                    if "content_type" in b
+                    else ContentType.GENERAL
+                )
+                recent.append(CodeBlock(**b))
+            except Exception:
+                pass
+
+        committed: List[CodeBlock] = []
+        for b in data.get("committed_changes", []):
+            try:
+                b["content_type"] = (
+                    ContentType(b["content_type"])
+                    if "content_type" in b
+                    else ContentType.GENERAL
+                )
+                committed.append(CodeBlock(**b))
+            except Exception:
+                pass
+
+        feedback: List[AppliedChangeFeedback] = []
+        for fb in data.get("feedback_history", []):
+            try:
+                feedback.append(AppliedChangeFeedback(**fb))
+            except Exception:
+                self._f._log_debug(f"Skipping corrupt feedback entry in '{project_id}'")
+
+        # ── Recalculate token counts ───────────────────────────────────────
+        for blk in list(active.values()) + recent + committed:
+            if self._f.tokenizer:
+                blk._cached_token_count = len(self._f.tokenizer.encode(blk.content))
+            else:
+                blk._cached_token_count = len(blk.content) // 4
+
+        # ── Restore docstrings from symbol_docstrings table ──────────────
+        try:
+            cur = self._f._db_conn.execute(
+                "SELECT symbol_name, docstring FROM symbol_docstrings "
+                "WHERE project_id = ?",
+                (project_id,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                doc_map = {row[0]: row[1] for row in rows}
+                for block in active.values():
+                    if block.obsolete:
+                        continue
+                    for sym in block.symbols:
+                        if sym.docstring:
+                            continue
+                        qid = qualify_symbol_name(
+                            sym.name, sym.parent_symbol, sym.file_path
+                        )
+                        doc = doc_map.get(qid) or doc_map.get(sym.name)
+                        if doc:
+                            sym.docstring = doc
+                            self._f._symbol_index.update_docstring(qid, project_id, doc)
+        except Exception as e:
+            self._f._log_debug(f"_load_from_db: docstring restore failed: {e}")
+
+        # ── Build and return ConversationState ─────────────────────────────
+        return ConversationState(
+            active_blocks=active,
+            recent_changes=recent,
+            committed_changes=committed,
+            feedback_history=feedback,
+            message_count=data.get("message_count", 0),
+            last_compression_timestamp=data.get("last_compression_timestamp", 0.0),
+            last_suggestion_timestamp=data.get("last_suggestion_timestamp", 0.0),
+            has_any_calls=data.get("has_any_calls", False),
+            last_cleanup_suggestion_msg_idx=data.get(
+                "last_cleanup_suggestion_msg_idx", 0
+            ),
+            last_cot_level=data.get("last_cot_level", 0),
+            conversation_summaries=data.get("conversation_summaries", []),
+            summarized_turn_hwm=data.get("summarized_turn_hwm", 0),
+            history_blocked_age=data.get("history_blocked_age", {}),
+            # Aliases for compatibility with pre-Phase-1 DBs (fields with leading '_')
+            wm_fired=data.get("wm_fired", data.get("_wm_fired", False)),
+            wm_msgs_evicted=data.get(
+                "wm_msgs_evicted", data.get("_wm_msgs_evicted", 0)
+            ),
+            wm_turns_evicted=data.get(
+                "wm_turns_evicted", data.get("_wm_turns_evicted", 0)
+            ),
+            wm_summary_ok=data.get("wm_summary_ok", data.get("_wm_summary_ok", False)),
+            wm_emergency_cap=data.get(
+                "wm_emergency_cap", data.get("_wm_emergency_cap", False)
+            ),
+            wm_batch_too_small=data.get(
+                "wm_batch_too_small", data.get("_wm_batch_too_small", False)
+            ),
+            wm_no_slot=data.get("wm_no_slot", data.get("_wm_no_slot", False)),
+            wm_degradation_guard=data.get(
+                "wm_degradation_guard",
+                data.get("_wm_degradation_guard", False),
+            ),
+            pending_slot_resave=data.get(
+                "pending_slot_resave",
+                data.get("_pending_slot_resave", False),
+            ),
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. Save to SQLite
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _save_to_db_async(
+        self, project_id: str, state: ConversationState
+    ) -> None:
+        """Acquire the project lock and persist the state."""
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            await self._save_to_db(project_id, state)
+
+    async def _save_to_db(self, project_id: str, state: ConversationState) -> None:
+        """
+        Serialize ConversationState and persist to SQLite.
+
+        Migrated from StateStore._save_state_to_db().
+        Differences:
+          - Reads attributes (state.recent_changes) instead of dict keys.
+          - Persists summarized_turn_hwm, history_blocked_age, and all wm_* fields.
+          - The @@hash trick for code_contents remains unchanged.
+        """
+        # ── Serialize active_blocks, externalizing content ─────────────────
+        active_blocks_meta: Dict[str, Any] = {}
+        for k, v in state.active_blocks.items():
+            d = v.dict()
+            d["content_type"] = v.content_type.value
+            content_hash = v.hash
+            await self._f._state_store._db_enqueue(
+                lambda ch=content_hash, ct=v.content: self._f._db_conn.execute(
+                    "INSERT OR IGNORE INTO code_contents "
+                    "(hash, content, created_at) VALUES (?, ?, ?)",
+                    (ch, ct, time.time()),
+                )
+            )
+            d["content"] = f"@@hash:{content_hash}"
+            active_blocks_meta[k] = d
+
+        serializable = {
+            "active_blocks": active_blocks_meta,
+            "recent_changes": [b.dict() for b in state.recent_changes],
+            "committed_changes": [b.dict() for b in state.committed_changes],
+            "feedback_history": [fb.dict() for fb in state.feedback_history],
+            "message_count": state.message_count,
+            "last_compression_timestamp": state.last_compression_timestamp,
+            "last_suggestion_timestamp": state.last_suggestion_timestamp,
+            "last_cleanup_suggestion_msg_idx": (state.last_cleanup_suggestion_msg_idx),
+            "has_any_calls": state.has_any_calls,
+            "last_cot_level": state.last_cot_level,
+            "conversation_summaries": state.conversation_summaries,
+            "summarized_turn_hwm": state.summarized_turn_hwm,
+            "history_blocked_age": state.history_blocked_age,
+            "wm_fired": state.wm_fired,
+            "wm_msgs_evicted": state.wm_msgs_evicted,
+            "wm_turns_evicted": state.wm_turns_evicted,
+            "wm_summary_ok": state.wm_summary_ok,
+            "wm_emergency_cap": state.wm_emergency_cap,
+            "wm_batch_too_small": state.wm_batch_too_small,
+            "wm_no_slot": state.wm_no_slot,
+            "wm_degradation_guard": state.wm_degradation_guard,
+            "pending_slot_resave": state.pending_slot_resave,
+        }
+
+        def _write() -> None:
+            self._f._db_conn.execute(
+                "REPLACE INTO conversation_state "
+                "(project_id, state_json, updated_at) VALUES (?, ?, ?)",
+                (project_id, json.dumps(serializable), time.time()),
+            )
+            self._f._db_conn.commit()
+
+        await self._f._state_store._db_enqueue(_write)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 4. SymbolIndex rebuild after cold load
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _rebuild_symbol_index(self, state: ConversationState, project_id: str) -> None:
+        """
+        Rebuild SymbolIndex from active blocks.
+
+        Migrated from StateStore._rebuild_symbol_index().
+        No logic changes; only attribute access (state.active_blocks).
+
+        Invariant: The index for project_id must be empty before calling this
+        to avoid duplicates. get() guarantees this because it is only called
+        on a cache miss (cold load), when the index for that project has not
+        been populated yet. If called elsewhere, call clear_project() first.
+        """
+        for block in state.active_blocks.values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                self._f._symbol_index.add(sym, block.hash, project_id)
+                caller_qid = qualify_symbol_name(
+                    sym.name, sym.parent_symbol, sym.file_path
+                )
+                for callee in sym.calls:
+                    edge = Edge(
+                        src=caller_qid,
+                        dst=callee,
+                        type="calls",
+                        weight=EDGE_WEIGHTS["calls"],
+                    )
+                    self._f._symbol_index.add_edge(edge, project_id)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 5. LRU eviction
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _evict_lru(self) -> None:
+        """
+        Evict the least recently used projects when max_cached_projects is exceeded.
+
+        Migrated from the while loop in StateStore.get_state().
+        Centralised here so both get() and set() can trigger it.
+
+        IMPORTANT: Flushes dirty state synchronously before eviction to avoid
+        data loss. Since this method is synchronous, we cannot await the async
+        save path; we use a synchronous write (see _db_conn_write_sync in
+        StateStore). If that method is not available, the dirty state will be
+        lost; consider implementing it or using an alternative.
+        """
+        max_cached = self._f.valves.max_cached_projects
+        while len(self._cache) > max_cached:
+            oldest_pid, oldest_state = next(iter(self._cache.items()))
+
+            # ── Flush dirty state before eviction ─────────────────────────
+            if oldest_pid in self._dirty:
+                try:
+                    # Synchronous write to DB (must be implemented in StateStore)
+                    # If not available, this will raise AttributeError; catch and log.
+                    serialized = self._f._state_store._db_conn_write_sync(
+                        oldest_pid, oldest_state
+                    )
+                    self._f._log_debug(
+                        f"ConversationStateManager: flushed dirty state for "
+                        f"'{oldest_pid}' before LRU eviction"
+                    )
+                except AttributeError:
+                    self._f._log_debug(
+                        f"ConversationStateManager: StateStore._db_conn_write_sync "
+                        f"not implemented; dirty state for '{oldest_pid}' may be lost."
+                    )
+                except Exception as e:
+                    self._f._log_debug(
+                        f"ConversationStateManager: flush before eviction failed "
+                        f"for '{oldest_pid}': {e} — state may be lost"
+                    )
+
+            self._f._symbol_index.clear_project(oldest_pid)
+            self._f._path_index.clear_project(oldest_pid)
+            self._f._pager.clear_project(oldest_pid)
+            self._f._project_state_manager.clear_project(oldest_pid)
+            self.clear_project(oldest_pid)
+            self._f._log_debug(
+                f"ConversationStateManager: evicted LRU project '{oldest_pid}'"
+            )
+
+
 class ActivationGraph:
     """Personalised PageRank (PPR) engine for the symbol call graph.
 
@@ -5732,170 +6284,39 @@ class ControlFlowExtractor:
 
 
 class StateStore:
-    """Persistent conversation state backed by SQLite, with an async write
-    queue and per‑project reentrant locks.
+    """
+    SQLite database infrastructure for the CodeAware filter.
 
-    Provides:
-    * ``get_state(project_id)`` — loads state from the in‑memory LRU cache
-      or falls back to SQLite, rebuilding the SymbolIndex on cache miss.
-    * ``set_state(project_id, state)`` — marks the state dirty without
-      blocking; actual persistence is deferred to ``save_state_if_dirty()``.
-    * ``save_state_if_dirty(project_id)`` — writes the state to SQLite via
-      the background write queue, with a minimum cooldown between writes.
-    * ``init_db()`` — idempotent DDL for all tables and indexes.
-    * ``get_project_lock(project_id)`` — returns a ``ReentrantAsyncLock``
-      scoped to a single project, preventing concurrent mutation of the
-      same project's state from different requests.
-    * ``_rebuild_symbol_index(state, project_id)`` — reconstructs the
-      SymbolIndex from the active blocks after a cold load, ensuring
-      call‑graph edges are correctly qualified.
-    * ``_db_enqueue(fn)`` — non‑blocking, serialised writes to SQLite
-      handled by a dedicated worker loop (``db_worker``).
+    This class manages:
+      - DDL (table creation, indexes)
+      - Serialized write queue (prevents "database is locked" errors)
+      - Per-project async locks
+      - Persistence of symbol edges, path views, docstrings, CFG skeletons
+      - Database checkpoints (WAL)
+      - Purge of orphaned rows
 
-    The write queue ensures SQLite never sees concurrent writes even under
-    high parallelism, avoiding "database is locked" errors.
+    It does NOT manage conversation state (→ ConversationStateManager).
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
-        self._f = filter_ref
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 1. State access & persistence
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def get_state(self, project_id: str) -> dict:
         """
-        Return the conversation state for the given project, loading from DB if needed.
+        Initialize the state store with a reference to the parent Filter.
 
         Args:
-            project_id (str): The project identifier.
-
-        Returns:
-            dict: The conversation state dictionary for the project.
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
         """
-        # --- 1. Check in-memory cache ---
-        if project_id in self._f._conversation_state:
-            self._f._conversation_state.move_to_end(project_id)
-            return self._f._conversation_state[project_id]
+        self._f = filter_ref
 
-        # --- 2. Load from database if not in cache ---
-        state = self._load_state_from_db(project_id)
-        if not state:
-            state = self._f._state_factory()
-
-        # --- 3. Store in cache and move to end (most recently used) ---
-        self._f._conversation_state[project_id] = state
-        self._f._conversation_state.move_to_end(project_id)
-
-        # --- 4. LRU eviction: keep only max_cached_projects ---
-        while len(self._f._conversation_state) > self._f.valves.max_cached_projects:
-            oldest_pid = next(iter(self._f._conversation_state))
-            oldest_state = self._f._conversation_state[oldest_pid]
-
-            # Clean up symbol index and conversation state
-            self._f._symbol_index.clear_project(oldest_pid)
-            del self._f._conversation_state[oldest_pid]
-
-            # Clean up core indexes (path, pager)
-            self._f._path_index.clear_project(oldest_pid)
-            self._f._pager.clear_project(oldest_pid)
-
-            # Clean up ALL per-project volatile state at once via ProjectStateManager
-            self._f._project_state_manager.clear_project(oldest_pid)
-
-            # REMOVED: ContextBuilder caches are now managed by ProjectStateManager
-            # No need to manually pop _block_a_cache, _skeleton_tier_cache, etc.
-
-        # --- 5. Rebuild symbol index from active blocks if needed ---
-        if state.get("active_blocks"):
-            self._rebuild_symbol_index(state, project_id)
-
-        return state
-
-    def set_state(self, project_id: str, state: dict) -> None:
-        """Mark the conversation state as dirty without persisting immediately."""
-        self._f._conversation_state[project_id] = state
-        self._f._conversation_state.move_to_end(project_id)
-        self._f._state_dirty = True
-
-    async def save_state_if_dirty(self, project_id: str) -> None:
-        """
-        Persist the state if dirty and at least 2 seconds have passed since last save.
-        Waits for the DB write to complete, logging any error.
-        """
-        if not self._f._state_dirty:
-            return
-        now = time.time()
-        if now - self._f._state_last_saved < 2.0:
-            return
-
-        self._f._state_last_saved = now
-        self._f._state_dirty = False
-
-        try:
-            await self._save_state_to_db_async(
-                project_id, self._f._conversation_state[project_id]
-            )
-        except Exception as e:
-            import traceback
-
-            self._f._log_debug(f"Failed to save state: {e}\n{traceback.format_exc()}")
-
-    async def _save_state_to_db_async(self, project_id: str, state: dict) -> None:
-        """Acquire the project lock, then persist the state to DB."""
-        lock = await self.get_project_lock(project_id)
-        async with lock:
-            await self._save_state_to_db(project_id, state)
-
-    async def _save_state_to_db(self, project_id: str, state: dict) -> None:
-        """Serialize active blocks metadata and persist to SQLite."""
-        # Serialize active blocks metadata
-        active_blocks_meta = {}
-        for k, v in state["active_blocks"].items():
-            d = v.dict()
-            d["content_type"] = v.content_type.value
-            content_hash = v.hash
-            # Persist the raw content via the write queue
-            await self._db_enqueue(
-                lambda ch=content_hash, ct=v.content: self._f._db_conn.execute(
-                    "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
-                    (ch, ct, time.time()),
-                )
-            )
-            d["content"] = f"@@hash:{content_hash}"
-            active_blocks_meta[k] = d
-
-        serializable = {
-            "active_blocks": active_blocks_meta,
-            "recent_changes": [b.dict() for b in state["recent_changes"]],
-            "committed_changes": [b.dict() for b in state["committed_changes"]],
-            "feedback_history": [fb.dict() for fb in state["feedback_history"]],
-            "message_count": state["message_count"],
-            "last_compression_timestamp": state.get("last_compression_timestamp", 0),
-            "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
-            "last_cleanup_suggestion_msg_idx": state.get(
-                "last_cleanup_suggestion_msg_idx", 0
-            ),
-            "has_any_calls": state.get("has_any_calls", False),
-            "last_cot_level": state.get("last_cot_level", 0),
-            "conversation_summaries": state.get("conversation_summaries", []),
-        }
-
-        def _write():
-            self._f._db_conn.execute(
-                "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
-                (project_id, json.dumps(serializable), time.time()),
-            )
-            self._f._db_conn.commit()
-
-        await self._db_enqueue(_write)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Database lifecycle (init, load, rebuild)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. Database lifecycle (DDL, connection, worker)
+    # ═══════════════════════════════════════════════════════════════════════
 
     def init_db(self) -> None:
-        """Create tables and indexes (idempotent)."""
+        """
+        Create all necessary tables and indexes (idempotent).
+
+        Called once during Filter initialization.
+        """
         db_path = self._f.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._f._db_conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -6005,185 +6426,19 @@ class StateStore:
         """)
         self._f._db_conn.commit()
 
-    def _load_state_from_db(self, project_id: str) -> Optional[dict]:
-        """Load conversation state from SQLite. Returns None if it does not exist."""
-        cur = self._f._db_conn.execute(
-            "SELECT state_json FROM conversation_state WHERE project_id = ?",
-            (project_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        data = json.loads(row[0])
-
-        # Ensure expected keys with default values
-        for key in [
-            "feedback_history",
-            "last_compression_timestamp",
-            "last_suggestion_timestamp",
-            "has_any_calls",
-            "last_cot_level",
-        ]:
-            data.setdefault(key, [] if key == "feedback_history" else 0)
-        data.setdefault("last_cleanup_suggestion_msg_idx", 0)
-
-        # Detection of corruption in active_blocks
-        raw_active = data.get("active_blocks")
-        if raw_active is None:
-            self._f._log_debug(
-                "⚠️  CORRUPT STATE: 'active_blocks' is missing or null in DB. "
-                "To fix, delete the database file: %s and restart."
-                % self._f.valves.state_db_path
-            )
-            raw_active = {}
-        elif not isinstance(raw_active, dict):
-            self._f._log_debug(
-                "⚠️  CORRUPT STATE: 'active_blocks' is not a dict (type=%s). "
-                "Resetting to empty. If problems persist, delete the DB file: %s"
-                % (type(raw_active).__name__, self._f.valves.state_db_path)
-            )
-            raw_active = {}
-
-        active = {}
-        for k, v in raw_active.items():
-            try:
-                content_field = v.get("content", "")
-                if content_field.startswith("@@hash:"):
-                    content_hash = content_field[7:]
-                    cur2 = self._f._db_conn.execute(
-                        "SELECT content FROM code_contents WHERE hash = ?",
-                        (content_hash,),
-                    )
-                    row2 = cur2.fetchone()
-                    if row2:
-                        v["content"] = row2[0]
-                    else:
-                        v["content"] = f"[Content not found for hash {content_hash}]"
-                v["content_type"] = (
-                    ContentType(v["content_type"])
-                    if "content_type" in v
-                    else ContentType.GENERAL
-                )
-                blk = CodeBlock(**v)
-                if blk.last_mentioned_msg_idx is None:
-                    blk.last_mentioned_msg_idx = data.get("message_count", 0)
-                active[k] = blk
-            except Exception:
-                self._f._log_debug("Skipping corrupted block %s in state DB" % k)
-
-        # Restore other collections
-        recent = []
-        for b in data.get("recent_changes", []):
-            try:
-                b["content_type"] = (
-                    ContentType(b["content_type"])
-                    if "content_type" in b
-                    else ContentType.GENERAL
-                )
-                recent.append(CodeBlock(**b))
-            except Exception:
-                pass
-
-        committed = []
-        for b in data.get("committed_changes", []):
-            try:
-                b["content_type"] = (
-                    ContentType(b["content_type"])
-                    if "content_type" in b
-                    else ContentType.GENERAL
-                )
-                committed.append(CodeBlock(**b))
-            except Exception:
-                pass
-
-        feedback = [
-            AppliedChangeFeedback(**fb) for fb in data.get("feedback_history", [])
-        ]
-
-        state = {
-            "active_blocks": active,
-            "recent_changes": recent,
-            "committed_changes": committed,
-            "feedback_history": feedback,
-            "message_count": data.get("message_count", 0),
-            "last_compression_timestamp": data.get("last_compression_timestamp", 0),
-            "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
-            "has_any_calls": data.get("has_any_calls", False),
-            "last_cleanup_suggestion_msg_idx": data.get(
-                "last_cleanup_suggestion_msg_idx", 0
-            ),
-            "last_cot_level": data.get("last_cot_level", 0),
-            "conversation_summaries": data.get("conversation_summaries", []),
-            "summarized_turn_hwm": data.get("summarized_turn_hwm", 0),
-        }
-
-        # Recalculate cached token counts
-        for blk in (
-            list(state["active_blocks"].values())
-            + state["recent_changes"]
-            + state["committed_changes"]
-        ):
-            if self._f.tokenizer:
-                blk._cached_token_count = len(self._f.tokenizer.encode(blk.content))
-            else:
-                blk._cached_token_count = len(blk.content) // 4
-
-        # ── Restore persisted docstrings from SQLite into memory ──
-        try:
-            cur = self._f._db_conn.execute(
-                "SELECT symbol_name, docstring FROM symbol_docstrings WHERE project_id = ?",
-                (project_id,),
-            )
-            rows = cur.fetchall()
-            if rows:
-                doc_map = {row[0]: row[1] for row in rows}
-                for block in state["active_blocks"].values():
-                    if block.obsolete:
-                        continue
-                    for sym in block.symbols:
-                        if sym.docstring:
-                            continue
-                        # ── FIX 10: Resolve qualified id and try exact match first ──
-                        qid = qualify_symbol_name(
-                            sym.name, sym.parent_symbol, sym.file_path
-                        )
-                        # qid covers methods (Class.method); the bare-name fallback
-                        # covers module functions persisted under their bare name
-                        # (silent ingestion, file_path=None).
-                        doc = doc_map.get(qid) or doc_map.get(sym.name)
-                        if doc:
-                            sym.docstring = doc
-                            self._f._symbol_index.update_docstring(qid, project_id, doc)
-        except Exception as e:
-            self._f._log_debug(f"Failed to load persisted docstrings: {e}")
-
-        return state
-
-    def _rebuild_symbol_index(self, state: dict, project_id: str) -> None:
-        """Reconstruct the SymbolIndex when loading state from cold storage."""
-        for block in state.get("active_blocks", {}).values():
-            if block.obsolete:
-                continue
-            for sym in block.symbols:
-                self._f._symbol_index.add(sym, block.hash, project_id)
-                caller_qid = qualify_symbol_name(
-                    sym.name, sym.parent_symbol, sym.file_path
-                )
-                for callee in sym.calls:
-                    edge = Edge(
-                        src=caller_qid,
-                        dst=callee,
-                        type="calls",
-                        weight=EDGE_WEIGHTS["calls"],
-                    )
-                    self._f._symbol_index.add_edge(edge, project_id)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 3. DB write queue (serialised, non-blocking writes)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
+    # 2. Database write queue (serialised, non-blocking writes)
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _db_enqueue(self, fn, args=(), kwargs=None) -> None:
-        """Enqueue a write operation on the DB worker queue."""
+        """
+        Enqueue a database write operation to the worker queue.
+
+        Args:
+            fn: Callable to execute.
+            args: Positional arguments.
+            kwargs: Keyword arguments (default: empty dict).
+        """
         if kwargs is None:
             kwargs = {}
         await self._f._db_write_queue.put((fn, args, kwargs))
@@ -6221,9 +6476,65 @@ class StateStore:
                         else:
                             raise
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Maintenance (checkpoints)
-    # ═══════════════════════════════════════════════════════════════════════════
+    def _db_conn_write_sync(self, project_id: str, state: ConversationState) -> None:
+        """
+        Synchronous write of ConversationState to SQLite (used by LRU eviction).
+
+        This method bypasses the async queue and writes directly to the DB.
+        It is only intended for emergency flushes during eviction to avoid data loss.
+
+        Args:
+            project_id: The project identifier.
+            state: The ConversationState to persist.
+        """
+        # Serialize the state (logic mirrored from _save_to_db)
+        active_blocks_meta = {}
+        for k, v in state.active_blocks.items():
+            d = v.dict()
+            d["content_type"] = v.content_type.value
+            content_hash = v.hash
+            # Insert content if not present (synchronous)
+            self._f._db_conn.execute(
+                "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
+                (content_hash, v.content, time.time()),
+            )
+            d["content"] = f"@@hash:{content_hash}"
+            active_blocks_meta[k] = d
+
+        serializable = {
+            "active_blocks": active_blocks_meta,
+            "recent_changes": [b.dict() for b in state.recent_changes],
+            "committed_changes": [b.dict() for b in state.committed_changes],
+            "feedback_history": [fb.dict() for fb in state.feedback_history],
+            "message_count": state.message_count,
+            "last_compression_timestamp": state.last_compression_timestamp,
+            "last_suggestion_timestamp": state.last_suggestion_timestamp,
+            "last_cleanup_suggestion_msg_idx": state.last_cleanup_suggestion_msg_idx,
+            "has_any_calls": state.has_any_calls,
+            "last_cot_level": state.last_cot_level,
+            "conversation_summaries": state.conversation_summaries,
+            "summarized_turn_hwm": state.summarized_turn_hwm,
+            "history_blocked_age": state.history_blocked_age,
+            "wm_fired": state.wm_fired,
+            "wm_msgs_evicted": state.wm_msgs_evicted,
+            "wm_turns_evicted": state.wm_turns_evicted,
+            "wm_summary_ok": state.wm_summary_ok,
+            "wm_emergency_cap": state.wm_emergency_cap,
+            "wm_batch_too_small": state.wm_batch_too_small,
+            "wm_no_slot": state.wm_no_slot,
+            "wm_degradation_guard": state.wm_degradation_guard,
+            "pending_slot_resave": state.pending_slot_resave,
+        }
+
+        self._f._db_conn.execute(
+            "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
+            (project_id, json.dumps(serializable), time.time()),
+        )
+        self._f._db_conn.commit()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. Maintenance (checkpoints)
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def run_db_checkpoints(self) -> None:
         """Run SQLite WAL checkpoint and ChromaDB persist."""
@@ -6241,15 +6552,22 @@ class StateStore:
         except Exception as e:
             self._f._log_debug(f"ChromaDB checkpoint error: {e}")
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Edge & path persistence
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
+    # 4. Edge persistence
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def save_symbol_edges_to_db(self, project_id: str) -> int:
         """
-        Persist the typed edges from the SymbolIndex to SQLite.
+        Persist typed edges from the SymbolIndex to SQLite.
+
         Saves alongside the current code_state_hash for invalidation detection.
         Returns the number of edges saved.
+
+        Args:
+            project_id: The current project identifier.
+
+        Returns:
+            int: Number of edges persisted.
         """
         if not self._f.valves.enable_edge_persistence:
             return 0
@@ -6300,8 +6618,15 @@ class StateStore:
     async def load_symbol_edges_from_db(self, project_id: str) -> int:
         """
         Restore typed edges from SQLite.
+
         Only restores if the saved code_state_hash matches the current state.
         Returns the number of edges restored (0 if stale or no data).
+
+        Args:
+            project_id: The current project identifier.
+
+        Returns:
+            int: Number of edges restored.
         """
         if not self._f.valves.enable_edge_persistence:
             return 0
@@ -6314,9 +6639,6 @@ class StateStore:
         current_code_hash = self._f._activation.compute_code_state_hash(project_id)
         if not current_code_hash:
             return 0  # no active code
-
-        # Check if the saved hash matches
-        import anyio
 
         meta_row = await anyio.to_thread.run_sync(
             lambda: self._f._db_conn.execute(
@@ -6339,7 +6661,6 @@ class StateStore:
             )
             return 0
 
-        # Hash matches → restore edges
         rows = await anyio.to_thread.run_sync(
             lambda: self._f._db_conn.execute(
                 "SELECT src, dst, type, weight, confidence "
@@ -6366,8 +6687,18 @@ class StateStore:
         )
         return count
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # 5. Path view persistence
+    # ═══════════════════════════════════════════════════════════════════════
+
     async def save_path_views_to_db(self, project_id: str, views: list) -> None:
-        """Persist CodePathViews to SQLite, replacing any existing views for the project."""
+        """
+        Persist CodePathViews to SQLite, replacing any existing views for the project.
+
+        Args:
+            project_id: The current project identifier.
+            views: List of CodePathView objects to persist.
+        """
 
         def _write():
             self._f._db_conn.execute(
@@ -6397,9 +6728,15 @@ class StateStore:
         await self._db_enqueue(_write)
 
     async def load_path_views_from_db(self, project_id: str) -> list:
-        """Carga las CodePathViews almacenadas en SQLite para un proyecto."""
-        import anyio
+        """
+        Load CodePathViews from SQLite for a project.
 
+        Args:
+            project_id: The current project identifier.
+
+        Returns:
+            list: List of CodePathView objects (may be empty).
+        """
         rows = await anyio.to_thread.run_sync(
             lambda: self._f._db_conn.execute(
                 "SELECT path_id, entry_point, seed_nodes_json, induced_nodes_json, "
@@ -6433,18 +6770,32 @@ class StateStore:
                 self._f._log_debug(f"Skipping corrupt CodePathView: {e}")
         return views
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # 6. Orphan data cleanup
+    # ═══════════════════════════════════════════════════════════════════════
+
     async def purge_orphaned_data(self, project_id: str) -> int:
         """
         Remove rows from code_contents, symbol_docstrings, and symbol_cfg
         that no longer correspond to active blocks or symbols.
+
         Returns the total number of rows deleted.
+
+        Args:
+            project_id: The current project identifier.
+
+        Returns:
+            int: Total number of rows purged.
         """
-        state = self._f._conversation_state.get(project_id)
-        if not state:
+        state = self._f._conversation_state_manager.get(project_id)
+        if (
+            not state.active_blocks
+            and not self._f._symbol_index.get_all_qualified_names(project_id)
+        ):
             return 0
 
         active_qids = self._f._symbol_index.get_all_qualified_names(project_id)
-        active_hashes = set(state.get("active_blocks", {}).keys())
+        active_hashes = set(state.active_blocks.keys())
 
         total_deleted = 0
 
@@ -6452,7 +6803,6 @@ class StateStore:
             nonlocal total_deleted
             conn = self._f._db_conn
 
-            # Purge code_contents
             if active_hashes:
                 placeholders = ",".join("?" * len(active_hashes))
                 cursor = conn.execute(
@@ -6461,18 +6811,18 @@ class StateStore:
                 )
                 total_deleted += cursor.rowcount
 
-            # Purge symbol_docstrings
             if active_qids:
                 placeholders = ",".join("?" * len(active_qids))
                 cursor = conn.execute(
-                    f"DELETE FROM symbol_docstrings WHERE project_id = ? AND symbol_name NOT IN ({placeholders})",
+                    f"DELETE FROM symbol_docstrings WHERE project_id = ? "
+                    f"AND symbol_name NOT IN ({placeholders})",
                     (project_id,) + tuple(active_qids),
                 )
                 total_deleted += cursor.rowcount
 
-                # Purge symbol_cfg
                 cursor = conn.execute(
-                    f"DELETE FROM symbol_cfg WHERE project_id = ? AND symbol_name NOT IN ({placeholders})",
+                    f"DELETE FROM symbol_cfg WHERE project_id = ? "
+                    f"AND symbol_name NOT IN ({placeholders})",
                     (project_id,) + tuple(active_qids),
                 )
                 total_deleted += cursor.rowcount
@@ -6484,12 +6834,20 @@ class StateStore:
             self._f._log_debug(f"Purged {total_deleted} orphaned rows from DB")
         return total_deleted
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Project locks (reentrant async locks per project)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
+    # 7. Per‑project locks (reentrant async locks)
+    # ═══════════════════════════════════════════════════════════════════════
 
-    async def get_project_lock(self, project_id: str) -> "ReentrantAsyncLock":
-        """Return (or create) the reentrant async lock for the given project."""
+    async def get_project_lock(self, project_id: str) -> ReentrantAsyncLock:
+        """
+        Return (or create) the reentrant async lock for the given project.
+
+        Args:
+            project_id: The project identifier.
+
+        Returns:
+            ReentrantAsyncLock: The lock instance.
+        """
         async with self._f._lock_lock:
             if project_id not in self._f._project_locks:
                 self._f._project_locks[project_id] = ReentrantAsyncLock()
@@ -12794,7 +13152,8 @@ class ActivationEngine:
 
 
 class HistoryCompressor:
-    """Compresses conversation history and code blocks to keep the token
+    """
+    Compresses conversation history and code blocks to keep the token
     budget under control without losing essential information.
 
     Provides:
@@ -12820,14 +13179,20 @@ class HistoryCompressor:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the HistoryCompressor with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._f = filter_ref
         # block.hash -> in-flight background summary task, to avoid firing
         # a second summary attempt for the same block while one is pending.
         self._pending_block_summaries: Set[str] = set()
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 1. Code history compression (multi‑phase code parts → summaries)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def compress_code_history(self, messages: list, project_id: str) -> list:
         """
@@ -12841,6 +13206,10 @@ class HistoryCompressor:
           5. If NOT indexed: increment blocked age; if age exceeds
              code_history_force_compress_after_turns, force compression
              WITHOUT an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
+
+        This method now uses ConversationState.history_blocked_age (persistent)
+        instead of ProjectStateManager (volatile), ensuring that the blocked-age
+        counter survives server restarts.
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
@@ -12858,10 +13227,10 @@ class HistoryCompressor:
         keep = self._f.valves.code_history_keep_last_n_parts
         force_after = self._f.valves.code_history_force_compress_after_turns
 
-        # --- Load blocked-age tracking from per-project state ---
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        blocked_age = pstate.get("history_blocked_age", {})
-        modified_blocked = False
+        # --- Load blocked-age tracking from persistent ConversationState ---
+        state = self._f._conversation_state_manager.get(project_id)
+        blocked_age = state.history_blocked_age  # mutable dict, modified in-place
+        dirty = False  # track whether we modified blocked_age
 
         # Collect indices of uncompressed code-part messages
         code_part_indices: List[Tuple[int, int, int]] = []
@@ -12897,9 +13266,9 @@ class HistoryCompressor:
                         code_part_indices.append((i, 1, 1))
 
         if len(code_part_indices) <= keep:
-            # No old parts to compress; still save blocked_age if modified
-            if modified_blocked:
-                pstate["history_blocked_age"] = blocked_age
+            # No old parts to compress; still save dirty if modified
+            if dirty:
+                self._f._conversation_state_manager.mark_dirty(project_id)
             return messages
 
         to_compress = code_part_indices[:-keep]
@@ -12925,7 +13294,7 @@ class HistoryCompressor:
             if not safe:
                 # Increment blocked age
                 blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
-                modified_blocked = True
+                dirty = True
                 age = blocked_age[msg_key]
 
                 # Log the block with more detail
@@ -12971,7 +13340,7 @@ class HistoryCompressor:
             # Reset blocked age for this message since it was successfully compressed
             if msg_key in blocked_age:
                 del blocked_age[msg_key]
-                modified_blocked = True
+                dirty = True
 
             self._f._log_debug(
                 f"Code history: compressed Part {part_num}/{total_parts} — "
@@ -12981,8 +13350,8 @@ class HistoryCompressor:
             )
 
         # Save updated blocked_age if modified
-        if modified_blocked:
-            pstate["history_blocked_age"] = blocked_age
+        if dirty:
+            self._f._conversation_state_manager.mark_dirty(project_id)
 
         if compressed_n:
             self._f._log_debug(
@@ -13114,9 +13483,9 @@ class HistoryCompressor:
 
         return "\n".join(lines)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 2. Lean user code compression (replace large user code blocks with stubs)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def lean_user_code_messages(self, messages: list, project_id: str) -> list:
         """
@@ -13244,9 +13613,9 @@ class HistoryCompressor:
 
         return new_messages
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 3. Refactor state injection
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def build_refactor_state_injection(self, messages: list) -> str:
         """
@@ -13294,9 +13663,9 @@ class HistoryCompressor:
 
         return "\n".join(lines)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 4. LLMLingua‑2 code block compression
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def compress_code_block(
         self,
@@ -13441,9 +13810,9 @@ class HistoryCompressor:
             self._f._log_debug(f"LLMLingua-2 compression failed: {e} — using original")
             return code
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 5. Message summarization (for trimmed old messages)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def summarize_messages(
         self, old_messages: list, is_code_context: bool = False
@@ -13474,9 +13843,9 @@ class HistoryCompressor:
         )
         return summary.strip() if summary else None
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 6. Proactive summarization suggestion
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def check_and_suggest_summarization(
         self,
@@ -13496,9 +13865,9 @@ class HistoryCompressor:
             )
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 7. Oversized block summary generation (fire-and-forget)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def schedule_block_summary(self, block: "CodeBlock", project_id: str) -> None:
         """
@@ -13524,8 +13893,7 @@ class HistoryCompressor:
                 await self.maybe_generate_block_summary(block)
                 if block.block_summary:
                     # Mark state dirty so the next save_state_if_dirty() persists it.
-                    state = self._f._state_store.get_state(project_id)
-                    self._f._state_store.set_state(project_id, state)
+                    self._f._conversation_state_manager.mark_dirty(project_id)
             except Exception as exc:
                 self._f._log_debug(f"Background block summary failed: {exc}")
             finally:
@@ -16045,28 +16413,34 @@ class WindowManager:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the WindowManager with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._f = filter_ref
         # Phase 3 seam: turn that separates raw band from compressible band.
         # In Phase 1 it is updated but nobody reads it.
         self._frontier_c_turn: int = 0
 
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 1. Public entry point
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def apply(
         self,
         messages: List[dict],
-        state: dict,
+        state: ConversationState,
         project_id: str,
         slot_free: bool,
     ) -> Tuple[List[dict], str]:
         """
-        Applies the history window policy.
+        Apply the history window policy.
 
         Args:
             messages:    full list (system + history)
-            state:       conversation state for the project
+            state:       ConversationState for the project (persistent)
             project_id:  project identifier
             slot_free:   if False, no summaries are generated
 
@@ -16079,7 +16453,7 @@ class WindowManager:
         """
         v = self._f.valves
 
-        # ── 0. Clean orphan tool calls at front ────────────────────────
+        # ── 0. Clean orphan tool calls at front ──────────────────────────
         # (migrated from _trim_and_summarize preserve_tool_calls)
         if v.preserve_tool_calls:
             while messages and messages[0].get("role") == "tool":
@@ -16098,7 +16472,7 @@ class WindowManager:
                 if not tool_call_ids.issubset(tool_response_ids):
                     messages = messages[1:]
 
-        # ── 1. AutoContinue deferral ──────────────────────────────────
+        # ── 1. AutoContinue deferral ──────────────────────────────────────
         if v.compaction_defer_during_autocontinue and self._is_autocontinue_active(
             messages
         ):
@@ -16107,34 +16481,34 @@ class WindowManager:
             )
             return messages, ""
 
-        # ── 2. Separate system / history ──────────────────────────────
+        # ── 2. Separate system / history ──────────────────────────────────
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         history = [m for m in messages if m.get("role") != "system"]
         if not history:
             return messages, ""
 
-        # ── 3. Effective budget ──────────────────────────────────────
+        # ── 3. Effective budget ──────────────────────────────────────────
         budget = self._effective_budget(project_id)
 
-        # ── 4. Turn indexing ──────────────────────────────────────────
+        # ── 4. Turn indexing ──────────────────────────────────────────────
         turns, _total_turns = self._index_turns(history)
 
-        # ── 5. Compute frontier ───────────────────────────────────────
+        # ── 5. Compute frontier ───────────────────────────────────────────
         kept, old_msgs, cut_turn = self._compute_frontier(history, turns, budget)
         self._frontier_c_turn = cut_turn  # Phase 3 seam
 
-        # ── 6. Everything fits ────────────────────────────────────────
+        # ── 6. Everything fits ────────────────────────────────────────────
         if not old_msgs:
             return sys_msgs + kept, ""
 
-        # ── 7. Emergency cap ──────────────────────────────────────────
+        # ── 7. Emergency cap ──────────────────────────────────────────────
         kept, old_msgs = self._apply_emergency_cap(
             history, turns, kept, old_msgs, budget
         )
         if not old_msgs:
             return sys_msgs + kept, ""
 
-        # ── 8. Minimum batch ──────────────────────────────────────────
+        # ── 8. Minimum batch ──────────────────────────────────────────────
         old_turn_nums = {t for m, t in zip(history, turns) if m in old_msgs}
         if len(old_turn_nums) < v.summarize_batch_turns:
             self._f._log_debug(
@@ -16144,7 +16518,7 @@ class WindowManager:
             )
             return sys_msgs + history, ""
 
-        # ── 9. Summarize batch ──────────────────────────────────────
+        # ── 9. Summarize batch ────────────────────────────────────────────
         if not slot_free:
             self._f._log_debug("WindowManager: no free slot, keeping raw history")
             return sys_msgs + history, ""
@@ -16161,7 +16535,7 @@ class WindowManager:
             )
             return sys_msgs + history, ""
 
-        # ── 10. Persist ─────────────────────────────────────────────
+        # ── 10. Persist ──────────────────────────────────────────────────
         pending = await self._persist(
             summary_text=summary_text,
             old_msgs=old_msgs,
@@ -16172,12 +16546,12 @@ class WindowManager:
             slot_free=slot_free,
         )
 
-        # ── 11. Return trimmed history ──────────────────────────────
+        # ── 11. Return trimmed history ──────────────────────────────────
         return sys_msgs + kept, pending
 
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 2. Calculation helpers (no side effects)
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _effective_budget(self, project_id: str) -> int:
         """
@@ -16195,7 +16569,9 @@ class WindowManager:
         return max(0, budget)
 
     def _token_count(self, text: str) -> int:
-        """Counts tokens with tokenizer if available, else 4 chars/token heuristic."""
+        """
+        Count tokens with tokenizer if available, else 4 chars/token heuristic.
+        """
         if self._f.tokenizer:
             return len(self._f.tokenizer.encode(text))
         return max(1, len(text) // 4)
@@ -16203,7 +16579,7 @@ class WindowManager:
     @staticmethod
     def _index_turns(history: List[dict]) -> Tuple[List[int], int]:
         """
-        Assigns a 1-based turn number to each message.
+        Assign a 1-based turn number to each message.
         Each user message increments the counter.
         Assistant/tool messages share the turn number of the preceding user.
         Returns (turns_per_message, total_turns).
@@ -16223,7 +16599,7 @@ class WindowManager:
         budget: int,
     ) -> Tuple[List[dict], List[dict], int]:
         """
-        Computes the window frontier.
+        Compute the window frontier.
         Iterates from the most recent message backwards, accumulating tokens.
         The frontier is aligned to full turn boundaries (never cuts a turn in half).
 
@@ -16306,9 +16682,9 @@ class WindowManager:
         ct = s.get("covers_turns")
         return float(ct[0]) if ct else float(s.get("created_at", 0))
 
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 3. Persistence (side effects: state, LTM, consolidation)
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _persist(
         self,
@@ -16316,12 +16692,12 @@ class WindowManager:
         old_msgs: List[dict],
         turns: List[int],
         history: List[dict],
-        state: dict,
+        state: ConversationState,
         project_id: str,
         slot_free: bool,
     ) -> str:
         """
-        Persists the generated summary:
+        Persist the generated summary:
           a. Unified metadata → conversation_summaries.
           b. L1 cap.
           c. Update summarized_turn_hwm (manager owns the hwm).
@@ -16334,7 +16710,7 @@ class WindowManager:
         system prompt (same format as _trim_and_summarize returned).
         """
         v = self._f.valves
-        old_hwm = state.get("summarized_turn_hwm", 0)
+        old_hwm = state.summarized_turn_hwm
 
         old_turn_nums = [t for m, t in zip(history, turns) if m in old_msgs]
         new_hwm = max(old_turn_nums) if old_turn_nums else old_hwm
@@ -16347,28 +16723,28 @@ class WindowManager:
             "covers_turns": [old_hwm + 1, new_hwm],
             "level": 1,
         }
-        state["conversation_summaries"].append(summary_entry)
+        state.conversation_summaries.append(summary_entry)
 
         # b. L1 cap
         max_l1 = v.max_conversation_summaries
         if max_l1 > 0:
-            l1 = [s for s in state["conversation_summaries"] if s.get("level", 1) == 1]
+            l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
             if len(l1) > max_l1:
                 keep_ids = {id(s) for s in l1[-max_l1:]}
-                state["conversation_summaries"] = [
+                state.conversation_summaries = [
                     s
-                    for s in state["conversation_summaries"]
+                    for s in state.conversation_summaries
                     if s.get("level", 1) != 1 or id(s) in keep_ids
                 ]
 
         # c. Manager owns the hwm
-        state["summarized_turn_hwm"] = new_hwm
+        state.summarized_turn_hwm = new_hwm
 
-        # ── Instrumentación persistente: escribir en state, no en pstate ──
-        state["_wm_fired"] = True
-        state["_wm_summary_ok"] = True
-        state["_wm_msgs_evicted"] = len(old_msgs)
-        state["_wm_turns_evicted"] = new_hwm - old_hwm
+        # ── Instrumentation: write metrics to state, not pstate ──
+        state.wm_fired = True
+        state.wm_summary_ok = True
+        state.wm_msgs_evicted = len(old_msgs)
+        state.wm_turns_evicted = new_hwm - old_hwm
 
         self._f._log_debug(
             f"WindowManager: L1 summary generated "
@@ -16382,7 +16758,7 @@ class WindowManager:
 
         # e. Consolidate L1→L2
         l1_count = sum(
-            1 for s in state["conversation_summaries"] if s.get("level", 1) == 1
+            1 for s in state.conversation_summaries if s.get("level", 1) == 1
         )
         if (
             slot_free
@@ -16396,41 +16772,41 @@ class WindowManager:
         # f. Phase 2 seam (no-op in Phase 1)
         self._on_frontier_advance(old_hwm, new_hwm)
 
-        # g. Persist state (esto guarda las métricas _wm_* en SQLite)
-        self._f._state_store.set_state(project_id, state)
+        # g. Persist state using ConversationStateManager
+        self._f._conversation_state_manager.set(project_id, state)
 
         return f"[Summary of earlier conversation]\n{summary_text}"
 
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 4. Seams and static helpers
-    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _on_frontier_advance(self, old_hwm: int, new_hwm: int) -> None:
         """
         Phase 2: KV-freeze after history eviction.
-    
+
         When WindowManager evicts turns and generates a summary, the history
         before the frontier disappears from the context. If the server's KV
         cache still contains those pre-filled tokens, subsequent requests
         would have to re-prefill the entire new system+history sequence.
-    
+
         By saving the slot immediately after eviction (force=True), the .bin
         file captures the KV state with the new stabilized prefix (Block A + summary).
         The next request restores from that checkpoint instead of re-prefilling
         from scratch.
-    
+
         force=True bypasses the static hash guard (history changed, but Block A
         did not, so the hash doesn't change and without force the slot would
         not be saved). The slot_save_max_context_tokens guard is always respected.
         """
         if old_hwm >= new_hwm:
             return  # no real advance, nothing to freeze
-    
+
         self._f._log_debug(
             f"Phase 2 KV-freeze: frontier advanced hwm {old_hwm}→{new_hwm}, "
             "scheduling slot_save(force=True)"
         )
-    
+
         # asyncio.create_task works because _on_frontier_advance is called
         # from _persist(), which is a coroutine running inside the event loop.
         project_id = self._f._inlet_orch.get_project_id()
@@ -16460,7 +16836,8 @@ class WindowManager:
 
 
 class MessageAssembler:
-    """Final processing of the message list before it is sent to the LLM.
+    """
+    Final processing of the message list before it is sent to the LLM.
 
     Orchestrates, in order:
     * Chain‑of‑Thought detection and reasoning generation (Level 1‑3).
@@ -16470,7 +16847,7 @@ class MessageAssembler:
     * Multi‑phase protocol injection when the token budget is tight.
     * Adaptive trimming of old messages with optional summarisation.
     * Assembly of the final system prompt (Block A + Block B) and its
-      injection as the first message.
+        injection as the first message.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -16485,9 +16862,9 @@ class MessageAssembler:
         # WindowManager: unified history window policy (replaces M1, M3, M4)
         self._window_manager = WindowManager(filter_ref)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 1. Main orchestration
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def assemble(
         self,
@@ -16498,7 +16875,7 @@ class MessageAssembler:
         prelim_system: str,
         last_user_msg: Optional[dict],
         is_code_session: bool,
-        state: dict,
+        state: ConversationState,
         __user__: Optional[dict],
         user_question: str,
         has_code_blocks: bool,
@@ -16515,7 +16892,7 @@ class MessageAssembler:
             prelim_system: The preliminary system prompt (Block A + Block B).
             last_user_msg: The last user message, if any.
             is_code_session: Whether the session is code-aware.
-            state: The conversation state for the project.
+            state: The ConversationState for the project.
             __user__: The user context from OpenWebUI.
             user_question: The extracted question from the user message.
             has_code_blocks: Whether the user message contained code fences.
@@ -16554,6 +16931,7 @@ class MessageAssembler:
 
         # 4. WindowManager: unified history window policy
         #    Replaces: _apply_turn_based_window (M1) + _trim_and_summarize (M3 + M4)
+        #    ✅ state se pasa directamente (ya es ConversationState)
         messages, pending_summary = await self._window_manager.apply(
             messages, state, project_id, slot_free
         )
@@ -16568,10 +16946,8 @@ class MessageAssembler:
             slot_free,
         )
 
-        # 6. Trim and summarize old messages
-        #    NOTE: Step 6 (_trim_and_summarize) has been removed.
-        #    Its functionality is now fully handled by WindowManager in step 4.
-        #    The pending_summary variable is already populated from step 4.
+        # 6. Trim and summarize old messages (now handled by WindowManager)
+        #    No action needed here; pending_summary is already populated.
 
         # 7. Assemble final system message and inject into message list
         messages = self._assemble_final_system_and_log(
@@ -16580,16 +16956,16 @@ class MessageAssembler:
 
         return messages
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 2. Chain‑of‑Thought (CoT) detection and generation
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _detect_and_generate_cot(
         self,
         dynamic_injections: List[Tuple[str, str]],
         last_user_msg: Optional[dict],
         is_code_session: bool,
-        state: dict,
+        state: ConversationState,
         user_question: str,
         prelim_system: str,
         project_id: str,
@@ -16899,9 +17275,9 @@ class MessageAssembler:
             )
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 3. Code history compression & lean user code
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _compress_code_history_and_lean(
         self,
@@ -17041,19 +17417,12 @@ class MessageAssembler:
 
         return out
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Turn‑based window management
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
+    # 4. Turn‑based window management (now handled by WindowManager)
+    # ═══════════════════════════════════════════════════════════════════════
 
-    def _is_autocontinue_active(self, messages: List[dict]) -> bool:
-        """True if the last assistant message ended with a multi‑part continuation marker."""
-        last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        if not last_assistant:
-            return False
-        content = last_assistant.get("content", "")
-        return any(marker in content for marker in self._f._MULTI_PHASE_MARKERS)
+    # Los siguientes métodos auxiliares se mantienen sin cambios, ya que
+    # no tocan el estado persistente directamente (usan LTM o helpers).
 
     async def _persist_turn_summary_to_ltm(
         self, summary: str, project_id: str, turn_start: int, turn_end: int
@@ -17142,7 +17511,7 @@ class MessageAssembler:
 
     async def _consolidate_summaries(
         self,
-        state: dict,
+        state: ConversationState,
         project_id: str,
         slot_free: bool,
     ) -> None:
@@ -17150,11 +17519,11 @@ class MessageAssembler:
         Consolidate L1 summaries into L2 and apply level-aware cap.
 
         Args:
-            state: The conversation state for the project.
+            state: The ConversationState for the project.
             project_id: The project identifier.
             slot_free: Whether the LLM slot is free for auxiliary calls.
         """
-        summaries = state.get("conversation_summaries", [])
+        summaries = state.conversation_summaries
         if not summaries:
             return
 
@@ -17196,15 +17565,17 @@ class MessageAssembler:
             l1 = l1[-max_l1:]
         if max_l2 > 0:
             l2 = l2[-max_l2:]
-        state["conversation_summaries"] = sorted(
+        # Reassign to state attribute
+        state.conversation_summaries = sorted(
             l2 + l1,
             key=WindowManager._summary_sort_key,
         )
-        self._f._state_store.set_state(project_id, state)
+        # ✅ Persistir el estado mediante ConversationStateManager
+        self._f._conversation_state_manager.set(project_id, state)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 5. Multi‑phase instructions injection
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _inject_multi_phase_instructions(
         self,
@@ -17267,9 +17638,9 @@ class MessageAssembler:
                 f"{self._f.valves.multi_phase_response_threshold} and force=False)."
             )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 6. Final system assembly & logging
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _assemble_final_system_and_log(
         self,
@@ -17453,7 +17824,8 @@ class MessageAssembler:
 # ContextDumper — per-turn context snapshots for evolution tracking
 # ---------------------------------------------------------------------------
 class ContextDumper:
-    """Captures per‑turn context snapshots and writes them to disk for
+    """
+    Captures per‑turn context snapshots and writes them to disk for
     offline evolution tracking — the operator can follow how the context
     grows and when the Block‑A KV‑cache prefix changes across a
     conversation.
@@ -17474,12 +17846,18 @@ class ContextDumper:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the ContextDumper with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._f = filter_ref
         self._tasks: Set[asyncio.Task] = set()
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 1. Public API – schedule snapshot capture
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def schedule_inlet_snapshot(
         self,
@@ -17495,11 +17873,17 @@ class ContextDumper:
 
         Called from a synchronous context inside the async inlet, so a running
         loop exists; if it does not (unexpected), fall back to a blocking write.
+
+        Args:
+            project_id: The project identifier.
+            static_block: The rendered Block A (static, KV-cacheable).
+            dynamic_block: The rendered Block B (dynamic, per-query).
+            final_system: The fully assembled system prompt.
+            messages: The final message list sent to the LLM.
         """
         if not self._f.valves.enable_context_dump:
             return
 
-        # Log para saber que se ha programado un volcado
         self._f._log_debug(f"📸 Scheduling context dump for project '{project_id}'")
 
         payload = self._capture_payload(
@@ -17517,9 +17901,9 @@ class ContextDumper:
             except Exception as exc:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 2. Payload capture (sync, cheap, mutation‑safe)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _capture_payload(
         self,
@@ -17531,6 +17915,9 @@ class ContextDumper:
     ) -> dict:
         """
         Snapshot strings + metadata immediately so later mutation can't race.
+
+        Returns:
+            dict: A complete payload dictionary with all context data and metrics.
         """
         max_chars = self._f.valves.context_dump_message_max_chars
         msg_copy: List[Tuple[str, str]] = []
@@ -17545,7 +17932,7 @@ class ContextDumper:
                     )
                 msg_copy.append((role, content))
 
-        # --- Resolve per-project state ---
+        # ── Resolve per-project state ─────────────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         try:
@@ -17553,14 +17940,15 @@ class ContextDumper:
         except Exception:
             code_state_hash = ""
 
-        # --- Get hashes from pstate ---
+        # ── Get hashes from pstate ────────────────────────────────────────
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
 
+        # ── Get persistent state via ConversationStateManager ─────────────
         try:
-            state = self._f._state_store.get_state(project_id)
-            turn = state.get("message_count", 0)
-            n_active_blocks = len(state.get("active_blocks", {}))
+            state = self._f._conversation_state_manager.get(project_id)
+            turn = state.message_count
+            n_active_blocks = len(state.active_blocks)
         except Exception:
             turn = 0
             n_active_blocks = 0
@@ -17570,7 +17958,7 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
-        # --- Class membership metrics ---
+        # ── Class membership metrics ──────────────────────────────────────
         try:
             all_names = self._f._symbol_index.get_all_names(project_id)
             n_with_parent = sum(
@@ -17582,27 +17970,23 @@ class ContextDumper:
         except Exception:
             n_with_parent, n_classes = 0, 0
 
-        # ── WindowManager metrics ──────────────────────────────────────────
-        # Ahora se leen de state, no de pstate, para que sean persistentes.
+        # ── WindowManager metrics (now persistent in ConversationState) ──
         try:
-            _state = self._f._state_store.get_state(project_id)
-
-            # Leer todas las métricas desde state (no desde pstate)
-            wm_fired = _state.get("_wm_fired", False)
-            wm_msgs_evicted = _state.get("_wm_msgs_evicted", 0)
-            wm_turns_evicted = _state.get("_wm_turns_evicted", 0)
-            wm_summary_ok = _state.get("_wm_summary_ok", False)
-            wm_emergency_cap = _state.get("_wm_emergency_cap", False)
-            wm_batch_too_small = _state.get("_wm_batch_too_small", False)
-            wm_no_slot = _state.get("_wm_no_slot", False)
-            wm_degradation_guard = _state.get("_wm_degradation_guard", False)
-
-            frontier_hwm = _state.get("summarized_turn_hwm", 0)
-            summaries = _state.get("conversation_summaries", [])
+            state = self._f._conversation_state_manager.get(project_id)
+            wm_fired = state.wm_fired
+            wm_msgs_evicted = state.wm_msgs_evicted
+            wm_turns_evicted = state.wm_turns_evicted
+            wm_summary_ok = state.wm_summary_ok
+            wm_emergency_cap = state.wm_emergency_cap
+            wm_batch_too_small = state.wm_batch_too_small
+            wm_no_slot = state.wm_no_slot
+            wm_degradation_guard = state.wm_degradation_guard
+            frontier_hwm = state.summarized_turn_hwm
+            summaries = state.conversation_summaries
             n_summaries_l1 = sum(1 for s in summaries if s.get("level", 1) == 1)
             n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
         except Exception:
-            # Nunca romper el dump por errores de lectura de métricas
+            # Never break the dump on reading errors
             wm_fired = wm_summary_ok = wm_emergency_cap = False
             wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
             wm_msgs_evicted = wm_turns_evicted = 0
@@ -17628,7 +18012,7 @@ class ContextDumper:
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
-            # ── WindowManager metrics (leídas de state) ─────────────────────
+            # ── WindowManager metrics (read from ConversationState) ─────────
             "wm_fired": wm_fired,
             "wm_msgs_evicted": wm_msgs_evicted,
             "wm_turns_evicted": wm_turns_evicted,
@@ -17643,11 +18027,17 @@ class ContextDumper:
             "n_summaries_l2": n_summaries_l2,
         }
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 3. Writing (async + sync)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def _write_async(self, payload: dict) -> None:
+        """
+        Asynchronously write the context snapshot to disk.
+
+        Args:
+            payload: The payload dictionary from _capture_payload.
+        """
         self._f._log_debug(f"📝 Writing context dump (turn {payload['turn']})...")
         try:
             await anyio.to_thread.run_sync(self._write_sync, payload)
@@ -17657,7 +18047,10 @@ class ContextDumper:
 
     def _write_sync(self, payload: dict) -> None:
         """
-        Render Markdown + JSONL and write to the project dump directory.
+        Synchronously render Markdown + JSONL and write to the project dump directory.
+
+        Args:
+            payload: The payload dictionary from _capture_payload.
         """
         project_dir = self._project_dir(payload["project_id"])
         os.makedirs(project_dir, exist_ok=True)
@@ -17727,9 +18120,9 @@ class ContextDumper:
         # 4. Prune old snapshots.
         self._prune(project_dir)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 4. Rendering
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _render_markdown(
         self,
@@ -17741,6 +18134,16 @@ class ContextDumper:
     ) -> str:
         """
         Render the context snapshot as Markdown for human inspection.
+
+        Args:
+            payload: The payload dictionary.
+            block_a_tokens: Token count of Block A.
+            block_b_tokens: Token count of Block B.
+            system_tokens: Total system prompt tokens.
+            history_tokens: History tokens (non-system).
+
+        Returns:
+            str: The rendered Markdown text.
         """
         lines: List[str] = []
         lines.append(
@@ -17765,7 +18168,7 @@ class ContextDumper:
         )
         lines.append(f"- classes detected: {payload['n_classes']}")
 
-        # ── WindowManager metrics (replaces compaction metrics) ────────────
+        # ── WindowManager metrics ────────────────────────────────────────────
         lines.append("")
         lines.append("### WindowManager metrics (this turn)")
         lines.append(
@@ -17816,20 +18219,35 @@ class ContextDumper:
 
         return "\n".join(lines)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 5. Directory & pruning
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _project_dir(self, project_id: str) -> str:
+        """
+        Return the project-specific dump directory path.
+
+        Args:
+            project_id: The project identifier.
+
+        Returns:
+            str: The directory path.
+        """
         slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:40] or "default"
         return os.path.join(self._f.valves.context_dump_dir.rstrip("/"), slug)
 
     def _prune(self, project_dir: str) -> None:
+        """
+        Prune old snapshots, keeping only the most recent ones.
+
+        Args:
+            project_dir: The project directory containing snapshots.
+        """
         keep = self._f.valves.context_dump_max_files_per_project
         if keep <= 0:
             return
         try:
-            # Encuentra todos los snapshots con el nuevo formato: XXXX_turn_...md
+            # Find all snapshots with the new format: XXXX_turn_...md
             snapshots = sorted(
                 f
                 for f in os.listdir(project_dir)
@@ -17849,7 +18267,8 @@ class ContextDumper:
 # ProjectStateManager — per‑project volatile state (SRP)
 # ---------------------------------------------------------------------------
 class ProjectStateManager:
-    """Manages per‑project volatile state that lives in memory only.
+    """
+    Manages per‑project volatile state that lives in memory only.
 
     This class holds all attributes that vary by project (call‑graph mode,
     ingested language, cache keys, invalidation flags, etc.) in a dictionary
@@ -17861,7 +18280,12 @@ class ProjectStateManager:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
-        """Initialize with a reference to the parent Filter for logging and valve access."""
+        """
+        Initialize with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
         self._f = filter_ref
         self._store: dict[str, dict] = {}
 
@@ -17869,9 +18293,8 @@ class ProjectStateManager:
         """
         Factory for a fresh per-project state bag with all defaults.
 
-        Note: The `_wm_*` metrics have been moved to the persistent `state`
-        (conversation_state) to survive server restarts. They are no longer
-        stored in pstate.
+        Note: history_blocked_age has been moved to ConversationState
+        (persistent) as of Phase 1. It is no longer stored here.
         """
         return {
             # Call-graph mode
@@ -17909,15 +18332,13 @@ class ProjectStateManager:
             # LOD adaptive tracking
             "last_activation_scores": {},
             "last_lod_levels": {},
-            # ── WindowManager metrics have been moved to state, to survive server restarts ──
-            # The following keys are no longer used:
-            # "_wm_fired", "_wm_msgs_evicted", "_wm_turns_evicted",
-            # "_wm_summary_ok", "_wm_emergency_cap", "_wm_batch_too_small",
-            # "_wm_no_slot", "_wm_degradation_guard"
+            # structure_hash_for_cache is set by ContextBuilder.build_block_a
+            "structure_hash_for_cache": None,
         }
 
     def get_pstate(self, project_id: str) -> dict:
-        """Return the mutable per‑project state bag, creating it on first access.
+        """
+        Return the mutable per‑project state bag, creating it on first access.
 
         Args:
             project_id (str): The project identifier.
@@ -17935,9 +18356,9 @@ class ProjectStateManager:
         """Remove the state bag for a project (called on eviction)."""
         self._store.pop(project_id, None)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # 3 — KVCache persistence
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
 
     async def slot_save(self, project_id: str, force: bool = False) -> bool:
         """
@@ -17949,6 +18370,13 @@ class ProjectStateManager:
 
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
+
+        Args:
+            project_id: The project identifier.
+            force: Whether to force save even if the hash hasn't changed.
+
+        Returns:
+            bool: True if the slot was saved successfully.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -18020,6 +18448,12 @@ class ProjectStateManager:
 
         Uses the structural hash (signatures only) to locate the correct
         slot file, ensuring that docstring population does not cause a miss.
+
+        Args:
+            project_id: The project identifier.
+
+        Returns:
+            bool: True if the slot was restored successfully.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -18090,6 +18524,12 @@ class ProjectStateManager:
         inlet when slot_free=True.
 
         Uses the structural hash for consistency with the slot filename.
+
+        Args:
+            project_id: The project identifier.
+
+        Returns:
+            bool: True if the slot was restored successfully.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -18166,6 +18606,10 @@ class ProjectStateManager:
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """
         Delete stale slot files, keeping only the current one.
+
+        Args:
+            project_id: The project identifier.
+            keep: The filename to keep (current slot).
         """
         slot_dir = self._f.valves.slot_save_path.rstrip("/")
         if not os.path.isdir(slot_dir):
@@ -19227,6 +19671,8 @@ class Filter:
         )
 
         self._state_store = StateStore(self)
+        self._conversation_state_manager = ConversationStateManager(self)
+
         self._ltm = LongTermMemory(self)
         self._llm_orchestrator = LLMOrchestrator(self)
         self._reasoning = ReasoningEngine(self)
@@ -19247,32 +19693,6 @@ class Filter:
         self._ctx_builder = ContextBuilder(self)
         self._pager = ContextPager(self)
         self._raptor = RaptorCodeIndex()
-
-        self._conversation_state: OrderedDict = OrderedDict()
-        self._state_factory = lambda: {
-            "active_blocks": {},
-            "recent_changes": [],
-            "committed_changes": [],
-            "message_count": 0,
-            "feedback_history": [],
-            "last_compression_timestamp": 0,
-            "last_suggestion_timestamp": 0,
-            "has_any_calls": False,
-            "last_cleanup_suggestion_msg_idx": 0,
-            "last_cot_level": 0,
-            "conversation_summaries": [],
-            "summarized_turn_hwm": 0,
-            "_pending_slot_resave": False,
-            # ── instrumentation metrics ──
-            "_wm_fired": False,
-            "_wm_msgs_evicted": 0,
-            "_wm_turns_evicted": 0,
-            "_wm_summary_ok": False,
-            "_wm_emergency_cap": False,
-            "_wm_batch_too_small": False,
-            "_wm_no_slot": False,
-            "_wm_degradation_guard": False,
-        }
 
         # Patterns
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
@@ -19360,10 +19780,6 @@ class Filter:
 
         # ── Write counter for periodic tasks (RAPTOR, checkpoints) ──
         self._write_counter = 0
-
-        # State debounce
-        self._state_dirty = False
-        self._state_last_saved = 0.0
 
         # ── Silent ingestion guard ──
         self._is_silent_ingestion = False
@@ -19697,7 +20113,7 @@ class Filter:
         5. Silent ingestion when the message is a large code‑only paste.
         6. Session classification and active‑code update.
         7. System‑prompt assembly (Block A + Block B) with CoT, compression,
-           multi‑phase, and adaptive trimming.
+            multi‑phase, and adaptive trimming.
 
         Returns the modified body with the final message list ready for the LLM.
         """
@@ -19712,15 +20128,10 @@ class Filter:
 
         project_id = self._inlet_orch.get_project_id()
         slot_free = True
-        # Cold‑start guard: si no hay modelo cargado, no hay slot que liberar
         if slot_free and self._last_used_model is None:
             slot_free = False
 
-        # Cancel any pending background docstring tasks, waiting for the
-        # in‑flight one to finish so the slot is released cleanly.
         await self._enrichment.cancel_docstring_tasks()
-
-        # Reset the per‑turn lazy docstring counter so the new turn starts fresh
         self._enrichment._lazy_docstrings_generated_this_turn = 0
 
         # ─────────────────────────────────────────────────────────────────
@@ -19876,11 +20287,14 @@ class Filter:
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
 
-                self._state_dirty = True
-                await self._state_store.save_state_if_dirty(project_id)
+                # ✅ NUEVO: marcar dirty y guardar mediante ConversationStateManager
+                self._conversation_state_manager.mark_dirty(project_id)
+                await self._conversation_state_manager.save_if_dirty(project_id)
 
-                state = self._state_store.get_state(project_id)
-                num_blocks = len(state.get("active_blocks", {}))
+                state = self._conversation_state_manager.get(
+                    project_id
+                )  # 🔄 get actualizado
+                num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
@@ -19947,7 +20361,7 @@ class Filter:
         #      (delegates Block A/B construction to ContextBuilder)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        state = self._state_store.get_state(project_id)
+        state = self._conversation_state_manager.get(project_id)  # 🔄 get actualizado
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
                 messages,
@@ -20001,6 +20415,12 @@ class Filter:
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
+        # ✅ Validación de active_blocks (actualizada)
+        # Nota: state ya es un ConversationState, por lo que state.active_blocks es un dict.
+        if not isinstance(state.active_blocks, dict):
+            state.active_blocks = {}
+            self._conversation_state_manager.set(project_id, state)
+
         body["messages"] = messages
 
         _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -20022,17 +20442,17 @@ class Filter:
         Runs maintenance and persistence tasks that do not block the user:
         * Updates active code blocks and stores the new message in LTM.
         * Intercepts ``/expand`` commands in the assistant's response and
-          replaces them with real code from the SymbolIndex.
+            replaces them with real code from the SymbolIndex.
         * Stores the response in the semantic cache for future reuse.
         * Adjusts LOD thresholds adaptively based on which symbols the LLM
-          actually used.
+            actually used.
         * Runs speculative prefetch for the next likely query.
         * Purges expired memories, rebuilds RAPTOR clusters periodically,
-          and runs SQLite + ChromaDB checkpoints.
+            and runs SQLite + ChromaDB checkpoints.
         * Persists symbol edges, path views, and dirty conversation state.
         * Saves the KV slot (slot persistence) for future session restores.
         * Waits for background LLM tasks (docstrings, etc.) to finish before
-          exiting, to prevent them from blocking the next request.
+            exiting, to prevent them from blocking the next request.
 
         Returns the (possibly modified) body unchanged.
         """
@@ -20047,27 +20467,23 @@ class Filter:
         try:
             messages = body.get("messages", [])
             project_id = self._inlet_orch.get_project_id()
-            state = self._state_store.get_state(project_id)
+            state = self._conversation_state_manager.get(
+                project_id
+            )  # 🔄 get actualizado
             is_code_session = await self._inlet_orch.classify_session(
                 messages, project_id
             )
             last_msg = messages[-1] if messages else None
 
-            # --- Resolve per-project state ---
             pstate = self._project_state_manager.get_pstate(project_id)
 
             if last_msg:
                 last_idx = len(messages) - 1
 
-                # --- Always process assistant messages for indexing ---
-                # The previous guard (last_idx <= pstate.get("last_processed_message_idx"))
-                # was incorrectly skipping assistant messages because the index didn't
-                # advance in the way the guard expected. Now we process based on role.
                 if last_msg.get("role") == "assistant":
                     self._log_debug(
                         "outlet: processing assistant message for indexing and expansion"
                     )
-                    # Process /expand commands first
                     if is_code_session and "/expand" in last_msg.get("content", ""):
                         self._log_debug(
                             "🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code"
@@ -20084,7 +20500,6 @@ class Filter:
                                 "outlet: /expand intercepted — history rewritten with real code"
                             )
 
-                    # Index assistant code and store in LTM
                     await self._llm_orchestrator.wait_for_llm_tasks()
                     if is_code_session:
                         self._log_debug(
@@ -20096,9 +20511,9 @@ class Filter:
                         )
 
                         if self.valves.enable_auto_docstrings_background:
-                            state = self._state_store.get_state(project_id)
+                            state = self._conversation_state_manager.get(project_id)
                             pending = []
-                            for block in state["active_blocks"].values():
+                            for block in state.active_blocks.values():
                                 if block.obsolete:
                                     continue
                                 for sym in block.symbols:
@@ -20119,19 +20534,16 @@ class Filter:
                             )
 
                 else:
-                    # For user messages, use the existing guard to avoid double-processing
                     if last_idx <= pstate.get("last_processed_message_idx", -1):
                         self._log_debug(
                             "outlet: last user message already processed in inlet, skipping"
                         )
                     else:
-                        # Process user message (mainly LTM and background docstrings)
                         await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
                             await self._ltm.store_messages(
                                 project_id, [last_msg], wait=False
                             )
-                            # If there's code in the user message, index it
                             await self._update_active_code(last_msg, project_id)
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
@@ -20233,13 +20645,11 @@ class Filter:
             await self._ltm.purge_expired_memories()
             self._log_debug("outlet: after purge expired memories")
 
-            # ── Increment write counter (with defensive check) ────────
             if not hasattr(self, "_write_counter"):
                 self._write_counter = 0
             self._write_counter += 1
             self._log_debug(f"outlet: write_counter={self._write_counter}")
 
-            # ── Purge orphaned DB rows periodically ──
             interval = self.valves.purge_orphaned_data_interval
             if interval > 0 and self._write_counter % interval == 0:
                 await self._state_store.purge_orphaned_data(project_id)
@@ -20284,7 +20694,6 @@ class Filter:
             # ── Slot save ──────────────────────────────────────────────
             self._log_debug("outlet: before slot save")
             if self.valves.enable_slot_persistence:
-                # Track total context tokens for the threshold guard
                 try:
                     pstate["last_total_context_tokens"] = self._tokens.estimate_tokens(
                         messages
@@ -20292,7 +20701,7 @@ class Filter:
                 except Exception as e:
                     self._log_debug(f"outlet: token estimation failed: {e}")
 
-                if state and state.get("_pending_slot_resave"):
+                if state and state.pending_slot_resave:  # ✅ atributo, no dict key
                     saved = await self._project_state_manager.slot_save(
                         project_id, force=True
                     )
@@ -20300,8 +20709,10 @@ class Filter:
                         self._log_debug(
                             "Slot re-saved after compaction (stable new prefix)"
                         )
-                    state["_pending_slot_resave"] = False
-                    self._state_store.set_state(project_id, state)
+                    state.pending_slot_resave = False
+                    self._conversation_state_manager.set(
+                        project_id, state
+                    )  # ✅ set actualizado
                 else:
                     await self._project_state_manager.slot_save(project_id)
             self._log_debug("outlet: after slot save")
@@ -20341,7 +20752,8 @@ class Filter:
             self._log_debug(
                 "🔥 STATE MANAGEMENT – Saving conversation state (to preserve context across restarts)"
             )
-            await self._state_store.save_state_if_dirty(project_id)
+            # ✅ Reemplazar save_state_if_dirty por save_if_dirty
+            await self._conversation_state_manager.save_if_dirty(project_id)
 
             self._log_debug(
                 "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
@@ -20354,11 +20766,9 @@ class Filter:
             self._log_debug(traceback.format_exc())
 
         finally:
-            # ── Release silent ingestion flag at the very end ──
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
 
-            # ── Wait for background LLM tasks to complete before exiting ──
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             await self._llm_orchestrator.wait_for_llm_tasks()
             self._log_debug("outlet: background LLM tasks completed")
