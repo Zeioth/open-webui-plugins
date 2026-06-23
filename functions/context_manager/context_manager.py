@@ -3425,16 +3425,19 @@ class ContextBuilder:
         ordered = sorted(
             resolved,
             key=lambda q: (
-                last_mod.get(q, current_turn),   # oldest‑edited first → top
-                -heat.get(q, 0.0),               # hot hubs go bottom
-                q
-            )
+                last_mod.get(q, current_turn),  # oldest‑edited first → top
+                -heat.get(q, 0.0),  # hot hubs go bottom
+                q,
+            ),
         )
 
         # ── Budget cap: keep top (stable), drop bottom (volatile) ──
         budget = self._f.valves.hub_bodies_tier_max_tokens
         # Auto‑cap if multi‑phase is active (M8)
-        if self._f.valves.enable_multi_phase_response or self._f.valves.force_multi_phase_response:
+        if (
+            self._f.valves.enable_multi_phase_response
+            or self._f.valves.force_multi_phase_response
+        ):
             budget = min(budget, 6000)
             self._f._log_debug(f"Hub tier: budget capped to 6000 (multi‑phase active)")
 
@@ -3442,7 +3445,7 @@ class ContextBuilder:
             "## Core Implementation (hub symbols — stable, cached)",
             "_Full bodies of the most central symbols, ordered from most to least stable. "
             "They rarely change and are anchored here for KV cache reuse._",
-            ""
+            "",
         ]
         total = self._f._tokens.estimate_code_tokens("\n".join(lines))
         kept = []
@@ -3462,7 +3465,7 @@ class ContextBuilder:
             chunk = f"### `{qid}`\n{doc_line}```{lang}\n{body_with_xrefs}\n```\n"
             tok = self._f._tokens.estimate_code_tokens(chunk)
             if budget > 0 and total + tok > budget:
-                excluded_by_cap.extend(ordered[ordered.index(qid):])
+                excluded_by_cap.extend(ordered[ordered.index(qid) :])
                 break
             lines.append(chunk)
             kept.append(qid)
@@ -3479,15 +3482,14 @@ class ContextBuilder:
 
         tier_text = "\n".join(lines)
 
-        # ── M6 + Bug fix: include selection parameters AND budget caps in hash ──
+        # ── M6: include selection parameters in hash ──
         config_prefix = (
             f"n={self._f.valves.hub_bodies_tier_top_n}|"
-            f"floor={self._f.valves.hub_bodies_tier_min_centrality}|"
-            f"maxtok={self._f.valves.hub_bodies_tier_max_tokens}|"
-            f"maxbody={self._f.valves.hub_bodies_tier_max_body_tokens}"
+            f"floor={self._f.valves.hub_bodies_tier_min_centrality}"
         )
         tier_hash = hashlib.md5(
-            f"{config_prefix}|" + "|".join(f"{q}:{resolved[q][1]}" for q in kept).encode()
+            f"{config_prefix}|"
+            + "|".join(f"{q}:{resolved[q][1]}" for q in kept).encode()
         ).hexdigest()[:16]
 
         # ── Prune stale tracker entries ──
