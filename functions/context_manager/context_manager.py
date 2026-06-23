@@ -14969,18 +14969,8 @@ class EnrichmentTasks:
 
     async def cancel_docstring_tasks(self) -> None:
         """
-        Cancel the background docstring generation loop gracefully, drain any
-        pending DB writes from cancelled tasks, then wait until the inference
-        slot is free before returning.
-
-        This method is called at the start of every inlet to ensure that no
-        background SQLite writes remain in flight when the new turn begins.
-        Without the drain, cancelled docstring tasks leave write operations
-        in `_db_write_queue` that continue executing concurrently with the
-        new inlet's reads, causing `database is locked` errors.
-
-        The drain has a 5‑second timeout to avoid hanging the inlet if the
-        queue is stuck; after that, we proceed anyway (best effort).
+        Cancel the background docstring generation loop gracefully,
+        drain any pending DB writes from cancelled tasks.
         """
         # ------------------------------------------------------------------
         # REGION 1 — Cancel the background task and wait for its cancellation
@@ -14996,10 +14986,6 @@ class EnrichmentTasks:
         # ------------------------------------------------------------------
         # REGION 2 — Drain pending DB write operations from the queue
         # ------------------------------------------------------------------
-        # Cancelled docstring tasks may have enqueued INSERT/REPLACE operations
-        # for symbol_docstrings. If we don't drain them here, they will keep
-        # executing in the worker thread while the new inlet does heavy reads,
-        # causing contention and "database is locked" even in WAL mode.
         drain_deadline = time.monotonic() + 5.0
         while not self._f._db_write_queue.empty():
             if time.monotonic() > drain_deadline:
@@ -15008,14 +14994,6 @@ class EnrichmentTasks:
                 )
                 break
             await asyncio.sleep(0.05)
-
-        # ------------------------------------------------------------------
-        # REGION 3 — Wait for the inference slot to be released
-        # ------------------------------------------------------------------
-        # Ensure that any auxiliary LLM calls (CoT, contradiction detection,
-        # etc.) have finished before the new inlet continues, so they don't
-        # dirty the KV cache.
-        await self._f._llm_orchestrator.wait_for_slot()
 
     async def _background_docstring(
         self,
