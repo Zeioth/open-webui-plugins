@@ -2221,7 +2221,7 @@ class ContextPager:
         from collections import defaultdict
 
         by_file = defaultdict(list)
-        for h, block in state.get("active_blocks", {}).items():
+        for h, block in state.active_blocks.items():
             if block.file_path and not block.pinned and not block.obsolete:
                 by_file[block.file_path].append((h, block))
 
@@ -2243,12 +2243,12 @@ class ContextPager:
                         embedder=embedder,
                     )
                     if paged:
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
                         purged += 1
                         continue
                 # Fallback: remove from active blocks without paging
-                if h in state["active_blocks"]:
-                    del state["active_blocks"][h]
+                if h in state.active_blocks:
+                    del state.active_blocks[h]
                     purged += 1
 
         if purged > 0:
@@ -3151,7 +3151,7 @@ class ContextBuilder:
         symbol_section_rendered = False
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._conversation_state_manager.get(project_id)
-            if state and state.get("active_blocks"):
+            if state and state.active_blocks:
                 centrality = pstate.get("node_centrality", {})
                 resolved_mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
                 self._f._log_debug(
@@ -3890,7 +3890,7 @@ class ContextBuilder:
             state = self._f._conversation_state_manager.get(project_id)
             block = None
             for bh in block_hashes:
-                blk = state["active_blocks"].get(bh)
+                blk = state.active_blocks.get(bh)
                 if blk and not blk.obsolete:
                     block = blk
                     break
@@ -8623,7 +8623,7 @@ class ReasoningEngine:
 
         # Persist level for conversational continuity if feature is enabled
         if self._f.ENABLE_COT_STICKY:
-            state["last_cot_level"] = level
+            state.last_cot_level = level
 
         return level
 
@@ -8915,7 +8915,7 @@ class ReasoningEngine:
             signals += 1
 
         if self._f.ENABLE_COT_STICKY:
-            prev_level = state.get("last_cot_level", 0)
+            prev_level = state.last_cot_level
             if prev_level >= 2 and has_complex_kw:
                 signals += 1
 
@@ -9925,7 +9925,7 @@ class CommandRouter:
                 ]
                 state = self._f._conversation_state_manager.get(project_id)
                 for h in candidates:
-                    blk = state["active_blocks"].get(h)
+                    blk = state.active_blocks.get(h)
                     if blk:
                         snippet = blk.content[:80].replace("\n", " ")
                         file_info = f" ({blk.file_path})" if blk.file_path else ""
@@ -10019,7 +10019,7 @@ class CommandRouter:
                     if pair in seen_pairs:
                         continue
                     seen_pairs.add(pair)
-                    block = state["active_blocks"].get(bh)
+                    block = state.active_blocks.get(bh)
                     if block and not block.obsolete:
                         lang = block.symbols[0].language if block.symbols else ""
                         body = CodeBlockManager.extract_symbol_body(block, mname)
@@ -10082,7 +10082,7 @@ class CommandRouter:
             visited.add(current_name)
             blocks = self._f._symbol_index.find_blocks(current_name, project_id)
             for h in blocks:
-                block = state["active_blocks"].get(h)
+                block = state.active_blocks.get(h)
                 if block and not block.obsolete:
                     loc = f" (file: {block.file_path})" if block.file_path else ""
                     # ── FIX 2c: Extract symbol body instead of whole block ──
@@ -10174,7 +10174,7 @@ class CommandRouter:
                         if pair in seen_pairs:
                             continue
                         seen_pairs.add(pair)
-                        block = state["active_blocks"].get(bh)
+                        block = state.active_blocks.get(bh)
                         if block and not block.obsolete:
                             lang = block.symbols[0].language if block.symbols else ""
                             body = CodeBlockManager.extract_symbol_body(block, mname)
@@ -10205,13 +10205,13 @@ class CommandRouter:
                         target_name, project_id
                     )
                     for h in block_hashes:
-                        block = state["active_blocks"].get(h)
+                        block = state.active_blocks.get(h)
                         if block and not block.obsolete:
                             block.is_raw = True
                             block.pinned = True
                             block.importance_score = 10.0
                             block.last_mentioned = time.time()
-                            block.last_mentioned_msg_idx = state["message_count"]
+                            block.last_mentioned_msg_idx = state.message_count
                             break
                     self._f._activation.invalidate_lightweight_cache(project_id)
                     self._f._conversation_state_manager.set(project_id, state)
@@ -10246,28 +10246,28 @@ class CommandRouter:
             if not state:
                 return messages, False
             if target == "all":
-                for block in state["active_blocks"].values():
+                for block in state.active_blocks.values():
                     self._f._symbol_index.remove_all_for_block(
                         block.hash, block.symbols, project_id
                     )
-                state["active_blocks"].clear()
-                state["recent_changes"].clear()
-                state["committed_changes"].clear()
-                state["has_any_calls"] = False
+                state.active_blocks.clear()
+                state.recent_changes.clear()
+                state.committed_changes.clear()
+                state.has_any_calls = False
                 self._f._activation.invalidate_lightweight_cache(project_id)
                 confirmation = "Forgotten all context."
             elif target == "last":
-                if state["active_blocks"]:
+                if state.active_blocks:
                     last_hash = max(
-                        state["active_blocks"].keys(),
-                        key=lambda h: state["active_blocks"][h].timestamp,
+                        state.active_blocks.keys(),
+                        key=lambda h: state.active_blocks[h].timestamp,
                     )
-                    block = state["active_blocks"].get(last_hash)
+                    block = state.active_blocks.get(last_hash)
                     if block:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                    del state["active_blocks"][last_hash]
+                    del state.active_blocks[last_hash]
                     self._f._activation.invalidate_lightweight_cache(project_id)
                     confirmation = "Forgotten the last context block."
                 else:
@@ -10275,16 +10275,16 @@ class CommandRouter:
             else:
                 to_remove = [
                     h
-                    for h, blk in state["active_blocks"].items()
+                    for h, blk in state.active_blocks.items()
                     if (blk.file_path and target in blk.file_path) or target in h
                 ]
                 for h in to_remove:
-                    block = state["active_blocks"].get(h)
+                    block = state.active_blocks.get(h)
                     if block:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                    del state["active_blocks"][h]
+                    del state.active_blocks[h]
                 self._f._activation.invalidate_lightweight_cache(project_id)
                 confirmation = (
                     f"Forgotten {len(to_remove)} block(s) matching '{target}'."
@@ -10311,34 +10311,34 @@ class CommandRouter:
                 )
 
             if action == "forget_last":
-                if state["active_blocks"]:
+                if state.active_blocks:
                     last_hash = max(
-                        state["active_blocks"].keys(),
-                        key=lambda h: state["active_blocks"][h].timestamp,
+                        state.active_blocks.keys(),
+                        key=lambda h: state.active_blocks[h].timestamp,
                     )
-                    block = state["active_blocks"].get(last_hash)
+                    block = state.active_blocks.get(last_hash)
                     if block:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                    del state["active_blocks"][last_hash]
+                    del state.active_blocks[last_hash]
                     self._f._activation.invalidate_lightweight_cache(project_id)
                 return "Forgotten the last context block."
 
             elif action == "forget_n":
                 n = intent.get("n", 1)
                 blocks_by_time = sorted(
-                    state["active_blocks"].items(),
+                    state.active_blocks.items(),
                     key=lambda x: x[1].timestamp,
                     reverse=True,
                 )
                 removed = 0
                 for h, block in blocks_by_time[:n]:
-                    if h in state["active_blocks"]:
+                    if h in state.active_blocks:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
                         removed += 1
                 if removed:
                     self._f._activation.invalidate_lightweight_cache(project_id)
@@ -10350,16 +10350,16 @@ class CommandRouter:
                     return "No file specified."
                 to_remove = [
                     h
-                    for h, blk in state["active_blocks"].items()
+                    for h, blk in state.active_blocks.items()
                     if blk.file_path and file_path in blk.file_path
                 ]
                 for h in to_remove:
-                    block = state["active_blocks"].get(h)
+                    block = state.active_blocks.get(h)
                     if block:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                    del state["active_blocks"][h]
+                    del state.active_blocks[h]
                 if to_remove:
                     self._f._activation.invalidate_lightweight_cache(project_id)
                 return f"Forgotten {len(to_remove)} block(s) related to {file_path}."
@@ -10368,23 +10368,23 @@ class CommandRouter:
                 block_id = intent.get("hash") or intent.get("id") or ""
                 if not block_id:
                     return "No block specified."
-                if block_id in state["active_blocks"]:
-                    block = state["active_blocks"][block_id]
+                if block_id in state.active_blocks:
+                    block = state.active_blocks[block_id]
                     self._f._symbol_index.remove_all_for_block(
                         block.hash, block.symbols, project_id
                     )
-                    del state["active_blocks"][block_id]
+                    del state.active_blocks[block_id]
                     self._f._activation.invalidate_lightweight_cache(project_id)
                     return f"Forgotten block {block_id}."
-                matches = [h for h in state["active_blocks"] if block_id in h]
+                matches = [h for h in state.active_blocks if block_id in h]
                 if matches:
                     for h in matches:
-                        block = state["active_blocks"].get(h)
+                        block = state.active_blocks.get(h)
                         if block:
                             self._f._symbol_index.remove_all_for_block(
                                 block.hash, block.symbols, project_id
                             )
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
                     self._f._activation.invalidate_lightweight_cache(project_id)
                     return f"Forgotten {len(matches)} block(s) matching {block_id}."
                 return f"No block found for {block_id}."
@@ -10412,7 +10412,7 @@ class CommandRouter:
                 return count
 
             action = intent.get("action", "")
-            blocks = list(state["active_blocks"].values())
+            blocks = list(state.active_blocks.values())
             if not blocks:
                 return "No blocks available."
 
@@ -10489,7 +10489,7 @@ class CommandRouter:
                     "Please type `/obsolete all` explicitly to confirm."
                 )
 
-            blocks = list(state["active_blocks"].values())
+            blocks = list(state.active_blocks.values())
             if not blocks:
                 return "No blocks available."
 
@@ -10696,11 +10696,11 @@ class CommandRouter:
         if not self._f.valves.enable_command_suggestions:
             return None
         now = time.time()
-        last_sugg = state.get("last_suggestion_timestamp", 0)
+        last_sugg = state.last_suggestion_timestamp
         if now - last_sugg < self._f.valves.command_suggestion_cooldown_minutes * 60:
             return None
-        if state["message_count"] > 15 and not state.get("has_any_calls"):
-            state["last_suggestion_timestamp"] = now
+        if state.message_count > 15 and not state.has_any_calls:
+            state.last_suggestion_timestamp = now
             return (
                 "[CodeAware] Tip: You can manage context with commands like "
                 "`/forget`, `/remember`, `/status`, `/clean`. Use `/help` for more info."
@@ -10714,13 +10714,13 @@ class CommandRouter:
     def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
         """Return hashes of blocks that haven't been mentioned recently."""
         state = self._f._conversation_state_manager.get(project_id)
-        if not state or not state["active_blocks"]:
+        if not state or not state.active_blocks:
             return []
         threshold = self._f.valves.cleanup_inactive_threshold_messages
         excluded_types = set(self._f.valves.cleanup_excluded_content_types)
-        current_msg_idx = state["message_count"]
+        current_msg_idx = state.message_count
         candidates = []
-        for h, block in state["active_blocks"].items():
+        for h, block in state.active_blocks.items():
             if block.pinned or block.obsolete:
                 continue
             if block.content_type.value in excluded_types:
@@ -10752,7 +10752,7 @@ class CommandRouter:
                     f"⚠️ {len(candidates)} inactive block(s) (not mentioned in last {self._f.valves.cleanup_inactive_threshold_messages} messages):"
                 ]
                 for h in candidates:
-                    blk = state["active_blocks"].get(h)
+                    blk = state.active_blocks.get(h)
                     if blk:
                         snippet = blk.content[:80].replace("\n", " ")
                         file_info = f" ({blk.file_path})" if blk.file_path else ""
@@ -10765,23 +10765,23 @@ class CommandRouter:
                 if not candidates:
                     return "✅ No inactive blocks to clean."
                 for h in candidates:
-                    block = state["active_blocks"].pop(h, None)
+                    block = state.active_blocks.pop(h, None)
                     if block:
                         self._f._symbol_index.remove_all_for_block(
                             block.hash, block.symbols, project_id
                         )
-                state["recent_changes"] = [
-                    c for c in state["recent_changes"] if c.hash not in candidates
+                state.recent_changes = [
+                    c for c in state.recent_changes if c.hash not in candidates
                 ]
-                state["committed_changes"] = [
-                    c for c in state["committed_changes"] if c.hash not in candidates
+                state.committed_changes = [
+                    c for c in state.committed_changes if c.hash not in candidates
                 ]
                 self._f._activation.invalidate_lightweight_cache(project_id)
                 self._f._conversation_state_manager.set(project_id, state)
                 return f"✅ Cleaned {len(candidates)} inactive block(s)."
             target_hash = subcommand.strip()
             if target_hash in candidates:
-                block = state["active_blocks"].pop(target_hash, None)
+                block = state.active_blocks.pop(target_hash, None)
                 if block:
                     self._f._symbol_index.remove_all_for_block(
                         block.hash, block.symbols, project_id
@@ -10790,10 +10790,10 @@ class CommandRouter:
                 self._f._conversation_state_manager.set(project_id, state)
                 return f"✅ Cleaned block `{target_hash[:8]}...`."
             else:
-                matched = [h for h in state["active_blocks"] if target_hash in h]
+                matched = [h for h in state.active_blocks if target_hash in h]
                 for h in matched:
                     if h in candidates:
-                        block = state["active_blocks"].pop(h, None)
+                        block = state.active_blocks.pop(h, None)
                         if block:
                             self._f._symbol_index.remove_all_for_block(
                                 block.hash, block.symbols, project_id
@@ -11852,7 +11852,7 @@ class CodeBlockManager:
         if not self._f.valves.auto_remove_duplicate_blocks:
             return
 
-        blocks = list(state["active_blocks"].values())
+        blocks = list(state.active_blocks.values())
         to_remove = set()
 
         # ── 1. Pairwise similarity comparison ──────────────────────────────
@@ -11909,25 +11909,25 @@ class CodeBlockManager:
 
         # ── 3. Apply removal ────────────────────────────────────────────────
         for h in to_remove:
-            if h in state["active_blocks"]:
-                block = state["active_blocks"][h]
+            if h in state.active_blocks:
+                block = state.active_blocks[h]
                 self._f._symbol_index.remove_all_for_block(
                     block.hash, block.symbols, project_id
                 )
-                del state["active_blocks"][h]
+                del state.active_blocks[h]
 
         # ── 4. Clean up dependent lists ─────────────────────────────────────
-        state["recent_changes"] = [
-            b for b in state["recent_changes"] if b.hash not in to_remove
+        state.recent_changes = [
+            b for b in state.recent_changes if b.hash not in to_remove
         ]
-        state["committed_changes"] = [
-            b for b in state["committed_changes"] if b.hash not in to_remove
+        state.committed_changes = [
+            b for b in state.committed_changes if b.hash not in to_remove
         ]
 
         # ── 5. Update state and invalidate cache ───────────────────────────
         if to_remove:
-            state["has_any_calls"] = any(
-                any(s.calls for s in b.symbols) for b in state["active_blocks"].values()
+            state.has_any_calls = any(
+                any(s.calls for s in b.symbols) for b in state.active_blocks.values()
             )
             self._f._activation.invalidate_lightweight_cache(project_id)
 
@@ -11955,7 +11955,7 @@ class CodeBlockManager:
         if new_block.content_type != ContentType.PROPOSED_CHANGE:
             return False
 
-        for existing in state["recent_changes"]:
+        for existing in state.recent_changes:
             if existing.hash == new_block.hash:
                 continue
 
@@ -12338,12 +12338,12 @@ class ActivationEngine:
         # REGION 1 — Load state & filter active blocks
         # ═══════════════════════════════════════════════════════════════════════════
         state = self._f._conversation_state_manager.get(project_id)
-        if not state or not state["active_blocks"]:
+        if not state or not state.active_blocks:
             return ""
 
         now = time.time()
         active = []
-        for block in state["active_blocks"].values():
+        for block in state.active_blocks.values():
             if block.obsolete:
                 continue
             if not block.is_active and self._f.valves.track_active_code_age:
@@ -13144,7 +13144,7 @@ class ActivationEngine:
     async def rebuild_path_index(self, project_id: str) -> None:
         """Reconstruct PathIndex from SymbolIndex for all entry points."""
         state = self._f._conversation_state_manager.get(project_id)
-        if not state or not state.get("active_blocks"):
+        if not state or not state.active_blocks:
             return
         entry_points = self._f._path_index.find_entry_points(
             self._f._symbol_index, project_id
@@ -13288,10 +13288,10 @@ class ActivationEngine:
         return h
 
     def _compute_code_state_hash_from_state(self, state: dict) -> str:
-        if not state or not state.get("active_blocks"):
+        if not state or not state.active_blocks:
             return ""
         sorted_hashes = sorted(
-            h for h, b in state["active_blocks"].items() if not b.obsolete
+            h for h, b in state.active_blocks.items() if not b.obsolete
         )
         return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
 
@@ -13314,13 +13314,13 @@ class ActivationEngine:
         obsolete, and content types listed in `cleanup_excluded_content_types`.
         """
         state = self._f._conversation_state_manager.get(project_id)
-        if not state or not state.get("active_blocks"):
+        if not state or not state.active_blocks:
             return []
         threshold = self._f.valves.cleanup_inactive_threshold_messages
         excluded_types = set(self._f.valves.cleanup_excluded_content_types)
-        current_msg_idx = state["message_count"]
+        current_msg_idx = state.message_count
         candidates = []
-        for h, block in state["active_blocks"].items():
+        for h, block in state.active_blocks.items():
             if block.pinned or block.obsolete:
                 continue
             if block.content_type.value in excluded_types:
@@ -13384,8 +13384,8 @@ class ActivationEngine:
             name
             for name in mentioned
             if any(
-                state["active_blocks"].get(bh) is not None
-                and (now - state["active_blocks"][bh].timestamp) < recent_window
+                state.active_blocks.get(bh) is not None
+                and (now - state.active_blocks[bh].timestamp) < recent_window
                 for bh in self._f._symbol_index.find_blocks(name, project_id)
             )
         ]
@@ -14432,11 +14432,11 @@ class EnrichmentTasks:
         for name in mentioned_names:
             affected_blocks.update(self._f._symbol_index.find_blocks(name, project_id))
         for block_hash in affected_blocks:
-            block = state["active_blocks"].get(block_hash)
+            block = state.active_blocks.get(block_hash)
             if block:
                 block.mention_count += 1
                 block.last_mentioned = time.time()
-                block.last_mentioned_msg_idx = state["message_count"]
+                block.last_mentioned_msg_idx = state.message_count
                 block._update_importance()
 
     async def expire_blocks_by_time(self, project_id: str) -> None:
@@ -14449,7 +14449,7 @@ class EnrichmentTasks:
             now = time.time()
             expiration_seconds = self._f.valves.block_expiration_hours * 3600
             to_remove = []
-            for h, block in state["active_blocks"].items():
+            for h, block in state.active_blocks.items():
                 if block.pinned or block.obsolete:
                     continue
                 age = now - block.last_mentioned
@@ -14471,16 +14471,16 @@ class EnrichmentTasks:
                     ):
                         to_remove.append(h)
             for h in to_remove:
-                if h in state["active_blocks"]:
-                    block = state["active_blocks"][h]
+                if h in state.active_blocks:
+                    block = state.active_blocks[h]
                     self._f._symbol_index.remove_all_for_block(
                         block.hash, block.symbols, project_id
                     )
-                del state["active_blocks"][h]
+                del state.active_blocks[h]
             if to_remove:
-                state["has_any_calls"] = any(
+                state.has_any_calls = any(
                     any(s.calls for s in b.symbols)
-                    for b in state["active_blocks"].values()
+                    for b in state.active_blocks.values()
                 )
                 self._f._activation.invalidate_lightweight_cache(project_id)
                 self._f._conversation_state_manager.set(project_id, state)
@@ -14581,7 +14581,7 @@ class EnrichmentTasks:
     def get_feedback_context(self, project_id: str) -> str:
         """Return a formatted string of recent feedback for the given project."""
         state = self._f._conversation_state_manager.get(project_id)
-        feedback = state.get("feedback_history", [])
+        feedback = state.feedback_history
         if not feedback:
             return ""
         recent = feedback[-self._f.valves.feedback_history_limit :]
@@ -14713,7 +14713,7 @@ class EnrichmentTasks:
         # at entry — see Bug 3 snapshot note (no new race vs. the lock-free
         # original).
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
-        for _block in state["active_blocks"].values():
+        for _block in state.active_blocks.values():
             for _sym in _block.symbols:
                 _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
                 if _q not in _qid_index:
@@ -14835,7 +14835,7 @@ class EnrichmentTasks:
         # ensure_docstrings_batch). First-match-wins ordering preserved;
         # snapshot semantics per Bug 3 note.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
-        for _block in state["active_blocks"].values():
+        for _block in state.active_blocks.values():
             for _sym in _block.symbols:
                 _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
                 if _q not in _qid_index:
@@ -14939,7 +14939,7 @@ class EnrichmentTasks:
 
         # --- 1. Ensure the block still exists ---
         state = self._f._conversation_state_manager.get(project_id)
-        target_block = state["active_blocks"].get(block_hash)
+        target_block = state.active_blocks.get(block_hash)
         if target_block is None:
             self._f._log_debug(
                 f"Background docstring: block {block_hash} not found, skipping '{name}'"
@@ -15012,7 +15012,7 @@ class EnrichmentTasks:
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
-            block = state["active_blocks"].get(block_hash)
+            block = state.active_blocks.get(block_hash)
             if block:
                 # Find the exact symbol instance
                 for s in block.symbols:
@@ -15163,7 +15163,7 @@ class EnrichmentTasks:
         # --- 1. Snapshot: collect all symbols without docstrings ---
         state = self._f._conversation_state_manager.get(project_id)
         pending = []
-        for block in state["active_blocks"].values():
+        for block in state.active_blocks.values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
@@ -15251,7 +15251,7 @@ class ActiveCodeUpdater:
 
             # 4. Housekeeping
             self._f._enrichment.update_mentions_from_message(state, content, project_id)
-            for block in state["active_blocks"].values():
+            for block in state.active_blocks.values():
                 if (
                     block.content
                     and self._f._code_blocks.calculate_code_similarity(
@@ -15261,7 +15261,7 @@ class ActiveCodeUpdater:
                 ):
                     block.mention_count += 1
                     block.last_mentioned = time.time()
-                    block.last_mentioned_msg_idx = state["message_count"]
+                    block.last_mentioned_msg_idx = state.message_count
                     block._update_importance()
 
             if not content and not new_blocks_pending:
@@ -15284,7 +15284,7 @@ class ActiveCodeUpdater:
                     new_block.hash, (False, None)
                 )
                 existing = (
-                    state["active_blocks"].get(existing_hash) if existing_hash else None
+                    state.active_blocks.get(existing_hash) if existing_hash else None
                 )
 
                 if is_dup and existing:
@@ -15395,14 +15395,14 @@ class ActiveCodeUpdater:
             return duplicate_info
 
         existing_contents = {
-            h: b.content for h, b in state.get("active_blocks", {}).items()
+            h: b.content for h, b in state.active_blocks.items()
         }
 
         for new_block in new_blocks:
             is_dup = False
             existing_dup = None
             for h, ex_content in existing_contents.items():
-                ex_block = state["active_blocks"].get(h)
+                ex_block = state.active_blocks.get(h)
                 if (
                     ex_block
                     and self._f._code_blocks.calculate_code_similarity(
@@ -15448,7 +15448,7 @@ class ActiveCodeUpdater:
             existing.timestamp = time.time()
             existing.mention_count += 1
             existing.last_mentioned = time.time()
-            existing.last_mentioned_msg_idx = state["message_count"]
+            existing.last_mentioned_msg_idx = state.message_count
             existing.pinned = True
             existing.is_raw = existing.is_raw or new_block.is_raw
             existing.importance_score = 10.0
@@ -15477,7 +15477,7 @@ class ActiveCodeUpdater:
             existing.timestamp = time.time()
             existing.mention_count += 1
             existing.last_mentioned = time.time()
-            existing.last_mentioned_msg_idx = state["message_count"]
+            existing.last_mentioned_msg_idx = state.message_count
             existing.symbols = syms
 
             # Re-index with background docstrings
@@ -15580,7 +15580,7 @@ class ActiveCodeUpdater:
         for sym in syms:
             sym.parent_block_hash = new_block.hash
         new_block.symbols = syms
-        new_block.last_mentioned_msg_idx = state["message_count"]
+        new_block.last_mentioned_msg_idx = state.message_count
 
         # --- 1. Index symbols and call-graph edges ---
         for sym in syms:
@@ -15609,7 +15609,7 @@ class ActiveCodeUpdater:
                 )
 
         if any(s.calls for s in syms):
-            state["has_any_calls"] = True
+            state.has_any_calls = True
 
         # --- 3. Check for conflicting proposed changes ---
         is_conflicting = False
@@ -15621,12 +15621,12 @@ class ActiveCodeUpdater:
                 new_block.importance_score = max(new_block.importance_score, 7.0)
 
         # --- 4. Insert the new block into active_blocks ---
-        state["active_blocks"][new_block.hash] = new_block
+        state.active_blocks[new_block.hash] = new_block
 
         # --- 5. Mark older blocks for the same file as obsolete (step 13) ---
         obsolete_hashes = []
         if new_block.file_path and self._f.valves.enable_obsolete_marking:
-            for h, blk in list(state["active_blocks"].items()):
+            for h, blk in list(state.active_blocks.items()):
                 if h == new_block.hash:
                     continue
                 if blk.file_path == new_block.file_path and not blk.pinned:
@@ -15645,7 +15645,7 @@ class ActiveCodeUpdater:
                 if max_keep == 0:
                     # Remove all obsolete blocks immediately
                     for h in obsolete_hashes:
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
                     self._f._log_debug(
                         f"Removed {len(obsolete_hashes)} obsolete block(s) for '{new_block.file_path}' "
                         f"(max_obsolete_versions_per_file=0)."
@@ -15653,15 +15653,15 @@ class ActiveCodeUpdater:
                 else:
                     # Keep the most recent max_keep versions
                     obsolete_blocks = [
-                        (h, state["active_blocks"][h])
+                        (h, state.active_blocks[h])
                         for h in obsolete_hashes
-                        if h in state["active_blocks"]
+                        if h in state.active_blocks
                     ]
                     obsolete_blocks.sort(key=lambda x: x[1].timestamp, reverse=True)
 
                     to_remove = [h for h, _ in obsolete_blocks[max_keep:]]
                     for h in to_remove:
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
 
                     kept = len(obsolete_blocks) - len(to_remove)
                     self._f._log_debug(
@@ -15672,18 +15672,18 @@ class ActiveCodeUpdater:
         # --- 6. Handle content-type specific actions ---
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             if new_block.file_path:
-                state["recent_changes"] = [
+                state.recent_changes = [
                     c
-                    for c in state["recent_changes"]
+                    for c in state.recent_changes
                     if not (
                         c.file_path
                         and c.file_path == new_block.file_path
                         and c.hash != new_block.hash
                     )
                 ]
-            state["recent_changes"].append(new_block)
+            state.recent_changes.append(new_block)
             if self._f.valves.enable_diff_application and not is_conflicting:
-                for base in list(state["active_blocks"].values()):
+                for base in list(state.active_blocks.values()):
                     if (
                         base.content_type == ContentType.BASE_CODE
                         and base.file_path == new_block.file_path
@@ -15691,15 +15691,15 @@ class ActiveCodeUpdater:
                         if await self._f._code_blocks.apply_change_with_diff(
                             base, new_block
                         ):
-                            state["recent_changes"] = [
+                            state.recent_changes = [
                                 c
-                                for c in state["recent_changes"]
+                                for c in state.recent_changes
                                 if c.hash != new_block.hash
                             ]
-                            state["committed_changes"].append(new_block)
+                            state.committed_changes.append(new_block)
                             break
         elif new_block.content_type == ContentType.COMMITTED_CHANGE:
-            state["committed_changes"].append(new_block)
+            state.committed_changes.append(new_block)
         elif (
             new_block.content_type == ContentType.ERROR
             and self._f.valves.preserve_error_context
@@ -15709,10 +15709,10 @@ class ActiveCodeUpdater:
         # --- 7. Hard eviction if too many active blocks ---
         if (
             self._f.valves.max_active_blocks > 0
-            and len(state["active_blocks"]) > self._f.valves.max_active_blocks
+            and len(state.active_blocks) > self._f.valves.max_active_blocks
         ):
             sorted_blocks = sorted(
-                state["active_blocks"].values(),
+                state.active_blocks.values(),
                 key=lambda b: b.importance_score
                 + (self._f.valves.raw_file_priority_boost if b.is_raw else 0),
                 reverse=True,
@@ -15720,9 +15720,9 @@ class ActiveCodeUpdater:
             keep_hashes = {
                 b.hash for b in sorted_blocks[: self._f.valves.max_active_blocks]
             }
-            to_remove_hard = [h for h in state["active_blocks"] if h not in keep_hashes]
+            to_remove_hard = [h for h in state.active_blocks if h not in keep_hashes]
             for h in to_remove_hard:
-                block = state["active_blocks"].get(h)
+                block = state.active_blocks.get(h)
                 if (
                     block
                     and self._f.valves.enable_block_paging
@@ -15737,11 +15737,11 @@ class ActiveCodeUpdater:
                         embedder=self._f.embedder,
                     )
                     if paged:
-                        del state["active_blocks"][h]
+                        del state.active_blocks[h]
                         continue
                 # Fallback: remove without paging
-                if h in state["active_blocks"]:
-                    del state["active_blocks"][h]
+                if h in state.active_blocks:
+                    del state.active_blocks[h]
             if to_remove_hard:
                 self._f._log_debug(
                     f"Evicted {len(to_remove_hard)} blocks due to max_active_blocks limit. "
@@ -15763,7 +15763,7 @@ class ActiveCodeUpdater:
         for block_info in extracted:
             best_base = None
             best_sim = 0.0
-            for base in state["active_blocks"].values():
+            for base in state.active_blocks.values():
                 if base.content_type == ContentType.BASE_CODE:
                     sim = self._f._code_blocks.calculate_code_similarity(
                         base.content, block_info["code"]
@@ -15795,7 +15795,7 @@ class ActiveCodeUpdater:
                     )
                 await self._reindex_block_symbols(best_base, project_id)
                 if any(s.calls for s in best_base.symbols):
-                    state["has_any_calls"] = True
+                    state.has_any_calls = True
                 if prev_content != block_info["code"]:
                     await self._f._enrichment.generate_change_summary(
                         best_base.hash, prev_content, block_info["code"]
@@ -15814,7 +15814,7 @@ class ActiveCodeUpdater:
     ) -> None:
         """Expiration, enrichment, oversized‑block summaries, path index, soft eviction."""
         if not is_continuation:
-            state["message_count"] += 1
+            state.message_count += 1
         if self._f.valves.auto_remove_duplicate_blocks:
             self._f._code_blocks.remove_duplicate_blocks(state, project_id)
 
@@ -15829,13 +15829,13 @@ class ActiveCodeUpdater:
             interval = self._f.valves.session_summary_interval_messages
             if (
                 interval > 0
-                and state["message_count"] % interval == 0
-                and state["message_count"] > 0
+                and state.message_count % interval == 0
+                and state.message_count > 0
             ):
                 await self._f._enrichment.run_session_summary_task(
                     {
                         "project_id": project_id,
-                        "message_count": state["message_count"],
+                        "message_count": state.message_count,
                         "code_state_hash": self._f._activation.compute_code_state_hash(
                             project_id
                         ),
@@ -15848,7 +15848,7 @@ class ActiveCodeUpdater:
             self._f.valves.max_code_block_tokens > 0
             and self._f.valves.code_block_overflow_action == "summarize"
         ):
-            for block in state["active_blocks"].values():
+            for block in state.active_blocks.values():
                 if not block.obsolete:
                     await self._f._history_compressor.schedule_block_summary(
                         block, project_id
@@ -15905,7 +15905,7 @@ class ActiveCodeUpdater:
                 min_activation=self._f.valves.block_paging_min_activation,
             )
             for hash_ in candidates:
-                block = state["active_blocks"].get(hash_)
+                block = state.active_blocks.get(hash_)
                 if block:
                     paged = await self._f._pager.page_out_block(
                         block=block,
@@ -15916,7 +15916,7 @@ class ActiveCodeUpdater:
                         embedder=self._f.embedder,
                     )
                     if paged:
-                        del state["active_blocks"][hash_]
+                        del state.active_blocks[hash_]
             if candidates:
                 self._f._log_debug(
                     f"Soft-evicted {len(candidates)} block(s) via ContextPager "
@@ -16118,12 +16118,12 @@ class InletOrchestrator:
             user_question = user_query
 
         state = self._f._conversation_state_manager.get(project_id)
-        if not isinstance(state.get("active_blocks"), dict):
+        if not isinstance(state.active_blocks, dict):
             self._f._log_debug(
                 "CRITICAL: active_blocks corrupted even after load; resetting to empty. "
                 "Delete %s if this recurs." % self._f.valves.state_db_path
             )
-            state["active_blocks"] = {}
+            state.active_blocks = {}
             self._f._conversation_state_manager.set(project_id, state)
 
         return is_code_session, user_question
@@ -16155,7 +16155,7 @@ class InletOrchestrator:
                 del self._f._session_classify_cache[cache_key]
 
         state = self._f._conversation_state_manager.get(project_id)
-        if state and state.get("active_blocks"):
+        if state and state.active_blocks:
             if cache_key:
                 self._f._session_classify_cache[cache_key] = (True, time.time())
             return True
@@ -16180,7 +16180,7 @@ class InletOrchestrator:
 
         if (
             last_user
-            and not state.get("active_blocks")
+            and not state.active_blocks
             and not self._f._commands.has_code_indicators(last_user.get("content", ""))
         ):
             if len(last_user.get("content", "")) > 200:
@@ -16582,9 +16582,9 @@ class SystemPromptBuilder:
         ):
             candidates = self._f._activation.get_inactive_block_candidates(project_id)
             if candidates:
-                last_sugg_idx = state.get("last_cleanup_suggestion_msg_idx", 0)
+                last_sugg_idx = state.last_cleanup_suggestion_msg_idx
                 if (
-                    state["message_count"] - last_sugg_idx
+                    state.message_count - last_sugg_idx
                     >= self._f.valves.cleanup_suggestion_cooldown_messages
                 ):
                     suggestions.append(
@@ -16594,7 +16594,7 @@ class SystemPromptBuilder:
                             f"Use `/status` or `/clean`.",
                         )
                     )
-                    state["last_cleanup_suggestion_msg_idx"] = state["message_count"]
+                    state.last_cleanup_suggestion_msg_idx = state.message_count
                     self._f._conversation_state_manager.set(project_id, state)
 
         # ── Token pressure suggestion ──────────────────────────────────
@@ -16616,7 +16616,7 @@ class SystemPromptBuilder:
             suggestions.append(("low", cmd_suggestion))
 
         # ── Persisted conversation summaries ───────────────────────────
-        summaries = state.get("conversation_summaries", [])
+        summaries = state.conversation_summaries
         if summaries:
 
             def _summary_header(s: dict) -> str:
