@@ -8342,7 +8342,7 @@ class LLMOrchestrator:
         """
         Call the LLM with cache and deduplication. Retries are handled by
         shared_resources.call_llm internally.
-    
+
         All calls to this method are serialized via `_llm_semaphore` to prevent
         concurrent LLM requests, which avoids cancellation issues when using
         `--parallel 1` in llama.cpp.
@@ -8352,7 +8352,7 @@ class LLMOrchestrator:
             "bg_docstring",
         ):
             return None
-    
+
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -8364,13 +8364,13 @@ class LLMOrchestrator:
                 future = asyncio.Future()
                 self._f._pending_llm[dedup_key] = future
                 is_producer = True
-    
+
         if not is_producer:
             return await future
-    
+
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
-    
+
         # ── SERIALIZATION WITH THE SEMAPHORE ──────────────────────────────────
         # All LLM calls (main response, CoT, docstrings, summaries...)
         # are serialized here. This guarantees that only one executes at a time,
@@ -8380,15 +8380,15 @@ class LLMOrchestrator:
                 base_url = self._f.valves.LLM_BASE_URL.rstrip("/")
                 if base_url.endswith("/v1"):
                     base_url = base_url[:-3].rstrip("/")
-    
+
                 is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-    
+
                 model = model_override or self._f.valves.llm_model
                 if not model:
                     logger.warning(f"[LLM]{label_str} No model available")
                     future.set_result(None)
                     return None
-    
+
                 # ── Cache LLM ──
                 cache_key = hashlib.md5(
                     f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
@@ -8400,17 +8400,17 @@ class LLMOrchestrator:
                         f"[LLM] {model}{label_str} (cached) took {time.monotonic() - t_start:.3f}s"
                     )
                     return cached
-    
+
                 ep_type = "chat"
                 if model.startswith("llamacpp/"):
                     ep_type = self._f.valves.llamacpp_endpoint_type
-    
+
                 if self._f.tokenizer:
                     prompt_tokens = len(self._f.tokenizer.encode(prompt))
                     self._f._log_debug(
                         f"LLM call to {model}{label_str} – prompt size: ~{prompt_tokens} tokens"
                     )
-    
+
                 # ── Real call (with internal retries in shared_resources) ──
                 task = asyncio.current_task()
                 async with self._f._active_llm_tasks_lock:
@@ -8427,17 +8427,21 @@ class LLMOrchestrator:
                         timeout=self._f.valves.llm_request_timeout,
                         endpoint_type=ep_type,
                     )
-    
+
                     if content:
                         await self._f._llm_cache.set(cache_key, content)
                         future.set_result(content)
                         async with self._f._model_lock:
                             self._f._last_used_model = model
                         in_tokens = (
-                            len(self._f.tokenizer.encode(prompt)) if self._f.tokenizer else "?"
+                            len(self._f.tokenizer.encode(prompt))
+                            if self._f.tokenizer
+                            else "?"
                         )
                         out_tokens = (
-                            len(self._f.tokenizer.encode(content)) if self._f.tokenizer else "?"
+                            len(self._f.tokenizer.encode(content))
+                            if self._f.tokenizer
+                            else "?"
                         )
                         self._f._log_debug(
                             f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
@@ -8447,17 +8451,73 @@ class LLMOrchestrator:
                     else:
                         future.set_result(None)
                         return None
-    
+
                 finally:
                     async with self._f._active_llm_tasks_lock:
                         self._f._active_llm_tasks.discard(task)
-    
+
             except Exception as e:
                 future.set_exception(e)
                 raise
             finally:
                 async with self._f._pending_llm_lock:
                     self._f._pending_llm.pop(dedup_key, None)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Coordination primitives (slot & task waiting)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def wait_for_llm_tasks(self) -> None:
+        """
+        Wait until all LLM-using tasks have completed.
+
+        Since all LLM calls are serialized via `_llm_semaphore` (limit 1),
+        waiting for the semaphore to be fully available guarantees that
+        no LLM calls are currently in progress and no tasks are pending.
+        """
+        async with self._f._llm_semaphore:
+            pass
+
+    async def wait_for_slot(self) -> None:
+        """
+        Wait until the inference slot is free.
+
+        This is an alias for `wait_for_llm_tasks()` that provides semantic
+        clarity when the caller only needs to know the slot is available.
+        """
+        async with self._f._llm_semaphore:
+            pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. CrossEncoder helper (keep full code decision)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def should_keep_full_code(self, user_question: str) -> bool:
+        """
+        Decide whether to keep the full code in context or provide only a summary.
+        Uses the CrossEncoder for fast CPU inference.
+        Returns True if full code should be kept.
+        """
+        if not user_question.strip():
+            return False
+
+        pairs = [
+            (
+                user_question[:500],
+                "The user wants the full code, complete implementation, or exact details.",
+            ),
+            (
+                user_question[:500],
+                "The user only needs a summary, brief explanation, or high-level overview.",
+            ),
+        ]
+        scores = await self._f._commands._predict_cross_encoder(pairs)
+        if scores is None:
+            self._f._log_debug(
+                "_should_keep_full_code: CrossEncoder not loaded, keeping full code by default."
+            )
+            return True
+        return scores[0] > scores[1]
 
 
 class ReasoningEngine:
