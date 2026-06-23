@@ -16407,12 +16407,36 @@ class WindowManager:
 
     def _on_frontier_advance(self, old_hwm: int, new_hwm: int) -> None:
         """
-        Phase 2 seam.
-        Phase 1: no-op.
-        Phase 2: trigger slot_save(force=True) to freeze KV
-                behind the advanced frontier.
+        Phase 2: KV-freeze after history eviction.
+    
+        When WindowManager evicts turns and generates a summary, the history
+        before the frontier disappears from the context. If the server's KV
+        cache still contains those pre-filled tokens, subsequent requests
+        would have to re-prefill the entire new system+history sequence.
+    
+        By saving the slot immediately after eviction (force=True), the .bin
+        file captures the KV state with the new stabilized prefix (Block A + summary).
+        The next request restores from that checkpoint instead of re-prefilling
+        from scratch.
+    
+        force=True bypasses the static hash guard (history changed, but Block A
+        did not, so the hash doesn't change and without force the slot would
+        not be saved). The slot_save_max_context_tokens guard is always respected.
         """
-        pass
+        if old_hwm >= new_hwm:
+            return  # no real advance, nothing to freeze
+    
+        self._f._log_debug(
+            f"Phase 2 KV-freeze: frontier advanced hwm {old_hwm}→{new_hwm}, "
+            "scheduling slot_save(force=True)"
+        )
+    
+        # asyncio.create_task works because _on_frontier_advance is called
+        # from _persist(), which is a coroutine running inside the event loop.
+        project_id = self._f._inlet_orch.get_project_id()
+        asyncio.create_task(
+            self._f._project_state_manager.slot_save(project_id, force=True)
+        )
 
     @staticmethod
     def _is_autocontinue_active(messages: List[dict]) -> bool:
