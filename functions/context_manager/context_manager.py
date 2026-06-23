@@ -908,9 +908,7 @@ class ConversationStateManager:
             wm_turns_evicted=data.get(
                 "wm_turns_evicted", data.get("_wm_turns_evicted", 0)
             ),
-            wm_summary_ok=data.get(
-                "wm_summary_ok", data.get("_wm_summary_ok", False)
-            ),
+            wm_summary_ok=data.get("wm_summary_ok", data.get("_wm_summary_ok", False)),
             wm_emergency_cap=data.get(
                 "wm_emergency_cap", data.get("_wm_emergency_cap", False)
             ),
@@ -945,9 +943,7 @@ class ConversationStateManager:
         async with lock:
             await self._save_to_db(project_id, state)
 
-    async def _save_to_db(
-        self, project_id: str, state: ConversationState
-    ) -> None:
+    async def _save_to_db(self, project_id: str, state: ConversationState) -> None:
         """
         Serialize ConversationState and persist to SQLite.
 
@@ -982,9 +978,7 @@ class ConversationStateManager:
             "message_count": state.message_count,
             "last_compression_timestamp": state.last_compression_timestamp,
             "last_suggestion_timestamp": state.last_suggestion_timestamp,
-            "last_cleanup_suggestion_msg_idx": (
-                state.last_cleanup_suggestion_msg_idx
-            ),
+            "last_cleanup_suggestion_msg_idx": (state.last_cleanup_suggestion_msg_idx),
             "has_any_calls": state.has_any_calls,
             "last_cot_level": state.last_cot_level,
             "conversation_summaries": state.conversation_summaries,
@@ -2039,7 +2033,7 @@ class ContextPager:
 
     def get_eviction_candidates(
         self,
-        state: dict,
+        state: ConversationState,
         project_id: str,
         activation_scores: dict,
         paging_threshold: int,
@@ -2059,7 +2053,7 @@ class ContextPager:
                                    for s in block.symbols) or 0.0
 
         Args:
-            state: The current conversation state.
+            state: The current conversation state (ConversationState).
             project_id: Current project identifier.
             activation_scores: Dict mapping qualified symbol ids to activation scores.
             paging_threshold: Active block count above which paging starts.
@@ -2073,12 +2067,12 @@ class ContextPager:
         if len(active) <= paging_threshold:
             return []
 
-        # ── fallback para tier_qids si pstate está vacío ──
+        # ── Bug 5: fallback para tier_qids si pstate está vacío ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         tier_qids = set(pstate.get("hub_tier_qids", []))
         if not tier_qids:
             # Primer turno o cross‑restart: leer desde state (persistido)
-            tier_qids = set(state.get("hub_tier_qids_persisted", []))
+            tier_qids = set(state.hub_tier_qids_persisted)
 
         candidates = []
         for h, block in active.items():
@@ -2091,7 +2085,7 @@ class ContextPager:
                     continue
 
             if block.symbols:
-                # ── Use qualify_symbol to include file_path ──
+                # ── FIX 17.c: Use qualify_symbol to include file_path ──
                 block_activation = max(
                     (
                         activation_scores.get(qualify_symbol(s), 0.0)
@@ -2111,7 +2105,7 @@ class ContextPager:
         n_to_page = len(active) - paging_threshold
         selected = [h for h, _, _ in candidates[:n_to_page]]
 
-        # Debug log if under-paging
+        # Debug log if under-paging (FIX #8)
         if len(selected) < n_to_page:
             # The caller (Filter) will log this via self._log_debug when it
             # sees fewer blocks paged than expected.
@@ -3390,9 +3384,9 @@ class ContextBuilder:
         current_turn = state.message_count
 
         # ── Persistent trackers (survive restarts via state) ──
-        last_mod = state.setdefault("hub_tier_last_modified", {})
-        body_hashes = state.setdefault("hub_tier_body_hashes", {})
-        heat = state.setdefault("hub_tier_query_heat", {})
+        last_mod = state.hub_tier_last_modified
+        body_hashes = state.hub_tier_body_hashes
+        heat = state.hub_tier_query_heat
         prev_seeds = set(pstate.get("hub_tier_prev_seeds", []))
 
         # ── Selection: top‑N with optional centrality floor ──
@@ -3504,9 +3498,8 @@ class ContextBuilder:
             for stale in [k for k in list(d.keys()) if k not in live]:
                 del d[stale]
 
-        # ── persist tracker changes ──
-        # also persist tier_qids for pager fallback
-        state["hub_tier_qids_persisted"] = kept
+        # ── Persist tracker changes (atributos, no dict) ──
+        state.hub_tier_qids_persisted = kept
         self._f._conversation_state_manager.set(project_id, state)  # marks dirty
 
         return tier_text, tier_hash, kept
@@ -20555,7 +20548,7 @@ class Filter:
         5. Silent ingestion when the message is a large code‑only paste.
         6. Session classification and active‑code update.
         7. System‑prompt assembly (Block A + Block B) with CoT, compression,
-            multi‑phase, and adaptive trimming.
+           multi‑phase, and adaptive trimming.
 
         Returns the modified body with the final message list ready for the LLM.
         """
@@ -20729,13 +20722,32 @@ class Filter:
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
 
-                # ✅ NUEVO: marcar dirty y guardar mediante ConversationStateManager
+                # ── M7: Pre‑calcular tier durante silent ingestion ──
+                if (
+                    self.valves.enable_hub_bodies_tier
+                    and self.valves.hub_bodies_tier_warmup_on_ingestion
+                ):
+                    tier_text, tier_hash, tier_qids = (
+                        self._ctx_builder._build_hub_bodies_tier(project_id)
+                    )
+                    pstate["hub_tier_text"] = tier_text
+                    pstate["hub_tier_hash"] = tier_hash
+                    pstate["hub_tier_qids"] = tier_qids
+                    # ✅ Atributo, no dict key
+                    state.hub_tier_qids_persisted = tier_qids
+                    self._conversation_state_manager.set(project_id, state)
+
+                    # Lanzar prefill en background
+                    asyncio.create_task(
+                        self._ctx_builder._warmup_tier_prefill(project_id)
+                    )
+
+                # ✅ mark_dirty y save mediante ConversationStateManager
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
-                state = self._conversation_state_manager.get(
-                    project_id
-                )  # 🔄 get actualizado
+                # ✅ get_state mediante ConversationStateManager
+                state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
@@ -20803,7 +20815,8 @@ class Filter:
         #      (delegates Block A/B construction to ContextBuilder)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        state = self._conversation_state_manager.get(project_id)  # 🔄 get actualizado
+        # ✅ get_state mediante ConversationStateManager
+        state = self._conversation_state_manager.get(project_id)
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
                 messages,
@@ -20857,8 +20870,7 @@ class Filter:
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
-        # ✅ Validación de active_blocks (actualizada)
-        # Nota: state ya es un ConversationState, por lo que state.active_blocks es un dict.
+        # ✅ active_blocks Validation (attribute, not dict)
         if not isinstance(state.active_blocks, dict):
             state.active_blocks = {}
             self._conversation_state_manager.set(project_id, state)
