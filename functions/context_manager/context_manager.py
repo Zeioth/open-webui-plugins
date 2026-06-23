@@ -577,6 +577,25 @@ class ConversationState(BaseModel):
     wm_no_slot: bool = False
     wm_degradation_guard: bool = False
 
+    # ── Hub‑Bodies Tier tracker (cross‑restart stability) ────────────────
+    # These four fields ensure that the Hub‑Bodies Tier survives server
+    # restarts without re‑sealing all hubs and changing the tier_hash.
+    #
+    # hub_tier_last_modified:  turn number when each symbol's body last changed.
+    #                          Used to order hubs by stability (oldest first).
+    # hub_tier_body_hashes:    hash of each symbol's body, used to detect
+    #                          changes and update last_modified.
+    # hub_tier_query_heat:     EWMA of how often each symbol is a seed of the
+    #                          current query. Hot hubs move lower in the tier
+    #                          to reduce re‑prefill cost on edits.
+    # hub_tier_qids_persisted: snapshot of tier qids from the last build,
+    #                          used as a fallback for ContextPager on first
+    #                          turn after restart (Bug 5).
+    hub_tier_last_modified: Dict[str, int] = Field(default_factory=dict)
+    hub_tier_body_hashes: Dict[str, str] = Field(default_factory=dict)
+    hub_tier_query_heat: Dict[str, float] = Field(default_factory=dict)
+    hub_tier_qids_persisted: List[str] = Field(default_factory=list)
+
     def reset_wm_metrics(self) -> None:
         """Reset all WindowManager instrumentation flags at the start of each turn."""
         self.wm_fired = False
@@ -725,6 +744,7 @@ class ConversationStateManager:
           - Returns ConversationState instead of a dict.
           - Uses wm_* aliases for compatibility with pre-Phase-1 DBs (names with '_').
           - Reads history_blocked_age (migrated from pstate in Phase 1).
+          - Reads hub_tier_* tracker fields for cross‑restart stability.
         """
         try:
             cur = self._f._db_conn.execute(
@@ -888,7 +908,9 @@ class ConversationStateManager:
             wm_turns_evicted=data.get(
                 "wm_turns_evicted", data.get("_wm_turns_evicted", 0)
             ),
-            wm_summary_ok=data.get("wm_summary_ok", data.get("_wm_summary_ok", False)),
+            wm_summary_ok=data.get(
+                "wm_summary_ok", data.get("_wm_summary_ok", False)
+            ),
             wm_emergency_cap=data.get(
                 "wm_emergency_cap", data.get("_wm_emergency_cap", False)
             ),
@@ -904,6 +926,11 @@ class ConversationStateManager:
                 "pending_slot_resave",
                 data.get("_pending_slot_resave", False),
             ),
+            # ── Hub‑Bodies Tier tracker (cross‑restart) ──
+            hub_tier_last_modified=data.get("hub_tier_last_modified", {}),
+            hub_tier_body_hashes=data.get("hub_tier_body_hashes", {}),
+            hub_tier_query_heat=data.get("hub_tier_query_heat", {}),
+            hub_tier_qids_persisted=data.get("hub_tier_qids_persisted", []),
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -918,7 +945,9 @@ class ConversationStateManager:
         async with lock:
             await self._save_to_db(project_id, state)
 
-    async def _save_to_db(self, project_id: str, state: ConversationState) -> None:
+    async def _save_to_db(
+        self, project_id: str, state: ConversationState
+    ) -> None:
         """
         Serialize ConversationState and persist to SQLite.
 
@@ -926,6 +955,7 @@ class ConversationStateManager:
         Differences:
           - Reads attributes (state.recent_changes) instead of dict keys.
           - Persists summarized_turn_hwm, history_blocked_age, and all wm_* fields.
+          - Persists hub_tier_* tracker fields for cross‑restart stability.
           - The @@hash trick for code_contents remains unchanged.
         """
         # ── Serialize active_blocks, externalizing content ─────────────────
@@ -952,7 +982,9 @@ class ConversationStateManager:
             "message_count": state.message_count,
             "last_compression_timestamp": state.last_compression_timestamp,
             "last_suggestion_timestamp": state.last_suggestion_timestamp,
-            "last_cleanup_suggestion_msg_idx": (state.last_cleanup_suggestion_msg_idx),
+            "last_cleanup_suggestion_msg_idx": (
+                state.last_cleanup_suggestion_msg_idx
+            ),
             "has_any_calls": state.has_any_calls,
             "last_cot_level": state.last_cot_level,
             "conversation_summaries": state.conversation_summaries,
@@ -967,6 +999,11 @@ class ConversationStateManager:
             "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
             "pending_slot_resave": state.pending_slot_resave,
+            # ── Hub‑Bodies Tier tracker (cross‑restart) ──
+            "hub_tier_last_modified": state.hub_tier_last_modified,
+            "hub_tier_body_hashes": state.hub_tier_body_hashes,
+            "hub_tier_query_heat": state.hub_tier_query_heat,
+            "hub_tier_qids_persisted": state.hub_tier_qids_persisted,
         }
 
         def _write() -> None:
@@ -2032,16 +2069,29 @@ class ContextPager:
             A list of block hashes eligible for page-out, sorted by
             (activation, importance) ascending (coldest first).
         """
-        active = state.get("active_blocks", {})
+        active = state.active_blocks
         if len(active) <= paging_threshold:
             return []
+
+        # ── fallback para tier_qids si pstate está vacío ──
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        tier_qids = set(pstate.get("hub_tier_qids", []))
+        if not tier_qids:
+            # Primer turno o cross‑restart: leer desde state (persistido)
+            tier_qids = set(state.get("hub_tier_qids_persisted", []))
 
         candidates = []
         for h, block in active.items():
             if block.pinned or block.obsolete:
                 continue
+
+            # ── Proteger bloques que contienen hubs del tier ──
+            if self._f.valves.hub_bodies_tier_protect_from_paging:
+                if any(qualify_symbol(s) in tier_qids for s in block.symbols):
+                    continue
+
             if block.symbols:
-                # ── FIX 17.c: Use qualify_symbol to include file_path ──
+                # ── Use qualify_symbol to include file_path ──
                 block_activation = max(
                     (
                         activation_scores.get(qualify_symbol(s), 0.0)
@@ -2061,7 +2111,7 @@ class ContextPager:
         n_to_page = len(active) - paging_threshold
         selected = [h for h, _, _ in candidates[:n_to_page]]
 
-        # Debug log if under-paging (FIX #8)
+        # Debug log if under-paging
         if len(selected) < n_to_page:
             # The caller (Filter) will log this via self._log_debug when it
             # sees fewer blocks paged than expected.
@@ -3316,6 +3366,239 @@ class ContextBuilder:
 
         return tier
 
+    def _build_hub_bodies_tier(self, project_id: str) -> Tuple[str, str, List[str]]:
+        """
+        Build the Hub‑Bodies Tier: full bodies of top‑N hubs by centrality,
+        ordered by stability (last_modified_turn), truncated by budget.
+
+        Returns (tier_text, tier_hash, ordered_qids).
+        ('', '', []) if disabled or no centrality.
+
+        INVARIANT: zero query‑dependent annotations in the rendered text.
+        Any query‑dependent data (scores, activation) goes into the recency
+        pointer (volatile Block B), not here.
+        """
+        if not self._f.valves.enable_hub_bodies_tier:
+            return "", "", []
+
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        centrality = pstate.get("node_centrality", {})
+        if not centrality:
+            return "", "", []
+
+        state = self._f._conversation_state_manager.get(project_id)
+        current_turn = state.message_count
+
+        # ── Persistent trackers (survive restarts via state) ──
+        last_mod = state.setdefault("hub_tier_last_modified", {})
+        body_hashes = state.setdefault("hub_tier_body_hashes", {})
+        heat = state.setdefault("hub_tier_query_heat", {})
+        prev_seeds = set(pstate.get("hub_tier_prev_seeds", []))
+
+        # ── Selection: top‑N with optional centrality floor ──
+        ranked = self._f._symbol_index.get_hub_symbols(
+            project_id, centrality, self._f.valves.hub_bodies_tier_top_n
+        )
+        floor = self._f.valves.hub_bodies_tier_min_centrality
+        candidates = [qid for qid, c in ranked if (floor <= 0 or c >= floor)]
+
+        # ── Resolve bodies, detect changes, update trackers ──
+        resolved = {}  # qid -> (body, body_hash, lang)
+        for qid in candidates:
+            body, lang = self._resolve_hub_body(qid, project_id, state)
+            if not body:
+                continue
+            max_body = self._f.valves.hub_bodies_tier_max_body_tokens
+            if max_body > 0 and self._f._tokens.estimate_code_tokens(body) > max_body:
+                self._f._log_debug(f"Hub tier: skipping {qid} (body > {max_body} tok)")
+                continue
+            bh = hashlib.md5(body.encode()).hexdigest()[:16]
+            if body_hashes.get(qid) != bh:
+                last_mod[qid] = current_turn  # changed → move to bottom
+            body_hashes[qid] = bh
+            resolved[qid] = (body, bh, lang)
+
+        if not resolved:
+            return "", "", []
+
+        # ── Update query heat (EWMA) ──
+        alpha = 0.3
+        for qid in candidates:
+            was_seed = 1.0 if qid in prev_seeds else 0.0
+            heat[qid] = alpha * was_seed + (1 - alpha) * heat.get(qid, 0.0)
+
+        # ── Order: stability primary, heat secondary (hot hubs go lower) ──
+        ordered = sorted(
+            resolved,
+            key=lambda q: (
+                last_mod.get(q, current_turn),  # oldest‑edited first → top
+                -heat.get(q, 0.0),  # hot hubs go bottom
+                q,
+            ),
+        )
+
+        # ── Budget cap: keep top (stable), drop bottom (volatile) ──
+        budget = self._f.valves.hub_bodies_tier_max_tokens
+        # Auto‑cap if multi‑phase is active (M8)
+        if (
+            self._f.valves.enable_multi_phase_response
+            or self._f.valves.force_multi_phase_response
+        ):
+            budget = min(budget, 6000)
+            self._f._log_debug(f"Hub tier: budget capped to 6000 (multi‑phase active)")
+
+        lines = [
+            "## Core Implementation (hub symbols — stable, cached)",
+            "_Full bodies of the most central symbols, ordered from most to least stable. "
+            "They rarely change and are anchored here for KV cache reuse._",
+            "",
+        ]
+        total = self._f._tokens.estimate_code_tokens("\n".join(lines))
+        kept = []
+        excluded_by_cap = []
+
+        for qid in ordered:
+            body, bh, lang = resolved[qid]
+            # ── M3: docstring in header ──
+            meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
+            doc = meta.get("docstring", "")
+            doc_line = f"_{doc}_\n" if doc else ""
+
+            # ── M5: cross‑reference hints ──
+            kept_set = set(kept)  # only already‑kept hubs for inline refs
+            body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | set([qid]))
+
+            chunk = f"### `{qid}`\n{doc_line}```{lang}\n{body_with_xrefs}\n```\n"
+            tok = self._f._tokens.estimate_code_tokens(chunk)
+            if budget > 0 and total + tok > budget:
+                excluded_by_cap.extend(ordered[ordered.index(qid) :])
+                break
+            lines.append(chunk)
+            kept.append(qid)
+            total += tok
+
+        if excluded_by_cap:
+            self._f._log_debug(
+                f"Hub tier: {len(excluded_by_cap)} hub(s) excluded by budget cap "
+                f"→ will be served via LoD: {excluded_by_cap}"
+            )
+
+        if not kept:
+            return "", "", []
+
+        tier_text = "\n".join(lines)
+
+        # ── M6: include selection parameters in hash ──
+        config_prefix = (
+            f"n={self._f.valves.hub_bodies_tier_top_n}|"
+            f"floor={self._f.valves.hub_bodies_tier_min_centrality}"
+        )
+        tier_hash = hashlib.md5(
+            f"{config_prefix}|"
+            + "|".join(f"{q}:{resolved[q][1]}" for q in kept).encode()
+        ).hexdigest()[:16]
+
+        # ── Prune stale tracker entries ──
+        live = set(candidates)
+        for d in (last_mod, body_hashes, heat):
+            for stale in [k for k in list(d.keys()) if k not in live]:
+                del d[stale]
+
+        # ── persist tracker changes ──
+        # also persist tier_qids for pager fallback
+        state["hub_tier_qids_persisted"] = kept
+        self._f._conversation_state_manager.set(project_id, state)  # marks dirty
+
+        return tier_text, tier_hash, kept
+
+    def _resolve_hub_body(
+        self, qid: str, project_id: str, state: "ConversationState"
+    ) -> Tuple[str, str]:
+        """
+        Deterministically resolve the full body of a symbol.
+
+        Returns (body, language). Returns ('', 'python') if not found.
+        """
+        candidates = []
+        for bh in self._f._symbol_index.find_blocks(qid, project_id):
+            block = state.active_blocks.get(bh)
+            if block and not block.obsolete:
+                body = CodeBlockManager.extract_symbol_body(block, qid)
+                if body:
+                    candidates.append((block.timestamp, body, block))
+        if not candidates:
+            return "", "python"
+        candidates.sort(key=lambda x: x[0], reverse=True)  # newest first
+        _, body, block = candidates[0]
+        lang = block.symbols[0].language if block.symbols else "python"
+        return body, lang
+
+    def _inject_tier_xrefs(self, body: str, qid: str, kept_set: Set[str]) -> str:
+        """
+        Add inline comments where this symbol calls another hub in the tier.
+        Helps the model trace call chains without long‑distance attention.
+        """
+        lines = body.split("\n")
+        result = []
+        for line in lines:
+            result.append(line)
+            for other_qid in kept_set:
+                if other_qid == qid:
+                    continue
+                bare = other_qid.rsplit(".", 1)[-1]
+                # Detect call patterns (language‑agnostic best effort)
+                if (
+                    f"{bare}(" in line
+                    or f"self.{bare}(" in line
+                    or f"->{bare}(" in line
+                ):
+                    result.append(f"    # ↑ see `{other_qid}` in this tier")
+                    break
+        return "\n".join(result)
+
+    def _build_hub_recency_pointers(
+        self, project_id: str, ag: "ActivationGraph"
+    ) -> str:
+        """
+        Build the recency pointer for hubs that are seeds of the current query.
+
+        M1: includes the full signature, not just the qid.
+        """
+        if not self._f.valves.hub_bodies_tier_recency_pointers:
+            return ""
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        tier_qids = set(pstate.get("hub_tier_qids", []))
+        if not tier_qids:
+            return ""
+        seeds = set(ag.get_seed_nodes()) & tier_qids
+        if not seeds:
+            return ""
+        lines = ["**Symbols in focus** (full bodies in «Core Implementation» above):"]
+        for qid in sorted(seeds):
+            meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
+            sig = meta.get("signature", qid)
+            lines.append(f"- `{sig}`")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_instruction_tail(use_case: str = "C") -> str:
+        """
+        M2: instruction tail adapted to the active use case.
+        """
+        tails = {
+            "A": "_[Architecture mode: focus on contracts, interfaces, and invariants. "
+            "Reasoning guidelines from system above apply.]_",
+            "D": "_[Refactor mode: identify all callers before proposing changes. "
+            "Code review checklist from system above applies.]_",
+            "E": "_[Scaffold mode: signatures only, no implementation. "
+            "Guidelines from system above apply.]_",
+        }
+        default = (
+            "_[Reasoning mode: code review checklist + critical reasoning "
+            "guidelines from system above apply to this response]_"
+        )
+        return tails.get(use_case, default)
+
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
         """
         True only if the skeleton tier was actually rendered into Block A
@@ -3983,8 +4266,8 @@ class ContextBuilder:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
             return active_ctx if active_ctx else ""
 
-        state = self._f._state_store.get_state(project_id)
-        if not state or not state.get("active_blocks"):
+        state = self._f._conversation_state_manager.get(project_id)
+        if not state or not state.active_blocks:
             return ""
 
         # ── Fast path: FILTERED skeleton (single symbol + 1-hop deps) ────
@@ -4113,8 +4396,12 @@ class ContextBuilder:
             )
             budget = min(budget, max(8000, _available_for_context))
 
+        # ── Supress hubs already in tier ──────────────────────────────────
+        tier_qids = set(pstate.get("hub_tier_qids", []))
+        injected_symbols: Set[str] = set(tier_qids)
+
         # ── FIX: track injected symbols, not blocks ──────────────────────
-        injected_symbols: Set[str] = set()
+        # injected_symbols ya incluye los hubs del tier.
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
         # ── Centrality LOD bump ────────────────────────────────────────────
@@ -4148,7 +4435,7 @@ class ContextBuilder:
                 for node_id in lod2_candidates:
                     has_doc = False
                     for bh in self._f._symbol_index.find_blocks(node_id, project_id):
-                        blk = state["active_blocks"].get(bh)
+                        blk = state.active_blocks.get(bh)
                         if blk and any(
                             qualify_symbol_name(s.name, s.parent_symbol) == node_id
                             and s.docstring
@@ -4195,15 +4482,9 @@ class ContextBuilder:
             if node_id in injected_symbols:
                 continue
 
-            if score < lod1:
-                _lod0_parts.append(f"`{node_id}`")
-                total_tokens += 2
-                injected_symbols.add(node_id)
-                continue
-
             block_hashes = self._f._symbol_index.find_blocks(node_id, project_id)
             for bh in block_hashes:
-                block = state["active_blocks"].get(bh)
+                block = state.active_blocks.get(bh)
 
                 # Page-in support for evicted blocks
                 if block is None and self._f._pager is not None:
@@ -4399,6 +4680,14 @@ class ContextBuilder:
                 + "\n".join(_lod3_parts)
             )
 
+        # ── Recency pointers (Bug 1: moved to end of B, not inside LoD) ──
+        _ptr = self._build_hub_recency_pointers(project_id, ag)
+        if _ptr:
+            ordered.append(_ptr)
+
+        # ── Instruction tail (M2: use‑case aware) ──
+        ordered.append(self._build_instruction_tail(active_use_case))
+
         # ── Avoid fallback when skeleton tier is active ──
         if len(ordered) <= 1:
             if self._f.valves.debug:
@@ -4413,7 +4702,7 @@ class ContextBuilder:
                 return ""
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── FIX: summary line uses injected_symbols ──────────────────────
+        # ── summary line uses injected_symbols ──────────────────────
         summary_line = (
             f"\n_(Context: {len(injected_symbols)} symbols, "
             f"~{total_tokens} tokens, "
@@ -16018,7 +16307,11 @@ class SystemPromptBuilder:
     ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
         """
         Orchestrate the construction of the two-block system prompt.
+
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
+
+        Now includes the Hub‑Bodies Tier between Block A and Block B,
+        with recency pointers and instruction‑tail integrated via ContextBuilder.
         """
         # ══════════════════════════════════════════════════════════════
         # BLOCK A — STATIC (via ContextBuilder)
@@ -16029,6 +16322,20 @@ class SystemPromptBuilder:
             is_code_session=is_code_session,
             is_continuation=not slot_free,
         )
+
+        # ══════════════════════════════════════════════════════════════
+        # HUB‑BODIES TIER (stable, between A and B)
+        # ══════════════════════════════════════════════════════════════
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        hub_tier_text, hub_tier_hash, hub_tier_qids = (
+            self._f._ctx_builder._build_hub_bodies_tier(project_id)
+        )
+        pstate["hub_tier_text"] = hub_tier_text
+        pstate["hub_tier_hash"] = hub_tier_hash
+        pstate["hub_tier_qids"] = hub_tier_qids
+        # M4: store previous seeds for heat tracking
+        pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
+        pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
 
         # ══════════════════════════════════════════════════════════════
         # BLOCK B — DYNAMIC (per-query)
@@ -16081,7 +16388,10 @@ class SystemPromptBuilder:
         # B5: Assemble prelim_system (budget-aware)
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
-            static_block, dynamic_injections, messages
+            static_block,
+            hub_tier_text,  # ← NUEVO: tier entre A y B
+            dynamic_injections,
+            messages,
         )
 
         self._f._log_debug("🔄 Block B: complete")
@@ -16343,12 +16653,22 @@ class SystemPromptBuilder:
     def _assemble_prelim_system(
         self,
         static_block: str,
+        hub_tier: str,
         dynamic_injections: List[Tuple[str, str]],
         messages: List[dict],
     ) -> str:
-        """Apply token budget constraints and build the preliminary system prompt."""
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        """
+        Assemble the preliminary system prompt with token budget constraints.
 
+        The order is:
+            1. static_block (Block A)
+            2. hub_tier (stable full bodies of top hubs)
+            3. dynamic_block (Block B: LOD, pointers, LTM, suggestions, etc.)
+            4. user's original system prompt (captured separately)
+
+        This order ensures that the stable prefix (A + tier) is KV-cacheable
+        across turns, while the dynamic tail re-prefills as needed.
+        """
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
@@ -16359,16 +16679,30 @@ class SystemPromptBuilder:
             static_tokens = (
                 len(self._f.tokenizer.encode(static_block)) if static_block else 0
             )
-            remaining_budget = max(0, budget - static_tokens)
+            hub_tier_tokens = len(self._f.tokenizer.encode(hub_tier)) if hub_tier else 0
+            # User system prompt is never truncated
+            user_prompt_tokens = (
+                len(
+                    self._f.tokenizer.encode(
+                        getattr(self._f, "_original_system_prompt", "") or ""
+                    )
+                )
+                if getattr(self._f, "_original_system_prompt", "")
+                else 0
+            )
+            dyn_budget = max(
+                0, budget - static_tokens - hub_tier_tokens - user_prompt_tokens
+            )
+
             for prio, text in dynamic_injections:
                 if not text:
                     continue
                 tok = len(self._f.tokenizer.encode(text))
-                if used + tok <= remaining_budget:
+                if used + tok <= dyn_budget:
                     selected.append(text)
                     used += tok
                 elif prio in ("critical", "high"):
-                    avail = remaining_budget - used
+                    avail = dyn_budget - used
                     if avail > 20:
                         selected.append(text[: avail * 4] + "\n[truncated]")
                         break
@@ -16376,12 +16710,17 @@ class SystemPromptBuilder:
         else:
             dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
-        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
-        prelim_system = static_block + separator + dynamic_block
+        # ── Assemble with tier between static and dynamic ──
+        separator = "\n\n---\n\n"
+        parts = [p for p in [static_block, hub_tier, dynamic_block] if p.strip()]
+        prelim_system = separator.join(parts)
 
-        base_content = sys_msgs[0].get("content", "") if sys_msgs else ""
+        # Append user's original system prompt if present (captured once per turn)
+        base_content = getattr(self._f, "_original_system_prompt", "") or ""
         if base_content.strip():
-            prelim_system = prelim_system + "\n\n" + base_content
+            prelim_system = (
+                prelim_system + separator + "## User instructions\n" + base_content
+            )
 
         return prelim_system
 
@@ -19648,6 +19987,109 @@ class Filter:
             description=(
                 "Show outgoing calls ('→ calls:') for hub symbols, alongside "
                 "the existing incoming-callers line ('← used by:')."
+            ),
+        )
+
+        # ═══════════════════════════════════════════════════════════════════════
+        #  Hub‑Bodies Tier (stable full bodies of top hubs)
+        # ═══════════════════════════════════════════════════════════════════════
+        # This region controls the amount of permanent code permanently expanded.
+        # This provides better visibility and prevent excessive filling.
+        enable_hub_bodies_tier: bool = Field(
+            default=False,
+            description=(
+                "Enable the stable hub‑bodies tier in Block A. "
+                "When enabled, the full bodies of the top‑N most central symbols "
+                "are injected as a cacheable tier between Block A and Block B. "
+                "This dramatically improves recall for queries about core symbols "
+                "without increasing LoD pressure.\n\n"
+                "Off by default until validated on hardware. Estimated cost: "
+                "+3.3s cold start, 0s on read‑only turns (slot hit), "
+                "+1.7s on first edit of a cold hub."
+            ),
+        )
+
+        hub_bodies_tier_top_n: int = Field(
+            default=7,
+            ge=1,
+            le=20,
+            description=(
+                "Number of top hubs to include in the tier. "
+                "PageRank centrality is heavy‑tailed; the top‑7 are genuinely "
+                "central. N > 7 dilutes attention without proportional gain.\n\n"
+                "Recommended: 7 (default). Range 1‑20."
+            ),
+        )
+
+        hub_bodies_tier_min_centrality: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum PageRank centrality score to qualify for the tier. "
+                "0.0 = no floor (only top‑N applies). Values > 0 automatically "
+                "prune low‑centrality hubs even if they are in the top‑N.\n\n"
+                "Useful for very large codebases where even the 7th hub is "
+                "peripheral. Default 0.0 (rely on top‑N only)."
+            ),
+        )
+
+        hub_bodies_tier_max_tokens: int = Field(
+            default=10000,
+            ge=500,
+            description=(
+                "Token budget for the entire tier. If the rendered tier exceeds "
+                "this, hubs are dropped from the bottom (most volatile) until "
+                "the budget is met.\n\n"
+                "Auto‑capped to 6000 if multi‑phase response is active "
+                "(see enable_multi_phase_response / force_multi_phase_response).\n\n"
+                "Recommended: 10000 (MP‑OFF), 6000 (MP‑ON)."
+            ),
+        )
+
+        hub_bodies_tier_max_body_tokens: int = Field(
+            default=1500,
+            ge=200,
+            description=(
+                "Maximum tokens allowed for an individual hub body. "
+                "Hubs larger than this are skipped (they go via LoD).\n\n"
+                "Rationale: very large bodies (e.g., 200‑line functions) have "
+                "poor re‑prefill cost when edited and cause attention dilution "
+                "when irrelevant. LoD injects them only when activated.\n\n"
+                "Recommended: 1500 (default). Range 200‑4000."
+            ),
+        )
+
+        hub_bodies_tier_protect_from_paging: bool = Field(
+            default=True,
+            description=(
+                "Prevent code blocks that contain hubs in the tier from being "
+                "paged out by ContextPager.\n\n"
+                "Required for tier correctness. Keep enabled unless debugging."
+            ),
+        )
+
+        hub_bodies_tier_recency_pointers: bool = Field(
+            default=True,
+            description=(
+                "Include recency pointers for hub seeds in Block B.\n\n"
+                "CRITICAL for attention: the full bodies are in the tier "
+                "(zone media, ~22k‑27k), but the recency pointer creates an "
+                "anchor near the query, enabling effective recall.\n\n"
+                "Keep enabled unless you measure that the model recovers well "
+                "without it. Default True."
+            ),
+        )
+
+        hub_bodies_tier_warmup_on_ingestion: bool = Field(
+            default=False,
+            description=(
+                "Background prefill of the stable prefix (Block A + tier) "
+                "after silent ingestion.\n\n"
+                "When enabled, the tier is built and a dummy 1‑token request "
+                "is sent to the LLM, populating the KV cache. The first real "
+                "query then does a slot restore instead of a cold prefill.\n\n"
+                "Hides the +3.3s cold start cost. Default False (Phase 2)."
             ),
         )
 
