@@ -1771,18 +1771,19 @@ class HubSymbolIndex:
         return "\n".join(lines)
 
     def _format_symbol_line_no_score(self, qid, project_id, symbol_index) -> str:
-        """Same as _format_symbol_line but without the centrality score column.
+        """
+        Same as _format_symbol_line but without the centrality score column.
         full_graph forces callees on: showing the bidirectional edge set is the
         whole point of this mode.
 
         Caller attribution caveat: get_edges_in() resolves by bare name —
         a method shared across multiple classes (every __init__, etc.) shows
         the union of callers of ANY same-named method, not specifically this
-        occurrence. hubs_only/expanded_hubs limit this ambiguity to ≤top_n
-        symbols; full_graph surfaces it for every repeated bare name in the
-        project. Lines affected by this are marked '(ambiguous: shared name)'
+        occurrence. Lines affected by this are marked '(ambiguous: shared name)'
         so the model — and a human reading the dump — doesn't treat the
         caller list as precise for those symbols.
+
+        All callers and callees are shown in full, without truncation.
         """
         bare_name = qid.rsplit(".", 1)[-1]
         is_ambiguous_name = (
@@ -1793,15 +1794,14 @@ class HubSymbolIndex:
         callees = self._safe_callees(qid, project_id, symbol_index)
 
         parts = [f"- `{qid}`"]
+
         if callers:
-            shown = sorted(callers)[:5]
-            extra = f", ... (+{len(callers) - 5} more)" if len(callers) > 5 else ""
             tag = " (ambiguous: shared name)" if is_ambiguous_name else ""
-            parts.append(f"\n  ← used by{tag}: {', '.join(shown)}{extra}")
+            parts.append(f"\n  ← used by{tag}: {', '.join(sorted(callers))}")
+
         if callees:
-            shown = sorted(callees)[:5]
-            extra = f", ... (+{len(callees) - 5} more)" if len(callees) > 5 else ""
-            parts.append(f"\n  → calls: {', '.join(shown)}{extra}")
+            parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
+
         return "".join(parts)
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1963,25 +1963,25 @@ class HubSymbolIndex:
     def _format_symbol_line(
         self, qid, centrality, symbol_index, project_id, enable_callees=True
     ) -> str:
-        """Format one hub-symbol line: ``- `qid` (centrality: score)``
-        optionally followed by ``← used by:`` (top 5 callers) and
-        ``→ calls:`` (top 5 callees, when *enable_callees* is True)."""
+        """
+        Format one hub-symbol line: ``- `qid` (centrality: score)``
+        optionally followed by ``← used by:`` (all callers) and
+        ``→ calls:`` (all callees, when *enable_callees* is True).
+
+        All callers and callees are shown in full, without truncation.
+        """
         score = centrality.get(qid, 0.0)
         callers = self._safe_callers(qid, project_id, symbol_index)
 
         parts = [f"- `{qid}` (centrality: {score:.2f})"]
 
         if callers:
-            shown = sorted(callers)[:5]
-            extra = f", ... (+{len(callers) - 5} more)" if len(callers) > 5 else ""
-            parts.append(f"\n  ← used by: {', '.join(shown)}{extra}")
+            parts.append(f"\n  ← used by: {', '.join(sorted(callers))}")
 
         if enable_callees:
             callees = self._safe_callees(qid, project_id, symbol_index)
             if callees:
-                shown = sorted(callees)[:5]
-                extra = f", ... (+{len(callees) - 5} more)" if len(callees) > 5 else ""
-                parts.append(f"\n  → calls: {', '.join(shown)}{extra}")
+                parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
 
         return "".join(parts)
 
@@ -4188,6 +4188,22 @@ class ContextBuilder:
         # --- 1. Resolve project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
+        # ── NEW: Global scope detection ──────────────────────────────────────
+        # Queries like "check all orphan calls" need visibility of the ENTIRE graph.
+        # Seed inference returns {} for them (see SemanticSeedInferencer.is_global_scope).
+        # Here we force the most informative mode and activate multi‑phase.
+        if hasattr(
+            self._f, "_seed_inferencer"
+        ) and self._f._seed_inferencer.is_global_scope(query):
+            pstate["resolved_call_graph_mode"] = "full_graph"
+            pstate["force_multi_phase_this_turn"] = True
+            pstate["graph_mode_downgrade_streak"] = 0
+            self._f._log_debug(
+                "prepare_call_graph_mode: global scope detected → "
+                "full_graph forced + multi‑phase activated this turn."
+            )
+            return "full_graph"
+
         # --- 2. Resolve the raw mode from intent and budget ---
         raw_resolved_mode = self._resolve_call_graph_mode(
             query, intent_vector, project_id
@@ -4208,7 +4224,6 @@ class ContextBuilder:
             pstate["graph_mode_downgrade_streak"] = 0
         else:
             # Candidate downgrade: only commit after enough consecutive turns.
-            # This implements the hysteresis to avoid flip-flop (step 10).
             streak += 1
             pstate["graph_mode_downgrade_streak"] = streak
             if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
@@ -4290,9 +4305,26 @@ class ContextBuilder:
             if all_qids:
                 return await self._format_full_symbol_inventory(all_qids, project_id)
 
-        # ── Step 1: ActivationGraph ──────────────────────────────────────
+        # ── Step 1a: Classify use case (needed before PPR for infer_seeds) ──
+        active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
+
+        # ── Step 1b: LLM‑guided seed inference (before PPR) ──
+        inferred_seeds: Dict[str, float] = {}
+        if self._f.valves.seed_inference_mode != "off":
+            inferred_seeds = await self._f._seed_inferencer.infer_seeds(
+                query=query,
+                project_id=project_id,
+                intent_vector=intent_vector,
+                use_case=active_use_case,
+                slot_free=slot_free,
+            )
+
+        # ── Step 1c: ActivationGraph (with inferred seeds) ────────────────
         ag = self._f._activation.build_activation_graph(
-            query, project_id, messages=messages
+            query,
+            project_id,
+            messages=messages,
+            inferred_seeds=inferred_seeds,
         )
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
@@ -4303,7 +4335,7 @@ class ContextBuilder:
             )
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── Step 2: Adjust LOD thresholds by intent ───────────────────────
+        # ── Step 2: Adjust LOD thresholds by intent ───────────────────────────
         debug_weight = intent_vector.get("debug", 0.2)
         modify_weight = intent_vector.get("modify", 0.3)
         refactor_weight = intent_vector.get("refactor", 0.1)
@@ -4312,11 +4344,8 @@ class ContextBuilder:
         lod2 = self._f.valves.lod2_threshold
         lod1 = self._f.valves.lod1_threshold
 
-        # ── Cambio A: Move classify_use_case here (was near the end) ──
-        active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
-
+        # ── Per-use-case LOD scaling ──────────────────────────────────────
         if self._f.valves.enable_lod_by_intent:
-            # Per-use-case LOD profile
             lod1 *= use_case_profile.get("lod1_mult", 1.0)
             lod2 *= use_case_profile.get("lod2_mult", 1.0)
             lod3 *= use_case_profile.get("lod3_mult", 1.0)
@@ -4393,8 +4422,6 @@ class ContextBuilder:
         tier_qids = set(pstate.get("hub_tier_qids", []))
         injected_symbols: Set[str] = set(tier_qids)
 
-        # ── FIX: track injected symbols, not blocks ──────────────────────
-        # injected_symbols ya incluye los hubs del tier.
         sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
 
         # ── Centrality LOD bump ────────────────────────────────────────────
@@ -4471,7 +4498,6 @@ class ContextBuilder:
             if total_tokens >= budget:
                 break
 
-            # ── FIX: deduplicate by symbol, not block ─────────────────────
             if node_id in injected_symbols:
                 continue
 
@@ -4582,7 +4608,6 @@ class ContextBuilder:
                                 f"[Summary of {tok}-token block]\n{block.block_summary}"
                             )
                         else:
-                            # ── FIX: hard truncate when summary not ready ──
                             content_to_inject = (
                                 self._f._tokens.truncate_text_to_tokens(
                                     content_to_inject,
@@ -4645,7 +4670,6 @@ class ContextBuilder:
                 _lod2_parts.insert(0, raptor_section)
 
         # ── Step 4: SWA-aware assembly ────────────────────────────────────
-        # --- UPDATED: Suppression gate uses the per-turn render state ---
         suppress_sigs = (
             self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
@@ -4673,20 +4697,18 @@ class ContextBuilder:
                 + "\n".join(_lod3_parts)
             )
 
-        # ── Recency pointers (Bug 1: moved to end of B, not inside LoD) ──
+        # ── Recency pointers ──────────────────────────────────────────────
         _ptr = self._build_hub_recency_pointers(project_id, ag)
         if _ptr:
             ordered.append(_ptr)
 
-        # ── Instruction tail (M2: use‑case aware) ──
+        # ── Instruction tail ──────────────────────────────────────────────
         ordered.append(self._build_instruction_tail(active_use_case))
 
-        # ── Avoid fallback when skeleton tier is active ──
+        # ── Avoid fallback when skeleton tier is active ──────────────────
         if len(ordered) <= 1:
             if self._f.valves.debug:
                 self._f._log_debug("build_block_b: no activated nodes or empty context")
-            # If the skeleton tier is active and we're suppressing signatures,
-            # the skeleton tier in Block A already provides the necessary context.
             if suppress_sigs:
                 self._f._log_debug(
                     "build_block_b: skeleton tier active and suppress_sigs=True, "
@@ -4695,7 +4717,7 @@ class ContextBuilder:
                 return ""
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── summary line uses injected_symbols ──────────────────────
+        # ── summary line uses injected_symbols ──────────────────────────
         summary_line = (
             f"\n_(Context: {len(injected_symbols)} symbols, "
             f"~{total_tokens} tokens, "
@@ -12734,20 +12756,17 @@ class ActivationEngine:
         history_boosts: Dict[str, float],
         edges_out: dict,
         project_id: str,
+        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
     ) -> "ActivationGraph":
         """Build activation graph when multi‑seed activation is disabled.
 
-        Each seed is resolved from its bare name to the qualified id(s) of
-        the matching symbol(s) before being written into the graph, since
-        edges_out is now keyed by qualified id (see SymbolIndex).  A bare
-        name shared by several same‑named methods across classes (e.g. every
-        __init__) is split among all of them, with the score divided among
-        the matches — we don't know which one the user means, so each
-        plausible candidate gets a fair, bounded share instead of an
-        arbitrary winner."""
+        Each bare‑name seed is split across its qualified id(s) before being
+        written into the graph, since edges_out is now keyed by qualified id.
+        """
         symbol_index = self._f._symbol_index
         ag = ActivationGraph()
 
+        # ── Lexical + traceback + history seeds (unchanged) ──
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
@@ -12801,6 +12820,27 @@ class ActivationEngine:
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
+        # ── Inferred seeds (high confidence, already qualified ids) ──
+        # Injected AFTER lexical/historical seeds so they do not overwrite
+        # a higher lexical score; we take the max.
+        for qid, inf_score in (inferred_seeds or {}).items():
+            existing = ag._activations.get(qid)
+            if existing:
+                ag._activations[qid] = ActivationState(
+                    node_id=qid,
+                    score=min(1.0, max(existing.score, inf_score)),
+                    depth=0,
+                    source="seed",
+                )
+            else:
+                ag._activations[qid] = ActivationState(
+                    node_id=qid,
+                    score=inf_score,
+                    depth=0,
+                    source="seed",
+                )
+
+        # ── Fallback to entry points if no seeds at all ──
         if not ag._activations:
             pstate = self._f._project_state_manager.get_pstate(project_id)
             centrality = pstate.get("node_centrality", {})
@@ -12834,6 +12874,7 @@ class ActivationEngine:
         history_boosts: Dict[str, float],
         edges_out: dict,
         project_id: str,
+        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
     ) -> "ActivationGraph":
         """Build activation graph combining lexical, structural and historical
         seed vectors.  Like _build_single_seed_graph, each bare‑name seed is
@@ -12882,6 +12923,17 @@ class ActivationEngine:
                     ag_lex._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
                     )
+
+        # ── NEW: Inferred seeds → lexical vector (they are query signal) ──
+        for qid, inf_score in (inferred_seeds or {}).items():
+            existing = ag_lex._activations.get(qid)
+            ag_lex._activations[qid] = ActivationState(
+                node_id=qid,
+                score=min(1.0, max(existing.score if existing else 0.0, inf_score)),
+                depth=0,
+                source="seed",
+            )
+
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -12901,6 +12953,8 @@ class ActivationEngine:
             lexical_seed_qids |= symbol_index.get_qualified_names_for(
                 sym_name, project_id
             )
+        # ── NEW: include inferred seeds as legitimate lexical seeds ──
+        lexical_seed_qids |= set(inferred_seeds or {})
 
         structural_seeds: Set[str] = set()
         for view in self._f._path_index.get_all(project_id):
@@ -13023,12 +13077,20 @@ class ActivationEngine:
         project_id: str,
         max_propagation_steps: int = 4,
         messages: Optional[List[dict]] = None,
+        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
     ) -> "ActivationGraph":
         """
         Build an ActivationGraph combining up to three independent seed vectors.
 
-        Delegates seed extraction and the single‑seed / multi‑seed construction
-        to private helpers, keeping the top‑level logic easy to read.
+        Args:
+            query: The user query string.
+            project_id: Current project identifier.
+            max_propagation_steps: Steps for PPR propagation.
+            messages: Recent conversation messages (for historical seeds).
+            inferred_seeds: Optional {qid: score} from LLM‑guided inference.
+
+        Returns:
+            ActivationGraph with propagated scores.
         """
         self._f._log_debug(
             f"[PPR] build_activation_graph: query='{query[:100]}', "
@@ -13051,6 +13113,7 @@ class ActivationEngine:
         )
 
         # 2. Build the activation graph in the appropriate mode
+        _inferred = inferred_seeds or {}
         if not self._f.valves.enable_multi_seed_activation:
             self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
             ag = self._build_single_seed_graph(
@@ -13060,6 +13123,7 @@ class ActivationEngine:
                 history_boosts,
                 edges_out,
                 project_id,
+                _inferred,
             )
         else:
             self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
@@ -13070,6 +13134,7 @@ class ActivationEngine:
                 history_boosts,
                 edges_out,
                 project_id,
+                _inferred,
             )
 
         # 3. Store scores for downstream consumers (LOD, prefetch, pager)
@@ -17288,6 +17353,7 @@ class MessageAssembler:
             messages,
             user_question,
             slot_free,
+            project_id,  # ← NEW: pass project_id for global-scope flag
         )
 
         # 6. Trim and summarize old messages (now handled by WindowManager)
@@ -17928,9 +17994,11 @@ class MessageAssembler:
         messages: List[dict],
         user_question: str,
         slot_free: bool,
+        project_id: str,  # ← NEW
     ) -> None:
         """
-        Inject multi‑phase protocol if the token budget is tight.
+        Inject multi‑phase protocol if the token budget is tight or a global‑scope
+        query demands it.
         """
         if not (
             self._f.valves.enable_multi_phase_response
@@ -17958,7 +18026,20 @@ class MessageAssembler:
 
         # --- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
-        use_multi_phase = self._f.valves.force_multi_phase_response or budget_tight
+
+        # ── NEW: read the one‑shot global‑scope flag ──
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        force_global_scope = pstate.pop("force_multi_phase_this_turn", False)
+
+        use_multi_phase = (
+            self._f.valves.force_multi_phase_response
+            or budget_tight
+            or force_global_scope
+        )
+        if force_global_scope and not budget_tight:
+            self._f._log_debug(
+                "Multi‑phase: activated by global‑scope query (full_graph active this turn)."
+            )
 
         if use_multi_phase:
             _INSTRUCTION_OVERHEAD = 450
@@ -18636,9 +18717,6 @@ class ProjectStateManager:
     def _new_pstate(self) -> dict:
         """
         Factory for a fresh per-project state bag with all defaults.
-
-        Note: history_blocked_age has been moved to ConversationState
-        (persistent) as of Phase 1. It is no longer stored here.
         """
         return {
             # Call-graph mode
@@ -18678,6 +18756,8 @@ class ProjectStateManager:
             "last_lod_levels": {},
             # structure_hash_for_cache is set by ContextBuilder.build_block_a
             "structure_hash_for_cache": None,
+            # ── one‑shot flag for global‑scope queries ──
+            "force_multi_phase_this_turn": False,
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -18967,6 +19047,264 @@ class ProjectStateManager:
                     self._f._log_debug(f"Removed obsolete slot file: {fname}")
         except Exception as e:
             self._f._log_debug(f"Slot cleanup error: {e}")
+
+
+class SemanticSeedInferencer:
+    """
+    LLM‑guided seed inference for the PPR activation graph.
+
+    PROBLEM IT SOLVES
+    ─────────────────
+    `_extract_query_seeds()` only seeds symbols whose name appears literally in
+    the query. For implicit requests ("add OAuth2", "make login use JWT", "how
+    would a new notification type affect the system?") the relevant symbols are
+    never named → PPR gets no seeds → the model doesn't see the bodies it needs
+    → shallow or incorrect answers.
+
+    SOLUTION
+    ────────
+    Given the project skeleton (already built and cached for Block A) and the
+    query, ask the LLM which qualified ids need their full body. The returned
+    ids are injected as high‑confidence seeds before PPR.
+
+    COST AND KV CACHE
+    ─────────────────
+    - ONE auxiliary call bounded by seed_inference_skeleton_max_tokens.
+    - Gated by slot_free (does not run during AutoContinue continuations).
+    - Dirties the KV slot exactly like CoT/contradiction.
+    - Covered by slot_restore_for_continuity at the end of the inlet (see patch K).
+      No separate restore is needed.
+
+    GLOBAL SCOPE
+    ─────────────
+    "check every call for orphans" → the whole project is relevant; seeding subsets
+    doesn't help. is_global_scope() detects these cases and inference returns {}
+    → the request is routed to the multi‑phase protocol with full_graph in Block A
+    (see patch I).
+    """
+
+    # Queries that demand traversing the ENTIRE project, not a subgraph.
+    _GLOBAL_SCOPE_RE = re.compile(
+        r"\b("
+        r"todos?\s+los\s+(?:m[eé]todos|s[ií]mbolos|calls?|llamadas?|funciones?)|"
+        r"cada\s+(?:m[eé]todo|funci[oó]n|call|llamada)|"
+        r"l[ií]nea\s+a\s+l[ií]nea|"
+        r"call(?:s)?\s+hu[eé]rfan|hu[eé]rfan[oa]s?\s+(?:call|llamada)|orphan\s+call|"
+        r"todo\s+el\s+(?:c[oó]digo|proyecto)|whole\s+(?:codebase|project)|"
+        r"every\s+(?:method|function|call|symbol)|all\s+(?:methods|functions|calls|symbols)|"
+        r"recorre\s+(?:todo|cada)|traverse\s+(?:all|every)"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    # A line from the LLM that contains a qualified id (with or without backticks/bullets).
+    _ID_LINE_RE = re.compile(r"^[\s\-*\d.]*`?([A-Za-z_][\w.]*)`?\s*(?:#.*)?$")
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the inferencer with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
+        self._f = filter_ref
+
+    # ── Global scope detection ────────────────────────────────────────────────
+
+    def is_global_scope(self, query: str) -> bool:
+        """
+        Return True if the request demands a traversal of the whole project.
+        """
+        return bool(self._GLOBAL_SCOPE_RE.search(query or ""))
+
+    # ── Gate: is it worth spending an LLM call? ──────────────────────────────
+
+    def _should_infer(
+        self,
+        query: str,
+        project_id: str,
+        intent_vector: dict,
+        use_case: str,
+    ) -> bool:
+        """
+        Decide whether to spend an LLM call on seed inference.
+
+        Modes (valve seed_inference_mode):
+          'off'    → never.
+          'always' → always, provided there is a skeleton and a non‑trivial query.
+          'auto'   → (default) when lexical seeds are insufficient OR
+                     the use case is A/D (architecture/refactor), where the
+                     impact reasoning needs bodies the user didn't name.
+        """
+        mode = self._f.valves.seed_inference_mode
+        if mode == "off":
+            return False
+
+        # Query too short to infer anything useful.
+        if not query or len(query.strip()) < self._f.valves.seed_inference_min_chars:
+            return False
+
+        # Empty project: no skeleton to send.
+        if not self._f._symbol_index.get_all_qualified_names(project_id):
+            return False
+
+        if mode == "always":
+            return True
+
+        # 'auto': infer when lexical seeds are scarce OR the use case is
+        # architecture/refactor (implicit impact on many unnamed symbols).
+        exact, _ = self._f._activation._extract_query_seeds(query, project_id)
+        if len(exact) < self._f.valves.seed_inference_min_lexical:
+            return True
+        if use_case in ("A", "D"):
+            return True
+
+        return False
+
+    # ── Main inference ────────────────────────────────────────────────────────
+
+    async def infer_seeds(
+        self,
+        query: str,
+        project_id: str,
+        intent_vector: dict,
+        use_case: str,
+        slot_free: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Return {qualified_id: seed_score} of symbols the LLM judges relevant.
+
+        Returns {} when:
+          - slot is not free (AutoContinue active: no inference on parts).
+          - global scope detected (routed to multi‑phase + full_graph).
+          - the gate _should_infer fails.
+          - skeleton is empty or LLM call fails.
+          Always without exception for the caller — PPR simply uses lexical
+          seeds in those cases.
+        """
+        if not slot_free:
+            return {}
+
+        # Global scope → multi‑phase, no subgraph expansion.
+        if self.is_global_scope(query):
+            self._f._log_debug(
+                "SemanticSeedInferencer: global scope detected → "
+                "inference skipped, delegated to multi‑phase + full_graph."
+            )
+            return {}
+
+        if not self._should_infer(query, project_id, intent_vector, use_case):
+            return {}
+
+        # Reuse the skeleton already built/cached for Block A.
+        # _get_skeleton_for_cot returns the same text as _format_skeleton,
+        # cached by structure_hash. Cost: O(1) if already in cache.
+        skeleton = await self._f._ctx_builder._get_skeleton_for_cot(project_id, query)
+        if not skeleton.strip():
+            self._f._log_debug("SemanticSeedInferencer: empty skeleton, cannot infer.")
+            return {}
+
+        # Trim skeleton to the configured budget.
+        max_sk = self._f.valves.seed_inference_skeleton_max_tokens
+        if max_sk > 0:
+            skeleton = self._f._tokens.truncate_text_to_tokens(skeleton, max_sk)
+
+        n = self._f.valves.seed_inference_max_symbols
+        prompt = (
+            f"Project skeleton (signatures only — no bodies):\n"
+            f"```\n{skeleton}\n```\n\n"
+            f'User request:\n"{query[:600]}"\n\n'
+            f"List the qualified symbol identifiers whose FULL implementation body "
+            f"must be read to fulfill this request correctly. "
+            f"Use the exact identifiers from the skeleton (e.g. `ClassName.method` "
+            f"or `module_function`). Include direct dependencies implied by the "
+            f"request even if not named explicitly by the user. "
+            f"Output ONLY identifiers, one per line, no explanations, no numbering. "
+            f"Maximum {n} identifiers."
+        )
+
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a code retrieval planner. Given a project skeleton and a "
+                "user request, output only the qualified symbol identifiers whose "
+                "full bodies must be read. One identifier per line, nothing else."
+            ),
+            model_override=(
+                self._f.valves.seed_inference_model or self._f.valves.llm_model
+            ),
+            max_tokens=self._f.valves.seed_inference_max_tokens,
+            temperature=0.0,
+            label="seed_inference",
+        )
+
+        if not response:
+            self._f._log_debug("SemanticSeedInferencer: LLM returned no response.")
+            return {}
+
+        seeds = self._parse_and_resolve(response, project_id)
+        return seeds
+
+    # ── Parsing and resolution ───────────────────────────────────────────────
+
+    def _parse_and_resolve(self, response: str, project_id: str) -> Dict[str, float]:
+        """
+        Parse one‑id‑per‑line and resolve each token to actual qualified ids.
+
+        Resolution rules:
+          - Token in all_qids → exact match, full score.
+          - Bare token (no '.') → get_qualified_names_for → all qids sharing
+            that bare name; score divided among ambiguities.
+          - Hallucinated token (not in index) → discarded silently.
+        """
+        score = self._f.valves.seed_inference_score
+        max_syms = self._f.valves.seed_inference_max_symbols
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
+        seeds: Dict[str, float] = {}
+        for line in response.splitlines():
+            if len(seeds) >= max_syms:
+                break
+            m = self._ID_LINE_RE.match(line)
+            if not m:
+                continue
+            token = m.group(1).strip()
+            if not token:
+                continue
+
+            if token in all_qids:
+                # Qualified id exact — highest confidence.
+                seeds[token] = max(seeds.get(token, 0.0), score)
+            else:
+                # Bare name — resolve to all matching qids.
+                qids = {
+                    q
+                    for q in self._f._symbol_index.get_qualified_names_for(
+                        token, project_id
+                    )
+                    if q in all_qids
+                }
+                if qids:
+                    # Proportionate score: if ambiguous, split.
+                    # PPR will propagate from each qid; the most relevant one
+                    # will differentiate via graph topology.
+                    share = score / len(qids)
+                    for q in qids:
+                        seeds[q] = max(seeds.get(q, 0.0), share)
+
+        if seeds:
+            sample = sorted(seeds)[:8]
+            ellipsis = "..." if len(seeds) > 8 else ""
+            self._f._log_debug(
+                f"SemanticSeedInferencer: {len(seeds)} symbol(s) seeded "
+                f"→ {sample}{ellipsis}"
+            )
+        else:
+            self._f._log_debug(
+                "SemanticSeedInferencer: LLM responded but no id "
+                "matches the index (possible hallucinations)."
+            )
+        return seeds
 
 
 # ---------------------------------------------------------------------------
@@ -20098,6 +20436,67 @@ class Filter:
             ),
         )
 
+        # ═══════════════════════════════════════════════════════════════════
+        #  Semantic seed inference (LLM-guided LOD-3 selection)
+        # ═══════════════════════════════════════════════════════════════════
+        seed_inference_mode: str = Field(
+            default="auto",
+            description=(
+                "LLM‑guided seed inference before PPR.\n"
+                "'auto': infer when lexical seeds are scarce "
+                "(< seed_inference_min_lexical) or the use case is A/D.\n"
+                "'always': always in code sessions.\n"
+                "'off': disabled."
+            ),
+        )
+        seed_inference_model: str = Field(
+            default="",
+            description=(
+                "Model for seed inference. " "Empty = use llm_model (the main model)."
+            ),
+        )
+        seed_inference_min_lexical: int = Field(
+            default=2,
+            ge=0,
+            description=(
+                "In 'auto' mode: infer if the query names fewer than N symbols "
+                "from the index literally."
+            ),
+        )
+        seed_inference_min_chars: int = Field(
+            default=15,
+            ge=0,
+            description="Minimum query length to trigger inference.",
+        )
+        seed_inference_max_symbols: int = Field(
+            default=12,
+            ge=1,
+            le=40,
+            description="Maximum symbols seeded by inference.",
+        )
+        seed_inference_score: float = Field(
+            default=0.85,
+            ge=0.1,
+            le=1.0,
+            description=(
+                "Seed score assigned to LLM‑validated symbols. "
+                "High value (> lod3_threshold) guarantees LOD‑3 (full body)."
+            ),
+        )
+        seed_inference_skeleton_max_tokens: int = Field(
+            default=6000,
+            ge=500,
+            description=(
+                "Skeleton token cap sent to the planner LLM. "
+                "0 = no cap (not recommended)."
+            ),
+        )
+        seed_inference_max_tokens: int = Field(
+            default=200,
+            ge=50,
+            description="Token cap for the planner's response.",
+        )
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
@@ -20135,6 +20534,7 @@ class Filter:
         self._system_prompt_builder = SystemPromptBuilder(self)
         self._message_assembler = MessageAssembler(self)
         self._context_dumper = ContextDumper(self)
+        self._seed_inferencer = SemanticSeedInferencer(self)
 
         self._hub_index = HubSymbolIndex()
         self._ctx_builder = ContextBuilder(self)
@@ -20746,6 +21146,7 @@ class Filter:
                     pstate["hub_tier_hash"] = tier_hash
                     pstate["hub_tier_qids"] = tier_qids
                     # ✅ Atributo, no dict key
+                    state = self._conversation_state_manager.get(project_id)
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
 
@@ -20770,11 +21171,18 @@ class Filter:
                     f"Usa `/expand <Clase>` o `/expand <Clase>.<método>` para ver implementaciones."
                 )
 
-                compressed_stub = (
-                    f"```python\n"
+                # ── CAMBIO 3: Silent ingestion stub respeta lean_user_code_stub_max_tokens ──
+                _si_stub_body = (
                     f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados en SymbolGraph]\n"
-                    f"# Usa /expand <nombre> para ver cualquier implementación.\n"
-                    f"```\n\n"
+                    f"# Usa /expand <nombre> para ver cualquier implementación."
+                )
+                _si_max_stub = self.valves.lean_user_code_stub_max_tokens
+                if _si_max_stub > 0:
+                    _si_stub_body = self._tokens.truncate_text_to_tokens(
+                        _si_stub_body, _si_max_stub
+                    )
+                compressed_stub = (
+                    f"```python\n{_si_stub_body}\n```\n\n"
                     f"_(El código está disponible internamente; no es necesario repetirlo aquí.)_"
                 )
                 messages[-1] = {**messages[-1], "content": compressed_stub}
@@ -20827,7 +21235,6 @@ class Filter:
         #      (delegates Block A/B construction to ContextBuilder)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        # ✅ get_state mediante ConversationStateManager
         state = self._conversation_state_manager.get(project_id)
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
@@ -20844,9 +21251,7 @@ class Filter:
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
 
-        # ── Restore KV slot after Block A has been built ──
-        if self.valves.enable_slot_persistence:
-            await self._project_state_manager.slot_restore(project_id)
+        # ── PREMATURE slot_restore REMOVED (moved to the end) ──
 
         if cached_response:
             messages.pop()
@@ -20888,6 +21293,19 @@ class Filter:
             self._conversation_state_manager.set(project_id, state)
 
         body["messages"] = messages
+
+        # ─────────────────────────────────────────────────────────────────
+        # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
+        # ─────────────────────────────────────────────────────────────────
+        # slot_restore_for_continuity is independent of slot_restore:
+        #   - slot_restore: session start / first time Block A is built.
+        #   - slot_restore_for_continuity: end of each inlet, after CoT,
+        #     seed inference and other auxiliaries have dirtied the slot.
+        # One restore at the end covers ALL auxiliary calls of this turn.
+        # Gated by slot_free (in AutoContinue continuations the slot is already
+        # configured for streaming and should not be touched).
+        if slot_free and self.valves.enable_slot_persistence:
+            await self._project_state_manager.slot_restore_for_continuity(project_id)
 
         _inlet_timing("total_inlet (end-to-end)", inlet_start)
         self._log_section(
