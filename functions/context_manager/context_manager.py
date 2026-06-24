@@ -7637,8 +7637,8 @@ class LongTermMemory:
         """
         Generate alternative search queries for LTM retrieval.
 
-        Uses a minimalist prompt to avoid meta-commentary in the output.
-        Filters responses heuristically to keep only valid natural-language queries.
+        Uses a few-shot prompt to force the model to output only the queries.
+        Filters responses by extracting lines after a marker or by heuristics.
 
         Args:
             query (str): The original user question.
@@ -7659,17 +7659,15 @@ class LongTermMemory:
             return [query]
 
         # ------------------------------------------------------------------
-        # REGION 2: Build a direct and explicit prompt with examples
+        # REGION 2: Few-shot prompt with explicit format
         # ------------------------------------------------------------------
         prompt = (
             f"Generate {self._f.valves.multi_query_variants} alternative search queries for:\n"
             f'"{query[:300]}"\n\n'
-            "Output ONLY the queries, one per line.\n"
-            "Do NOT include any analysis, labels, numbering, bullets, or extra text.\n"
             "Example of valid output:\n"
             "How does build_block_b work?\n"
             "What is the purpose of the recency pointer?\n"
-            "Now generate your queries:"
+            "Now generate your queries:\n"
         )
 
         # ------------------------------------------------------------------
@@ -7679,8 +7677,8 @@ class LongTermMemory:
             prompt=prompt,
             system_prompt="",  # Empty to prevent model self-reference
             model_override=self._f.valves.llm_model,
-            max_tokens=100,     # Slightly more room for 2-3 queries
-            temperature=0.3,    # More variety
+            max_tokens=80,
+            temperature=0.3,
             label="multi_query_expand",
         )
 
@@ -7690,31 +7688,51 @@ class LongTermMemory:
         queries = [query]
         if response:
             # ------------------------------------------------------------------
-            # REGION 4: Robust filter that extracts questions
+            # REGION 4: Extract queries from the response
             # ------------------------------------------------------------------
-            import re
-            for line in response.strip().split("\n"):
+            lines = response.strip().split("\n")
+            extracted = []
+
+            # Try to find the "Now generate your queries:" marker
+            marker_idx = -1
+            for i, line in enumerate(lines):
+                if "generate your queries" in line.lower():
+                    marker_idx = i
+                    break
+
+            if marker_idx != -1:
+                # Take all lines after the marker
+                candidate_lines = lines[marker_idx + 1 :]
+            else:
+                # If no marker, take all lines
+                candidate_lines = lines
+
+            for line in candidate_lines:
                 line = line.strip()
-                if not line or len(line) < 3:
+                if not line or len(line) < 5:
                     continue
 
-                # Look for any line containing a question mark
-                if "?" in line:
-                    # Remove numbering or bullet prefixes (e.g., "1. ", "- ", "* ")
-                    cleaned = re.sub(r"^[\d]+\.\s*|^[-*]\s*", "", line).strip()
-                    # Ensure it's a complete query (starts with capital or is a question)
-                    if cleaned and cleaned not in queries:
-                        queries.append(cleaned)
+                # Remove leading bullets/numbers
+                cleaned = re.sub(r"^[\d]+\.\s*|^[-*]\s*", "", line).strip()
+                if not cleaned:
+                    continue
 
-                # Fallback: if no '?' but the line looks like a query (e.g., "flujo principal")
-                elif len(line) > 10 and not line.startswith(("Analyze", "Input", "**", "1.")):
-                    # Try to extract the core phrase
-                    cleaned = re.sub(r"^[\d]+\.\s*|^[-*]\s*", "", line).strip()
-                    if cleaned and cleaned not in queries and len(cleaned.split()) >= 3:
-                        queries.append(cleaned)
+                # Accept if it's a question or a short phrase with capital letter
+                if cleaned.endswith("?") or (
+                    cleaned[0].isupper() and len(cleaned.split()) < 15
+                ):
+                    extracted.append(cleaned)
 
-            # Limit to configured variants (+1 for original)
-            queries = queries[: self._f.valves.multi_query_variants + 1]
+            # If we extracted queries, use them; otherwise fallback to original only
+            if extracted:
+                queries.extend(extracted)
+                # Limit to configured variants (+1 for original)
+                queries = queries[: self._f.valves.multi_query_variants + 1]
+            else:
+                # If extraction failed, log and keep only original
+                self._f._log_debug(
+                    "Multi-query: no valid queries extracted, using original only"
+                )
 
         self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
         return queries
@@ -20054,13 +20072,14 @@ class Filter:
                 "too large to count as 'compressed'."
             ),
         )
+        # Ideally, use the same value.
         lazy_docstring_max_per_turn: int = Field(
             default=25,
             ge=0,
             description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
         )
         docstring_batch_size: int = Field(
-            default=24,
+            default=25,
             ge=1,
             le=20,
             description=(
