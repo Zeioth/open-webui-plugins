@@ -22,6 +22,7 @@ import asyncio
 import threading
 import textwrap
 import numpy as np
+from enum import Enum
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable
@@ -248,6 +249,33 @@ FALLBACK_CALL_QUERIES = {
 # ---------------------------------------------------------------------------
 # Global helper functions
 # ---------------------------------------------------------------------------
+
+
+class UseCase(str, Enum):
+    """
+    Use case categories for intent classification.
+
+    Each member has a short internal key (value) and a human-readable label.
+    The internal key is used for LOD profiles and logic; the label is used
+    for logging and prompts.
+    """
+
+    ARCHITECTURE = "A"
+    PLANNING = "B"
+    PROGRAMMING = "C"
+    REFACTORING = "D"
+    SCAFFOLDING = "E"
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for the use case."""
+        return {
+            "A": "Architecture/Design",
+            "B": "Planning/Roadmap",
+            "C": "General Programming",
+            "D": "Refactoring/Impact Analysis",
+            "E": "Scaffolding/Boilerplate",
+        }[self.value]
 
 
 def qualify_symbol_name(
@@ -3977,9 +4005,12 @@ class ContextBuilder:
         )
         return budget
 
-    def classify_use_case(self, query: str, intent_vector: dict) -> Tuple[str, dict]:
+    def classify_use_case(
+        self, query: str, intent_vector: dict
+    ) -> Tuple[str, dict, str]:
         """
-        Classify the query into one of five use cases and return its LOD profile.
+        Classify the query into one of five use cases and return its LOD profile
+        and a human-readable label.
 
         A architecture · B plans · C programming · D refactor · E scaffolding.
 
@@ -3994,45 +4025,64 @@ class ContextBuilder:
           6. intent_vector tie-break: refactor-dominant → D, explain-dominant
              → A; otherwise C (most common case).
 
-        Returns (case_label, profile_copy); the copy is safe to mutate.
+        Returns (case_key, profile_copy, human_label); profile copy is safe to mutate.
         """
         q = query or ""
 
+        # ------------------------------------------------------------------
+        # REGION 1: Explicit command prefix
+        # ------------------------------------------------------------------
         if self._f.valves.lod_intent_explicit_override:
             m = self._UC_COMMAND_RE.match(q)
             if m:
-                case = {
-                    "arch": "A",
-                    "plan": "B",
-                    "code": "C",
-                    "refactor": "D",
-                    "scaffold": "E",
+                case_key = {
+                    "arch": UseCase.ARCHITECTURE,
+                    "plan": UseCase.PLANNING,
+                    "code": UseCase.PROGRAMMING,
+                    "refactor": UseCase.REFACTORING,
+                    "scaffold": UseCase.SCAFFOLDING,
                 }[m.group(1).lower()]
+                case = case_key.value
                 self._f._log_debug(
-                    f"classify_use_case: detected '{case}' via explicit command '/{m.group(1)}'"
+                    f"classify_use_case: detected '{case_key.label}' "
+                    f"via explicit command '/{m.group(1)}'"
                 )
-                return case, dict(self.LOD_PROFILES[case])
+                return case, dict(self.LOD_PROFILES[case]), case_key.label
 
+        # ------------------------------------------------------------------
+        # REGION 2: Regex-based detection (scaffolding before refactor)
+        # ------------------------------------------------------------------
         if self._UC_SCAFFOLD_RE.search(q):
+            case = UseCase.SCAFFOLDING
             self._f._log_debug(
-                "classify_use_case: detected 'E' (scaffolding) via regex"
+                f"classify_use_case: detected '{case.label}' (scaffolding) via regex"
             )
-            return "E", dict(self.LOD_PROFILES["E"])
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_REFACTOR_RE.search(q):
-            self._f._log_debug("classify_use_case: detected 'D' (refactor) via regex")
-            return "D", dict(self.LOD_PROFILES["D"])
+            case = UseCase.REFACTORING
+            self._f._log_debug(
+                f"classify_use_case: detected '{case.label}' (refactor) via regex"
+            )
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_ARCH_RE.search(q):
+            case = UseCase.ARCHITECTURE
             self._f._log_debug(
-                "classify_use_case: detected 'A' (architecture) via regex"
+                f"classify_use_case: detected '{case.label}' (architecture) via regex"
             )
-            return "A", dict(self.LOD_PROFILES["A"])
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_PLAN_RE.search(q):
-            self._f._log_debug("classify_use_case: detected 'B' (plan) via regex")
-            return "B", dict(self.LOD_PROFILES["B"])
+            case = UseCase.PLANNING
+            self._f._log_debug(
+                f"classify_use_case: detected '{case.label}' (plan) via regex"
+            )
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
+        # ------------------------------------------------------------------
+        # REGION 3: Intent vector tie-break
+        # ------------------------------------------------------------------
         iv = intent_vector or {}
         refactor_w = iv.get("refactor", 0.0)
         debug_w = iv.get("debug", 0.0)
@@ -4040,23 +4090,29 @@ class ContextBuilder:
         explain_w = iv.get("explain", 0.0)
 
         if refactor_w >= 0.30 and refactor_w >= max(debug_w, modify_w, explain_w):
+            case = UseCase.REFACTORING
             self._f._log_debug(
-                f"classify_use_case: detected 'D' (refactor) via intent_vector tie-break "
-                f"(refactor={refactor_w:.2f})"
+                f"classify_use_case: detected '{case.label}' (refactor) "
+                f"via intent_vector tie-break (refactor={refactor_w:.2f})"
             )
-            return "D", dict(self.LOD_PROFILES["D"])
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if explain_w >= 0.5 and explain_w > modify_w:
+            case = UseCase.ARCHITECTURE
             self._f._log_debug(
-                f"classify_use_case: detected 'A' (architecture) via intent_vector tie-break "
-                f"(explain={explain_w:.2f} > modify={modify_w:.2f})"
+                f"classify_use_case: detected '{case.label}' (architecture) "
+                f"via intent_vector tie-break (explain={explain_w:.2f} > modify={modify_w:.2f})"
             )
-            return "A", dict(self.LOD_PROFILES["A"])
+            return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
+        # ------------------------------------------------------------------
+        # REGION 4: Default
+        # ------------------------------------------------------------------
+        case = UseCase.PROGRAMMING
         self._f._log_debug(
-            "classify_use_case: default 'C' (programming) - no specific signals"
+            f"classify_use_case: default '{case.label}' (programming) - no specific signals"
         )
-        return "C", dict(self.LOD_PROFILES["C"])
+        return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
     def _resolve_call_graph_mode(
         self,
@@ -4095,7 +4151,11 @@ class ContextBuilder:
             self._f._log_debug(f"  manual override → '{valve}'")
             return valve
 
-        use_case, _ = self.classify_use_case(query, intent_vector)
+        # ------------------------------------------------------------------
+        # Get the use case (ignore label for this logic)
+        # ------------------------------------------------------------------
+        use_case, _, _ = self.classify_use_case(query, intent_vector)
+
         total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
         free_tokens = self.get_effective_context_budget(project_id)
 
@@ -4310,7 +4370,9 @@ class ContextBuilder:
                 return await self._format_full_symbol_inventory(all_qids, project_id)
 
         # ── Step 1a: Classify use case (needed before PPR for infer_seeds) ──
-        active_use_case, use_case_profile = self.classify_use_case(query, intent_vector)
+        active_use_case, use_case_profile, _ = self.classify_use_case(
+            query, intent_vector
+        )
 
         # ── Step 1b: LLM‑guided seed inference (before PPR) ──
         inferred_seeds: Dict[str, float] = {}
@@ -4536,7 +4598,7 @@ class ContextBuilder:
                     if total_tokens + tok > budget:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
-                    _lod1_parts.append(f"- `{sig}`{loc} _(score: {score:.2f})_")
+                    _lod1_parts.append(f"- '{sig}'{loc} _(score: {score:.2f})_")
                     total_tokens += tok
                     injected_symbols.add(node_id)
 
@@ -4571,12 +4633,12 @@ class ContextBuilder:
 
                     if cfg_skeleton:
                         self._f._log_debug(f"💉 CFG injected for '{node_id}' (LOD2)")
-                        text = f"`{sig}`"
+                        text = f"'{sig}'"
                         if docstring:
                             text += f": {docstring}"
                         text += f"\n```python\n{cfg_skeleton}\n```"
                     else:
-                        text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
+                        text = f"- '{sig}': {docstring}" if docstring else f"- '{sig}'"
 
                     tok = self._f._tokens.estimate_code_tokens(text)
                     if total_tokens + tok > budget:
@@ -4663,7 +4725,7 @@ class ContextBuilder:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod3_parts.append(
-                        f"### `{node_id}`{loc} [activation: {score:.2f}]\n"
+                        f"### '{node_id}'{loc} [activation: {score:.2f}]\n"
                         f"```\n{content_to_inject}\n```\n"
                     )
                     total_tokens += tok
@@ -7578,7 +7640,7 @@ class LongTermMemory:
     async def _expand_query_for_retrieval(
         self,
         query: str,
-        use_case: str = "C",
+        use_case_label: str = "General Programming",
         slot_free: bool = True,
     ) -> List[str]:
         """
@@ -7592,7 +7654,7 @@ class LongTermMemory:
 
         Args:
             query (str): The original user question.
-            use_case (str): The resolved use case (A, B, C, D, E).
+            use_case_label (str): Human-readable label of the resolved use case.
             slot_free (bool): Whether the LLM slot is available.
 
         Returns:
@@ -7611,15 +7673,6 @@ class LongTermMemory:
         # ------------------------------------------------------------------
         # REGION 2: Build the thematic prompt
         # ------------------------------------------------------------------
-        use_case_labels = {
-            "A": "architecture / design",
-            "B": "planning / roadmap",
-            "C": "general programming / implementation",
-            "D": "refactoring / impact analysis",
-            "E": "scaffolding / boilerplate",
-        }
-        label = use_case_labels.get(use_case, "general programming")
-
         prompt = (
             f"Given the following user question, generate {self._f.valves.multi_query_variants} high-level thematic queries "
             "for searching a semantic memory of past conversations and architectural decisions.\n\n"
@@ -7631,7 +7684,7 @@ class LongTermMemory:
             "5. Vary the phrasing: one query can be a 'why' question, another a 'what' question, another a keyword list.\n"
             "6. Do NOT simply rephrase the original question with synonyms; abstract it to a higher level.\n\n"
             f"User question: {query[:300]}\n\n"
-            f"Use case context: {use_case} ({label})\n\n"
+            f"Use case context: {use_case_label}\n\n"
             "Queries:"
         )
 
@@ -7676,9 +7729,6 @@ class LongTermMemory:
                 f"Multi-query expansion (thematic): {len(queries)} queries "
                 f"({[q[:40] for q in queries]})"
             )
-        # ------------------------------------------------------------------
-        # REGION 5: Return
-        # ------------------------------------------------------------------
         return queries
 
     async def _rerank_results(
@@ -7826,7 +7876,7 @@ class LongTermMemory:
         self,
         query: str,
         project_id: str,
-        use_case: str = "C",
+        use_case_label: str = "General Programming",
         slot_free: bool = True,
     ) -> list:
         """
@@ -7839,7 +7889,7 @@ class LongTermMemory:
         Args:
             query (str): The user query (original or cleaned).
             project_id (str): The current project identifier.
-            use_case (str): The resolved use case (A, B, C, D, E).
+            use_case_label (str): Human-readable label of the resolved use case.
             slot_free (bool): Whether the LLM slot is available.
 
         Returns:
@@ -7861,7 +7911,7 @@ class LongTermMemory:
         # REGION 2: Build query variants (thematic expansion)
         # ------------------------------------------------------------------
         query_variants = await self._expand_query_for_retrieval(
-            query, use_case=use_case, slot_free=slot_free
+            query, use_case_label=use_case_label, slot_free=slot_free
         )
 
         try:
@@ -16590,11 +16640,13 @@ class SystemPromptBuilder:
         dynamic_injections: List[Tuple[str, str]] = []
 
         # ------------------------------------------------------------------
-        # REGION: Compute use_case for LTM retrieval
+        # Compute use_case and its human‑readable label
         # ------------------------------------------------------------------
-        use_case, _ = self._f._ctx_builder.classify_use_case(user_query, intent_vector or {})
+        use_case, _, use_case_label = self._f._ctx_builder.classify_use_case(
+            user_query, intent_vector or {}
+        )
 
-        # B1: LTM retrieval (now passes use_case)
+        # B1: LTM retrieval (now passes the label)
         self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         ltm_text = await self._build_ltm_injection(
             project_id,
@@ -16602,7 +16654,7 @@ class SystemPromptBuilder:
             user_query,
             is_code_session,
             slot_free,
-            use_case,
+            use_case_label,
         )
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
@@ -16665,11 +16717,15 @@ class SystemPromptBuilder:
         user_query: str,
         is_code_session: bool,
         slot_free: bool,
-        use_case: str = "C",
+        use_case_label: str = "General Programming",
     ) -> Optional[str]:
         """
         Retrieve and format relevant LTM entries for the current query,
         using RAPTOR‑first and thematic expansions.
+
+        The formatted section explicitly indicates that the retrieved content
+        comes from long-term memory (past conversations, not the current chat
+        history), so the LLM can correctly interpret it as external context.
 
         Args:
             project_id (str): The current project identifier.
@@ -16677,7 +16733,7 @@ class SystemPromptBuilder:
             user_query (str): The full user query (with code).
             is_code_session (bool): Whether the session is a code session.
             slot_free (bool): Whether the LLM slot is free for auxiliary calls.
-            use_case (str): The resolved use case (A, B, C, D, E).
+            use_case_label (str): Human-readable label of the resolved use case.
 
         Returns:
             Optional[str]: The formatted LTM context, or None if no relevant memories.
@@ -16723,7 +16779,7 @@ class SystemPromptBuilder:
         all_meta = await self._f._ltm.retrieve_memories_unified(
             refined_query,
             project_id,
-            use_case=use_case,
+            use_case_label=use_case_label,
             slot_free=slot_free,
         )
         if not all_meta:
@@ -16743,7 +16799,17 @@ class SystemPromptBuilder:
         max_ltm = self._f.valves.ltm_retrieval_max_tokens
         parts: List[str] = []
         current_tokens = 0
-        header = "## Relevant Past Context\n\n"
+
+        # ------------------------------------------------------------------
+        # REGION 5: Build header with explicit LTM origin
+        # ------------------------------------------------------------------
+        header = (
+            "## Relevant Past Context (long-term memory)\n\n"
+            "> The following fragments were retrieved from past conversations "
+            "(different sessions) and are provided as additional context. "
+            "They are NOT part of the current chat history.\n\n"
+        )
+
         for mem in unique_meta:
             ts = mem.get("timestamp")
             if ts and ts > 1_000_000_000:
@@ -16762,9 +16828,10 @@ class SystemPromptBuilder:
                     )
                     text = f"[Skeleton snapshot {time_str} — {fresh}]\n" f"{mem['doc']}"
                 else:
-                    text = f"[{time_str}] {mem['doc']}"
+                    text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
-                text = f"[unknown date] {mem['doc']}"
+                text = f"[Past conversation — unknown date]\n{mem['doc']}"
+
             frag_tok = self._f._tokens.estimate_code_tokens(text)
             if max_ltm > 0 and current_tokens + frag_tok > max_ltm:
                 continue
