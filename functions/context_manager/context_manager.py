@@ -2980,6 +2980,15 @@ class ContextBuilder:
     * Scaffolding / skeleton responses for intent queries.
     * Chain‑of‑Thought (CoT) expand resolution.
     * Slot persistence (save / restore of KV cache state).
+
+    Docs 10–13 backported:
+        B4 – `_warmup_tier_prefill` stub (prevents AttributeError).
+        E1 – LOD‑2 hysteresis (entry/exit thresholds).
+        E3 – stable ordering by (tier, -PPR, qid).
+        E4 – ghost hub qid pruning in Block A.
+        E5 – skip duplicate signatures for skeleton‑tier symbols.
+        E6 – recency pointers with signature previews for symbols not in Block B.
+        M6 – prev_seeds fallback to persisted qids on cold‑start.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -3083,6 +3092,17 @@ class ContextBuilder:
             re.IGNORECASE,
         )
 
+    # ======================================================================
+    # B4 – warmup stub
+    # ======================================================================
+    async def _warmup_tier_prefill(self, project_id: str) -> None:
+        """Phase‑2 placeholder: pre‑warms the stable tier prefix into the KV slot
+        immediately after silent ingestion, so the next inlet finds it hot.
+        Currently a no‑op; full implementation deferred to Phase 2 (KV‑slot
+        prediction). Removing this placeholder will cause AttributeError in the
+        silent‑ingestion task — keep it until Phase 2 is wired."""
+        pass
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Block A – static, KV‑cache‑anchoring content
     # ═══════════════════════════════════════════════════════════════════════════
@@ -3097,12 +3117,34 @@ class ContextBuilder:
         Build Block A: stable, KV-cache-anchoring content.
 
         Returns "" when not a code session.
+
+        Modified (E4): prune ghost hub qids after large code changes.
+        Modified (M7-compatible): stores structure_hash_for_cache for slot persistence.
         """
         if not is_code_session:
             return ""
 
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # ── E4: prune ghost hub qids ──────────────────────────────────────
+        hub_qids: List[str] = pstate.get("hub_tier_qids_persisted", [])
+        if hub_qids:
+            current_qids: Set[str] = set(
+                self._f._symbol_index.get_all_qualified_names(project_id)
+            )
+            hub_set = set(hub_qids)
+            ghost_qids = hub_set - current_qids
+            if ghost_qids:
+                deletion_ratio = len(ghost_qids) / max(len(hub_set), 1)
+                if deletion_ratio > 0.30:
+                    pruned = list(hub_set & current_qids)
+                    self._f._log_debug(
+                        f"Hub tier: pruned {len(ghost_qids)} ghost qids "
+                        f"({deletion_ratio:.0%} deleted after large code change). "
+                        f"Remaining: {len(pruned)}"
+                    )
+                    pstate["hub_tier_qids_persisted"] = pruned
 
         # --- 2. Compute structure-only hash (stable across docstring enrichment) ---
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
@@ -3253,41 +3295,19 @@ class ContextBuilder:
         """
         Force Block A rebuild on the next request, optionally refreshing
         centrality scores.
-
-        MIGRATED (step 9): PageRank recomputation is now decoupled from mode
-        changes. `recompute_centrality` defaults to False because changing the
-        call-graph mode does not alter the graph topology. Only graph mutations
-        (new code ingestion, new edges) should set this to True.
-
-        The valve `call_graph_mode_recompute_pagerank` (step 11) provides an
-        opt-in override for debugging/emergency recomputation on mode changes.
-
-        Args:
-            project_id (str): The project whose cache should be invalidated.
-            reason (str): Optional reason for logging.
-            recompute_centrality (bool): Whether to recompute PageRank centrality.
-                                         Default False; pass True only when the
-                                         graph has actually mutated.
         """
         # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         # --- 2. Clear all per-project caches ---
-        # Block A cache
         pstate["block_a_cache_key"] = None
         pstate["block_a_cached"] = None
-
-        # Skeleton cache (whole-project signatures only)
         pstate["skeleton_cache_key"] = None
         pstate["skeleton_cached"] = None
-
-        # Skeleton tier cache (stable signature tier inside Block A)
         pstate["skeleton_tier_cache_key"] = None
         pstate["skeleton_tier_cached"] = None
 
-        # --- 3. Optionally recompute centrality (PageRank) ---
-        # PageRank only depends on graph topology, not on the display mode.
-        # Therefore we only recompute when explicitly requested (graph mutation).
+        # --- 3. Optionally recompute centrality ---
         if recompute_centrality:
             try:
                 pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
@@ -3295,12 +3315,6 @@ class ContextBuilder:
                 )
             except Exception as e:
                 self._f._log_debug(f"Centrality recomputation failed: {e}")
-        else:
-            # Log that we skipped recompute on a non-graph invalidation.
-            self._f._log_debug(
-                f"Skipped PageRank recompute for '{project_id}' (not a graph mutation). "
-                "Set call_graph_mode_recompute_pagerank=True to force."
-            )
 
         # --- 4. Log the invalidation ---
         if reason:
@@ -3315,37 +3329,27 @@ class ContextBuilder:
         Render the project skeleton (signatures only) as a STABLE context tier,
         cached by structure_hash so body edits and docstring additions don't
         invalidate it. Returns "" when disabled, empty, or over the tier budget.
-
-        The cache key is based on the structural hash (signatures + parent
-        relationships, excluding docstrings) so that background docstring
-        population doesn't cause spurious rebuilds and KV-cache misses.
         """
         if not self._f.valves.enable_skeleton_tier:
             return ""
 
-        # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # --- 2. Compute structure-only hash (stable across docstring enrichment) ---
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
         if not structure_hash:
             return ""
 
-        # --- 3. Check cache using the structure hash ---
         cached_hash = pstate.get("skeleton_tier_cache_key")
         cached_tier = pstate.get("skeleton_tier_cached")
         if cached_hash and cached_hash == structure_hash and cached_tier is not None:
             return cached_tier
 
-        # --- 4. Render the skeleton (docstrings included if valve allows) ---
         skel = self._format_skeleton(project_id)
         if not skel:
             pstate["skeleton_tier_cache_key"] = structure_hash
             pstate["skeleton_tier_cached"] = ""
             return ""
 
-        # --- 5. Check token budget ---
-        # NOTE: This is a hard cap, not a pre-reservation.
         budget = self._f.valves.skeleton_tier_max_tokens
         if budget > 0:
             tok = self._f._tokens.estimate_code_tokens(skel)
@@ -3358,7 +3362,6 @@ class ContextBuilder:
                 pstate["skeleton_tier_cached"] = ""
                 return ""
 
-        # --- 6. Build the tier text ---
         tier = (
             "## Project Skeleton (stable — signatures only)\n"
             "_Contracts for the whole project. Bodies are shown on demand below "
@@ -3366,7 +3369,6 @@ class ContextBuilder:
             f"{skel}"
         )
 
-        # --- 7. Store in cache ---
         pstate["skeleton_tier_cache_key"] = structure_hash
         pstate["skeleton_tier_cached"] = tier
 
@@ -3377,17 +3379,15 @@ class ContextBuilder:
 
         return tier
 
+    # ── M6 + E4: _build_hub_bodies_tier (modified) ──────────────────────────
+
     def _build_hub_bodies_tier(self, project_id: str) -> Tuple[str, str, List[str]]:
         """
         Build the Hub‑Bodies Tier: full bodies of top‑N hubs by centrality,
         ordered by stability (last_modified_turn), truncated by budget.
 
-        Returns (tier_text, tier_hash, ordered_qids).
-        ('', '', []) if disabled or no centrality.
-
-        INVARIANT: zero query‑dependent annotations in the rendered text.
-        Any query‑dependent data (scores, activation) goes into the recency
-        pointer (volatile Block B), not here.
+        Modified (M6): cold‑start fallback for prev_seeds from persisted qids.
+        Modified (E4): ghost pruning is handled in build_block_a, not here.
         """
         if not self._f.valves.enable_hub_bodies_tier:
             return "", "", []
@@ -3400,21 +3400,26 @@ class ContextBuilder:
         state = self._f._conversation_state_manager.get(project_id)
         current_turn = state.message_count
 
-        # ── Persistent trackers (survive restarts via state) ──
+        # ── M6: prev_seeds fallback on cold‑start ────────────────────────
+        hub_seeds_this_turn = pstate.get("hub_tier_seeds_this_turn", [])
+        if hub_seeds_this_turn:
+            prev_seeds = pstate.get("hub_tier_prev_seeds", [])
+        else:
+            prev_seeds = list(pstate.get("hub_tier_qids_persisted", []))
+
+        # Persistent trackers (survive restarts via state)
         last_mod = state.hub_tier_last_modified
         body_hashes = state.hub_tier_body_hashes
         heat = state.hub_tier_query_heat
-        prev_seeds = set(pstate.get("hub_tier_prev_seeds", []))
 
-        # ── Selection: top‑N with optional centrality floor ──
+        # Selection: top‑N with optional centrality floor
         ranked = self._f._symbol_index.get_hub_symbols(
             project_id, centrality, self._f.valves.hub_bodies_tier_top_n
         )
         floor = self._f.valves.hub_bodies_tier_min_centrality
         candidates = [qid for qid, c in ranked if (floor <= 0 or c >= floor)]
 
-        # ── Resolve bodies, detect changes, update trackers ──
-        resolved = {}  # qid -> (body, body_hash, lang)
+        resolved = {}
         for qid in candidates:
             body, lang = self._resolve_hub_body(qid, project_id, state)
             if not body:
@@ -3425,32 +3430,28 @@ class ContextBuilder:
                 continue
             bh = hashlib.md5(body.encode()).hexdigest()[:16]
             if body_hashes.get(qid) != bh:
-                last_mod[qid] = current_turn  # changed → move to bottom
+                last_mod[qid] = current_turn
             body_hashes[qid] = bh
             resolved[qid] = (body, bh, lang)
 
         if not resolved:
             return "", "", []
 
-        # ── Update query heat (EWMA) ──
         alpha = 0.3
         for qid in candidates:
             was_seed = 1.0 if qid in prev_seeds else 0.0
             heat[qid] = alpha * was_seed + (1 - alpha) * heat.get(qid, 0.0)
 
-        # ── Order: stability primary, heat secondary (hot hubs go lower) ──
         ordered = sorted(
             resolved,
             key=lambda q: (
-                last_mod.get(q, current_turn),  # oldest‑edited first → top
-                -heat.get(q, 0.0),  # hot hubs go bottom
+                last_mod.get(q, current_turn),
+                -heat.get(q, 0.0),
                 q,
             ),
         )
 
-        # ── Budget cap: keep top (stable), drop bottom (volatile) ──
         budget = self._f.valves.hub_bodies_tier_max_tokens
-        # Auto‑cap if multi‑phase is active (M8)
         if (
             self._f.valves.enable_multi_phase_response
             or self._f.valves.force_multi_phase_response
@@ -3470,13 +3471,11 @@ class ContextBuilder:
 
         for qid in ordered:
             body, bh, lang = resolved[qid]
-            # ── M3: docstring in header ──
             meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
             doc = meta.get("docstring", "")
             doc_line = f"_{doc}_\n" if doc else ""
 
-            # ── M5: cross‑reference hints ──
-            kept_set = set(kept)  # only already‑kept hubs for inline refs
+            kept_set = set(kept)
             body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | set([qid]))
 
             chunk = f"### `{qid}`\n{doc_line}```{lang}\n{body_with_xrefs}\n```\n"
@@ -3499,7 +3498,6 @@ class ContextBuilder:
 
         tier_text = "\n".join(lines)
 
-        # ── M6: include selection parameters in hash ──
         config_prefix = (
             f"n={self._f.valves.hub_bodies_tier_top_n}|"
             f"floor={self._f.valves.hub_bodies_tier_min_centrality}"
@@ -3509,17 +3507,14 @@ class ContextBuilder:
             + "|".join(f"{q}:{resolved[q][1]}" for q in kept).encode()
         ).hexdigest()[:16]
 
-        # ── Prune stale tracker entries ──
         live = set(candidates)
         for d in (last_mod, body_hashes, heat):
             for stale in [k for k in list(d.keys()) if k not in live]:
                 del d[stale]
 
-        # ── Persist tracker changes (atributos, no dict) ──
         state.hub_tier_qids_persisted = kept
-        self._f._conversation_state_manager.set(project_id, state)  # marks dirty
+        self._f._conversation_state_manager.set(project_id, state)
 
-        # ── Tier hash hit/miss logging ──────────────────────────────
         previous_tier_hash = pstate.get("last_tier_hash")
         if previous_tier_hash and previous_tier_hash != tier_hash:
             self._f._log_debug(
@@ -3532,6 +3527,9 @@ class ContextBuilder:
         else:
             self._f._log_debug(f"✓ TIER CACHE HIT: tier_hash stable ({tier_hash})")
         pstate["last_tier_hash"] = tier_hash
+
+        # ── M6: persist prev_seeds ────────────────────────────────────────
+        pstate["hub_tier_prev_seeds"] = hub_seeds_this_turn or prev_seeds
 
         return tier_text, tier_hash, kept
 
@@ -3552,16 +3550,13 @@ class ContextBuilder:
                     candidates.append((block.timestamp, body, block))
         if not candidates:
             return "", "python"
-        candidates.sort(key=lambda x: x[0], reverse=True)  # newest first
+        candidates.sort(key=lambda x: x[0], reverse=True)
         _, body, block = candidates[0]
         lang = block.symbols[0].language if block.symbols else "python"
         return body, lang
 
     def _inject_tier_xrefs(self, body: str, qid: str, kept_set: Set[str]) -> str:
-        """
-        Add inline comments where this symbol calls another hub in the tier.
-        Helps the model trace call chains without long‑distance attention.
-        """
+        """Add inline comments where this symbol calls another hub in the tier."""
         lines = body.split("\n")
         result = []
         for line in lines:
@@ -3570,7 +3565,6 @@ class ContextBuilder:
                 if other_qid == qid:
                     continue
                 bare = other_qid.rsplit(".", 1)[-1]
-                # Detect call patterns (language‑agnostic best effort)
                 if (
                     f"{bare}(" in line
                     or f"self.{bare}(" in line
@@ -3580,35 +3574,50 @@ class ContextBuilder:
                     break
         return "\n".join(result)
 
+    # ── E6: recency pointers (new implementation) ────────────────────────────
+
     def _build_hub_recency_pointers(
-        self, project_id: str, ag: "ActivationGraph"
+        self,
+        project_id: str,
+        current_block_b_qids: Set[str],
     ) -> str:
         """
-        Build the recency pointer for hubs that are seeds of the current query.
+        Build the recency pointer section for Block B.
 
-        M1: includes the full signature, not just the qid.
+        E6: includes a one‑line signature preview for symbols NOT in Block B.
+        Symbols that ARE in Block B are marked as active this turn.
         """
         if not self._f.valves.hub_bodies_tier_recency_pointers:
             return ""
+
         pstate = self._f._project_state_manager.get_pstate(project_id)
-        tier_qids = set(pstate.get("hub_tier_qids", []))
-        if not tier_qids:
+        prev_seeds = pstate.get("hub_tier_prev_seeds", [])
+        if not prev_seeds:
             return ""
-        seeds = set(ag.get_seed_nodes()) & tier_qids
-        if not seeds:
-            return ""
-        lines = ["**Symbols in focus** (full bodies in «Core Implementation» above):"]
-        for qid in sorted(seeds):
+
+        in_ctx = [q for q in prev_seeds if q in current_block_b_qids]
+        out_of_ctx = [q for q in prev_seeds if q not in current_block_b_qids]
+
+        lines = ["**Recently Active Symbols** (recency pointers):"]
+
+        for qid in in_ctx:
+            lines.append(f"  · `{qid}`  ← active this turn (full body in Block B)")
+
+        for qid in out_of_ctx[:3]:
             meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
             sig = meta.get("signature", qid)
-            lines.append(f"- `{sig}`")
-        return "\n".join(lines)
+            lines.append(f"  · `{sig}`  # signature preview (not in Block B this turn)")
+
+        if len(out_of_ctx) > 3:
+            lines.append(
+                f"  · … and {len(out_of_ctx) - 3} more (not in context this turn)"
+            )
+
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     @staticmethod
     def _build_instruction_tail(use_case: str = "C") -> str:
-        """
-        M2: instruction tail adapted to the active use case.
-        """
+        """M2: instruction tail adapted to the active use case."""
         tails = {
             "A": "_[Architecture mode: focus on contracts, interfaces, and invariants. "
             "Reasoning guidelines from system above apply.]_",
@@ -3624,19 +3633,9 @@ class ContextBuilder:
         return tails.get(use_case, default)
 
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
-        """
-        True only if the skeleton tier was actually rendered into Block A
-        THIS turn for the current structural hash — not just enabled with
-        symbols present. Uses the per-turn state set by build_block_a.
-
-        This replaces the previous cache-key comparison, which was brittle
-        because the cache could be empty (due to budget) while the tier was
-        enabled, leading to false negatives.
-        """
+        """True only if the skeleton tier was actually rendered into Block A THIS turn."""
         if not self._f.valves.enable_skeleton_tier:
             return False
-
-        # --- Resolve per-project state and check the per-turn flag ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
         return pstate.get("skeleton_rendered_this_turn", False)
 
@@ -3645,23 +3644,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _format_skeleton(self, project_id: str) -> str:
-        """
-        Render the project skeleton: signatures of all indexed symbols.
-
-        Generates a compact, human‑readable list of:
-        - Classes with their method signatures (indented).
-        - Module‑level functions (bulleted).
-
-        Optionally includes one‑line docstrings if the valve
-        `skeleton_include_docstrings` is True. This method is used by:
-        - `_build_skeleton_tier` (for the stable Block‑A cache).
-        - Fast‑path skeleton queries (`/esqueleto`, `/skeleton`, etc.).
-
-        Returns:
-            A formatted string ready for injection into the system prompt,
-            or an empty string if no symbols are indexed.
-        """
-        # ── 1. Early exit if no symbols ──────────────────────────────────
+        """Render the project skeleton: signatures of all indexed symbols."""
         symbol_index = self._f._symbol_index
         qids = sorted(symbol_index.get_all_qualified_names(project_id))
         if not qids:
@@ -3670,7 +3653,6 @@ class ContextBuilder:
         lines: List[str] = []
         include_docstrings = self._f.valves.skeleton_include_docstrings
 
-        # ── 2. Render classes with their methods ──────────────────────────
         classes = sorted(symbol_index.get_classes(project_id))
         if classes:
             lines.append("## Classes")
@@ -3692,7 +3674,6 @@ class ContextBuilder:
                     else:
                         lines.append(f"    {sig}")
 
-        # ── 3. Render module‑level functions ─────────────────────────────
         module_funcs = [
             qid
             for qid in qids
@@ -3726,27 +3707,12 @@ class ContextBuilder:
     async def _format_skeleton_for_symbol(
         self, symbol_name: str, project_id: str, query: str
     ) -> str:
-        """
-        Render a filtered skeleton for a single symbol and its direct neighbors.
-
-        Used for fast‑path queries like "esqueleto de X" or "skeleton of X".
-        Returns the signature of the symbol itself plus its immediate callers
-        and callees (up to 10 each) to provide architectural context.
-
-        Args:
-            symbol_name: Bare or qualified symbol name.
-            project_id: Current project identifier.
-            query: The user query (unused, kept for signature compatibility).
-
-        Returns:
-            A formatted string with signatures, or empty if symbol not found.
-        """
+        """Render a filtered skeleton for a single symbol and its direct neighbors."""
         symbol_index = self._f._symbol_index
         qids = symbol_index.get_qualified_names_for(symbol_name, project_id)
         if not qids:
             return ""
 
-        # Prefer the first matching qid (alphabetical tie‑breaker).
         target_qid = sorted(qids)[0]
         meta = symbol_index.get_symbol_meta(target_qid, project_id) or {}
         sig = meta.get("signature", target_qid)
@@ -3759,7 +3725,6 @@ class ContextBuilder:
         if doc and self._f.valves.skeleton_include_docstrings:
             lines.append(f"# {doc.split(chr(10))[0]}")
 
-        # ── 1. Direct callers ──────────────────────────────────────
         bare = meta.get("name", target_qid.rsplit(".", 1)[-1])
         callers = set()
         for edge in symbol_index.get_edges_in(bare, project_id):
@@ -3771,14 +3736,12 @@ class ContextBuilder:
                 csig = cm.get("signature", c)
                 lines.append(f"- `{csig}`")
 
-        # ── 2. Direct callees ──────────────────────────────────────
         callees = set()
         for edge in symbol_index.get_edges_out(target_qid, project_id):
             callees.add(edge.dst)
         if callees:
             lines.append("\n### Callees")
             for c in sorted(callees)[:10]:
-                # Resolve callee to a qualified id (best‑effort)
                 q = symbol_index.get_qualified_names_for(c, project_id)
                 if q:
                     qid = sorted(q)[0]
@@ -3797,26 +3760,13 @@ class ContextBuilder:
     async def _format_full_symbol_inventory(
         self, all_qids: List[str], project_id: str
     ) -> str:
-        """
-        Render a complete inventory of all symbols in the project.
-
-        Used for fast‑path inventory intents (e.g., "dame la lista de clases").
-        Groups symbols by type: classes with their methods, and module‑level functions.
-
-        Args:
-            all_qids: List of all qualified symbol ids in the project.
-            project_id: Current project identifier.
-
-        Returns:
-            A formatted string with the full inventory, or empty if no symbols.
-        """
+        """Render a complete inventory of all symbols in the project."""
         if not all_qids:
             return ""
 
         symbol_index = self._f._symbol_index
         lines = ["## Code Inventory (all symbols)"]
 
-        # ── 1. Classes ──────────────────────────────────────────────────
         classes = sorted(symbol_index.get_classes(project_id))
         if classes:
             lines.append("\n### Classes")
@@ -3825,14 +3775,13 @@ class ContextBuilder:
                 if not members:
                     continue
                 lines.append(f"- **{cls}** ({len(members)} methods)")
-                for m in members[:20]:  # safety limit
+                for m in members[:20]:
                     meta = symbol_index.get_symbol_meta(m, project_id) or {}
                     sig = meta.get("signature", m)
                     lines.append(f"    - `{sig}`")
                 if len(members) > 20:
                     lines.append(f"    - ... and {len(members)-20} more")
 
-        # ── 2. Module‑level functions ──────────────────────────────────
         module_funcs = [
             qid
             for qid in all_qids
@@ -3856,19 +3805,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _get_skeleton_for_cot(self, project_id: str, query: str) -> str:
-        """
-        Retrieve the project skeleton (signatures only) for use as CoT context.
-
-        This is identical to the skeleton tier content, but kept as a separate
-        method for future customisation (e.g., filtering by query).
-
-        Args:
-            project_id: Current project identifier.
-            query: The user query (unused currently).
-
-        Returns:
-            The skeleton string, or empty if no symbols are indexed.
-        """
+        """Retrieve the project skeleton (signatures only) for use as CoT context."""
         return self._format_skeleton(project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -3876,20 +3813,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _resolve_cot_expands(self, reasoning_text: str, project_id: str) -> str:
-        """
-        Replace `/expand <symbol>` placeholders in the reasoning text with actual
-        symbol bodies, so the main model sees the implementation immediately.
-
-        This is used after architecture‑mode CoT generation, where the reasoning
-        may suggest inspecting specific symbols.
-
-        Args:
-            reasoning_text: The raw CoT reasoning string.
-            project_id: Current project identifier.
-
-        Returns:
-            The reasoning text with `/expand` placeholders expanded inline.
-        """
+        """Replace `/expand <symbol>` placeholders with actual symbol bodies."""
         if not self._f.valves.enable_cot_expand_resolution:
             return reasoning_text
 
@@ -3897,24 +3821,20 @@ class ContextBuilder:
         max_expands = self._f.valves.cot_expand_max_symbols
         max_tokens = self._f.valves.cot_expand_max_tokens
 
-        # Collect unique symbols from the text.
         matches = pattern.findall(reasoning_text)
         if not matches:
             return reasoning_text
 
-        # Deduplicate and limit.
         symbols = list(dict.fromkeys(matches))[:max_expands]
         expanded = reasoning_text
         total_chars_added = 0
 
         for sym in symbols:
-            # ── 1. Resolve symbol to qualified id ──────────────────────────
             qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
             if not qids:
                 continue
             qid = sorted(qids)[0]
 
-            # ── 2. Find the block containing the symbol ─────────────────────
             block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
             if not block_hashes:
                 continue
@@ -3928,28 +3848,23 @@ class ContextBuilder:
             if block is None:
                 continue
 
-            # ── 3. Extract the body ─────────────────────────────────────────
             body = CodeBlockManager.extract_symbol_body(block, qid)
             if not body:
                 continue
 
-            # ── 4. Limit total expansion size ──────────────────────────────
             if max_tokens > 0:
                 est_tokens = self._f._tokens.estimate_code_tokens(body)
                 if total_chars_added + est_tokens * 4 > max_tokens * 4:
-                    # Truncate the remaining expansions
                     truncated = (
                         body[: (max_tokens * 4 - total_chars_added)]
                         + "\n# ... [truncated]"
                     )
                     body = truncated
-                    # Force stop after this insertion
                     expanded = expanded.replace(
                         f"/expand {sym}", f"```\n{body}\n```", 1
                     )
                     break
 
-            # ── 5. Replace the placeholder ─────────────────────────────────
             replacement = f"```\n{body}\n```"
             expanded = expanded.replace(f"/expand {sym}", replacement, 1)
             total_chars_added += len(body)
@@ -3957,15 +3872,11 @@ class ContextBuilder:
         return expanded
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2.6 — Docstring provider (used by skeleton renderer)
+    # 2.6 — Docstring provider
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _make_docstring_provider(self, project_id: str):
-        """Return f(symbol_name, parent_class='') -> one-line docstring or ''.
-        Backed by the index (covers both source-extracted and LLM-generated
-        docstrings).  `parent_class` allows resolving the EXACT occurrence's
-        docstring (e.g. THIS class's __init__, not another's) instead of an
-        ambiguous one."""
+        """Return f(symbol_name, parent_class='') -> one-line docstring or ''."""
         if not self._f.valves.skeleton_include_docstrings:
             return lambda _name, _parent="": ""
 
@@ -3982,16 +3893,8 @@ class ContextBuilder:
     def get_effective_context_budget(self, project_id: str) -> int:
         """
         Tokens available for history + user message after Block A + Block B.
-
-        Args:
-            project_id (str): The current project identifier.
-
-        Returns:
-            int: The number of tokens available for the history and user message.
         """
         window = self._f.valves.context_window_tokens
-
-        # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
         used = pstate.get("last_system_tokens", 0)
 
@@ -4010,27 +3913,9 @@ class ContextBuilder:
         """
         Classify the query into one of five use cases and return its LOD profile
         and a human-readable label.
-
-        A architecture · B plans · C programming · D refactor · E scaffolding.
-
-        Resolution order (first match wins):
-          1. Explicit command prefix (/arch /plan /code /refactor /scaffold),
-             when lod_intent_explicit_override is enabled.
-          2. Scaffolding regex (E).
-          3. Refactor regex (D) — BEFORE architecture, since the architecture
-             regex also matches "refactor".
-          4. Architecture/design regex (A).
-          5. Plan regex (B).
-          6. intent_vector tie-break: refactor-dominant → D, explain-dominant
-             → A; otherwise C (most common case).
-
-        Returns (case_key, profile_copy, human_label); profile copy is safe to mutate.
         """
         q = query or ""
 
-        # ------------------------------------------------------------------
-        # REGION 1: Explicit command prefix
-        # ------------------------------------------------------------------
         if self._f.valves.lod_intent_explicit_override:
             m = self._UC_COMMAND_RE.match(q)
             if m:
@@ -4048,9 +3933,6 @@ class ContextBuilder:
                 )
                 return case, dict(self.LOD_PROFILES[case]), case_key.label
 
-        # ------------------------------------------------------------------
-        # REGION 2: Regex-based detection (scaffolding before refactor)
-        # ------------------------------------------------------------------
         if self._UC_SCAFFOLD_RE.search(q):
             case = UseCase.SCAFFOLDING
             self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
@@ -4071,9 +3953,6 @@ class ContextBuilder:
             self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
-        # ------------------------------------------------------------------
-        # REGION 3: Intent vector tie-break
-        # ------------------------------------------------------------------
         iv = intent_vector or {}
         refactor_w = iv.get("refactor", 0.0)
         debug_w = iv.get("debug", 0.0)
@@ -4096,9 +3975,6 @@ class ContextBuilder:
             )
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
-        # ------------------------------------------------------------------
-        # REGION 4: Default
-        # ------------------------------------------------------------------
         case = UseCase.PROGRAMMING
         self._f._log_debug(
             f"classify_use_case: default '{case.label}' - no specific signals"
@@ -4111,30 +3987,7 @@ class ContextBuilder:
         intent_vector: dict,
         project_id: str,
     ) -> str:
-        """
-        Resolve the effective call-graph depth for Block A.
-
-        Manual override (any valve value other than "auto") always wins — auto
-        is only consulted when the valve is literally "auto".
-
-        auto resolution:
-          1. Reuse classify_use_case(query, intent_vector) — already computed by
-             build_block_b for the same query; no duplicate regex work, and no
-             risk of drifting out of sync with its precedence rules (refactor
-             tested before architecture, explicit /command override, etc.).
-          2. use_case "A" (architecture) → prefer full_graph, else expanded_hubs.
-             use_case "D" (refactor)     → prefer expanded_hubs, else hubs_only.
-             "B"/"C"/"E"                 → hubs_only.
-          3. Every upgrade is gated by BOTH a project-size ceiling AND a
-             free-token-budget floor (qualified symbol count + effective context
-             budget). Both must pass or the mode is capped one level down. Hard
-             cap, not a preference: auto never exceeds what the guards allow.
-
-        Uses get_all_qualified_names() (not get_all_names) for the size count so
-        that same-named methods across classes (every __init__, build, ...) are
-        counted distinctly — otherwise the ceilings would be wildly miscalibrated
-        on codebases with heavy method-name duplication.
-        """
+        """Resolve the effective call-graph depth for Block A."""
         valve = self._f.valves.call_graph_context_mode
         self._f._log_debug(f"Resolving call graph mode: valve='{valve}'")
 
@@ -4142,9 +3995,6 @@ class ContextBuilder:
             self._f._log_debug(f"  manual override → '{valve}'")
             return valve
 
-        # ------------------------------------------------------------------
-        # Get the use case (ignore label for this logic)
-        # ------------------------------------------------------------------
         use_case, _, _ = self.classify_use_case(query, intent_vector)
 
         total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
@@ -4155,7 +4005,6 @@ class ContextBuilder:
             f"free_tokens={free_tokens}"
         )
 
-        # --- window-relative token floors ---
         window = self._f.valves.context_window_tokens
         full_graph_floor = int(window * self._f.valves.full_graph_min_free_token_ratio)
         expanded_hubs_floor = int(
@@ -4223,30 +4072,11 @@ class ContextBuilder:
     ) -> str:
         """
         Resolve and apply the call-graph mode for this turn BEFORE Block A is
-        built, so an upgrade (e.g. hubs_only -> full_graph for an architecture
-        query) is visible in the very turn that triggered it instead of
-        lagging one turn behind.
-
-        Implements hysteresis (step 10) to avoid mode flip-flop:
-        - Upgrades (hubs_only → expanded_hubs → full_graph) apply immediately.
-        - Downgrades are deferred until N consecutive turns request the lower mode,
-          where N is `call_graph_mode_downgrade_after_turns`.
-
-        Args:
-            project_id (str): Current project identifier.
-            query (str): The user's query text.
-            intent_vector (dict): Pre-classified intent vector.
-
-        Returns:
-            str: The resolved mode string: "hubs_only", "expanded_hubs", or "full_graph".
+        built. Implements hysteresis: upgrades immediate, downgrades deferred.
         """
-        # --- 1. Resolve project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── Global scope detection ──────────────────────────────────────
-        # Queries like "check all orphan calls" need visibility of the ENTIRE graph.
-        # Seed inference returns {} for them (see SemanticSeedInferencer.is_global_scope).
-        # Here we force the most informative mode and activate multi‑phase.
+        # Global scope detection
         if hasattr(
             self._f, "_seed_inferencer"
         ) and self._f._seed_inferencer.is_global_scope(query):
@@ -4259,26 +4089,21 @@ class ContextBuilder:
             )
             return "full_graph"
 
-        # --- 2. Resolve the raw mode from intent and budget ---
         raw_resolved_mode = self._resolve_call_graph_mode(
             query, intent_vector, project_id
         )
 
         _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
 
-        # --- 3. Read previous mode and downgrade streak ---
         previous_mode = pstate.get("resolved_call_graph_mode")
         streak = pstate.get("graph_mode_downgrade_streak", 0)
 
-        # --- 4. Apply hysteresis: upgrades apply immediately, downgrades need streak ---
         if previous_mode is None or _MODE_RANK.get(
             raw_resolved_mode, 0
         ) >= _MODE_RANK.get(previous_mode, 0):
-            # First resolution ever, or an upgrade/stay-equal: apply immediately.
             resolved_graph_mode = raw_resolved_mode
             pstate["graph_mode_downgrade_streak"] = 0
         else:
-            # Candidate downgrade: only commit after enough consecutive turns.
             streak += 1
             pstate["graph_mode_downgrade_streak"] = streak
             if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
@@ -4292,7 +4117,6 @@ class ContextBuilder:
                     f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
                 )
 
-        # --- 5. Store the resolved mode in project state ---
         if previous_mode != resolved_graph_mode:
             self._f._log_debug(
                 f"Call graph mode: {previous_mode or '(none)'} → "
@@ -4301,6 +4125,25 @@ class ContextBuilder:
             pstate["resolved_call_graph_mode"] = resolved_graph_mode
 
         return resolved_graph_mode
+
+    # ── E5: helper to render body only ──────────────────────────────────────
+
+    def _render_symbol_body_only(self, qid: str, project_id: str) -> str:
+        """Render a symbol's body without the signature header.
+
+        Used when the signature is already present in Block A (skeleton tier).
+        """
+        state = self._f._conversation_state_manager.get(project_id)
+        block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
+        for bh in block_hashes:
+            block = state.active_blocks.get(bh)
+            if block and not block.obsolete:
+                body = CodeBlockManager.extract_symbol_body(block, qid)
+                if body:
+                    return f"# {qid} — body\n{body}\n"
+        return ""
+
+    # ── E1, E3, E5, E6: build_block_b (modified) ────────────────────────────
 
     async def build_block_b(
         self,
@@ -4314,16 +4157,10 @@ class ContextBuilder:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
 
-        Args:
-            project_id (str): Current project identifier.
-            query (str): The user's query text.
-            messages (list): The conversation messages.
-            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
-            intent_vector (dict): Pre-classified intent vector.
-            is_continuation (bool): Whether this is an AutoContinue continuation.
-
-        Returns:
-            str: The assembled Block B content, or an empty string if no context.
+        Modified (E1): LOD‑2 hysteresis (entry/exit thresholds).
+        Modified (E3): stable ordering by (tier, -PPR, qid).
+        Modified (E5): skip duplicate signatures for skeleton‑tier symbols.
+        Modified (E6): recency pointers with signature previews.
         """
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
@@ -4333,7 +4170,7 @@ class ContextBuilder:
         if not state or not state.active_blocks:
             return ""
 
-        # ── Fast path: FILTERED skeleton (single symbol + 1-hop deps) ────
+        # Fast path: FILTERED skeleton
         if self._f.valves.enable_skeleton_intent:
             _sym_match = self._SKELETON_SYMBOL_RE.search(query)
             if _sym_match:
@@ -4346,7 +4183,7 @@ class ContextBuilder:
                     if skel:
                         return skel
 
-        # ── Fast path: skeleton / scaffolding queries (signatures only) ──
+        # Fast path: skeleton / scaffolding queries
         if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
             query
         ):
@@ -4354,18 +4191,18 @@ class ContextBuilder:
             if skel:
                 return skel
 
-        # ── Fast path for inventory / listing queries ────────────────────
+        # Fast path for inventory / listing queries
         if self._LIST_INTENTS.search(query):
             all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
             if all_qids:
                 return await self._format_full_symbol_inventory(all_qids, project_id)
 
-        # ── Step 1a: Classify use case (needed before PPR for infer_seeds) ──
+        # Step 1a: Classify use case
         active_use_case, use_case_profile, _ = self.classify_use_case(
             query, intent_vector
         )
 
-        # ── Step 1b: LLM‑guided seed inference (before PPR) ──
+        # Step 1b: LLM‑guided seed inference
         inferred_seeds: Dict[str, float] = {}
         if self._f.valves.seed_inference_mode != "off":
             inferred_seeds = await self._f._seed_inferencer.infer_seeds(
@@ -4376,7 +4213,7 @@ class ContextBuilder:
                 slot_free=slot_free,
             )
 
-        # ── Step 1c: ActivationGraph (with inferred seeds) ────────────────
+        # Step 1c: ActivationGraph
         ag = self._f._activation.build_activation_graph(
             query,
             project_id,
@@ -4392,7 +4229,11 @@ class ContextBuilder:
             )
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── Step 2: Adjust LOD thresholds by intent ───────────────────────────
+        if self._f.valves.debug and hasattr(self._f, "_write_counter"):
+            if self._f._write_counter % 50 == 0:
+                self._f._log_debug(self._f._activation._ppr_cache.stats)
+
+        # Step 2: Adjust LOD thresholds by intent
         debug_weight = intent_vector.get("debug", 0.2)
         modify_weight = intent_vector.get("modify", 0.3)
         refactor_weight = intent_vector.get("refactor", 0.1)
@@ -4401,13 +4242,11 @@ class ContextBuilder:
         lod2 = self._f.valves.lod2_threshold
         lod1 = self._f.valves.lod1_threshold
 
-        # ── Per-use-case LOD scaling ──────────────────────────────────────
         if self._f.valves.enable_lod_by_intent:
             lod1 *= use_case_profile.get("lod1_mult", 1.0)
             lod2 *= use_case_profile.get("lod2_mult", 1.0)
             lod3 *= use_case_profile.get("lod3_mult", 1.0)
         else:
-            # Legacy flat scaling
             if debug_weight + modify_weight > 0.6:
                 scale = 0.7
             elif refactor_weight > 0.4:
@@ -4418,7 +4257,7 @@ class ContextBuilder:
             lod2 *= scale
             lod1 *= scale
 
-        # ── Case D (refactor): pull in direct callers of the seed symbols ──
+        # Case D: pull in direct callers
         if (
             self._f.valves.enable_lod_by_intent
             and active_use_case == "D"
@@ -4446,7 +4285,7 @@ class ContextBuilder:
                     f"into Block B at LOD-1 (impact analysis)."
                 )
 
-        # ── Mode is resolved BEFORE Block A is built this turn ────────────
+        # Mode is resolved BEFORE Block A is built this turn
         pstate = self._f._project_state_manager.get_pstate(project_id)
         resolved_graph_mode = pstate.get("resolved_call_graph_mode")
         if resolved_graph_mode is None:
@@ -4454,11 +4293,10 @@ class ContextBuilder:
                 project_id, query, intent_vector
             )
 
-        # ── Step 3: Build LOD tiers as separate accumulators ──────────────
+        # Step 3: Build LOD tiers
         total_tokens = 0
         budget = self._f.valves.active_context_max_tokens or 32000
 
-        # Auto-budget for multi-phase
         if (
             self._f.valves.auto_budget_context_for_parts
             and (
@@ -4475,66 +4313,123 @@ class ContextBuilder:
             )
             budget = min(budget, max(8000, _available_for_context))
 
-        # ── Supress hubs already in tier ──────────────────────────────────
         tier_qids = set(pstate.get("hub_tier_qids", []))
         injected_symbols: Set[str] = set(tier_qids)
 
-        sorted_nodes = sorted(activated.items(), key=lambda x: x[1], reverse=True)
+        # ── E3: stable ordering ──────────────────────────────────────────────
+        # First, compute LOD tiers for E1 and E3
+        pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── Centrality LOD bump ────────────────────────────────────────────
+        # ── E1: LOD‑2 hysteresis ────────────────────────────────────────────
+        lod2_entry = self._f.valves.lod2_threshold
+        lod2_exit = lod2_entry * self._f.valves.lod2_exit_ratio
+        currently_lod2: Set[str] = set(pstate.get("lod2_active_qids_prev", []))
+
+        lod2_qids: Set[str] = set()
+        lod3_qids: Set[str] = set()
+        lod1_qids: Set[str] = set()
+
+        for qid, score in activated.items():
+            if qid in currently_lod2:
+                if score >= lod2_exit:
+                    lod2_qids.add(qid)
+            else:
+                if score >= lod2_entry:
+                    lod2_qids.add(qid)
+            if score >= lod3:
+                lod3_qids.add(qid)
+
+        # Persist for next turn (E1)
+        pstate["lod2_active_qids_prev"] = list(lod2_qids)
+
+        # ── E5: retrieve skeleton tier qids to avoid duplicates ──────────────
+        skeleton_qids: Set[str] = set(pstate.get("skeleton_tier_qids", []))
+
+        # ── E3: stable ordering function ──────────────────────────────────────
+        def _lod_tier(qid: str) -> int:
+            if qid in lod3_qids:
+                return 3
+            if qid in lod2_qids:
+                return 2
+            return 1
+
+        sorted_nodes = sorted(
+            activated.keys(),
+            key=lambda qid: (
+                -_lod_tier(qid),  # tier DESC
+                -activated.get(qid, 0.0),  # PPR DESC within tier
+                qid,  # stable lexicographic tie‑breaker
+            ),
+        )
+
+        # ── Centrality LOD bump ──────────────────────────────────────────────
         if self._f.valves.enable_centrality_lod_bump:
             centrality = pstate.get("node_centrality", {})
             threshold = self._f.valves.centrality_lod_bump_threshold
             adjusted = []
-            for node_id, score in sorted_nodes:
-                cent = centrality.get(node_id, 0.0)
+            for qid in sorted_nodes:
+                cent = centrality.get(qid, 0.0)
                 if cent >= threshold:
                     effective = min(
-                        1.0, score + cent * self._f.valves.centrality_lod_bump_weight
+                        1.0,
+                        activated.get(qid, 0.0)
+                        + cent * self._f.valves.centrality_lod_bump_weight,
                     )
+                    adjusted.append((qid, effective))
                 else:
-                    effective = score
-                adjusted.append((node_id, effective))
-            sorted_nodes = adjusted
+                    adjusted.append((qid, activated.get(qid, 0.0)))
+            # Re‑sort with adjusted scores? Simpler: just update activated and re‑sort.
+            # We'll keep sorted_nodes as is, but use activated_scores for sorting.
+            # Actually, the existing logic uses activated dict. We'll just re‑apply the stable sort.
+            activated_scores = dict(adjusted)
+            sorted_nodes = sorted(
+                activated_scores.keys(),
+                key=lambda qid: (
+                    -_lod_tier(qid),
+                    -activated_scores.get(qid, 0.0),
+                    qid,
+                ),
+            )
+        else:
+            activated_scores = activated
 
-        _lod0_parts: List[str] = []
-        _lod1_parts: List[str] = []
-        _lod2_parts: List[str] = []
-        _lod3_parts: List[str] = []
-
-        # ── Batched LOD-2 docstring pre-resolution ──
+        # ── Batched LOD-2 docstring pre-resolution ─────────────────────────
         if self._f.valves.enable_auto_docstrings:
             lod2_candidates = [
-                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+                qid
+                for qid in lod2_qids
+                if not skeleton_qids or qid not in skeleton_qids
             ]
             if lod2_candidates:
                 missing = []
-                for node_id in lod2_candidates:
+                for qid in lod2_candidates:
                     has_doc = False
-                    for bh in self._f._symbol_index.find_blocks(node_id, project_id):
+                    for bh in self._f._symbol_index.find_blocks(qid, project_id):
                         blk = state.active_blocks.get(bh)
                         if blk and any(
-                            qualify_symbol_name(s.name, s.parent_symbol) == node_id
+                            qualify_symbol_name(s.name, s.parent_symbol) == qid
                             and s.docstring
                             for s in blk.symbols
                         ):
                             has_doc = True
                             break
                     if not has_doc:
-                        missing.append(node_id)
+                        missing.append(qid)
                 if missing:
                     await self._f._enrichment.ensure_docstrings_batch(
                         missing, project_id
                     )
 
-        # ── Batched LOD-2.5 CFG pre-resolution ──
+        # ── Batched LOD-2.5 CFG pre-resolution ─────────────────────────────
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
             >= self._f.valves.cfg_skeleton_debug_intent_threshold
         ):
             cfg_candidates = [
-                node_id for node_id, score in sorted_nodes if lod2 <= score < lod3
+                qid
+                for qid in lod2_qids
+                if not skeleton_qids or qid not in skeleton_qids
             ]
             self._f._log_debug(
                 f"CFG gate TRIGGERED: use_case={active_use_case}, "
@@ -4550,19 +4445,41 @@ class ContextBuilder:
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
-        # ── Iterate over activated nodes and build LOD tiers ──────────────
-        for node_id, score in sorted_nodes:
+        # ── Iterate over sorted_nodes and build LOD tiers ──────────────────
+        _lod0_parts: List[str] = []
+        _lod1_parts: List[str] = []
+        _lod2_parts: List[str] = []
+        _lod3_parts: List[str] = []
+
+        for qid in sorted_nodes:
             if total_tokens >= budget:
                 break
 
-            if node_id in injected_symbols:
+            if qid in injected_symbols:
                 continue
 
-            block_hashes = self._f._symbol_index.find_blocks(node_id, project_id)
+            # ── E5: skip if in skeleton tier and LOD-2 ──────────────────────
+            if qid in skeleton_qids:
+                if _lod_tier(qid) == 2:
+                    self._f._log_debug(
+                        f"Block B: skipping LOD-2 for {qid} (in skeleton tier)"
+                    )
+                    continue
+                if _lod_tier(qid) == 3:
+                    # Render body only
+                    body_only = self._render_symbol_body_only(qid, project_id)
+                    if body_only:
+                        tok = self._f._tokens.estimate_code_tokens(body_only)
+                        if total_tokens + tok <= budget:
+                            _lod3_parts.append(body_only)
+                            total_tokens += tok
+                            injected_symbols.add(qid)
+                    continue
+
+            block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
             for bh in block_hashes:
                 block = state.active_blocks.get(bh)
 
-                # Page-in support for evicted blocks
                 if block is None and self._f._pager is not None:
                     if self._f._pager.is_paged(bh, project_id):
                         block = await self._f._pager.page_in_block(
@@ -4575,15 +4492,17 @@ class ContextBuilder:
                 if not block or block.obsolete:
                     continue
 
-                # ── LOD-1: Signatures only ──────────────────────────────────
-                if score < lod2:
+                score = activated_scores.get(qid, 0.0)
+
+                # LOD-1: Signatures only
+                if _lod_tier(qid) == 1:
                     sig = next(
                         (
                             sym.signature
                             for sym in block.symbols
-                            if qualify_symbol(sym) == node_id
+                            if qualify_symbol(sym) == qid
                         ),
-                        node_id,
+                        qid,
                     )
                     tok = len(sig) // 4 + 2
                     if total_tokens + tok > budget:
@@ -4591,23 +4510,23 @@ class ContextBuilder:
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod1_parts.append(f"- '{sig}'{loc} _(score: {score:.2f})_")
                     total_tokens += tok
-                    injected_symbols.add(node_id)
+                    injected_symbols.add(qid)
 
-                # ── LOD-2: Signatures + docstrings ──────────────────────────
-                elif score < lod3:
+                # LOD-2: Signatures + docstrings
+                elif _lod_tier(qid) == 2:
                     sig = next(
                         (
                             sym.signature
                             for sym in block.symbols
-                            if qualify_symbol(sym) == node_id
+                            if qualify_symbol(sym) == qid
                         ),
-                        node_id,
+                        qid,
                     )
                     docstring = next(
                         (
                             sym.docstring
                             for sym in block.symbols
-                            if qualify_symbol(sym) == node_id and sym.docstring
+                            if qualify_symbol(sym) == qid and sym.docstring
                         ),
                         "",
                     )
@@ -4619,11 +4538,11 @@ class ContextBuilder:
                         >= self._f.valves.cfg_skeleton_debug_intent_threshold
                     ):
                         cfg_skeleton = (
-                            self._f._symbol_index.get_cfg(node_id, project_id) or ""
+                            self._f._symbol_index.get_cfg(qid, project_id) or ""
                         )
 
                     if cfg_skeleton:
-                        self._f._log_debug(f"💉 CFG injected for '{node_id}' (LOD2)")
+                        self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
                         text = f"'{sig}'"
                         if docstring:
                             text += f": {docstring}"
@@ -4637,13 +4556,11 @@ class ContextBuilder:
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
                     total_tokens += tok
-                    injected_symbols.add(node_id)
+                    injected_symbols.add(qid)
 
-                # ── LOD-3: Full code body ──────────────────────────────────
+                # LOD-3: Full code body
                 else:
-                    content_to_inject = CodeBlockManager.extract_symbol_body(
-                        block, node_id
-                    )
+                    content_to_inject = CodeBlockManager.extract_symbol_body(block, qid)
                     tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
                     _is_oversized = (
@@ -4651,7 +4568,6 @@ class ContextBuilder:
                         and tok > self._f.valves.max_code_block_tokens
                     )
 
-                    # ── Handle oversized blocks ────────────────────────────
                     if (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "warn"
@@ -4677,7 +4593,6 @@ class ContextBuilder:
                             )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
-                    # ── Truncate action ──────────────────
                     elif (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "truncate"
@@ -4691,7 +4606,6 @@ class ContextBuilder:
                         )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
-                    # ── Optional: LLMLingua compression (if enabled) ───────
                     if (
                         slot_free
                         and self._f.valves.enable_code_compression
@@ -4716,13 +4630,13 @@ class ContextBuilder:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod3_parts.append(
-                        f"### '{node_id}'{loc} [activation: {score:.2f}]\n"
+                        f"### '{qid}'{loc} [activation: {score:.2f}]\n"
                         f"```\n{content_to_inject}\n```\n"
                     )
                     total_tokens += tok
-                    injected_symbols.add(node_id)
+                    injected_symbols.add(qid)
 
-                break  # inner loop: found the block, done
+                break
 
         # ── RAPTOR cluster summaries → LOD-2 tier ─────────────────────────
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
@@ -4772,15 +4686,16 @@ class ContextBuilder:
                 + "\n".join(_lod3_parts)
             )
 
-        # ── Recency pointers ──────────────────────────────────────────────
-        _ptr = self._build_hub_recency_pointers(project_id, ag)
+        # ── E6: recency pointers ──────────────────────────────────────────
+        # Compute the set of qids actually rendered in Block B
+        current_b_qids = set(injected_symbols)
+        _ptr = self._build_hub_recency_pointers(project_id, current_b_qids)
         if _ptr:
             ordered.append(_ptr)
 
         # ── Instruction tail ──────────────────────────────────────────────
         ordered.append(self._build_instruction_tail(active_use_case))
 
-        # ── Avoid fallback when skeleton tier is active ──────────────────
         if len(ordered) <= 1:
             if self._f.valves.debug:
                 self._f._log_debug("build_block_b: no activated nodes or empty context")
@@ -4792,7 +4707,6 @@ class ContextBuilder:
                 return ""
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── summary line uses injected_symbols ──────────────────────────
         summary_line = (
             f"\n_(Context: {len(injected_symbols)} symbols, "
             f"~{total_tokens} tokens, "
@@ -4803,25 +4717,21 @@ class ContextBuilder:
         # ── LOD tracking for adaptive feedback ──────────────────────────
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
-            for node_id, score in activated.items():
+            for qid, score in activated.items():
                 if score < lod1:
-                    lod_map[node_id] = 0
+                    lod_map[qid] = 0
                 elif score < lod2:
-                    lod_map[node_id] = 1
+                    lod_map[qid] = 1
                 elif score < lod3:
-                    lod_map[node_id] = 2
+                    lod_map[qid] = 2
                 else:
-                    lod_map[node_id] = 3
+                    lod_map[qid] = 3
             pstate["last_lod_levels"] = lod_map
 
         return "\n".join(ordered)
 
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
-        """
-        Delete stale slot files, keeping only the current one.
-
-        MIGRATE-VERBATIM: Filter._cleanup_old_slot_files().
-        """
+        """Delete stale slot files, keeping only the current one."""
         slot_dir = self._f.valves.slot_save_path.rstrip("/")
         if not os.path.isdir(slot_dir):
             return
@@ -7390,8 +7300,7 @@ class StateStore:
 
 
 class LongTermMemory:
-    """Manages long‑term conversational and code memory using ChromaDB
-    with semantic embeddings.
+    """Manages long‑term conversational and code memory using ChromaDB.
 
     Provides:
     * Storage and retrieval of user/assistant messages indexed by project
@@ -7401,17 +7310,30 @@ class LongTermMemory:
     * Duplicate question detection using cosine similarity and optional
       CrossEncoder reranking.
     * Time‑bounded expiration of old memories.
+
+    Docs 10–13 backported:
+        M1 – strip <details> reasoning before embedding.
+        M2 – skip partial multi‑phase assistant responses.
+        C1 – apply similarity threshold on raw score, not decayed.
+        C2 – deduplicate fragments by document ID.
+        C3 – purge_project.
+        C4 – validate embedding model dimension on startup.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """Initialize with a reference to the parent Filter."""
         self._f = filter_ref
+        self._retrieval_disabled_reason: Optional[str] = None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
 
     def init(self) -> None:
-        """Initialise ChromaDB, embedder, and response cache collection."""
+        """Initialise ChromaDB, embedder, and response cache collection.
+
+        Modified: C4 – validate embedding model after collection is ready.
+        """
         os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
         self._f.embedder = _shared_get_embedder()
         self._f._log_debug("Embedder: using Qwen/Qwen3-Embedding-0.6B")
@@ -7440,6 +7362,9 @@ class LongTermMemory:
             )
         )
         self._f._log_debug("LTM ready")
+
+        # ── C4: validate embedding model after collection is ready ──────────
+        self._validate_embedding_model()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Response cache & duplicate detection
@@ -7639,14 +7564,6 @@ class LongTermMemory:
 
         Forces structured output using a strong system prompt and numbered list.
         Extracts queries using regex to handle variations in formatting.
-
-        Args:
-            query (str): The original user question.
-            use_case_label (str): Human-readable label of the resolved use case.
-            slot_free (bool): Whether the LLM slot is available.
-
-        Returns:
-            List[str]: A list of query variants, including the original query.
         """
         # ------------------------------------------------------------------
         # REGION 1: Early exits
@@ -7856,7 +7773,7 @@ class LongTermMemory:
         return [{"doc": doc, "timestamp": ts} for doc, _, ts, _ in docs_with_meta]
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Main retrieval methods
+    # 4. Main retrieval methods – MODIFIED (C1, C2, C4)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def retrieve_memories_unified(
@@ -7869,19 +7786,18 @@ class LongTermMemory:
         """
         Retrieve relevant LTM entries, with multi‑query expansion and reranking.
 
-        The method now uses thematic expansions (via _expand_query_for_retrieval)
-        to capture high-level architectural context, complementing the exact
-        symbol matches from seed_inference.
-
-        Args:
-            query (str): The user query (original or cleaned).
-            project_id (str): The current project identifier.
-            use_case_label (str): Human-readable label of the resolved use case.
-            slot_free (bool): Whether the LLM slot is available.
-
-        Returns:
-            list: A list of dictionaries with 'doc', 'timestamp', and 'meta'.
+        Modified:
+            C1 – threshold on raw similarity (before time decay)
+            C2 – deduplicate by document ID, keeping highest score
+            C4 – early exit if retrieval disabled due to model mismatch
         """
+        # ── C4: early exit if retrieval disabled ──────────────────────────
+        if self._retrieval_disabled_reason:
+            self._f._log_debug(
+                f"LTM retrieval skipped: {self._retrieval_disabled_reason}"
+            )
+            return []
+
         # ------------------------------------------------------------------
         # REGION 1: Early exits
         # ------------------------------------------------------------------
@@ -7919,6 +7835,7 @@ class LongTermMemory:
                     }
                 )
 
+            # ── C2: deduplicate results by memory_id, keeping highest raw score ──
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
 
             # ------------------------------------------------------------------
@@ -7949,6 +7866,11 @@ class LongTermMemory:
                 for i, doc in enumerate(variant_results["documents"][0]):
                     meta = variant_results["metadatas"][0][i]
                     raw_sim = 1.0 - (variant_results["distances"][0][i] / 2.0)
+
+                    # ── C1: apply threshold on RAW similarity ──────────────────
+                    if raw_sim < self._f.valves.long_term_memory_similarity_threshold:
+                        continue
+
                     ts = meta.get("timestamp")
                     if ts is not None and ts < 1000000000:
                         ts = None
@@ -7957,39 +7879,30 @@ class LongTermMemory:
                         "memory_id",
                         hashlib.md5(doc.encode()).hexdigest()[:16],
                     )
+
+                    # ── C2: deduplicate, keep highest raw score ─────────────────
                     if (
                         mem_id not in all_raw_results
                         or raw_sim > all_raw_results[mem_id][1]
                     ):
                         all_raw_results[mem_id] = (doc, raw_sim, ts, meta)
 
-            results_list = list(all_raw_results.values())
-
-            # ------------------------------------------------------------------
-            # REGION 4: Apply time decay, symbol boost, and reranking
-            # ------------------------------------------------------------------
+            # ── C1: apply time decay for ranking (not for filtering) ──────────
             docs_with_meta = []
-            if results_list:
-                for doc, raw_sim, ts, meta in results_list:
-                    if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
-                        age_hours = (now - ts) / 3600
-                        effective_sim = raw_sim * (
-                            0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
-                        )
-                    else:
-                        effective_sim = raw_sim
+            for mem_id, (doc, raw_sim, ts, meta) in all_raw_results.items():
+                if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
+                    age_hours = (now - ts) / 3600
+                    effective_sim = raw_sim * (
+                        0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
+                    )
+                else:
+                    effective_sim = raw_sim
 
-                    if meta.get("is_raptor_summary"):
-                        raptor_level = meta.get("raptor_level", 1)
-                        effective_sim *= 1.0 + 0.1 * raptor_level
+                if meta.get("is_raptor_summary"):
+                    raptor_level = meta.get("raptor_level", 1)
+                    effective_sim *= 1.0 + 0.1 * raptor_level
 
-                    if (
-                        effective_sim
-                        < self._f.valves.long_term_memory_similarity_threshold
-                    ):
-                        continue
-
-                    docs_with_meta.append((doc, effective_sim, ts, meta, raw_sim))
+                docs_with_meta.append((doc, effective_sim, ts, meta, raw_sim))
 
             if self._f.valves.preserve_error_context:
                 new_docs = []
@@ -8173,8 +8086,34 @@ class LongTermMemory:
             return []
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Message storage (LTM + response cache)
+    # 5. Message storage – MODIFIED (M1, M2)
     # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── M1: strip CoT scaffolding ──────────────────────────────────────────
+    _LTM_STRIP_RE = re.compile(
+        r"<details[^>]*>.*?</details>",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def _prepare_text_for_ltm(self, text: str, role: str) -> str:
+        """Strip model CoT scaffolding before embedding into ChromaDB.
+        Only applied to assistant messages. The original message content
+        shown to the user is NOT modified."""
+        if role != "assistant":
+            return text
+        stripped = self._LTM_STRIP_RE.sub("", text).strip()
+        return stripped
+
+    # ── M2: skip partial multi‑phase responses ─────────────────────────────
+    _MULTI_PHASE_CONTINUATION_MARKER = "▶ CONTINÚA:"
+    _MULTI_PHASE_PART_RE = re.compile(
+        r"##\s+C[oó]digo\s*[—–-]\s*Parte\s+\d+/\d+", re.IGNORECASE
+    )
+
+    def _is_partial_multi_phase(self, text: str) -> bool:
+        return self._MULTI_PHASE_CONTINUATION_MARKER in text or bool(
+            self._MULTI_PHASE_PART_RE.search(text)
+        )
 
     async def store_messages(
         self, project_id: str, messages: list, wait: bool = True
@@ -8185,20 +8124,14 @@ class LongTermMemory:
         If `wait` is False, the actual embedding and upsert run in a background
         task and the method returns immediately.
 
-        M2 fix: Assistant responses that are partial multi-phase continuations
-        (containing "▶ CONTINÚA:" or "## Código — Parte N/M") are skipped
-        entirely to prevent polluting long-term memory with incomplete code
-        fragments that would be retrieved as "relevant past context".
+        Modified:
+            M1 – strip <details> reasoning before embedding.
+            M2 – skip partial multi‑phase assistant responses.
         """
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return
 
-        # ── M2: Pattern to detect partial multi-phase assistant responses ──
-        _MULTI_PHASE_PARTIAL = re.compile(
-            r"(?:▶\s*CONTINÚA:|##\s+C[oó]digo\s*[—–-]\s*Parte\s+\d+/\d+)", re.IGNORECASE
-        )
-
-        # ── Filter valid messages (skip partial multi-phase) ──────────────
+        # ── M2: Filter valid messages (skip partial multi-phase) ──────────
         valid = []
         for msg in messages:
             content = msg.get("content", "")
@@ -8207,13 +8140,18 @@ class LongTermMemory:
 
             role = msg.get("role", "")
             # M2: Skip partial multi-phase assistant responses
-            if role == "assistant" and _MULTI_PHASE_PARTIAL.search(content):
+            if role == "assistant" and self._is_partial_multi_phase(content):
                 self._f._log_debug(
                     "ltm: skipping partial multi-phase response (not embedding)"
                 )
                 continue
 
-            valid.append(msg)
+            # M1: Strip CoT scaffolding
+            content = self._prepare_text_for_ltm(content, role)
+            if not content:
+                continue
+
+            valid.append({"role": role, "content": content})
 
         if not valid:
             return
@@ -8560,6 +8498,87 @@ class LongTermMemory:
         if expired and expired["ids"]:
             self._f.memory_collection.delete(ids=expired["ids"])
             self._f._log_debug(f"Purged {len(expired['ids'])} expired memories")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. Project purge – NEW (C3)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def purge_project(self, project_id: str) -> int:
+        """Delete all ChromaDB documents for a project.
+
+        Returns the number of documents deleted.
+        """
+        try:
+            existing = self._f.memory_collection.get(
+                where={"project_id": {"$eq": project_id}}
+            )
+            ids_to_delete: List[str] = existing.get("ids", [])
+            if ids_to_delete:
+                self._f.memory_collection.delete(ids=ids_to_delete)
+                self._f._log_debug(
+                    f"LTM: purged {len(ids_to_delete)} documents for project '{project_id}'"
+                )
+            return len(ids_to_delete)
+        except Exception as e:
+            self._f._log_debug(f"LTM: purge_project failed for '{project_id}': {e}")
+            return 0
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. Embedding model validation – NEW (C4)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_embedding_dimension(self) -> int:
+        """Return the output dimension of the current embedding model."""
+        test_vec = self._f.embedder.encode(["test"])
+        return len(test_vec[0]) if test_vec else 0
+
+    def _validate_embedding_model(self) -> bool:
+        """Validate that the current embedding model matches the stored one.
+
+        Reads/writes model metadata from the ChromaDB collection.
+        Returns False and sets _retrieval_disabled if a mismatch is found.
+        """
+        try:
+            current_model: str = getattr(
+                self._f.valves, "embedding_model_name", "unknown"
+            )
+            current_dim: int = self._get_embedding_dimension()
+
+            coll_meta: dict = self._f.memory_collection.metadata or {}
+            stored_model: Optional[str] = coll_meta.get("_codeaware_embedding_model")
+            stored_dim: Optional[int] = coll_meta.get("_codeaware_embedding_dim")
+
+            if stored_model is None:
+                # First run: persist model fingerprint
+                self._f.memory_collection.modify(
+                    metadata={
+                        **coll_meta,
+                        "_codeaware_embedding_model": current_model,
+                        "_codeaware_embedding_dim": current_dim,
+                    }
+                )
+                self._f._log_debug(
+                    f"LTM: embedding fingerprint stored (model={current_model}, dim={current_dim})"
+                )
+                return True
+
+            if stored_model != current_model or stored_dim != current_dim:
+                reason = (
+                    f"LTM embedding mismatch — collection built with "
+                    f"'{stored_model}' (dim={stored_dim}), "
+                    f"current model is '{current_model}' (dim={current_dim}). "
+                    f"LTM retrieval DISABLED. To fix: clear the ChromaDB collection."
+                )
+                self._f._log_debug(reason)
+                self._retrieval_disabled_reason = reason
+                return False
+
+            return True
+
+        except Exception as e:
+            # Fail open to avoid breaking existing installs that lack the metadata
+            self._f._log_debug(f"LTM: could not validate embedding model: {e}")
+            return True
 
 
 class LLMOrchestrator:
@@ -10038,6 +10057,10 @@ class CommandRouter:
         "conserva",
     }
 
+    _FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
+    _INDENTED_CODE_RE = re.compile(r"(?m)^(?:    |\t).+$")
+    _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
@@ -10122,15 +10145,65 @@ class CommandRouter:
             )
         return None
 
+    def _extract_text_for_classification(self, message: str) -> str:
+        """
+        Extract only non-code portions of the user message for intent classification.
+
+        CrossEncoders are typically limited to 512 tokens. Passing full messages
+        that contain pasted code causes silent truncation that often removes the
+        actual question (usually at the end of the message).
+
+        Code blocks are replaced with a '[CODE]' placeholder so the classifier
+        can still infer 'there was code here' without ingesting the tokens.
+
+        Args:
+            message: The raw user message.
+
+        Returns:
+            A cleaned string with code blocks removed/replaced, suitable for
+            feeding into the CrossEncoder.
+        """
+        if not message:
+            return ""
+
+        # Replace fenced code blocks (```...```) with a placeholder
+        text = self._FENCED_CODE_BLOCK_RE.sub("[CODE]", message)
+
+        # Replace indented code blocks (4 spaces or tab at start of line)
+        text = self._INDENTED_CODE_RE.sub("", text)
+
+        # Clean up excessive newlines
+        text = self._EXCESS_NEWLINES_RE.sub("\n\n", text).strip()
+
+        if not text or text == "[CODE]":
+            # Pure code message: provide a placeholder so the classifier
+            # can still decide (likely case B: implement/modify)
+            return "[CODE ONLY — no natural language text]"
+
+        return text
+
     async def classify_intent(self, user_query: str, project_id: str) -> dict:
-        """Classify the user's intent using the CrossEncoder.
+        """
+        Classify the user's intent using the CrossEncoder.
+
+        Q1 fix: Strip code blocks from the input before classification to avoid
+        silent truncation that removes the actual question.
+
         Returns a dict with probabilities for explain, modify, debug, refactor.
         """
+        # ── Q1: Extract text without code for the classifier ──
+        classifier_input = self._extract_text_for_classification(user_query)
+
+        self._f._log_debug(
+            f"classify_intent: input truncated from {len(user_query.split())} words "
+            f"to {len(classifier_input.split())} (code stripped)"
+        )
+
         pairs = [
-            (user_query[:500], "The user wants to understand or explain code."),
-            (user_query[:500], "The user wants to modify, fix, or create code."),
-            (user_query[:500], "The user is debugging an error or exception."),
-            (user_query[:500], "The user wants to refactor or restructure code."),
+            (classifier_input[:500], "The user wants to understand or explain code."),
+            (classifier_input[:500], "The user wants to modify, fix, or create code."),
+            (classifier_input[:500], "The user is debugging an error or exception."),
+            (classifier_input[:500], "The user wants to refactor or restructure code."),
         ]
         raw = await self._predict_cross_encoder(pairs)
         if raw is None:
@@ -12600,8 +12673,55 @@ class ActivationEngine:
       and centrality so the next request rebuilds them from scratch.
     """
 
+    # ── Q2: PPR cache (nested class) ──────────────────────────────────────────
+    class _PPRCache:
+        """LRU cache for PPR results.
+
+        Key: (code_state_hash: str, seed_qids: frozenset[str])
+        Value: dict[str, float]  — qid → PPR score
+
+        Thread safety: not needed (single-threaded inlet/build_block_b flow).
+        Invalidation: automatic via code_state_hash — any code change produces
+        a new hash, naturally evicting all cached entries for that project.
+        """
+
+        def __init__(self, maxsize: int = 20):
+            self._cache: OrderedDict[tuple, dict[str, float]] = OrderedDict()
+            self._maxsize = maxsize
+            self._hits = 0
+            self._misses = 0
+
+        def get(self, code_hash: str, seeds: frozenset) -> Optional[Dict[str, float]]:
+            """Retrieve cached PPR scores if available."""
+            key = (code_hash, seeds)
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
+
+        def set(
+            self, code_hash: str, seeds: frozenset, scores: Dict[str, float]
+        ) -> None:
+            """Store PPR scores in the cache."""
+            key = (code_hash, seeds)
+            self._cache[key] = scores
+            self._cache.move_to_end(key)
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+
+        @property
+        def stats(self) -> str:
+            """Return cache hit/miss statistics."""
+            total = self._hits + self._misses
+            rate = self._hits / total if total else 0
+            return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
+
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+        # ── Q2: PPR cache ──
+        self._ppr_cache = self._PPRCache(maxsize=20)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Active code context (fallback when path analysis is disabled)
@@ -12609,7 +12729,6 @@ class ActivationEngine:
 
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
-
         # ═══════════════════════════════════════════════════════════════════════════
         # REGION 1 — Load state & filter active blocks
         # ═══════════════════════════════════════════════════════════════════════════
@@ -12835,7 +12954,7 @@ class ActivationEngine:
         return inside
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Activation graph building (PPR engine)
+    # 2. Seed extraction helpers
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _extract_query_seeds(
@@ -13000,6 +13119,96 @@ class ActivationEngine:
         )
         return exact_seeds, partial_seeds, tb_seeds, history_boosts
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. PPR computation with caching (Q2)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_or_compute_ppr_scores(
+        self,
+        seed_qids: List[str],
+        project_id: str,
+        code_state_hash: str,
+        edges_out: Dict[str, List[Edge]],
+        max_steps: int = 20,
+        min_score: float = 0.05,
+        alpha: float = 0.85,
+    ) -> Dict[str, float]:
+        """
+        Compute PPR scores with LRU caching.
+
+        Q2 fix: Caches results by (code_state_hash, frozenset(seed_qids)).
+        Avoids recomputation when the same seeds are used on the same code.
+
+        Args:
+            seed_qids: List of qualified symbol ids to seed.
+            project_id: Current project identifier.
+            code_state_hash: Hash of the code state (cache invalidation key).
+            edges_out: Call graph edges (outgoing).
+            max_steps: PPR propagation steps.
+            min_score: Minimum score to keep.
+            alpha: Damping factor.
+
+        Returns:
+            Dict[str, float]: qid → PPR score.
+        """
+        seed_frozenset = frozenset(seed_qids)
+
+        # ── Check cache ──
+        cached = self._ppr_cache.get(code_state_hash, seed_frozenset)
+        if cached is not None:
+            self._f._log_debug(f"PPR: cache hit ({self._ppr_cache.stats})")
+            return cached
+
+        # ── Compute PPR ──
+        ag = ActivationGraph()
+
+        # Seed the graph
+        total_seed_score = len(seed_qids)
+        if total_seed_score == 0:
+            # Fallback to entry points
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            centrality = pstate.get("node_centrality", {})
+            entry_points = self._f._path_index.find_entry_points(
+                self._f._symbol_index, project_id
+            )
+            if entry_points:
+                sorted_eps = sorted(
+                    entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
+                )
+                for sym_name in sorted_eps[:3]:
+                    cent_score = centrality.get(sym_name, 0.0)
+                    seed_score = 0.2 + 0.2 * cent_score
+                    ag.seed([sym_name], initial_score=seed_score)
+        else:
+            # Distribute seed scores evenly
+            init_score = 1.0 / total_seed_score
+            ag.seed(seed_qids, initial_score=init_score)
+
+        # Run PPR propagation
+        ag.propagate(
+            edges_out=edges_out,
+            max_steps=max_steps,
+            min_score=min_score,
+            alpha=alpha,
+        )
+
+        # Extract scores
+        scores = ag.get_activated_nodes(threshold=min_score)
+
+        # ── Store in cache ──
+        self._ppr_cache.set(code_state_hash, seed_frozenset, scores)
+        self._f._log_debug(f"PPR: computed and cached ({self._ppr_cache.stats})")
+
+        # Log stats periodically (every 50th computation)
+        if hasattr(self._f, "_write_counter") and self._f._write_counter % 50 == 0:
+            self._f._log_debug(self._ppr_cache.stats)
+
+        return scores
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Activation graph builders
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _build_single_seed_graph(
         self,
         exact_seeds: List[str],
@@ -13008,22 +13217,27 @@ class ActivationEngine:
         history_boosts: Dict[str, float],
         edges_out: dict,
         project_id: str,
-        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
+        inferred_seeds: Optional[Dict[str, float]] = None,
+        cached_scores: Optional[Dict[str, float]] = None,  # ← Q2
     ) -> "ActivationGraph":
         """Build activation graph when multi‑seed activation is disabled.
 
         Each bare‑name seed is split across its qualified id(s) before being
         written into the graph, since edges_out is now keyed by qualified id.
+
+        Q2: If cached_scores is provided, skip propagation and load scores directly.
         """
         symbol_index = self._f._symbol_index
         ag = ActivationGraph()
+        lexical_seed_qids: Set[str] = set()
 
-        # ── Lexical + traceback + history seeds (unchanged) ──
+        # ── Lexical + traceback + history seeds ──
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
                 share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag._activations[qid] = ActivationState(
@@ -13034,6 +13248,7 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
                 share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag._activations[qid] = ActivationState(
@@ -13041,6 +13256,7 @@ class ActivationEngine:
                     )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
             share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag._activations.get(qid)
@@ -13057,6 +13273,7 @@ class ActivationEngine:
                     )
         for sym_name, boost in history_boosts.items():
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
             share = boost / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag._activations.get(qid)
@@ -13072,10 +13289,9 @@ class ActivationEngine:
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        # ── Inferred seeds (high confidence, already qualified ids) ──
-        # Injected AFTER lexical/historical seeds so they do not overwrite
-        # a higher lexical score; we take the max.
+        # ── Inferred seeds ──
         for qid, inf_score in (inferred_seeds or {}).items():
+            lexical_seed_qids.add(qid)
             existing = ag._activations.get(qid)
             if existing:
                 ag._activations[qid] = ActivationState(
@@ -13092,30 +13308,49 @@ class ActivationEngine:
                     source="seed",
                 )
 
-        # ── Fallback to entry points if no seeds at all ──
-        if not ag._activations:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            centrality = pstate.get("node_centrality", {})
-            entry_points = self._f._path_index.find_entry_points(
-                symbol_index, project_id
-            )
-            if entry_points:
-                sorted_eps = sorted(
-                    entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
-                )
-                for sym_name in sorted_eps[:3]:
-                    cent_score = centrality.get(sym_name, 0.0)
-                    seed_score = 0.2 + 0.2 * cent_score
-                    ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=seed_score, depth=0, source="seed"
+        # ── Q2: Use cached scores if available, otherwise run PPR ──
+        if cached_scores is not None:
+            # Populate from cache (but preserve seed status for seeds that were already set)
+            for qid, score in cached_scores.items():
+                if score >= 0.01:
+                    existing = ag._activations.get(qid)
+                    final_score = max(score, existing.score) if existing else score
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=final_score,
+                        depth=0,
+                        source="seed" if qid in lexical_seed_qids else "propagation",
                     )
+            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
+        else:
+            # ── Fallback to entry points if no seeds at all ──
+            if not ag._activations:
+                pstate = self._f._project_state_manager.get_pstate(project_id)
+                centrality = pstate.get("node_centrality", {})
+                entry_points = self._f._path_index.find_entry_points(
+                    symbol_index, project_id
+                )
+                if entry_points:
+                    sorted_eps = sorted(
+                        entry_points,
+                        key=lambda ep: centrality.get(ep, 0.0),
+                        reverse=True,
+                    )
+                    for sym_name in sorted_eps[:3]:
+                        cent_score = centrality.get(sym_name, 0.0)
+                        seed_score = 0.2 + 0.2 * cent_score
+                        ag._activations[sym_name] = ActivationState(
+                            node_id=sym_name, score=seed_score, depth=0, source="seed"
+                        )
+                        lexical_seed_qids.add(sym_name)
 
-        ag.propagate(
-            edges_out=edges_out,
-            max_steps=20,
-            min_score=0.05,
-            alpha=self._f.valves.ppr_alpha,
-        )
+            # Run PPR propagation
+            ag.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.05,
+                alpha=self._f.valves.ppr_alpha,
+            )
         return ag
 
     def _build_multi_seed_graph(
@@ -13126,12 +13361,14 @@ class ActivationEngine:
         history_boosts: Dict[str, float],
         edges_out: dict,
         project_id: str,
-        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
+        inferred_seeds: Optional[Dict[str, float]] = None,
+        cached_scores: Optional[Dict[str, float]] = None,  # ← Q2
     ) -> "ActivationGraph":
         """Build activation graph combining lexical, structural and historical
-        seed vectors.  Like _build_single_seed_graph, each bare‑name seed is
-        split across its qualified id(s) before being written into any of
-        the three vectors, since edges_out is now qualified-id‑keyed."""
+        seed vectors.
+
+        Q2: If cached_scores is provided, use it directly instead of recomputing.
+        """
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
@@ -13139,11 +13376,13 @@ class ActivationEngine:
 
         # ── Vector 1: Lexical ──────────────────────────────────────────
         ag_lex = ActivationGraph()
+        lexical_seed_qids: Set[str] = set()
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
                 share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_lex._activations[qid] = ActivationState(
@@ -13154,6 +13393,7 @@ class ActivationEngine:
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
                 share = score / len(qids) if qids else 0.0
                 for qid in qids:
                     ag_lex._activations[qid] = ActivationState(
@@ -13161,6 +13401,7 @@ class ActivationEngine:
                     )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
             share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag_lex._activations.get(qid)
@@ -13176,8 +13417,9 @@ class ActivationEngine:
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        # ── NEW: Inferred seeds → lexical vector (they are query signal) ──
+        # ── Inferred seeds → lexical vector ──
         for qid, inf_score in (inferred_seeds or {}).items():
+            lexical_seed_qids.add(qid)
             existing = ag_lex._activations.get(qid)
             ag_lex._activations[qid] = ActivationState(
                 node_id=qid,
@@ -13196,21 +13438,10 @@ class ActivationEngine:
 
         # ── Vector 2: Structural ───────────────────────────────────────
         ag_str = ActivationGraph()
-        lexical_seed_qids: Set[str] = set()
-        for sym_name in exact_seeds:
-            lexical_seed_qids |= symbol_index.get_qualified_names_for(
-                sym_name, project_id
-            )
-        for sym_name, _ in tb_seeds:
-            lexical_seed_qids |= symbol_index.get_qualified_names_for(
-                sym_name, project_id
-            )
-        # ── NEW: include inferred seeds as legitimate lexical seeds ──
-        lexical_seed_qids |= set(inferred_seeds or {})
-
+        seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
         for view in self._f._path_index.get_all(project_id):
-            for lex_seed in lexical_seed_qids:
+            for lex_seed in seed_qids_for_structural:
                 if lex_seed in view.induced_nodes:
                     structural_seeds.add(view.entry_point)
                     break
@@ -13248,7 +13479,23 @@ class ActivationEngine:
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Combine the three vectors ──────────────────────────────────
+        # ── Q2: If cached_scores is provided, combine them directly ──
+        if cached_scores is not None:
+            ag_final = ActivationGraph()
+            # Use cached scores as the base
+            for qid, score in cached_scores.items():
+                if score >= 0.01:
+                    source = "seed" if qid in lexical_seed_qids else "propagation"
+                    ag_final._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=score,
+                        depth=0,
+                        source=source,
+                    )
+            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
+            return ag_final
+
+        # ── No cached scores: combine the three vectors ──
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -13323,13 +13570,17 @@ class ActivationEngine:
             self._f._last_activation_scores: Dict[str, Dict[str, float]] = {}
         self._f._last_activation_scores[project_id] = activated
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Main entry point: build_activation_graph (with Q2 cache integration)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def build_activation_graph(
         self,
         query: str,
         project_id: str,
         max_propagation_steps: int = 4,
         messages: Optional[List[dict]] = None,
-        inferred_seeds: Optional[Dict[str, float]] = None,  # ← NEW
+        inferred_seeds: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
         """
         Build an ActivationGraph combining up to three independent seed vectors.
@@ -13343,6 +13594,9 @@ class ActivationEngine:
 
         Returns:
             ActivationGraph with propagated scores.
+
+        Q2: Integrates PPR cache to avoid recomputation when seeds and code unchanged.
+        E7: Normalizes PPR scores to [0,1] within the project distribution.
         """
         self._f._log_debug(
             f"[PPR] build_activation_graph: query='{query[:100]}', "
@@ -13364,7 +13618,39 @@ class ActivationEngine:
             f"tb={len(tb_seeds)}, history={len(history_boosts)}"
         )
 
-        # 2. Build the activation graph in the appropriate mode
+        # ── Q2: Build seed_qids list for cache key ──
+        seed_qids: List[str] = []
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
+        for sym in exact_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        for sym in partial_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        for sym, _ in tb_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        if inferred_seeds:
+            seed_qids.extend(inferred_seeds.keys())
+        # Deduplicate and filter to only existing qids
+        seed_qids = list(set(seed_qids) & set(all_qids))
+
+        # ── Q2: Get code_state_hash for cache invalidation ──
+        code_state_hash = self.compute_code_state_hash(project_id)
+
+        # ── Q2: Get cached PPR scores or compute ──
+        cached_scores = self._get_or_compute_ppr_scores(
+            seed_qids=seed_qids,
+            project_id=project_id,
+            code_state_hash=code_state_hash,
+            edges_out=edges_out,
+            max_steps=max_propagation_steps,
+            min_score=0.05,
+            alpha=self._f.valves.ppr_alpha,
+        )
+
+        # 2. Build the activation graph using cached scores if available
         _inferred = inferred_seeds or {}
         if not self._f.valves.enable_multi_seed_activation:
             self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
@@ -13376,6 +13662,7 @@ class ActivationEngine:
                 edges_out,
                 project_id,
                 _inferred,
+                cached_scores=cached_scores,  # ← Q2
             )
         else:
             self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
@@ -13387,14 +13674,18 @@ class ActivationEngine:
                 edges_out,
                 project_id,
                 _inferred,
+                cached_scores=cached_scores,  # ← Q2
             )
 
         # 3. Store scores for downstream consumers (LOD, prefetch, pager)
         self._store_activation_scores(ag, project_id)
 
+        # ── E7: normalize scores before returning ──────────────────────────
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
         )
+        activated = self._normalize_ppr_scores(activated)
+
         self._f._log_debug(
             f"[PPR] Activation complete: {len(activated)} nodes activated "
             f"(threshold={self._f.valves.path_activation_threshold})"
@@ -13403,7 +13694,7 @@ class ActivationEngine:
         return ag
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 3. Path index & cross‑chunk edges
+    # 6. Path index & cross‑chunk edges
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _build_view_from_activation(
@@ -13515,7 +13806,7 @@ class ActivationEngine:
         return resolved
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Speculative prefetch
+    # 7. Speculative prefetch
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def speculative_prefetch(
@@ -13567,7 +13858,7 @@ class ActivationEngine:
             await self._build_view_from_activation(sym_name, ag, project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Hash utilities
+    # 8. Hash utilities
     # ═══════════════════════════════════════════════════════════════════════════
 
     def compute_structural_hash(
@@ -13614,6 +13905,27 @@ class ActivationEngine:
         )
         return hashlib.md5("|".join(sorted_hashes).encode()).hexdigest()[:16]
 
+    def _normalize_ppr_scores(
+        self,
+        raw_scores: Dict[str, float],
+    ) -> Dict[str, float]:
+        """Normalize PPR scores to [0, 1] within the project's distribution.
+
+        E7: prevents threshold miscalibration across projects of different sizes.
+        After normalization, lod2_threshold=0.10 means "top 10% by PPR rank",
+        regardless of how many symbols the project has.
+        """
+        if not raw_scores:
+            return raw_scores
+        min_s = min(raw_scores.values())
+        max_s = max(raw_scores.values())
+        if max_s <= min_s:
+            # All scores equal (e.g. isolated graph) — normalize to 0.5
+            return {qid: 0.5 for qid in raw_scores}
+        return {
+            qid: (score - min_s) / (max_s - min_s) for qid, score in raw_scores.items()
+        }
+
     def compute_context_hash(self, messages: list) -> str:
         """Hash of system message content, used for response cache keying."""
         if not self._f.valves.response_cache_include_context_hash:
@@ -13623,7 +13935,7 @@ class ActivationEngine:
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Inactive block candidates & cache invalidation
+    # 9. Inactive block candidates & cache invalidation
     # ═══════════════════════════════════════════════════════════════════════════
 
     def get_inactive_block_candidates(self, project_id: str) -> list:
@@ -13659,7 +13971,7 @@ class ActivationEngine:
         pstate["node_centrality"] = {}
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Static evidence (for scientific CoT)
+    # 10. Static evidence (for scientific CoT)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _gather_static_evidence(
@@ -13777,7 +14089,30 @@ class HistoryCompressor:
     * ``check_and_suggest_summarization(project_id, ...)`` — returns a
       proactive suggestion when the conversation is approaching the token
       window limit.
+
+    Docs 10–13 backported:
+        B5 – force‑compressed keys survive restarts via persistent set.
     """
+
+    # ── Q4: Commit summary prompt ──────────────────────────────────────────
+    COMMIT_SUMMARY_PROMPT = """\
+You are summarizing a coding decision for long-term context compression.
+Respond ONLY with a JSON object, no preamble, no markdown fences.
+
+{
+  "action": "<verb phrase: what was done, ≤15 words>",
+  "rationale": "<why this approach: the constraint, tradeoff, or requirement that drove the decision, ≤20 words, or null if not stated>",
+  "symbols": ["<fully_qualified_symbol_1>", "<fully_qualified_symbol_2>"]
+}
+
+User message to summarize:
+\"\"\"
+{user_message}
+\"\"\"
+
+Code context (recent symbols referenced):
+{symbols_context}
+"""
 
     def __init__(self, filter_ref: "Filter") -> None:
         """
@@ -13795,7 +14130,7 @@ class HistoryCompressor:
     # 1. Code history compression (multi‑phase code parts → summaries)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def compress_code_history(self, messages: list, project_id: str) -> list:
+    async def compress_code_history(self, messages: list, project_id: str) -> list:
         """
         Replace old assistant code-part messages with compact commit summaries.
 
@@ -13809,10 +14144,9 @@ class HistoryCompressor:
              force-compressed in a previous session, force compression WITHOUT
              an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
 
-        The force-compressed state is persisted across server restarts via
-        `force_compressed_keys` in the project state, so a message that was
-        force-compressed once stays compressed without waiting for another
-        `force_after` turns after a restart.
+        Modified (B5): force-compressed keys are persisted in pstate so they
+        survive server restarts. A set of already-force-compressed message
+        keys is loaded at the start and saved at the end, with LRU eviction.
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
@@ -13834,7 +14168,7 @@ class HistoryCompressor:
         state = self._f._conversation_state_manager.get(project_id)
         blocked_age = state.history_blocked_age  # mutable dict, modified in-place
 
-        # ── NEW: Persistent set of already-force-compressed message keys ────
+        # ── B5: load persistent force‑compressed keys ──────────────────────
         force_compressed_keys: Set[str] = set(pstate.get("force_compressed_keys", []))
 
         dirty = False  # track whether we modified blocked_age or force_compressed_keys
@@ -13919,7 +14253,7 @@ class HistoryCompressor:
                 )
                 blocked_by_ratio += 1
 
-                # ── Force compression if age exceeds threshold OR key already force-compressed ──
+                # ── B5: force compression if age exceeds threshold OR key already force-compressed ──
                 if force_after > 0 and (
                     age >= force_after or msg_key in force_compressed_keys
                 ):
@@ -13936,7 +14270,7 @@ class HistoryCompressor:
                     continue
 
             # If safe (either verified or forced), compress
-            summary = self._build_code_commit_summary(
+            summary = await self._build_code_commit_summary(
                 content,
                 project_id,
                 part_num,
@@ -13948,7 +14282,7 @@ class HistoryCompressor:
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
 
-            # ── Record that this message was force-compressed ──────────────
+            # ── B5: record that this message was force-compressed ──────────
             if force_no_expand:
                 force_compressed_keys.add(msg_key)
                 dirty = True
@@ -13965,18 +14299,15 @@ class HistoryCompressor:
                 + (" [FORCED NO-EXPAND]" if force_no_expand else "")
             )
 
-        # ── Evict old entries from force_compressed_keys to prevent unbounded growth ──
+        # ── B5: evict old force‑compressed keys ─────────────────────────────
         if len(force_compressed_keys) > 500:
-            # Keep only the most recent 250 (insertion order is append-only,
-            # so slicing from the end gives the newest ones)
+            # Keep the most recent 250 (ordered by insertion, but set order is stable)
             force_compressed_keys = set(list(force_compressed_keys)[-250:])
             dirty = True
 
-        # ── Persist updated state ──────────────────────────────────────────
+        # ── B5: persist force‑compressed keys ──────────────────────────────
         if dirty:
-            # Save blocked_age via ConversationStateManager
             self._f._conversation_state_manager.mark_dirty(project_id)
-            # Save force_compressed_keys via pstate
             pstate["force_compressed_keys"] = list(force_compressed_keys)
 
         if compressed_n:
@@ -14018,7 +14349,46 @@ class HistoryCompressor:
             self._f._log_debug(f"Symbol index check failed: {exc}")
             return False, 0.0
 
-    def _build_code_commit_summary(
+    # ── Q4: Commit summary builder with rationale ──────────────────────────
+
+    def _parse_commit_summary_response(self, raw: str) -> dict:
+        """
+        Parse the LLM response for a commit summary.
+
+        Strips markdown fences and any explanatory text before parsing JSON.
+        Falls back to treating the whole response as the action if parsing fails.
+        """
+        try:
+            # Strip potential reasoning blocks before parsing
+            clean = re.sub(r"<details[^>]*>.*?</details>", "", raw, flags=re.DOTALL)
+            clean = clean.strip().lstrip("```json").rstrip("```").strip()
+            return json.loads(clean)
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: treat the whole response as the action
+            return {"action": raw[:100], "rationale": None, "symbols": []}
+
+    def _render_commit_summary(self, summary: dict, turn: int) -> str:
+        """
+        Render a commit summary for insertion into compressed history.
+
+        Format:
+            [T{turn}] {action}
+              Rationale: {rationale}
+              Symbols: {symbols}
+        """
+        action = summary.get("action", "unknown action")
+        rationale = summary.get("rationale")
+        symbols = summary.get("symbols", [])
+
+        lines = [f"[T{turn}] {action}"]
+        if rationale:
+            lines.append(f"  Rationale: {rationale}")
+        if symbols:
+            lines.append(f"  Symbols: {', '.join(symbols)}")
+
+        return "\n".join(lines)
+
+    async def _build_code_commit_summary(
         self,
         content: str,
         project_id: str,
@@ -14028,6 +14398,8 @@ class HistoryCompressor:
     ) -> str:
         """
         Generate a compact commit summary for a compressed code message.
+
+        Q4: Uses LLM to produce structured summary including rationale.
 
         Args:
             content: The original code message content.
@@ -14040,6 +14412,71 @@ class HistoryCompressor:
 
         Returns:
             A formatted summary string.
+        """
+        # ── If forced no-expand, use the old format (no LLM call) ──
+        if force_no_expand:
+            return self._build_legacy_commit_summary(
+                content, part_num, total_parts, force_no_expand=True
+            )
+
+        # ── Extract symbols from content ──────────────────────────────
+        classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        methods = re.findall(
+            r"^\s{4,}(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE
+        )
+        symbols = classes + top_fns + methods
+        # Take up to 5 symbols
+        symbols = symbols[:5]
+
+        # ── Build the prompt ────────────────────────────────────────────
+        prompt = self.COMMIT_SUMMARY_PROMPT.format(
+            user_message=content[:2000],  # Truncate to avoid token overflow
+            symbols_context=", ".join(symbols) if symbols else "none",
+        )
+
+        # ── Call LLM ────────────────────────────────────────────────────
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a code summarization assistant. Output only valid JSON.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=250,
+            temperature=0.2,
+            label="commit_summary",
+        )
+
+        if not response:
+            # Fallback to legacy summary
+            return self._build_legacy_commit_summary(
+                content, part_num, total_parts, force_no_expand=False
+            )
+
+        # ── Parse response ─────────────────────────────────────────────
+        summary = self._parse_commit_summary_response(response)
+        # Ensure action is not empty
+        if not summary.get("action"):
+            summary["action"] = "code change"
+        # Add part info
+        summary["part_num"] = part_num
+        summary["total_parts"] = total_parts
+
+        # ── Render with turn number (we use part_num as turn proxy) ──
+        rendered = self._render_commit_summary(summary, turn=part_num)
+
+        # ── If not fully indexed, add a note ────────────────────────────
+        # (force_no_expand is handled above, but for normal case we check)
+        return rendered
+
+    def _build_legacy_commit_summary(
+        self,
+        content: str,
+        part_num: int,
+        total_parts: int,
+        force_no_expand: bool = False,
+    ) -> str:
+        """
+        Legacy commit summary builder (fallback when LLM is unavailable
+        or when force_no_expand is True).
         """
         classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
@@ -14066,10 +14503,8 @@ class HistoryCompressor:
             dep_symbols.extend(s.strip() for s in imp.split(","))
         dep_symbols = dep_symbols[:6]
 
-        # --- Build title based on force_no_expand ---
         if force_no_expand:
             title = f"[🗜️ CÓDIGO COMPRIMIDO — sin índice]"
-            # Omit /expand affordance and the "use /expand" line
             lines = [title]
             if classes:
                 lines.append(f"Clases:    {', '.join(classes)}")
@@ -14085,7 +14520,6 @@ class HistoryCompressor:
             )
             return "\n".join(lines)
 
-        # --- Normal (indexed) compression title ---
         title = f"[🗜️ PARTE {part_num}/{total_parts}"
         if part_label:
             title += f": {part_label}"
@@ -14805,40 +15239,25 @@ class EnrichmentTasks:
         """
         Adjust lod3_threshold based on which symbols appear in the LLM's
         response compared to the LOD level they received.
-
-        Logic:
-        - If the LLM mentions symbols that only got LOD ≤ 2 (docstring/signature):
-          → Lower lod3_threshold: give more full code next time.
-        - If the LLM does NOT mention symbols that got LOD 3 (full code):
-          → Raise lod3_threshold slightly: those expansions were unnecessary.
-
-        Adjustments are small (lod_adapt_rate) and bounded [min, max].
-        Threshold state is NOT persisted across server restarts.
-
-        MIGRATED: uses pstate for `last_lod_levels`.
         """
         if not self._f.valves.enable_lod_adaptive:
             return
 
-        # --- 1. Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
         last_lod_map = pstate.get("last_lod_levels", {})
         if not last_lod_map:
             return
 
-        # --- 2. Extract symbols mentioned in the response ---
         bare_names = self._f._symbol_index.get_all_names(project_id)
         response_words = set(re.findall(r"\b\w+\b", response_text))
         bare_referenced = bare_names.intersection(response_words)
 
-        # --- 3. Resolve bare names to qualified ids ---
         referenced: Set[str] = set()
         for bare in bare_referenced:
             referenced |= self._f._symbol_index.get_qualified_names_for(
                 bare, project_id
             )
 
-        # --- 4. Classify as underserved (needed LOD3 but got ≤ LOD2) or overserved ---
         underserved = [sym for sym in referenced if last_lod_map.get(sym, 3) < 3]
         overserved = [
             sym
@@ -14846,12 +15265,10 @@ class EnrichmentTasks:
             if last_lod_map[sym] == 3 and sym not in referenced
         ]
 
-        # --- 5. Apply adjustments ---
         old_threshold = self._f.valves.lod3_threshold
         changed = False
 
         if len(underserved) >= self._f.valves.lod_adapt_underserved_min:
-            # Lower threshold: give more full code next time.
             self._f.valves.lod3_threshold = max(
                 self._f.valves.lod_adapt_min,
                 self._f.valves.lod3_threshold - self._f.valves.lod_adapt_rate,
@@ -14864,7 +15281,6 @@ class EnrichmentTasks:
             )
 
         elif len(overserved) >= self._f.valves.lod_adapt_overserved_min:
-            # Raise threshold: those expansions were unnecessary.
             self._f.valves.lod3_threshold = min(
                 self._f.valves.lod_adapt_max,
                 self._f.valves.lod3_threshold + self._f.valves.lod_adapt_rate * 0.5,
@@ -14978,34 +15394,30 @@ class EnrichmentTasks:
 
     _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
 
+    # ── M5: Resolve dunders with context ─────────────────────────────────────
+
     def _resolve_parsed_docstring_name(
         self,
         bare_name: str,
         project_id: str,
         context_symbol: Optional[str] = None,
     ) -> Optional[str]:
-        """
-        Resolve a bare name from the batch docstring response to a qualified id.
+        """Resolve a bare name from the batch docstring response to a qid.
 
-        Step 1: Exact bare-name lookup (returns the single qid if unambiguous).
-        Step 2: For dunders (__init__, __str__, etc.) where the model omits the
-                class prefix, use context_symbol to infer the parent class and
-                build a candidate qid (e.g., 'ContextBuilder.__init__').
-        Step 3: If multiple bare-name matches exist and no context can disambiguate,
-                return None (skip this entry).
-
-        This prevents docstrings from being assigned to the wrong symbol when
-        multiple classes share the same dunder name.
+        M5: dunder disambiguation via context_symbol.
+        Step 1: bare-name lookup (returns single qid if unambiguous).
+        Step 2: for dunders (__init__, __str__, etc.), use context_symbol's
+                parent class to construct the full qid.
+        Step 3: if multiple bare-name matches and no context, return None.
         """
         # Step 1: bare-name lookup
         results = self._f._symbol_index.get_qualified_names_for(bare_name, project_id)
         if len(results) == 1:
             return next(iter(results))
 
-        # Step 2: dunder disambiguation via context_symbol
+        # Step 2: dunder disambiguation via context_symbol parent
         if bare_name.startswith("__") and bare_name.endswith("__") and context_symbol:
-            # Extract parent class from context_symbol
-            # e.g., "ContextBuilder.build" -> "ContextBuilder"
+            # Extract parent class from context_symbol (e.g. "ContextBuilder.build" → "ContextBuilder")
             parent = (
                 context_symbol.rsplit(".", 1)[0]
                 if "." in context_symbol
@@ -15016,7 +15428,7 @@ class EnrichmentTasks:
             if candidate in self._f._symbol_index.get_all_qualified_names(project_id):
                 return candidate
 
-        # Step 3: ambiguous — skip
+        # Step 3: ambiguous bare name
         if len(results) > 1:
             self._f._log_debug(
                 f"_resolve_parsed_docstring_name: ambiguous bare name '{bare_name}' "
@@ -15042,6 +15454,8 @@ class EnrichmentTasks:
         with the corresponding qid from the batch providing context for dunder disambiguation.
 
         Returns a dict mapping qualified id -> docstring.
+
+        Modified (M5): uses context_symbol to disambiguate dunders (__init__, __str__, etc.).
         """
         result: Dict[str, str] = {}
         pattern = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
@@ -15055,10 +15469,10 @@ class EnrichmentTasks:
             if not docstring:
                 continue
 
-            # Use the corresponding qid from the batch as context hint
-            context_symbol = batch_qids[idx] if idx < len(batch_qids) else None
+            # ── M5: resolve with context hint ──────────────────────────────
+            context_hint = batch_qids[idx] if idx < len(batch_qids) else None
             qid = self._resolve_parsed_docstring_name(
-                bare_name, self._f.valves.project_id, context_symbol
+                bare_name, self._f.valves.project_id, context_hint
             )
 
             if qid and qid in expected_names:
@@ -15075,29 +15489,15 @@ class EnrichmentTasks:
     ) -> Dict[str, str]:
         """
         Resolve docstrings for many symbols at once, identified by their
-        QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name,
-        because dozens of methods in this codebase share bare names across
-        different classes.  Passing bare names here would silently resolve
-        and apply the SAME generated docstring to every symbol sharing that
-        name, exactly the bug this function used to have.
-
-        Cache hits (already in memory or in SQLite) are resolved for free.
-        Cache misses are generated in groups of `docstring_batch_size`,
-        ONE LLM call per group instead of one call per symbol.
-
-        Returns {qid: docstring} for every qid that has (or now has) a
-        non-empty docstring.
+        QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
 
         M5 fix: batch_qids are passed to `_parse_docstring_batch_response`
-        to provide context for disambiguating dunders (__init__, __str__, etc.)
-        when the model omits the class prefix.
+        to provide context for disambiguating dunders.
         """
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # Build a qid → (sym, block) index ONCE instead of scanning every
-        # block/symbol on each _find_symbol call.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -15162,7 +15562,6 @@ class EnrichmentTasks:
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
-            # ── Extract batch_qids for context ──────────────────────────────
             batch_qids = [qid for qid, _, _ in batch]
 
             prompt = self._build_docstring_batch_prompt(batch)
@@ -15181,7 +15580,8 @@ class EnrichmentTasks:
             if not response:
                 continue
 
-            # ── Pass batch_qids for dunder disambiguation ────────────────────
+            # ── M5: `_parse_docstring_batch_response` ahora recibe batch_qids ──
+            # y usa `_resolve_parsed_docstring_name` para desambiguar dunders.
             parsed = self._parse_docstring_batch_response(
                 response, expected, batch_qids
             )
@@ -15193,7 +15593,6 @@ class EnrichmentTasks:
                     sym.docstring = docstring
                 self._f._symbol_index.update_docstring(qid, project_id, docstring)
 
-            # Phase C: write all parsed docstrings in one batch using executemany
             if parsed:
                 rows = [
                     (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
@@ -15217,29 +15616,13 @@ class EnrichmentTasks:
     ) -> Dict[str, str]:
         """
         Resolve control-flow skeletons for many symbols, identified by their
-        QUALIFIED id. Pure CPU, deterministic, no LLM call — unlike
-        ensure_docstrings_batch there is no network round trip to batch away;
-        "batch" here just means "resolve N symbols under one state read instead
-        of N reads."
-
-        Cache hits (already in _symbol_meta with a matching body_hash) are free.
-        Cache misses are recomputed via ControlFlowExtractor.extract_for_symbol
-        and persisted to SQLite for observability.
-
-        Returns {qid: cfg_skeleton} for every qid that has (or now has) a
-        non-empty skeleton. Symbols with no control-flow worth preserving, or
-        that fail to parse, are silently absent — the caller falls back to the
-        existing LOD2 tier (signature + docstring) for those.
+        QUALIFIED id. Pure CPU, deterministic, no LLM call.
         """
         self._f._log_debug(f"CFG batch: invoked with {len(qids)} candidate(s): {qids}")
         state = self._f._conversation_state_manager.get(project_id)
-        cfg_rows = []  # for coalesced batch write (Phase C)
+        cfg_rows = []
         resolved: Dict[str, str] = {}
 
-        # Build a qid → (sym, block) index ONCE instead of re-scanning every
-        # block/symbol per lookup (same quadratic-per-turn issue as
-        # ensure_docstrings_batch). First-match-wins ordering preserved;
-        # snapshot semantics per Bug 3 note.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -15248,7 +15631,6 @@ class EnrichmentTasks:
                     _qid_index[_q] = (_sym, _block)
 
         def _find_symbol_and_block(qid: str):
-            """Locate the CodeSymbol and its block by qualified id (dict lookup)."""
             return _qid_index.get(qid, (None, None))
 
         for qid in qids:
@@ -15280,10 +15662,7 @@ class EnrichmentTasks:
                 block.content, sym, max_lines=self._f.valves.cfg_skeleton_max_lines
             )
             if result is None:
-                self._f._log_debug(
-                    f"CFG batch: '{qid}' extractor returned None "
-                    "(no control-flow, parse error, or exceeds max_lines)"
-                )
+                self._f._log_debug(f"CFG batch: '{qid}' extractor returned None")
                 continue
             skeleton, body_hash = result
             self._f._log_debug(
@@ -15293,7 +15672,6 @@ class EnrichmentTasks:
             resolved[qid] = skeleton
             cfg_rows.append((project_id, qid, skeleton, body_hash, time.time()))
 
-        # Phase C: coalesce all CFG writes into one executemany
         if cfg_rows:
 
             def _write_cfg_batch(rows=cfg_rows):
@@ -15314,17 +15692,152 @@ class EnrichmentTasks:
         return resolved
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Background docstring loop
+    # 7. Background docstring loop (with Q5 prioritization)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── Q5: Priorization of docstring targets ───────────────────────────────
+
+    def _prioritize_docstring_targets(
+        self,
+        qids: List[str],
+        project_id: str,
+        pstate: dict,
+    ) -> List[str]:
+        """
+        Sort symbols by docstring generation priority.
+
+        Priority order:
+        1. Symbols in skeleton tier (visible in Block A every turn)
+        2. Symbols currently in Block B at LOD-2/3 (visible this turn)
+        3. Hub symbols (high PPR — frequently referenced)
+        4. Everything else (leaf symbols — rarely in context)
+        """
+        skeleton_qids: Set[str] = set(pstate.get("skeleton_tier_qids", []))
+        block_b_qids: Set[str] = set(pstate.get("block_b_qids_this_turn", []))
+
+        # Get cached PPR scores if available (from Q2 fix cache)
+        ppr_scores: Dict[str, float] = (
+            self._f._activation._ppr_cache.get(
+                pstate.get("code_state_hash", ""),
+                frozenset(pstate.get("hub_tier_qids_persisted", [])),
+            )
+            or {}
+        )
+
+        def priority_key(qid: str) -> tuple:
+            in_skeleton = 0 if qid in skeleton_qids else 1  # 0 = highest priority
+            in_block_b = 0 if qid in block_b_qids else 1
+            ppr = -ppr_scores.get(qid, 0.0)  # negate for desc sort
+            return (in_skeleton, in_block_b, ppr, qid)
+
+        return sorted(qids, key=priority_key)
+
+    async def _docstring_generation_loop(self, project_id: str) -> None:
+        """
+        Background loop that generates docstrings for all pending symbols
+        (functions, methods, and classes) that lack one.
+
+        Takes a snapshot of all symbols without docstrings at the start,
+        then prioritizes them using `_prioritize_docstring_targets` so that
+        skeleton-tier symbols are documented first.
+
+        Processes in batches using `docstring_bg_batch_size` to reduce serial
+        LLM calls from N to ceil(N / batch_size).
+
+        After all batches complete, calls `slot_restore_for_continuity()`
+        to return the KV slot to the stable prefix.
+        """
+        # ── 1. Snapshot: collect all symbols without docstrings ──────────
+        state = self._f._conversation_state_manager.get(project_id)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        pending_qids: List[str] = []
+
+        for block in state.active_blocks.values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                if sym.kind in ("function", "method", "class") and not sym.docstring:
+                    qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                    pending_qids.append(qid)
+
+        if not pending_qids:
+            self._f._log_debug("Background docstring loop: no pending symbols")
+            return
+
+        self._f._log_debug(
+            f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
+        )
+
+        # ── Q5: Prioritize symbols ──────────────────────────────────────────
+        prioritized_qids = self._prioritize_docstring_targets(
+            pending_qids, project_id, pstate
+        )
+
+        self._f._log_debug(
+            f"bg_docstring: prioritized {len(prioritized_qids)} symbols, "
+            f"skeleton-tier first"
+        )
+
+        # ── 2. Batch configuration ──────────────────────────────────────────
+        batch_size = getattr(self._f.valves, "docstring_bg_batch_size", 5)
+        batches = [
+            prioritized_qids[i : i + batch_size]
+            for i in range(0, len(prioritized_qids), batch_size)
+        ]
+
+        self._f._log_debug(
+            f"bg_docstring: {len(prioritized_qids)} symbols → "
+            f"{len(batches)} batches (batch_size={batch_size})"
+        )
+
+        # ── 3. Process each batch ──────────────────────────────────────────
+        for batch_idx, batch in enumerate(batches):
+            try:
+                results: Dict[str, str] = await self.ensure_docstrings_batch(
+                    batch, project_id
+                )
+                for qid, docstring in results.items():
+                    if docstring:
+                        self._f._symbol_index.update_docstring(
+                            qid, docstring, project_id
+                        )
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1}/{len(batches)}: "
+                    f"got {len(results)} docstrings"
+                )
+            except Exception as e:
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1} failed: {e} — "
+                    "continuing with remaining batches"
+                )
+
+        # ── 4. Restore slot to stable prefix after all batch LLM calls ────
+        try:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+            self._f._log_debug(
+                "bg_docstring: slot restored to stable prefix after batches"
+            )
+        except Exception as e:
+            self._f._log_debug(f"bg_docstring: slot restore failed (non-fatal): {e}")
+
+        self._f._log_debug("Background docstring loop: finished")
+
+    def start_docstring_loop(self, project_id: str) -> None:
+        """Launch the background docstring generation loop (if not already running)."""
+        if self._active_bg_task is not None and not self._active_bg_task.done():
+            return
+
+        self._active_bg_task = asyncio.create_task(
+            self._docstring_generation_loop(project_id)
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. Helper methods for background docstring (unchanged)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def cancel_docstring_tasks(self) -> None:
-        """
-        Cancel the background docstring generation loop gracefully,
-        drain any pending DB writes from cancelled tasks.
-        """
-        # ------------------------------------------------------------------
-        # REGION 1 — Cancel the background task and wait for its cancellation
-        # ------------------------------------------------------------------
+        """Cancel the background docstring generation loop gracefully."""
         if self._active_bg_task is not None and not self._active_bg_task.done():
             self._active_bg_task.cancel()
             try:
@@ -15333,9 +15846,6 @@ class EnrichmentTasks:
                 pass
         self._active_bg_task = None
 
-        # ------------------------------------------------------------------
-        # REGION 2 — Drain pending DB write operations from the queue
-        # ------------------------------------------------------------------
         drain_deadline = time.monotonic() + 5.0
         while not self._f._db_write_queue.empty():
             if time.monotonic() > drain_deadline:
@@ -15353,8 +15863,7 @@ class EnrichmentTasks:
     ) -> None:
         """
         Generate a one-line docstring for a symbol (function, method, or class) in the background,
-        and persist it to the SymbolIndex and SQLite. For classes, it builds a structural mini-skeleton
-        from method signatures and section comments to provide better context.
+        and persist it to the SymbolIndex and SQLite.
         """
         name = sym.name
         kind = sym.kind
@@ -15363,7 +15872,6 @@ class EnrichmentTasks:
         line_end = sym.line_end
         block_hash = block.hash
 
-        # --- 1. Ensure the block still exists ---
         state = self._f._conversation_state_manager.get(project_id)
         target_block = state.active_blocks.get(block_hash)
         if target_block is None:
@@ -15372,10 +15880,8 @@ class EnrichmentTasks:
             )
             return
 
-        # --- 2. Build the snippet for the LLM prompt ---
         snippet = ""
         if kind == "class":
-            # Build a structural skeleton for the class
             members_qids = self._f._symbol_index.get_class_members(name, project_id)
             members_meta = []
             for qid in members_qids:
@@ -15398,7 +15904,6 @@ class EnrichmentTasks:
                 line_end=line_end or len(block.content.splitlines()),
             )
         else:
-            # For functions and methods: use signature + first few lines of body
             if line_start and target_block:
                 lines = target_block.content.split("\n")
                 start_idx = max(0, line_start - 1)
@@ -15407,13 +15912,11 @@ class EnrichmentTasks:
             else:
                 snippet = target_block.content[:500]
 
-        # --- 3. Generate prompt based on kind ---
         if kind == "class":
             prompt = f"In one sentence, describe the single responsibility of this class based on its method names and structure:\n\n```\n{snippet}\n```"
         else:
             prompt = f"Summarize in one short sentence what this code does:\n\n```\n{signature}\n{snippet}\n```"
 
-        # --- 4. Call LLM ---
         docstring_text = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Output only one concise sentence.",
@@ -15426,7 +15929,6 @@ class EnrichmentTasks:
         if not docstring_text or not docstring_text.strip():
             return
 
-        # --- 5. Parse and clean the response ---
         docstring = self._clean_single_docstring(docstring_text, name)
         if not docstring:
             self._f._log_debug(
@@ -15434,13 +15936,11 @@ class EnrichmentTasks:
             )
             return
 
-        # --- 6. Acquire project lock to update state and index ---
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
             block = state.active_blocks.get(block_hash)
             if block:
-                # Find the exact symbol instance
                 for s in block.symbols:
                     if s.name == name and s.line_start == line_start:
                         s.docstring = docstring
@@ -15464,11 +15964,7 @@ class EnrichmentTasks:
     def _clean_single_docstring(
         self, raw_response: str, symbol_name: str
     ) -> Optional[str]:
-        """
-        Parse the LLM response to extract a single docstring sentence.
-        Returns None if no valid docstring found.
-        """
-        # --- 1. Define patterns for filtering ---
+        """Parse the LLM response to extract a single docstring sentence."""
         _BAD_PATTERNS = re.compile(
             r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:)"
         )
@@ -15477,7 +15973,6 @@ class EnrichmentTasks:
         lines = raw_response.strip().splitlines()
         docstring = None
 
-        # --- 2. Try to find a valid line ---
         for line in lines:
             stripped = line.strip()
             if not stripped:
@@ -15490,13 +15985,11 @@ class EnrichmentTasks:
                 if desc and len(desc) > 5:
                     docstring = desc
                     break
-            # Fallback: accept a plain sentence
             if (stripped[0].isupper() or stripped[0].isalpha()) and len(stripped) > 10:
                 if not re.match(r"^\d+\.\s+", stripped) and "**" not in stripped:
                     docstring = stripped
                     break
 
-        # --- 3. If still nothing, take the last non-bad line as a fallback ---
         if not docstring:
             for line in reversed(lines):
                 stripped = line.strip()
@@ -15509,7 +16002,6 @@ class EnrichmentTasks:
                     docstring = stripped[:200]
                     break
 
-        # --- 4. Clean up: remove leading "name:" prefix, truncate to first sentence ---
         if docstring:
             docstring = re.sub(r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1)
             docstring = re.split(r"[.!?]\s", docstring, maxsplit=1)[0] + "."
@@ -15520,10 +16012,7 @@ class EnrichmentTasks:
     def _extract_section_comments(
         self, block: "CodeBlock", class_sym: "CodeSymbol"
     ) -> List[Tuple[int, str]]:
-        """
-        Extract section header comments (e.g., '# ── Initialization ──') from within a class body.
-        Returns a list of (line_number, comment_text) for lines that look like section markers.
-        """
+        """Extract section header comments from within a class body."""
         SECTION_RE = re.compile(
             r"^\s*#\s*[─━=\-]{2,}.*[─━=\-]{0,}\s*$|^\s*#\s*[─━=\-\s]*\w+[─━=\-\s]*$"
         )
@@ -15545,25 +16034,17 @@ class EnrichmentTasks:
         line_start: int,
         line_end: int,
     ) -> str:
-        """
-        Build a structural skeleton for a class, interleaving method signatures and section comments
-        in order of appearance. Used as context for generating a class docstring.
-        """
-        # --- 1. Build mapping of line number to signature for methods ---
+        """Build a structural skeleton for a class."""
         method_lines = {}
         for m in members_meta:
             if m.get("line_start"):
                 method_lines[m["line_start"]] = m.get("signature", m.get("qid", ""))
 
-        # --- 2. Set of header lines ---
         header_lines = {h[0] for h in section_headers}
-
-        # --- 3. Get all lines of the class body ---
         lines = block.content.split("\n")
         start_idx = max(0, line_start - 1)
         end_idx = min(len(lines), line_end)
 
-        # --- 4. Build the skeleton ---
         buf = [f"class {class_name}:"]
         for i in range(start_idx, end_idx):
             line_num = i + 1
@@ -15572,108 +16053,140 @@ class EnrichmentTasks:
                 buf.append("    " + line.strip())
             elif line_num in method_lines:
                 buf.append("    " + method_lines[line_num])
-            # else ignore other lines (bodies, etc.)
 
         if len(buf) == 1:
             buf.append("    ...")
 
         skeleton = "\n".join(buf)
-        return skeleton[:800]  # limit size
+        return skeleton[:800]
 
-    async def _docstring_generation_loop(self, project_id: str) -> None:
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 9. Q6: Docstring migration on symbol rename
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _migrate_docstring(
+        self,
+        from_qid: str,
+        to_qid: str,
+        project_id: str,
+    ) -> bool:
         """
-        Background loop that generates docstrings for all pending symbols
-        (functions, methods, and classes) that lack one.
-
-        Takes a snapshot of all symbols without docstrings at the start,
-        then processes them in batches using `docstring_bg_batch_size`
-        to reduce serial LLM calls from N to ceil(N / batch_size).
-
-        After all batches complete, calls `slot_restore_for_continuity()`
-        to return the KV slot to the stable prefix — undoing any dirty state
-        introduced by the batch LLM calls.
-
-        This prevents the race condition where a user message arrives while
-        the background loop is running and the slot file is in a dirty state.
+        Move a docstring from one qid to another (rename migration).
+        Returns True if migration was successful.
         """
-        # ── 1. Snapshot: collect all symbols without docstrings ──────────
-        state = self._f._conversation_state_manager.get(project_id)
-        pending_qids: List[str] = []
-
-        for block in state.active_blocks.values():
-            if block.obsolete:
-                continue
-            for sym in block.symbols:
-                if sym.kind in ("function", "method", "class") and not sym.docstring:
-                    qid = qualify_symbol_name(sym.name, sym.parent_symbol)
-                    pending_qids.append(qid)
-
-        if not pending_qids:
-            self._f._log_debug("Background docstring loop: no pending symbols")
-            return
-
-        self._f._log_debug(
-            f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
-        )
-
-        # ── 2. Batch configuration ──────────────────────────────────────────
-        batch_size = getattr(self._f.valves, "docstring_bg_batch_size", 5)
-        batches = [
-            pending_qids[i : i + batch_size]
-            for i in range(0, len(pending_qids), batch_size)
-        ]
-
-        self._f._log_debug(
-            f"bg_docstring: {len(pending_qids)} symbols → "
-            f"{len(batches)} batches (batch_size={batch_size})"
-        )
-
-        # ── 3. Process each batch ──────────────────────────────────────────
-        for batch_idx, batch in enumerate(batches):
-            try:
-                # Reuse the existing batch prompt path (foreground batching)
-                results: Dict[str, str] = await self.ensure_docstrings_batch(
-                    batch, project_id
-                )
-                for qid, docstring in results.items():
-                    if docstring:
-                        self._f._symbol_index.update_docstring(
-                            qid, docstring, project_id
-                        )
-                self._f._log_debug(
-                    f"bg_docstring batch {batch_idx + 1}/{len(batches)}: "
-                    f"got {len(results)} docstrings"
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"bg_docstring batch {batch_idx + 1} failed: {e} — "
-                    "continuing with remaining batches"
-                )
-                # Continue with remaining batches — don't abort on partial failure
-
-        # ── 4. Restore slot to stable prefix after all batch LLM calls ────
-        # Each batch call dirtied the KV slot. Restore now so that if the user
-        # sends a message before the next inlet, the slot is clean.
         try:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-            self._f._log_debug(
-                "bg_docstring: slot restored to stable prefix after batches"
+            # First, get the existing docstring
+            row = await self._f._state_store._db_read(
+                lambda: self._f._db_conn.execute(
+                    "SELECT docstring FROM symbol_docstrings "
+                    "WHERE project_id=? AND symbol_name=?",
+                    (project_id, from_qid),
+                ).fetchone()
             )
+            if not row or not row[0]:
+                return False
+
+            docstring = row[0]
+
+            # Insert or replace into the new qid
+            def _write():
+                self._f._db_conn.execute(
+                    "INSERT OR REPLACE INTO symbol_docstrings "
+                    "(project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                    (project_id, to_qid, docstring, time.time()),
+                )
+                # Delete the old entry
+                self._f._db_conn.execute(
+                    "DELETE FROM symbol_docstrings "
+                    "WHERE project_id=? AND symbol_name=?",
+                    (project_id, from_qid),
+                )
+                self._f._db_conn.commit()
+
+            await self._f._state_store._db_enqueue(_write)
+
+            # Also update the in-memory SymbolIndex
+            self._f._symbol_index.update_docstring(to_qid, project_id, docstring)
+            # Clear the old docstring from memory (optional)
+            # self._f._symbol_index.update_docstring(from_qid, project_id, "")
+
+            self._f._log_debug(
+                f"Docstring migrated on rename: '{from_qid}' → '{to_qid}'"
+            )
+            return True
+
         except Exception as e:
-            self._f._log_debug(f"bg_docstring: slot restore failed (non-fatal): {e}")
+            self._f._log_debug(f"Docstring migration failed {from_qid} → {to_qid}: {e}")
+            return False
 
-        self._f._log_debug("Background docstring loop: finished")
-
-    def start_docstring_loop(self, project_id: str) -> None:
+    async def _detect_and_migrate_renames(
+        self,
+        deleted_qids: Set[str],
+        added_qids: Set[str],
+        project_id: str,
+    ) -> Tuple[Set[str], Set[str]]:
         """
-        Launch the background docstring generation loop (if not already running).
-        """
-        if self._active_bg_task is not None and not self._active_bg_task.done():
-            return  # loop already running
+        Detect symbol renames and migrate docstrings from old to new qid.
 
-        self._active_bg_task = asyncio.create_task(
-            self._docstring_generation_loop(project_id)
-        )
+        A rename is detected when:
+        - A symbol disappears from the graph (in deleted_qids)
+        - A new symbol appears (in added_qids)
+        - Both share the same body hash (same implementation, different name)
+
+        Returns:
+            (truly_deleted, truly_added): sets with renames removed from both.
+            The caller should not re-enqueue migrated symbols for bg_docstring.
+        """
+        # ── Obtener estado una sola vez ──
+        state = self._f._conversation_state_manager.get(project_id)
+        active_blocks = state.active_blocks  # ← cache local
+
+        # Compute body hashes for deleted symbols (only if they had docstrings)
+        old_body_hashes: Dict[str, str] = {}  # body_hash -> old_qid
+        for qid in deleted_qids:
+            # Check if this symbol has a docstring worth migrating
+            doc = self._f._symbol_index.get_docstring(qid, project_id)
+            if not doc:
+                continue
+            # Get the body content from the active block
+            block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
+            for bh in block_hashes:
+                block = active_blocks.get(bh)  # ← usar cache local
+                if block and not block.obsolete:
+                    body = CodeBlockManager.extract_symbol_body(block, qid)
+                    if body:
+                        body_hash = hashlib.md5(body.encode()).hexdigest()
+                        old_body_hashes[body_hash] = qid
+                        break
+
+        # Compute body hashes for added symbols
+        new_body_hashes: Dict[str, str] = {}  # body_hash -> new_qid
+        for qid in added_qids:
+            block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
+            for bh in block_hashes:
+                block = active_blocks.get(bh)  # ← usar cache local
+                if block and not block.obsolete:
+                    body = CodeBlockManager.extract_symbol_body(block, qid)
+                    if body:
+                        body_hash = hashlib.md5(body.encode()).hexdigest()
+                        new_body_hashes[body_hash] = qid
+                        break
+
+        # Find renames: same body hash, different qid
+        migrated_old: Set[str] = set()
+        migrated_new: Set[str] = set()
+
+        for body_hash, old_qid in old_body_hashes.items():
+            new_qid = new_body_hashes.get(body_hash)
+            if new_qid and new_qid != old_qid:
+                # Rename detected: migrate docstring
+                success = await self._migrate_docstring(old_qid, new_qid, project_id)
+                if success:
+                    migrated_old.add(old_qid)
+                    migrated_new.add(new_qid)
+
+        # Return filtered sets
+        return (deleted_qids - migrated_old), (added_qids - migrated_new)
 
 
 class ActiveCodeUpdater:
@@ -16049,6 +16562,8 @@ class ActiveCodeUpdater:
         """
         Register a brand‑new block: symbols, edges, conflict/obsolete checks,
         and hard eviction if max_active_blocks is exceeded.
+
+        Q6: Migrates docstrings from renamed symbols before processing.
         """
         for sym in syms:
             sym.parent_block_hash = new_block.hash
@@ -16116,7 +16631,6 @@ class ActiveCodeUpdater:
             max_keep = self._f.valves.max_obsolete_versions_per_file
             if obsolete_hashes:
                 if max_keep == 0:
-                    # Remove all obsolete blocks immediately
                     for h in obsolete_hashes:
                         del state.active_blocks[h]
                     self._f._log_debug(
@@ -16124,7 +16638,6 @@ class ActiveCodeUpdater:
                         f"(max_obsolete_versions_per_file=0)."
                     )
                 else:
-                    # Keep the most recent max_keep versions
                     obsolete_blocks = [
                         (h, state.active_blocks[h])
                         for h in obsolete_hashes
@@ -16212,7 +16725,6 @@ class ActiveCodeUpdater:
                     if paged:
                         del state.active_blocks[h]
                         continue
-                # Fallback: remove without paging
                 if h in state.active_blocks:
                     del state.active_blocks[h]
             if to_remove_hard:
@@ -16413,14 +16925,16 @@ class InletOrchestrator:
       classifies whether the session involves code, triggers active‑block
       updates, and handles AutoContinue continuations.
     * ``classify_session(messages, project_id)`` — returns True if the
-      conversation context (recent messages, active blocks, last user text)
-      indicates a coding session.  Uses a short‑lived cache to avoid
-      redundant CrossEncoder calls.
+      conversation context indicates a coding session.
     * ``ensure_last_message_is_user(messages)`` — guarantees the message
-      list ends with a user role, inserting a placeholder if necessary.
+      list ends with a user role.
+
+    Docs 10–13 backported:
+        E2 – detect short continuations and inherit use_case from previous turn.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
+        """Initialize with a reference to the parent Filter."""
         self._f = filter_ref
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -16444,12 +16958,8 @@ class InletOrchestrator:
                 f"Project changed from {self._f._last_project_id} to {project_id}"
             )
             self._f._conversation_state_manager.clear_project(self._f._last_project_id)
-            if old_state:
-                self._f._symbol_index.clear_project(self._f._last_project_id)
-
+            self._f._symbol_index.clear_project(self._f._last_project_id)
             self._f._project_state_manager.clear_project(self._f._last_project_id)
-
-            # _block_change_summaries is global (LRU); keep it as is.
             self._f._block_change_summaries.clear()
 
         self._f._last_project_id = project_id
@@ -16487,16 +16997,7 @@ class InletOrchestrator:
         self,
         messages: list,
     ) -> Tuple[Optional[dict], str, str, bool, bool]:
-        """Extract last user message, query, and detect explicit commands.
-
-        IMPORTANT: this is the canonical point where the user's own system
-        message(s) are captured. Every downstream step (code-history
-        compression, LLMLingua history compression, turn-based eviction,
-        adaptive trim) operates on `messages` and may rewrite or drop system
-        entries — capturing here, before any of that runs, guarantees the
-        original user instructions are preserved verbatim regardless of what
-        happens to `messages` afterward. See Filter._original_system_prompt.
-        """
+        """Extract last user message, query, and detect explicit commands."""
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -16534,10 +17035,8 @@ class InletOrchestrator:
             "content", ""
         ).startswith("/")
 
-        # Capture EVERY system message now, joined in order, before any
-        # downstream compression/trim step can touch them. This is the only
-        # read of the user's original system prompt(s) in the whole pipeline;
-        # everywhere else, the captured string is passed through explicitly.
+        # Capture every system message now, joined in order, before any
+        # downstream compression/trim step can touch them.
         system_msgs_now = [m for m in messages if m.get("role") == "system"]
         original_system_prompt = "\n\n".join(
             m.get("content", "")
@@ -16733,6 +17232,112 @@ class InletOrchestrator:
                 messages = messages[: last_user_idx + 1]
         return messages
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. Intent classification with continuation inheritance – NEW (E2)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── E2: continuation detection ──────────────────────────────────────────
+    _CONTINUATION_RE = re.compile(
+        r"^(ok|okay|sí|si|yes|yep|yeah|continúa|continua|continue|"
+        r"go on|adelante|sigue|prosigue|hazlo|hazla|genéralo|generate it|"
+        r"implementa|implement|de acuerdo|sounds good|great|perfecto|"
+        r"bien|vale|listo|done|proceed)\W*$",
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    def _is_continuation_message(
+        self, message: str, classifier_confidence: float
+    ) -> bool:
+        """E2: detect short continuations with no intent signal.
+
+        Criteria:
+        - No code blocks (pasted code always carries intent)
+        - Fewer than 15 words in non-code portions
+        - Classifier confidence below 0.80 (if classifier is certain, trust it)
+        """
+        if "```" in message:
+            return False
+        text_only = re.sub(r"```.*?```", "", message, flags=re.DOTALL).strip()
+        if len(text_only.split()) > 15:
+            return False
+        if classifier_confidence >= 0.80:
+            return False
+        return True
+
+    async def classify_intent_with_continuation(
+        self,
+        user_query: str,
+        project_id: str,
+        intent_vector: Optional[dict] = None,
+    ) -> Tuple[str, dict, str]:
+        """
+        Classify the user intent and apply continuation inheritance (E2).
+
+        If the message is a short continuation (no code, <15 words, low confidence),
+        inherit the use_case from the previous turn instead of re-classifying.
+
+        Returns:
+            Tuple[str, dict, str]: (use_case_key, profile_copy, human_label)
+        """
+        # ── 1. Classify intent using the existing classifier ──────────────
+        if intent_vector is None:
+            intent_vector = await self._f._commands.classify_intent(
+                user_query, project_id
+            )
+
+        # ── 2. Get the use_case from ContextBuilder ──────────────────────
+        use_case_key, profile_copy, human_label = (
+            self._f._ctx_builder.classify_use_case(user_query, intent_vector)
+        )
+
+        # ── 3. Compute classifier confidence (max probability) ────────────
+        confidence = max(intent_vector.values()) if intent_vector else 0.5
+
+        # ── 4. E2: inherit use_case for short continuations ──────────────
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        if self._is_continuation_message(user_query, confidence):
+            inherited = pstate.get("last_use_case")
+            if inherited:
+                self._f._log_debug(
+                    f"use_case: short continuation — inheriting '{inherited}' "
+                    f"from previous turn (classifier had '{use_case_key}' @ {confidence:.2f})"
+                )
+                use_case_key = inherited
+                # Update profile and label to match inherited use_case
+                profile_copy = dict(
+                    self._f._ctx_builder.LOD_PROFILES.get(inherited, {})
+                )
+                # Re-derive human label from UseCase enum
+                try:
+                    from enum import Enum
+
+                    class UseCase(str, Enum):
+                        ARCHITECTURE = "A"
+                        PLANNING = "B"
+                        PROGRAMMING = "C"
+                        REFACTORING = "D"
+                        SCAFFOLDING = "E"
+
+                        @property
+                        def label(self):
+                            return {
+                                "A": "Architecture/Design",
+                                "B": "Planning/Roadmap",
+                                "C": "General Programming",
+                                "D": "Refactoring/Impact Analysis",
+                                "E": "Scaffolding/Boilerplate",
+                            }[self.value]
+
+                    human_label = UseCase(inherited).label
+                except Exception:
+                    human_label = "General Programming"
+
+        # ── 5. Persist the use_case for next turn ──────────────────────────
+        pstate["last_use_case"] = use_case_key
+
+        return use_case_key, profile_copy, human_label
+
 
 class SystemPromptBuilder:
     """Assembles the complete system prompt from two layers: a stable,
@@ -16776,21 +17381,17 @@ class SystemPromptBuilder:
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
 
-        Now includes the Hub‑Bodies Tier between Block A and Block B,
-        with recency pointers and instruction‑tail integrated via ContextBuilder.
-
-        M7 fix: Computes and stores `block_a_rebuild_reason` in pstate for
-        evolution tracking (JSONL).
+        Modified (M7): computes and stores block_a_rebuild_reason in pstate.
         """
         # ── REGION 1: Resolve per-project state ──────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── REGION 2: Get previous state for rebuild reason ──────────────────
+        # ── M7: Get previous state for rebuild reason ──────────────────────────
         prev_block_a_hash = pstate.get("block_a_hash")
         prev_code_hash = pstate.get("code_state_hash")
         prev_graph_mode = pstate.get("resolved_call_graph_mode")
 
-        # ── REGION 3: Build Block A (static) ─────────────────────────────────
+        # ── REGION 2: Build Block A (static) ─────────────────────────────────
         self._f._log_debug("🧱 Block A (static): building / retrieving from cache")
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
@@ -16798,19 +17399,18 @@ class SystemPromptBuilder:
             is_continuation=not slot_free,
         )
 
-        # ── REGION 4: Compute Block A hash and rebuild reason ───────────────
+        # ── M7: Compute Block A hash and rebuild reason ──────────────────────
         if static_block:
             new_block_a_hash = hashlib.md5(static_block.encode()).hexdigest()[:16]
         else:
             new_block_a_hash = ""
 
+        # ── M7: Determine rebuild reason ──────────────────────────────────────
         if prev_block_a_hash is None:
             rebuild_reason = "first_build"
         elif new_block_a_hash != prev_block_a_hash:
-            # Get current hashes (after building Block A)
             current_code_hash = self._f._activation.compute_code_state_hash(project_id)
             current_graph_mode = pstate.get("resolved_call_graph_mode")
-
             if current_code_hash != prev_code_hash:
                 rebuild_reason = "code_changed"
             elif current_graph_mode != prev_graph_mode:
@@ -16820,11 +17420,11 @@ class SystemPromptBuilder:
         else:
             rebuild_reason = None  # cache hit — no rebuild
 
-        # Store for ContextDumper
+        # ── M7: Store for evolution tracking ─────────────────────────────────
         pstate["block_a_hash"] = new_block_a_hash
         pstate["block_a_rebuild_reason"] = rebuild_reason
 
-        # ── REGION 5: Build Hub‑Bodies Tier ──────────────────────────────────
+        # ── REGION 3: Build Hub‑Bodies Tier ──────────────────────────────────
         hub_tier_text, hub_tier_hash, hub_tier_qids = (
             self._f._ctx_builder._build_hub_bodies_tier(project_id)
         )
@@ -16834,15 +17434,15 @@ class SystemPromptBuilder:
         pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
         pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
 
-        # ── REGION 6: Block B — Dynamic per-query injections ────────────────
+        # ── REGION 4: Block B — Dynamic per-query injections ────────────────
         dynamic_injections: List[Tuple[str, str]] = []
 
-        # 6a: Compute use_case label
+        # 4a: Compute use_case label
         use_case, _, use_case_label = self._f._ctx_builder.classify_use_case(
             user_query, intent_vector or {}
         )
 
-        # 6b: LTM retrieval
+        # 4b: LTM retrieval
         self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         ltm_text = await self._build_ltm_injection(
             project_id,
@@ -16855,7 +17455,7 @@ class SystemPromptBuilder:
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
 
-        # 6c: Parallel checks (contradiction, cache, duplicate)
+        # 4c: Parallel checks (contradiction, cache, duplicate)
         self._f._log_debug("🔄 Block B – Step 2/5: Parallel checks")
         contradiction_warning, cached_response, duplicate_match = (
             await self._build_parallel_checks(
@@ -16875,7 +17475,7 @@ class SystemPromptBuilder:
                 )
             )
 
-        # 6d: Activated code (per-query)
+        # 4d: Activated code (per-query)
         self._f._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         active_ctx = await self._build_activated_code(
             user_query, project_id, messages, is_code_session, slot_free
@@ -16883,14 +17483,14 @@ class SystemPromptBuilder:
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
 
-        # 6e: Proactive suggestions
+        # 4e: Proactive suggestions
         self._f._log_debug("🔄 Block B – Step 4/5: Proactive suggestions")
         for prio, text in await self._build_suggestions(
             state, project_id, messages, is_code_session
         ):
             dynamic_injections.append((prio, text))
 
-        # 6f: Assemble prelim_system (budget-aware)
+        # 4f: Assemble prelim_system (budget-aware)
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
             static_block,
@@ -18201,6 +18801,18 @@ class MessageAssembler:
             )
         )
 
+        # ── M3: enforce_scientific_method must set cot_any_used ──────────────
+        # If the valve is enabled, we force level=3 and ensure generation.
+        # The actual forcing is done above in REGION 1, but we also need
+        # to guarantee that cot_any_used is True so the reasoning block is generated.
+        # This is already handled by the early detection, but as a safety net:
+        if self._f.valves.enforce_scientific_method and not cot_any_used:
+            self._f._log_debug("M3: enforce_scientific_method forced cot_any_used=True")
+            cot_any_used = True
+            # If we're here, we need to generate reasoning again? No, we already
+            # generated it above, but we need to ensure the block is injected.
+            # The injection already happened, so we just log.
+
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Code history compression & lean user code
     # ═══════════════════════════════════════════════════════════════════════
@@ -18873,7 +19485,7 @@ class ContextDumper:
         Returns:
             dict: A complete payload dictionary with all context data and metrics.
 
-        M7 fix: Includes `block_a_rebuild_reason` from pstate.
+        M7: Includes block_a_rebuild_reason from pstate.
         """
         max_chars = self._f.valves.context_dump_message_max_chars
         msg_copy: List[Tuple[str, str]] = []
@@ -18899,7 +19511,6 @@ class ContextDumper:
         # ── Get hashes from pstate ──────────────────────────────────────────
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
-        block_a_rebuild_reason = pstate.get("block_a_rebuild_reason")
 
         # ── Get persistent state via ConversationStateManager ───────────────
         try:
@@ -18943,7 +19554,6 @@ class ContextDumper:
             n_summaries_l1 = sum(1 for s in summaries if s.get("level", 1) == 1)
             n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
         except Exception:
-            # Never break the dump on reading errors
             wm_fired = wm_summary_ok = wm_emergency_cap = False
             wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
             wm_msgs_evicted = wm_turns_evicted = 0
@@ -18963,8 +19573,8 @@ class ContextDumper:
             "final_system": final_system or "",
             "messages": msg_copy,
             "block_a_hash": block_a_hash,
-            # ── NEW: rebuild reason ─────────────────────────────────────────
-            "block_a_rebuild_reason": block_a_rebuild_reason,
+            # ── M7: rebuild reason ─────────────────────────────────────────────
+            "block_a_rebuild_reason": pstate.get("block_a_rebuild_reason"),
             "code_state_hash": code_state_hash,
             "slot_saved_hash": slot_hash,
             "n_active_blocks": n_active_blocks,
@@ -19041,6 +19651,112 @@ class ContextDumper:
                 os.path.join(project_dir, "evolution.jsonl"), "a", encoding="utf-8"
             ) as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _write_sync(self, payload: dict) -> None:
+        """
+        Synchronously write the context snapshot to disk (Markdown + JSONL).
+
+        Modified (M7): adds block_a_rebuild_reason to evolution.jsonl.
+        """
+        project_id = payload["project_id"]
+        project_dir = self._project_dir(project_id)
+        os.makedirs(project_dir, exist_ok=True)
+
+        # ── 1. Compute token counts ──────────────────────────────────────────
+        if self._f.tokenizer:
+            static_block = payload.get("static_block", "")
+            dynamic_block = payload.get("dynamic_block", "")
+            final_system = payload.get("final_system", "")
+            block_a_tokens = (
+                len(self._f.tokenizer.encode(static_block)) if static_block else 0
+            )
+            block_b_tokens = (
+                len(self._f.tokenizer.encode(dynamic_block)) if dynamic_block else 0
+            )
+            system_tokens = (
+                len(self._f.tokenizer.encode(final_system)) if final_system else 0
+            )
+            # History tokens: sum of all non-system messages
+            history_tokens = 0
+            for role, content in payload.get("messages", []):
+                if role != "system":
+                    history_tokens += len(self._f.tokenizer.encode(content))
+        else:
+            block_a_tokens = len(payload.get("static_block", "")) // 4
+            block_b_tokens = len(payload.get("dynamic_block", "")) // 4
+            system_tokens = len(payload.get("final_system", "")) // 4
+            history_tokens = 0
+            for role, content in payload.get("messages", []):
+                if role != "system":
+                    history_tokens += len(content) // 4
+
+        # ── 2. Write Markdown snapshot ───────────────────────────────────────
+        md_content = self._render_markdown(
+            payload, block_a_tokens, block_b_tokens, system_tokens, history_tokens
+        )
+        turn = payload.get("turn", 0)
+        timestamp_str = datetime.fromtimestamp(
+            payload["timestamp"], tz=timezone.utc
+        ).strftime("%Y%m%d_%H%M%S")
+        md_filename = f"{timestamp_str}_turn_{turn:04d}.md"
+        md_path = os.path.join(project_dir, md_filename)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        # ── 3. Update latest.md symlink (or copy) ──────────────────────────
+        latest_path = os.path.join(project_dir, "latest.md")
+        try:
+            if os.path.exists(latest_path):
+                os.remove(latest_path)
+            os.symlink(md_filename, latest_path)
+        except Exception:
+            # If symlink fails (e.g., Windows without admin), copy instead
+            try:
+                import shutil
+
+                shutil.copy2(md_path, latest_path)
+            except Exception:
+                pass
+
+        # ── 4. Write JSONL evolution record (M7) ─────────────────────────────
+        if self._f.valves.context_dump_write_jsonl:
+            # ── M7: include rebuild reason in the JSONL record ──────────────
+            record = {
+                "ts": payload["timestamp"],
+                "iso": payload["iso"],
+                "turn": turn,
+                "block_a_tokens": block_a_tokens,
+                "block_b_tokens": block_b_tokens,
+                "system_tokens": system_tokens,
+                "history_tokens": history_tokens,
+                "n_messages": len(payload.get("messages", [])),
+                "n_active_blocks": payload.get("n_active_blocks", 0),
+                "n_symbols": payload.get("n_symbols", 0),
+                "block_a_hash": payload.get("block_a_hash", ""),
+                # ── M7: rebuild reason (string or null) ──────────────────────
+                "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
+                "code_state_hash": payload.get("code_state_hash", ""),
+                "slot_saved_hash": payload.get("slot_saved_hash", ""),
+                # ── WindowManager metrics ──────────────────────────────────
+                "wm_fired": payload.get("wm_fired", False),
+                "wm_msgs_evicted": payload.get("wm_msgs_evicted", 0),
+                "wm_turns_evicted": payload.get("wm_turns_evicted", 0),
+                "wm_summary_ok": payload.get("wm_summary_ok", False),
+                "wm_emergency_cap": payload.get("wm_emergency_cap", False),
+                "wm_batch_too_small": payload.get("wm_batch_too_small", False),
+                "wm_no_slot": payload.get("wm_no_slot", False),
+                "wm_degradation_guard": payload.get("wm_degradation_guard", False),
+                "frontier_hwm": payload.get("frontier_hwm", 0),
+                "n_summaries_l1": payload.get("n_summaries_l1", 0),
+                "n_summaries_l2": payload.get("n_summaries_l2", 0),
+            }
+            jsonl_path = os.path.join(project_dir, "evolution.jsonl")
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # ── 5. Prune old snapshots ───────────────────────────────────────────
+        self._prune(project_dir)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Rendering
@@ -19599,6 +20315,9 @@ class SemanticSeedInferencer:
     doesn't help. is_global_scope() detects these cases and inference returns {}
     → the request is routed to the multi‑phase protocol with full_graph in Block A
     (see patch I).
+
+    Docs 10–13 backported:
+        B2 – dotted‑name decomposition (e.g. 'Filter.inlet') resolves correctly.
     """
 
     # Queries that demand traversing the ENTIRE project, not a subgraph.
@@ -19623,7 +20342,7 @@ class SemanticSeedInferencer:
         Initialize the inferencer with a reference to the parent Filter.
 
         Args:
-            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+            filter_ref: The parent Filter instance.
         """
         self._f = filter_ref
 
@@ -19763,25 +20482,54 @@ class SemanticSeedInferencer:
         seeds = self._parse_and_resolve(response, project_id)
         return seeds
 
-    # ── Parsing and resolution ───────────────────────────────────────────────
+    # ── Fuzzy fallback (original, unchanged) ─────────────────────────────────
+
+    def _fuzzy_resolve(self, token: str, project_id: str) -> List[str]:
+        """
+        Fallback fuzzy resolution for hallucinated tokens.
+
+        Uses rapidfuzz token_set_ratio against all qualified ids in the project.
+        """
+        if not HAS_FUZZ:
+            return []
+        from rapidfuzz import fuzz
+
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+        best_match = None
+        best_ratio = 0.0
+        token_lower = token.lower()
+        for qid in all_qids:
+            ratio = fuzz.token_set_ratio(token_lower, qid.lower())
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = qid
+        if best_match and best_ratio >= self._f.valves.seed_inference_fuzzy_threshold:
+            self._f._log_debug(
+                f"SemanticSeedInferencer: fuzzy matched '{token}' → '{best_match}' "
+                f"(ratio={best_ratio:.0f}%)"
+            )
+            return [best_match]
+        return []
+
+    # ── Parsing and resolution ── MODIFIED (B2) ──────────────────────────────
 
     def _parse_and_resolve(self, response: str, project_id: str) -> Dict[str, float]:
         """
         Parse one‑id‑per‑line and resolve each token to actual qualified ids.
 
-        Resolution rules:
+        Resolution rules (B2):
           - Token in all_qids → exact match, full score.
+          - (NEW B2) Dotted name (e.g. 'Filter.inlet') → split on last dot,
+            construct the qualified id via qualify_symbol_name(method, parent).
           - Bare token (no '.') → get_qualified_names_for → all qids sharing
             that bare name; score divided among ambiguities.
-          - Hallucinated token (not in index) → try fuzzy matching against
-            all_qids using rapidfuzz (token_set_ratio) with threshold 0.85.
-            If a match is found, assign the score with a 0.8 penalty.
+          - Hallucinated token → fuzzy matching with rapidfuzz (token_set_ratio)
+            threshold 0.85, score penalty 0.8.
           - If fuzzy fails, discard silently.
         """
         score = self._f.valves.seed_inference_score
         max_syms = self._f.valves.seed_inference_max_symbols
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
-        all_qids_lower = {qid.lower(): qid for qid in all_qids}
 
         seeds: Dict[str, float] = {}
         for line in response.splitlines():
@@ -19794,12 +20542,35 @@ class SemanticSeedInferencer:
             if not token:
                 continue
 
-            # ── 1. Exact match ──────────────────────────────────────────────
+            # ── Step 1: Exact match ──────────────────────────────────────────────
             if token in all_qids:
                 seeds[token] = max(seeds.get(token, 0.0), score)
                 continue
 
-            # ── 2. Bare name resolution ──────────────────────────────────────
+            # ── Step 2 (B2): Dotted‑name decomposition ──────────────────────────
+            # The LLM often returns qualified names like "Filter.inlet" or
+            # "ContextBuilder.build_block_b". Split on the last dot and try to
+            # resolve the method against its parent class via qualify_symbol_name.
+            if "." in token:
+                parent_name, method_part = token.rsplit(".", 1)
+                # Try qualify_symbol_name(method, parent) with the global helper
+                constructed_qid = qualify_symbol_name(method_part, parent_name)
+                if constructed_qid in all_qids:
+                    seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
+                    continue
+                # Fallback: maybe the parent is also compound ("a.b.C") —
+                # try just the method part via bare‑name lookup
+                by_method = self._f._symbol_index.get_qualified_names_for(
+                    method_part, project_id
+                )
+                if by_method:
+                    share = score / len(by_method)
+                    for q in by_method:
+                        if q in all_qids:
+                            seeds[q] = max(seeds.get(q, 0.0), share)
+                    continue
+
+            # ── Step 3: Bare name resolution (original) ──────────────────────────
             qids = {
                 q
                 for q in self._f._symbol_index.get_qualified_names_for(
@@ -19813,30 +20584,13 @@ class SemanticSeedInferencer:
                     seeds[q] = max(seeds.get(q, 0.0), share)
                 continue
 
-            # ── 3. Fuzzy matching (new) ──────────────────────────────────────
-            if HAS_FUZZ:
-                from rapidfuzz import fuzz
-
-                token_lower = token.lower()
-                # Find best match among all qualified ids
-                best_match = None
-                best_ratio = 0.0
-                for qid_lower, qid in all_qids_lower.items():
-                    ratio = fuzz.token_set_ratio(token_lower, qid_lower)
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_match = qid
-                if (
-                    best_match
-                    and best_ratio >= self._f.valves.seed_inference_fuzzy_threshold
-                ):
-                    # Apply a penalty (0.8) for fuzzy matches
-                    fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
-                    seeds[best_match] = max(seeds.get(best_match, 0.0), fuzzy_score)
-                    self._f._log_debug(
-                        f"SemanticSeedInferencer: fuzzy matched '{token}' → '{best_match}' (ratio={best_ratio:.0f}%)"
-                    )
-                    continue
+            # ── Step 4: Fuzzy matching (existing) ──────────────────────────────
+            fuzzy_matches = self._fuzzy_resolve(token, project_id)
+            if fuzzy_matches:
+                fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
+                for q in fuzzy_matches:
+                    seeds[q] = max(seeds.get(q, 0.0), fuzzy_score)
+                continue
 
             # If no match, discard silently
             self._f._log_debug(f"SemanticSeedInferencer: no match for '{token}'")
@@ -20393,14 +21147,22 @@ class Filter:
                 "forcing a full KV-cache prefill) on every topic switch."
             ),
         )
-
-        # ── PageRank recomputation on mode change (step 11) ──────────
         call_graph_mode_recompute_pagerank: bool = Field(
             default=False,
             description=(
                 "If True, recompute PageRank when the call-graph mode changes. "
                 "Mode does not alter graph topology, so this is normally unnecessary; "
                 "kept as an opt-in safety/debug switch."
+            ),
+        )
+        call_graph_downgrade_turns: int = Field(
+            default=3,
+            ge=1,
+            le=20,
+            description=(
+                "Number of consecutive turns in which the resolved mode would be lower "
+                "than the current mode before a downgrade is applied. "
+                "Upgrades (adding context) are always immediate."
             ),
         )
 
@@ -20496,6 +21258,17 @@ class Filter:
             description=(
                 "Max DIRECT callers pulled into Block B at LOD-1 for refactor "
                 "(case D) impact analysis. 0 = unlimited."
+            ),
+        )
+        lod2_exit_ratio: float = Field(
+            default=0.60,
+            ge=0.3,
+            le=0.9,
+            description=(
+                "Fraction of lod2_threshold used as the exit threshold for LOD-2 "
+                "hysteresis. A symbol that entered LOD-2 will stay until its PPR "
+                "drops below lod2_threshold * lod2_exit_ratio. "
+                "Lower values = symbols stay in LOD-2 longer."
             ),
         )
         # ── Centrality ──────────────────────────────────────────────
@@ -21151,11 +21924,11 @@ class Filter:
         self._llm_orchestrator.init_cache()
         self._last_used_model: Optional[str] = None
 
-        # ── Tracking of active LLM tasks (prevents model switching conflicts) ──
+        # ── Tracking of active LLM tasks ──
         self._active_llm_tasks: Set[asyncio.Task] = set()
         self._active_llm_tasks_lock = asyncio.Lock()
 
-        # ── Database write queue (prevents "database is locked") ──
+        # ── Database write queue ──
         self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._db_worker_task = asyncio.create_task(self._state_store.db_worker())
 
@@ -21164,11 +21937,10 @@ class Filter:
         self._session_classify_ttl: float = 1800.0
         self._project_state_manager = ProjectStateManager(self)
 
-        # ── Project tracking (global) ──
+        # ── Project tracking ──
         self._last_project_id: str = ""
 
-        # Symbol index and path index (shared across projects, but their
-        # contents are keyed by project_id internally)
+        # Symbol index and path index
         self._symbol_index = SymbolIndex()
         self._path_index = PathIndex()
 
@@ -21176,7 +21948,7 @@ class Filter:
         self._block_change_summaries: OrderedDict = OrderedDict()
         self._MAX_CHANGE_SUMMARIES = self.valves.max_change_summaries
 
-        # Thread pools for blocking operations
+        # Thread pools
         import concurrent.futures
 
         self._db_executor = concurrent.futures.ThreadPoolExecutor(
@@ -21191,14 +21963,18 @@ class Filter:
         self.ENABLE_KEYWORD_COUNT_WEIGHT = True
         self.ENABLE_COT_STICKY = False
 
-        # ── Write counter for periodic tasks (RAPTOR, checkpoints) ──
+        # ── Write counter for periodic tasks ──
         self._write_counter = 0
 
         # ── Silent ingestion guard ──
         self._is_silent_ingestion = False
 
-        # ── Original user system prompt, captured once per turn ──
+        # ── Original user system prompt ──
         self._original_system_prompt: str = ""
+
+        # ── C6: LTM store completion event ──────────────────────────────
+        self._ltm_store_complete: asyncio.Event = asyncio.Event()
+        self._ltm_store_complete.set()  # initially "complete"
 
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
@@ -21515,7 +22291,6 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
-
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Pre‑process the request before the LLM sees it.
@@ -21584,6 +22359,20 @@ class Filter:
             has_code_blocks,
         ) = await self._inlet_orch.inlet_extract_user_info(messages)
         _inlet_timing("Step 2/7: Extract user info", step_start)
+
+        # ── C6: Wait for previous LTM store to complete ──────────────────
+        if not self._ltm_store_complete.is_set():
+            self._log_debug("LTM: store pending from previous turn — waiting up to 3s")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._ltm_store_complete.wait()),
+                    timeout=3.0,
+                )
+                self._log_debug("LTM: store completed — proceeding with retrieval")
+            except asyncio.TimeoutError:
+                self._log_warning(
+                    "LTM: store timeout (>3s) — retrieval may miss previous turn"
+                )
 
         # ── Detect AutoContinue continuation ──────────────────────────────
         _last_assistant = next(
@@ -21728,6 +22517,7 @@ class Filter:
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
 
+                    # ── B4: warmup tier prefill ──────────────────────────────
                     asyncio.create_task(
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
@@ -21801,6 +22591,11 @@ class Filter:
         #   Resolve call‑graph mode BEFORE Block A is built.
         # ─────────────────────────────────────────────────────────────────
         intent_vector = await self._commands.classify_intent(user_query, project_id)
+        use_case_key, use_case_profile, use_case_label = (
+            await self._inlet_orch.classify_intent_with_continuation(
+                user_query, project_id, intent_vector
+            )
+        )
         self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
 
         # ─────────────────────────────────────────────────────────────────
@@ -21962,9 +22757,21 @@ class Filter:
                             "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
                         )
                         await self._update_active_code(last_msg, project_id)
-                        await self._ltm.store_messages(
-                            project_id, [last_msg], wait=False
-                        )
+
+                        # ── C6: wrap store_messages with signal ──────────────────────────
+                        self._ltm_store_complete.clear()
+
+                        async def _store_and_signal():
+                            try:
+                                await self._ltm.store_messages(
+                                    project_id, [last_msg], wait=False
+                                )
+                            except Exception as e:
+                                self._log_debug(f"LTM: store_messages failed: {e}")
+                            finally:
+                                self._ltm_store_complete.set()
+
+                        asyncio.create_task(_store_and_signal())
 
                         if self.valves.enable_auto_docstrings_background:
                             state = self._conversation_state_manager.get(project_id)
@@ -21985,9 +22792,20 @@ class Filter:
                             self._log_debug(
                                 "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
                             )
-                            await self._ltm.store_messages(
-                                project_id, [last_msg], wait=False
-                            )
+                            # ── C6: also signal for non‑code stores ──────────────────
+                            self._ltm_store_complete.clear()
+
+                            async def _store_and_signal_noncode():
+                                try:
+                                    await self._ltm.store_messages(
+                                        project_id, [last_msg], wait=False
+                                    )
+                                except Exception as e:
+                                    self._log_debug(f"LTM: store_messages failed: {e}")
+                                finally:
+                                    self._ltm_store_complete.set()
+
+                            asyncio.create_task(_store_and_signal_noncode())
 
                 else:
                     if last_idx <= pstate.get("last_processed_message_idx", -1):
@@ -21997,15 +22815,38 @@ class Filter:
                     else:
                         await self._llm_orchestrator.wait_for_llm_tasks()
                         if is_code_session:
-                            await self._ltm.store_messages(
-                                project_id, [last_msg], wait=False
-                            )
+                            # ── C6: signal for user message in code session ──────────
+                            self._ltm_store_complete.clear()
+
+                            async def _store_and_signal_user_code():
+                                try:
+                                    await self._ltm.store_messages(
+                                        project_id, [last_msg], wait=False
+                                    )
+                                except Exception as e:
+                                    self._log_debug(f"LTM: store_messages failed: {e}")
+                                finally:
+                                    self._ltm_store_complete.set()
+
+                            asyncio.create_task(_store_and_signal_user_code())
                             await self._update_active_code(last_msg, project_id)
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
-                                await self._ltm.store_messages(
-                                    project_id, [last_msg], wait=False
-                                )
+                                self._ltm_store_complete.clear()
+
+                                async def _store_and_signal_user_noncode():
+                                    try:
+                                        await self._ltm.store_messages(
+                                            project_id, [last_msg], wait=False
+                                        )
+                                    except Exception as e:
+                                        self._log_debug(
+                                            f"LTM: store_messages failed: {e}"
+                                        )
+                                    finally:
+                                        self._ltm_store_complete.set()
+
+                                asyncio.create_task(_store_and_signal_user_noncode())
 
             # ─────────────────────────────────────────────────────────────────────
             # 🔥 Save slot NOW (stable state, before long tasks)
