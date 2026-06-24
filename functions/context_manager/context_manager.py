@@ -16895,7 +16895,7 @@ class SystemPromptBuilder:
             # --- Check suppression before falling back ---
             # Replicate the suppression check from build_block_b to avoid
             # falling back to full context when the skeleton tier is active.
-            active_use_case, _ = self._f._ctx_builder.classify_use_case(
+            active_use_case, _, _ = self._f._ctx_builder.classify_use_case(
                 user_query, intent_vector
             )
             suppress_sigs = (
