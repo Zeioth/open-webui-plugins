@@ -3117,9 +3117,6 @@ class ContextBuilder:
         Build Block A: stable, KV-cache-anchoring content.
 
         Returns "" when not a code session.
-
-        Modified (E4): prune ghost hub qids after large code changes.
-        Modified (M7-compatible): stores structure_hash_for_cache for slot persistence.
         """
         if not is_code_session:
             return ""
@@ -3379,15 +3376,12 @@ class ContextBuilder:
 
         return tier
 
-    # ── M6 + E4: _build_hub_bodies_tier (modified) ──────────────────────────
+    # ── M6 + E4: _build_hub_bodies_tier ──────────────────────────
 
     def _build_hub_bodies_tier(self, project_id: str) -> Tuple[str, str, List[str]]:
         """
         Build the Hub‑Bodies Tier: full bodies of top‑N hubs by centrality,
         ordered by stability (last_modified_turn), truncated by budget.
-
-        Modified (M6): cold‑start fallback for prev_seeds from persisted qids.
-        Modified (E4): ghost pruning is handled in build_block_a, not here.
         """
         if not self._f.valves.enable_hub_bodies_tier:
             return "", "", []
@@ -4143,8 +4137,6 @@ class ContextBuilder:
                     return f"# {qid} — body\n{body}\n"
         return ""
 
-    # ── E1, E3, E5, E6: build_block_b (modified) ────────────────────────────
-
     async def build_block_b(
         self,
         project_id: str,
@@ -4156,11 +4148,6 @@ class ContextBuilder:
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
-
-        Modified (E1): LOD‑2 hysteresis (entry/exit thresholds).
-        Modified (E3): stable ordering by (tier, -PPR, qid).
-        Modified (E5): skip duplicate signatures for skeleton‑tier symbols.
-        Modified (E6): recency pointers with signature previews.
         """
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
@@ -5498,7 +5485,7 @@ class SignatureExtractor:
     _parser_cache: Dict[str, Any] = {}
     _parser_cache_lock = threading.Lock()
 
-    # ── NEW: extraction cache ──────────────────────────────────────────────
+    # ── extraction cache ──────────────────────────────────────────────
     _extraction_cache: Dict[str, Tuple[List["CodeSymbol"], float]] = {}
     _EXTRACTION_CACHE_MAXSIZE: int = 128
     _EXTRACTION_CACHE_TTL: int = 3600  # 1 hour
@@ -7330,10 +7317,7 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def init(self) -> None:
-        """Initialise ChromaDB, embedder, and response cache collection.
-
-        Modified: C4 – validate embedding model after collection is ready.
-        """
+        """Initialise ChromaDB, embedder, and response cache collection."""
         os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
         self._f.embedder = _shared_get_embedder()
         self._f._log_debug("Embedder: using Qwen/Qwen3-Embedding-0.6B")
@@ -7773,7 +7757,7 @@ class LongTermMemory:
         return [{"doc": doc, "timestamp": ts} for doc, _, ts, _ in docs_with_meta]
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Main retrieval methods – MODIFIED (C1, C2, C4)
+    # 4. Main retrieval methods
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def retrieve_memories_unified(
@@ -7785,11 +7769,6 @@ class LongTermMemory:
     ) -> list:
         """
         Retrieve relevant LTM entries, with multi‑query expansion and reranking.
-
-        Modified:
-            C1 – threshold on raw similarity (before time decay)
-            C2 – deduplicate by document ID, keeping highest score
-            C4 – early exit if retrieval disabled due to model mismatch
         """
         # ── C4: early exit if retrieval disabled ──────────────────────────
         if self._retrieval_disabled_reason:
@@ -8086,7 +8065,7 @@ class LongTermMemory:
             return []
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Message storage – MODIFIED (M1, M2)
+    # 5. Message storage
     # ═══════════════════════════════════════════════════════════════════════════
 
     # ── M1: strip CoT scaffolding ──────────────────────────────────────────
@@ -8123,15 +8102,11 @@ class LongTermMemory:
 
         If `wait` is False, the actual embedding and upsert run in a background
         task and the method returns immediately.
-
-        Modified:
-            M1 – strip <details> reasoning before embedding.
-            M2 – skip partial multi‑phase assistant responses.
         """
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return
 
-        # ── M2: Filter valid messages (skip partial multi-phase) ──────────
+        # ── Filter valid messages (skip partial multi-phase) ──────────
         valid = []
         for msg in messages:
             content = msg.get("content", "")
@@ -14143,10 +14118,6 @@ Code context (recent symbols referenced):
              code_history_force_compress_after_turns OR the message was already
              force-compressed in a previous session, force compression WITHOUT
              an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
-
-        Modified (B5): force-compressed keys are persisted in pstate so they
-        survive server restarts. A set of already-force-compressed message
-        keys is loaded at the start and saved at the end, with LRU eviction.
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
@@ -15454,8 +15425,6 @@ class EnrichmentTasks:
         with the corresponding qid from the batch providing context for dunder disambiguation.
 
         Returns a dict mapping qualified id -> docstring.
-
-        Modified (M5): uses context_symbol to disambiguate dunders (__init__, __str__, etc.).
         """
         result: Dict[str, str] = {}
         pattern = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
@@ -16164,7 +16133,7 @@ class EnrichmentTasks:
         for qid in added_qids:
             block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
             for bh in block_hashes:
-                block = active_blocks.get(bh)  # ← usar cache local
+                block = active_blocks.get(bh)  # ← Use local cache
                 if block and not block.obsolete:
                     body = CodeBlockManager.extract_symbol_body(block, qid)
                     if body:
@@ -17380,8 +17349,6 @@ class SystemPromptBuilder:
         Orchestrate the construction of the two-block system prompt.
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
-
-        Modified (M7): computes and stores block_a_rebuild_reason in pstate.
         """
         # ── REGION 1: Resolve per-project state ──────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
@@ -18469,7 +18436,7 @@ class MessageAssembler:
             messages,
             user_question,
             slot_free,
-            project_id,  # ← NEW: pass project_id for global-scope flag
+            project_id,
         )
 
         # 6. Trim and summarize old messages (now handled by WindowManager)
@@ -19158,7 +19125,7 @@ class MessageAssembler:
         # --- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
 
-        # ── NEW: read the one‑shot global‑scope flag ──
+        # ── Read the one‑shot global‑scope flag ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         force_global_scope = pstate.pop("force_multi_phase_this_turn", False)
 
@@ -19629,7 +19596,7 @@ class ContextDumper:
                 "n_active_blocks": payload["n_active_blocks"],
                 "n_symbols": payload["n_symbols"],
                 "block_a_hash": payload["block_a_hash"],
-                # ── NEW: rebuild reason ──────────────────────────────────
+                # ── Rebuild reason ──────────────────────────────────
                 "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
                 "code_state_hash": payload["code_state_hash"],
                 "slot_saved_hash": payload["slot_saved_hash"],
@@ -19655,8 +19622,6 @@ class ContextDumper:
     def _write_sync(self, payload: dict) -> None:
         """
         Synchronously write the context snapshot to disk (Markdown + JSONL).
-
-        Modified (M7): adds block_a_rebuild_reason to evolution.jsonl.
         """
         project_id = payload["project_id"]
         project_dir = self._project_dir(project_id)
@@ -20511,7 +20476,7 @@ class SemanticSeedInferencer:
             return [best_match]
         return []
 
-    # ── Parsing and resolution ── MODIFIED (B2) ──────────────────────────────
+    # ── Parsing and resolution ────────────────────────────────
 
     def _parse_and_resolve(self, response: str, project_id: str) -> Dict[str, float]:
         """
