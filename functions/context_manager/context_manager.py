@@ -8179,18 +8179,42 @@ class LongTermMemory:
     async def store_messages(
         self, project_id: str, messages: list, wait: bool = True
     ) -> None:
-        """Store user/assistant messages in the LTM ChromaDB collection.
+        """
+        Store user/assistant messages in the LTM ChromaDB collection.
 
         If `wait` is False, the actual embedding and upsert run in a background
         task and the method returns immediately.
+
+        M2 fix: Assistant responses that are partial multi-phase continuations
+        (containing "▶ CONTINÚA:" or "## Código — Parte N/M") are skipped
+        entirely to prevent polluting long-term memory with incomplete code
+        fragments that would be retrieved as "relevant past context".
         """
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return
-        valid = [
-            m
-            for m in messages
-            if m.get("content", "").strip() and len(m["content"].strip()) >= 15
-        ]
+
+        # ── M2: Pattern to detect partial multi-phase assistant responses ──
+        _MULTI_PHASE_PARTIAL = re.compile(
+            r"(?:▶\s*CONTINÚA:|##\s+C[oó]digo\s*[—–-]\s*Parte\s+\d+/\d+)", re.IGNORECASE
+        )
+
+        # ── Filter valid messages (skip partial multi-phase) ──────────────
+        valid = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if not content or len(content.strip()) < 15:
+                continue
+
+            role = msg.get("role", "")
+            # M2: Skip partial multi-phase assistant responses
+            if role == "assistant" and _MULTI_PHASE_PARTIAL.search(content):
+                self._f._log_debug(
+                    "ltm: skipping partial multi-phase response (not embedding)"
+                )
+                continue
+
+            valid.append(msg)
+
         if not valid:
             return
 
@@ -8199,7 +8223,7 @@ class LongTermMemory:
             asyncio.create_task(self._store_messages_async(project_id, valid))
             return
 
-        # Original synchronous path (unchanged)
+        # ── Original synchronous path ──────────────────────────────────────
         texts_for_embedding: List[str] = []
         documents_to_store: List[str] = []
         ids = []
@@ -8215,7 +8239,6 @@ class LongTermMemory:
             ctx_symbols: List[str] = []
             for blk in extracted[:3]:
                 try:
-                    # ── FIX 9: Pass language as keyword argument ──
                     syms = await SignatureExtractor.extract_async(
                         blk["code"], language=blk.get("language")
                     )
@@ -8258,7 +8281,6 @@ class LongTermMemory:
                 all_syms = set()
                 for blk in extracted:
                     try:
-                        # ── FIX 9: Pass language as keyword argument ──
                         syms = await SignatureExtractor.extract_async(
                             blk["code"], language=blk.get("language")
                         )
@@ -13783,21 +13805,22 @@ class HistoryCompressor:
           3. For each older part, verify symbols are indexed in the SymbolGraph.
           4. If indexed (ratio >= threshold): replace with commit summary.
           5. If NOT indexed: increment blocked age; if age exceeds
-             code_history_force_compress_after_turns, force compression
-             WITHOUT an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
+             code_history_force_compress_after_turns OR the message was already
+             force-compressed in a previous session, force compression WITHOUT
+             an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
 
-        This method now uses ConversationState.history_blocked_age (persistent)
-        instead of ProjectStateManager (volatile), ensuring that the blocked-age
-        counter survives server restarts.
+        The force-compressed state is persisted across server restarts via
+        `force_compressed_keys` in the project state, so a message that was
+        force-compressed once stays compressed without waiting for another
+        `force_after` turns after a restart.
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
 
-        # --- Standard multi-phase marker (legacy) ---
+        # ── Patterns ─────────────────────────────────────────────────────────
         _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
         _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
 
-        # --- NEW: Broader pattern for "Fase X", "Parte X", "Phase X", "Step X" ---
         _PHASE_HEADER = re.compile(
             r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
             re.IGNORECASE,
@@ -13806,12 +13829,17 @@ class HistoryCompressor:
         keep = self._f.valves.code_history_keep_last_n_parts
         force_after = self._f.valves.code_history_force_compress_after_turns
 
-        # --- Load blocked-age tracking from persistent ConversationState ---
+        # ── Load persistent state ───────────────────────────────────────────
+        pstate = self._f._project_state_manager.get_pstate(project_id)
         state = self._f._conversation_state_manager.get(project_id)
         blocked_age = state.history_blocked_age  # mutable dict, modified in-place
-        dirty = False  # track whether we modified blocked_age
 
-        # Collect indices of uncompressed code-part messages
+        # ── NEW: Persistent set of already-force-compressed message keys ────
+        force_compressed_keys: Set[str] = set(pstate.get("force_compressed_keys", []))
+
+        dirty = False  # track whether we modified blocked_age or force_compressed_keys
+
+        # ── Collect indices of uncompressed code-part messages ─────────────
         code_part_indices: List[Tuple[int, int, int]] = []
         for i, msg in enumerate(messages):
             if msg.get("role") != "assistant":
@@ -13819,16 +13847,16 @@ class HistoryCompressor:
             content = msg.get("content", "")
             if _ALREADY_COMPRESSED.search(content):
                 continue
+
             m = _PART_HEADER.search(content)
             if m:
                 code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
                 continue
+
             # Try the broader phase/part pattern
             if _PHASE_HEADER.search(content):
-                # Check if it's a large code block (estimated tokens > 300)
                 est_tokens = self._f._tokens.estimate_code_tokens(content)
                 if est_tokens > 300:
-                    # Find max phase number in conversation
                     max_phase = 0
                     for msg2 in messages:
                         if msg2.get("role") != "assistant":
@@ -13848,6 +13876,7 @@ class HistoryCompressor:
             # No old parts to compress; still save dirty if modified
             if dirty:
                 self._f._conversation_state_manager.mark_dirty(project_id)
+                pstate["force_compressed_keys"] = list(force_compressed_keys)
             return messages
 
         to_compress = code_part_indices[:-keep]
@@ -13860,12 +13889,12 @@ class HistoryCompressor:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
 
-            # --- Generate a stable key for this message ---
+            # ── Generate a stable key for this message ─────────────────────
             msg_key = hashlib.md5(f"{msg.get('role')}|{content}".encode()).hexdigest()[
                 :16
             ]
 
-            # --- Verify symbols are indexed ---
+            # ── Verify symbols are indexed ─────────────────────────────────
             safe, ratio = self._verify_code_symbols_indexed(content, project_id)
 
             force_no_expand = False
@@ -13890,11 +13919,14 @@ class HistoryCompressor:
                 )
                 blocked_by_ratio += 1
 
-                # Force compression if age exceeds threshold
-                if force_after > 0 and age >= force_after:
+                # ── Force compression if age exceeds threshold OR key already force-compressed ──
+                if force_after > 0 and (
+                    age >= force_after or msg_key in force_compressed_keys
+                ):
                     self._f._log_debug(
                         f"Code history: FORCING compression of {part_label_for_log} "
-                        f"after {age} blocked turns (force_after={force_after}). "
+                        f"(force_after={force_after}, age={age}, "
+                        f"already_force={msg_key in force_compressed_keys}). "
                         f"Compressing WITHOUT /expand guarantee."
                     )
                     force_no_expand = True
@@ -13916,6 +13948,11 @@ class HistoryCompressor:
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
 
+            # ── Record that this message was force-compressed ──────────────
+            if force_no_expand:
+                force_compressed_keys.add(msg_key)
+                dirty = True
+
             # Reset blocked age for this message since it was successfully compressed
             if msg_key in blocked_age:
                 del blocked_age[msg_key]
@@ -13928,9 +13965,19 @@ class HistoryCompressor:
                 + (" [FORCED NO-EXPAND]" if force_no_expand else "")
             )
 
-        # Save updated blocked_age if modified
+        # ── Evict old entries from force_compressed_keys to prevent unbounded growth ──
+        if len(force_compressed_keys) > 500:
+            # Keep only the most recent 250 (insertion order is append-only,
+            # so slicing from the end gives the newest ones)
+            force_compressed_keys = set(list(force_compressed_keys)[-250:])
+            dirty = True
+
+        # ── Persist updated state ──────────────────────────────────────────
         if dirty:
+            # Save blocked_age via ConversationStateManager
             self._f._conversation_state_manager.mark_dirty(project_id)
+            # Save force_compressed_keys via pstate
+            pstate["force_compressed_keys"] = list(force_compressed_keys)
 
         if compressed_n:
             self._f._log_debug(
@@ -14931,17 +14978,96 @@ class EnrichmentTasks:
 
     _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
 
+    def _resolve_parsed_docstring_name(
+        self,
+        bare_name: str,
+        project_id: str,
+        context_symbol: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Resolve a bare name from the batch docstring response to a qualified id.
+
+        Step 1: Exact bare-name lookup (returns the single qid if unambiguous).
+        Step 2: For dunders (__init__, __str__, etc.) where the model omits the
+                class prefix, use context_symbol to infer the parent class and
+                build a candidate qid (e.g., 'ContextBuilder.__init__').
+        Step 3: If multiple bare-name matches exist and no context can disambiguate,
+                return None (skip this entry).
+
+        This prevents docstrings from being assigned to the wrong symbol when
+        multiple classes share the same dunder name.
+        """
+        # Step 1: bare-name lookup
+        results = self._f._symbol_index.get_qualified_names_for(bare_name, project_id)
+        if len(results) == 1:
+            return next(iter(results))
+
+        # Step 2: dunder disambiguation via context_symbol
+        if bare_name.startswith("__") and bare_name.endswith("__") and context_symbol:
+            # Extract parent class from context_symbol
+            # e.g., "ContextBuilder.build" -> "ContextBuilder"
+            parent = (
+                context_symbol.rsplit(".", 1)[0]
+                if "." in context_symbol
+                else context_symbol
+            )
+            candidate = f"{parent}.{bare_name}"
+            # Verify the candidate exists in the index
+            if candidate in self._f._symbol_index.get_all_qualified_names(project_id):
+                return candidate
+
+        # Step 3: ambiguous — skip
+        if len(results) > 1:
+            self._f._log_debug(
+                f"_resolve_parsed_docstring_name: ambiguous bare name '{bare_name}' "
+                f"→ {len(results)} candidates, skipping"
+            )
+            return None
+
+        return None
+
     def _parse_docstring_batch_response(
-        self, response: str, expected_names: Set[str]
+        self,
+        response: str,
+        expected_names: Set[str],
+        batch_qids: List[str],
     ) -> Dict[str, str]:
+        """
+        Parse the LLM response for batch docstrings.
+
+        Each line is expected to be in the format:
+            <identifier>: <one short sentence>
+
+        The identifier is resolved to a qualified id using `_resolve_parsed_docstring_name`,
+        with the corresponding qid from the batch providing context for dunder disambiguation.
+
+        Returns a dict mapping qualified id -> docstring.
+        """
         result: Dict[str, str] = {}
-        for line in response.splitlines():
-            m = self._BATCH_DOCSTRING_LINE_RE.match(line.strip())
+        pattern = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
+
+        for idx, line in enumerate(response.splitlines()):
+            m = pattern.match(line.strip())
             if not m:
                 continue
-            name, desc = m.group(1), m.group(2).strip()
-            if name in expected_names and desc:
-                result[name] = desc[:200]
+
+            bare_name, docstring = m.group(1), m.group(2).strip()
+            if not docstring:
+                continue
+
+            # Use the corresponding qid from the batch as context hint
+            context_symbol = batch_qids[idx] if idx < len(batch_qids) else None
+            qid = self._resolve_parsed_docstring_name(
+                bare_name, self._f.valves.project_id, context_symbol
+            )
+
+            if qid and qid in expected_names:
+                result[qid] = docstring[:200]
+            else:
+                self._f._log_debug(
+                    f"_parse_docstring_batch_response: could not resolve '{bare_name}'"
+                )
+
         return result
 
     async def ensure_docstrings_batch(
@@ -14961,18 +15087,17 @@ class EnrichmentTasks:
 
         Returns {qid: docstring} for every qid that has (or now has) a
         non-empty docstring.
+
+        M5 fix: batch_qids are passed to `_parse_docstring_batch_response`
+        to provide context for disambiguating dunders (__init__, __str__, etc.)
+        when the model omits the class prefix.
         """
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
         # Build a qid → (sym, block) index ONCE instead of scanning every
-        # block/symbol on each _find_symbol call. _find_symbol is called
-        # several times per qid (cache check, snippet build, result apply),
-        # so the old per-call O(active symbols) scan was effectively quadratic
-        # per turn. First-match-wins ordering is preserved. Snapshot is taken
-        # at entry — see Bug 3 snapshot note (no new race vs. the lock-free
-        # original).
+        # block/symbol on each _find_symbol call.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -15037,6 +15162,9 @@ class EnrichmentTasks:
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
+            # ── Extract batch_qids for context ──────────────────────────────
+            batch_qids = [qid for qid, _, _ in batch]
+
             prompt = self._build_docstring_batch_prompt(batch)
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
@@ -15053,7 +15181,11 @@ class EnrichmentTasks:
             if not response:
                 continue
 
-            parsed = self._parse_docstring_batch_response(response, expected)
+            # ── Pass batch_qids for dunder disambiguation ────────────────────
+            parsed = self._parse_docstring_batch_response(
+                response, expected, batch_qids
+            )
+
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -15450,36 +15582,85 @@ class EnrichmentTasks:
 
     async def _docstring_generation_loop(self, project_id: str) -> None:
         """
-        Background loop that generates docstrings for all pending symbols (functions, methods, and classes)
-        that lack one. Takes a snapshot of all symbols without docstrings at the start, then processes
-        each one exactly once. This prevents infinite retries on failing symbols and ensures termination.
+        Background loop that generates docstrings for all pending symbols
+        (functions, methods, and classes) that lack one.
+
+        Takes a snapshot of all symbols without docstrings at the start,
+        then processes them in batches using `docstring_bg_batch_size`
+        to reduce serial LLM calls from N to ceil(N / batch_size).
+
+        After all batches complete, calls `slot_restore_for_continuity()`
+        to return the KV slot to the stable prefix — undoing any dirty state
+        introduced by the batch LLM calls.
+
+        This prevents the race condition where a user message arrives while
+        the background loop is running and the slot file is in a dirty state.
         """
-        # --- 1. Snapshot: collect all symbols without docstrings ---
+        # ── 1. Snapshot: collect all symbols without docstrings ──────────
         state = self._f._conversation_state_manager.get(project_id)
-        pending = []
+        pending_qids: List[str] = []
+
         for block in state.active_blocks.values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
                 if sym.kind in ("function", "method", "class") and not sym.docstring:
-                    pending.append((sym, block))
+                    qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                    pending_qids.append(qid)
 
-        if not pending:
+        if not pending_qids:
             self._f._log_debug("Background docstring loop: no pending symbols")
             return
 
         self._f._log_debug(
-            f"Background docstring loop: {len(pending)} symbol(s) to process"
+            f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
         )
 
-        # --- 2. Process each symbol once ---
-        for idx, (sym, block) in enumerate(pending, 1):
-            await self._background_docstring(sym, block, project_id)
-            # Throttle requests to avoid saturating the LLM server
-            if idx % 5 == 0:
-                await asyncio.sleep(1.0)
-            else:
-                await asyncio.sleep(0.3)
+        # ── 2. Batch configuration ──────────────────────────────────────────
+        batch_size = getattr(self._f.valves, "docstring_bg_batch_size", 5)
+        batches = [
+            pending_qids[i : i + batch_size]
+            for i in range(0, len(pending_qids), batch_size)
+        ]
+
+        self._f._log_debug(
+            f"bg_docstring: {len(pending_qids)} symbols → "
+            f"{len(batches)} batches (batch_size={batch_size})"
+        )
+
+        # ── 3. Process each batch ──────────────────────────────────────────
+        for batch_idx, batch in enumerate(batches):
+            try:
+                # Reuse the existing batch prompt path (foreground batching)
+                results: Dict[str, str] = await self.ensure_docstrings_batch(
+                    batch, project_id
+                )
+                for qid, docstring in results.items():
+                    if docstring:
+                        self._f._symbol_index.update_docstring(
+                            qid, docstring, project_id
+                        )
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1}/{len(batches)}: "
+                    f"got {len(results)} docstrings"
+                )
+            except Exception as e:
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1} failed: {e} — "
+                    "continuing with remaining batches"
+                )
+                # Continue with remaining batches — don't abort on partial failure
+
+        # ── 4. Restore slot to stable prefix after all batch LLM calls ────
+        # Each batch call dirtied the KV slot. Restore now so that if the user
+        # sends a message before the next inlet, the slot is clean.
+        try:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+            self._f._log_debug(
+                "bg_docstring: slot restored to stable prefix after batches"
+            )
+        except Exception as e:
+            self._f._log_debug(f"bg_docstring: slot restore failed (non-fatal): {e}")
 
         self._f._log_debug("Background docstring loop: finished")
 
@@ -16597,10 +16778,19 @@ class SystemPromptBuilder:
 
         Now includes the Hub‑Bodies Tier between Block A and Block B,
         with recency pointers and instruction‑tail integrated via ContextBuilder.
+
+        M7 fix: Computes and stores `block_a_rebuild_reason` in pstate for
+        evolution tracking (JSONL).
         """
-        # ══════════════════════════════════════════════════════════════
-        # BLOCK A — STATIC (via ContextBuilder)
-        # ══════════════════════════════════════════════════════════════
+        # ── REGION 1: Resolve per-project state ──────────────────────────────
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        # ── REGION 2: Get previous state for rebuild reason ──────────────────
+        prev_block_a_hash = pstate.get("block_a_hash")
+        prev_code_hash = pstate.get("code_state_hash")
+        prev_graph_mode = pstate.get("resolved_call_graph_mode")
+
+        # ── REGION 3: Build Block A (static) ─────────────────────────────────
         self._f._log_debug("🧱 Block A (static): building / retrieving from cache")
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
@@ -16608,10 +16798,33 @@ class SystemPromptBuilder:
             is_continuation=not slot_free,
         )
 
-        # ══════════════════════════════════════════════════════════════
-        # HUB‑BODIES TIER (stable, between A and B)
-        # ══════════════════════════════════════════════════════════════
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        # ── REGION 4: Compute Block A hash and rebuild reason ───────────────
+        if static_block:
+            new_block_a_hash = hashlib.md5(static_block.encode()).hexdigest()[:16]
+        else:
+            new_block_a_hash = ""
+
+        if prev_block_a_hash is None:
+            rebuild_reason = "first_build"
+        elif new_block_a_hash != prev_block_a_hash:
+            # Get current hashes (after building Block A)
+            current_code_hash = self._f._activation.compute_code_state_hash(project_id)
+            current_graph_mode = pstate.get("resolved_call_graph_mode")
+
+            if current_code_hash != prev_code_hash:
+                rebuild_reason = "code_changed"
+            elif current_graph_mode != prev_graph_mode:
+                rebuild_reason = "mode_changed"
+            else:
+                rebuild_reason = "other"  # docstring population, valve change, etc.
+        else:
+            rebuild_reason = None  # cache hit — no rebuild
+
+        # Store for ContextDumper
+        pstate["block_a_hash"] = new_block_a_hash
+        pstate["block_a_rebuild_reason"] = rebuild_reason
+
+        # ── REGION 5: Build Hub‑Bodies Tier ──────────────────────────────────
         hub_tier_text, hub_tier_hash, hub_tier_qids = (
             self._f._ctx_builder._build_hub_bodies_tier(project_id)
         )
@@ -16621,19 +16834,15 @@ class SystemPromptBuilder:
         pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
         pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
 
-        # ══════════════════════════════════════════════════════════════
-        # BLOCK B — DYNAMIC (per-query)
-        # ══════════════════════════════════════════════════════════════
+        # ── REGION 6: Block B — Dynamic per-query injections ────────────────
         dynamic_injections: List[Tuple[str, str]] = []
 
-        # ------------------------------------------------------------------
-        # Compute use_case and its human‑readable label
-        # ------------------------------------------------------------------
+        # 6a: Compute use_case label
         use_case, _, use_case_label = self._f._ctx_builder.classify_use_case(
             user_query, intent_vector or {}
         )
 
-        # B1: LTM retrieval (now passes the label)
+        # 6b: LTM retrieval
         self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         ltm_text = await self._build_ltm_injection(
             project_id,
@@ -16646,7 +16855,7 @@ class SystemPromptBuilder:
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
 
-        # B2: Parallel checks (contradiction, cache, duplicate)
+        # 6c: Parallel checks (contradiction, cache, duplicate)
         self._f._log_debug("🔄 Block B – Step 2/5: Parallel checks")
         contradiction_warning, cached_response, duplicate_match = (
             await self._build_parallel_checks(
@@ -16666,7 +16875,7 @@ class SystemPromptBuilder:
                 )
             )
 
-        # B3: Activated code (per-query, via ContextBuilder)
+        # 6d: Activated code (per-query)
         self._f._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         active_ctx = await self._build_activated_code(
             user_query, project_id, messages, is_code_session, slot_free
@@ -16674,14 +16883,14 @@ class SystemPromptBuilder:
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
 
-        # B4: Proactive suggestions + command suggestions
+        # 6e: Proactive suggestions
         self._f._log_debug("🔄 Block B – Step 4/5: Proactive suggestions")
         for prio, text in await self._build_suggestions(
             state, project_id, messages, is_code_session
         ):
             dynamic_injections.append((prio, text))
 
-        # B5: Assemble prelim_system (budget-aware)
+        # 6f: Assemble prelim_system (budget-aware)
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
             static_block,
@@ -18663,6 +18872,8 @@ class ContextDumper:
 
         Returns:
             dict: A complete payload dictionary with all context data and metrics.
+
+        M7 fix: Includes `block_a_rebuild_reason` from pstate.
         """
         max_chars = self._f.valves.context_dump_message_max_chars
         msg_copy: List[Tuple[str, str]] = []
@@ -18677,7 +18888,7 @@ class ContextDumper:
                     )
                 msg_copy.append((role, content))
 
-        # ── Resolve per-project state ─────────────────────────────────────
+        # ── Resolve per-project state ────────────────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         try:
@@ -18685,11 +18896,12 @@ class ContextDumper:
         except Exception:
             code_state_hash = ""
 
-        # ── Get hashes from pstate ────────────────────────────────────────
+        # ── Get hashes from pstate ──────────────────────────────────────────
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
+        block_a_rebuild_reason = pstate.get("block_a_rebuild_reason")
 
-        # ── Get persistent state via ConversationStateManager ─────────────
+        # ── Get persistent state via ConversationStateManager ───────────────
         try:
             state = self._f._conversation_state_manager.get(project_id)
             turn = state.message_count
@@ -18703,7 +18915,7 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
-        # ── Class membership metrics ──────────────────────────────────────
+        # ── Class membership metrics ────────────────────────────────────────
         try:
             all_names = self._f._symbol_index.get_all_names(project_id)
             n_with_parent = sum(
@@ -18715,7 +18927,7 @@ class ContextDumper:
         except Exception:
             n_with_parent, n_classes = 0, 0
 
-        # ── WindowManager metrics (now persistent in ConversationState) ──
+        # ── WindowManager metrics (now persistent in ConversationState) ────
         try:
             state = self._f._conversation_state_manager.get(project_id)
             wm_fired = state.wm_fired
@@ -18751,13 +18963,15 @@ class ContextDumper:
             "final_system": final_system or "",
             "messages": msg_copy,
             "block_a_hash": block_a_hash,
+            # ── NEW: rebuild reason ─────────────────────────────────────────
+            "block_a_rebuild_reason": block_a_rebuild_reason,
             "code_state_hash": code_state_hash,
             "slot_saved_hash": slot_hash,
             "n_active_blocks": n_active_blocks,
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
-            # ── WindowManager metrics (read from ConversationState) ─────────
+            # ── WindowManager metrics ──────────────────────────────────────
             "wm_fired": wm_fired,
             "wm_msgs_evicted": wm_msgs_evicted,
             "wm_turns_evicted": wm_turns_evicted,
@@ -18766,7 +18980,7 @@ class ContextDumper:
             "wm_batch_too_small": wm_batch_too_small,
             "wm_no_slot": wm_no_slot,
             "wm_degradation_guard": wm_degradation_guard,
-            # ── HWM and summaries ────────────────────────────────────────────
+            # ── HWM and summaries ───────────────────────────────────────────
             "frontier_hwm": frontier_hwm,
             "n_summaries_l1": n_summaries_l1,
             "n_summaries_l2": n_summaries_l2,
@@ -18790,42 +19004,6 @@ class ContextDumper:
         except Exception as exc:
             self._f._log_debug(f"❌ Context dump write failed: {exc}")
 
-    def _write_sync(self, payload: dict) -> None:
-        """
-        Synchronously render Markdown + JSONL and write to the project dump directory.
-
-        Args:
-            payload: The payload dictionary from _capture_payload.
-        """
-        project_dir = self._project_dir(payload["project_id"])
-        os.makedirs(project_dir, exist_ok=True)
-
-        # Token counts (done here, off the hot path).
-        tok = self._f._tokens
-        block_a_tokens = tok.estimate_code_tokens(payload["static_block"])
-        block_b_tokens = tok.estimate_code_tokens(payload["dynamic_block"])
-        system_tokens = tok.estimate_code_tokens(payload["final_system"])
-        history_tokens = sum(
-            tok.estimate_code_tokens(c) for r, c in payload["messages"] if r != "system"
-        )
-
-        # 1. Markdown snapshot
-        md = self._render_markdown(
-            payload, block_a_tokens, block_b_tokens, system_tokens, history_tokens
-        )
-        fname = f"{payload['turn']:04d}_turn_{int(payload['timestamp'] * 1000)}.md"
-        with open(os.path.join(project_dir, fname), "w", encoding="utf-8") as fh:
-            fh.write(md)
-
-        # 2. Rolling latest.md (handy for tail/watch).
-        try:
-            with open(
-                os.path.join(project_dir, "latest.md"), "w", encoding="utf-8"
-            ) as fh:
-                fh.write(md)
-        except Exception:
-            pass
-
         # 3. Append compact metrics to the evolution log.
         if self._f.valves.context_dump_write_jsonl:
             record = {
@@ -18841,6 +19019,8 @@ class ContextDumper:
                 "n_active_blocks": payload["n_active_blocks"],
                 "n_symbols": payload["n_symbols"],
                 "block_a_hash": payload["block_a_hash"],
+                # ── NEW: rebuild reason ──────────────────────────────────
+                "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
                 "code_state_hash": payload["code_state_hash"],
                 "slot_saved_hash": payload["slot_saved_hash"],
                 # ── WindowManager metrics ──────────────────────────────────
@@ -18861,9 +19041,6 @@ class ContextDumper:
                 os.path.join(project_dir, "evolution.jsonl"), "a", encoding="utf-8"
             ) as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        # 4. Prune old snapshots.
-        self._prune(project_dir)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Rendering
@@ -20068,6 +20245,16 @@ class Filter:
                 "call. Higher = fewer round trips (important under "
                 "--parallel 1, where calls cannot run concurrently) at the "
                 "cost of a larger prompt/response per call."
+            ),
+        )
+        docstring_bg_batch_size: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description=(
+                "Number of symbols per batch in the background docstring loop. "
+                "Smaller batches produce shorter prompts and reduce per-call latency. "
+                "Foreground batching (during LOD-2 pre-resolution) uses docstring_batch_size."
             ),
         )
         enable_auto_docstrings_background: bool = Field(
