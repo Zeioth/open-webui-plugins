@@ -4053,30 +4053,22 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         if self._UC_SCAFFOLD_RE.search(q):
             case = UseCase.SCAFFOLDING
-            self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (scaffolding) via regex"
-            )
+            self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_REFACTOR_RE.search(q):
             case = UseCase.REFACTORING
-            self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (refactor) via regex"
-            )
+            self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_ARCH_RE.search(q):
             case = UseCase.ARCHITECTURE
-            self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (architecture) via regex"
-            )
+            self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if self._UC_PLAN_RE.search(q):
             case = UseCase.PLANNING
-            self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (plan) via regex"
-            )
+            self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         # ------------------------------------------------------------------
@@ -4091,7 +4083,7 @@ class ContextBuilder:
         if refactor_w >= 0.30 and refactor_w >= max(debug_w, modify_w, explain_w):
             case = UseCase.REFACTORING
             self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (refactor) "
+                f"classify_use_case: detected '{case.label}' "
                 f"via intent_vector tie-break (refactor={refactor_w:.2f})"
             )
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
@@ -4099,7 +4091,7 @@ class ContextBuilder:
         if explain_w >= 0.5 and explain_w > modify_w:
             case = UseCase.ARCHITECTURE
             self._f._log_debug(
-                f"classify_use_case: detected '{case.label}' (architecture) "
+                f"classify_use_case: detected '{case.label}' "
                 f"via intent_vector tie-break (explain={explain_w:.2f} > modify={modify_w:.2f})"
             )
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
@@ -4109,7 +4101,7 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         case = UseCase.PROGRAMMING
         self._f._log_debug(
-            f"classify_use_case: default '{case.label}' (programming) - no specific signals"
+            f"classify_use_case: default '{case.label}' - no specific signals"
         )
         return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
@@ -7643,13 +7635,11 @@ class LongTermMemory:
         slot_free: bool = True,
     ) -> List[str]:
         """
-        Generate thematic queries for LTM retrieval, abstracting the original
-        question to capture architectural intent, design rationale, or problem
-        domain.
+        Generate alternative search queries for LTM retrieval.
 
-        The generated queries are used as additional search vectors in ChromaDB
-        to retrieve past conversations and high-level context that complement
-        the exact symbol matches found by the SymbolGraph (seed_inference).
+        Uses a minimalist prompt to avoid meta-commentary in the output.
+        Filters responses heuristically (no hardcoded pattern lists) to keep
+        only valid natural-language queries.
 
         Args:
             query (str): The original user question.
@@ -7670,64 +7660,48 @@ class LongTermMemory:
             return [query]
 
         # ------------------------------------------------------------------
-        # REGION 2: Build the thematic prompt
+        # REGION 2: Ultra-simple prompt (no system prompt, no metadata)
         # ------------------------------------------------------------------
         prompt = (
-            f"Given the following user question, generate {self._f.valves.multi_query_variants} high-level thematic queries "
-            "for searching a semantic memory of past conversations and architectural decisions.\n\n"
-            "STRICT RULES:\n"
-            "1. Output ONLY the queries, one per line. No labels, numbering, bullets, or meta-commentary.\n"
-            "2. Each query must be a complete, natural-language question or a short phrase (under 15 words).\n"
-            "3. Focus on the **architectural intent**, **problem domain**, or **design rationale**, not on implementation details.\n"
-            "4. If specific function/class names are mentioned, include them but wrap them in a broader context.\n"
-            "5. Vary the phrasing: one query can be a 'why' question, another a 'what' question, another a keyword list.\n"
-            "6. Do NOT simply rephrase the original question with synonyms; abstract it to a higher level.\n\n"
-            f"User question: {query[:300]}\n\n"
-            f"Use case context: {use_case_label}\n\n"
-            "Queries:"
+            f"Generate {self._f.valves.multi_query_variants} alternative search queries for:\n"
+            f'"{query[:300]}"\n\n'
+            "Output ONLY the queries, one per line. No labels, no numbering, no extra text."
         )
 
         # ------------------------------------------------------------------
-        # REGION 3: Call LLM and parse response
+        # REGION 3: Call LLM with temperature=0.0 for deterministic output
         # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=(
-                "You are a search query reformulator specialized in software architecture. "
-                "Output only the alternative queries, one per line, with no extra text."
-            ),
+            system_prompt="",  # Empty to avoid model self-reference
             model_override=self._f.valves.llm_model,
             max_tokens=80,
-            temperature=0.6,
+            temperature=0.0,
             label="multi_query_expand",
         )
 
         queries = [query]
         if response:
             # ------------------------------------------------------------------
-            # REGION 4: Filter invalid lines (strict)
+            # REGION 4: Heuristic filter (no hardcoded patterns)
             # ------------------------------------------------------------------
-            _BAD_PATTERNS = re.compile(
-                r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:|"
-                r"^\s*\d+\.\s+.*?(?:Analyze|Request|Task|Step)|"
-                r"^\s*\*\*.*?\*\*|"
-                r"^\s*[-*]\s+Task:|"
-                r"Original Question:|Thinking Process:|Analysis:)",
-                re.IGNORECASE,
-            )
-            alternatives = [
-                line.strip()
-                for line in response.strip().split("\n")
-                if line.strip()
-                and len(line.strip()) > 5
-                and not _BAD_PATTERNS.search(line.strip())
-                and not line.strip().startswith(("Original", "Thinking", "Analysis"))
-            ]
-            queries.extend(alternatives[: self._f.valves.multi_query_variants])
-            self._f._log_debug(
-                f"Multi-query expansion (thematic): {len(queries)} queries "
-                f"({[q[:40] for q in queries]})"
-            )
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                if not line or len(line) < 5:
+                    continue
+
+                # Discard lines with metadata markers (':' or leading '*', '-')
+                if ":" in line or line.startswith(("*", "-")):
+                    continue
+
+                # Keep only questions or short phrases with proper capitalization
+                if line.endswith("?") or (line[0].isupper() and len(line.split()) < 15):
+                    queries.append(line)
+
+            # Limit to configured number of variants (+1 for original)
+            queries = queries[: self._f.valves.multi_query_variants + 1]
+
+        self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
         return queries
 
     async def _rerank_results(
@@ -16726,6 +16700,8 @@ class SystemPromptBuilder:
         comes from long-term memory (past conversations, not the current chat
         history), so the LLM can correctly interpret it as external context.
 
+        Formatting is delegated to _render_ltm_section for clarity and testability.
+
         Args:
             project_id (str): The current project identifier.
             user_question (str): The cleaned user question (without code spans).
@@ -16781,26 +16757,43 @@ class SystemPromptBuilder:
             use_case_label=use_case_label,
             slot_free=slot_free,
         )
+
         if not all_meta:
+            self._f._log_debug("LTM: no memories retrieved")
             return None
 
         # ------------------------------------------------------------------
-        # REGION 4: Format and truncate
+        # REGION 4: Delegate formatting to dedicated renderer
         # ------------------------------------------------------------------
-        all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
-        unique_meta = []
-        seen_docs: Set[str] = set()
-        for m in all_meta:
-            if m["doc"] not in seen_docs:
-                seen_docs.add(m["doc"])
-                unique_meta.append(m)
+        return self._render_ltm_section(project_id, all_meta)
 
-        max_ltm = self._f.valves.ltm_retrieval_max_tokens
-        parts: List[str] = []
-        current_tokens = 0
+    def _render_ltm_section(self, project_id: str, memories: list) -> str:
+        """
+        Render the LTM section with a clear header and per-fragment labels.
+
+        This method is separated from retrieval logic to make formatting
+        easier to test and debug independently.
+
+        Args:
+            project_id (str): The current project identifier.
+            memories (list): List of memory dicts with 'doc', 'timestamp', and 'meta'.
+
+        Returns:
+            str: The fully formatted LTM section, or empty string if no valid fragments.
+        """
+        # ------------------------------------------------------------------
+        # REGION 1: Sort and deduplicate
+        # ------------------------------------------------------------------
+        memories.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+        seen = set()
+        unique = []
+        for m in memories:
+            if m["doc"] not in seen:
+                seen.add(m["doc"])
+                unique.append(m)
 
         # ------------------------------------------------------------------
-        # REGION 5: Build header with explicit LTM origin
+        # REGION 2: Build header with explicit LTM origin
         # ------------------------------------------------------------------
         header = (
             "## Relevant Past Context (long-term memory)\n\n"
@@ -16809,12 +16802,22 @@ class SystemPromptBuilder:
             "They are NOT part of the current chat history.\n\n"
         )
 
-        for mem in unique_meta:
+        # ------------------------------------------------------------------
+        # REGION 3: Render each fragment with proper label
+        # ------------------------------------------------------------------
+        parts = []
+        max_tokens = self._f.valves.ltm_retrieval_max_tokens
+        current_tokens = 0
+
+        for mem in unique:
             ts = mem.get("timestamp")
+
+            # Build the label with timestamp if available
             if ts and ts > 1_000_000_000:
                 time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
                     "%Y-%m-%d %H:%M:%SZ"
                 )
+                # Check if this is a skeleton snapshot (special formatting)
                 if mem.get("meta", {}).get("is_skeleton"):
                     saved_hash = mem.get("meta", {}).get("code_state_hash", "")
                     current_hash = self._f._activation.compute_code_state_hash(
@@ -16825,21 +16828,31 @@ class SystemPromptBuilder:
                         if saved_hash and saved_hash == current_hash
                         else "stale — code changed since"
                     )
-                    text = f"[Skeleton snapshot {time_str} — {fresh}]\n" f"{mem['doc']}"
+                    text = f"[Skeleton snapshot {time_str} — {fresh}]\n{mem['doc']}"
                 else:
                     text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
                 text = f"[Past conversation — unknown date]\n{mem['doc']}"
 
-            frag_tok = self._f._tokens.estimate_code_tokens(text)
-            if max_ltm > 0 and current_tokens + frag_tok > max_ltm:
-                continue
+            # Apply token budget
+            tok = self._f._tokens.estimate_code_tokens(text)
+            if max_tokens > 0 and current_tokens + tok > max_tokens:
+                break
             parts.append(text)
-            current_tokens += frag_tok
+            current_tokens += tok
 
         if not parts:
-            return None
-        return header + "\n---\n".join(parts)
+            self._f._log_debug("LTM: no parts after truncation")
+            return ""
+
+        # ------------------------------------------------------------------
+        # REGION 4: Assemble and log
+        # ------------------------------------------------------------------
+        full_text = header + "\n---\n".join(parts)
+        self._f._log_debug(
+            f"LTM section rendered ({len(parts)} fragments, ~{current_tokens} tokens)"
+        )
+        return full_text
 
     async def _build_parallel_checks(
         self,
