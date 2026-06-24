@@ -19094,6 +19094,9 @@ class ProjectStateManager:
         # --- 3. Check if file exists ---
         slot_dir = self._f.valves.slot_save_path.rstrip("/")
         file_path = os.path.join(slot_dir, filename)
+        self._f._log_debug(
+            f"slot_restore_for_continuity: looking for {file_path} (hash={static_hash})"
+        )
         if not os.path.exists(file_path):
             self._f._log_debug(
                 f"slot_restore_for_continuity: file not found: {file_path}, skipping"
@@ -19386,11 +19389,15 @@ class SemanticSeedInferencer:
           - Token in all_qids → exact match, full score.
           - Bare token (no '.') → get_qualified_names_for → all qids sharing
             that bare name; score divided among ambiguities.
-          - Hallucinated token (not in index) → discarded silently.
+          - Hallucinated token (not in index) → try fuzzy matching against
+            all_qids using rapidfuzz (token_set_ratio) with threshold 0.85.
+            If a match is found, assign the score with a 0.8 penalty.
+          - If fuzzy fails, discard silently.
         """
         score = self._f.valves.seed_inference_score
         max_syms = self._f.valves.seed_inference_max_symbols
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+        all_qids_lower = {qid.lower(): qid for qid in all_qids}
 
         seeds: Dict[str, float] = {}
         for line in response.splitlines():
@@ -19403,25 +19410,52 @@ class SemanticSeedInferencer:
             if not token:
                 continue
 
+            # ── 1. Exact match ──────────────────────────────────────────────
             if token in all_qids:
-                # Qualified id exact — highest confidence.
                 seeds[token] = max(seeds.get(token, 0.0), score)
-            else:
-                # Bare name — resolve to all matching qids.
-                qids = {
-                    q
-                    for q in self._f._symbol_index.get_qualified_names_for(
-                        token, project_id
+                continue
+
+            # ── 2. Bare name resolution ──────────────────────────────────────
+            qids = {
+                q
+                for q in self._f._symbol_index.get_qualified_names_for(
+                    token, project_id
+                )
+                if q in all_qids
+            }
+            if qids:
+                share = score / len(qids)
+                for q in qids:
+                    seeds[q] = max(seeds.get(q, 0.0), share)
+                continue
+
+            # ── 3. Fuzzy matching (new) ──────────────────────────────────────
+            if HAS_FUZZ:
+                from rapidfuzz import fuzz
+
+                token_lower = token.lower()
+                # Find best match among all qualified ids
+                best_match = None
+                best_ratio = 0.0
+                for qid_lower, qid in all_qids_lower.items():
+                    ratio = fuzz.token_set_ratio(token_lower, qid_lower)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_match = qid
+                if (
+                    best_match
+                    and best_ratio >= self._f.valves.seed_inference_fuzzy_threshold
+                ):
+                    # Apply a penalty (0.8) for fuzzy matches
+                    fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
+                    seeds[best_match] = max(seeds.get(best_match, 0.0), fuzzy_score)
+                    self._f._log_debug(
+                        f"SemanticSeedInferencer: fuzzy matched '{token}' → '{best_match}' (ratio={best_ratio:.0f}%)"
                     )
-                    if q in all_qids
-                }
-                if qids:
-                    # Proportionate score: if ambiguous, split.
-                    # PPR will propagate from each qid; the most relevant one
-                    # will differentiate via graph topology.
-                    share = score / len(qids)
-                    for q in qids:
-                        seeds[q] = max(seeds.get(q, 0.0), share)
+                    continue
+
+            # If no match, discard silently
+            self._f._log_debug(f"SemanticSeedInferencer: no match for '{token}'")
 
         if seeds:
             sample = sorted(seeds)[:8]
@@ -20047,9 +20081,9 @@ class Filter:
         )
         path_summary_max_tokens: int = Field(default=80)
         # ── LOD thresholds ──────────────────────────────────────────
-        lod1_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
-        lod2_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
-        lod3_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
+        lod1_threshold: float = Field(default=0.20, ge=0.0, le=1.0)
+        lod2_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+        lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
         # ── LOD by use case ───────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
@@ -20626,6 +20660,19 @@ class Filter:
             default=200,
             ge=50,
             description="Token cap for the planner's response.",
+        )
+        # ── Fuzzy matching for rapidfuzz ──────────────────────────────
+        seed_inference_fuzzy_threshold: float = Field(
+            default=0.85,
+            ge=0.6,
+            le=1.0,
+            description="Minimum token_set_ratio for fuzzy matching of hallucinated ids.",
+        )
+        seed_inference_fuzzy_penalty: float = Field(
+            default=0.8,
+            ge=0.5,
+            le=1.0,
+            description="Score multiplier for symbols found via fuzzy matching.",
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
