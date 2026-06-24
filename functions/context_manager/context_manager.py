@@ -1054,11 +1054,11 @@ class ConversationStateManager:
         Migrated from the while loop in StateStore.get_state().
         Centralised here so both get() and set() can trigger it.
 
-        IMPORTANT: Flushes dirty state synchronously before eviction to avoid
-        data loss. Since this method is synchronous, we cannot await the async
-        save path; we use a synchronous write (see _db_conn_write_sync in
-        StateStore). If that method is not available, the dirty state will be
-        lost; consider implementing it or using an alternative.
+        IMPORTANT: Flushes dirty state before eviction to avoid data loss.
+        The blocking DB write is offloaded to the thread pool with a timeout
+        to prevent event-loop stalls. If the write times out or fails, the
+        state may be lost (logged) but eviction proceeds to keep the cache
+        within bounds.
         """
         max_cached = self._f.valves.max_cached_projects
         while len(self._cache) > max_cached:
@@ -1067,14 +1067,25 @@ class ConversationStateManager:
             # ── Flush dirty state before eviction ─────────────────────────
             if oldest_pid in self._dirty:
                 try:
-                    # Synchronous write to DB (must be implemented in StateStore)
-                    # If not available, this will raise AttributeError; catch and log.
-                    serialized = self._f._state_store._db_conn_write_sync(
-                        oldest_pid, oldest_state
+                    # Offload blocking DB write to the thread pool
+                    # so the event loop is not stalled during eviction.
+                    import concurrent.futures
+
+                    future = self._f._db_executor.submit(
+                        self._f._state_store._db_conn_write_sync,
+                        oldest_pid,
+                        oldest_state,
                     )
+                    # Wait with a timeout to prevent indefinite blocking
+                    future.result(timeout=10.0)
                     self._f._log_debug(
                         f"ConversationStateManager: flushed dirty state for "
                         f"'{oldest_pid}' before LRU eviction"
+                    )
+                except concurrent.futures.TimeoutError:
+                    self._f._log_debug(
+                        f"ConversationStateManager: flush timed out for "
+                        f"'{oldest_pid}' — state may be lost"
                     )
                 except AttributeError:
                     self._f._log_debug(
@@ -1087,6 +1098,7 @@ class ConversationStateManager:
                         f"for '{oldest_pid}': {e} — state may be lost"
                     )
 
+            # ── Clear all per-project state ────────────────────────────────
             self._f._symbol_index.clear_project(oldest_pid)
             self._f._path_index.clear_project(oldest_pid)
             self._f._pager.clear_project(oldest_pid)
@@ -3502,6 +3514,20 @@ class ContextBuilder:
         state.hub_tier_qids_persisted = kept
         self._f._conversation_state_manager.set(project_id, state)  # marks dirty
 
+        # ── Tier hash hit/miss logging ──────────────────────────────
+        previous_tier_hash = pstate.get("last_tier_hash")
+        if previous_tier_hash and previous_tier_hash != tier_hash:
+            self._f._log_debug(
+                f"⚠️ TIER CACHE MISS: tier_hash changed "
+                f"({previous_tier_hash} → {tier_hash}). "
+                f"Hub bodies will be re-prefilled."
+            )
+        elif not previous_tier_hash:
+            self._f._log_debug(f"TIER CACHE: first tier built ({tier_hash})")
+        else:
+            self._f._log_debug(f"✓ TIER CACHE HIT: tier_hash stable ({tier_hash})")
+        pstate["last_tier_hash"] = tier_hash
+
         return tier_text, tier_hash, kept
 
     def _resolve_hub_body(
@@ -4188,7 +4214,7 @@ class ContextBuilder:
         # --- 1. Resolve project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── NEW: Global scope detection ──────────────────────────────────────
+        # ── Global scope detection ──────────────────────────────────────
         # Queries like "check all orphan calls" need visibility of the ENTIRE graph.
         # Seed inference returns {} for them (see SemanticSeedInferencer.is_global_scope).
         # Here we force the most informative mode and activate multi‑phase.
@@ -4593,12 +4619,15 @@ class ContextBuilder:
                         self._f.valves.max_code_block_tokens > 0
                         and tok > self._f.valves.max_code_block_tokens
                     )
+
+                    # ── Handle oversized blocks ────────────────────────────
                     if (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "warn"
                     ):
                         content_to_inject = self._f.valves.code_block_warn_message
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
                     elif (
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "summarize"
@@ -4617,6 +4646,21 @@ class ContextBuilder:
                             )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
+                    # ── Truncate action ──────────────────
+                    elif (
+                        _is_oversized
+                        and self._f.valves.code_block_overflow_action == "truncate"
+                    ):
+                        content_to_inject = self._f._tokens.truncate_text_to_tokens(
+                            content_to_inject,
+                            self._f.valves.max_code_block_tokens,
+                        )
+                        content_to_inject += (
+                            "\n# ... [truncated — use /expand for full body]"
+                        )
+                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
+                    # ── Optional: LLMLingua compression (if enabled) ───────
                     if (
                         slot_free
                         and self._f.valves.enable_code_compression
@@ -5470,7 +5514,8 @@ class SymbolIndex:
 # SignatureExtractor – tree‑sitter based symbol and call extraction
 # ---------------------------------------------------------------------------
 class SignatureExtractor:
-    """Extracts ``CodeSymbol`` lists and call relationships from source code
+    """
+    Extracts ``CodeSymbol`` lists and call relationships from source code
     using tree‑sitter for precise, qualified results.
 
     Each returned symbol carries a **qualified identity** (``ClassName.method``
@@ -5484,6 +5529,12 @@ class SignatureExtractor:
     Docstrings are extracted statically for Python via the ``ast`` module;
     for other languages (or when the source lacks a docstring), they are
     filled in later by the LLM‑driven ``ensure_docstrings_batch`` path.
+
+    Caching:
+        Results are cached with a 1-hour TTL to avoid re-parsing the same
+        code block multiple times within a session. The cache stores raw
+        symbols (before parent enrichment) and returns deep copies to
+        prevent mutation of cached entries.
     """
 
     MAX_PARSE_SIZE_BYTES = 5_000_000
@@ -5505,6 +5556,20 @@ class SignatureExtractor:
 
     _parser_cache: Dict[str, Any] = {}
     _parser_cache_lock = threading.Lock()
+
+    # ── NEW: extraction cache ──────────────────────────────────────────────
+    _extraction_cache: Dict[str, Tuple[List["CodeSymbol"], float]] = {}
+    _EXTRACTION_CACHE_MAXSIZE: int = 128
+    _EXTRACTION_CACHE_TTL: int = 3600  # 1 hour
+    _EXTRACTION_CACHE_LOCK = threading.Lock()
+
+    @staticmethod
+    def _cache_key(code: str, file_path: Optional[str], language: Optional[str]) -> str:
+        """
+        Generate a deterministic cache key for a code extraction request.
+        """
+        h = hashlib.md5(code.encode()).hexdigest()[:16]
+        return f"{h}|{file_path or ''}|{language or ''}"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Language detection
@@ -5554,7 +5619,7 @@ class SignatureExtractor:
         return "unknown"
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Main extraction entry point
+    # 2. Main extraction entry point (with caching)
     # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
@@ -5568,9 +5633,26 @@ class SignatureExtractor:
         Falls back to an empty list when tree-sitter is unavailable or fails,
         logging a warning — no fallback extraction is attempted, to avoid
         corrupting the symbol index with unqualified data.
+
+        Results are cached with a 1-hour TTL to avoid re-parsing the same
+        code block multiple times. The cache stores raw symbols (before
+        parent enrichment) and returns deep copies.
         """
+        # ── Cache check (before any validation) ──────────────────────────
+        cache_key = SignatureExtractor._cache_key(code, file_path, language)
+        with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+            if cache_key in SignatureExtractor._extraction_cache:
+                cached_symbols, ts = SignatureExtractor._extraction_cache[cache_key]
+                if time.time() - ts < SignatureExtractor._EXTRACTION_CACHE_TTL:
+                    # Return deep copies to prevent mutation of cached entries.
+                    return [s.copy() for s in cached_symbols]
+                else:
+                    del SignatureExtractor._extraction_cache[cache_key]
+
+        # ── Size validation ──────────────────────────────────────────────
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             return []
+
         if not HAS_TREE_SITTER:
             logger.warning(
                 "tree-sitter not available — skipping symbol extraction. "
@@ -5585,6 +5667,7 @@ class SignatureExtractor:
             )
             return []
 
+        # ── Parse ──────────────────────────────────────────────────────────
         try:
             loop = asyncio.get_event_loop()
             tree = await asyncio.wait_for(
@@ -5600,11 +5683,14 @@ class SignatureExtractor:
             )
             return []
 
+        # ── Extract symbols and calls ─────────────────────────────────────
         syms = SignatureExtractor._extract_symbols_from_tree(
             tree, lang, code, file_path
         )
         call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
         del tree
+
+        # ── Populate call relationships ──────────────────────────────────
         for sym in syms:
             qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
             calls = list(call_map.get(qid, []))
@@ -5613,8 +5699,25 @@ class SignatureExtractor:
                     if c not in calls:
                         calls.append(c)
             sym.calls = calls
+
+        # ── Python docstring extraction (static) ─────────────────────────
         if lang == "python" or (file_path and file_path.endswith(".py")):
             SignatureExtractor._extract_docstrings_python(code, syms)
+
+        # ── Cache store (after successful extraction) ────────────────────
+        with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+            if (
+                len(SignatureExtractor._extraction_cache)
+                >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
+            ):
+                # Evict oldest entry (by timestamp)
+                oldest_key = min(
+                    SignatureExtractor._extraction_cache,
+                    key=lambda k: SignatureExtractor._extraction_cache[k][1],
+                )
+                del SignatureExtractor._extraction_cache[oldest_key]
+            SignatureExtractor._extraction_cache[cache_key] = (syms, time.time())
+
         return syms
 
     @staticmethod
@@ -18075,13 +18178,21 @@ class MessageAssembler:
         project_id: str,
         pending_summary: str,
     ) -> List[dict]:
-        """Assemble final system prompt, inject it, and log token breakdown."""
+        """
+        Assemble final system prompt, inject it, and log token breakdown.
+
+        The stable prefix (Block A + hub-bodies tier) is placed FIRST in the
+        system prompt to maximize KV cache reusability. User instructions
+        (base_content) are appended LAST — they are the dynamic tail and do
+        not affect the stable prefix.
+        """
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
         # --- Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
+        # ── Build dynamic_block from injections (budget-aware) ──
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
             selected_dynamic: List[str] = []
@@ -18098,9 +18209,8 @@ class MessageAssembler:
                 if getattr(self._f, "_original_system_prompt", "")
                 else 0
             )
-            # The user's system prompt is never truncated or dropped to fit
-            # the budget — only CodeAware's own dynamic injections are
-            # rationed against what remains after static block + user prompt.
+            # User system prompt is never truncated — only CodeAware's
+            # dynamic injections are rationed.
             dyn_budget = max(0, budget - static_tokens - user_prompt_tokens)
 
             for prio, text in dynamic_injections:
@@ -18120,25 +18230,31 @@ class MessageAssembler:
             dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
         separator = "\n\n---\n\n" if static_block and dynamic_block else ""
+
+        # ── Stable prefix: Block A + tier ────────────────────────────
+        # This is placed FIRST so it is KV-cacheable across turns.
         codeaware_block = static_block + separator + dynamic_block
 
-        # The user's own system prompt was captured ONCE at the start of
-        # inlet (InletOrchestrator.inlet_extract_user_info), before any
-        # compression/trim step could touch it. Re-reading `messages` here
-        # would risk picking up a mangled/stripped version if an upstream
-        # step rewrote the system role (e.g. history LLMLingua compression),
-        # and would only preserve the first of several system messages.
-        # Inject it FIRST, clearly delimited, so user instructions are not
-        # buried under CodeAware's own injections and so the model's
-        # instruction-following sees them at the top of the system turn.
+        # ── User instructions (dynamic tail) ─────────────────────────
+        # Appended LAST so changes to it do not shift the stable prefix.
         base_content = getattr(self._f, "_original_system_prompt", "") or ""
 
+        # ── Assemble final system ────────────────────────────────────
         final_system_parts = []
-        if base_content.strip():
-            final_system_parts.append("## User instructions\n" + base_content.strip())
         if codeaware_block.strip():
             final_system_parts.append(codeaware_block)
         final_system = "\n\n---\n\n".join(final_system_parts)
+
+        # User instructions go LAST — they are the dynamic tail.
+        if base_content.strip():
+            if final_system.strip():
+                final_system = (
+                    final_system
+                    + "\n\n---\n\n## User instructions\n"
+                    + base_content.strip()
+                )
+            else:
+                final_system = "## User instructions\n" + base_content.strip()
 
         # Append pending summary if any
         if pending_summary:
@@ -18186,11 +18302,11 @@ class MessageAssembler:
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
-            self._f._log_debug(
-                f"  User system prompt (captured): ~{base_tok} tokens (first)"
-            )
             self._f._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
             self._f._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
+            self._f._log_debug(
+                f"  User instructions (tail):      ~{base_tok} tokens (LAST)"
+            )
             self._f._log_debug(
                 f"  TOTAL system tokens:          ~{total_system_tok} tokens"
             )
@@ -18202,10 +18318,7 @@ class MessageAssembler:
                 f"  → If hash changed:            KV cache MISS, full prefill"
             )
             if self._f.valves.enable_multi_phase_response:
-                if "_mp_available" not in dir():
-                    self._f._log_debug(
-                        "  Multi-phase:                  (see earlier log)"
-                    )
+                self._f._log_debug("  Multi-phase:                  (see earlier log)")
             if (
                 self._f.valves.enable_code_history_compression
                 or self._f.valves.enable_lean_user_code
