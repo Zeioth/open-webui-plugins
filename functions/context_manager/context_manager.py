@@ -517,20 +517,6 @@ class ActivationState(BaseModel):
 class ConversationState(BaseModel):
     """
     Persistent conversation state for a single project.
-
-    This model replaces the raw dictionary previously returned by _state_factory.
-    All fields have sensible defaults equivalent to the initial empty state.
-
-    Advantages:
-    - Complete inventory of all persistent flags in one place.
-    - Attribute access (state.message_count) instead of dict keys.
-    - Type validation via Pydantic v2.
-    - Parallel structure with ProjectStateManager (volatile state).
-
-    Serialization notes (Phase 1):
-    StateStore._save_state_to_db and _load_from_db continue to use dict
-    serialization internally; they are adapted to read/write attributes rather
-    than dict keys. Full SQLite layer refactoring is Phase 2.
     """
 
     model_config = {"arbitrary_types_allowed": True}
@@ -558,16 +544,12 @@ class ConversationState(BaseModel):
     summarized_turn_hwm: int = 0
 
     # ── History compression tracker ──────────────────────────────────────
-    # Migrated from pstate: persists across restarts so that
-    # force_compress_after_turns works correctly.
     history_blocked_age: Dict[str, int] = Field(default_factory=dict)
 
     # ── KV slot persistence ───────────────────────────────────────────────
     pending_slot_resave: bool = False
 
     # ── WindowManager instrumentation (persistent metrics) ───────────────
-    # These are not stored in pstate; they survive server restarts so that
-    # evolution.jsonl reflects real history.
     wm_fired: bool = False
     wm_msgs_evicted: int = 0
     wm_turns_evicted: int = 0
@@ -578,23 +560,15 @@ class ConversationState(BaseModel):
     wm_degradation_guard: bool = False
 
     # ── Hub‑Bodies Tier tracker (cross‑restart stability) ────────────────
-    # These four fields ensure that the Hub‑Bodies Tier survives server
-    # restarts without re‑sealing all hubs and changing the tier_hash.
-    #
-    # hub_tier_last_modified:  turn number when each symbol's body last changed.
-    #                          Used to order hubs by stability (oldest first).
-    # hub_tier_body_hashes:    hash of each symbol's body, used to detect
-    #                          changes and update last_modified.
-    # hub_tier_query_heat:     EWMA of how often each symbol is a seed of the
-    #                          current query. Hot hubs move lower in the tier
-    #                          to reduce re‑prefill cost on edits.
-    # hub_tier_qids_persisted: snapshot of tier qids from the last build,
-    #                          used as a fallback for ContextPager on first
-    #                          turn after restart (Bug 5).
     hub_tier_last_modified: Dict[str, int] = Field(default_factory=dict)
     hub_tier_body_hashes: Dict[str, str] = Field(default_factory=dict)
     hub_tier_query_heat: Dict[str, float] = Field(default_factory=dict)
     hub_tier_qids_persisted: List[str] = Field(default_factory=list)
+
+    # ── Persistent compression stubs for large user messages ──────
+    compressed_user_messages: Dict[str, str] = Field(default_factory=dict)
+    # key: md5 hash of the original message content (16 hex chars)
+    # value: the stub text that replaces it in the conversation history
 
     def reset_wm_metrics(self) -> None:
         """Reset all WindowManager instrumentation flags at the start of each turn."""
@@ -13987,129 +13961,93 @@ class HistoryCompressor:
     # 2. Lean user code compression (replace large user code blocks with stubs)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def lean_user_code_messages(self, messages: list, project_id: str) -> list:
+    def _build_user_stub(self, symbol_count: int) -> str:
         """
-        Replace large user code blocks with compact stubs to save context space.
+        Generate a stub message for a large user code block.
 
-        The stub is hardcoded with a fixed message indicating the code has been
-        compressed. The original code is stored in LTM and SymbolIndex, recoverable
-        via /expand or LOD activation. The stub length is capped by the
-        `lean_user_code_stub_max_tokens` valve.
-
-        Two detection paths:
-        1. Fenced code blocks (```language ... ```): Replaced individually.
-        2. Raw pastes (no backticks): Entire message replaced if it looks like code.
+        This stub is used both during silent ingestion and in the normal
+        message compression flow. It informs the model that the code is
+        already indexed and available via /expand, avoiding redundant
+        token consumption.
 
         Args:
-            messages (list): List of conversation message dicts.
-            project_id (str): Current project identifier.
+            symbol_count (int): Number of symbols currently indexed in the SymbolGraph.
 
         Returns:
-            list: Updated messages with compressed user messages.
+            str: The stub text, ready for injection into the conversation history.
         """
-        # ── 1. Early exit if feature is disabled ──────────────────────────
+        return (
+            f"_(The code is internally available; no need to repeat it here.)_\n\n"
+            f"_[{symbol_count} symbols indexed in SymbolGraph. Use /expand <name> to see any implementation.]_"
+        )
+
+    def ensure_compressed_user_messages(
+        self,
+        messages: list,
+        state: ConversationState,
+        project_id: str,
+    ) -> list:
+        """
+        Replace long user messages with compressed stubs, using persistent state.
+
+        This method is called during message assembly (in MessageAssembler)
+        and ensures that any user message exceeding lean_user_code_min_tokens
+        is replaced by a compact stub. The stub is stored in ConversationState
+        under compressed_user_messages, keyed by MD5 hash of the original content.
+
+        If a stub already exists for a given message, it is reused. If not,
+        a new stub is generated, stored, and the state is marked dirty for
+        persistence in SQLite.
+
+        Args:
+            messages (list): The list of conversation messages (dicts).
+            state (ConversationState): The persistent state for the current project.
+            project_id (str): The current project identifier.
+
+        Returns:
+            list: The updated list of messages, with long user messages replaced by stubs.
+        """
         if not self._f.valves.enable_lean_user_code:
             return messages
 
-        # ── 2. Get max stub tokens ────────────────────────────────────────
-        max_stub_tokens = self._f.valves.lean_user_code_stub_max_tokens
+        min_tokens = self._f.valves.lean_user_code_min_tokens
 
-        # ── 3. Count indexed symbols ──────────────────────────────────────
-        try:
-            symbol_count = len(self._f._symbol_index.get_all_names(project_id))
-        except Exception:
-            symbol_count = 0
-
-        # Skip if symbol index is too sparse (stub would be misleading)
+        # Avoid compressing when the symbol index is too sparse (stub would be misleading)
+        symbol_count = len(self._f._symbol_index.get_all_names(project_id))
         if symbol_count < 20:
             return messages
 
-        # ── 4. Compile regex and constants ────────────────────────────────
-        _CODE_BLOCK = re.compile(r"```(?P<lang>\w*)\n(?P<body>.*?)```", re.DOTALL)
-        _ALREADY_LEAN = "[CÓDIGO COMPRIMIDO"
-        min_tokens = self._f.valves.lean_user_code_min_tokens
-
-        # Hardcoded stub template
-        STUB_TEMPLATE = (
-            "[CÓDIGO COMPRIMIDO — {tokens:,} tokens — "
-            "{symbol_count} símbolos indexados en SymbolGraph. "
-            "Recuperar implementaciones con /expand <nombre> o via LOD.]"
-        )
-
-        new_messages = list(messages)
-
-        # ── 5. Iterate over messages ─────────────────────────────────────
-        for i, msg in enumerate(new_messages):
+        new_messages = []
+        for msg in messages:
             if msg.get("role") != "user":
+                new_messages.append(msg)
                 continue
 
             content = msg.get("content", "")
-            if _ALREADY_LEAN in content:
-                continue  # Already compressed, skip
 
-            # ── 5a. Case 1: Fenced code blocks ───────────────────────────
-            total_fenced_tokens = sum(
-                self._f._tokens.estimate_tokens(m.group("body"))
-                for m in _CODE_BLOCK.finditer(content)
-            )
-
-            if total_fenced_tokens >= min_tokens:
-
-                def _replace(match: re.Match) -> str:
-                    body = match.group("body")
-                    lang = match.group("lang") or "code"
-                    blk_tokens = self._f._tokens.estimate_tokens(body)
-
-                    if blk_tokens < min_tokens:
-                        return match.group(0)
-
-                    # Generate stub from hardcoded template
-                    stub_text = STUB_TEMPLATE.format(
-                        tokens=blk_tokens, symbol_count=symbol_count
-                    )
-
-                    # Apply token limit if configured
-                    if max_stub_tokens > 0:
-                        stub_text = self._f._tokens.truncate_text_to_tokens(
-                            stub_text, max_stub_tokens
-                        )
-
-                    return f"```{lang}\n{stub_text}\n```"
-
-                new_content = _CODE_BLOCK.sub(_replace, content)
-                if new_content != content:
-                    new_messages[i] = {**msg, "content": new_content}
+            # Skip messages that are already short enough
+            if self._f._tokens.estimate_code_tokens(content) < min_tokens:
+                new_messages.append(msg)
                 continue
 
-            # ── 5b. Case 2: Raw paste without fences ─────────────────────
-            total_msg_tokens = self._f._tokens.estimate_code_tokens(content)
-            if total_msg_tokens >= min_tokens:
-                code_indicators = any(
-                    kw in content[:2000]
-                    for kw in (
-                        "def ",
-                        "class ",
-                        "import ",
-                        "async def ",
-                        "return ",
-                        "function ",
-                    )
-                )
-                if code_indicators:
-                    stub_text = STUB_TEMPLATE.format(
-                        tokens=total_msg_tokens, symbol_count=symbol_count
-                    )
+            # Compute a stable hash of the original content
+            content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
 
-                    if max_stub_tokens > 0:
-                        stub_text = self._f._tokens.truncate_text_to_tokens(
-                            stub_text, max_stub_tokens
-                        )
+            # Reuse existing stub if available
+            if content_hash in state.compressed_user_messages:
+                stub = state.compressed_user_messages[content_hash]
+                new_messages.append({**msg, "content": stub})
+                continue
 
-                    new_messages[i] = {**msg, "content": stub_text}
-                    self._f._log_debug(
-                        f"Lean user code (raw paste): message {i} — "
-                        f"replaced ~{total_msg_tokens:,} tokens with stub"
-                    )
+            # Generate new stub (no truncation needed – stub is naturally short)
+            stub = self._build_user_stub(symbol_count)
+
+            # Store in state and mark dirty for persistence
+            state.compressed_user_messages[content_hash] = stub
+            self._f._conversation_state_manager.mark_dirty(project_id)
+
+            # Replace the message content with the stub
+            new_messages.append({**msg, "content": stub})
 
         return new_messages
 
@@ -17867,7 +17805,9 @@ class MessageAssembler:
         project_id: str,
         dynamic_injections: List[Tuple[str, str]],
     ) -> List[dict]:
-        """Apply code history compression and lean user code if enabled."""
+        """
+        Apply code history compression and lean user code if enabled.
+        """
         if not (
             self._f.valves.enable_code_history_compression
             or self._f.valves.enable_lean_user_code
@@ -17880,8 +17820,9 @@ class MessageAssembler:
             )
 
         if self._f.valves.enable_lean_user_code:
-            messages = self._f._history_compressor.lean_user_code_messages(
-                messages, project_id
+            state = self._f._conversation_state_manager.get(project_id)
+            messages = self._f._history_compressor.ensure_compressed_user_messages(
+                messages, state, project_id
             )
 
         _refactor_state = self._f._history_compressor.build_refactor_state_injection(
@@ -19850,13 +19791,6 @@ class Filter:
                 "In real life applies to LOD3 mostly."
             ),
         )
-        lean_user_code_stub_max_tokens: int = Field(
-            default=60,
-            description=(
-                "After this many tokens, truncade the code in the chat history. "
-                "Set to 0 for unlimited (use with caution)."
-            ),
-        )
         # ── Conversation summaries ──────────────────────────────────
         summarize_old_messages: bool = Field(
             default=True,
@@ -21196,6 +21130,7 @@ class Filter:
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Pre‑process the request before the LLM sees it.
@@ -21405,11 +21340,9 @@ class Filter:
                     pstate["hub_tier_text"] = tier_text
                     pstate["hub_tier_hash"] = tier_hash
                     pstate["hub_tier_qids"] = tier_qids
-                    # Attribute, not dict key
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
 
-                    # Launch background prefill
                     asyncio.create_task(
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
@@ -21418,35 +21351,32 @@ class Filter:
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
-                # Get state via ConversationStateManager
+                # Get final counts after indexing
                 state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
+                # ── Generate and store stub (no truncation) ──
+                stub = self._history_compressor._build_user_stub(num_symbols)
+
+                # Store stub in state so it persists for future turns
+                content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
+                state.compressed_user_messages[content_hash] = stub
+                self._conversation_state_manager.mark_dirty(project_id)
+
+                # Replace the current user message with the stub
+                messages[-1] = {**messages[-1], "content": stub}
+
+                # Build the assistant response
                 response = (
                     f"✅ {num_symbols} symbols in {num_classes} classes "
                     f"({num_blocks} active blocks). Code is in the SymbolGraph. "
                     f"Use `/expand <Class>` or `/expand <Class>.<method>` to see implementations."
                 )
-
-                # ── Silent ingestion stub respects lean_user_code_stub_max_tokens ──
-                _si_stub_body = (
-                    f"# [COMPRESSED CODE — {num_symbols} symbols indexed in SymbolGraph]\n"
-                    f"# Use /expand <name> to see any implementation."
-                )
-                _si_max_stub = self.valves.lean_user_code_stub_max_tokens
-                if _si_max_stub > 0:
-                    _si_stub_body = self._tokens.truncate_text_to_tokens(
-                        _si_stub_body, _si_max_stub
-                    )
-                compressed_stub = (
-                    f"```python\n{_si_stub_body}\n```\n\n"
-                    f"_(The code is internally available; no need to repeat it here.)_"
-                )
-                messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
 
+                # ── Context dump (if enabled) ────────────────────────────────────
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -21843,9 +21773,6 @@ class Filter:
                 )
                 await self._state_store.run_db_checkpoints()
             self._log_debug("outlet: after DB checkpoints")
-
-            # ── Slot save (ya movido al principio; esta parte se elimina) ──
-            # ELIMINADO: ya se ha guardado al inicio del outlet
 
             # ── Purge old versions ─────────────────────────────────────
             self._log_debug("outlet: before purge old versions")
