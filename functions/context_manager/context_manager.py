@@ -22,7 +22,6 @@ import asyncio
 import threading
 import textwrap
 import numpy as np
-from enum import Enum
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable
