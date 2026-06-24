@@ -19069,6 +19069,9 @@ class ProjectStateManager:
             bool: True if the slot was restored successfully.
         """
         if not self._f.valves.enable_slot_persistence:
+            self._f._log_debug(
+                "slot_restore_for_continuity: disabled (enable_slot_persistence=False)"
+            )
             return False
 
         # --- 1. Resolve per-project state ---
@@ -19081,19 +19084,31 @@ class ProjectStateManager:
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
             else:
+                self._f._log_debug(
+                    "slot_restore_for_continuity: no static hash available, skipping"
+                )
                 return False
 
         filename = self._slot_filename(project_id, static_hash)
 
         # --- 3. Check if file exists ---
         slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.exists(os.path.join(slot_dir, filename)):
+        file_path = os.path.join(slot_dir, filename)
+        if not os.path.exists(file_path):
+            self._f._log_debug(
+                f"slot_restore_for_continuity: file not found: {file_path}, skipping"
+            )
             return False
 
         # --- 4. Call llama.cpp API to restore ---
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3]
+
+        self._f._log_debug(
+            f"slot_restore_for_continuity: attempting restore for '{project_id}' "
+            f"with hash {static_hash} -> {filename}"
+        )
 
         try:
             session = await _shared_get_http_session(
@@ -19111,13 +19126,16 @@ class ProjectStateManager:
                         f"({data.get('n_restored', '?')} tokens)"
                     )
                     return True
+
                 body = await resp.text()
                 self._f._log_debug(
-                    f"KV cache continuity restore failed: HTTP {resp.status} — {body}"
+                    f"slot_restore_for_continuity: restore failed: "
+                    f"HTTP {resp.status} — {body}"
                 )
                 return False
+
         except Exception as e:
-            self._f._log_debug(f"KV cache continuity restore error: {e}")
+            self._f._log_debug(f"slot_restore_for_continuity: error: {e}")
             return False
 
     def _slot_filename(self, project_id: str, static_hash: str) -> str:
@@ -19518,7 +19536,7 @@ class Filter:
             description="Total token capacity of the LLM server. Must match the llama.cpp --ctx-size exactly.",
         )
         active_context_max_tokens: int = Field(
-            default=8000,
+            default=15000,
             description="Maximum tokens for code context injected in Block B (LOD‑activated code).",
         )
         history_max_tokens: int = Field(
@@ -19549,7 +19567,7 @@ class Filter:
         )
         # ── Per‑block limits ───────────────────────────────────────
         max_code_block_tokens: int = Field(
-            default=4000,
+            default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited. See code_block_overflow_action.",
         )
         code_block_overflow_action: str = Field(
@@ -19620,7 +19638,7 @@ class Filter:
         enable_contextual_retrieval: bool = Field(default=True)
         contextual_retrieval_mode: str = Field(default="metadata")
         enable_multi_query_retrieval: bool = Field(default=True)
-        multi_query_variants: int = Field(default=2, ge=1, le=4)
+        multi_query_variants: int = Field(default=1, ge=1, le=4)
 
         # ═══════════════════════════════════════════════════════════════════
         #  Context compression (conversation + code)
@@ -20215,7 +20233,7 @@ class Filter:
         # ── Proactive suggestions ───────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
-        proactive_summary_threshold: float = Field(default=0.75)
+        proactive_summary_threshold: float = Field(default=0.95)
         # ── Context cleanup ─────────────────────────────────────────
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
@@ -20452,7 +20470,7 @@ class Filter:
         # This region controls the amount of permanent code permanently expanded.
         # This provides better visibility and prevent excessive filling.
         enable_hub_bodies_tier: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Enable the stable hub‑bodies tier in Block A. "
                 "When enabled, the full bodies of the top‑N most central symbols "
@@ -21063,7 +21081,8 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Pre‑process the request before the LLM sees it.
+        """
+        Pre‑process the request before the LLM sees it.
 
         Orchestrates seven sequential steps:
         1. Project‑switch detection, cache loading, and KV‑slot restore.
@@ -21087,8 +21106,15 @@ class Filter:
             self._log_timing(step_name, start - inlet_start, end - start)
 
         project_id = self._inlet_orch.get_project_id()
+
+        # ── Get state early to decide slot_free ──
+        state = self._conversation_state_manager.get(project_id)
+
+        # ── slot_free logic ─────────────────────────────────────────────
         slot_free = True
-        if slot_free and self._last_used_model is None:
+        # If no model has been used yet and this is the first turn,
+        # disable slot_free so we don't try to restore a non‑existent slot.
+        if self._last_used_model is None and state.message_count <= 1:
             slot_free = False
 
         await self._enrichment.cancel_docstring_tasks()
@@ -21247,7 +21273,7 @@ class Filter:
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
 
-                # ── M7: Pre‑calcular tier durante silent ingestion ──
+                # ── M7: Pre‑compute tier during silent ingestion ──
                 if (
                     self.valves.enable_hub_bodies_tier
                     and self.valves.hub_bodies_tier_warmup_on_ingestion
@@ -21258,36 +21284,35 @@ class Filter:
                     pstate["hub_tier_text"] = tier_text
                     pstate["hub_tier_hash"] = tier_hash
                     pstate["hub_tier_qids"] = tier_qids
-                    # ✅ Atributo, no dict key
-                    state = self._conversation_state_manager.get(project_id)
+                    # Attribute, not dict key
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
 
-                    # Lanzar prefill en background
+                    # Launch background prefill
                     asyncio.create_task(
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
 
-                # ✅ mark_dirty y save mediante ConversationStateManager
+                # Mark dirty and save via ConversationStateManager
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
-                # ✅ get_state mediante ConversationStateManager
+                # Get state via ConversationStateManager
                 state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
                 response = (
-                    f"✅ {num_symbols} símbolos en {num_classes} clases "
-                    f"({num_blocks} bloques activos). El código está en el SymbolGraph. "
-                    f"Usa `/expand <Clase>` o `/expand <Clase>.<método>` para ver implementaciones."
+                    f"✅ {num_symbols} symbols in {num_classes} classes "
+                    f"({num_blocks} active blocks). Code is in the SymbolGraph. "
+                    f"Use `/expand <Class>` or `/expand <Class>.<method>` to see implementations."
                 )
 
-                # ── CAMBIO 3: Silent ingestion stub respeta lean_user_code_stub_max_tokens ──
+                # ── Silent ingestion stub respects lean_user_code_stub_max_tokens ──
                 _si_stub_body = (
-                    f"# [CÓDIGO COMPRIMIDO — {num_symbols} símbolos indexados en SymbolGraph]\n"
-                    f"# Usa /expand <nombre> para ver cualquier implementación."
+                    f"# [COMPRESSED CODE — {num_symbols} symbols indexed in SymbolGraph]\n"
+                    f"# Use /expand <name> to see any implementation."
                 )
                 _si_max_stub = self.valves.lean_user_code_stub_max_tokens
                 if _si_max_stub > 0:
@@ -21296,7 +21321,7 @@ class Filter:
                     )
                 compressed_stub = (
                     f"```python\n{_si_stub_body}\n```\n\n"
-                    f"_(El código está disponible internamente; no es necesario repetirlo aquí.)_"
+                    f"_(The code is internally available; no need to repeat it here.)_"
                 )
                 messages[-1] = {**messages[-1], "content": compressed_stub}
                 messages.append({"role": "assistant", "content": response})
