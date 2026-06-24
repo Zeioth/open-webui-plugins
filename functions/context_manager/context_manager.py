@@ -7638,8 +7638,7 @@ class LongTermMemory:
         Generate alternative search queries for LTM retrieval.
 
         Uses a minimalist prompt to avoid meta-commentary in the output.
-        Filters responses heuristically (no hardcoded pattern lists) to keep
-        only valid natural-language queries.
+        Filters responses heuristically to keep only valid natural-language queries.
 
         Args:
             query (str): The original user question.
@@ -7660,7 +7659,7 @@ class LongTermMemory:
             return [query]
 
         # ------------------------------------------------------------------
-        # REGION 2: Ultra-simple prompt (no system prompt, no metadata)
+        # REGION 2: Build a simple and direct prompt
         # ------------------------------------------------------------------
         prompt = (
             f"Generate {self._f.valves.multi_query_variants} alternative search queries for:\n"
@@ -7669,36 +7668,38 @@ class LongTermMemory:
         )
 
         # ------------------------------------------------------------------
-        # REGION 3: Call LLM with temperature=0.0 for deterministic output
+        # REGION 3: Call LLM with a low temperature for controlled variety
         # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="",  # Empty to avoid model self-reference
+            system_prompt="",  # Empty to prevent model self-reference
             model_override=self._f.valves.llm_model,
             max_tokens=80,
-            temperature=0.0,
+            temperature=0.2,    # Slight variety without losing coherence
             label="multi_query_expand",
         )
+
+        # Log the raw response for debugging purposes
+        self._f._log_debug(f"Multi-query raw response: {response}")
 
         queries = [query]
         if response:
             # ------------------------------------------------------------------
-            # REGION 4: Heuristic filter (no hardcoded patterns)
+            # REGION 4: Inclusive heuristic filter
             # ------------------------------------------------------------------
             for line in response.strip().split("\n"):
                 line = line.strip()
                 if not line or len(line) < 5:
                     continue
 
-                # Discard lines with metadata markers (':' or leading '*', '-')
-                if ":" in line or line.startswith(("*", "-")):
-                    continue
+                # Remove bullet points or leading dashes
+                cleaned = line.lstrip("-* ").strip()
 
-                # Keep only questions or short phrases with proper capitalization
-                if line.endswith("?") or (line[0].isupper() and len(line.split()) < 15):
-                    queries.append(line)
+                # Accept if it's a question or a short phrase starting with a capital letter
+                if cleaned.endswith("?") or (cleaned[0].isupper() and len(cleaned.split()) < 15):
+                    queries.append(cleaned)
 
-            # Limit to configured number of variants (+1 for original)
+            # Limit to the configured number of variants (+1 for the original)
             queries = queries[: self._f.valves.multi_query_variants + 1]
 
         self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
@@ -19865,7 +19866,7 @@ class Filter:
         enable_contextual_retrieval: bool = Field(default=True)
         contextual_retrieval_mode: str = Field(default="metadata")
         enable_multi_query_retrieval: bool = Field(default=True)
-        multi_query_variants: int = Field(default=1, ge=1, le=4)
+        multi_query_variants: int = Field(default=2, ge=1, le=4)
 
         # ═══════════════════════════════════════════════════════════════════
         #  Context compression (conversation + code)
