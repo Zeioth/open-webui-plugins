@@ -7637,8 +7637,8 @@ class LongTermMemory:
         """
         Generate alternative search queries for LTM retrieval.
 
-        Uses a few-shot prompt to force the model to output only the queries.
-        Filters responses by extracting lines after a marker or by heuristics.
+        Forces structured output using a strong system prompt and numbered list.
+        Extracts queries using regex to handle variations in formatting.
 
         Args:
             query (str): The original user question.
@@ -7659,26 +7659,30 @@ class LongTermMemory:
             return [query]
 
         # ------------------------------------------------------------------
-        # REGION 2: Few-shot prompt with explicit format
+        # REGION 2: Prompt with numbered list format
         # ------------------------------------------------------------------
         prompt = (
-            f"Generate {self._f.valves.multi_query_variants} alternative search queries for:\n"
-            f'"{query[:300]}"\n\n'
-            "Example of valid output:\n"
-            "How does build_block_b work?\n"
-            "What is the purpose of the recency pointer?\n"
-            "Now generate your queries:\n"
+            f"User question: {query[:300]}\n\n"
+            f"Generate {self._f.valves.multi_query_variants} alternative search queries.\n"
+            "Output ONLY the queries, one per line, numbered 1 to N.\n"
+            "Do not include any other text.\n\n"
+            "1. "
         )
 
         # ------------------------------------------------------------------
-        # REGION 3: Call LLM with low temperature for controlled variety
+        # REGION 3: Strong system prompt to enforce role
         # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="",  # Empty to prevent model self-reference
+            system_prompt=(
+                "You are a search query reformulator. Your ONLY task is to output search queries. "
+                "Never include analysis, reasoning, explanations, or meta-commentary. "
+                "Output must be in the exact format: numbered queries, one per line. "
+                "No other text is allowed."
+            ),
             model_override=self._f.valves.llm_model,
             max_tokens=80,
-            temperature=0.3,
+            temperature=0.4,
             label="multi_query_expand",
         )
 
@@ -7688,51 +7692,23 @@ class LongTermMemory:
         queries = [query]
         if response:
             # ------------------------------------------------------------------
-            # REGION 4: Extract queries from the response
+            # REGION 4: Extract numbered lines using regex
             # ------------------------------------------------------------------
-            lines = response.strip().split("\n")
-            extracted = []
-
-            # Try to find the "Now generate your queries:" marker
-            marker_idx = -1
-            for i, line in enumerate(lines):
-                if "generate your queries" in line.lower():
-                    marker_idx = i
-                    break
-
-            if marker_idx != -1:
-                # Take all lines after the marker
-                candidate_lines = lines[marker_idx + 1 :]
-            else:
-                # If no marker, take all lines
-                candidate_lines = lines
-
-            for line in candidate_lines:
+            import re
+            pattern = re.compile(r"^\s*(?:\d+\.\s*|[-*]\s*)?(.+)$")
+            for line in response.strip().split("\n"):
                 line = line.strip()
-                if not line or len(line) < 5:
+                if not line:
                     continue
+                match = pattern.match(line)
+                if match:
+                    cleaned = match.group(1).strip()
+                    # Accept if it's a valid query (not empty, not meta-commentary)
+                    if cleaned and len(cleaned) > 5 and "analysis" not in cleaned.lower():
+                        queries.append(cleaned)
 
-                # Remove leading bullets/numbers
-                cleaned = re.sub(r"^[\d]+\.\s*|^[-*]\s*", "", line).strip()
-                if not cleaned:
-                    continue
-
-                # Accept if it's a question or a short phrase with capital letter
-                if cleaned.endswith("?") or (
-                    cleaned[0].isupper() and len(cleaned.split()) < 15
-                ):
-                    extracted.append(cleaned)
-
-            # If we extracted queries, use them; otherwise fallback to original only
-            if extracted:
-                queries.extend(extracted)
-                # Limit to configured variants (+1 for original)
-                queries = queries[: self._f.valves.multi_query_variants + 1]
-            else:
-                # If extraction failed, log and keep only original
-                self._f._log_debug(
-                    "Multi-query: no valid queries extracted, using original only"
-                )
+            # Limit to configured variants (+1 for original)
+            queries = queries[: self._f.valves.multi_query_variants + 1]
 
         self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
         return queries
