@@ -7576,18 +7576,31 @@ class LongTermMemory:
         return True
 
     async def _expand_query_for_retrieval(
-        self, query: str, slot_free: bool = True
+        self,
+        query: str,
+        use_case: str = "C",
+        slot_free: bool = True,
     ) -> List[str]:
         """
-        Generate alternative phrasings of the query for LTM retrieval.
+        Generate thematic queries for LTM retrieval, abstracting the original
+        question to capture architectural intent, design rationale, or problem
+        domain.
+
+        The generated queries are used as additional search vectors in ChromaDB
+        to retrieve past conversations and high-level context that complement
+        the exact symbol matches found by the SymbolGraph (seed_inference).
 
         Args:
-            query (str): The original user query.
-            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
+            query (str): The original user question.
+            use_case (str): The resolved use case (A, B, C, D, E).
+            slot_free (bool): Whether the LLM slot is available.
 
         Returns:
-            List[str]: A list of query variants, including the original.
+            List[str]: A list of query variants, including the original query.
         """
+        # ------------------------------------------------------------------
+        # REGION 1: Early exits
+        # ------------------------------------------------------------------
         if not self._f.valves.enable_multi_query_retrieval:
             return [query]
         if not slot_free:
@@ -7595,18 +7608,41 @@ class LongTermMemory:
         if len(query.strip()) < 15:
             return [query]
 
+        # ------------------------------------------------------------------
+        # REGION 2: Build the thematic prompt
+        # ------------------------------------------------------------------
+        use_case_labels = {
+            "A": "architecture / design",
+            "B": "planning / roadmap",
+            "C": "general programming / implementation",
+            "D": "refactoring / impact analysis",
+            "E": "scaffolding / boilerplate",
+        }
+        label = use_case_labels.get(use_case, "general programming")
+
         prompt = (
-            f"Generate {self._f.valves.multi_query_variants} alternative phrasings "
-            f"of this programming question for document search. "
-            f"Focus on different vocabulary (errors, function names, behaviors).\n\n"
-            f"Original: {query[:250]}\n\n"
-            f"Output only the alternatives, one per line. No numbering."
+            f"Given the following user question, generate {self._f.valves.multi_query_variants} high-level thematic queries "
+            "for searching a semantic memory of past conversations and architectural decisions.\n\n"
+            "STRICT RULES:\n"
+            "1. Output ONLY the queries, one per line. No labels, numbering, bullets, or meta-commentary.\n"
+            "2. Each query must be a complete, natural-language question or a short phrase (under 15 words).\n"
+            "3. Focus on the **architectural intent**, **problem domain**, or **design rationale**, not on implementation details.\n"
+            "4. If specific function/class names are mentioned, include them but wrap them in a broader context.\n"
+            "5. Vary the phrasing: one query can be a 'why' question, another a 'what' question, another a keyword list.\n"
+            "6. Do NOT simply rephrase the original question with synonyms; abstract it to a higher level.\n\n"
+            f"User question: {query[:300]}\n\n"
+            f"Use case context: {use_case} ({label})\n\n"
+            "Queries:"
         )
+
+        # ------------------------------------------------------------------
+        # REGION 3: Call LLM and parse response
+        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "Output only the alternative phrasings, one per line. "
-                "Be concise and specific to the code context."
+                "You are a search query reformulator specialized in software architecture. "
+                "Output only the alternative queries, one per line, with no extra text."
             ),
             model_override=self._f.valves.llm_model,
             max_tokens=80,
@@ -7616,28 +7652,33 @@ class LongTermMemory:
 
         queries = [query]
         if response:
-            # Filter out lines that contain reasoning artifacts or markdown.
-            # These are not valid alternative phrasings and would pollute the
-            # retrieval query set, degrading LTM quality.
+            # ------------------------------------------------------------------
+            # REGION 4: Filter invalid lines (strict)
+            # ------------------------------------------------------------------
             _BAD_PATTERNS = re.compile(
                 r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:|"
                 r"^\s*\d+\.\s+.*?(?:Analyze|Request|Task|Step)|"
                 r"^\s*\*\*.*?\*\*|"
-                r"^\s*[-*]\s+Task:)"
+                r"^\s*[-*]\s+Task:|"
+                r"Original Question:|Thinking Process:|Analysis:)",
+                re.IGNORECASE,
             )
-
             alternatives = [
                 line.strip()
                 for line in response.strip().split("\n")
                 if line.strip()
                 and len(line.strip()) > 5
                 and not _BAD_PATTERNS.search(line.strip())
+                and not line.strip().startswith(("Original", "Thinking", "Analysis"))
             ]
             queries.extend(alternatives[: self._f.valves.multi_query_variants])
             self._f._log_debug(
-                f"Multi-query expansion: {len(queries)} queries "
+                f"Multi-query expansion (thematic): {len(queries)} queries "
                 f"({[q[:40] for q in queries]})"
             )
+        # ------------------------------------------------------------------
+        # REGION 5: Return
+        # ------------------------------------------------------------------
         return queries
 
     async def _rerank_results(
@@ -7782,9 +7823,31 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def retrieve_memories_unified(
-        self, query: str, project_id: str, slot_free: bool = True
+        self,
+        query: str,
+        project_id: str,
+        use_case: str = "C",
+        slot_free: bool = True,
     ) -> list:
-        """Retrieve relevant LTM entries, with multi‑query expansion and reranking."""
+        """
+        Retrieve relevant LTM entries, with multi‑query expansion and reranking.
+
+        The method now uses thematic expansions (via _expand_query_for_retrieval)
+        to capture high-level architectural context, complementing the exact
+        symbol matches from seed_inference.
+
+        Args:
+            query (str): The user query (original or cleaned).
+            project_id (str): The current project identifier.
+            use_case (str): The resolved use case (A, B, C, D, E).
+            slot_free (bool): Whether the LLM slot is available.
+
+        Returns:
+            list: A list of dictionaries with 'doc', 'timestamp', and 'meta'.
+        """
+        # ------------------------------------------------------------------
+        # REGION 1: Early exits
+        # ------------------------------------------------------------------
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
@@ -7794,15 +7857,18 @@ class LongTermMemory:
                 forced_symbol, cleaned_query, project_id
             )
 
+        # ------------------------------------------------------------------
+        # REGION 2: Build query variants (thematic expansion)
+        # ------------------------------------------------------------------
+        query_variants = await self._expand_query_for_retrieval(
+            query, use_case=use_case, slot_free=slot_free
+        )
+
         try:
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
-            # ── FIX 11: Expiration filter with OR for summaries ──
-            # Summaries (session/turn/RAPTOR/hierarchical) are persisted without
-            # an expires_at field; a bare {"expires_at": {"$gt": now}} filter
-            # silently excludes them in ChromaDB. OR them back in so they remain
-            # retrievable.
+            # Expiration filter with OR for summaries
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append(
                     {
@@ -7816,14 +7882,12 @@ class LongTermMemory:
                     }
                 )
 
-            query_variants = await self._expand_query_for_retrieval(
-                query, slot_free=slot_free
-            )
-
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
 
+            # ------------------------------------------------------------------
+            # REGION 3: Retrieve for each variant
+            # ------------------------------------------------------------------
             for variant_query in query_variants:
-                # Requires an embedder supporting 32768 context or more.
                 q_emb = await anyio.to_thread.run_sync(
                     lambda q=variant_query: self._f.embedder.encode(
                         self._f._tokens.truncate_text_to_tokens(q, 32768)
@@ -7864,6 +7928,9 @@ class LongTermMemory:
 
             results_list = list(all_raw_results.values())
 
+            # ------------------------------------------------------------------
+            # REGION 4: Apply time decay, symbol boost, and reranking
+            # ------------------------------------------------------------------
             docs_with_meta = []
             if results_list:
                 for doc, raw_sim, ts, meta in results_list:
@@ -7931,8 +7998,6 @@ class LongTermMemory:
                 )
                 docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
                 reranked = await self._rerank_results(query, docs_only, rerank_k)
-                # Carry the full tuple (score, ts, meta_dict) through reranking
-                # so the metadata dict is not lost when len-5 entries are flattened.
                 doc_to_meta = {
                     d[0]: (d[1], d[2], d[3] if len(d) > 3 else {})
                     for d in docs_with_meta
@@ -7943,12 +8008,14 @@ class LongTermMemory:
 
             docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
 
+            # ------------------------------------------------------------------
+            # REGION 5: Normalize output
+            # ------------------------------------------------------------------
             normalized = []
             for entry in docs_with_meta:
                 if len(entry) == 5:
                     doc, score, ts, meta_dict, _ = entry
                 elif len(entry) == 4:
-                    # Post-reranking format: (doc, score, ts, meta_dict)
                     doc, score, ts, meta_dict = entry
                 elif len(entry) == 3:
                     doc, score, ts = entry
@@ -7962,6 +8029,7 @@ class LongTermMemory:
                 {"doc": doc, "timestamp": ts, "meta": meta_dict}
                 for doc, _, ts, meta_dict in normalized
             ]
+
         except Exception as e:
             logger.warning(f"Unified memory retrieval failed: {e}")
             return []
@@ -16513,7 +16581,6 @@ class SystemPromptBuilder:
         pstate["hub_tier_text"] = hub_tier_text
         pstate["hub_tier_hash"] = hub_tier_hash
         pstate["hub_tier_qids"] = hub_tier_qids
-        # M4: store previous seeds for heat tracking
         pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
         pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
 
@@ -16522,10 +16589,20 @@ class SystemPromptBuilder:
         # ══════════════════════════════════════════════════════════════
         dynamic_injections: List[Tuple[str, str]] = []
 
-        # B1: LTM retrieval
+        # ------------------------------------------------------------------
+        # REGION: Compute use_case for LTM retrieval
+        # ------------------------------------------------------------------
+        use_case, _ = self._f._ctx_builder.classify_use_case(user_query, intent_vector or {})
+
+        # B1: LTM retrieval (now passes use_case)
         self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         ltm_text = await self._build_ltm_injection(
-            project_id, user_question, user_query, is_code_session, slot_free
+            project_id,
+            user_question,
+            user_query,
+            is_code_session,
+            slot_free,
+            use_case,
         )
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
@@ -16569,7 +16646,7 @@ class SystemPromptBuilder:
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
             static_block,
-            hub_tier_text,  # ← NUEVO: tier entre A y B
+            hub_tier_text,
             dynamic_injections,
             messages,
         )
@@ -16588,8 +16665,26 @@ class SystemPromptBuilder:
         user_query: str,
         is_code_session: bool,
         slot_free: bool,
+        use_case: str = "C",
     ) -> Optional[str]:
-        """Retrieve and format relevant LTM entries for the current query, RAPTOR‑first."""
+        """
+        Retrieve and format relevant LTM entries for the current query,
+        using RAPTOR‑first and thematic expansions.
+
+        Args:
+            project_id (str): The current project identifier.
+            user_question (str): The cleaned user question (without code spans).
+            user_query (str): The full user query (with code).
+            is_code_session (bool): Whether the session is a code session.
+            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
+            use_case (str): The resolved use case (A, B, C, D, E).
+
+        Returns:
+            Optional[str]: The formatted LTM context, or None if no relevant memories.
+        """
+        # ------------------------------------------------------------------
+        # REGION 1: Early exits
+        # ------------------------------------------------------------------
         if not (
             self._f.valves.enable_code_awareness
             and is_code_session
@@ -16600,7 +16695,9 @@ class SystemPromptBuilder:
 
         _ltm_query = user_question if user_question else user_query
 
-        # ── v2.0: RAPTOR‑first retrieval ────────────────────────────
+        # ------------------------------------------------------------------
+        # REGION 2: RAPTOR refinement (if enabled)
+        # ------------------------------------------------------------------
         refined_query = _ltm_query
         if (
             self._f.valves.enable_raptor
@@ -16620,12 +16717,21 @@ class SystemPromptBuilder:
             except Exception:
                 pass  # fall through to plain query on any error
 
+        # ------------------------------------------------------------------
+        # REGION 3: Retrieve memories with thematic expansion
+        # ------------------------------------------------------------------
         all_meta = await self._f._ltm.retrieve_memories_unified(
-            refined_query, project_id, slot_free=slot_free
+            refined_query,
+            project_id,
+            use_case=use_case,
+            slot_free=slot_free,
         )
         if not all_meta:
             return None
 
+        # ------------------------------------------------------------------
+        # REGION 4: Format and truncate
+        # ------------------------------------------------------------------
         all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
         unique_meta = []
         seen_docs: Set[str] = set()
@@ -16644,8 +16750,6 @@ class SystemPromptBuilder:
                 time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
                     "%Y-%m-%d %H:%M:%SZ"
                 )
-                # Skeleton snapshots get a staleness label so the model
-                # knows whether the architecture is still current.
                 if mem.get("meta", {}).get("is_skeleton"):
                     saved_hash = mem.get("meta", {}).get("code_state_hash", "")
                     current_hash = self._f._activation.compute_code_state_hash(
@@ -19862,7 +19966,7 @@ class Filter:
             description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
         )
         docstring_batch_size: int = Field(
-            default=8,
+            default=24,
             ge=1,
             le=20,
             description=(
