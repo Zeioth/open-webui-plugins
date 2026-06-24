@@ -745,13 +745,15 @@ class ConversationStateManager:
           - Uses wm_* aliases for compatibility with pre-Phase-1 DBs (names with '_').
           - Reads history_blocked_age (migrated from pstate in Phase 1).
           - Reads hub_tier_* tracker fields for cross‑restart stability.
+          - ALL SQLite reads are serialized with _db_global_lock.
         """
         try:
-            cur = self._f._db_conn.execute(
-                "SELECT state_json FROM conversation_state WHERE project_id = ?",
-                (project_id,),
-            )
-            row = cur.fetchone()
+            with _db_global_lock:
+                cur = self._f._db_conn.execute(
+                    "SELECT state_json FROM conversation_state WHERE project_id = ?",
+                    (project_id,),
+                )
+                row = cur.fetchone()
         except Exception as e:
             self._f._log_debug(
                 f"ConversationStateManager._load_from_db: DB read error "
@@ -796,11 +798,12 @@ class ConversationStateManager:
                 content_field = v.get("content", "")
                 if content_field.startswith("@@hash:"):
                     content_hash = content_field[7:]
-                    cur2 = self._f._db_conn.execute(
-                        "SELECT content FROM code_contents WHERE hash = ?",
-                        (content_hash,),
-                    )
-                    row2 = cur2.fetchone()
+                    with _db_global_lock:
+                        cur2 = self._f._db_conn.execute(
+                            "SELECT content FROM code_contents WHERE hash = ?",
+                            (content_hash,),
+                        )
+                        row2 = cur2.fetchone()
                     v["content"] = (
                         row2[0]
                         if row2
@@ -859,12 +862,13 @@ class ConversationStateManager:
 
         # ── Restore docstrings from symbol_docstrings table ──────────────
         try:
-            cur = self._f._db_conn.execute(
-                "SELECT symbol_name, docstring FROM symbol_docstrings "
-                "WHERE project_id = ?",
-                (project_id,),
-            )
-            rows = cur.fetchall()
+            with _db_global_lock:
+                cur = self._f._db_conn.execute(
+                    "SELECT symbol_name, docstring FROM symbol_docstrings "
+                    "WHERE project_id = ?",
+                    (project_id,),
+                )
+                rows = cur.fetchall()
             if rows:
                 doc_map = {row[0]: row[1] for row in rows}
                 for block in active.values():
@@ -6886,24 +6890,63 @@ class StateStore:
                 self._f._log_debug(f"DB worker crashed: {e} — restarting in 2s")
                 await asyncio.sleep(2)
 
+    async def drain_writes(self, timeout: float = 5.0) -> None:
+        """
+        Blocks until all pending items in _db_write_queue have been processed
+        (task_done called by the worker).
+
+        Called at the start of each inlet to ensure that docstring writes from
+        the previous turn finish BEFORE inlet_preprocess() starts reading from
+        SQLite. Eliminates reader/writer overlap on _db_conn.
+
+        Args:
+            timeout: maximum seconds to wait. If timeout elapses, logs and
+                     continues (soft degradation, no exception).
+        """
+        try:
+            await asyncio.wait_for(self._f._db_write_queue.join(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._f._log_debug(
+                f"drain_writes: timeout {timeout}s; "
+                "writes still in progress, continuing (soft degradation)"
+            )
+
+    async def _db_read(self, fn, *args, **kwargs):
+        """
+        Serialized read with the writer worker.
+
+        While all access to _db_conn goes through _db_global_lock,
+        two threads cannot touch the connection simultaneously, and
+        "database is locked" disappears as a race condition.
+
+        The lock is acquired INSIDE the thread (run_sync), not crossing
+        an await, to avoid blocking the event loop.
+
+        Usage:
+            row = await self._f._state_store._db_read(
+                lambda: self._f._db_conn.execute(sql, params).fetchone()
+            )
+        """
+
+        def _run():
+            with _db_global_lock:
+                return fn(*args, **kwargs)
+
+        return await anyio.to_thread.run_sync(_run)
+
     async def _db_worker_loop(self) -> None:
         """
         Single run of the DB write loop. Exits on CancelledError.
 
         Each job is executed with a retry loop that uses **exponential backoff**
         when encountering a `database is locked` error. This gives SQLite's WAL
-        mechanism enough time to resolve contention, especially when many
-        background docstring writes are flushed at the same time.
+        mechanism enough time to resolve contention.
 
-        The backoff sequence is: 0.1s, 0.2s, 0.4s, 0.8s – much more effective
-        than the old linear sleep (0.5s, 1s, 1.5s, 2s) because it starts small
-        and grows quickly, reducing latency for short locks while still
-        giving space for long ones.
+        The lock is acquired INSIDE the thread (not crossing an await) to avoid
+        blocking the event loop. On exhaustion of retries, the job is dropped
+        (no raise) to prevent worker crashes and closure accumulation.
         """
         while True:
-            # --------------------------------------------------------------
-            # REGION 1 — Fetch the next write job from the queue
-            # --------------------------------------------------------------
             try:
                 job = await asyncio.wait_for(self._f._db_write_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -6913,28 +6956,33 @@ class StateStore:
 
             func, args, kwargs = job
 
-            # --------------------------------------------------------------
-            # REGION 2 — Execute with exponential backoff on lock errors
-            # --------------------------------------------------------------
-            with _db_global_lock:
-                for attempt in range(5):
-                    try:
-                        await anyio.to_thread.run_sync(lambda: func(*args, **kwargs))
-                        break  # success – exit retry loop
-                    except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() and attempt < 4:
-                            # Exponential backoff: 0.1, 0.2, 0.4, 0.8 seconds
-                            backoff = 0.1 * (2**attempt)
-                            self._f._log_debug(
-                                f"DB worker: locked (attempt {attempt+1}/5), "
-                                f"retrying in {backoff:.1f}s"
-                            )
-                            await asyncio.sleep(backoff)
-                        else:
-                            self._f._log_debug(
-                                f"DB worker: giving up after {attempt+1} attempts: {e}"
-                            )
-                            raise  # re-raise after exhausting retries
+            # Lock acquired inside the thread, not across an await
+            def _run_batch(fn=func, a=args, kw=kwargs):
+                with _db_global_lock:
+                    fn(*a, **kw)
+
+            for attempt in range(5):
+                try:
+                    await anyio.to_thread.run_sync(_run_batch)
+                    break  # success
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e).lower() and attempt < 4:
+                        # Exponential backoff: 0.1, 0.2, 0.4, 0.8 seconds
+                        backoff = 0.1 * (2**attempt)
+                        self._f._log_debug(
+                            f"DB worker: locked (attempt {attempt+1}/5), "
+                            f"retrying in {backoff:.1f}s"
+                        )
+                        await asyncio.sleep(backoff)
+                    else:
+                        # Drop the job instead of crashing/restarting the worker
+                        self._f._log_debug(
+                            f"DB worker: job dropped after {attempt+1} attempts: {e}"
+                        )
+                        break
+
+            # Mark the item as processed (enables queue.join())
+            self._f._db_write_queue.task_done()
 
     def _db_conn_write_sync(self, project_id: str, state: ConversationState) -> None:
         """
@@ -13952,6 +14000,9 @@ class HistoryCompressor:
         1. Fenced code blocks (```language ... ```): Replaced individually.
         2. Raw pastes (no backticks): Entire message replaced if it looks like code.
 
+        If a semantic summary (block_summary) already exists for the block, it is
+        used in the stub instead of the generic template, providing more context.
+
         Args:
             messages (list): List of conversation message dicts.
             project_id (str): Current project identifier.
@@ -14015,10 +14066,26 @@ class HistoryCompressor:
                     if blk_tokens < min_tokens:
                         return match.group(0)
 
-                    # Generate stub from hardcoded template
-                    stub_text = STUB_TEMPLATE.format(
-                        tokens=blk_tokens, symbol_count=symbol_count
-                    )
+                    # Look for an existing semantic summary for this block
+                    body_hash = hashlib.md5(body.encode()).hexdigest()[:16]
+                    existing_summary = ""
+                    try:
+                        state_now = self._f._conversation_state_manager.get(project_id)
+                        blk = state_now.active_blocks.get(body_hash)
+                        if blk and blk.block_summary:
+                            existing_summary = blk.block_summary
+                    except Exception:
+                        pass
+
+                    if existing_summary:
+                        stub_text = (
+                            f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens]\n"
+                            f"{existing_summary}"
+                        )
+                    else:
+                        stub_text = STUB_TEMPLATE.format(
+                            tokens=blk_tokens, symbol_count=symbol_count
+                        )
 
                     # Apply token limit if configured
                     if max_stub_tokens > 0:
@@ -14048,9 +14115,26 @@ class HistoryCompressor:
                     )
                 )
                 if code_indicators:
-                    stub_text = STUB_TEMPLATE.format(
-                        tokens=total_msg_tokens, symbol_count=symbol_count
-                    )
+                    # Look for an existing semantic summary for this block
+                    content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+                    existing_summary = ""
+                    try:
+                        state_now = self._f._conversation_state_manager.get(project_id)
+                        blk = state_now.active_blocks.get(content_hash)
+                        if blk and blk.block_summary:
+                            existing_summary = blk.block_summary
+                    except Exception:
+                        pass
+
+                    if existing_summary:
+                        stub_text = (
+                            f"[CÓDIGO COMPRIMIDO — {total_msg_tokens:,} tokens]\n"
+                            f"{existing_summary}"
+                        )
+                    else:
+                        stub_text = STUB_TEMPLATE.format(
+                            tokens=total_msg_tokens, symbol_count=symbol_count
+                        )
 
                     if max_stub_tokens > 0:
                         stub_text = self._f._tokens.truncate_text_to_tokens(
@@ -14061,6 +14145,7 @@ class HistoryCompressor:
                     self._f._log_debug(
                         f"Lean user code (raw paste): message {i} — "
                         f"replaced ~{total_msg_tokens:,} tokens with stub"
+                        + (" [with semantic summary]" if existing_summary else "")
                     )
 
         return new_messages
@@ -21167,6 +21252,11 @@ class Filter:
         await self._enrichment.cancel_docstring_tasks()
         self._enrichment._lazy_docstrings_generated_this_turn = 0
 
+        # ── Phase A: Write barrier ──────────────────────────────────
+        # Esperar a que todos los writes pendientes del turno anterior
+        # terminen ANTES de que comencemos a leer SQLite.
+        await self._state_store.drain_writes(timeout=5.0)
+
         # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   1. Preprocess (project switch, cache load)
@@ -21612,6 +21702,27 @@ class Filter:
                                 project_id, [last_msg], wait=False
                             )
                             await self._update_active_code(last_msg, project_id)
+
+                            # Schedule summaries for large user blocks
+                            # If enable_lean_user_code is active, large blocks will be
+                            # compressed to stubs in future passes. Pre-generate the
+                            # summary in background so the stub becomes semantic
+                            # instead of generic (zero cost on the next pass).
+                            if self.valves.enable_lean_user_code:
+                                _state_now = self._conversation_state_manager.get(
+                                    project_id
+                                )
+                                for _blk in _state_now.active_blocks.values():
+                                    if (
+                                        not _blk.obsolete
+                                        and not _blk.block_summary
+                                        and not _blk.generated_by_assistant
+                                        and _blk._cached_token_count
+                                        >= self.valves.lean_user_code_min_tokens
+                                    ):
+                                        await self._history_compressor.schedule_block_summary(
+                                            _blk, project_id
+                                        )
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 await self._ltm.store_messages(
@@ -21769,9 +21880,6 @@ class Filter:
                 )
                 await self._state_store.run_db_checkpoints()
             self._log_debug("outlet: after DB checkpoints")
-
-            # ── Slot save (ya movido al principio; esta parte se elimina) ──
-            # ELIMINADO: ya se ha guardado al inicio del outlet
 
             # ── Purge old versions ─────────────────────────────────────
             self._log_debug("outlet: before purge old versions")
