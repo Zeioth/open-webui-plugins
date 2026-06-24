@@ -2321,12 +2321,12 @@ class ContextPager:
             except Exception:
                 pass
 
-        # Recover the full body from code_contents (authoritative).
+        # Recover the full body from code_contents (authoritative) – now via _db_read
         content = ""
         if db_conn is not None:
             try:
-                row = await anyio.to_thread.run_sync(
-                    lambda: db_conn.execute(
+                row = await self._f._state_store._db_read(
+                    lambda: self._f._db_conn.execute(
                         "SELECT content FROM code_contents WHERE hash = ?",
                         (block_hash,),
                     ).fetchone()
@@ -7148,7 +7148,7 @@ class StateStore:
         if not current_code_hash:
             return 0  # no active code
 
-        meta_row = await anyio.to_thread.run_sync(
+        meta_row = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT code_state_hash, edge_count FROM symbol_edges_meta "
                 "WHERE project_id = ?",
@@ -7169,7 +7169,7 @@ class StateStore:
             )
             return 0
 
-        rows = await anyio.to_thread.run_sync(
+        rows = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT src, dst, type, weight, confidence "
                 "FROM symbol_edges WHERE project_id = ?",
@@ -7245,7 +7245,7 @@ class StateStore:
         Returns:
             list: List of CodePathView objects (may be empty).
         """
-        rows = await anyio.to_thread.run_sync(
+        rows = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT path_id, entry_point, seed_nodes_json, induced_nodes_json, "
                 "induced_edges_json, activation_score, business_label, summary, "
@@ -14000,9 +14000,6 @@ class HistoryCompressor:
         1. Fenced code blocks (```language ... ```): Replaced individually.
         2. Raw pastes (no backticks): Entire message replaced if it looks like code.
 
-        If a semantic summary (block_summary) already exists for the block, it is
-        used in the stub instead of the generic template, providing more context.
-
         Args:
             messages (list): List of conversation message dicts.
             project_id (str): Current project identifier.
@@ -14066,26 +14063,10 @@ class HistoryCompressor:
                     if blk_tokens < min_tokens:
                         return match.group(0)
 
-                    # Look for an existing semantic summary for this block
-                    body_hash = hashlib.md5(body.encode()).hexdigest()[:16]
-                    existing_summary = ""
-                    try:
-                        state_now = self._f._conversation_state_manager.get(project_id)
-                        blk = state_now.active_blocks.get(body_hash)
-                        if blk and blk.block_summary:
-                            existing_summary = blk.block_summary
-                    except Exception:
-                        pass
-
-                    if existing_summary:
-                        stub_text = (
-                            f"[CÓDIGO COMPRIMIDO — {blk_tokens:,} tokens]\n"
-                            f"{existing_summary}"
-                        )
-                    else:
-                        stub_text = STUB_TEMPLATE.format(
-                            tokens=blk_tokens, symbol_count=symbol_count
-                        )
+                    # Generate stub from hardcoded template
+                    stub_text = STUB_TEMPLATE.format(
+                        tokens=blk_tokens, symbol_count=symbol_count
+                    )
 
                     # Apply token limit if configured
                     if max_stub_tokens > 0:
@@ -14115,26 +14096,9 @@ class HistoryCompressor:
                     )
                 )
                 if code_indicators:
-                    # Look for an existing semantic summary for this block
-                    content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
-                    existing_summary = ""
-                    try:
-                        state_now = self._f._conversation_state_manager.get(project_id)
-                        blk = state_now.active_blocks.get(content_hash)
-                        if blk and blk.block_summary:
-                            existing_summary = blk.block_summary
-                    except Exception:
-                        pass
-
-                    if existing_summary:
-                        stub_text = (
-                            f"[CÓDIGO COMPRIMIDO — {total_msg_tokens:,} tokens]\n"
-                            f"{existing_summary}"
-                        )
-                    else:
-                        stub_text = STUB_TEMPLATE.format(
-                            tokens=total_msg_tokens, symbol_count=symbol_count
-                        )
+                    stub_text = STUB_TEMPLATE.format(
+                        tokens=total_msg_tokens, symbol_count=symbol_count
+                    )
 
                     if max_stub_tokens > 0:
                         stub_text = self._f._tokens.truncate_text_to_tokens(
@@ -14145,7 +14109,6 @@ class HistoryCompressor:
                     self._f._log_debug(
                         f"Lean user code (raw paste): message {i} — "
                         f"replaced ~{total_msg_tokens:,} tokens with stub"
-                        + (" [with semantic summary]" if existing_summary else "")
                     )
 
         return new_messages
@@ -14982,10 +14945,11 @@ class EnrichmentTasks:
             found = sym.docstring if sym and sym.docstring else ""
             if not found:
                 try:
-                    row = await anyio.to_thread.run_sync(
-                        lambda q=qid: self._f._db_conn.execute(
-                            "SELECT docstring FROM symbol_docstrings WHERE project_id=? AND symbol_name=?",
-                            (project_id, q),
+                    row = await self._f._state_store._db_read(
+                        lambda: self._f._db_conn.execute(
+                            "SELECT docstring FROM symbol_docstrings "
+                            "WHERE project_id=? AND symbol_name=?",
+                            (project_id, qid),
                         ).fetchone()
                     )
                 except Exception:
@@ -15053,12 +15017,23 @@ class EnrichmentTasks:
                 if sym is not None:
                     sym.docstring = docstring
                 self._f._symbol_index.update_docstring(qid, project_id, docstring)
-                await self._f._state_store._db_enqueue(
-                    lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
-                        "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
-                        (pid, q, d, time.time()),
+
+            # Phase C: write all parsed docstrings in one batch using executemany
+            if parsed:
+                rows = [
+                    (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
+                ]
+
+                def _write_batch(rows=rows):
+                    self._f._db_conn.executemany(
+                        "INSERT OR REPLACE INTO symbol_docstrings "
+                        "(project_id, symbol_name, docstring, updated_at) "
+                        "VALUES (?,?,?,?)",
+                        rows,
                     )
-                )
+                    self._f._db_conn.commit()
+
+                await self._f._state_store._db_enqueue(_write_batch)
 
         return resolved
 
@@ -15083,6 +15058,7 @@ class EnrichmentTasks:
         """
         self._f._log_debug(f"CFG batch: invoked with {len(qids)} candidate(s): {qids}")
         state = self._f._conversation_state_manager.get(project_id)
+        cfg_rows = []  # for coalesced batch write (Phase C)
         resolved: Dict[str, str] = {}
 
         # Build a qid → (sym, block) index ONCE instead of re-scanning every
@@ -15140,16 +15116,24 @@ class EnrichmentTasks:
             )
             self._f._symbol_index.update_cfg(qid, project_id, skeleton, body_hash)
             resolved[qid] = skeleton
+            cfg_rows.append((project_id, qid, skeleton, body_hash, time.time()))
 
-            await self._f._state_store._db_enqueue(
-                lambda q=qid, s=skeleton, h=body_hash, pid=project_id: self._f._db_conn.execute(
+        # Phase C: coalesce all CFG writes into one executemany
+        if cfg_rows:
+
+            def _write_cfg_batch(rows=cfg_rows):
+                self._f._db_conn.executemany(
                     "INSERT OR REPLACE INTO symbol_cfg "
                     "(project_id, symbol_name, cfg_skeleton, body_hash, updated_at) "
                     "VALUES (?,?,?,?,?)",
-                    (pid, q, s, h, time.time()),
+                    rows,
                 )
+                self._f._db_conn.commit()
+
+            await self._f._state_store._db_enqueue(_write_cfg_batch)
+            self._f._log_debug(
+                f"CFG batch: persisted {len(cfg_rows)} CFG entries in one batch"
             )
-            self._f._log_debug(f"CFG batch: persisted '{qid}' (body_hash={body_hash})")
 
         self._f._log_debug(f"CFG batch: resolved {len(resolved)}/{len(qids)}")
         return resolved
@@ -21253,8 +21237,8 @@ class Filter:
         self._enrichment._lazy_docstrings_generated_this_turn = 0
 
         # ── Phase A: Write barrier ──────────────────────────────────
-        # Esperar a que todos los writes pendientes del turno anterior
-        # terminen ANTES de que comencemos a leer SQLite.
+        # Wait for all pending writes from the previous turn to finish
+        # BEFORE we start reading SQLite.
         await self._state_store.drain_writes(timeout=5.0)
 
         # ─────────────────────────────────────────────────────────────────
@@ -21702,27 +21686,6 @@ class Filter:
                                 project_id, [last_msg], wait=False
                             )
                             await self._update_active_code(last_msg, project_id)
-
-                            # Schedule summaries for large user blocks
-                            # If enable_lean_user_code is active, large blocks will be
-                            # compressed to stubs in future passes. Pre-generate the
-                            # summary in background so the stub becomes semantic
-                            # instead of generic (zero cost on the next pass).
-                            if self.valves.enable_lean_user_code:
-                                _state_now = self._conversation_state_manager.get(
-                                    project_id
-                                )
-                                for _blk in _state_now.active_blocks.values():
-                                    if (
-                                        not _blk.obsolete
-                                        and not _blk.block_summary
-                                        and not _blk.generated_by_assistant
-                                        and _blk._cached_token_count
-                                        >= self.valves.lean_user_code_min_tokens
-                                    ):
-                                        await self._history_compressor.schedule_block_summary(
-                                            _blk, project_id
-                                        )
                         else:
                             if not self.valves.ltm_store_only_code_sessions:
                                 await self._ltm.store_messages(
@@ -21880,6 +21843,9 @@ class Filter:
                 )
                 await self._state_store.run_db_checkpoints()
             self._log_debug("outlet: after DB checkpoints")
+
+            # ── Slot save (ya movido al principio; esta parte se elimina) ──
+            # ELIMINADO: ya se ha guardado al inicio del outlet
 
             # ── Purge old versions ─────────────────────────────────────
             self._log_debug("outlet: before purge old versions")
