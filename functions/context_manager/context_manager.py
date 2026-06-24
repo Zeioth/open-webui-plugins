@@ -7695,6 +7695,7 @@ class LongTermMemory:
             # REGION 4: Extract numbered lines using regex
             # ------------------------------------------------------------------
             import re
+
             pattern = re.compile(r"^\s*(?:\d+\.\s*|[-*]\s*)?(.+)$")
             for line in response.strip().split("\n"):
                 line = line.strip()
@@ -7704,7 +7705,11 @@ class LongTermMemory:
                 if match:
                     cleaned = match.group(1).strip()
                     # Accept if it's a valid query (not empty, not meta-commentary)
-                    if cleaned and len(cleaned) > 5 and "analysis" not in cleaned.lower():
+                    if (
+                        cleaned
+                        and len(cleaned) > 5
+                        and "analysis" not in cleaned.lower()
+                    ):
                         queries.append(cleaned)
 
             # Limit to configured variants (+1 for original)
