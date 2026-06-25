@@ -2601,24 +2601,17 @@ class ContextPager:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def __init__(self, filter_ref: "Filter") -> None:
-        # Back-reference to the parent Filter. Only purge_old_versions() needs
-        # it (for valves + logging); the page-in/page-out paths are self-
-        # contained. Kept as a deliberate back-reference rather than passing
-        # the filter through every call.
         self._f = filter_ref
-        # project_id → set of block hashes currently paged out.
         self._paged_hashes: dict = {}
 
     def is_paged(self, block_hash: str, project_id: str) -> bool:
-        """True if block_hash has been paged out to ChromaDB for this project."""
         return block_hash in self._paged_hashes.get(project_id, set())
 
     def clear_project(self, project_id: str) -> None:
-        """Drop the in-memory paged registry for a project (on project switch)."""
         self._paged_hashes.pop(project_id, None)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Eviction candidate selection & page-out
+    # 2. Eviction candidate selection & page-out (migrado a psm)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def get_eviction_candidates(
@@ -2629,39 +2622,13 @@ class ContextPager:
         paging_threshold: int,
         min_activation: float,
     ) -> list:
-        """
-        Return block hashes eligible for page-out.
-
-        Criteria: len(active_blocks) > paging_threshold AND
-                  block_activation < min_activation.
-        Pinned blocks are never candidates.
-
-        activation_scores is keyed by SYMBOL name (from
-        Filter._last_activation_scores). Block-level aggregation uses the MAX
-        of its symbols' scores — any hot symbol keeps the whole block in RAM:
-            block_activation = max(scores.get(s.name, 0.0)
-                                   for s in block.symbols) or 0.0
-
-        Args:
-            state: The current conversation state (ConversationState).
-            project_id: Current project identifier.
-            activation_scores: Dict mapping qualified symbol ids to activation scores.
-            paging_threshold: Active block count above which paging starts.
-            min_activation: Minimum activation score to keep a block in RAM.
-
-        Returns:
-            A list of block hashes eligible for page-out, sorted by
-            (activation, importance) ascending (coldest first).
-        """
         active = state.active_blocks
         if len(active) <= paging_threshold:
             return []
 
-        # ── Bug 5: fallback para tier_qids si pstate está vacío ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        tier_qids = set(pstate.get("hub_tier_qids", []))
+        psm = self._f._project_state_manager
+        tier_qids = set(psm.get_hub_tier_qids(project_id))
         if not tier_qids:
-            # Primer turno o cross‑restart: leer desde state (persistido)
             tier_qids = set(state.hub_tier_qids_persisted)
 
         candidates = []
@@ -2669,13 +2636,11 @@ class ContextPager:
             if block.pinned or block.obsolete:
                 continue
 
-            # ── Proteger bloques que contienen hubs del tier ──
             if self._f.valves.hub_bodies_tier_protect_from_paging:
                 if any(qualify_symbol(s) in tier_qids for s in block.symbols):
                     continue
 
             if block.symbols:
-                # ── FIX 17.c: Use qualify_symbol to include file_path ──
                 block_activation = max(
                     (
                         activation_scores.get(qualify_symbol(s), 0.0)
@@ -2688,19 +2653,9 @@ class ContextPager:
             if block_activation < min_activation:
                 candidates.append((h, block_activation, block.importance_score))
 
-        # Page out the coldest first: lowest activation, then lowest importance.
         candidates.sort(key=lambda t: (t[1], t[2]))
-
-        # Only page out enough to return under the threshold, leaving headroom.
         n_to_page = len(active) - paging_threshold
         selected = [h for h, _, _ in candidates[:n_to_page]]
-
-        # Debug log if under-paging (FIX #8)
-        if len(selected) < n_to_page:
-            # The caller (Filter) will log this via self._log_debug when it
-            # sees fewer blocks paged than expected.
-            pass
-
         return selected
 
     async def page_out_block(
@@ -2712,36 +2667,19 @@ class ContextPager:
         chroma_collection,
         embedder,
     ) -> bool:
-        """
-        Soft‑evict a code block to ChromaDB, with semantic relevance filtering.
-
-        Uses a cascade:
-        1. Heuristic reinforcement: boost "keep" if block is in hub tier or has high importance.
-        2. CrossEncoder evaluates relevance of the block to the current context.
-        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
-        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        5. Middle zone: use heuristic (default: keep).
-
-        Restores KV slot after any LLM call.
-        """
         if chroma_collection is None or embedder is None:
             return False
 
-        # ── Get current query from volatile project state (pstate) ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        current_query = pstate.get("last_user_query", "")
+        current_query = self._f._project_state_manager.get_last_user_query(project_id)
 
-        # ── Heuristic reinforcement ──
-        should_page_out = True  # default: page out
+        should_page_out = True
         h_weight = self._f.valves.heuristic_reinforcement_weight
 
-        # Boost keep if block is important or pinned
         if block.importance_score > 5.0 or block.pinned:
             keep_boost = 0.2 * h_weight
         else:
             keep_boost = 0.0
 
-        # ── CrossEncoder evaluation ──
         if current_query and self._f._cross_encoder is not None:
             content_snippet = block.content[:1500]
             pairs = [
@@ -2757,23 +2695,20 @@ class ContextPager:
             scores = await self._f._commands._predict_cross_encoder(pairs)
 
             if scores is not None and len(scores) >= 2:
-                # ── Apply heuristic reinforcement ──
                 scores_reinforced = list(scores)
-                scores_reinforced[0] += keep_boost  # boost "keep" side
+                scores_reinforced[0] += keep_boost
 
                 diff = scores_reinforced[0] - scores_reinforced[1]
                 CE_CONFIDENCE_THRESHOLD = self._f.valves.paging_ce_threshold
                 LLM_FALLBACK_THRESHOLD = self._f.valves.paging_llm_threshold
 
                 if diff >= CE_CONFIDENCE_THRESHOLD:
-                    # Confident → use CrossEncoder
                     should_page_out = scores_reinforced[1] > scores_reinforced[0]
                     self._f._log_debug(
                         f"page_out_block: CE confident (diff={diff:.2f}) → "
                         f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
                     )
                 elif diff < LLM_FALLBACK_THRESHOLD:
-                    # Extremely uncertain → LLM with CE context
                     self._f._log_debug(
                         f"page_out_block: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                         f"using LLM for {block.hash[:8]}"
@@ -2782,14 +2717,12 @@ class ContextPager:
                         block, current_query, scores_reinforced, project_id
                     )
                 else:
-                    # Middle zone: use heuristic (keep if important)
                     should_page_out = not (block.importance_score > 5.0 or block.pinned)
                     self._f._log_debug(
                         f"page_out_block: middle zone, heuristic: "
                         f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
                     )
 
-        # ── If decision is to page out, proceed ──
         if should_page_out:
             entry_id = f"{project_id}_paged_{block.hash}"
             excerpt = block.content[:2000]
@@ -2837,13 +2770,6 @@ class ContextPager:
         embedder,
         chroma_collection,
     ) -> None:
-        """Background task for embedding and upserting a paged block.
-
-        The embedding is serialized through _chroma_semaphore so a burst of
-        evictions can't run many encodes concurrently and spike embedder
-        memory. The block has already been removed from active_blocks by the
-        synchronous caller; this only affects how fast cold storage catches up.
-        """
         async with self._f._chroma_semaphore:
             try:
                 embedding = await anyio.to_thread.run_sync(
@@ -2858,11 +2784,10 @@ class ContextPager:
                     )
                 )
             except Exception:
-                # Best effort; the block content is still in SQLite
                 pass
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 3. Purge old versions (per-file version limit)
+    # 3. Purge old versions (migrado a psm)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def purge_old_versions(
@@ -2875,35 +2800,6 @@ class ContextPager:
         max_versions_per_file: int = 3,
         stop_event: asyncio.Event = None,
     ) -> int:
-        """
-        Move code blocks older than the N most recent versions per file to cold storage,
-        with semantic relevance filtering.
-
-        This method modifies state.active_blocks, so it must acquire the
-        project_lock to avoid race conditions with the inlet.
-
-        Cascade for each block:
-        1. Heuristic: keep if pinned or high importance.
-        2. CrossEncoder evaluates if block is still relevant.
-        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
-        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        5. Middle zone: use heuristic (keep if important).
-
-        Restores KV slot after any LLM call.
-
-        Args:
-            project_id: Current project identifier.
-            state: The conversation state.
-            symbol_index: The SymbolIndex.
-            chroma_collection: ChromaDB collection for cold storage.
-            embedder: The embedder instance.
-            max_versions_per_file: Number of recent versions per file to keep.
-            stop_event: If set, stops processing gracefully after the current file.
-
-        Returns:
-            int: The number of blocks purged.
-        """
-        # ── Acquire project lock to protect state modifications ──
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
             from collections import defaultdict
@@ -2917,11 +2813,9 @@ class ContextPager:
                     by_file[block.file_path].append((h, block))
 
             purged = 0
-
-            # ── Get current query from volatile project state (pstate) ──
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            current_query = pstate.get("last_user_query", "")
-
+            current_query = self._f._project_state_manager.get_last_user_query(
+                project_id
+            )
             h_weight = self._f.valves.heuristic_reinforcement_weight
 
             for file_path, versions in by_file.items():
@@ -2938,12 +2832,9 @@ class ContextPager:
                 to_purge = versions[max_versions_per_file:]
 
                 for h, block in to_purge:
-                    should_purge = True  # default: purge
-
-                    # ── Heuristic reinforcement: keep if important ──
+                    should_purge = True
                     keep_boost = 0.2 * h_weight if block.importance_score > 5.0 else 0.0
 
-                    # ── CrossEncoder evaluation ──
                     if current_query and self._f._cross_encoder is not None:
                         content_snippet = block.content[:1500]
                         pairs = [
@@ -2959,16 +2850,14 @@ class ContextPager:
                         scores = await self._f._commands._predict_cross_encoder(pairs)
 
                         if scores is not None and len(scores) >= 2:
-                            # ── Apply heuristic reinforcement ──
                             scores_reinforced = list(scores)
-                            scores_reinforced[0] += keep_boost  # boost "keep" side
+                            scores_reinforced[0] += keep_boost
 
                             diff = scores_reinforced[0] - scores_reinforced[1]
                             CE_CONFIDENCE_THRESHOLD = self._f.valves.purge_ce_threshold
                             LLM_FALLBACK_THRESHOLD = self._f.valves.purge_llm_threshold
 
                             if diff >= CE_CONFIDENCE_THRESHOLD:
-                                # Confident → use CrossEncoder
                                 should_purge = (
                                     scores_reinforced[1] > scores_reinforced[0]
                                 )
@@ -2977,7 +2866,6 @@ class ContextPager:
                                     f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
                                 )
                             elif diff < LLM_FALLBACK_THRESHOLD:
-                                # Extremely uncertain → LLM with CE context
                                 self._f._log_debug(
                                     f"purge_old_versions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                                     f"using LLM for {block.hash[:8]}"
@@ -2986,7 +2874,6 @@ class ContextPager:
                                     block, current_query, scores_reinforced, project_id
                                 )
                             else:
-                                # Middle zone: use heuristic (keep if important)
                                 should_purge = not (
                                     block.importance_score > 5.0 or block.pinned
                                 )
@@ -2995,7 +2882,6 @@ class ContextPager:
                                     f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
                                 )
 
-                    # ── Execute purge if decided ──
                     if should_purge:
                         if (
                             self._f.valves.enable_block_paging
@@ -3013,7 +2899,6 @@ class ContextPager:
                                 del state.active_blocks[h]
                                 purged += 1
                                 continue
-                        # Fallback: remove from active blocks without paging
                         if h in state.active_blocks:
                             del state.active_blocks[h]
                             purged += 1
@@ -3031,20 +2916,6 @@ class ContextPager:
         ce_scores: List[float],
         project_id: str,
     ) -> bool:
-        """
-        LLM fallback for purge decision.
-
-        Uses CrossEncoder scores as context and restores the KV slot afterward.
-
-        Args:
-            block (CodeBlock): The block to evaluate.
-            query (str): The current user query.
-            ce_scores (List[float]): CrossEncoder scores (reinforced).
-            project_id (str): Current project identifier.
-
-        Returns:
-            bool: True if the block should be purged, False if it should be kept.
-        """
         snippet = block.content[:500]
 
         prompt = f"""
@@ -3072,7 +2943,6 @@ Output only "KEEP" or "PURGE".
             label="purge_llm",
         )
 
-        # ── Restore KV slot ──
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
@@ -3081,7 +2951,7 @@ Output only "KEEP" or "PURGE".
         return False
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Page-in (temporary reconstruction from ChromaDB)
+    # 4. Page-in (sin cambios)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def page_in_block(
@@ -3091,28 +2961,11 @@ Output only "KEEP" or "PURGE".
         chroma_collection,
         db_conn=None,
     ) -> "Optional[CodeBlock]":
-        """
-        Retrieve a paged block for temporary use THIS TURN ONLY.
-
-        Reconstruction is lossless:
-          1. Read the full body from SQLite code_contents WHERE hash = block_hash
-             (populated by _save_state_to_db). If a db_conn is provided we use
-             it; otherwise we fall back to the ChromaDB excerpt (degraded).
-          2. Re-extract symbols deterministically via SignatureExtractor — this
-             yields identical symbols to the original block.
-          3. Rebuild the CodeBlock from content + ChromaDB metadata.
-
-        Does NOT restore the block to active_blocks and does NOT remove it from
-        the paged registry — the block stays cold; only this turn sees it.
-
-        Returns None if the block cannot be reconstructed from either source.
-        """
         if not self.is_paged(block_hash, project_id):
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
 
-        # Try ChromaDB for metadata + excerpt (FIX #4: ChromaDB is optional for reconstruction)
         meta = None
         excerpt = ""
         if chroma_collection is not None:
@@ -3128,7 +2981,6 @@ Output only "KEEP" or "PURGE".
             except Exception:
                 pass
 
-        # Recover the full body from code_contents (authoritative) – now via _db_read
         content = ""
         if db_conn is not None:
             try:
@@ -3143,15 +2995,12 @@ Output only "KEEP" or "PURGE".
             except Exception:
                 pass
 
-        # If DB failed, fall back to excerpt
         if not content:
             content = excerpt
 
-        # If both sources are empty, we cannot reconstruct
         if not content:
             return None
 
-        # Extract metadata fields with safe defaults
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3165,14 +3014,12 @@ Output only "KEEP" or "PURGE".
         except Exception:
             ctype = ContentType.GENERAL
 
-        # Deterministic symbol re-extraction
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
 
-        # Reconstruct the CodeBlock
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -14354,6 +14201,584 @@ class CodeBlockManager:
         return edges
 
 
+class ContextPager:
+    """
+    Manages CodeBlock lifecycle between active_blocks (RAM) and ChromaDB (paged).
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization & state management
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        # Back-reference to the parent Filter. Only purge_old_versions() needs
+        # it (for valves + logging); the page-in/page-out paths are self-
+        # contained. Kept as a deliberate back-reference rather than passing
+        # the filter through every call.
+        self._f = filter_ref
+        # project_id → set of block hashes currently paged out.
+        self._paged_hashes: dict = {}
+
+    def is_paged(self, block_hash: str, project_id: str) -> bool:
+        """True if block_hash has been paged out to ChromaDB for this project."""
+        return block_hash in self._paged_hashes.get(project_id, set())
+
+    def clear_project(self, project_id: str) -> None:
+        """Drop the in-memory paged registry for a project (on project switch)."""
+        self._paged_hashes.pop(project_id, None)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. Eviction candidate selection & page-out
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_eviction_candidates(
+        self,
+        state: ConversationState,
+        project_id: str,
+        activation_scores: dict,
+        paging_threshold: int,
+        min_activation: float,
+    ) -> list:
+        """
+        Return block hashes eligible for page-out.
+
+        Criteria: len(active_blocks) > paging_threshold AND
+                  block_activation < min_activation.
+        Pinned blocks are never candidates.
+
+        activation_scores is keyed by SYMBOL name (from
+        Filter._last_activation_scores). Block-level aggregation uses the MAX
+        of its symbols' scores — any hot symbol keeps the whole block in RAM:
+            block_activation = max(scores.get(s.name, 0.0)
+                                   for s in block.symbols) or 0.0
+
+        Args:
+            state: The current conversation state (ConversationState).
+            project_id: Current project identifier.
+            activation_scores: Dict mapping qualified symbol ids to activation scores.
+            paging_threshold: Active block count above which paging starts.
+            min_activation: Minimum activation score to keep a block in RAM.
+
+        Returns:
+            A list of block hashes eligible for page-out, sorted by
+            (activation, importance) ascending (coldest first).
+        """
+        active = state.active_blocks
+        if len(active) <= paging_threshold:
+            return []
+
+        psm = self._f._project_state_manager
+        tier_qids = set(psm.get_hub_tier_qids(project_id))
+        if not tier_qids:
+            tier_qids = set(state.hub_tier_qids_persisted)
+
+        candidates = []
+        for h, block in active.items():
+            if block.pinned or block.obsolete:
+                continue
+
+            if self._f.valves.hub_bodies_tier_protect_from_paging:
+                if any(qualify_symbol(s) in tier_qids for s in block.symbols):
+                    continue
+
+            if block.symbols:
+                block_activation = max(
+                    (
+                        activation_scores.get(qualify_symbol(s), 0.0)
+                        for s in block.symbols
+                    ),
+                    default=0.0,
+                )
+            else:
+                block_activation = 0.0
+            if block_activation < min_activation:
+                candidates.append((h, block_activation, block.importance_score))
+
+        # Page out the coldest first: lowest activation, then lowest importance.
+        candidates.sort(key=lambda t: (t[1], t[2]))
+
+        # Only page out enough to return under the threshold, leaving headroom.
+        n_to_page = len(active) - paging_threshold
+        selected = [h for h, _, _ in candidates[:n_to_page]]
+
+        return selected
+
+    async def page_out_block(
+        self,
+        block: "CodeBlock",
+        project_id: str,
+        state: dict,
+        symbol_index: "SymbolIndex",
+        chroma_collection,
+        embedder,
+    ) -> bool:
+        """
+        Soft‑evict a code block to ChromaDB, with semantic relevance filtering.
+
+        Uses a cascade:
+        1. Heuristic reinforcement: boost "keep" if block is in hub tier or has high importance.
+        2. CrossEncoder evaluates relevance of the block to the current context.
+        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
+        5. Middle zone: use heuristic (default: keep).
+
+        Restores KV slot after any LLM call.
+        """
+        if chroma_collection is None or embedder is None:
+            return False
+
+        current_query = self._f._project_state_manager.get_last_user_query(project_id)
+
+        should_page_out = True  # default: page out
+        h_weight = self._f.valves.heuristic_reinforcement_weight
+
+        # Boost keep if block is important or pinned
+        if block.importance_score > 5.0 or block.pinned:
+            keep_boost = 0.2 * h_weight
+        else:
+            keep_boost = 0.0
+
+        if current_query and self._f._cross_encoder is not None:
+            content_snippet = block.content[:1500]
+            pairs = [
+                (
+                    current_query[:500],
+                    f"This code block is relevant to the current query and should be kept:\n{content_snippet}",
+                ),
+                (
+                    current_query[:500],
+                    f"This code block is not relevant to the current query and can be paged out:\n{content_snippet}",
+                ),
+            ]
+            scores = await self._f._commands._predict_cross_encoder(pairs)
+
+            if scores is not None and len(scores) >= 2:
+                # ── Apply heuristic reinforcement ──
+                scores_reinforced = list(scores)
+                scores_reinforced[0] += keep_boost  # boost "keep" side
+
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                CE_CONFIDENCE_THRESHOLD = self._f.valves.paging_ce_threshold
+                LLM_FALLBACK_THRESHOLD = self._f.valves.paging_llm_threshold
+
+                if diff >= CE_CONFIDENCE_THRESHOLD:
+                    # Confident → use CrossEncoder
+                    should_page_out = scores_reinforced[1] > scores_reinforced[0]
+                    self._f._log_debug(
+                        f"page_out_block: CE confident (diff={diff:.2f}) → "
+                        f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
+                    )
+                elif diff < LLM_FALLBACK_THRESHOLD:
+                    # Extremely uncertain → LLM with CE context
+                    self._f._log_debug(
+                        f"page_out_block: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                        f"using LLM for {block.hash[:8]}"
+                    )
+                    should_page_out = await self._page_out_block_with_llm(
+                        block, current_query, scores_reinforced, project_id
+                    )
+                else:
+                    # Middle zone: use heuristic (keep if important)
+                    should_page_out = not (block.importance_score > 5.0 or block.pinned)
+                    self._f._log_debug(
+                        f"page_out_block: middle zone, heuristic: "
+                        f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
+                    )
+
+        if should_page_out:
+            entry_id = f"{project_id}_paged_{block.hash}"
+            excerpt = block.content[:2000]
+            symbol_names = ",".join(s.name for s in block.symbols)
+
+            safe_text = block.content
+            if hasattr(self._f, "_tokens"):
+                safe_text = self._f._tokens.truncate_text_to_tokens(
+                    block.content, 32768
+                )
+
+            metadata = {
+                "project_id": project_id,
+                "is_paged_block": True,
+                "block_hash": block.hash,
+                "file_path": block.file_path or "",
+                "content_type": block.content_type.value,
+                "importance_score": block.importance_score,
+                "paged_at": time.time(),
+                "symbol_names": symbol_names,
+            }
+
+            asyncio.create_task(
+                self._page_out_async(
+                    entry_id=entry_id,
+                    safe_text=safe_text,
+                    excerpt=excerpt,
+                    metadata=metadata,
+                    embedder=embedder,
+                    chroma_collection=chroma_collection,
+                )
+            )
+
+            self._paged_hashes.setdefault(project_id, set()).add(block.hash)
+            return True
+
+        return False
+
+    async def _page_out_async(
+        self,
+        entry_id: str,
+        safe_text: str,
+        excerpt: str,
+        metadata: dict,
+        embedder,
+        chroma_collection,
+    ) -> None:
+        """Background task for embedding and upserting a paged block.
+
+        The embedding is serialized through _chroma_semaphore so a burst of
+        evictions can't run many encodes concurrently and spike embedder
+        memory. The block has already been removed from active_blocks by the
+        synchronous caller; this only affects how fast cold storage catches up.
+        """
+        async with self._f._chroma_semaphore:
+            try:
+                embedding = await anyio.to_thread.run_sync(
+                    lambda: embedder.encode(safe_text).tolist()
+                )
+                await anyio.to_thread.run_sync(
+                    lambda: chroma_collection.upsert(
+                        ids=[entry_id],
+                        embeddings=[embedding],
+                        documents=[excerpt],
+                        metadatas=[metadata],
+                    )
+                )
+            except Exception:
+                # Best effort; the block content is still in SQLite
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. Purge old versions (per-file version limit)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def purge_old_versions(
+        self,
+        project_id: str,
+        state: dict,
+        symbol_index: "SymbolIndex",
+        chroma_collection,
+        embedder,
+        max_versions_per_file: int = 3,
+        stop_event: asyncio.Event = None,
+    ) -> int:
+        """
+        Move code blocks older than the N most recent versions per file to cold storage,
+        with semantic relevance filtering.
+
+        This method modifies state.active_blocks, so it must acquire the
+        project_lock to avoid race conditions with the inlet.
+
+        Cascade for each block:
+        1. Heuristic: keep if pinned or high importance.
+        2. CrossEncoder evaluates if block is still relevant.
+        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
+        5. Middle zone: use heuristic (keep if important).
+
+        Restores KV slot after any LLM call.
+
+        Args:
+            project_id: Current project identifier.
+            state: The conversation state.
+            symbol_index: The SymbolIndex.
+            chroma_collection: ChromaDB collection for cold storage.
+            embedder: The embedder instance.
+            max_versions_per_file: Number of recent versions per file to keep.
+            stop_event: If set, stops processing gracefully after the current file.
+
+        Returns:
+            int: The number of blocks purged.
+        """
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            from collections import defaultdict
+
+            if stop_event and stop_event.is_set():
+                return 0
+
+            by_file = defaultdict(list)
+            for h, block in state.active_blocks.items():
+                if block.file_path and not block.pinned and not block.obsolete:
+                    by_file[block.file_path].append((h, block))
+
+            purged = 0
+
+            current_query = self._f._project_state_manager.get_last_user_query(
+                project_id
+            )
+            h_weight = self._f.valves.heuristic_reinforcement_weight
+
+            for file_path, versions in by_file.items():
+                if stop_event and stop_event.is_set():
+                    self._f._log_debug(
+                        f"purge_old_versions: stopped after {purged} purged blocks"
+                    )
+                    break
+
+                if len(versions) <= max_versions_per_file:
+                    continue
+
+                versions.sort(key=lambda x: x[1].timestamp, reverse=True)
+                to_purge = versions[max_versions_per_file:]
+
+                for h, block in to_purge:
+                    should_purge = True  # default: purge
+
+                    # ── Heuristic reinforcement: keep if important ──
+                    keep_boost = 0.2 * h_weight if block.importance_score > 5.0 else 0.0
+
+                    # ── CrossEncoder evaluation ──
+                    if current_query and self._f._cross_encoder is not None:
+                        content_snippet = block.content[:1500]
+                        pairs = [
+                            (
+                                current_query[:500],
+                                f"This old version is still relevant and should be kept:\n{content_snippet}",
+                            ),
+                            (
+                                current_query[:500],
+                                f"This old version is obsolete and can be purged:\n{content_snippet}",
+                            ),
+                        ]
+                        scores = await self._f._commands._predict_cross_encoder(pairs)
+
+                        if scores is not None and len(scores) >= 2:
+                            # ── Apply heuristic reinforcement ──
+                            scores_reinforced = list(scores)
+                            scores_reinforced[0] += keep_boost  # boost "keep" side
+
+                            diff = scores_reinforced[0] - scores_reinforced[1]
+                            CE_CONFIDENCE_THRESHOLD = self._f.valves.purge_ce_threshold
+                            LLM_FALLBACK_THRESHOLD = self._f.valves.purge_llm_threshold
+
+                            if diff >= CE_CONFIDENCE_THRESHOLD:
+                                # Confident → use CrossEncoder
+                                should_purge = (
+                                    scores_reinforced[1] > scores_reinforced[0]
+                                )
+                                self._f._log_debug(
+                                    f"purge_old_versions: CE confident (diff={diff:.2f}) → "
+                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                )
+                            elif diff < LLM_FALLBACK_THRESHOLD:
+                                # Extremely uncertain → LLM with CE context
+                                self._f._log_debug(
+                                    f"purge_old_versions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                                    f"using LLM for {block.hash[:8]}"
+                                )
+                                should_purge = await self._purge_old_version_with_llm(
+                                    block, current_query, scores_reinforced, project_id
+                                )
+                            else:
+                                # Middle zone: use heuristic (keep if important)
+                                should_purge = not (
+                                    block.importance_score > 5.0 or block.pinned
+                                )
+                                self._f._log_debug(
+                                    f"purge_old_versions: middle zone, heuristic: "
+                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                )
+
+                    # ── Execute purge if decided ──
+                    if should_purge:
+                        if (
+                            self._f.valves.enable_block_paging
+                            and chroma_collection is not None
+                        ):
+                            paged = await self.page_out_block(
+                                block=block,
+                                project_id=project_id,
+                                state=state,
+                                symbol_index=symbol_index,
+                                chroma_collection=chroma_collection,
+                                embedder=embedder,
+                            )
+                            if paged:
+                                del state.active_blocks[h]
+                                purged += 1
+                                continue
+                        # Fallback: remove from active blocks without paging
+                        if h in state.active_blocks:
+                            del state.active_blocks[h]
+                            purged += 1
+
+            if purged > 0:
+                self._f._log_debug(
+                    f"Purged {purged} old code version(s) across {len(by_file)} file(s)"
+                )
+            return purged
+
+    async def _purge_old_version_with_llm(
+        self,
+        block: "CodeBlock",
+        query: str,
+        ce_scores: List[float],
+        project_id: str,
+    ) -> bool:
+        """
+        LLM fallback for purge decision.
+
+        Uses CrossEncoder scores as context and restores the KV slot afterward.
+
+        Args:
+            block (CodeBlock): The block to evaluate.
+            query (str): The current user query.
+            ce_scores (List[float]): CrossEncoder scores (reinforced).
+            project_id (str): Current project identifier.
+
+        Returns:
+            bool: True if the block should be purged, False if it should be kept.
+        """
+        snippet = block.content[:500]
+
+        prompt = f"""
+The CrossEncoder is uncertain. Scores:
+- Keep: {ce_scores[0]:.2f}
+- Purge: {ce_scores[1]:.2f}
+
+Old version (snippet):
+{snippet}
+
+Current query:
+{query[:500]}
+
+Is this old version still valuable for context, or can it be safely purged?
+Consider: is it likely to be referenced again?
+
+Output only "KEEP" or "PURGE".
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a memory manager. Output only 'KEEP' or 'PURGE'.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="purge_llm",
+        )
+
+        # ── Restore KV slot ──
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "PURGE":
+            return True
+        return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. Page-in (temporary reconstruction from ChromaDB)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def page_in_block(
+        self,
+        block_hash: str,
+        project_id: str,
+        chroma_collection,
+        db_conn=None,
+    ) -> "Optional[CodeBlock]":
+        """
+        Retrieve a paged block for temporary use THIS TURN ONLY.
+
+        Reconstruction is lossless:
+          1. Read the full body from SQLite code_contents WHERE hash = block_hash
+             (populated by _save_state_to_db). If a db_conn is provided we use
+             it; otherwise we fall back to the ChromaDB excerpt (degraded).
+          2. Re-extract symbols deterministically via SignatureExtractor — this
+             yields identical symbols to the original block.
+          3. Rebuild the CodeBlock from content + ChromaDB metadata.
+
+        Does NOT restore the block to active_blocks and does NOT remove it from
+        the paged registry — the block stays cold; only this turn sees it.
+
+        Returns None if the block cannot be reconstructed from either source.
+        """
+        if not self.is_paged(block_hash, project_id):
+            return None
+
+        entry_id = f"{project_id}_paged_{block_hash}"
+
+        # Try ChromaDB for metadata + excerpt (FIX #4: ChromaDB is optional for reconstruction)
+        meta = None
+        excerpt = ""
+        if chroma_collection is not None:
+            try:
+                result = await anyio.to_thread.run_sync(
+                    lambda: chroma_collection.get(
+                        ids=[entry_id], include=["metadatas", "documents"]
+                    )
+                )
+                if result and result.get("ids"):
+                    meta = result["metadatas"][0]
+                    excerpt = result["documents"][0] if result.get("documents") else ""
+            except Exception:
+                pass
+
+        # Recover the full body from code_contents (authoritative) – now via _db_read
+        content = ""
+        if db_conn is not None:
+            try:
+                row = await self._f._state_store._db_read(
+                    lambda: self._f._db_conn.execute(
+                        "SELECT content FROM code_contents WHERE hash = ?",
+                        (block_hash,),
+                    ).fetchone()
+                )
+                if row and row[0]:
+                    content = row[0]
+            except Exception:
+                pass
+
+        # If DB failed, fall back to excerpt
+        if not content:
+            content = excerpt
+
+        # If both sources are empty, we cannot reconstruct
+        if not content:
+            return None
+
+        # Extract metadata fields with safe defaults
+        file_path = meta.get("file_path") if meta else None
+        ctype_str = (
+            meta.get("content_type", ContentType.GENERAL.value)
+            if meta
+            else ContentType.GENERAL.value
+        )
+        importance = meta.get("importance_score", 1.0) if meta else 1.0
+
+        try:
+            ctype = ContentType(ctype_str)
+        except Exception:
+            ctype = ContentType.GENERAL
+
+        # Deterministic symbol re-extraction
+        symbols = []
+        try:
+            symbols = await SignatureExtractor.extract_async(content, file_path)
+        except Exception:
+            pass
+
+        # Reconstruct the CodeBlock
+        block = CodeBlock(
+            content=content,
+            content_type=ctype,
+            file_path=file_path,
+            hash=block_hash,
+            symbols=symbols,
+            importance_score=importance,
+        )
+        for s in block.symbols:
+            s.parent_block_hash = block_hash
+        return block
+
+
 class ActivationEngine:
     """Builds activation graphs from query seeds and the symbol call graph,
     determining which code blocks are relevant to the current user message.
@@ -14428,7 +14853,6 @@ class ActivationEngine:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
-        # ── Q2: PPR cache ──
         self._ppr_cache = self._PPRCache(maxsize=20)
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -14437,9 +14861,6 @@ class ActivationEngine:
 
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 1 — Load state & filter active blocks
-        # ═══════════════════════════════════════════════════════════════════════════
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return ""
@@ -14460,9 +14881,6 @@ class ActivationEngine:
         if not active:
             return ""
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 2 — Recent activity & mentioned files
-        # ═══════════════════════════════════════════════════════════════════════════
         recent_window = self._f.valves.recent_activity_window_minutes * 60
         recent_files = {}
         for b in active:
@@ -14489,9 +14907,6 @@ class ActivationEngine:
                 + "\n\n"
             )
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 3 — Compute relevance boost (file + symbol mentions)
-        # ═══════════════════════════════════════════════════════════════════════════
         mentioned_files = set()
         mentioned_symbols = set()
         if user_query:
@@ -14519,9 +14934,6 @@ class ActivationEngine:
             boost = relevance_boost(b)
             boosted_active.append((b, boost))
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 4 — Sort and group blocks by type
-        # ═══════════════════════════════════════════════════════════════════════════
         boost_priority = self._f.valves.raw_file_priority_boost
         boosted_active.sort(
             key=lambda pair: (
@@ -14561,9 +14973,6 @@ class ActivationEngine:
             else []
         )
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 5 — Build the context sections (Base, Proposed, Committed, Errors)
-        # ═══════════════════════════════════════════════════════════════════════════
         parts = ["## Currently Active Code Context (by importance)\n"]
         parts.insert(
             1,
@@ -14600,11 +15009,8 @@ class ActivationEngine:
                 tag = " [RELEVANT]" if relevance_boost(b) > 0 else ""
                 parts.append(CodeBlockManager.format_block_context(b, is_latest) + tag)
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGION 6 — Dynamic budget & truncation (uses pstate)
-        # ═══════════════════════════════════════════════════════════════════════════
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        used_system = pstate.get("last_system_tokens", 0)
+        psm = self._f._project_state_manager
+        used_system = psm.get_last_system_tokens(project_id)
 
         effective_budget = max(
             4000,
@@ -14617,7 +15023,6 @@ class ActivationEngine:
             effective_budget,
         )
 
-        # Convergent truncation with line-by-line fence detection.
         if max_tokens > 0 and self._f.tokenizer:
             part_tokens = [len(self._f.tokenizer.encode(p)) for p in parts]
             current_tokens = sum(part_tokens)
@@ -14686,7 +15091,6 @@ class ActivationEngine:
         partial = []
 
         if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
-            # Build candidates: symbols that share a prefix or contain a query word
             candidates = set()
             for word in query_words:
                 if len(word) < 3:
@@ -14703,42 +15107,35 @@ class ActivationEngine:
                 pairs = [(query, name) for name in candidates]
                 scores = self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None:
-                    # Heuristic reinforcement: if name contains query word exactly, boost
                     scores_reinforced = list(scores)
                     for i, name in enumerate(candidates):
                         if any(word in name for word in query_words):
                             scores_reinforced[i] += 0.1
-                    # Sort by score descending
                     scored = sorted(
                         zip(candidates, scores_reinforced),
                         key=lambda x: x[1],
                         reverse=True,
                     )
-                    # Keep those above threshold
                     ce_threshold = 0.5
                     best = [name for name, sc in scored if sc > ce_threshold]
                     if best:
                         partial = best[:5]
                     else:
-                        # If best is empty, check if the top score is very close to the second (diff < 0.10)
                         if len(scored) >= 2:
                             diff = scored[0][1] - scored[1][1]
                             if diff < 0.10:
-                                # Extremely uncertain → use LLM to disambiguate
                                 llm_choice = self._extract_seeds_with_llm(
                                     query, scored[:5], project_id
                                 )
                                 if llm_choice:
                                     partial = [llm_choice]
                                 else:
-                                    # fallback to fuzzy
                                     partial = [scored[0][0]]
                             else:
                                 partial = [scored[0][0]]
                         elif scored:
                             partial = [scored[0][0]]
 
-        # ── Fallback: existing partial matching ──
         if len(partial) < 3:
             for word in query_words:
                 if len(word) < 4:
@@ -14967,21 +15364,17 @@ Output only the symbol name.
         """
         seed_frozenset = frozenset(seed_qids)
 
-        # ── Check cache ──
         cached = self._ppr_cache.get(code_state_hash, seed_frozenset)
         if cached is not None:
             self._f._log_debug(f"PPR: cache hit ({self._ppr_cache.stats})")
             return cached
 
-        # ── Compute PPR ──
         ag = ActivationGraph()
 
-        # Seed the graph
         total_seed_score = len(seed_qids)
         if total_seed_score == 0:
-            # Fallback to entry points
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            centrality = pstate.get("node_centrality", {})
+            psm = self._f._project_state_manager
+            centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
                 self._f._symbol_index, project_id
             )
@@ -14994,11 +15387,9 @@ Output only the symbol name.
                     seed_score = 0.2 + 0.2 * cent_score
                     ag.seed([sym_name], initial_score=seed_score)
         else:
-            # Distribute seed scores evenly
             init_score = 1.0 / total_seed_score
             ag.seed(seed_qids, initial_score=init_score)
 
-        # Run PPR propagation
         ag.propagate(
             edges_out=edges_out,
             max_steps=max_steps,
@@ -15006,14 +15397,11 @@ Output only the symbol name.
             alpha=alpha,
         )
 
-        # Extract scores
         scores = ag.get_activated_nodes(threshold=min_score)
 
-        # ── Store in cache ──
         self._ppr_cache.set(code_state_hash, seed_frozenset, scores)
         self._f._log_debug(f"PPR: computed and cached ({self._ppr_cache.stats})")
 
-        # Log stats periodically (every 50th computation)
         if hasattr(self._f, "_write_counter") and self._f._write_counter % 50 == 0:
             self._f._log_debug(self._ppr_cache.stats)
 
@@ -15032,7 +15420,7 @@ Output only the symbol name.
         edges_out: dict,
         project_id: str,
         inferred_seeds: Optional[Dict[str, float]] = None,
-        cached_scores: Optional[Dict[str, float]] = None,  # ← Q2
+        cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
         """Build activation graph when multi‑seed activation is disabled.
 
@@ -15045,7 +15433,6 @@ Output only the symbol name.
         ag = ActivationGraph()
         lexical_seed_qids: Set[str] = set()
 
-        # ── Lexical + traceback + history seeds ──
         if exact_seeds:
             for sym_name in exact_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
@@ -15103,7 +15490,6 @@ Output only the symbol name.
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        # ── Inferred seeds ──
         for qid, inf_score in (inferred_seeds or {}).items():
             lexical_seed_qids.add(qid)
             existing = ag._activations.get(qid)
@@ -15122,9 +15508,7 @@ Output only the symbol name.
                     source="seed",
                 )
 
-        # ── Q2: Use cached scores if available, otherwise run PPR ──
         if cached_scores is not None:
-            # Populate from cache (but preserve seed status for seeds that were already set)
             for qid, score in cached_scores.items():
                 if score >= 0.01:
                     existing = ag._activations.get(qid)
@@ -15137,10 +15521,9 @@ Output only the symbol name.
                     )
             self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
         else:
-            # ── Fallback to entry points if no seeds at all ──
             if not ag._activations:
-                pstate = self._f._project_state_manager.get_pstate(project_id)
-                centrality = pstate.get("node_centrality", {})
+                psm = self._f._project_state_manager
+                centrality = psm.get_node_centrality(project_id)
                 entry_points = self._f._path_index.find_entry_points(
                     symbol_index, project_id
                 )
@@ -15158,7 +15541,6 @@ Output only the symbol name.
                         )
                         lexical_seed_qids.add(sym_name)
 
-            # Run PPR propagation
             ag.propagate(
                 edges_out=edges_out,
                 max_steps=20,
@@ -15176,7 +15558,7 @@ Output only the symbol name.
         edges_out: dict,
         project_id: str,
         inferred_seeds: Optional[Dict[str, float]] = None,
-        cached_scores: Optional[Dict[str, float]] = None,  # ← Q2
+        cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
         """Build activation graph combining lexical, structural and historical
         seed vectors.
@@ -15188,7 +15570,6 @@ Output only the symbol name.
         w_his = self._f.valves.multi_seed_weight_historical
         symbol_index = self._f._symbol_index
 
-        # ── Vector 1: Lexical ──────────────────────────────────────────
         ag_lex = ActivationGraph()
         lexical_seed_qids: Set[str] = set()
         if exact_seeds:
@@ -15231,7 +15612,6 @@ Output only the symbol name.
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        # ── Inferred seeds → lexical vector ──
         for qid, inf_score in (inferred_seeds or {}).items():
             lexical_seed_qids.add(qid)
             existing = ag_lex._activations.get(qid)
@@ -15250,7 +15630,6 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Vector 2: Structural ───────────────────────────────────────
         ag_str = ActivationGraph()
         seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
@@ -15276,7 +15655,6 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Vector 3: Historical ───────────────────────────────────────
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -15293,10 +15671,8 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Q2: If cached_scores is provided, combine them directly ──
         if cached_scores is not None:
             ag_final = ActivationGraph()
-            # Use cached scores as the base
             for qid, score in cached_scores.items():
                 if score >= 0.01:
                     source = "seed" if qid in lexical_seed_qids else "propagation"
@@ -15309,7 +15685,6 @@ Output only the symbol name.
             self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
             return ag_final
 
-        # ── No cached scores: combine the three vectors ──
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -15318,8 +15693,8 @@ Output only the symbol name.
 
         ag_final = ActivationGraph()
         if not all_activated:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            centrality = pstate.get("node_centrality", {})
+            psm = self._f._project_state_manager
+            centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
                 symbol_index, project_id
             )
@@ -15421,7 +15796,6 @@ Output only the symbol name.
 
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
 
-        # 1. Extract all seed symbols from the query and history
         exact_seeds, partial_seeds, tb_seeds, history_boosts = (
             self._prepare_seed_symbols(query, project_id, messages)
         )
@@ -15432,7 +15806,6 @@ Output only the symbol name.
             f"tb={len(tb_seeds)}, history={len(history_boosts)}"
         )
 
-        # ── Q2: Build seed_qids list for cache key ──
         seed_qids: List[str] = []
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
 
@@ -15447,13 +15820,10 @@ Output only the symbol name.
             seed_qids.extend(qids)
         if inferred_seeds:
             seed_qids.extend(inferred_seeds.keys())
-        # Deduplicate and filter to only existing qids
         seed_qids = list(set(seed_qids) & set(all_qids))
 
-        # ── Q2: Get code_state_hash for cache invalidation ──
         code_state_hash = self.compute_code_state_hash(project_id)
 
-        # ── Q2: Get cached PPR scores or compute ──
         cached_scores = self._get_or_compute_ppr_scores(
             seed_qids=seed_qids,
             project_id=project_id,
@@ -15464,7 +15834,6 @@ Output only the symbol name.
             alpha=self._f.valves.ppr_alpha,
         )
 
-        # 2. Build the activation graph using cached scores if available
         _inferred = inferred_seeds or {}
         if not self._f.valves.enable_multi_seed_activation:
             self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
@@ -15476,7 +15845,7 @@ Output only the symbol name.
                 edges_out,
                 project_id,
                 _inferred,
-                cached_scores=cached_scores,  # ← Q2
+                cached_scores=cached_scores,
             )
         else:
             self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
@@ -15488,13 +15857,11 @@ Output only the symbol name.
                 edges_out,
                 project_id,
                 _inferred,
-                cached_scores=cached_scores,  # ← Q2
+                cached_scores=cached_scores,
             )
 
-        # 3. Store scores for downstream consumers (LOD, prefetch, pager)
         self._store_activation_scores(ag, project_id)
 
-        # ── E7: normalize scores before returning ──────────────────────────
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
         )
@@ -15578,9 +15945,10 @@ Output only the symbol name.
             await self._build_view_from_activation(ep, ag, project_id)
 
         if self._f.valves.enable_centrality_prior:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
-                project_id
+            psm = self._f._project_state_manager
+            psm.set_node_centrality(
+                project_id,
+                self._f._symbol_index.precompute_centrality(project_id),
             )
 
     async def resolve_dangling_edges(self, project_id: str) -> int:
@@ -15694,10 +16062,8 @@ Output only the symbol name.
         if not last_activated:
             return
 
-        # ── 1. Select top activated symbols ──
         top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
 
-        # ── 2. Collect candidates (direct callees with high confidence) ──
         prefetch_candidates: Set[str] = set()
         for sym in top_syms:
             for edge in self._f._symbol_index.get_edges_out(sym, project_id):
@@ -15714,7 +16080,6 @@ Output only the symbol name.
         if stop_event and stop_event.is_set():
             return
 
-        # ── 3. Build CodePathViews for candidates ──
         candidates = list(prefetch_candidates)[
             : self._f.valves.speculative_prefetch_max
         ]
@@ -15802,7 +16167,6 @@ Output only the symbol name.
         min_s = min(raw_scores.values())
         max_s = max(raw_scores.values())
         if max_s <= min_s:
-            # All scores equal (e.g. isolated graph) — normalize to 0.5
             return {qid: 0.5 for qid in raw_scores}
         return {
             qid: (score - min_s) / (max_s - min_s) for qid, score in raw_scores.items()
@@ -15847,10 +16211,11 @@ Output only the symbol name.
 
     def invalidate_lightweight_cache(self, project_id: str) -> None:
         """Clear cached lightweight context and centrality so the next request rebuilds them."""
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
         pstate["cached_lightweight_context"] = ""
         pstate["cached_code_state_hash"] = None
-        pstate["node_centrality"] = {}
+        psm.set_node_centrality(project_id, {})
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 10. Static evidence (for scientific CoT)
@@ -17117,13 +17482,14 @@ class EnrichmentTasks:
                 self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 3. LOD adaptive adjustment
+    # 3. LOD adaptive adjustment (MIGRADO)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def update_lod_thresholds_from_response(
         self,
         project_id: str,
         response_text: str,
+        stop_event: asyncio.Event = None,
     ) -> None:
         """
         Adjust lod3_threshold based on which symbols appear in the LLM's
@@ -17132,8 +17498,8 @@ class EnrichmentTasks:
         if not self._f.valves.enable_lod_adaptive:
             return
 
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        last_lod_map = pstate.get("last_lod_levels", {})
+        psm = self._f._project_state_manager
+        last_lod_map = psm.get_last_lod_levels(project_id)
         if not last_lod_map:
             return
 
@@ -17454,10 +17820,10 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
-        # ── REGION 4: Determine priority for each qid ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        skeleton_qids = set(pstate.get("skeleton_tier_qids", []))
-        lod2_qids = set(pstate.get("lod2_active_qids_prev", []))
+        # ── REGION 4: Determine priority for each qid (MIGRADO) ──
+        psm = self._f._project_state_manager
+        skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
+        lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
 
         # ── REGION 5: Build items with adaptive context ──
         items: List[Tuple[str, str, str]] = []
@@ -17625,7 +17991,7 @@ class EnrichmentTasks:
     # 7. Background docstring loop (with Q5 prioritization)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    # ── Q5: Priorization of docstring targets ───────────────────────────────
+    # ── Q5: Priorization of docstring targets (MIGRADO) ──────────────────────
 
     def _prioritize_docstring_targets(
         self,
@@ -17642,8 +18008,9 @@ class EnrichmentTasks:
         3. Hub symbols (high PPR — frequently referenced)
         4. Everything else (leaf symbols — rarely in context)
         """
-        skeleton_qids: Set[str] = set(pstate.get("skeleton_tier_qids", []))
-        block_b_qids: Set[str] = set(pstate.get("block_b_qids_this_turn", []))
+        psm = self._f._project_state_manager
+        skeleton_qids: Set[str] = set(psm.get_skeleton_tier_qids(project_id))
+        block_b_qids: Set[str] = set(psm.get_block_b_qids_this_turn(project_id))
 
         # Get cached PPR scores if available (from Q2 fix cache)
         ppr_scores: Dict[str, float] = (
@@ -17708,7 +18075,7 @@ class EnrichmentTasks:
             f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
         )
 
-        # ── Q5: Prioritize symbols ──────────────────────────────────────────
+        # ── Q5: Prioritize symbols ──
         prioritized_qids = self._prioritize_docstring_targets(
             pending_qids, project_id, pstate
         )
@@ -19535,7 +19902,7 @@ class SystemPromptBuilder:
             messages,
         )
 
-        # Save last activations scores for prefetch and LOD following
+        # Guardar últimas puntuaciones de activación para prefetch y seguimiento LOD
         pstate["last_activation_scores"] = getattr(
             self._f, "_last_activation_scores", {}
         ).get(project_id, {})
@@ -20229,7 +20596,7 @@ class WindowManager:
         if not history:
             return messages, ""
 
-        # ── 3. Effective budget ──────────────────────────────────────────
+        # ── 3. Effective budget (MIGRADO) ─────────────────────────────────
         budget = self._effective_budget(project_id)
 
         # ── 4. Turn indexing ──────────────────────────────────────────────
@@ -20302,8 +20669,8 @@ class WindowManager:
         Always returns a value >= 0.
         """
         v = self._f.valves
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        system_tokens = pstate.get("last_system_tokens", 0)
+        psm = self._f._project_state_manager
+        system_tokens = psm.get_last_system_tokens(project_id)
         budget = min(
             v.history_max_tokens,
             v.context_window_tokens - system_tokens - v.response_reserve_tokens,
@@ -21091,7 +21458,7 @@ class MessageAssembler:
             return messages
 
         if self._f.valves.enable_code_history_compression:
-            messages = await self._f._history_compressor.compress_code_history(  # <-- AÑADIDO await
+            messages = await self._f._history_compressor.compress_code_history(
                 messages, project_id
             )
 
@@ -21344,7 +21711,7 @@ class MessageAssembler:
         self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 5. Multi‑phase instructions injection
+    # 5. Multi‑phase instructions injection (MIGRADO)
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _inject_multi_phase_instructions(
@@ -21388,9 +21755,9 @@ class MessageAssembler:
         # --- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
 
-        # ── read the one‑shot global‑scope flag ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        force_global_scope = pstate.pop("force_multi_phase_this_turn", False)
+        # ── read the one‑shot global‑scope flag (MIGRADO) ──
+        psm = self._f._project_state_manager
+        force_global_scope = psm.pop_force_multi_phase_this_turn(project_id)
 
         use_multi_phase = (
             self._f.valves.force_multi_phase_response
@@ -21408,7 +21775,7 @@ class MessageAssembler:
             _mp_instructions = self._f._multi_phase.build_multi_phase_instructions(
                 available_tokens=_mp_budget_reported,
                 user_query=user_question,
-                cot_degraded_to_l1=self._last_cot_degraded,  # <-- FIX: pass the real flag
+                cot_degraded_to_l1=self._last_cot_degraded,
                 is_continuation=is_continuation,
             )
             dynamic_injections.append(("critical", _mp_instructions))
@@ -21425,7 +21792,7 @@ class MessageAssembler:
             )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 6. Final system assembly & logging
+    # 6. Final system assembly & logging (MIGRADO)
     # ═══════════════════════════════════════════════════════════════════════
 
     def _assemble_final_system_and_log(
@@ -21442,7 +21809,8 @@ class MessageAssembler:
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
 
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
@@ -21536,7 +21904,8 @@ class MessageAssembler:
             )
             total_system_tok = len(self._f.tokenizer.encode(final_system))
 
-            pstate["last_system_tokens"] = total_system_tok
+            # ── MIGRADO: usar set_last_system_tokens en lugar de pstate ──
+            psm.set_last_system_tokens(project_id, total_system_tok)
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             self._f._log_debug("─" * 60)
@@ -22464,9 +22833,23 @@ class ProjectStateManager:
 
     def set_last_assistant_response(self, project_id: str, response: str) -> None:
         """Store the assistant response for use by lazy LOD adjustment."""
-        pstate = self.get_pstate(project_id)
-        pstate["last_assistant_response"] = response
-        pstate["last_response_timestamp"] = time.time()
+        self.get_pstate(project_id)["last_assistant_response"] = response
+
+    def get_last_response_timestamp(self, project_id: str) -> float:
+        """
+        Return the timestamp of the last assistant response.
+
+        Used by lazy LOD adaptive adjustment to discard stale responses.
+        """
+        return self.get_pstate(project_id).get("last_response_timestamp", 0.0)
+
+    def set_last_response_timestamp(self, project_id: str, ts: float) -> None:
+        """
+        Store the timestamp of the last assistant response.
+
+        Used by lazy LOD adaptive adjustment to discard stale responses.
+        """
+        self.get_pstate(project_id)["last_response_timestamp"] = ts
 
     # -- Token accounting -----------------------------------------------------
 
@@ -22485,6 +22868,32 @@ class ProjectStateManager:
     def set_last_total_context_tokens(self, project_id: str, tokens: int) -> None:
         """Store the total context token count for KV slot size guard."""
         self.get_pstate(project_id)["last_total_context_tokens"] = tokens
+
+    # -- KV cache slot state (persistence metadata) ---------------------------
+
+    def get_last_saved_slot_hash(self, project_id: str) -> str:
+        """Return the structural hash of the last successfully saved KV slot."""
+        return self.get_pstate(project_id).get("last_saved_slot_hash", "")
+
+    def set_last_saved_slot_hash(self, project_id: str, hash_val: str) -> None:
+        """Store the structural hash of the last successfully saved KV slot."""
+        self.get_pstate(project_id)["last_saved_slot_hash"] = hash_val
+
+    def get_slot_restore_attempted(self, project_id: str) -> bool:
+        """Return True if a KV slot restore has been attempted for this project."""
+        return self.get_pstate(project_id).get("slot_restore_attempted", False)
+
+    def set_slot_restore_attempted(self, project_id: str, val: bool) -> None:
+        """Mark that a KV slot restore has been attempted for this project."""
+        self.get_pstate(project_id)["slot_restore_attempted"] = val
+
+    def get_slot_restored(self, project_id: str) -> bool:
+        """Return True if the KV slot was successfully restored for this project."""
+        return self.get_pstate(project_id).get("slot_restored", False)
+
+    def set_slot_restored(self, project_id: str, val: bool) -> None:
+        """Mark whether the KV slot was successfully restored for this project."""
+        self.get_pstate(project_id)["slot_restored"] = val
 
     # -- Continuation tracking ------------------------------------------------
 
@@ -22512,6 +22921,10 @@ class ProjectStateManager:
     def get_continuation_turns(self, project_id: str) -> int:
         """Return the number of consecutive AutoContinue turns so far."""
         return self.get_pstate(project_id).get("continuation_turns", 0)
+
+    def set_continuation_turns(self, project_id: str, turns: int) -> None:
+        """Set the number of consecutive AutoContinue turns directly."""
+        self.get_pstate(project_id)["continuation_turns"] = turns
 
     # -- Skeleton tier tracking -----------------------------------------------
 
@@ -22587,7 +23000,7 @@ class ProjectStateManager:
                 return False
 
         # --- 4. Skip if already saved and not forced ---
-        if not force and pstate.get("last_saved_slot_hash") == static_hash:
+        if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
             return False
 
         # --- 5. Build filename and call llama.cpp API ---
@@ -22608,7 +23021,7 @@ class ProjectStateManager:
                 json={"filename": filename, "model": self._f.valves.llm_model},
             ) as resp:
                 if resp.status == 200:
-                    pstate["last_saved_slot_hash"] = static_hash
+                    self.set_last_saved_slot_hash(project_id, static_hash)
                     data = await resp.json()
                     self._f._log_debug(
                         f"✓ Slot saved → {filename} "
@@ -22645,10 +23058,10 @@ class ProjectStateManager:
         pstate = self.get_pstate(project_id)
 
         # --- 2. Skip if already attempted ---
-        if pstate.get("slot_restore_attempted", False):
-            return pstate.get("slot_restored", False)
+        if self.get_slot_restore_attempted(project_id):
+            return self.get_slot_restored(project_id)
 
-        pstate["slot_restore_attempted"] = True
+        self.set_slot_restore_attempted(project_id, True)
 
         # --- 3. Get the structural hash from pstate ---
         static_hash = self.get_structure_hash_for_cache(project_id)
@@ -22685,7 +23098,7 @@ class ProjectStateManager:
                 json={"filename": filename, "model": self._f.valves.llm_model},
             ) as resp:
                 if resp.status == 200:
-                    pstate["slot_restored"] = True
+                    self.set_slot_restored(project_id, True)
                     data = await resp.json()
                     self._f._log_debug(
                         f"✓ Slot restored ← {filename} "
@@ -23857,7 +24270,7 @@ class TaskRegistry:
 
             # ── 4. Execute the lazy function ──
             try:
-                await task.lazy_func(project_id, pstate)
+                await task.lazy_func(project_id)
                 task.mark_completed(pstate, project_id)
                 self._f._log_debug(f"Lazy task '{task.name}' completed successfully")
             except Exception as e:
@@ -23868,7 +24281,7 @@ class TaskRegistry:
     # 3. Lazy implementations (specific to each task)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _lazy_docstrings(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_docstrings(self, project_id: str) -> None:
         """
         Lazy generation of docstrings for symbols that are needed in the
         current turn. This is a lightweight version that only processes
@@ -23876,15 +24289,15 @@ class TaskRegistry:
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
+        psm = self._f._project_state_manager
+
         # ── 1. Get the current conversation state ──
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return
 
         # ── 2. Determine which symbols need docstrings ──
-        psm = self._f._project_state_manager
         skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
         lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
 
@@ -23909,7 +24322,7 @@ class TaskRegistry:
                 f"_lazy_docstrings: generated {len(results)} docstrings for this turn"
             )
 
-    async def _lazy_prefetch(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_prefetch(self, project_id: str) -> None:
         """
         Lazy prefetch: build CodePathView for symbols mentioned in the query.
         This is a lightweight version that only builds views for symbols
@@ -23917,10 +24330,11 @@ class TaskRegistry:
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
+        psm = self._f._project_state_manager
+
         # ── 1. Get the current user query (from pstate) ──
-        query = pstate.get("last_user_query", "")
+        query = psm.get_last_user_query(project_id)
         if not query:
             return
 
@@ -23934,13 +24348,12 @@ class TaskRegistry:
                     seed, ag, project_id
                 )
 
-    async def _lazy_session_summary(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_session_summary(self, project_id: str) -> None:
         """
         Lazy session summary generation. Executed if not already done in background.
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
         state = self._f._conversation_state_manager.get(project_id)
         interval = self._f.valves.session_summary_interval_messages
@@ -23963,13 +24376,12 @@ class TaskRegistry:
             stop_event=None,  # No stop_event in lazy mode
         )
 
-    async def _lazy_raptor(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_raptor(self, project_id: str) -> None:
         """
         Lazy RAPTOR rebuild. Executed if not already done in background.
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
         if not self._f.valves.enable_raptor:
             return
@@ -23993,13 +24405,12 @@ class TaskRegistry:
             stop_event=None,  # No stop_event in lazy mode
         )
 
-    async def _lazy_purge(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_purge(self, project_id: str) -> None:
         """
         Lazy purge of old versions. Executed if not already done in background.
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
         if (
             not self._f.valves.purge_old_code_versions_enabled
@@ -24019,23 +24430,22 @@ class TaskRegistry:
             stop_event=None,  # No stop_event in lazy mode
         )
 
-    async def _lazy_lod(self, project_id: str, pstate: dict) -> None:
+    async def _lazy_lod(self, project_id: str) -> None:
         """
         Lazy LOD adaptive adjustment. Uses the last assistant response
         stored in pstate from the previous turn.
 
         Args:
             project_id (str): The current project identifier.
-            pstate (dict): The per-project volatile state.
         """
-        # ── 1. Get the last response ──
         psm = self._f._project_state_manager
+
+        # ── 1. Get the last response ──
         last_response = psm.get_last_assistant_response(project_id)
         if not last_response:
             return
         # Optional: check timestamp to avoid using very old responses
-        raw = psm.get_pstate(project_id)
-        ts = raw.get("last_response_timestamp", 0)
+        ts = psm.get_last_response_timestamp(project_id)
         if time.time() - ts > 60:  # 1 minute
             return
 
@@ -26128,7 +26538,7 @@ class Filter:
                 )
 
         # -- Detect AutoContinue continuation ----------------------------
-        # (This is now handled by pstate["is_continuation"] set in outlet.
+        # (This is now handled by psm.set_is_continuation() in outlet.
         #  We keep the old marker detection as a fallback for safety.)
         _last_assistant = next(
             (m for m in reversed(messages) if m.get("role") == "assistant"), None
@@ -26453,7 +26863,6 @@ class Filter:
             project_id = self._inlet_orch.get_project_id()
             state = self._conversation_state_manager.get(project_id)
             psm = self._project_state_manager
-            # pstate is kept for outlet-internal keys with no typed accessor.
             pstate = psm.get_pstate(project_id)
             messages = body.get("messages", [])
             is_code_session = await self._inlet_orch.classify_session(
@@ -26579,10 +26988,11 @@ class Filter:
                     )
                 except Exception as e:
                     self._log_debug(f"outlet: token estimation failed: {e}")
-                await self._project_state_manager.slot_save(project_id)
+                await psm.slot_save(project_id)
 
             # -- Save last response for LOD adaptive lazy -------------------
             psm.set_last_assistant_response(project_id, assistant_content)
+            psm.set_last_response_timestamp(project_id, time.time())
 
             # -- Response cache (use assistant_content for cache) -----------
             if (
@@ -26658,6 +27068,9 @@ class Filter:
                 )
             else:
                 psm.set_is_continuation(project_id, False)
+
+            # -- Continuation turns reset is handled inside set_is_continuation
+            # when set to False. No need to manually reset here.
 
         except Exception as e:
             self._log_debug(f"❌ outlet error: {e}")
