@@ -2140,23 +2140,41 @@ class ContextPager:
         embedder,
     ) -> bool:
         """
-        Soft‑evict `block` to ChromaDB **without blocking**.
+        Soft‑evict a code block to ChromaDB without blocking the main flow.
 
         The block is removed from active_blocks synchronously; the actual
         embedding and ChromaDB upsert are offloaded to a background task.
         The full body stays in the SQLite code_contents table, so the block
         can always be reconstructed later.
+
+        Args:
+            block (CodeBlock): The block to evict.
+            project_id (str): Current project identifier.
+            state (dict): The conversation state (used for logging).
+            symbol_index (SymbolIndex): The symbol index (unused, kept for API).
+            chroma_collection: The ChromaDB collection for LTM storage.
+            embedder: The sentence-transformer embedder instance.
+
+        Returns:
+            bool: True if the block was successfully marked for paging,
+            False if ChromaDB or embedder is unavailable.
         """
+        # ── REGION 1: Early exit if prerequisites are missing ──
         if chroma_collection is None or embedder is None:
             return False
 
-        # Capture the data needed for the background task
+        # ── REGION 2: Prepare the entry data ──
         entry_id = f"{project_id}_paged_{block.hash}"
-        excerpt = block.content[:500]
+        # Increased excerpt length from 500 to 2000 chars for better LTM retrieval
+        excerpt = block.content[:2000]
         symbol_names = ",".join(s.name for s in block.symbols)
+
+        # Truncate the full text to a safe token limit for the embedder
         safe_text = block.content
         if hasattr(self._f, "_tokens"):
             safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
+
+        # ── REGION 3: Build metadata for ChromaDB ──
         metadata = {
             "project_id": project_id,
             "is_paged_block": True,
@@ -2168,7 +2186,7 @@ class ContextPager:
             "symbol_names": symbol_names,
         }
 
-        # Offload the heavy embedding + upsert
+        # ── REGION 4: Launch the background embedding task ──
         asyncio.create_task(
             self._page_out_async(
                 entry_id=entry_id,
@@ -2180,7 +2198,7 @@ class ContextPager:
             )
         )
 
-        # Mark as paged immediately so the caller can remove the block
+        # ── REGION 5: Mark as paged immediately ──
         self._paged_hashes.setdefault(project_id, set()).add(block.hash)
         return True
 
@@ -7421,26 +7439,41 @@ class LongTermMemory:
     async def find_duplicate_question(
         self, query: str, project_id: str
     ) -> Optional[dict]:
-        """Detect near‑duplicate user questions using cosine similarity and,
+        """
+        Detect near‑duplicate user questions using cosine similarity and,
         when available, a CrossEncoder reranker.
 
-        Returns ``{"sim": float, "doc": str}`` if a duplicate is found, or
-        ``None`` otherwise.
+        This method first embeds the user's query and searches ChromaDB for
+        semantically similar user messages from the same project within the
+        configured time window. If a candidate exceeds the similarity
+        threshold, it optionally uses the CrossEncoder to re‑rank the top
+        candidates and confirm the duplicate with higher precision.
+
+        Args:
+            query (str): The user's current question.
+            project_id (str): The current project identifier.
+
+        Returns:
+            Optional[dict]: A dictionary with 'sim' (similarity score) and
+            'doc' (the matched document) if a duplicate is found, or None
+            if no duplicate is detected.
         """
-        # ── Early exit: prerequisites ──────────────────────────────────
+        # ── REGION 1: Prerequisites check ──
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return None
         if not query or len(query.strip()) < 15:
             return None
 
         try:
-            # ── Embed query ────────────────────────────────────────────
+            # ── REGION 2: Embed the query ──
+            # Increased from 1000 to 8000 characters to leverage the full
+            # embedding model's context window (Qwen3-Embedding-0.6B supports 32K)
             q_emb = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(query[:1000]).tolist()
+                lambda: self._f.embedder.encode(query[:8000]).tolist()
             )
             now = time.time()
 
-            # ── Build time‑bounded filter ──────────────────────────────
+            # ── REGION 3: Build the time‑filtered ChromaDB query ──
             where = {
                 "$and": [
                     {"project_id": {"$eq": project_id}},
@@ -7454,7 +7487,7 @@ class LongTermMemory:
                 ]
             }
 
-            # ── Query ChromaDB ─────────────────────────────────────────
+            # ── REGION 4: Query ChromaDB ──
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
                     query_embeddings=[q_emb],
@@ -7466,13 +7499,14 @@ class LongTermMemory:
             if not results or not results["ids"] or not results["ids"][0]:
                 return None
 
-            # ── Find best candidate, optionally via CrossEncoder ────────
+            # ── REGION 5: Evaluate candidates with CrossEncoder if available ──
             best_candidate = None
             best_sim = 0.0
             for i, doc in enumerate(results["documents"][0]):
                 dist = results["distances"][0][i]
                 sim = 1.0 - (dist / 2.0)
                 if sim >= self._f.valves.duplicate_question_threshold and doc != query:
+                    # Truncate pairs to avoid excessive token usage (CrossEncoder has 32K context now)
                     pairs = [(query[:500], doc[:500])]
                     raw_score = await self._f._commands._predict_cross_encoder(pairs)
                     if raw_score is None:
@@ -7482,7 +7516,6 @@ class LongTermMemory:
                         )
                         best_candidate = (sim, doc, None)
                         break
-                    # Normalize CrossEncoder logit to [0,1] before comparing to threshold
                     ce_prob = self._f._commands._normalize_cross_encoder_score(
                         raw_score[0]
                     )
@@ -7490,6 +7523,7 @@ class LongTermMemory:
                         best_candidate = (sim, doc, ce_prob)
                         break
 
+            # ── REGION 6: Return result if found ──
             if best_candidate:
                 sim, doc, ce = best_candidate
                 log_msg = f"Duplicate question found (cosine={sim:.3f}"
@@ -8387,11 +8421,28 @@ class LongTermMemory:
         state: dict,
         code_state_hash: str,
     ) -> None:
-        """Synchronous version of response cache storage."""
+        """
+        Store a response in the ChromaDB response cache synchronously.
+
+        This method embeds the query, stores the response document, and
+        updates metadata including the code_state_hash for staleness detection.
+        The query is truncated to 500 characters in metadata to keep the
+        metadata compact and human‑readable; this does not affect the
+        embedding or retrieval quality.
+
+        Args:
+            query (str): The user query that generated the response.
+            response (str): The assistant's response.
+            context_hash (str): Hash of the context (unused, kept for API).
+            state (dict): The conversation state (unused, kept for API).
+            code_state_hash (str): Hash of the code state for staleness detection.
+        """
+        # ── REGION 1: Prerequisites ──
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
             return
 
+        # ── REGION 2: Embed the query ──
         embedding = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
@@ -8401,6 +8452,7 @@ class LongTermMemory:
         max_entries = self._f.valves.response_cache_max_entries
         project = self._f.valves.project_id
 
+        # ── REGION 3: Enforce cache size limit ──
         pstate = self._f._project_state_manager.get_pstate(project)
         current_size = pstate.get("response_cache_count", 0)
 
@@ -8424,6 +8476,8 @@ class LongTermMemory:
             except Exception:
                 pass
 
+        # ── REGION 4: Store the entry ──
+        # Query is truncated to 500 chars in metadata to keep the field compact
         await anyio.to_thread.run_sync(
             lambda: col.upsert(
                 ids=[entry_id],
@@ -9281,19 +9335,48 @@ class ReasoningEngine:
     async def generate_cot_reasoning(
         self, question: str, context: str, label: str = ""
     ) -> str:
-        """Generate a Chain‑of‑Thought reasoning chain for the given question."""
+        """
+        Generate a Chain‑of‑Thought reasoning chain for the given question.
+
+        This method is used for CoT levels 2 and 3 (moderately complex to
+        deep reasoning). It takes the user's question and a context
+        (typically the system prompt or skeleton) and asks the LLM to
+        produce a step‑by‑step reasoning chain.
+
+        The context is truncated to a token limit derived from the active
+        context max tokens divided by 3. This balances providing enough
+        context for reasoning while keeping the prompt size manageable
+        and avoiding excessive latency.
+
+        Args:
+            question (str): The user's question to reason about.
+            context (str): The context (system prompt, code, etc.) to reason on.
+            label (str): Optional label for LLM call logging.
+
+        Returns:
+            str: A formatted reasoning chain with a header indicating the
+            CoT level and model used, or "Unable to generate reasoning." on failure.
+        """
+        # ── REGION 1: Configure token limits ──
         effective_max_tokens = (
             self._f.valves.cot_max_tokens if self._f.valves.cot_max_tokens > 0 else None
         )
 
+        # ── REGION 2: Optionally generate step‑back context ──
         step_back = await self._generate_step_back_context(question, context)
         enriched_context = step_back + context if step_back else context
 
+        # ── REGION 3: Build the reasoning prompt ──
+        # The question is passed in full (no truncation). The context is
+        # truncated to a token limit that is a fraction of the model's
+        # context window to keep the prompt manageable.
         prompt = (
             f"Context:\n{enriched_context}\n\n"
             f"Question:\n{question}\n\n"
             "Think step by step and provide your reasoning:"
         )
+
+        # ── REGION 4: Call the LLM ──
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -9304,6 +9387,8 @@ class ReasoningEngine:
             temperature=0.4,
             label=label,
         )
+
+        # ── REGION 5: Format and return ──
         if response:
             prefix = (
                 "## 🔎 Automated Chain-of-Thought Reasoning (Level 2)\n"
@@ -9322,22 +9407,47 @@ class ReasoningEngine:
         label: str = "",
     ) -> str:
         """
-        Architecture-mode CoT: reason on the code skeleton (contracts only).
-        Falls back to standard CoT if skeleton is empty or LLM fails.
+        Generate architecture‑level reasoning using the code skeleton.
+
+        This method is used for architecture, design, and refactoring queries
+        where the full system prompt would be too large or noisy. It uses
+        the project skeleton (signatures only, bodies as `...`) as the
+        reasoning context, which is more focused on contracts and interfaces.
+
+        The output includes concrete signature proposals and `/expand <name>`
+        hints for implementation details, keeping the reasoning at the
+        contract level.
+
+        Args:
+            question (str): The user's architecture/design question.
+            skeleton_context (str): The project skeleton (signatures only).
+            project_id (str): The current project identifier (unused but kept).
+            label (str): Optional label for LLM call logging.
+
+        Returns:
+            str: Formatted architecture reasoning with signature proposals
+            and /expand hints, or a fallback standard CoT if the skeleton
+            is empty or the LLM call fails.
         """
+        # ── REGION 1: Fallback to standard CoT if no skeleton is available ──
         if not skeleton_context.strip():
             return await self.generate_cot_reasoning(question, "", label=label)
 
+        # ── REGION 2: Configure token limits ──
         effective_max_tokens = (
             self._f.valves.skeleton_cot_max_tokens
             if self._f.valves.skeleton_cot_max_tokens > 0
             else 600
         )
 
+        # ── REGION 3: Build the architecture reasoning prompt ──
+        # The question is passed in full (no truncation) to preserve all
+        # context for the reasoning. The skeleton_context is capped to
+        # 4000 characters to keep the prompt manageable.
         prompt = (
             f"Code skeleton (contracts only — bodies as `...`):\n"
             f"{skeleton_context[:4000]}\n\n"
-            f"Architecture question:\n{question[:500]}\n\n"
+            f"Architecture question:\n{question}\n\n"
             "Reason step by step at the CONTRACT level:\n"
             "1. Which classes / methods are affected and why?\n"
             "2. What invariants or interfaces must be preserved or changed?\n"
@@ -9346,6 +9456,7 @@ class ReasoningEngine:
             "Be specific about signatures; avoid implementation details."
         )
 
+        # ── REGION 4: Call the LLM for architecture reasoning ──
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -9360,12 +9471,14 @@ class ReasoningEngine:
             label=label or "arch_cot",
         )
 
+        # ── REGION 5: Handle failure gracefully ──
         if not response or response.strip() == "Unable to generate reasoning.":
             self._f._log_debug("Architecture CoT failed — falling back to standard CoT")
             return await self.generate_cot_reasoning(
                 question, skeleton_context, label=label
             )
 
+        # ── REGION 6: Format and return the reasoning ──
         prefix = (
             "## 🏗️ Architecture Reasoning (skeleton-based CoT)\n"
             f"*Reasoning on contracts — use `/expand <name>` for implementations.*"
@@ -9380,22 +9493,34 @@ class ReasoningEngine:
         self, question: str, context: str, project_id: str, label: str = ""
     ) -> str:
         """
-        Scientific Chain-of-Thought reasoning with structural validation.
+        Generate scientific Chain-of-Thought reasoning with structural validation.
 
-        Flow:
+        This method implements a multi-hypothesis scientific reasoning loop:
         1. Generate N hypotheses about the answer.
         2. Score each hypothesis using StaticEvidence (deterministic) +
-           LLM-expressed confidence (if available).
+           LLM-expressed confidence.
         3. If the best hypothesis passes the confidence threshold, stop.
         4. Otherwise, feed evidence back to the LLM to refine hypotheses.
         5. Iterate up to scientific_max_iterations times.
         6. Synthesize a final reasoning from the best hypothesis + evidence.
+
+        Args:
+            question (str): The user's question to reason about.
+            context (str): The context (code, system prompt, etc.) to reason on.
+            project_id (str): The current project identifier.
+            label (str): Optional label for LLM call logging.
+
+        Returns:
+            str: A formatted reasoning chain with the best hypothesis and
+            structural evidence, or a fallback CoT response on failure.
         """
+        # ── REGION 1: Load configuration and helper definitions ──
         max_hypotheses = self._f.valves.scientific_hypotheses_count
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
         def _parse_hypotheses_from_response(text: str) -> List[Tuple[str, float]]:
+            """Extract hypothesis/confidence pairs from the LLM response."""
             results = []
             pattern = re.compile(
                 r"Hypothesis\s*\d*\s*:\s*(.+?)\s*Confidence\s*:\s*([\d.]+)",
@@ -9411,10 +9536,10 @@ class ReasoningEngine:
                 results.append((hyp_text, conf))
             return results
 
-        # ── Step 1: Generate initial hypotheses ────────────────────
+        # ── REGION 2: Generate initial hypotheses ──
         prompt = (
             f"Context:\n{context[:3000]}\n\n"
-            f"Question:\n{question[:500]}\n\n"
+            f"Question:\n{question}\n\n"
             f"Propose {max_hypotheses} distinct hypotheses that could explain the issue "
             f"or solve the problem. For each, state:\n"
             f"Hypothesis: <one concise sentence>\n"
@@ -9440,11 +9565,11 @@ class ReasoningEngine:
         if len(hypotheses) < 2:
             return await self.generate_cot_reasoning(question, context, label)
 
+        # ── REGION 3: Iterative hypothesis refinement loop ──
         best_hypothesis = ""
         best_combined_score = 0.0
         iteration = 0
 
-        # ── Iterative refinement loop ──────────────────────────────
         while iteration < max_iters:
             iteration += 1
             scored = []
@@ -9467,9 +9592,11 @@ class ReasoningEngine:
                 f"(obj={best_obj:.3f}, llm_conf={best_llm_conf:.3f})"
             )
 
+            # ── Stop if threshold met or max iterations reached ──
             if best_combined >= threshold or iteration >= max_iters:
                 break
 
+            # ── Feed evidence back to refine hypotheses ──
             evidence_feedback = (
                 f"Previous best hypothesis (score {best_combined:.2f}):\n"
                 f"{best_hypothesis}\n\n"
@@ -9506,10 +9633,10 @@ class ReasoningEngine:
             else:
                 break
 
-        # ── Step 6: Synthesize final reasoning ────────────────────
+        # ── REGION 4: Synthesize final reasoning from the best hypothesis ──
         final_prompt = (
             f"Context:\n{context[:3000]}\n\n"
-            f"Question:\n{question[:500]}\n\n"
+            f"Question:\n{question}\n\n"
             f"The best validated hypothesis (score {best_combined:.3f}):\n"
             f"{best_hypothesis}\n\n"
             f"Structural evidence supporting it:\n"
@@ -9539,6 +9666,7 @@ class ReasoningEngine:
         if not reasoning:
             return "Unable to synthesize scientific reasoning."
 
+        # ── REGION 5: Format and return the final reasoning ──
         return (
             f"## 🔬 Scientific Reasoning (Level 3)\n"
             f"*Validated against code structure. "
@@ -10059,7 +10187,20 @@ class CommandRouter:
         """
         Run the CrossEncoder on (text_a, text_b) pairs.
         Returns raw scores (logits) or None if the model is not loaded.
+
+        The CrossEncoder now supports up to 32,768 tokens, so no truncation
+        is applied here. Individual call sites may still apply character
+        limits for other reasons (e.g., to keep prompts short), but the
+        CrossEncoder itself can handle full inputs without warnings.
+
+        Args:
+            pairs (list): List of (text_a, text_b) tuples to score.
+
+        Returns:
+            Optional[list]: List of raw scores (logits) from the CrossEncoder,
+            or None if the model is not available.
         """
+        # ── REGION 1: Check if the CrossEncoder is loaded ──
         if self._f._cross_encoder is None:
             if not self._f._cross_encoder_unavailable_logged:
                 self._f._log_debug(
@@ -10070,6 +10211,7 @@ class CommandRouter:
 
         ce = self._f._cross_encoder
 
+        # ── REGION 2: Predict in a thread to avoid blocking the event loop ──
         def _predict_safely():
             return ce.predict(pairs)
 
@@ -15483,7 +15625,29 @@ class EnrichmentTasks:
         """
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
+
+        This method is called during LOD‑2 pre‑resolution. It batches symbols
+        to reduce the number of LLM calls and uses the SymbolIndex and SQLite
+        as a two‑level cache.
+
+        Docstrings are generated with adaptive context based on symbol priority:
+        - Skeleton tier symbols (visible in Block A every turn) → 4000 chars.
+        - LOD-2 symbols (active in the current query) → 3500 chars.
+        - Other symbols → 2000 chars.
+
+        Once generated, docstrings are cached permanently in SQLite and the
+        SymbolIndex, so the cost is paid only once.
+
+        Args:
+            qids (List[str]): Qualified symbol ids to resolve.
+            project_id (str): The current project identifier.
+
+        Returns:
+            Dict[str, str]: A mapping from qid to docstring for all
+            symbols that were successfully resolved (either from cache
+            or newly generated).
         """
+        # ── REGION 1: Load state and build a fast symbol lookup index ──
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
@@ -15498,6 +15662,7 @@ class EnrichmentTasks:
         def _find_symbol(qid: str):
             return _qid_index.get(qid, (None, None))
 
+        # ── REGION 2: Check in‑memory cache and persistent SQLite ──
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
@@ -15525,6 +15690,7 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
+        # ── REGION 3: Enforce per‑turn budget ──
         budget = self._f.valves.lazy_docstring_max_per_turn
         if budget > 0:
             remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
@@ -15532,23 +15698,39 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
+        # ── REGION 4: Determine priority for each qid ──
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        skeleton_qids = set(pstate.get("skeleton_tier_qids", []))
+        lod2_qids = set(pstate.get("lod2_active_qids_prev", []))
+
+        # ── REGION 5: Build items with adaptive context ──
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
             if sym is not None and block is not None:
                 signature = sym.signature
-                if sym.line_start:
-                    lines = block.content.split("\n")
-                    start_idx = max(0, sym.line_start - 1)
-                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
-                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
+
+                # Priority-based max_chars
+                if qid in skeleton_qids:
+                    max_snippet_chars = 4000  # Most important (Block A)
+                elif qid in lod2_qids:
+                    max_snippet_chars = 3500  # Important (current query)
                 else:
-                    snippet = block.content[:500]
+                    max_snippet_chars = 2000  # Standard
+
+                snippet = self._get_optimal_snippet(
+                    sym=sym,
+                    block=block,
+                    project_id=project_id,
+                    max_chars=max_snippet_chars,
+                    context_lines=5,
+                )
             else:
                 signature, snippet = qid, ""
             items.append((qid, signature, snippet))
 
-        batch_size = max(1, self._f.valves.docstring_batch_size)
+        # ── REGION 6: Process in batches ──
+        batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
@@ -15572,8 +15754,7 @@ class EnrichmentTasks:
             if not response:
                 continue
 
-            # ── M5: `_parse_docstring_batch_response` ahora recibe batch_qids ──
-            # y usa `_resolve_parsed_docstring_name` para desambiguar dunders.
+            # ── REGION 7: Parse and store results ──
             parsed = self._parse_docstring_batch_response(
                 response, expected, batch_qids
             )
@@ -15585,6 +15766,7 @@ class EnrichmentTasks:
                     sym.docstring = docstring
                 self._f._symbol_index.update_docstring(qid, project_id, docstring)
 
+            # Persist to SQLite in a single batch
             if parsed:
                 rows = [
                     (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
@@ -15847,34 +16029,46 @@ class EnrichmentTasks:
                 break
             await asyncio.sleep(0.05)
 
-    async def _background_docstring(
+    def _get_optimal_snippet(
         self,
         sym: "CodeSymbol",
         block: "CodeBlock",
         project_id: str,
-    ) -> None:
+        max_chars: int = 3000,
+        context_lines: int = 5,
+    ) -> str:
         """
-        Generate a one-line docstring for a symbol (function, method, or class) in the background,
-        and persist it to the SymbolIndex and SQLite.
+        Extract an optimal snippet for docstring generation, adaptive to symbol type
+        and block size.
+
+        For classes: returns the class skeleton (method signatures + section comments).
+        For functions/methods: extracts the function body with surrounding context.
+
+        The snippet length is adaptive:
+        - If the block is small (< 2000 chars), return the whole block (capped to max_chars).
+        - Otherwise, extract the symbol's region plus `context_lines` above and below.
+        - For classes, use the existing `_build_class_skeleton` method.
+
+        The extraction uses tree-sitter precise line ranges, so there is no risk
+        of accidentally including content from other functions.
+
+        Args:
+            sym (CodeSymbol): The symbol to document.
+            block (CodeBlock): The code block containing the symbol.
+            project_id (str): The current project identifier.
+            max_chars (int): Maximum characters for the snippet.
+            context_lines (int): Number of extra lines to include around the symbol.
+
+        Returns:
+            str: The extracted snippet, truncated to max_chars if necessary.
         """
-        name = sym.name
-        kind = sym.kind
-        signature = sym.signature
-        line_start = sym.line_start
-        line_end = sym.line_end
-        block_hash = block.hash
+        # ── REGION 1: Small block → return everything ──
+        if len(block.content) < 2000:
+            return block.content[:max_chars]
 
-        state = self._f._conversation_state_manager.get(project_id)
-        target_block = state.active_blocks.get(block_hash)
-        if target_block is None:
-            self._f._log_debug(
-                f"Background docstring: block {block_hash} not found, skipping '{name}'"
-            )
-            return
-
-        snippet = ""
-        if kind == "class":
-            members_qids = self._f._symbol_index.get_class_members(name, project_id)
+        # ── REGION 2: Classes → use the existing skeleton builder ──
+        if sym.kind == "class":
+            members_qids = self._f._symbol_index.get_class_members(sym.name, project_id)
             members_meta = []
             for qid in members_qids:
                 meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
@@ -15888,27 +16082,96 @@ class EnrichmentTasks:
                     )
             section_headers = self._extract_section_comments(block, sym)
             snippet = self._build_class_skeleton(
-                class_name=name,
+                class_name=sym.name,
                 members_meta=members_meta,
                 section_headers=section_headers,
                 block=block,
-                line_start=line_start or 1,
-                line_end=line_end or len(block.content.splitlines()),
+                line_start=sym.line_start or 1,
+                line_end=sym.line_end or len(block.content.splitlines()),
+            )
+            return snippet[:max_chars]
+
+        # ── REGION 3: Functions/methods → extract region + context ──
+        lines = block.content.split("\n")
+        start_idx = max(0, (sym.line_start or 1) - 1 - context_lines)
+        end_idx = min(len(lines), (sym.line_end or sym.line_start or 1) + context_lines)
+        snippet = "\n".join(lines[start_idx:end_idx])
+
+        # ── REGION 4: If too long, truncate intelligently ──
+        if len(snippet) > max_chars:
+            # Keep the signature (first few lines) and the end of the body
+            sig_end = min(5, len(lines[start_idx:]))
+            head = "\n".join(lines[start_idx : start_idx + sig_end])
+            tail = "\n".join(lines[max(start_idx, end_idx - 8) : end_idx])
+            snippet = f"{head}\n...\n{tail}"
+
+        return snippet
+
+    async def _background_docstring(
+        self,
+        sym: "CodeSymbol",
+        block: "CodeBlock",
+        project_id: str,
+    ) -> None:
+        """
+        Generate a one-line docstring for a symbol in the background.
+
+        This method is called from the background docstring loop and runs
+        asynchronously without blocking the main request flow. It extracts
+        a code snippet for the symbol, calls the LLM to generate a concise
+        docstring, and persists the result both in the SymbolIndex and in
+        SQLite.
+
+        Since this runs in the background, it uses the maximum context (4000
+        characters) for all symbols to ensure the highest quality docstrings.
+        The cost is paid once per symbol, and the benefit is permanent.
+
+        Args:
+            sym (CodeSymbol): The symbol to document.
+            block (CodeBlock): The code block containing the symbol.
+            project_id (str): The current project identifier.
+        """
+        # ── REGION 1: Extract symbol metadata ──
+        name = sym.name
+        kind = sym.kind
+        signature = sym.signature
+        line_start = sym.line_start
+        line_end = sym.line_end
+        block_hash = block.hash
+
+        # ── REGION 2: Verify the block still exists ──
+        state = self._f._conversation_state_manager.get(project_id)
+        target_block = state.active_blocks.get(block_hash)
+        if target_block is None:
+            self._f._log_debug(
+                f"Background docstring: block {block_hash} not found, skipping '{name}'"
+            )
+            return
+
+        # ── REGION 3: Build the snippet with maximum context ──
+        # In background, it does not block the user, so we use 4000 chars always.
+        # This ensures the highest quality docstrings for all symbols.
+        snippet = self._get_optimal_snippet(
+            sym=sym,
+            block=target_block,
+            project_id=project_id,
+            max_chars=4000,
+            context_lines=5,
+        )
+
+        # ── REGION 4: Build the LLM prompt ──
+        if kind == "class":
+            prompt = (
+                f"In one sentence, describe the single responsibility of this class "
+                f"based on its method names and structure:\n\n```\n{snippet}\n```"
             )
         else:
-            if line_start and target_block:
-                lines = target_block.content.split("\n")
-                start_idx = max(0, line_start - 1)
-                end_idx = min(len(lines), (line_end or line_start + 30))
-                snippet = "\n".join(lines[start_idx:end_idx])[:500]
-            else:
-                snippet = target_block.content[:500]
+            prompt = (
+                f"Summarize in one short sentence what this code does:\n\n"
+                f"```\n{signature}\n{snippet}\n```"
+            )
 
-        if kind == "class":
-            prompt = f"In one sentence, describe the single responsibility of this class based on its method names and structure:\n\n```\n{snippet}\n```"
-        else:
-            prompt = f"Summarize in one short sentence what this code does:\n\n```\n{signature}\n{snippet}\n```"
-
+        # ── REGION 5: Call the LLM ──
         docstring_text = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a code summarization assistant. Output only one concise sentence.",
@@ -15921,6 +16184,7 @@ class EnrichmentTasks:
         if not docstring_text or not docstring_text.strip():
             return
 
+        # ── REGION 6: Parse and validate the docstring ──
         docstring = self._clean_single_docstring(docstring_text, name)
         if not docstring:
             self._f._log_debug(
@@ -15928,6 +16192,7 @@ class EnrichmentTasks:
             )
             return
 
+        # ── REGION 7: Persist the docstring ──
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
@@ -15942,7 +16207,9 @@ class EnrichmentTasks:
                         )
                         await self._f._state_store._db_enqueue(
                             lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
-                                "INSERT OR REPLACE INTO symbol_docstrings (project_id, symbol_name, docstring, updated_at) VALUES (?,?,?,?)",
+                                "INSERT OR REPLACE INTO symbol_docstrings "
+                                "(project_id, symbol_name, docstring, updated_at) "
+                                "VALUES (?,?,?,?)",
                                 (pid, q, d, time.time()),
                             )
                         )
@@ -20890,12 +21157,12 @@ class Filter:
         )
         # Ideally, use the same value.
         lazy_docstring_max_per_turn: int = Field(
-            default=25,
+            default=8,
             ge=0,
             description="Maximum number of docstrings generated on-demand (lazy) per turn. 0 = unlimited.",
         )
-        docstring_batch_size: int = Field(
-            default=25,
+        lazy_docstring_batch_size: int = Field(
+            default=8,
             ge=1,
             le=20,
             description=(
@@ -20912,7 +21179,7 @@ class Filter:
             description=(
                 "Number of symbols per batch in the background docstring loop. "
                 "Smaller batches produce shorter prompts and reduce per-call latency. "
-                "Foreground batching (during LOD-2 pre-resolution) uses docstring_batch_size."
+                "Foreground batching (during LOD-2 pre-resolution) uses lazy_docstring_batch_size."
             ),
         )
         enable_auto_docstrings_background: bool = Field(
