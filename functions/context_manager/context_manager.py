@@ -3932,10 +3932,13 @@ class ContextBuilder:
             return ""
 
         # --- 1. Resolve per-project state ---
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        psm = self._f._project_state_manager
+        # pstate_raw is kept for keys that have no typed accessor:
+        # skeleton_render_mode, last_static_prefix_hash, hub_tier_qids_persisted.
+        pstate_raw = psm.get_pstate(project_id)
 
-        # ── E4: prune ghost hub qids ──────────────────────────────────────
-        hub_qids: List[str] = pstate.get("hub_tier_qids_persisted", [])
+        # -- E4: prune ghost hub qids -------------------------------------
+        hub_qids: List[str] = pstate_raw.get("hub_tier_qids_persisted", [])
         if hub_qids:
             current_qids: Set[str] = set(
                 self._f._symbol_index.get_all_qualified_names(project_id)
@@ -3948,24 +3951,24 @@ class ContextBuilder:
                     pruned = list(hub_set & current_qids)
                     self._f._log_debug(
                         f"Hub tier: pruned {len(ghost_qids)} ghost qids "
-                        f"({deletion_ratio:.0%} deleted after large code change). "
-                        f"Remaining: {len(pruned)}"
+                        f"({deletion_ratio:.0%} deleted after large code "
+                        f"change). Remaining: {len(pruned)}"
                     )
-                    pstate["hub_tier_qids_persisted"] = pruned
+                    pstate_raw["hub_tier_qids_persisted"] = pruned
 
         # --- 2. Compute structure-only hash (stable across docstring enrichment) ---
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
         if not structure_hash:
             structure_hash = hashlib.md5("no_symbols".encode()).hexdigest()[:16]
-        pstate["structure_hash_for_cache"] = structure_hash
+        psm.set_structure_hash_for_cache(project_id, structure_hash)
 
         # --- 3. Resolved call graph mode ---
-        mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
+        mode = psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
 
         # --- 4. Build cache key using structure hash (not the rendered text) ---
         cache_key = f"{structure_hash}__{mode}"
-        cached_text = pstate.get("block_a_cached")
-        stored_key = pstate.get("block_a_cache_key")
+        cached_text = psm.get_block_a_cached(project_id)
+        stored_key = psm.get_block_a_cache_key(project_id)
 
         if stored_key and stored_key == cache_key and cached_text is not None:
             # --- 4a. Cache hit: same code + same mode ---
@@ -3973,10 +3976,8 @@ class ContextBuilder:
 
         # --- 4b. Cache miss or continuation freeze ---
         if is_continuation and cached_text is not None:
-            # Continuation: freeze Block A to prevent KV cache misses
-            self._f._log_debug(
-                "🧱 Block A: frozen for AutoContinue (KV cache stability)"
-            )
+            # Continuation: freeze Block A to prevent KV cache misses.
+            self._f._log_debug("Block A: frozen for AutoContinue (KV cache stability)")
             return cached_text
 
         # --- 5. Build the static block ---
@@ -4018,8 +4019,10 @@ class ContextBuilder:
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._conversation_state_manager.get(project_id)
             if state and state.active_blocks:
-                centrality = pstate.get("node_centrality", {})
-                resolved_mode = pstate.get("resolved_call_graph_mode") or "hubs_only"
+                centrality = psm.get_node_centrality(project_id)
+                resolved_mode = (
+                    psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
+                )
                 self._f._log_debug(
                     f"Building Block A symbol section with mode='{resolved_mode}' "
                     f"(project={project_id})"
@@ -4057,20 +4060,20 @@ class ContextBuilder:
         static_block = "\n\n".join(p for p in parts if p.strip())
 
         # --- 6. Store in cache with the mode-aware key (using structure hash) ---
-        pstate["block_a_cache_key"] = cache_key
-        pstate["block_a_cached"] = static_block
+        psm.set_block_a_cache_key(project_id, cache_key)
+        psm.set_block_a_cached(project_id, static_block)
 
-        # --- 7. Record whether skeleton was actually rendered (for suppression gating) ---
-        pstate["skeleton_rendered_this_turn"] = skeleton_rendered_this_turn
-        pstate["skeleton_render_mode"] = mode
+        # --- 7. Record whether skeleton was actually rendered this turn ---
+        psm.set_skeleton_rendered_this_turn(project_id, skeleton_rendered_this_turn)
+        pstate_raw["skeleton_render_mode"] = mode
 
         # --- 8. Detect and log prefix changes (KV cache miss) ---
         new_prefix_hash = structure_hash
-        last_hash = pstate.get("last_static_prefix_hash")
+        last_hash = pstate_raw.get("last_static_prefix_hash")
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
-                f"⚠️  KV CACHE MISS detected: static block changed "
-                f"({last_hash} → {new_prefix_hash}). "
+                f"KV CACHE MISS detected: static block changed "
+                f"({last_hash} -> {new_prefix_hash}). "
                 f"llama.cpp will do a full prefill on this request."
             )
         elif not last_hash:
@@ -4080,10 +4083,10 @@ class ContextBuilder:
             )
         else:
             self._f._log_debug(
-                f"✓ KV Cache: static prefix stable ({new_prefix_hash}). "
+                f"KV Cache: static prefix stable ({new_prefix_hash}). "
                 f"llama.cpp will reuse KV states for Block A."
             )
-        pstate["last_static_prefix_hash"] = new_prefix_hash
+        pstate_raw["last_static_prefix_hash"] = new_prefix_hash
 
         tokens = (
             len(self._f.tokenizer.encode(static_block))
@@ -4101,19 +4104,22 @@ class ContextBuilder:
         Force Block A rebuild on the next request, optionally refreshing
         centrality scores.
         """
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-
-        pstate["block_a_cache_key"] = None
-        pstate["block_a_cached"] = None
-        pstate["skeleton_cache_key"] = None
-        pstate["skeleton_cached"] = None
-        pstate["skeleton_tier_cache_key"] = None
-        pstate["skeleton_tier_cached"] = None
+        psm = self._f._project_state_manager
+        psm.set_block_a_cache_key(project_id, None)
+        psm.set_block_a_cached(project_id, None)
+        # Skeleton tier cache keys are internal to _build_skeleton_tier;
+        # use raw pstate for them.
+        raw = psm.get_pstate(project_id)
+        raw["skeleton_cache_key"] = None
+        raw["skeleton_cached"] = None
+        raw["skeleton_tier_cache_key"] = None
+        raw["skeleton_tier_cached"] = None
 
         if recompute_centrality:
             try:
-                pstate["node_centrality"] = self._f._symbol_index.precompute_centrality(
-                    project_id
+                psm.set_node_centrality(
+                    project_id,
+                    self._f._symbol_index.precompute_centrality(project_id),
                 )
             except Exception as e:
                 self._f._log_debug(f"Centrality recomputation failed: {e}")
@@ -4127,14 +4133,17 @@ class ContextBuilder:
 
     def _build_skeleton_tier(self, project_id: str) -> str:
         """
-        Render the project skeleton (signatures only) as a STABLE context tier,
-        cached by structure_hash so body edits and docstring additions don't
-        invalidate it. Returns "" when disabled, empty, or over the tier budget.
+        Render the project skeleton (signatures only) as a STABLE context
+        tier, cached by structure_hash so body edits and docstring additions
+        do not invalidate it. Returns "" when disabled, empty, or over budget.
         """
         if not self._f.valves.enable_skeleton_tier:
             return ""
 
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        psm = self._f._project_state_manager
+        # Use raw pstate for skeleton-tier-specific keys that have no typed
+        # accessor (they are only read/written inside this method).
+        pstate = psm.get_pstate(project_id)
 
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
         if not structure_hash:
@@ -4156,8 +4165,8 @@ class ContextBuilder:
             tok = self._f._tokens.estimate_code_tokens(skel)
             if tok > budget:
                 self._f._log_debug(
-                    f"Skeleton tier skipped: {tok} tokens > budget {budget}. "
-                    "Block B keeps signatures inline."
+                    f"Skeleton tier skipped: {tok} tokens > budget "
+                    f"{budget}. Block B keeps signatures inline."
                 )
                 pstate["skeleton_tier_cache_key"] = structure_hash
                 pstate["skeleton_tier_cached"] = ""
@@ -4165,8 +4174,8 @@ class ContextBuilder:
 
         tier = (
             "## Project Skeleton (stable — signatures only)\n"
-            "_Contracts for the whole project. Bodies are shown on demand below "
-            "or via `/expand <name>`._\n\n"
+            "_Contracts for the whole project. Bodies are shown on demand "
+            "below or via `/expand <name>`._\n\n"
             f"{skel}"
         )
 
@@ -4188,19 +4197,21 @@ class ContextBuilder:
         if not self._f.valves.enable_hub_bodies_tier:
             return "", "", []
 
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        centrality = pstate.get("node_centrality", {})
+        psm = self._f._project_state_manager
+        centrality = psm.get_node_centrality(project_id)
         if not centrality:
             return "", "", []
 
         state = self._f._conversation_state_manager.get(project_id)
         current_turn = state.message_count
 
-        hub_seeds_this_turn = pstate.get("hub_tier_seeds_this_turn", [])
+        hub_seeds_this_turn = psm.get_hub_tier_seeds_this_turn(project_id)
         if hub_seeds_this_turn:
-            prev_seeds = pstate.get("hub_tier_prev_seeds", [])
+            prev_seeds = psm.get_hub_tier_prev_seeds(project_id)
         else:
-            prev_seeds = list(pstate.get("hub_tier_qids_persisted", []))
+            prev_seeds = list(
+                psm.get_pstate(project_id).get("hub_tier_qids_persisted", [])
+            )
 
         last_mod = state.hub_tier_last_modified
         body_hashes = state.hub_tier_body_hashes
@@ -4308,7 +4319,7 @@ class ContextBuilder:
         state.hub_tier_qids_persisted = kept
         self._f._conversation_state_manager.set(project_id, state)
 
-        previous_tier_hash = pstate.get("last_tier_hash")
+        previous_tier_hash = psm.get_pstate(project_id).get("last_tier_hash")
         if previous_tier_hash and previous_tier_hash != tier_hash:
             self._f._log_debug(
                 f"⚠️ TIER CACHE MISS: tier_hash changed "
@@ -4320,7 +4331,7 @@ class ContextBuilder:
         else:
             self._f._log_debug(f"✓ TIER CACHE HIT: tier_hash stable ({tier_hash})")
 
-        pstate["hub_tier_prev_seeds"] = hub_seeds_this_turn or prev_seeds
+        psm.set_hub_tier_prev_seeds(project_id, hub_seeds_this_turn or prev_seeds)
 
         return tier_text, tier_hash, kept
 
@@ -4379,8 +4390,7 @@ class ContextBuilder:
         if not self._f.valves.hub_bodies_tier_recency_pointers:
             return ""
 
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        prev_seeds = pstate.get("hub_tier_prev_seeds", [])
+        prev_seeds = self._f._project_state_manager.get_hub_tier_prev_seeds(project_id)
         if not prev_seeds:
             return ""
 
@@ -4425,8 +4435,9 @@ class ContextBuilder:
         """True only if the skeleton tier was actually rendered into Block A THIS turn."""
         if not self._f.valves.enable_skeleton_tier:
             return False
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        return pstate.get("skeleton_rendered_this_turn", False)
+        return self._f._project_state_manager.get_skeleton_rendered_this_turn(
+            project_id
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2.1 — Project skeleton rendering (signatures only)
@@ -4684,8 +4695,7 @@ class ContextBuilder:
         Tokens available for history + user message after Block A + Block B.
         """
         window = self._f.valves.context_window_tokens
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        used = pstate.get("last_system_tokens", 0)
+        used = self._f._project_state_manager.get_last_system_tokens(project_id)
 
         reserve = self._f.valves.response_reserve_tokens
         budget = max(0, window - used - reserve)
@@ -5083,21 +5093,32 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
         self, project_id: str, query: str, intent_vector: dict
     ) -> str:
         """
-        Resolve and apply the call-graph mode for this turn BEFORE Block A is
-        built. Implements hysteresis: upgrades immediate, downgrades deferred.
-        """
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        Resolve and apply the call-graph mode for this turn BEFORE Block A
+        is built. Implements hysteresis: upgrades are applied immediately;
+        downgrades are deferred by call_graph_mode_downgrade_after_turns.
 
-        # Global scope detection
+        Args:
+            project_id: Current project identifier.
+            query: The user query string.
+            intent_vector: Intent classification probabilities.
+
+        Returns:
+            The resolved call-graph mode string ('hubs_only', 'expanded_hubs',
+            or 'full_graph').
+        """
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+
+        # Global scope detection forces full_graph and activates multi-phase.
         if hasattr(
             self._f, "_seed_inferencer"
         ) and self._f._seed_inferencer.is_global_scope(query):
-            pstate["resolved_call_graph_mode"] = "full_graph"
-            pstate["force_multi_phase_this_turn"] = True
+            psm.set_resolved_call_graph_mode(project_id, "full_graph")
+            psm.set_force_multi_phase_this_turn(project_id, True)
             pstate["graph_mode_downgrade_streak"] = 0
             self._f._log_debug(
-                "prepare_call_graph_mode: global scope detected → "
-                "full_graph forced + multi‑phase activated this turn."
+                "prepare_call_graph_mode: global scope detected -> "
+                "full_graph forced + multi-phase activated this turn."
             )
             return "full_graph"
 
@@ -5107,7 +5128,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
 
         _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
 
-        previous_mode = pstate.get("resolved_call_graph_mode")
+        previous_mode = psm.get_resolved_call_graph_mode(project_id)
         streak = pstate.get("graph_mode_downgrade_streak", 0)
 
         if previous_mode is None or _MODE_RANK.get(
@@ -5124,17 +5145,20 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             else:
                 resolved_graph_mode = previous_mode
                 self._f._log_debug(
-                    f"Call graph mode: downgrade to {raw_resolved_mode} deferred "
-                    f"({streak}/{self._f.valves.call_graph_mode_downgrade_after_turns} "
-                    f"turns) — keeping {previous_mode} to avoid KV-cache thrash"
+                    f"Call graph mode: downgrade to {raw_resolved_mode} "
+                    f"deferred ({streak}/"
+                    f"{self._f.valves.call_graph_mode_downgrade_after_turns}"
+                    f" turns) - keeping {previous_mode} to avoid "
+                    f"KV-cache thrash"
                 )
 
         if previous_mode != resolved_graph_mode:
             self._f._log_debug(
-                f"Call graph mode: {previous_mode or '(none)'} → "
-                f"{resolved_graph_mode} (resolved before Block A build this turn)"
+                f"Call graph mode: {previous_mode or '(none)'} -> "
+                f"{resolved_graph_mode} (resolved before Block A "
+                f"build this turn)"
             )
-            pstate["resolved_call_graph_mode"] = resolved_graph_mode
+            psm.set_resolved_call_graph_mode(project_id, resolved_graph_mode)
 
         return resolved_graph_mode
 
@@ -5316,8 +5340,9 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 )
 
         # Mode is resolved BEFORE Block A is built this turn
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        resolved_graph_mode = pstate.get("resolved_call_graph_mode")
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+        resolved_graph_mode = psm.get_resolved_call_graph_mode(project_id)
         if resolved_graph_mode is None:
             resolved_graph_mode = self.prepare_call_graph_mode(
                 project_id, query, intent_vector
@@ -5343,16 +5368,16 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             )
             budget = min(budget, max(8000, _available_for_context))
 
-        tier_qids = set(pstate.get("hub_tier_qids", []))
+        tier_qids = set(psm.get_hub_tier_qids(project_id))
         injected_symbols: Set[str] = set(tier_qids)
 
-        # ── E3: stable ordering ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        # -- E3: stable ordering --
+        pstate = psm.get_pstate(project_id)
 
-        # ── E1: LOD‑2 hysteresis ──
+        # -- E1: LOD‑2 hysteresis --
         lod2_entry = self._f.valves.lod2_threshold
         lod2_exit = lod2_entry * self._f.valves.lod2_exit_ratio
-        currently_lod2: Set[str] = set(pstate.get("lod2_active_qids_prev", []))
+        currently_lod2: Set[str] = set(psm.get_lod2_active_qids_prev(project_id))
 
         lod2_qids: Set[str] = set()
         lod3_qids: Set[str] = set()
@@ -5368,12 +5393,12 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             if score >= lod3:
                 lod3_qids.add(qid)
 
-        pstate["lod2_active_qids_prev"] = list(lod2_qids)
+        psm.set_lod2_active_qids_prev(project_id, list(lod2_qids))
 
-        # ── E5: retrieve skeleton tier qids to avoid duplicates ──
-        skeleton_qids: Set[str] = set(pstate.get("skeleton_tier_qids", []))
+        # -- E5: retrieve skeleton tier qids to avoid duplicates --
+        skeleton_qids: Set[str] = set(psm.get_skeleton_tier_qids(project_id))
 
-        # ── E3: stable ordering function ──
+        # -- E3: stable ordering function --
         def _lod_tier(qid: str) -> int:
             if qid in lod3_qids:
                 return 3
@@ -5390,9 +5415,9 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             ),
         )
 
-        # ── Centrality LOD bump ──
+        # -- Centrality LOD bump --
         if self._f.valves.enable_centrality_lod_bump:
-            centrality = pstate.get("node_centrality", {})
+            centrality = psm.get_node_centrality(project_id)
             threshold = self._f.valves.centrality_lod_bump_threshold
             adjusted = []
             for qid in sorted_nodes:
@@ -5418,7 +5443,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
         else:
             activated_scores = activated
 
-        # ── Batched LOD-2 docstring pre-resolution ──
+        # -- Batched LOD-2 docstring pre-resolution --
         if self._f.valves.enable_auto_docstrings:
             lod2_candidates = [
                 qid
@@ -5445,7 +5470,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                         missing, project_id
                     )
 
-        # ── Batched LOD-2.5 CFG pre-resolution ──
+        # -- Batched LOD-2.5 CFG pre-resolution --
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
@@ -5470,7 +5495,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
-        # ── Iterate over sorted_nodes and build LOD tiers ──
+        # -- Iterate over sorted_nodes and build LOD tiers --
         _lod0_parts: List[str] = []
         _lod1_parts: List[str] = []
         _lod2_parts: List[str] = []
@@ -5483,7 +5508,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             if qid in injected_symbols:
                 continue
 
-            # ── E5: skip if in skeleton tier and LOD-2 ──
+            # -- E5: skip if in skeleton tier and LOD-2 --
             if qid in skeleton_qids:
                 if _lod_tier(qid) == 2:
                     self._f._log_debug(
@@ -5584,7 +5609,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
 
                 # LOD-3: Full code body
                 else:
-                    # ── Semantic relevance filter (LOD-3 only) ──
+                    # -- Semantic relevance filter (LOD-3 only) --
                     if self._f.valves.enable_semantic_lod3_filter and slot_free:
                         include_block = await self._evaluate_lod3_block_relevance(
                             block=block,
@@ -5676,7 +5701,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
 
                 break
 
-        # ── RAPTOR cluster summaries → LOD-2 tier ──
+        # -- RAPTOR cluster summaries -> LOD-2 tier --
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
             try:
                 raptor_hits = await self._f._raptor.retrieve(
@@ -5696,7 +5721,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 )
                 _lod2_parts.insert(0, raptor_section)
 
-        # ── Step 4: SWA-aware assembly ──
+        # -- Step 4: SWA-aware assembly --
         suppress_sigs = (
             self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
@@ -5724,13 +5749,13 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 + "\n".join(_lod3_parts)
             )
 
-        # ── E6: recency pointers ──
+        # -- E6: recency pointers --
         current_b_qids = set(injected_symbols)
         _ptr = self._build_hub_recency_pointers(project_id, current_b_qids)
         if _ptr:
             ordered.append(_ptr)
 
-        # ── Instruction tail ──
+        # -- Instruction tail --
         ordered.append(self._build_instruction_tail(active_use_case))
 
         if len(ordered) <= 1:
@@ -5751,7 +5776,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
         )
         ordered.append(summary_line)
 
-        # ── LOD tracking for adaptive feedback ──
+        # -- LOD tracking for adaptive feedback --
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
             for qid, score in activated.items():
@@ -5763,7 +5788,10 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                     lod_map[qid] = 2
                 else:
                     lod_map[qid] = 3
-            pstate["last_lod_levels"] = lod_map
+            psm.set_last_lod_levels(project_id, lod_map)
+
+        # -- Store injected qids for docstring prioritization in the next turn --
+        psm.set_block_b_qids_this_turn(project_id, list(injected_symbols))
 
         return "\n".join(ordered)
 
@@ -19412,10 +19440,11 @@ class SystemPromptBuilder:
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
         """
-        # ── REGION 1: Resolve per-project state ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        # -- REGION 1: Resolve per-project state --
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
 
-        # ── REGION 2: Build Block A (static) ──
+        # -- REGION 2: Build Block A (static) --
         slot_free = not slot_busy
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
@@ -19423,17 +19452,23 @@ class SystemPromptBuilder:
             is_continuation=is_continuation,
         )
 
-        # ── REGION 3: Build Hub‑Bodies Tier ──
+        # -- REGION 3: Build Hub‑Bodies Tier --
         hub_tier_text, hub_tier_hash, hub_tier_qids = (
             self._f._ctx_builder._build_hub_bodies_tier(project_id)
         )
-        pstate["hub_tier_text"] = hub_tier_text
-        pstate["hub_tier_hash"] = hub_tier_hash
-        pstate["hub_tier_qids"] = hub_tier_qids
-        pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
-        pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
+        # Almacenar en pstate (raw para claves de una sola clase)
+        pstate_raw = psm.get_pstate(project_id)
+        pstate_raw["hub_tier_text"] = hub_tier_text
+        pstate_raw["hub_tier_hash"] = hub_tier_hash
+        # Usar accesores tipados para claves compartidas
+        psm.set_hub_tier_qids(project_id, hub_tier_qids)
+        psm.set_hub_tier_prev_seeds(
+            project_id,
+            psm.get_hub_tier_seeds_this_turn(project_id),
+        )
+        psm.set_hub_tier_seeds_this_turn(project_id, list(hub_tier_qids))
 
-        # ── REGION 4: Block B — Dynamic per-query injections ──
+        # -- REGION 4: Block B — Dynamic per-query injections --
         dynamic_injections: List[Tuple[str, str]] = []
 
         # 4a: Compute use_case label
@@ -19451,12 +19486,12 @@ class SystemPromptBuilder:
             slot_free,
             use_case_label,
             is_continuation=is_continuation,
-            current_messages=messages,  # <-- pass for deduplication
+            current_messages=messages,
         )
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
 
-        # ── 4c: Parallel checks ──
+        # -- 4c: Parallel checks --
         self._f._log_debug("🔄 Block B – Step 2/5: Parallel checks")
         contradiction_warning, cached_response, duplicate_match = (
             await self._build_parallel_checks(
@@ -19476,7 +19511,7 @@ class SystemPromptBuilder:
                 )
             )
 
-        # ── 4d: Activated code ──
+        # -- 4d: Activated code --
         self._f._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         active_ctx = await self._build_activated_code(
             user_query, project_id, messages, is_code_session, slot_free
@@ -19484,14 +19519,14 @@ class SystemPromptBuilder:
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
 
-        # ── 4e: Proactive suggestions ──
+        # -- 4e: Proactive suggestions --
         self._f._log_debug("🔄 Block B – Step 4/5: Proactive suggestions")
         for prio, text in await self._build_suggestions(
             state, project_id, messages, is_code_session
         ):
             dynamic_injections.append((prio, text))
 
-        # ── 4f: Assemble prelim_system ──
+        # -- 4f: Assemble prelim_system --
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
             static_block,
@@ -19499,6 +19534,11 @@ class SystemPromptBuilder:
             dynamic_injections,
             messages,
         )
+
+        # Save last activations scores for prefetch and LOD following
+        pstate["last_activation_scores"] = getattr(
+            self._f, "_last_activation_scores", {}
+        ).get(project_id, {})
 
         self._f._log_debug("🔄 Block B: complete")
         return static_block, dynamic_injections, None, prelim_system
@@ -21557,6 +21597,131 @@ class MessageAssembler:
         return messages
 
 
+class ContextAssembler:
+    """
+    Single point of coordination for the full context construction pipeline.
+
+    Owns the two-phase context assembly sequence:
+      1. Calls SystemPromptBuilder.build() to produce Block A, Block B
+         injections, and the preliminary system prompt.
+      2. Calls MessageAssembler.assemble() to apply CoT, compression,
+         multi-phase instructions, and window management, then injects the
+         final system prompt into the message list.
+
+    Filter.inlet() delegates all context work here through a single
+    assemble_for_turn() call, reducing Filter's responsibility to pipeline
+    orchestration only.
+
+    Replaces the following Filter wrapper methods (dead code after migration):
+      - Filter._inlet_build_system_injections()
+      - Filter._inlet_assemble_final_messages()
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance.
+        """
+        self._f = filter_ref
+
+    async def assemble_for_turn(
+        self,
+        messages: List[dict],
+        project_id: str,
+        user_query: str,
+        user_question: str,
+        is_code_session: bool,
+        last_user_msg: Optional[dict],
+        state: "ConversationState",
+        __user__: Optional[dict],
+        has_code_blocks: bool,
+        slot_busy: bool = False,
+        is_continuation: bool = False,
+        intent_vector: Optional[dict] = None,
+    ) -> Tuple[List[dict], Optional[dict]]:
+        """
+        Execute the full context assembly pipeline for one turn.
+
+        Phase 1: Build Block A + Block B injections via SystemPromptBuilder.
+        Phase 2: Assemble the final message list via MessageAssembler.
+
+        Args:
+            messages: Current conversation message list.
+            project_id: Current project identifier.
+            user_query: Raw user query string.
+            user_question: Cleaned user question (code spans removed).
+            is_code_session: Whether the session involves code.
+            last_user_msg: The last user message dict, if any.
+            state: The persistent ConversationState for this project.
+            __user__: OpenWebUI user context.
+            has_code_blocks: Whether the user message contained code fences.
+            slot_busy: True if the KV slot is occupied (cold-start or
+                background tasks active).
+            is_continuation: True only for genuine AutoContinue turns
+                (the 'triangle CONTINUA:' marker was present in the last
+                assistant message).
+            intent_vector: Intent classification probabilities dict.
+
+        Returns:
+            Tuple of (final_messages, cached_response).
+            If cached_response is not None, the caller should short-circuit
+            and return the cached response without calling the LLM.
+        """
+        # -- Phase 1: Build system injections (Block A + Block B) ----------
+        static_block, dynamic_injections, cached_response, prelim_system = (
+            await self._f._system_prompt_builder.build(
+                messages=messages,
+                project_id=project_id,
+                user_query=user_query,
+                user_question=user_question,
+                is_code_session=is_code_session,
+                last_user_msg=last_user_msg,
+                state=state,
+                slot_busy=slot_busy,
+                is_continuation=is_continuation,
+                intent_vector=intent_vector,
+            )
+        )
+
+        if cached_response:
+            return messages, cached_response
+
+        # -- Phase 2: Assemble final messages (CoT, compression, trimming) -
+        final_messages = await self._f._message_assembler.assemble(
+            messages=messages,
+            project_id=project_id,
+            static_block=static_block,
+            dynamic_injections=dynamic_injections,
+            prelim_system=prelim_system,
+            last_user_msg=last_user_msg,
+            is_code_session=is_code_session,
+            state=state,
+            __user__=__user__,
+            user_question=user_question,
+            has_code_blocks=has_code_blocks,
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
+        )
+
+        # -- Validate active_blocks integrity after assembly ---------------
+        # ConversationState.active_blocks must always be a dict. If corrupted
+        # during assembly (e.g. failed DB load), reset it here so the inlet
+        # never returns an invalid state to the LLM.
+        _state = self._f._conversation_state_manager.get(project_id)
+        if not isinstance(_state.active_blocks, dict):
+            self._f._log_debug(
+                "CRITICAL: active_blocks corrupted after assembly; "
+                "resetting to empty. Delete %s if this recurs."
+                % self._f.valves.state_db_path
+            )
+            _state.active_blocks = {}
+            self._f._conversation_state_manager.set(project_id, _state)
+
+        return final_messages, None
+
+
 # ---------------------------------------------------------------------------
 # ContextDumper — per-turn context snapshots for evolution tracking
 # ---------------------------------------------------------------------------
@@ -22041,9 +22206,9 @@ class ContextDumper:
                 pass
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # ProjectStateManager — per‑project volatile state (SRP)
-# ---------------------------------------------------------------------------
+# ============================================================================
 class ProjectStateManager:
     """
     Manages per‑project volatile state that lives in memory only.
@@ -22069,16 +22234,21 @@ class ProjectStateManager:
 
     def _new_pstate(self) -> dict:
         """
-        Factory for a fresh per-project state bag with all defaults.
+        Factory for a fresh per-project volatile state bag with all defaults.
+
+        Every key that has a typed accessor on this class must appear here
+        with its correct default so that first-turn reads never raise KeyError
+        or return unexpected None values.
         """
         return {
-            # Call-graph mode
+            # -- Call-graph mode ------------------------------------------
             "resolved_call_graph_mode": None,
             "current_call_graph_mode": None,
-            # Silent ingestion
+            "graph_mode_downgrade_streak": 0,
+            # -- Silent ingestion -----------------------------------------
             "ingested_lang": None,
             "raw_ingested_symbols": None,
-            # Block A / skeleton cache keys and invalidation flags
+            # -- Block A / skeleton cache ---------------------------------
             "block_a_cache_key": None,
             "block_a_cached": None,
             "skeleton_cache_key": None,
@@ -22087,33 +22257,52 @@ class ProjectStateManager:
             "skeleton_tier_cached": None,
             "skeleton_invalidated": False,
             "block_a_invalidated": False,
-            # Centrality and lightweight context
+            "skeleton_rendered_this_turn": False,
+            "skeleton_render_mode": None,
+            "skeleton_tier_qids": [],
+            # -- Centrality and lightweight context -----------------------
             "node_centrality": {},
             "cached_lightweight_context": "",
             "cached_code_state_hash": None,
-            # Token accounting
+            "structure_hash_for_cache": None,
+            "last_static_prefix_hash": None,
+            # -- Hub tier -------------------------------------------------
+            "hub_tier_text": "",
+            "hub_tier_hash": "",
+            "hub_tier_qids": [],
+            "hub_tier_seeds_this_turn": [],
+            "hub_tier_prev_seeds": [],
+            # -- LOD tracking ---------------------------------------------
+            "lod2_active_qids_prev": [],
+            "last_lod_levels": {},
+            "last_activation_scores": {},
+            "block_b_qids_this_turn": [],
+            # -- Token accounting -----------------------------------------
             "last_system_tokens": 0,
             "last_total_context_tokens": 0,
-            # KVCache persistence
+            # -- KV cache persistence -------------------------------------
             "last_saved_slot_hash": "",
             "slot_restored": False,
             "slot_restore_attempted": False,
-            # Misc
-            "last_processed_message_idx": -1,
-            "response_cache_count": 0,
-            "summarize_inactive_in_progress": False,
-            # Graph mode downgrade streak
-            "graph_mode_downgrade_streak": 0,
-            # LOD adaptive tracking
-            "last_activation_scores": {},
-            "last_lod_levels": {},
-            # structure_hash_for_cache is set by ContextBuilder.build_block_a
-            "structure_hash_for_cache": None,
-            # ── one‑shot flag for global‑scope queries ──
-            "force_multi_phase_this_turn": False,
-            # ── Last assistant response for LOD adaptive lazy ──
+            # -- Query / response tracking --------------------------------
+            "last_user_query": "",
             "last_assistant_response": "",
             "last_response_timestamp": 0.0,
+            "last_outlet_response_hash": "",
+            # -- Continuation tracking ------------------------------------
+            "is_continuation": False,
+            "continuation_turns": 0,
+            # -- AutoContinue / multi-phase -------------------------------
+            "force_multi_phase_this_turn": False,
+            # -- Response cache -------------------------------------------
+            "response_cache_count": 0,
+            # -- Use case tracking ----------------------------------------
+            "last_use_case": None,
+            # -- Misc -----------------------------------------------------
+            "last_processed_message_idx": -1,
+            "summarize_inactive_in_progress": False,
+            "force_compressed_keys": [],
+            "block_a_rebuild_reason": None,
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -22135,6 +22324,218 @@ class ProjectStateManager:
     def clear_project(self, project_id: str) -> None:
         """Remove the state bag for a project (called on eviction)."""
         self._store.pop(project_id, None)
+
+    # =========================================================================
+    # 2. Typed accessors for shared volatile state keys
+    # =========================================================================
+    # Keys accessed from more than one class use these typed methods.
+    # Keys owned by a single class keep direct dict access (see ownership
+    # table in the handover document).
+
+    # -- Call-graph mode ------------------------------------------------------
+
+    def get_resolved_call_graph_mode(self, project_id: str) -> Optional[str]:
+        """Return the call-graph depth mode resolved for this turn."""
+        return self.get_pstate(project_id).get("resolved_call_graph_mode")
+
+    def set_resolved_call_graph_mode(self, project_id: str, mode: str) -> None:
+        """Persist the resolved call-graph mode for this turn."""
+        self.get_pstate(project_id)["resolved_call_graph_mode"] = mode
+
+    # -- Node centrality ------------------------------------------------------
+
+    def get_node_centrality(self, project_id: str) -> Dict[str, float]:
+        """Return the cached PageRank centrality scores for all symbols."""
+        return self.get_pstate(project_id).get("node_centrality", {})
+
+    def set_node_centrality(
+        self, project_id: str, centrality: Dict[str, float]
+    ) -> None:
+        """Store updated PageRank centrality scores."""
+        self.get_pstate(project_id)["node_centrality"] = centrality
+
+    # -- Hub tier -------------------------------------------------------------
+
+    def get_hub_tier_qids(self, project_id: str) -> List[str]:
+        """Return the list of qualified ids currently in the hub-bodies tier."""
+        return self.get_pstate(project_id).get("hub_tier_qids", [])
+
+    def set_hub_tier_qids(self, project_id: str, qids: List[str]) -> None:
+        """Store the qualified ids rendered in the hub-bodies tier."""
+        self.get_pstate(project_id)["hub_tier_qids"] = qids
+
+    def get_hub_tier_seeds_this_turn(self, project_id: str) -> List[str]:
+        """Return the hub-tier seed qids for the current turn."""
+        return self.get_pstate(project_id).get("hub_tier_seeds_this_turn", [])
+
+    def set_hub_tier_seeds_this_turn(self, project_id: str, seeds: List[str]) -> None:
+        """Store the hub-tier seed qids for the current turn."""
+        self.get_pstate(project_id)["hub_tier_seeds_this_turn"] = seeds
+
+    def get_hub_tier_prev_seeds(self, project_id: str) -> List[str]:
+        """Return the hub-tier seed qids from the previous turn."""
+        return self.get_pstate(project_id).get("hub_tier_prev_seeds", [])
+
+    def set_hub_tier_prev_seeds(self, project_id: str, seeds: List[str]) -> None:
+        """Store the hub-tier seed qids from the previous turn."""
+        self.get_pstate(project_id)["hub_tier_prev_seeds"] = seeds
+
+    # -- Block A / skeleton cache ---------------------------------------------
+
+    def get_block_a_cache_key(self, project_id: str) -> Optional[str]:
+        """Return the cache key used to validate the Block A cached text."""
+        return self.get_pstate(project_id).get("block_a_cache_key")
+
+    def set_block_a_cache_key(self, project_id: str, key: Optional[str]) -> None:
+        """Store or invalidate the Block A cache key."""
+        self.get_pstate(project_id)["block_a_cache_key"] = key
+
+    def get_block_a_cached(self, project_id: str) -> Optional[str]:
+        """Return the cached Block A rendered text, or None on a miss."""
+        return self.get_pstate(project_id).get("block_a_cached")
+
+    def set_block_a_cached(self, project_id: str, text: Optional[str]) -> None:
+        """Store the rendered Block A text for reuse across turns."""
+        self.get_pstate(project_id)["block_a_cached"] = text
+
+    def get_structure_hash_for_cache(self, project_id: str) -> Optional[str]:
+        """Return the structural hash used to key the Block A and slot files."""
+        return self.get_pstate(project_id).get("structure_hash_for_cache")
+
+    def set_structure_hash_for_cache(self, project_id: str, hash_val: str) -> None:
+        """Store the structural hash for the current code state."""
+        self.get_pstate(project_id)["structure_hash_for_cache"] = hash_val
+
+    # -- LOD tracking ---------------------------------------------------------
+
+    def get_lod2_active_qids_prev(self, project_id: str) -> List[str]:
+        """Return the qualified ids that were at LOD-2 in the previous turn."""
+        return self.get_pstate(project_id).get("lod2_active_qids_prev", [])
+
+    def set_lod2_active_qids_prev(self, project_id: str, qids: List[str]) -> None:
+        """Store the LOD-2 qualified ids for hysteresis tracking."""
+        self.get_pstate(project_id)["lod2_active_qids_prev"] = qids
+
+    def get_last_lod_levels(self, project_id: str) -> Dict[str, int]:
+        """Return the LOD level assigned to each symbol in the previous turn."""
+        return self.get_pstate(project_id).get("last_lod_levels", {})
+
+    def set_last_lod_levels(self, project_id: str, levels: Dict[str, int]) -> None:
+        """Store the LOD levels for adaptive LOD threshold tuning."""
+        self.get_pstate(project_id)["last_lod_levels"] = levels
+
+    def get_skeleton_tier_qids(self, project_id: str) -> List[str]:
+        """
+        Return the qualified ids currently rendered in the skeleton tier.
+
+        Written by ContextBuilder._build_skeleton_tier(); read by
+        EnrichmentTasks and TaskRegistry to prioritize docstring generation
+        for symbols visible in Block A every turn.
+        """
+        return self.get_pstate(project_id).get("skeleton_tier_qids", [])
+
+    def get_block_b_qids_this_turn(self, project_id: str) -> List[str]:
+        """
+        Return the qualified ids injected into Block B this turn.
+
+        Written by ContextBuilder.build_block_b() after LOD assembly;
+        read by EnrichmentTasks._prioritize_docstring_targets() to boost
+        docstring generation priority for symbols visible in Block B.
+        """
+        return self.get_pstate(project_id).get("block_b_qids_this_turn", [])
+
+    def set_block_b_qids_this_turn(self, project_id: str, qids: List[str]) -> None:
+        """Store the qualified ids injected into Block B this turn."""
+        self.get_pstate(project_id)["block_b_qids_this_turn"] = qids
+
+    # -- Query / response tracking --------------------------------------------
+
+    def get_last_user_query(self, project_id: str) -> str:
+        """Return the last user query stored for the current project."""
+        return self.get_pstate(project_id).get("last_user_query", "")
+
+    def set_last_user_query(self, project_id: str, query: str) -> None:
+        """Store the current user query for downstream consumers (pager, etc.)."""
+        self.get_pstate(project_id)["last_user_query"] = query
+
+    def get_last_assistant_response(self, project_id: str) -> str:
+        """Return the last assistant response text for LOD adaptive tuning."""
+        return self.get_pstate(project_id).get("last_assistant_response", "")
+
+    def set_last_assistant_response(self, project_id: str, response: str) -> None:
+        """Store the assistant response for use by lazy LOD adjustment."""
+        pstate = self.get_pstate(project_id)
+        pstate["last_assistant_response"] = response
+        pstate["last_response_timestamp"] = time.time()
+
+    # -- Token accounting -----------------------------------------------------
+
+    def get_last_system_tokens(self, project_id: str) -> int:
+        """Return the token count of the last assembled system prompt."""
+        return self.get_pstate(project_id).get("last_system_tokens", 0)
+
+    def set_last_system_tokens(self, project_id: str, tokens: int) -> None:
+        """Store the system prompt token count for context budget calculation."""
+        self.get_pstate(project_id)["last_system_tokens"] = tokens
+
+    def get_last_total_context_tokens(self, project_id: str) -> int:
+        """Return the total context token count for the last turn."""
+        return self.get_pstate(project_id).get("last_total_context_tokens", 0)
+
+    def set_last_total_context_tokens(self, project_id: str, tokens: int) -> None:
+        """Store the total context token count for KV slot size guard."""
+        self.get_pstate(project_id)["last_total_context_tokens"] = tokens
+
+    # -- Continuation tracking ------------------------------------------------
+
+    def get_is_continuation(self, project_id: str) -> bool:
+        """Return True if the current turn is a genuine AutoContinue continuation."""
+        return self.get_pstate(project_id).get("is_continuation", False)
+
+    def set_is_continuation(self, project_id: str, value: bool) -> None:
+        """Mark or unmark the current turn as an AutoContinue continuation.
+
+        Setting to False also resets the consecutive turn counter.
+        """
+        pstate = self.get_pstate(project_id)
+        pstate["is_continuation"] = value
+        if not value:
+            pstate["continuation_turns"] = 0
+
+    def increment_continuation_turns(self, project_id: str) -> int:
+        """Increment and return the consecutive AutoContinue turn counter."""
+        pstate = self.get_pstate(project_id)
+        turns = pstate.get("continuation_turns", 0) + 1
+        pstate["continuation_turns"] = turns
+        return turns
+
+    def get_continuation_turns(self, project_id: str) -> int:
+        """Return the number of consecutive AutoContinue turns so far."""
+        return self.get_pstate(project_id).get("continuation_turns", 0)
+
+    # -- Skeleton tier tracking -----------------------------------------------
+
+    def get_skeleton_rendered_this_turn(self, project_id: str) -> bool:
+        """Return True if the skeleton tier was rendered into Block A this turn."""
+        return self.get_pstate(project_id).get("skeleton_rendered_this_turn", False)
+
+    def set_skeleton_rendered_this_turn(self, project_id: str, value: bool) -> None:
+        """Record whether the skeleton tier was actually rendered this turn."""
+        self.get_pstate(project_id)["skeleton_rendered_this_turn"] = value
+
+    # -- Force multi-phase flag -----------------------------------------------
+
+    def pop_force_multi_phase_this_turn(self, project_id: str) -> bool:
+        """
+        Read and clear the one-shot flag that forces multi-phase this turn.
+
+        Returns the flag value before clearing it.
+        """
+        return self.get_pstate(project_id).pop("force_multi_phase_this_turn", False)
+
+    def set_force_multi_phase_this_turn(self, project_id: str, value: bool) -> None:
+        """Set the one-shot flag to force multi-phase protocol this turn."""
+        self.get_pstate(project_id)["force_multi_phase_this_turn"] = value
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3 — KVCache persistence
@@ -22162,12 +22563,12 @@ class ProjectStateManager:
             return False
 
         # --- 1. Resolve per-project state ---
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        pstate = self.get_pstate(project_id)
 
         # --- 2. Token threshold guard (skip oversized KV writes) ---
         _max_ctx = self._f.valves.slot_save_max_context_tokens
         if _max_ctx > 0:
-            _ctx_tok = pstate.get("last_total_context_tokens", 0)
+            _ctx_tok = self.get_last_total_context_tokens(project_id)
             if _ctx_tok > _max_ctx:
                 self._f._log_debug(
                     f"Slot save skipped: context {_ctx_tok} tokens > threshold "
@@ -22176,10 +22577,10 @@ class ProjectStateManager:
                 return False
 
         # --- 3. Get the structural hash from pstate (set by build_block_a) ---
-        static_hash = pstate.get("structure_hash_for_cache")
+        static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             # Fallback: compute from cache if available (should not happen in normal flow)
-            cached = pstate.get("block_a_cached")
+            cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
             else:
@@ -22196,6 +22597,8 @@ class ProjectStateManager:
             base = base[:-3]
 
         try:
+            from shared_resources import get_http_session as _shared_get_http_session
+
             session = await _shared_get_http_session(
                 timeout_seconds=self._f.valves.llm_per_call_timeout
             )
@@ -22239,7 +22642,7 @@ class ProjectStateManager:
             return False
 
         # --- 1. Resolve per-project state ---
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        pstate = self.get_pstate(project_id)
 
         # --- 2. Skip if already attempted ---
         if pstate.get("slot_restore_attempted", False):
@@ -22248,10 +22651,10 @@ class ProjectStateManager:
         pstate["slot_restore_attempted"] = True
 
         # --- 3. Get the structural hash from pstate ---
-        static_hash = pstate.get("structure_hash_for_cache")
+        static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             # Fallback: compute from cache if available
-            cached = pstate.get("block_a_cached")
+            cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
             else:
@@ -22271,6 +22674,8 @@ class ProjectStateManager:
             base = base[:-3]
 
         try:
+            from shared_resources import get_http_session as _shared_get_http_session
+
             session = await _shared_get_http_session(
                 timeout_seconds=self._f.valves.llm_per_call_timeout
             )
@@ -22318,12 +22723,12 @@ class ProjectStateManager:
             return False
 
         # --- 1. Resolve per-project state ---
-        pstate = self._f._project_state_manager.get_pstate(project_id)
+        pstate = self.get_pstate(project_id)
 
         # --- 2. Get the structural hash ---
-        static_hash = pstate.get("structure_hash_for_cache")
+        static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
-            cached = pstate.get("block_a_cached")
+            cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
             else:
@@ -22357,6 +22762,8 @@ class ProjectStateManager:
         )
 
         try:
+            from shared_resources import get_http_session as _shared_get_http_session
+
             session = await _shared_get_http_session(
                 timeout_seconds=self._f.valves.llm_per_call_timeout
             )
@@ -23257,7 +23664,7 @@ class TaskRegistry:
         Initialize the registry with a reference to the parent Filter.
 
         Args:
-            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+            filter_ref: The parent Filter instance.
         """
         self._f = filter_ref
         self._bg_tasks: List[BackgroundTask] = self._build_tasks()
@@ -23477,9 +23884,9 @@ class TaskRegistry:
             return
 
         # ── 2. Determine which symbols need docstrings ──
-        pstate_local = self._f._project_state_manager.get_pstate(project_id)
-        skeleton_qids = set(pstate_local.get("skeleton_tier_qids", []))
-        lod2_qids = set(pstate_local.get("lod2_active_qids_prev", []))
+        psm = self._f._project_state_manager
+        skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
+        lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
 
         qids_needed = set()
         for block in state.active_blocks.values():
@@ -23622,11 +24029,13 @@ class TaskRegistry:
             pstate (dict): The per-project volatile state.
         """
         # ── 1. Get the last response ──
-        last_response = pstate.get("last_assistant_response", "")
+        psm = self._f._project_state_manager
+        last_response = psm.get_last_assistant_response(project_id)
         if not last_response:
             return
         # Optional: check timestamp to avoid using very old responses
-        ts = pstate.get("last_response_timestamp", 0)
+        raw = psm.get_pstate(project_id)
+        ts = raw.get("last_response_timestamp", 0)
         if time.time() - ts > 60:  # 1 minute
             return
 
@@ -23634,6 +24043,152 @@ class TaskRegistry:
         await self._f._enrichment.update_lod_thresholds_from_response(
             project_id, last_response, stop_event=None
         )
+
+
+class FilterServices:
+    """
+    Read-only facade that groups the shared subsystem references a class
+    needs when constructed with a Filter back-reference.
+
+    Allows subsystem classes to declare their dependencies explicitly rather
+    than accessing them through self._f at every call site, making coupling
+    visible and testable.
+
+    Usage pattern::
+
+        class ContextBuilder:
+            def __init__(self, filter_ref: "Filter") -> None:
+                self._f = filter_ref
+                svc = FilterServices(filter_ref)
+                self._symbols = svc.symbol_index
+                self._state  = svc.conversation_state_manager
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Wrap the Filter reference into a typed facade.
+
+        Args:
+            filter_ref: The parent Filter instance.
+        """
+        self._f = filter_ref
+
+    # -- Index subsystems -----------------------------------------------------
+
+    @property
+    def symbol_index(self) -> "SymbolIndex":
+        """Central in-memory symbol and call-graph index."""
+        return self._f._symbol_index
+
+    @property
+    def path_index(self) -> "PathIndex":
+        """In-memory index of CodePathView objects."""
+        return self._f._path_index
+
+    # -- State managers -------------------------------------------------------
+
+    @property
+    def conversation_state_manager(self) -> "ConversationStateManager":
+        """Manager for persistent per-project ConversationState."""
+        return self._f._conversation_state_manager
+
+    @property
+    def project_state_manager(self) -> "ProjectStateManager":
+        """Manager for volatile per-project pstate dictionaries."""
+        return self._f._project_state_manager
+
+    # -- Processing subsystems ------------------------------------------------
+
+    @property
+    def activation(self) -> "ActivationEngine":
+        """PPR-based activation graph engine."""
+        return self._f._activation
+
+    @property
+    def enrichment(self) -> "EnrichmentTasks":
+        """Post-processing enrichment tasks (docstrings, LOD, summaries)."""
+        return self._f._enrichment
+
+    @property
+    def commands(self) -> "CommandRouter":
+        """Slash-command and intent dispatcher."""
+        return self._f._commands
+
+    @property
+    def code_blocks(self) -> "CodeBlockManager":
+        """Code block extraction, classification, and deduplication."""
+        return self._f._code_blocks
+
+    @property
+    def tokens(self) -> "TokenUtils":
+        """Token counting and text truncation utilities."""
+        return self._f._tokens
+
+    @property
+    def llm_orchestrator(self) -> "LLMOrchestrator":
+        """LLM caller with cache, retry, and deduplication."""
+        return self._f._llm_orchestrator
+
+    @property
+    def history_compressor(self) -> "HistoryCompressor":
+        """History and code block compression utilities."""
+        return self._f._history_compressor
+
+    # -- Context builders -----------------------------------------------------
+
+    @property
+    def ctx_builder(self) -> "ContextBuilder":
+        """Block A / Block B context builder."""
+        return self._f._ctx_builder
+
+    @property
+    def hub_index(self) -> "HubSymbolIndex":
+        """Hub symbol section renderer for Block A."""
+        return self._f._hub_index
+
+    @property
+    def pager(self) -> "ContextPager":
+        """Soft-eviction manager (active blocks <-> ChromaDB)."""
+        return self._f._pager
+
+    @property
+    def raptor(self) -> "RaptorCodeIndex":
+        """RAPTOR hierarchical cluster index."""
+        return self._f._raptor
+
+    # -- Storage --------------------------------------------------------------
+
+    @property
+    def state_store(self) -> "StateStore":
+        """SQLite database infrastructure."""
+        return self._f._state_store
+
+    @property
+    def ltm(self) -> "LongTermMemory":
+        """Long-term memory (ChromaDB + embeddings)."""
+        return self._f._ltm
+
+    # -- Config ---------------------------------------------------------------
+
+    @property
+    def valves(self) -> "Filter.Valves":
+        """User-facing configuration valves."""
+        return self._f.valves
+
+    @property
+    def tokenizer(self):
+        """Tiktoken tokenizer instance, or None if unavailable."""
+        return self._f.tokenizer
+
+    @property
+    def embedder(self):
+        """SentenceTransformer embedder instance."""
+        return self._f.embedder
+
+    @property
+    def memory_collection(self):
+        """ChromaDB memory collection."""
+        return self._f.memory_collection
 
 
 # ---------------------------------------------------------------------------
@@ -23697,15 +24252,6 @@ class Filter:
         }
     )
 
-    # Read via getattr(self._f, "_SYMBOL_BLACKLIST", set()) in
-    # LongTermMemory._is_symbol_indexable() — was referenced but never
-    # defined, so the blacklist check was a permanent no-op. Minimal
-    # starting point: low-retrieval-value dunders every class has, which
-    # add noise to LTM "code_symbols" metadata without being meaningful
-    # call-graph targets. __init__ deliberately excluded — constructors
-    # carry real signal for symbol-boosted retrieval. Adjust freely; this
-    # only affects what counts as a "symbol mention" in LTM, not the
-    # SymbolIndex itself (those symbols stay fully indexed there).
     _SYMBOL_BLACKLIST: frozenset = frozenset(
         {
             "__repr__",
@@ -23726,26 +24272,23 @@ class Filter:
         Pydantic model holding every user‑facing configuration valve for
         the CodeAware filter.
 
-        ============================================================================
-        NAVIGATION INDEX (by functional area)
-        ============================================================================
-        1.  CONTEXT WINDOW BUDGETS         — global token limits
-        2.  LLM & ORCHESTRATION            — endpoints, models, multi‑phase
-        3.  SYMBOLGRAPH & ACTIVE CODE      — symbol extraction, indexing, deduplication
-            └── Docstrings & CFG generation  — auto‑generation and batching
-        4.  ARCHITECTURE MAP & HUB‑BODIES  — static class outline and stable hub bodies
-        5.  SEMANTIC SEED INFERENCE        — LLM‑guided seed selection for PPR
-        6.  ACTIVATION GRAPH (PPR / LOD)   — path activation, LOD thresholds, centrality
-        7.  CLASSIFICATION THRESHOLDS      — cascade (Heuristic → CE → LLM) tuning
-        8.  REASONING (CoT)                — chain‑of‑thought detection and generation
-        9.  LONG‑TERM MEMORY (LTM)         — ChromaDB, RAPTOR, retrieval
-        10. CONTEXT COMPRESSION            — history, code, and summary compression
-        11. SESSION & STATE                — project, summaries, feedback, cache
-        12. PERFORMANCE & PERSISTENCE      — KV slots, paging, edge persistence
-        13. INTERACTION & COMMANDS         — slash commands, suggestions, cleanup
-        14. UTILITIES & TUNING             — debug, context dumps, weighting
-        15. LAZY + BACKGROUND TASKS        — master switch and per‑task controls
-        ============================================================================
+        ─── ÍNDICE DE SECCIONES ───
+        1.  CONTEXT WINDOW BUDGETS
+        2.  LLM & ORCHESTRATION
+        3.  SYMBOLGRAPH & ACTIVE CODE
+        4.  ARCHITECTURE MAP & HUB‑BODIES TIER
+        5.  SEMANTIC SEED INFERENCE
+        6.  ACTIVATION GRAPH (PPR / LOD)
+        7.  CLASSIFICATION THRESHOLDS
+        8.  REASONING (Chain‑of‑Thought)
+        9.  LONG‑TERM MEMORY (LTM)
+        10. CONTEXT COMPRESSION
+        11. SESSION & STATE
+        12. PERFORMANCE & PERSISTENCE
+        13. INTERACTION & COMMANDS
+        14. UTILITIES & TUNING
+        15. LAZY + BACKGROUND TASKS CONTROL
+        ────────────────────────────
         """
 
         # ═════════════════════════════════════════════════════════════════════════
@@ -23804,25 +24347,57 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 2. LLM & ORCHESTRATION
         # ═════════════════════════════════════════════════════════════════════════
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
-        LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
-        llamacpp_endpoint_type: str = Field(default="chat")
-        llm_request_timeout: int = Field(default=900)
-        llm_per_call_timeout: int = Field(default=900, ge=1)
-        llm_retry_total_timeout: int = Field(default=950, ge=10)
-        LLM_CACHE_TTL: int = Field(default=300)
-        LLM_CACHE_MAX_SIZE: int = Field(default=100)
+        LLM_BASE_URL: str = Field(
+            default="http://host.docker.internal:8080",
+            description="Base URL of the llama.cpp or OpenAI-compatible inference server.",
+        )
+        LLM_API_TOKEN: str = Field(
+            default="",
+            description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
+        )
+        llm_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Primary LLM model identifier used for all in-context completions.",
+        )
+        llamacpp_endpoint_type: str = Field(
+            default="chat",
+            description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
+        )
+        llm_request_timeout: int = Field(
+            default=900,
+            description="HTTP timeout in seconds for individual LLM requests before the connection is dropped.",
+        )
+        llm_per_call_timeout: int = Field(
+            default=900,
+            ge=1,
+            description="Per-call timeout in seconds passed to the HTTP session. Also used as the SQLite busy_timeout multiplier.",
+        )
+        llm_retry_total_timeout: int = Field(
+            default=950,
+            ge=10,
+            description="Total deadline in seconds for a single LLM call including all retries.",
+        )
+        LLM_CACHE_TTL: int = Field(
+            default=300,
+            description="Time-to-live in seconds for entries in the in-memory LLM response cache.",
+        )
+        LLM_CACHE_MAX_SIZE: int = Field(
+            default=100,
+            description="Maximum number of entries kept in the in-memory LLM response cache.",
+        )
 
         # ── Auxiliary models ──────────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
         # ── Multi‑phase response ─────────────────────────────────────────────
@@ -23876,8 +24451,7 @@ class Filter:
         )
         enable_cfg_skeletons: bool = Field(
             default=True,
-            description="Generate control‑flow skeletons (branches preserved, bodies elided) "
-            "for LOD2 symbols in refactor or high‑debug‑intent queries.",
+            description="Generate control‑flow skeletons (branches preserved, bodies elided) for LOD2 symbols in refactor or high‑debug‑intent queries.",
         )
         cfg_skeleton_debug_intent_threshold: float = Field(
             default=0.4,
@@ -24147,14 +24721,6 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 7. CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM cascade)
         # ═════════════════════════════════════════════════════════════════════════
-        # For each classification task, the cascade works as follows:
-        # 1. Heuristic reinforcement (keyword boosts) is applied to CE scores.
-        # 2. If the difference between top two CE scores >= CE_THRESHOLD → trust CE.
-        # 3. If diff < LLM_THRESHOLD → call LLM with CE context.
-        # 4. Otherwise (middle zone) → use heuristic fallback.
-        #
-        # The `heuristic_reinforcement_weight` multiplies all heuristic boosts.
-
         heuristic_reinforcement_weight: float = Field(
             default=1.0,
             ge=0.0,
@@ -24622,8 +25188,7 @@ class Filter:
         )
         enable_secondary_compaction: bool = Field(
             default=True,
-            description="Run LLMLingua (secondary compactor) after the primary compactor, "
-            "restricted to prose that wasn't already summarized.",
+            description="Run LLMLingua (secondary compactor) after the primary compactor, restricted to prose that wasn't already summarized.",
         )
 
         # ── Code compression (LLMLingua) ────────────────────────────────────
@@ -24654,8 +25219,7 @@ class Filter:
         code_history_force_compress_after_turns: int = Field(
             default=8,
             ge=0,
-            description="If a code‑bearing history message stays blocked by the symbol‑index "
-            "ratio for more than this many turns, force‑compress without /expand guarantee. 0 = never.",
+            description="If a code‑bearing history message stays blocked by the symbol‑index ratio for more than this many turns, force‑compress without /expand guarantee. 0 = never.",
         )
         code_history_keep_last_n_parts: int = Field(
             default=3,
@@ -24673,8 +25237,7 @@ class Filter:
         # ── User code in history ────────────────────────────────────────────
         enable_lean_user_code: bool = Field(
             default=True,
-            description="Replace large user code blocks in history with a compact stub. "
-            "The full code remains recoverable via /expand or LOD.",
+            description="Replace large user code blocks in history with a compact stub. The full code remains recoverable via /expand or LOD.",
         )
         lean_user_code_min_tokens: int = Field(
             default=12000,
@@ -24684,7 +25247,7 @@ class Filter:
         # ── Conversation summaries ──────────────────────────────────────────
         summarize_old_messages: bool = Field(
             default=True,
-            description="Summarise conversation messages that are trimmed from history.",
+            description="Summarise conversation messages that are trimmed from history by the WindowManager before discarding them.",
         )
         max_conversation_summaries: int = Field(
             default=3,
@@ -24692,19 +25255,33 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used for all general-purpose summarization tasks (history, sessions, hierarchical consolidation).",
         )
         summary_fallback_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Fallback model for summarization when the primary summarization_model is unavailable.",
         )
 
         # ═════════════════════════════════════════════════════════════════════════
         # 11. SESSION & STATE
         # ═════════════════════════════════════════════════════════════════════════
-        project_id: str = Field(default="default")
-        max_cached_projects: int = Field(default=10)
-        state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
-        preserve_tool_calls: bool = Field(default=True)
+        project_id: str = Field(
+            default="default",
+            description="Logical project identifier that scopes all per-project state (symbol index, active blocks, LTM, etc.).",
+        )
+        max_cached_projects: int = Field(
+            default=10,
+            description="Maximum number of project states kept in the in-memory LRU cache before the least recently used is evicted.",
+        )
+        state_db_path: str = Field(
+            default="/app/backend/data/conversation_state.db",
+            description="Filesystem path for the SQLite database that persists conversation state, edges, and docstrings.",
+        )
+        preserve_tool_calls: bool = Field(
+            default=True,
+            description="Strip orphaned tool-call messages from the front of history before window management to avoid API errors.",
+        )
 
         # ── Session summaries ───────────────────────────────────────────────
         enable_session_summary: bool = Field(default=True)
@@ -24781,12 +25358,11 @@ class Filter:
         skeleton_tier_max_tokens: int = Field(
             default=0,
             ge=0,
-            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget → tier skipped.",
+            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget -> tier skipped.",
         )
         skeleton_tier_suppresses_block_b_signatures: bool = Field(
             default=True,
-            description="When skeleton tier is active, Block B omits bare signatures (LOD‑0/LOD‑1) "
-            "because they are already in the stable tier. Case D (refactor) is exempt.",
+            description="When skeleton tier is active, Block B omits bare signatures (LOD‑0/LOD‑1) because they are already in the stable tier. Case D (refactor) is exempt.",
         )
         skeleton_include_docstrings: bool = Field(
             default=True,
@@ -24899,9 +25475,18 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 14. UTILITIES & TUNING
         # ═════════════════════════════════════════════════════════════════════════
-        debug: bool = Field(default=True)
-        priority: int = Field(default=0)
-        use_tiktoken: bool = Field(default=True)
+        debug: bool = Field(
+            default=True,
+            description="Enable verbose timestamped debug logging to stdout for all CodeAware subsystems.",
+        )
+        priority: int = Field(
+            default=0,
+            description="OpenWebUI pipeline priority. Lower numbers run earlier in the filter chain.",
+        )
+        use_tiktoken: bool = Field(
+            default=True,
+            description="Use tiktoken (cl100k_base) for accurate token counting. Falls back to a 4-chars-per-token heuristic if tiktoken is unavailable.",
+        )
 
         # ── Context dump (evolution tracking) ──────────────────────────────
         enable_context_dump: bool = Field(
@@ -25073,6 +25658,7 @@ class Filter:
         self._active_code_updater = ActiveCodeUpdater(self)
         self._system_prompt_builder = SystemPromptBuilder(self)
         self._message_assembler = MessageAssembler(self)
+        self._context_assembler = ContextAssembler(self)  # <-- CORRECTO
         self._context_dumper = ContextDumper(self)
         self._seed_inferencer = SemanticSeedInferencer(self)
 
@@ -25120,17 +25706,17 @@ class Filter:
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(1)
-        self._chroma_semaphore = asyncio.Semaphore(2)  # Limits ChromaDB concurrency
+        self._chroma_semaphore = asyncio.Semaphore(2)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
         self._llm_orchestrator.init_cache()
         self._last_used_model: Optional[str] = None
 
-        # ── Tracking of active LLM tasks ──
+        # -- Tracking of active LLM tasks --
         self._active_llm_tasks: Set[asyncio.Task] = set()
         self._active_llm_tasks_lock = asyncio.Lock()
 
-        # ── Database write queue ──
+        # -- Database write queue --
         self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._db_worker_task = asyncio.create_task(self._state_store.db_worker())
 
@@ -25139,7 +25725,7 @@ class Filter:
         self._session_classify_ttl: float = 1800.0
         self._project_state_manager = ProjectStateManager(self)
 
-        # ── Project tracking ──
+        # -- Project tracking --
         self._last_project_id: str = ""
 
         # Symbol index and path index
@@ -25165,25 +25751,25 @@ class Filter:
         self.ENABLE_KEYWORD_COUNT_WEIGHT = True
         self.ENABLE_COT_STICKY = False
 
-        # ── Write counter for periodic tasks ──
+        # -- Write counter for periodic tasks --
         self._write_counter = 0
 
-        # ── Silent ingestion guard ──
+        # -- Silent ingestion guard --
         self._is_silent_ingestion = False
 
-        # ── Original user system prompt ──
+        # -- Original user system prompt --
         self._original_system_prompt: str = ""
 
-        # ── C6: LTM store completion event ──────────────────────────────
+        # -- C6: LTM store completion event --
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
         self._ltm_store_complete.set()  # initially "complete"
 
-        # ── Background task manager ────────────────────────────────────────
+        # -- Background task manager --
         self._bg_manager = BackgroundTaskManager(
             self, max_concurrent=self.valves.bg_task_max_concurrent
         )
 
-        # ── Task registry ─────────────────────────────────────────────────────
+        # -- Task registry --
         self._task_registry = TaskRegistry(self)
 
         # --- Validate valve coherence at startup ---
@@ -25387,119 +25973,7 @@ class Filter:
             self._log_debug("Valve coherence check: no issues detected.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Background tasks registry & helpers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _build_bg_tasks(self) -> List[BackgroundTask]:
-        """Build the list of background task definitions."""
-        tasks = [
-            BackgroundTask(
-                name="session_summary",
-                state_key="bg_session_summary_state",
-                lazy_func=self._lazy_session_summary,
-                bg_func=self._enrichment.run_session_summary_task,
-                invalidation_func=None,
-                valve_bg="enable_bg_session_summary",
-                valve_lazy="enable_lazy_session_summary",
-                priority=1,
-                skip_if_completed=True,
-            ),
-            BackgroundTask(
-                name="prefetch",
-                state_key="bg_prefetch_state",
-                lazy_func=self._lazy_prefetch,
-                bg_func=self._activation.speculative_prefetch_background,
-                invalidation_func=lambda pid: self._activation.compute_code_state_hash(
-                    pid
-                ),
-                valve_bg="enable_bg_prefetch",
-                valve_lazy="enable_lazy_prefetch",
-                priority=2,
-                skip_if_completed=True,
-            ),
-            BackgroundTask(
-                name="docstrings",
-                state_key="bg_docstrings_state",
-                lazy_func=self._lazy_docstrings,
-                bg_func=self._enrichment._docstring_generation_loop,
-                invalidation_func=lambda pid: self._symbol_index.compute_structure_hash(
-                    pid
-                ),
-                valve_bg="enable_bg_docstrings",
-                valve_lazy="enable_lazy_docstrings",
-                priority=3,
-                skip_if_completed=True,
-            ),
-            BackgroundTask(
-                name="raptor",
-                state_key="bg_raptor_state",
-                lazy_func=self._lazy_raptor,
-                bg_func=self._raptor.rebuild,
-                invalidation_func=lambda pid: self._symbol_index.compute_structure_hash(
-                    pid
-                ),
-                valve_bg="enable_bg_raptor",
-                valve_lazy="enable_lazy_raptor",
-                priority=4,
-                skip_if_completed=True,
-            ),
-            BackgroundTask(
-                name="purge",
-                state_key="bg_purge_state",
-                lazy_func=self._lazy_purge,
-                bg_func=self._pager.purge_old_versions,
-                invalidation_func=lambda pid: self._activation.compute_code_state_hash(
-                    pid
-                ),
-                valve_bg="enable_bg_purge",
-                valve_lazy="enable_lazy_purge",
-                priority=5,
-                skip_if_completed=True,
-            ),
-            BackgroundTask(
-                name="lod_adaptive",
-                state_key="bg_lod_state",
-                lazy_func=self._lazy_lod,
-                bg_func=self._enrichment.update_lod_thresholds_from_response,
-                invalidation_func=lambda pid: str(
-                    self._conversation_state_manager.get(pid).message_count
-                ),
-                valve_bg="enable_bg_lod",
-                valve_lazy="enable_lazy_lod",
-                priority=6,
-                skip_if_completed=False,
-            ),
-        ]
-        return tasks
-
-    def _validate_and_order_bg_tasks(self) -> None:
-        """Validate background_priority valve and order tasks by priority."""
-        # ── 1. Validate keys ──
-        valid_names = {t.name for t in self._bg_tasks}
-        for name in self.valves.background_priority:
-            if name not in valid_names:
-                self._log_debug(
-                    f"WARNING: background_priority contains unknown task '{name}'"
-                )
-
-        # ── 2. Apply effective priority ──
-        for task in self._bg_tasks:
-            task._effective_priority = self.valves.background_priority.get(
-                task.name, task.priority
-            )
-
-        # ── 3. Sort by effective priority (higher first) ──
-        self._bg_tasks.sort(key=lambda t: -t._effective_priority)
-
-    def _get_task_definition(self, name: str) -> Optional[BackgroundTask]:
-        """Return the task definition for a given name, or None."""
-        for task in self._bg_tasks:
-            if task.name == name:
-                return task
-        return None
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Code update helper
+    # 4. Code update helper
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _update_active_code(
@@ -25509,84 +25983,21 @@ class Filter:
         await self._active_code_updater.process(message, project_id, is_continuation)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Inlet helpers
+    # 5. Continuation detection
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def _inlet_build_system_injections(
-        self,
-        messages,
-        project_id,
-        user_query,
-        user_question,
-        is_code_session,
-        last_user_msg,
-        state,
-        slot_busy: bool = False,
-        is_continuation: bool = False,
-        intent_vector=None,
-    ):
-        """
-        Build system injections (Block A + Block B) via SystemPromptBuilder.
-
-        Args:
-            slot_busy: True if the KV slot is occupied (cold-start, background tasks).
-            is_continuation: True only for genuine AutoContinue (▶ CONTINÚA: marker).
-        """
-        return await self._system_prompt_builder.build(
-            messages=messages,
-            project_id=project_id,
-            user_query=user_query,
-            user_question=user_question,
-            is_code_session=is_code_session,
-            last_user_msg=last_user_msg,
-            state=state,
-            slot_busy=slot_busy,
-            is_continuation=is_continuation,
-            intent_vector=intent_vector,
-        )
-
-    async def _inlet_assemble_final_messages(
-        self,
-        messages,
-        project_id,
-        static_block,
-        dynamic_injections,
-        prelim_system,
-        last_user_msg,
-        is_code_session,
-        state,
-        __user__,
-        user_question,
-        has_code_blocks,
-        slot_busy: bool = False,
-        is_continuation: bool = False,
-    ):
-        """
-        Delegate final message assembly to MessageAssembler.
-
-        Args:
-            slot_busy: True if the KV slot is occupied.
-            is_continuation: True only for genuine AutoContinue.
-        """
-        return await self._message_assembler.assemble(
-            messages,
-            project_id,
-            static_block,
-            dynamic_injections,
-            prelim_system,
-            last_user_msg,
-            is_code_session,
-            state,
-            __user__,
-            user_question,
-            has_code_blocks,
-            slot_busy=slot_busy,
-            is_continuation=is_continuation,
-        )
-
+    # TODO: Refactor  this funcion into some class. Don't have it here.
     def _detect_genuine_continuation(self, messages: list) -> bool:
-        """Return True only if the most recent ASSISTANT message contains
-        the AutoContinue marker '▶ CONTINÚA:'.
+        """
+        Return True if the most recent assistant message contains the
+        AutoContinue marker, indicating the model has split its response
+        and expects to be called again.
+
+        Args:
+            messages: The current conversation message list.
+
+        Returns:
+            True if the last assistant message contains a continuation marker.
         """
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
@@ -25624,13 +26035,13 @@ class Filter:
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
 
-        # ── Stop background tasks gracefully ────────────────────────────────
+        # -- Stop background tasks gracefully --------------------------------
         # We stop any ongoing background work (docstrings, summaries, etc.)
         # before processing the user's turn. The timeout is configurable via
         # the bg_task_stop_timeout valve.
         await self._bg_manager.stop_all()  # uses valve bg_task_stop_timeout
         self._bg_manager.set_paused(True)
-        # ──────────────────────────────────────────────────────────────────────
+        # ------------------------------------------------------------------
 
         def _inlet_timing(step_name: str, start: float, end: float = None):
             if end is None:
@@ -25639,62 +26050,59 @@ class Filter:
 
         project_id = self._inlet_orch.get_project_id()
 
-        # ── Get state early to decide slot_busy and is_continuation ──
+        # -- Get state early to decide slot_busy and is_continuation --
         state = self._conversation_state_manager.get(project_id)
-        pstate = self._project_state_manager.get_pstate(project_id)
+        psm = self._project_state_manager
+        # pstate is kept for outlet-internal keys with no typed accessor.
+        pstate = psm.get_pstate(project_id)
 
-        # ── AC-A: separate slot_busy from is_continuation ────────────────
+        # -- AC-A: separate slot_busy from is_continuation ---------------
         # slot_busy: True if the KV slot is occupied for ANY reason.
-        # Only affects slot-restore timing — does NOT suppress processing.
+        # Only affects slot-restore timing -- does NOT suppress processing.
         slot_busy = False
         if self._last_used_model is None and state.message_count <= 1:
             slot_busy = True
             self._log_debug("inlet: cold-start slot_busy=True")
 
         # is_continuation is read from pstate (set by outlet based on marker)
-        is_continuation = pstate.get("is_continuation", False)
+        is_continuation = psm.get_is_continuation(project_id)
 
-        # ── AC-A-WD: Watchdog for stuck continuations ──────────────────────
+        # -- AC-A-WD: Watchdog for stuck continuations -------------------
         if is_continuation:
-            turns = pstate.get("continuation_turns", 1)
+            turns = psm.get_continuation_turns(project_id)
             max_turns = self.valves.max_autocontinue_turns
             if turns > max_turns:
                 self._log_debug(
                     f"AutoContinue watchdog: is_continuation has been True for "
                     f"{turns} consecutive turns (max={max_turns}) "
-                    f"— forcing reset. Check if '▶ CONTINÚA:' marker is being "
-                    f"generated correctly."
+                    f"-- forcing reset. Check if 'triangle CONTINUA:' marker is "
+                    f"being generated correctly."
                 )
-                pstate["is_continuation"] = False
-                pstate["continuation_turns"] = 0
+                psm.set_is_continuation(project_id, False)
                 is_continuation = False
                 if self.valves.enable_slot_persistence:
-                    await self._project_state_manager.slot_restore_for_continuity(
-                        project_id
-                    )
+                    await psm.slot_restore_for_continuity(project_id)
 
         await self._enrichment.cancel_docstring_tasks()
         self._enrichment._lazy_docstrings_generated_this_turn = 0
 
-        # ── Phase A: Write barrier ──────────────────────────────────
+        # -- Phase A: Write barrier --------------------------------------
         # Wait for all pending writes from the previous turn to finish
         # BEFORE we start reading SQLite.
         await self._state_store.drain_writes(timeout=5.0)
 
-        # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   1. Preprocess (project switch, cache load)
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         messages = await self._inlet_orch.inlet_preprocess(body, project_id)
-        _inlet_timing("Step 1/7: Preprocess (project switch, cache load)", step_start)
+        _inlet_timing("Step 1/6: Preprocess (project switch, cache load)", step_start)
         if not messages:
             return body
 
-        # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   2. Extract user info
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         (
             last_user_msg,
@@ -25703,23 +26111,23 @@ class Filter:
             is_explicit_command,
             has_code_blocks,
         ) = await self._inlet_orch.inlet_extract_user_info(messages)
-        _inlet_timing("Step 2/7: Extract user info", step_start)
+        _inlet_timing("Step 2/6: Extract user info", step_start)
 
-        # ── C6: Wait for previous LTM store to complete ──────────────────
+        # -- C6: Wait for previous LTM store to complete ----------------
         if not self._ltm_store_complete.is_set():
-            self._log_debug("LTM: store pending from previous turn — waiting up to 3s")
+            self._log_debug("LTM: store pending from previous turn -- waiting up to 3s")
             try:
                 await asyncio.wait_for(
                     asyncio.shield(self._ltm_store_complete.wait()),
                     timeout=3.0,
                 )
-                self._log_debug("LTM: store completed — proceeding with retrieval")
+                self._log_debug("LTM: store completed -- proceeding with retrieval")
             except asyncio.TimeoutError:
                 self._log_debug(
-                    "LTM: store timeout (>3s) — retrieval may miss previous turn"
+                    "LTM: store timeout (>3s) -- retrieval may miss previous turn"
                 )
 
-        # ── Detect AutoContinue continuation ──────────────────────────────
+        # -- Detect AutoContinue continuation ----------------------------
         # (This is now handled by pstate["is_continuation"] set in outlet.
         #  We keep the old marker detection as a fallback for safety.)
         _last_assistant = next(
@@ -25742,19 +26150,18 @@ class Filter:
                     if _hint:
                         user_question = _hint
                         self._log_debug(
-                            f"AutoContinue detected — LOD query: '{user_question}'"
+                            f"AutoContinue detected -- LOD query: '{user_question}'"
                         )
                     break
 
-        # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
         #   3. Explicit commands (/forget, /status, /clean, /expand)
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         handled, handled_messages = await self._commands.handle_explicit_commands(
             messages, project_id, is_explicit_command, last_user_msg, __user__
         )
-        _inlet_timing("Step 3/7: Handle explicit commands", step_start)
+        _inlet_timing("Step 3/6: Handle explicit commands", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -25763,10 +26170,9 @@ class Filter:
             )
             return body
 
-        # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
         #   4. Natural language intents (forget, remember, obsolete)
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         handled, handled_messages = await self._commands.handle_natural_intents(
             messages,
@@ -25775,7 +26181,7 @@ class Filter:
             last_user_msg,
             slot_free=not slot_busy,  # only allow if slot is free
         )
-        _inlet_timing("Step 4/7: Handle natural language intents", step_start)
+        _inlet_timing("Step 4/6: Handle natural language intents", step_start)
         if handled:
             body["messages"] = handled_messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -25784,7 +26190,7 @@ class Filter:
             )
             return body
 
-        # ── Silent Ingestion (Modo B: chunked paste) ────────────────────
+        # -- Silent Ingestion (Modo B: chunked paste) -------------------
         if (
             self.valves.enable_silent_ingestion
             and last_user_msg is not None
@@ -25793,11 +26199,11 @@ class Filter:
             if await self._commands.is_code_only_message(user_query, project_id):
                 self._log_section("SILENT INGESTION MODE")
 
-                pstate = self._project_state_manager.get_pstate(project_id)
+                pstate_local = self._project_state_manager.get_pstate(project_id)
 
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
                 _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                pstate["ingested_lang"] = _lang
+                pstate_local["ingested_lang"] = _lang
 
                 raw_symbols = []
                 if HAS_TREE_SITTER:
@@ -25813,7 +26219,7 @@ class Filter:
                         raw_symbols, user_query
                     )
 
-                pstate["raw_ingested_symbols"] = raw_symbols
+                pstate_local["raw_ingested_symbols"] = raw_symbols
 
                 _msg_to_index = last_user_msg
 
@@ -25837,7 +26243,7 @@ class Filter:
                         project_id, is_code_session=True, is_continuation=False
                     )
                     self._log_debug(
-                        "🧱 Block A scaffold (hub symbols + skeleton tier) "
+                        "Block A scaffold (hub symbols + skeleton tier) "
                         "pre-built after silent ingestion"
                     )
                 except Exception as _scaffold_err:
@@ -25846,7 +26252,7 @@ class Filter:
                         f"Eager Block A scaffold build failed (non-fatal): {_scaffold_err}"
                     )
 
-                # ── M7: Pre‑compute tier during silent ingestion ──
+                # -- M7: Pre‑compute tier during silent ingestion --
                 if (
                     self.valves.enable_hub_bodies_tier
                     and self.valves.hub_bodies_tier_warmup_on_ingestion
@@ -25854,13 +26260,13 @@ class Filter:
                     tier_text, tier_hash, tier_qids = (
                         self._ctx_builder._build_hub_bodies_tier(project_id)
                     )
-                    pstate["hub_tier_text"] = tier_text
-                    pstate["hub_tier_hash"] = tier_hash
-                    pstate["hub_tier_qids"] = tier_qids
+                    pstate_local["hub_tier_text"] = tier_text
+                    pstate_local["hub_tier_hash"] = tier_hash
+                    psm.set_hub_tier_qids(project_id, tier_qids)
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
 
-                    # ── B4: warmup tier prefill ──────────────────────────────
+                    # -- B4: warmup tier prefill -------------------------
                     asyncio.create_task(
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
@@ -25875,7 +26281,7 @@ class Filter:
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
-                # ── Generate and store stub (no truncation) ──
+                # -- Generate and store stub (no truncation) --
                 stub = self._history_compressor._build_user_stub(num_symbols)
 
                 # Store stub in state so it persists for future turns
@@ -25894,7 +26300,7 @@ class Filter:
                 )
                 messages.append({"role": "assistant", "content": response})
 
-                # ── Context dump (if enabled) ────────────────────────────────────
+                # -- Context dump (if enabled) ------------------------------
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -25917,22 +26323,20 @@ class Filter:
                 )
                 return body
 
-        # ─────────────────────────────────────────────────────────────────
         # 🔥 STATE MANAGEMENT (Critical)
         #   5. Prepare code session (classify, update code blocks)
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         is_code_session, user_question = (
             await self._inlet_orch.inlet_prepare_code_session(
                 messages, project_id, user_query, is_continuation=is_continuation
             )
         )
-        _inlet_timing("Step 5/7: Prepare code session", step_start)
+        _inlet_timing("Step 5/6: Prepare code session", step_start)
 
-        # ─────────────────────────────────────────────────────────────────
         # 🧠 ENRICHMENT (Critical for call‑graph mode resolution)
         #   Resolve call‑graph mode BEFORE Block A is built.
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         intent_vector = await self._commands.classify_intent(user_query, project_id)
 
         # Use classify_intent_with_continuation, passing is_continuation
@@ -25942,45 +26346,40 @@ class Filter:
             )
         )
 
-        # ─────────────────────────────────────────────────────────────────
         # 🧠 ENRICHMENT – Run lazy tasks and prepare context
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         # Run lazy tasks (if not completed in background) before building
         # the rest of the context. This includes LOD adaptive adjustment
         # using the previous turn's response.
-        pstate = self._project_state_manager.get_pstate(project_id)
-        pstate["last_user_query"] = user_query
+        psm.set_last_user_query(project_id, user_query)
 
         await self._task_registry.run_lazy_tasks(project_id, pstate)
 
         # Now that lazy tasks are done, resolve call graph mode
         self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
 
-        # ─────────────────────────────────────────────────────────────────
-        # 🧠 ENRICHMENT (High value)
-        #   6. Build system injections and assemble final messages
-        #      (delegates Block A/B construction to ContextBuilder)
-        # ─────────────────────────────────────────────────────────────────
+        # 🧠📦 ENRICHMENT + COMPRESSION + ASSEMBLY (High value)
+        #   6. Assemble context and final messages
+        #      (Block A, Block B, CoT, compression, multi-phase, trimming)
+        # ----------------------------------------------------------------
         step_start = time.monotonic()
         state = self._conversation_state_manager.get(project_id)
 
-        static_block, dynamic_injections, cached_response, prelim_system = (
-            await self._inlet_build_system_injections(
-                messages,
-                project_id,
-                user_query,
-                user_question,
-                is_code_session,
-                last_user_msg,
-                state,
-                slot_busy=slot_busy,
-                is_continuation=is_continuation,
-                intent_vector=intent_vector,
-            )
+        messages, cached_response = await self._context_assembler.assemble_for_turn(
+            messages=messages,
+            project_id=project_id,
+            user_query=user_query,
+            user_question=user_question,
+            is_code_session=is_code_session,
+            last_user_msg=last_user_msg,
+            state=state,
+            __user__=__user__,
+            has_code_blocks=has_code_blocks,
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
+            intent_vector=intent_vector,
         )
-        _inlet_timing("Step 6/7: Build system injections", step_start)
-
-        # ── PREMATURE slot_restore REMOVED (moved to the end) ──
+        _inlet_timing("Step 6/6: Assemble context and final messages", step_start)
 
         if cached_response:
             messages.pop()
@@ -25991,42 +26390,15 @@ class Filter:
             body["messages"] = messages
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
-                "CONTEXT MANAGER - INLET END", duration=time.monotonic() - inlet_start
+                "CONTEXT MANAGER - INLET END",
+                duration=time.monotonic() - inlet_start,
             )
             return body
 
-        # ─────────────────────────────────────────────────────────────────
-        # 📦 COMPRESSION + ASSEMBLY (High value)
-        #   7. Assemble final messages with CoT, multi-phase, trimming
-        # ─────────────────────────────────────────────────────────────────
-        step_start = time.monotonic()
-        messages = await self._inlet_assemble_final_messages(
-            messages,
-            project_id,
-            static_block,
-            dynamic_injections,
-            prelim_system,
-            last_user_msg,
-            is_code_session,
-            state,
-            __user__,
-            user_question,
-            has_code_blocks,
-            slot_busy=slot_busy,
-            is_continuation=is_continuation,
-        )
-        _inlet_timing("Step 7/7: Assemble final messages", step_start)
-
-        # ✅ active_blocks Validation (attribute, not dict)
-        if not isinstance(state.active_blocks, dict):
-            state.active_blocks = {}
-            self._conversation_state_manager.set(project_id, state)
-
         body["messages"] = messages
 
-        # ─────────────────────────────────────────────────────────────────
         # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
-        # ─────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         # slot_restore_for_continuity is independent of slot_restore:
         #   - slot_restore: session start / first time Block A is built.
         #   - slot_restore_for_continuity: end of each inlet, after CoT,
@@ -26051,7 +26423,8 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ═══════════════════════════════════════════════════════════════════════════
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Post‑process the response after the LLM has generated it.
+        """
+        Post‑process the response after the LLM has generated it.
 
         Returns the (possibly modified) body unchanged.
 
@@ -26066,7 +26439,7 @@ class Filter:
             self._log_debug("outlet: prerequisites not met, returning body unchanged")
             return body
 
-        # ── Log body structure once for debugging ──────────────────────────
+        # -- Log body structure once for debugging --------------------------
         if not getattr(self, "_outlet_body_structure_logged", False):
             self._log_debug(
                 f"outlet body structure (first call): "
@@ -26079,13 +26452,15 @@ class Filter:
         try:
             project_id = self._inlet_orch.get_project_id()
             state = self._conversation_state_manager.get(project_id)
-            pstate = self._project_state_manager.get_pstate(project_id)
+            psm = self._project_state_manager
+            # pstate is kept for outlet-internal keys with no typed accessor.
+            pstate = psm.get_pstate(project_id)
             messages = body.get("messages", [])
             is_code_session = await self._inlet_orch.classify_session(
                 messages, project_id
             )
 
-            # ── Step 1: detect assistant response ────────────────────────────
+            # -- Step 1: detect assistant response --------------------------
             # In this OpenWebUI build, the assistant response may not be in messages.
             assistant_content = ""
             assistant_source = ""
@@ -26112,14 +26487,14 @@ class Filter:
 
             if not assistant_content:
                 self._log_debug(
-                    "outlet: no assistant response found in body — "
+                    "outlet: no assistant response found in body -- "
                     "_update_active_code skipped. "
                     f"(keys={list(body.keys())})"
                 )
                 # Still run other outlet tasks (slot save, etc.)
                 return body
 
-            # ── Step 2: deduplicate by content hash ──────────────────────────
+            # -- Step 2: deduplicate by content hash ------------------------
             response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
             if pstate.get("last_outlet_response_hash") == response_hash:
                 self._log_debug(
@@ -26134,7 +26509,7 @@ class Filter:
                 f"{len(assistant_content.split())} words)"
             )
 
-            # ── Step 3: process the assistant message ────────────────────────
+            # -- Step 3: process the assistant message ----------------------
             await self._llm_orchestrator.wait_for_llm_tasks()
 
             # Intercept /expand commands in the assistant content
@@ -26162,7 +26537,7 @@ class Filter:
                 )
                 await self._update_active_code(assistant_msg, project_id)
 
-                # ── C6: wrap store_messages with signal ──────────────────────────
+                # -- C6: wrap store_messages with signal --------------------
                 self._ltm_store_complete.clear()
 
                 async def _store_and_signal():
@@ -26195,23 +26570,21 @@ class Filter:
 
                     asyncio.create_task(_store_and_signal_noncode())
 
-            # ─────────────────────────────────────────────────────────────────────
-            # 🔥 Save slot NOW (stable state, before long tasks)
-            # ─────────────────────────────────────────────────────────────────────
+            # 🚀 RESOURCE OPTIMISATION – Save slot NOW (stable state, before long tasks)
+            # ----------------------------------------------------------------
             if self.valves.enable_slot_persistence:
                 try:
-                    pstate["last_total_context_tokens"] = self._tokens.estimate_tokens(
-                        messages
+                    psm.set_last_total_context_tokens(
+                        project_id, self._tokens.estimate_tokens(messages)
                     )
                 except Exception as e:
                     self._log_debug(f"outlet: token estimation failed: {e}")
                 await self._project_state_manager.slot_save(project_id)
 
-            # ── Save last response for LOD adaptive lazy ──
-            pstate["last_assistant_response"] = assistant_content
-            pstate["last_response_timestamp"] = time.time()
+            # -- Save last response for LOD adaptive lazy -------------------
+            psm.set_last_assistant_response(project_id, assistant_content)
 
-            # ── Response cache (use assistant_content for cache) ──
+            # -- Response cache (use assistant_content for cache) -----------
             if (
                 self.valves.enable_response_cache
                 and HAS_SENTENCE
@@ -26240,36 +26613,8 @@ class Filter:
                             wait=False,
                         )
 
-            # ── LOD adaptive (ELIMINADO – ahora solo background) ──
-            # # ── LOD adaptive ───────────────────────────────────────────
-            # if self.valves.enable_lod_adaptive and is_code_session:
-            #     _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
-            #         any(
-            #             marker in assistant_content
-            #             for marker in self._MULTI_PHASE_MARKERS
-            #         )
-            #         or bool(
-            #             re.search(
-            #                 r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
-            #                 assistant_content,
-            #                 re.IGNORECASE,
-            #             )
-            #         )
-            #     )
-            #     if not _is_partial_mp_lod:
-            #         await self._enrichment.update_lod_thresholds_from_response(
-            #             project_id, assistant_content
-            #         )
-
-            # ── Speculative prefetch (ELIMINADO – ahora solo background) ──
-            # if self.valves.enable_speculative_prefetch and is_code_session:
-            #     last_activated = pstate.get("last_activation_scores", {})
-            #     if last_activated:
-            #         await self._activation.speculative_prefetch(
-            #             project_id, last_activated
-            #         )
-
-            # ── Purge expired memories ─────────────────────────────────
+            # 🚀 RESOURCE OPTIMISATION – Purge expired memories
+            # ----------------------------------------------------------------
             await self._ltm.purge_expired_memories()
 
             if not hasattr(self, "_write_counter"):
@@ -26280,75 +26625,39 @@ class Filter:
             if interval > 0 and self._write_counter % interval == 0:
                 await self._state_store.purge_orphaned_data(project_id)
 
-            # ── RAPTOR rebuild (ELIMINADO – ahora solo background) ──
-            # if (
-            #     self.valves.enable_raptor
-            #     and self._write_counter % self.valves.raptor_rebuild_interval == 0
-            #     and self.memory_collection is not None
-            # ):
-            #     edges_out = self._symbol_index.get_all_edges_out(project_id)
-            #     graph_weight = (
-            #         self.valves.raptor_graph_weight
-            #         if self.valves.raptor_use_call_graph_proximity
-            #         else 0.0
-            #     )
-            #     await self._raptor.rebuild(
-            #         project_id=project_id,
-            #         symbol_index=self._symbol_index,
-            #         edges_out=edges_out,
-            #         n_clusters=self.valves.raptor_clusters_per_level,
-            #         summary_model=self.valves.raptor_summary_model,
-            #         summary_max_tokens=self.valves.raptor_summary_max_tokens,
-            #         chroma_collection=self.memory_collection,
-            #         llm_caller=self._llm_orchestrator.call_llm,
-            #         embedder=self.embedder,
-            #         graph_weight=graph_weight,
-            #     )
-
-            # ── DB checkpoints ─────────────────────────────────────────
+            # 🚀 RESOURCE OPTIMISATION – DB checkpoints
+            # ----------------------------------------------------------------
             if self._write_counter % 100 == 0:
                 await self._state_store.run_db_checkpoints()
 
-            # ── Purge old versions (ELIMINADO – ahora solo background) ──
-            # if (
-            #     self.valves.purge_old_code_versions_enabled
-            #     and self.valves.enable_block_paging
-            #     and self._pager is not None
-            # ):
-            #     await self._pager.purge_old_versions(
-            #         project_id=project_id,
-            #         state=state,
-            #         symbol_index=self._symbol_index,
-            #         chroma_collection=self.memory_collection,
-            #         embedder=self.embedder,
-            #         max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
-            #     )
-
-            # ── Save edges ─────────────────────────────────────────────
+            # 🚀 RESOURCE OPTIMISATION – Save edges
+            # ----------------------------------------------------------------
             if self.valves.enable_edge_persistence:
                 await self._state_store.save_symbol_edges_to_db(project_id)
 
-            # ── Save path views ───────────────────────────────────────
+            # 🚀 RESOURCE OPTIMISATION – Save path views
+            # ----------------------------------------------------------------
             if self.valves.enable_path_analysis:
                 await self._state_store.save_path_views_to_db(
                     project_id, self._path_index.get_all(project_id)
                 )
 
-            # ── Save state if dirty ───────────────────────────────────
+            # 🔥 STATE MANAGEMENT – Save state if dirty
+            # ----------------------------------------------------------------
             await self._conversation_state_manager.save_if_dirty(project_id)
 
-            # ── Detect and persist continuation marker (for AC-A) ─────
+            # 🔥 STATE MANAGEMENT – Detect and persist continuation marker
+            # ----------------------------------------------------------------
             genuine = self._detect_genuine_continuation(messages)
             if genuine:
-                pstate["is_continuation"] = True
-                pstate["continuation_turns"] = pstate.get("continuation_turns", 0) + 1
+                turns = psm.increment_continuation_turns(project_id)
+                psm.set_is_continuation(project_id, True)
                 self._log_debug(
                     f"AutoContinue: genuine marker detected "
-                    f"(turn {pstate['continuation_turns']} of continuation)"
+                    f"(turn {turns} of continuation)"
                 )
             else:
-                pstate["is_continuation"] = False
-                pstate["continuation_turns"] = 0
+                psm.set_is_continuation(project_id, False)
 
         except Exception as e:
             self._log_debug(f"❌ outlet error: {e}")
@@ -26363,13 +26672,12 @@ class Filter:
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             await self._llm_orchestrator.wait_for_llm_tasks()
 
-        # ──────────────────────────────────────────────────────────────────────
         # 🚀 BACKGROUND TASKS - Resume after critical work is done
-        # ──────────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         # Now that the user's turn is fully processed and the KV slot is saved,
         # we can resume background tasks to prepare for the next turn.
         # We unpause the manager first, then launch tasks in priority order.
-        # ──────────────────────────────────────────────────────────────────────
+        # ----------------------------------------------------------------
         # First, drain SQLite writes to reduce lock contention
         await self._state_store.drain_writes(timeout=2.0)
 
