@@ -128,122 +128,6 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 # Global lock for SQLite operations (prevents "database is locked" errors)
 _db_global_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Tree‑sitter fallback queries
-# ---------------------------------------------------------------------------
-# These S‑expression patterns tell tree‑sitter how to locate function / class
-# definitions and call sites for each supported programming language.
-# They are used by _extract_symbols_from_tree and _extract_calls_from_tree,
-# which together produce the qualified CodeSymbol list and the call graph.
-# If a language is missing from these maps, extraction is skipped with a
-# warning — there is no legacy fallback that could inject unqualified data.
-
-FALLBACK_LANGUAGE_QUERIES = {
-    "python": """
-        (function_definition name: (identifier) @name) @func
-        (class_definition name: (identifier) @name) @class
-    """,
-    "javascript": """
-        (function_declaration name: (identifier) @name) @func
-        (class_declaration name: (identifier) @name) @class
-        (lexical_declaration
-            (variable_declarator
-                name: (identifier) @name
-                value: (arrow_function)) @func)
-    """,
-    "tsx": """
-        (function_declaration name: (identifier) @name) @func
-        (class_declaration name: (identifier) @name) @class
-        (lexical_declaration
-            (variable_declarator
-                name: (identifier) @name
-                value: (arrow_function)) @func)
-    """,
-    "go": """
-        (function_declaration name: (identifier) @name) @func
-        (type_declaration (type_spec name: (type_identifier) @name)) @class
-    """,
-    "rust": """
-        (function_item name: (identifier) @name) @func
-        (struct_item name: (type_identifier) @name) @class
-        (enum_item name: (type_identifier) @name) @class
-    """,
-    "java": """
-        (method_declaration name: (identifier) @name) @func
-        (class_declaration name: (identifier) @name) @class
-    """,
-    "cpp": """
-        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func
-        (class_specifier name: (type_identifier) @name) @class
-    """,
-    "c": """
-        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func
-    """,
-}
-
-FALLBACK_CALL_QUERIES = {
-    "python": """
-        (function_definition
-            body: (block
-                (expression_statement
-                    (call function: [(identifier) (attribute) @callee])))) @caller
-    """,
-    "javascript": """
-        (function_declaration
-            body: (statement_block
-                (expression_statement
-                    (call_expression function: [(identifier) (member_expression) @callee])))) @caller
-        (lexical_declaration
-            (variable_declarator
-                name: (identifier) @caller_name
-                value: (arrow_function body: (statement_block
-                    (expression_statement
-                        (call_expression function: [(identifier) (member_expression) @callee]))))))
-    """,
-    "tsx": """
-        (function_declaration
-            body: (statement_block
-                (expression_statement
-                    (call_expression function: [(identifier) (member_expression) @callee])))) @caller
-        (lexical_declaration
-            (variable_declarator
-                name: (identifier) @caller_name
-                value: (arrow_function body: (statement_block
-                    (expression_statement
-                        (call_expression function: [(identifier) (member_expression) @callee]))))))
-    """,
-    "go": """
-        (function_declaration
-            body: (block
-                (expression_statement
-                    (call_expression function: [(identifier) (selector_expression) @callee])))) @caller
-    """,
-    "rust": """
-        (function_item
-            body: (block
-                (expression_statement
-                    (call_expression function: [(identifier) (field_expression) @callee])))) @caller
-        (function_item
-            body: (block
-                (macro_invocation macro: (identifier) @callee))) @caller
-    """,
-    "java": """
-        (method_declaration
-            body: (block
-                (expression_statement
-                    (method_invocation name: [(identifier) (field_access) @callee])))) @caller
-    """,
-    "cpp": """
-        (function_definition
-            body: (compound_statement
-                (call_expression function: [(identifier) (field_expression) @callee]))) @caller
-    """,
-    "c": """
-        (function_definition
-            body: (compound_statement
-                (call_expression function: [(identifier) (field_expression) @callee]))) @caller
-    """,
-}
 
 # ---------------------------------------------------------------------------
 # Global helper functions
@@ -5900,8 +5784,12 @@ class SignatureExtractor:
         2. Extension‑to‑language map (``_LANG_MAP``).
         3. Source‑code heuristics: Python keywords (def, class, import, from, async def)
            or JavaScript 'function' keyword.
-        4. ``"unknown"`` — callers will skip tree-sitter extraction.
+        4. (NEW) Use tree-sitter to detect the language from the content itself
+           by attempting to parse with each known language and checking if the
+           parse tree has meaningful nodes (not just ERROR nodes).
+        5. Fallback to "unknown" — callers will skip tree-sitter extraction.
         """
+        # 1. Try extension-based detection using tree-sitter (if file_path is given)
         if file_path and HAS_TREE_SITTER:
             try:
                 return detect_language_from_extension(
@@ -5909,19 +5797,94 @@ class SignatureExtractor:
                 )
             except Exception:
                 pass
+
+        # 2. Fallback to the internal extension map (without tree-sitter)
         if file_path:
             ext = file_path.rsplit(".", 1)[-1].lower()
             return SignatureExtractor._LANG_MAP.get(ext, "unknown")
 
-        # ── Improved heuristics for code without an extension ──────────────
-        # Look for multiple Python-specific patterns, not just 'def'
+        # 3. Simple heuristics for common languages (no extension)
         if re.search(r"\b(?:def|class|import|from|async def)\s+\w+", code):
             return "python"
         if re.search(r"\bfunction\s+\w+\s*\(", code):
             return "javascript"
 
-        # Fallback: if it contains braces and semicolons, it could be C/Java,
-        # but we leave it as unknown for now to avoid misdetection.
+        # 4. NEW: Use tree-sitter to detect language from content
+        #    This handles code pasted without a file extension.
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter import Parser as TSParser
+                from tree_sitter_language_pack import get_language
+
+                # List of languages to try, ordered by commonality
+                languages_to_try = [
+                    "python",
+                    "javascript",
+                    "tsx",  # TypeScript/JSX
+                    "go",
+                    "rust",
+                    "java",
+                    "cpp",
+                    "c",
+                    "ruby",
+                    "php",
+                    "c_sharp",
+                    "swift",
+                    "kotlin",
+                    "typescript",  # plain TS (if tsx doesn't match)
+                ]
+
+                # A heuristic: if the code has a shebang, try that first
+                if code.startswith("#!"):
+                    shebang_line = code.split("\n")[0]
+                    if "python" in shebang_line:
+                        return "python"
+                    if "node" in shebang_line or "js" in shebang_line:
+                        return "javascript"
+
+                # Try each language; if the parse tree has at least one
+                # non‑ERROR node (i.e., it parsed something meaningful),
+                # consider it a match.
+                for lang in languages_to_try:
+                    try:
+                        lang_obj = get_language(lang)
+                        parser = TSParser(lang_obj)
+                        tree = parser.parse(code.encode())
+                        root = tree.root_node
+                        # If the root has at least one child that is not an ERROR node,
+                        # and the tree is not entirely empty, it's likely a good match.
+                        if root.children:
+                            # Count non‑ERROR nodes
+                            valid_nodes = [
+                                n for n in root.children if n.type != "ERROR"
+                            ]
+                            if valid_nodes:
+                                return lang
+                    except Exception:
+                        # Parser error, language mismatch, or missing grammar
+                        continue
+
+                # If no language gave a good parse, try one more pass with
+                # a more permissive check: if the root type is not "ERROR"
+                # and it has at least one child, consider it valid.
+                for lang in languages_to_try:
+                    try:
+                        lang_obj = get_language(lang)
+                        parser = TSParser(lang_obj)
+                        tree = parser.parse(code.encode())
+                        root = tree.root_node
+                        if root.type != "ERROR" and root.children:
+                            # It parsed without a top‑level ERROR node;
+                            # good enough to assume this language.
+                            return lang
+                    except Exception:
+                        continue
+
+            except Exception:
+                # If tree-sitter language detection fails, fall back to "unknown"
+                pass
+
+        # 5. Fallback: unknown language
         return "unknown"
 
     @staticmethod
@@ -5942,39 +5905,37 @@ class SignatureExtractor:
         code: str, file_path: Optional[str] = None, language: Optional[str] = None
     ) -> List["CodeSymbol"]:
         """
-        Extract symbols and call relationships from source code using tree-sitter.
+        Extract symbols and call relationships from source code.
 
-        Returns qualified symbols (``ClassName.method`` / ``module.function``).
-        Falls back to an empty list when tree-sitter is unavailable or fails,
-        logging a warning — no fallback extraction is attempted, to avoid
-        corrupting the symbol index with unqualified data.
+        Uses AST for Python (fast and precise) and tree-sitter for all other
+        languages via `tree_sitter_language_pack.process()`. The result is a list
+        of `CodeSymbol` objects with qualified names, line ranges, and call lists.
 
-        Results are cached with a 1-hour TTL to avoid re-parsing the same
-        code block multiple times. The cache stores raw symbols (before
-        parent enrichment) and returns deep copies.
+        Results are cached with a 1‑hour TTL to avoid re‑parsing the same block.
+
+        Args:
+            code (str): The source code.
+            file_path (Optional[str]): The file path (used for language detection).
+            language (Optional[str]): Explicit language hint.
+
+        Returns:
+            List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
-        # ── Cache check (before any validation) ──────────────────────────
+        # ── Cache check ──────────────────────────────────────────────────────────
         cache_key = SignatureExtractor._cache_key(code, file_path, language)
         with SignatureExtractor._EXTRACTION_CACHE_LOCK:
             if cache_key in SignatureExtractor._extraction_cache:
                 cached_symbols, ts = SignatureExtractor._extraction_cache[cache_key]
                 if time.time() - ts < SignatureExtractor._EXTRACTION_CACHE_TTL:
-                    # Return deep copies to prevent mutation of cached entries.
                     return [s.copy() for s in cached_symbols]
                 else:
                     del SignatureExtractor._extraction_cache[cache_key]
 
-        # ── Size validation ──────────────────────────────────────────────
+        # ── Size validation ────────────────────────────────────────────────────
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             return []
 
-        if not HAS_TREE_SITTER:
-            logger.warning(
-                "tree-sitter not available — skipping symbol extraction. "
-                "Install tree-sitter-language-pack to enable code-aware features."
-            )
-            return []
-
+        # ── Language detection ────────────────────────────────────────────────
         lang = language or SignatureExtractor._guess_language(file_path, code)
         if lang == "unknown":
             logger.warning(
@@ -5982,58 +5943,267 @@ class SignatureExtractor:
             )
             return []
 
-        # ── Parse ──────────────────────────────────────────────────────────
+        # ── Python: use AST ──────────────────────────────────────────────────
+        if lang == "python":
+            try:
+                symbols = SignatureExtractor._extract_symbols_from_ast(code, file_path)
+                call_map = SignatureExtractor._extract_calls_from_ast(code)
+                # Attach calls to symbols
+                for sym in symbols:
+                    qid = qualify_symbol_name(
+                        sym.name, sym.parent_symbol, sym.file_path
+                    )
+                    calls = list(call_map.get(qid, []))
+                    if qid != sym.name:
+                        for c in call_map.get(sym.name, []):
+                            if c not in calls:
+                                calls.append(c)
+                    sym.calls = calls
+                # Cache and return
+                with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+                    if (
+                        len(SignatureExtractor._extraction_cache)
+                        >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
+                    ):
+                        oldest_key = min(
+                            SignatureExtractor._extraction_cache,
+                            key=lambda k: SignatureExtractor._extraction_cache[k][1],
+                        )
+                        del SignatureExtractor._extraction_cache[oldest_key]
+                    SignatureExtractor._extraction_cache[cache_key] = (
+                        symbols,
+                        time.time(),
+                    )
+                return symbols
+            except Exception as e:
+                logger.warning(
+                    f"AST extraction failed for Python: {e} — falling back to tree-sitter"
+                )
+                # Fall through to tree-sitter for Python if AST fails
+
+        # ── Other languages: use tree-sitter language pack ──────────────────
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
+
+                config = ProcessConfig()
+                config.language = lang
+                config.extract_symbols = True
+                config.extract_calls = True
+                result = process(code, config)
+
+                symbols = []
+                if hasattr(result, "symbols"):
+                    for sym in result.symbols:
+                        code_sym = CodeSymbol(
+                            name=sym.name,
+                            kind=sym.kind,  # 'function', 'class', 'method'
+                            signature=sym.signature or sym.name,
+                            file_path=file_path,
+                            line_start=sym.line_start + 1,  # convert to 1‑based
+                            line_end=sym.line_end + 1,
+                            language=lang,
+                            parent_symbol=sym.parent or "",
+                        )
+                        symbols.append(code_sym)
+
+                # Build call map
+                call_map: Dict[str, List[str]] = {}
+                if hasattr(result, "calls"):
+                    from collections import defaultdict
+
+                    tmp = defaultdict(set)
+                    for call in result.calls:
+                        if call.caller:
+                            tmp[call.caller].add(call.callee)
+                    call_map = {k: list(v) for k, v in tmp.items()}
+
+                # Attach calls to symbols
+                for sym in symbols:
+                    qid = qualify_symbol_name(
+                        sym.name, sym.parent_symbol, sym.file_path
+                    )
+                    calls = list(call_map.get(qid, []))
+                    if qid != sym.name:
+                        for c in call_map.get(sym.name, []):
+                            if c not in calls:
+                                calls.append(c)
+                    sym.calls = calls
+
+                # Cache and return
+                with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+                    if (
+                        len(SignatureExtractor._extraction_cache)
+                        >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
+                    ):
+                        oldest_key = min(
+                            SignatureExtractor._extraction_cache,
+                            key=lambda k: SignatureExtractor._extraction_cache[k][1],
+                        )
+                        del SignatureExtractor._extraction_cache[oldest_key]
+                    SignatureExtractor._extraction_cache[cache_key] = (
+                        symbols,
+                        time.time(),
+                    )
+                return symbols
+
+            except Exception as e:
+                logger.warning(
+                    f"tree-sitter process() extraction failed for language '{lang}': {e}"
+                )
+
+        # ── Fallback: empty ──────────────────────────────────────────────────
+        logger.warning(
+            "No extraction method available — returning empty symbol list. "
+            "Install tree-sitter-language-pack for non‑Python languages."
+        )
+        return []
+
+    @staticmethod
+    def _extract_symbols_from_ast(
+        code: str, file_path: Optional[str]
+    ) -> List["CodeSymbol"]:
+        """
+        Extract function, method, and class symbols from Python source code using AST.
+
+        This method parses the code with `ast.parse()`, walks the tree, and creates
+        a `CodeSymbol` for each `FunctionDef`, `AsyncFunctionDef`, and `ClassDef`.
+        It also resolves the parent class for methods.
+
+        Args:
+            code (str): The Python source code.
+            file_path (Optional[str]): The file path (stored in each symbol).
+
+        Returns:
+            List[CodeSymbol]: A list of symbols with correct line ranges.
+        """
         try:
-            loop = asyncio.get_event_loop()
-            tree = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, SignatureExtractor._parse_sync, code.encode(), lang
-                ),
-                timeout=30.0,
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(
-                f"tree-sitter parse failed for language '{lang}': {e} — "
-                "skipping symbol extraction to avoid corrupt fallback data."
-            )
+            tree = ast.parse(code)
+        except SyntaxError:
             return []
 
-        # ── Extract symbols and calls ─────────────────────────────────────
-        syms = SignatureExtractor._extract_symbols_from_tree(
-            tree, lang, code, file_path
-        )
-        call_map = SignatureExtractor._extract_calls_from_tree(tree, lang, code)
-        del tree
+        symbols = []
 
-        # ── Populate call relationships ──────────────────────────────────
-        for sym in syms:
-            qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
-            calls = list(call_map.get(qid, []))
-            if qid != sym.name:
-                for c in call_map.get(sym.name, []):
-                    if c not in calls:
-                        calls.append(c)
-            sym.calls = calls
+        # Pre‑build a mapping from class names to their body nodes for quick lookup
+        class_bodies = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                class_bodies[node.name] = node
 
-        # ── Python docstring extraction (static) ─────────────────────────
-        if lang == "python" or (file_path and file_path.endswith(".py")):
-            SignatureExtractor._extract_docstrings_python(code, syms)
-
-        # ── Cache store (after successful extraction) ────────────────────
-        with SignatureExtractor._EXTRACTION_CACHE_LOCK:
-            if (
-                len(SignatureExtractor._extraction_cache)
-                >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
-            ):
-                # Evict oldest entry (by timestamp)
-                oldest_key = min(
-                    SignatureExtractor._extraction_cache,
-                    key=lambda k: SignatureExtractor._extraction_cache[k][1],
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                # Determine if this function is a method (inside a class)
+                parent_class = ""
+                kind = "function"
+                for parent in ast.walk(tree):
+                    if isinstance(parent, ast.ClassDef) and node in parent.body:
+                        parent_class = parent.name
+                        kind = "method"
+                        break
+                # Build signature string (first line of the function definition)
+                signature = ast.unparse(node).split("\n")[0][:200]
+                line_start = node.lineno
+                line_end = node.end_lineno or node.lineno
+                symbols.append(
+                    CodeSymbol(
+                        name=name,
+                        kind=kind,
+                        signature=signature,
+                        file_path=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                        language="python",
+                        parent_symbol=parent_class,
+                    )
                 )
-                del SignatureExtractor._extraction_cache[oldest_key]
-            SignatureExtractor._extraction_cache[cache_key] = (syms, time.time())
 
-        return syms
+            elif isinstance(node, ast.ClassDef):
+                name = node.name
+                signature = f"class {name}: ..."
+                line_start = node.lineno
+                line_end = node.end_lineno or node.lineno
+                symbols.append(
+                    CodeSymbol(
+                        name=name,
+                        kind="class",
+                        signature=signature,
+                        file_path=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                        language="python",
+                        parent_symbol="",
+                    )
+                )
+
+        return symbols
+
+    @staticmethod
+    def _extract_calls_from_ast(code: str) -> Dict[str, List[str]]:
+        """
+        Extract call relationships from Python source code using AST.
+
+        For each `Call` node, it determines the callee name and the enclosing
+        function/method (caller). The caller is qualified with its parent class
+        if it is a method. The result is a dict mapping caller qualified name
+        to a list of callee bare names.
+
+        Args:
+            code (str): The Python source code.
+
+        Returns:
+            Dict[str, List[str]]: {caller_qualified_id: [callee_name, ...]}
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return {}
+
+        from collections import defaultdict
+
+        call_map = defaultdict(set)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            # Resolve callee name
+            callee = None
+            if isinstance(node.func, ast.Name):
+                callee = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                callee = node.func.attr
+
+            if not callee:
+                continue
+
+            # Find the enclosing function/method that contains this call
+            caller_name = None
+            parent_class = ""
+            for parent in ast.walk(tree):
+                if (
+                    isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node in parent.body
+                ):
+                    caller_name = parent.name
+                    # Check if this function is a method (inside a class)
+                    for cls_node in ast.walk(tree):
+                        if (
+                            isinstance(cls_node, ast.ClassDef)
+                            and parent in cls_node.body
+                        ):
+                            parent_class = cls_node.name
+                            break
+                    break
+
+            if not caller_name:
+                continue
+
+            # Qualify caller name with its parent class (if any)
+            caller_qid = qualify_symbol_name(caller_name, parent_class)
+            call_map[caller_qid].add(callee)
+
+        return {k: list(v) for k, v in call_map.items()}
 
     @staticmethod
     def _parse_sync(code_bytes: bytes, lang: str):
@@ -6154,139 +6324,81 @@ class SignatureExtractor:
         tree, lang: str, code: str, file_path: Optional[str]
     ) -> List["CodeSymbol"]:
         """
-        Extract symbols from the tree-sitter AST.
-
-        MIGRATED (step 18): Now uses the parent function/class definition node
-        to obtain `line_start` and `line_end`, ensuring that multi-line symbols
-        (e.g., functions with bodies) have a range larger than one line.
-        Previously the name-capture node (one line) was used, causing
-        `line_start == line_end` for every symbol, breaking docstring and CFG
-        generation.
+        Extract symbols using tree-sitter-language-pack's built-in queries.
 
         Args:
-            tree: The tree-sitter parse tree.
-            lang (str): The programming language.
-            code (str): The source code.
-            file_path (Optional[str]): The file path, if available.
+            tree: The tree-sitter parse tree (unused, kept for signature compatibility).
+            lang: The programming language.
+            code: The source code.
+            file_path: Optional file path.
 
         Returns:
-            List[CodeSymbol]: The extracted symbols with correct line ranges.
+            List[CodeSymbol]: Extracted symbols with line ranges.
         """
-        query_str = FALLBACK_LANGUAGE_QUERIES.get(lang)
-        if not query_str:
-            logger.warning(
-                f"No tree-sitter query defined for language '{lang}' — "
-                "skipping symbol extraction to avoid corrupt fallback data."
-            )
+        if not HAS_TREE_SITTER:
             return []
-        try:
-            lang_obj = get_language(lang)
-            query = lang_obj.query(query_str)
-            from tree_sitter import QueryCursor
 
-            cursor = QueryCursor(query)
-            captures = cursor.captures(tree.root_node)  # dict: {capture_name: [nodes]}
+        try:
+            from tree_sitter_language_pack import process, ProcessConfig
+
+            config = ProcessConfig()
+            config.language = lang
+            # Enable symbol extraction in the config
+            # (The exact property name may vary; check the library docs)
+            config.extract_symbols = True
+            result = process(code, config)
 
             symbols = []
-            func_types = (
-                "function_definition",
-                "function_declaration",
-                "method_declaration",
-                "function_item",
-                "arrow_function",
-                "function_expression",
-            )
-            class_types = (
-                "class_definition",
-                "class_declaration",
-                "type_spec",
-                "struct_item",
-                "enum_item",
-                "class_specifier",
-            )
-            # Combined types for the walk-up
-            definition_types = func_types + class_types
-
-            for cap_name, nodes in captures.items():
-                if cap_name != "name":
-                    continue
-                for node in nodes:
-                    parent = node.parent
-                    kind = "unknown"
-                    while parent:
-                        if parent.type in func_types:
-                            kind = "function"
-                            break
-                        elif parent.type in class_types:
-                            kind = "class"
-                            break
-                        parent = parent.parent
-
-                    parent_symbol = ""
-                    walker = node.parent
-                    if walker is not None:
-                        walker = walker.parent
-                    while walker:
-                        if walker.type in class_types:
-                            name_node = walker.child_by_field_name("name")
-                            if name_node:
-                                parent_symbol = name_node.text.decode("utf-8")
-                            break
-                        walker = walker.parent
-                    if kind == "function" and parent_symbol:
-                        kind = "method"
-
-                    sig = (
-                        parent.text.decode("utf-8").split("\n")[0].strip()[:200]
-                        if parent
-                        else node.text.decode("utf-8")
+            if hasattr(result, "symbols"):
+                for sym in result.symbols:
+                    # Convert to CodeSymbol
+                    # Assuming sym has: name, kind, signature, line_start, line_end, parent
+                    code_sym = CodeSymbol(
+                        name=sym.name,
+                        kind=sym.kind,  # 'function', 'class', 'method'
+                        signature=sym.signature or sym.name,
+                        file_path=file_path,
+                        line_start=sym.line_start + 1,  # if 0-indexed
+                        line_end=sym.line_end + 1,
+                        language=lang,
+                        parent_symbol=sym.parent or "",
                     )
-                    name = node.text.decode("utf-8")
-
-                    # --- Find the definition node (function or class) for the line range ---
-                    # Walk up from the name node until we hit a definition node.
-                    # If none is found, fall back to the name node itself.
-                    span_node = node
-                    while (
-                        span_node.parent is not None
-                        and span_node.parent.type not in definition_types
-                    ):
-                        span_node = span_node.parent
-                    if span_node.parent is not None:
-                        span_node = span_node.parent  # Now it's the definition node
-
-                    # Use the definition node's start/end points for the line range.
-                    # tree-sitter points are 0-indexed; convert to 1-indexed for storage.
-                    line_start = span_node.start_point[0] + 1
-                    line_end = span_node.end_point[0] + 1
-
-                    # Debug log to confirm the change
-                    logger.debug(
-                        f"[EXTRACT] Symbol '{name}' kind={kind}: "
-                        f"line_start={line_start}, line_end={line_end} "
-                        f"(span_node type={span_node.type})"
-                    )
-
-                    symbols.append(
-                        CodeSymbol(
-                            name=name,
-                            kind=kind,
-                            signature=sig,
-                            file_path=file_path,
-                            line_start=line_start,
-                            line_end=line_end,
-                            language=lang,
-                            parent_symbol=parent_symbol,
-                        )
-                    )
-            logger.debug(f"[EXTRACT] Extracted {len(symbols)} symbols from {lang} code")
+                    symbols.append(code_sym)
             return symbols
         except Exception as e:
-            logger.warning(
-                f"tree-sitter symbol extraction failed for language '{lang}': {e} — "
-                "skipping symbol extraction to avoid corrupt fallback data."
-            )
+            logger.warning(f"tree-sitter symbol extraction via process() failed: {e}")
             return []
+
+    @staticmethod
+    def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
+        """
+        Extract call relationships using tree-sitter-language-pack's built-in queries.
+
+        Returns:
+            Dict[str, List[str]]: {caller_qualified_id: [callee_name, ...]}
+        """
+        if not HAS_TREE_SITTER:
+            return {}
+
+        try:
+            from tree_sitter_language_pack import process, ProcessConfig
+
+            config = ProcessConfig()
+            config.language = lang
+            config.extract_calls = True
+            result = process(code, config)
+
+            call_map: Dict[str, Set[str]] = defaultdict(set)
+            if hasattr(result, "calls"):
+                for call in result.calls:
+                    # call should have: caller, callee, line
+                    # caller can be qualified (Class.method) or bare
+                    if call.caller:
+                        call_map[call.caller].add(call.callee)
+            return {k: list(v) for k, v in call_map.items()}
+        except Exception as e:
+            logger.warning(f"tree-sitter call extraction via process() failed: {e}")
+            return {}
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Call extraction from tree-sitter
@@ -9075,20 +9187,23 @@ Output only "YES" or "NO".
         return len(test_vec[0]) if test_vec else 0
 
     def _validate_embedding_model(self) -> bool:
-        """Validate that the current embedding model matches the stored one.
+        """
+        Validate that the current embedding model matches the stored one.
 
         Reads/writes model metadata from the ChromaDB collection.
         Returns False and sets _retrieval_disabled if a mismatch is found.
         """
         try:
-            current_model: str = getattr(
-                self._f.valves, "embedding_model_name", "unknown"
+            # Get current model info, converting to native Python types
+            # to avoid NumPy array ambiguity issues.
+            current_model: str = str(
+                getattr(self._f.valves, "embedding_model_name", "unknown")
             )
-            current_dim: int = self._get_embedding_dimension()
+            current_dim: int = int(self._get_embedding_dimension() or 0)
 
             coll_meta: dict = self._f.memory_collection.metadata or {}
-            stored_model: Optional[str] = coll_meta.get("_codeaware_embedding_model")
-            stored_dim: Optional[int] = coll_meta.get("_codeaware_embedding_dim")
+            stored_model: str = str(coll_meta.get("_codeaware_embedding_model", ""))
+            stored_dim: int = int(coll_meta.get("_codeaware_embedding_dim", 0) or 0)
 
             if stored_model is None:
                 # First run: persist model fingerprint
@@ -9104,6 +9219,7 @@ Output only "YES" or "NO".
                 )
                 return True
 
+            # Compare using native types (strings and ints) to avoid ambiguity
             if stored_model != current_model or stored_dim != current_dim:
                 reason = (
                     f"LTM embedding mismatch — collection built with "
@@ -19737,8 +19853,12 @@ Classify this message strictly. Output only CODE or TEXT.
             intent_vector = await self._f._commands.classify_intent(
                 user_query, project_id
             )
-        use_case_key, profile_copy, human_label = (
-            self._f._ctx_builder.classify_use_case(user_query, intent_vector)
+        (
+            use_case_key,
+            profile_copy,
+            human_label,
+        ) = await self._f._ctx_builder.classify_use_case(
+            user_query, intent_vector, project_id
         )
         confidence = max(intent_vector.values()) if intent_vector else 0.5
         pstate = self._f._project_state_manager.get_pstate(project_id)
@@ -19839,8 +19959,8 @@ class SystemPromptBuilder:
         dynamic_injections: List[Tuple[str, str]] = []
 
         # 4a: Compute use_case label
-        use_case, _, use_case_label = self._f._ctx_builder.classify_use_case(
-            user_query, intent_vector or {}
+        use_case, _, use_case_label = await self._f._ctx_builder.classify_use_case(
+            user_query, intent_vector or {}, project_id
         )
 
         # 4b: LTM retrieval (with current messages for deduplication)
@@ -20315,8 +20435,8 @@ Output only DUPLICATE or UNIQUE.
             )
 
             # --- Check suppression before falling back ---
-            active_use_case, _, _ = self._f._ctx_builder.classify_use_case(
-                user_query, intent_vector
+            active_use_case, _, _ = await self._f._ctx_builder.classify_use_case(
+                user_query, intent_vector, project_id
             )
             suppress_sigs = (
                 self._f.valves.skeleton_tier_suppresses_block_b_signatures
@@ -24402,7 +24522,6 @@ class TaskRegistry:
             llm_caller=self._f._llm_orchestrator.call_llm,
             embedder=self._f.embedder,
             graph_weight=graph_weight,
-            stop_event=None,  # No stop_event in lazy mode
         )
 
     async def _lazy_purge(self, project_id: str) -> None:
@@ -24944,6 +25063,12 @@ class Filter:
         )
         hub_bodies_tier_top_n: int = Field(
             default=7, ge=1, le=20, description="Number of top hubs to include."
+        )
+        symbol_index_max_in_block_a: int = Field(
+            default=30,
+            ge=1,
+            le=100,
+            description="Maximum number of hub symbols (by centrality) to display in Block A's symbol index section.",
         )
         hub_bodies_tier_min_centrality: float = Field(
             default=0.0,
