@@ -17246,17 +17246,14 @@ class InletOrchestrator:
         user_query: str,
         project_id: str,
         intent_vector: Optional[dict] = None,
+        is_continuation: bool = False,  # ← nuevo
     ) -> Tuple[str, dict, str]:
         """
         Classify the user intent and apply continuation inheritance (E2).
 
-        If the message is a short continuation (no code, <15 words, low confidence),
-        inherit the use_case from the previous turn instead of re-classifying.
-
-        Returns:
-            Tuple[str, dict, str]: (use_case_key, profile_copy, human_label)
+        If `is_continuation` is True, inherit the use_case from the previous turn.
         """
-        # ── 1. Classify intent using the existing classifier ──────────────
+        # ── 1. Classify intent if not provided ──────────────────────────────
         if intent_vector is None:
             intent_vector = await self._f._commands.classify_intent(
                 user_query, project_id
@@ -17267,51 +17264,31 @@ class InletOrchestrator:
             self._f._ctx_builder.classify_use_case(user_query, intent_vector)
         )
 
-        # ── 3. Compute classifier confidence (max probability) ────────────
+        # ── 3. Compute classifier confidence ────────────────────────────
         confidence = max(intent_vector.values()) if intent_vector else 0.5
 
-        # ── 4. E2: inherit use_case for short continuations ──────────────
+        # ── 4. E2: inherit use_case only for genuine continuations ────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        if self._is_continuation_message(user_query, confidence):
+        if is_continuation:
             inherited = pstate.get("last_use_case")
             if inherited:
                 self._f._log_debug(
-                    f"use_case: short continuation — inheriting '{inherited}' "
-                    f"from previous turn (classifier had '{use_case_key}' @ {confidence:.2f})"
+                    f"use_case: inheriting '{inherited}' from previous turn "
+                    f"(genuine continuation, classifier had '{use_case_key}')"
                 )
                 use_case_key = inherited
-                # Update profile and label to match inherited use_case
                 profile_copy = dict(
                     self._f._ctx_builder.LOD_PROFILES.get(inherited, {})
                 )
-                # Re-derive human label from UseCase enum
-                try:
-                    from enum import Enum
-
-                    class UseCase(str, Enum):
-                        ARCHITECTURE = "A"
-                        PLANNING = "B"
-                        PROGRAMMING = "C"
-                        REFACTORING = "D"
-                        SCAFFOLDING = "E"
-
-                        @property
-                        def label(self):
-                            return {
-                                "A": "Architecture/Design",
-                                "B": "Planning/Roadmap",
-                                "C": "General Programming",
-                                "D": "Refactoring/Impact Analysis",
-                                "E": "Scaffolding/Boilerplate",
-                            }[self.value]
-
-                    human_label = UseCase(inherited).label
-                except Exception:
-                    human_label = "General Programming"
-
-        # ── 5. Persist the use_case for next turn ──────────────────────────
-        pstate["last_use_case"] = use_case_key
+                human_label = UseCase(inherited).label
+            else:
+                self._f._log_debug(
+                    f"use_case: continuation but no previous use_case found, using '{use_case_key}'"
+                )
+        else:
+            # Normal classification — store for future continuations
+            pstate["last_use_case"] = use_case_key
 
         return use_case_key, profile_copy, human_label
 
@@ -17353,7 +17330,8 @@ class SystemPromptBuilder:
         is_code_session: bool,
         last_user_msg: Optional[dict],
         state: dict,
-        slot_free: bool = True,
+        slot_busy: bool = False,
+        is_continuation: bool = False,
         intent_vector: Optional[dict] = None,
     ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
         """
@@ -17376,7 +17354,7 @@ class SystemPromptBuilder:
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
             is_code_session=is_code_session,
-            is_continuation=not slot_free,
+            is_continuation=is_continuation,  # <--- just to freeze
         )
 
         # ── M7: Compute Block A hash and rebuild reason ──────────────────────
@@ -18387,7 +18365,8 @@ class MessageAssembler:
         __user__: Optional[dict],
         user_question: str,
         has_code_blocks: bool,
-        slot_free: bool = True,
+        slot_busy: bool = False,
+        is_continuation: bool = False,
     ) -> List[dict]:
         """
         Orchestrate CoT, multi-phase, trimming, and final assembly.
@@ -19376,9 +19355,6 @@ class MessageAssembler:
 # ---------------------------------------------------------------------------
 # ContextDumper — per-turn context snapshots for evolution tracking
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# ContextDumper — per-turn context snapshots for evolution tracking
-# ---------------------------------------------------------------------------
 class ContextDumper:
     """
     Captures per‑turn context snapshots and writes them to disk for
@@ -19597,53 +19573,19 @@ class ContextDumper:
         """
         Asynchronously write the context snapshot to disk.
 
+        Delegates the entire Markdown + JSONL writing to the synchronous
+        `_write_sync` method, which handles token counting and file I/O.
+
         Args:
             payload: The payload dictionary from _capture_payload.
         """
         self._f._log_debug(f"📝 Writing context dump (turn {payload['turn']})...")
         try:
+            # All writing (Markdown + JSONL) is handled by _write_sync.
             await anyio.to_thread.run_sync(self._write_sync, payload)
             self._f._log_debug(f"✅ Context dump written (turn {payload['turn']})")
         except Exception as exc:
             self._f._log_debug(f"❌ Context dump write failed: {exc}")
-
-        # 3. Append compact metrics to the evolution log.
-        if self._f.valves.context_dump_write_jsonl:
-            record = {
-                # ── Existing metrics ──────────────────────────────────────
-                "ts": payload["timestamp"],
-                "iso": payload["iso"],
-                "turn": payload["turn"],
-                "block_a_tokens": block_a_tokens,
-                "block_b_tokens": block_b_tokens,
-                "system_tokens": system_tokens,
-                "history_tokens": history_tokens,
-                "n_messages": len(payload["messages"]),
-                "n_active_blocks": payload["n_active_blocks"],
-                "n_symbols": payload["n_symbols"],
-                "block_a_hash": payload["block_a_hash"],
-                # ── NEW: rebuild reason ──────────────────────────────────
-                "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
-                "code_state_hash": payload["code_state_hash"],
-                "slot_saved_hash": payload["slot_saved_hash"],
-                # ── WindowManager metrics ──────────────────────────────────
-                "wm_fired": payload.get("wm_fired", False),
-                "wm_msgs_evicted": payload.get("wm_msgs_evicted", 0),
-                "wm_turns_evicted": payload.get("wm_turns_evicted", 0),
-                "wm_summary_ok": payload.get("wm_summary_ok", False),
-                "wm_emergency_cap": payload.get("wm_emergency_cap", False),
-                "wm_batch_too_small": payload.get("wm_batch_too_small", False),
-                "wm_no_slot": payload.get("wm_no_slot", False),
-                "wm_degradation_guard": payload.get("wm_degradation_guard", False),
-                # ── HWM and summaries ──────────────────────────────────────
-                "frontier_hwm": payload.get("frontier_hwm", 0),
-                "n_summaries_l1": payload.get("n_summaries_l1", 0),
-                "n_summaries_l2": payload.get("n_summaries_l2", 0),
-            }
-            with open(
-                os.path.join(project_dir, "evolution.jsonl"), "a", encoding="utf-8"
-            ) as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _write_sync(self, payload: dict) -> None:
         """
@@ -21575,7 +21517,18 @@ class Filter:
             ge=0,
             description="Number of turns between automatic purges of orphaned DB rows (0 = disabled).",
         )
-
+        # ── AutoContinue watchdog ──────────────────────────────────────
+        max_autocontinue_turns: int = Field(
+            default=8,
+            ge=2,
+            le=30,
+            description=(
+                "Maximum consecutive turns that AutoContinue can run before "
+                "the watchdog forces a reset. Prevents infinite continuation "
+                "loops due to stuck state. Must be higher than the longest "
+                "expected multi-phase response (typically 3-5 parts)."
+            ),
+        )
         # ═══════════════════════════════════════════════════════════════════
         #  Utilities & tuning
         # ═══════════════════════════════════════════════════════════════════
@@ -22274,6 +22227,16 @@ class Filter:
             slot_free,
         )
 
+    def _detect_genuine_continuation(self, messages: list) -> bool:
+        """Return True only if the most recent ASSISTANT message contains
+        the AutoContinue marker '▶ CONTINÚA:'.
+        """
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                return any(marker in content for marker in self._MULTI_PHASE_MARKERS)
+        return False
+
     # ═══════════════════════════════════════════════════════════════════════════
     # INLET – orchestrated entry point
     # ═══════════════════════════════════════════════════════════════════════════
@@ -22285,21 +22248,6 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """
-        Pre‑process the request before the LLM sees it.
-
-        Orchestrates seven sequential steps:
-        1. Project‑switch detection, cache loading, and KV‑slot restore.
-        2. User‑info extraction (last message, question, explicit commands).
-        3. Explicit command dispatch (/forget, /status, /clean, /expand).
-        4. Natural‑language intent dispatch (forget, remember, obsolete).
-        5. Silent ingestion when the message is a large code‑only paste.
-        6. Session classification and active‑code update.
-        7. System‑prompt assembly (Block A + Block B) with CoT, compression,
-           multi‑phase, and adaptive trimming.
-
-        Returns the modified body with the final message list ready for the LLM.
-        """
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
@@ -22310,23 +22258,41 @@ class Filter:
             self._log_timing(step_name, start - inlet_start, end - start)
 
         project_id = self._inlet_orch.get_project_id()
-
-        # ── Get state early to decide slot_free ──
         state = self._conversation_state_manager.get(project_id)
+        pstate = self._project_state_manager.get_pstate(project_id)
 
-        # ── slot_free logic ─────────────────────────────────────────────
-        slot_free = True
-        # If no model has been used yet and this is the first turn,
-        # disable slot_free so we don't try to restore a non‑existent slot.
+        # ── AC-A: separate slot_busy from is_continuation ────────────────
+        # slot_busy: True if the KV slot is occupied for ANY reason.
+        # Only affects slot-restore timing — does NOT suppress processing.
+        slot_busy = False
         if self._last_used_model is None and state.message_count <= 1:
-            slot_free = False
+            slot_busy = True
+            self._log_debug("inlet: cold-start slot_busy=True")
 
-        await self._enrichment.cancel_docstring_tasks()
-        self._enrichment._lazy_docstrings_generated_this_turn = 0
+        # is_continuation is read from pstate (set by outlet based on marker)
+        is_continuation = pstate.get("is_continuation", False)
+
+        # ── Watchdog (AC-A-WD) ─────────────────────────────────────────────
+        if is_continuation:
+            turns = pstate.get("continuation_turns", 1)
+            max_turns = self.valves.max_autocontinue_turns
+            if turns > max_turns:
+                self._log_warning(
+                    f"AutoContinue watchdog: is_continuation has been True for "
+                    f"{turns} consecutive turns (max={max_turns}) "
+                    f"— forcing reset. Check if '▶ CONTINÚA:' marker is being "
+                    f"generated correctly."
+                )
+                pstate["is_continuation"] = False
+                pstate["continuation_turns"] = 0
+                is_continuation = False
+                # Restore slot to stable prefix if it was frozen
+                if self.valves.enable_slot_persistence:
+                    await self._project_state_manager.slot_restore_for_continuity(
+                        project_id
+                    )
 
         # ── Phase A: Write barrier ──────────────────────────────────
-        # Wait for all pending writes from the previous turn to finish
-        # BEFORE we start reading SQLite.
         await self._state_store.drain_writes(timeout=5.0)
 
         # ─────────────────────────────────────────────────────────────────
@@ -22367,35 +22333,6 @@ class Filter:
                     "LTM: store timeout (>3s) — retrieval may miss previous turn"
                 )
 
-        # ── Detect AutoContinue continuation ──────────────────────────────
-        _last_assistant = next(
-            (m for m in reversed(messages) if m.get("role") == "assistant"), None
-        )
-        _hint = ""
-        _is_continuation = False
-        if _last_assistant:
-            _ac = _last_assistant.get("content", "")
-            for _marker in self._MULTI_PHASE_MARKERS:
-                if _marker in _ac:
-                    _is_continuation = True
-                    _idx = _ac.find(_marker)
-                    _hint_line = _ac[_idx:].split("\n")[0]
-                    _hint = re.sub(
-                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
-                        "",
-                        _hint_line,
-                        flags=re.IGNORECASE,
-                    ).strip()
-                    if _hint:
-                        user_question = _hint
-                        self._log_debug(
-                            f"AutoContinue detected — LOD query: '{user_question}'"
-                        )
-                    break
-        if _is_continuation:
-            slot_free = False
-            user_query = user_query + " código"
-
         # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
         #   3. Explicit commands (/forget, /status, /clean, /expand)
@@ -22423,7 +22360,7 @@ class Filter:
             project_id,
             is_explicit_command,
             last_user_msg,
-            slot_free=slot_free,
+            slot_free=not slot_busy,  # <--- solo para decidir si gastar slot
         )
         _inlet_timing("Step 4/7: Handle natural language intents", step_start)
         if handled:
@@ -22515,28 +22452,22 @@ class Filter:
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
 
-                # Mark dirty and save via ConversationStateManager
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
-                # Get final counts after indexing
                 state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
-                # ── Generate and store stub (no truncation) ──
                 stub = self._history_compressor._build_user_stub(num_symbols)
 
-                # Store stub in state so it persists for future turns
                 content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
                 state.compressed_user_messages[content_hash] = stub
                 self._conversation_state_manager.mark_dirty(project_id)
 
-                # Replace the current user message with the stub
                 messages[-1] = {**messages[-1], "content": stub}
 
-                # Build the assistant response
                 response = (
                     f"✅ {num_symbols} symbols in {num_classes} classes "
                     f"({num_blocks} active blocks). Code is in the SymbolGraph. "
@@ -22544,7 +22475,6 @@ class Filter:
                 )
                 messages.append({"role": "assistant", "content": response})
 
-                # ── Context dump (if enabled) ────────────────────────────────────
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -22572,9 +22502,10 @@ class Filter:
         #   5. Prepare code session (classify, update code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
+        # Pass is_continuation to avoid re-processing user message if it's a continuation
         is_code_session, user_question = (
             await self._inlet_orch.inlet_prepare_code_session(
-                messages, project_id, user_query, is_continuation=_is_continuation
+                messages, project_id, user_query, is_continuation=is_continuation
             )
         )
         _inlet_timing("Step 5/7: Prepare code session", step_start)
@@ -22584,9 +22515,11 @@ class Filter:
         #   Resolve call‑graph mode BEFORE Block A is built.
         # ─────────────────────────────────────────────────────────────────
         intent_vector = await self._commands.classify_intent(user_query, project_id)
+
+        # Use classify_intent_with_continuation, passing is_continuation
         use_case_key, use_case_profile, use_case_label = (
             await self._inlet_orch.classify_intent_with_continuation(
-                user_query, project_id, intent_vector
+                user_query, project_id, intent_vector, is_continuation
             )
         )
         self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
@@ -22607,13 +22540,12 @@ class Filter:
                 is_code_session,
                 last_user_msg,
                 state,
-                slot_free=slot_free,
+                slot_busy=slot_busy,  # <--- pass slot_busy, not slot_free
+                is_continuation=is_continuation,  # <--- pass is_continuation
                 intent_vector=intent_vector,
             )
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
-
-        # ── PREMATURE slot_restore REMOVED (moved to the end) ──
 
         if cached_response:
             messages.pop()
@@ -22645,11 +22577,11 @@ class Filter:
             __user__,
             user_question,
             has_code_blocks,
-            slot_free=slot_free,
+            slot_busy=slot_busy,  # <--- pass slot_busy
+            is_continuation=is_continuation,  # <--- pass is_continuation
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
-        # ✅ active_blocks Validation (attribute, not dict)
         if not isinstance(state.active_blocks, dict):
             state.active_blocks = {}
             self._conversation_state_manager.set(project_id, state)
@@ -22659,14 +22591,8 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
         # ─────────────────────────────────────────────────────────────────
-        # slot_restore_for_continuity is independent of slot_restore:
-        #   - slot_restore: session start / first time Block A is built.
-        #   - slot_restore_for_continuity: end of each inlet, after CoT,
-        #     seed inference and other auxiliaries have dirtied the slot.
-        # One restore at the end covers ALL auxiliary calls of this turn.
-        # Gated by slot_free (in AutoContinue continuations the slot is already
-        # configured for streaming and should not be touched).
-        if slot_free and self.valves.enable_slot_persistence:
+        # Only restore if the slot is NOT busy (cold-start, background tasks)
+        if not slot_busy and self.valves.enable_slot_persistence:
             await self._project_state_manager.slot_restore_for_continuity(project_id)
 
         _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -22685,22 +22611,10 @@ class Filter:
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """Post‑process the response after the LLM has generated it.
 
-        Runs maintenance and persistence tasks that do not block the user:
-        * Updates active code blocks and stores the new message in LTM.
-        * Intercepts ``/expand`` commands in the assistant's response and
-            replaces them with real code from the SymbolIndex.
-        * Stores the response in the semantic cache for future reuse.
-        * Adjusts LOD thresholds adaptively based on which symbols the LLM
-            actually used.
-        * Runs speculative prefetch for the next likely query.
-        * Purges expired memories, rebuilds RAPTOR clusters periodically,
-            and runs SQLite + ChromaDB checkpoints.
-        * Persists symbol edges, path views, and dirty conversation state.
-        * Saves the KV slot (slot persistence) for future session restores.
-        * Waits for background LLM tasks (docstrings, etc.) to finish before
-            exiting, to prevent them from blocking the next request.
-
         Returns the (possibly modified) body unchanged.
+
+        Modified (Doc 18 AC-B): uses response hash instead of message index
+        to avoid skipping _update_active_code in every turn.
         """
         self._log_debug("outlet called")
         start_time = time.monotonic()
@@ -22710,136 +22624,146 @@ class Filter:
             self._log_debug("outlet: prerequisites not met, returning body unchanged")
             return body
 
+        # ── Log body structure once for debugging ──────────────────────────
+        if not getattr(self, "_outlet_body_structure_logged", False):
+            self._log_debug(
+                f"outlet body structure (first call): "
+                f"keys={list(body.keys())}, "
+                f"messages_count={len(body.get('messages', []))}, "
+                f"last_role={body.get('messages', [{}])[-1].get('role', 'N/A')}"
+            )
+            self._outlet_body_structure_logged = True
+
         try:
-            messages = body.get("messages", [])
             project_id = self._inlet_orch.get_project_id()
             state = self._conversation_state_manager.get(project_id)
+            pstate = self._project_state_manager.get_pstate(project_id)
+            messages = body.get("messages", [])
             is_code_session = await self._inlet_orch.classify_session(
                 messages, project_id
             )
-            last_msg = messages[-1] if messages else None
 
-            pstate = self._project_state_manager.get_pstate(project_id)
+            # ── Step 1: detect assistant response ────────────────────────────
+            # In this OpenWebUI build, the assistant response may not be in messages.
+            assistant_content = ""
+            assistant_source = ""
 
-            if last_msg:
-                last_idx = len(messages) - 1
+            # First, check if messages already has an assistant message at the end
+            if messages and messages[-1].get("role") == "assistant":
+                assistant_content = messages[-1].get("content", "")
+                assistant_source = "messages[-1]"
 
-                if last_msg.get("role") == "assistant":
-                    self._log_debug(
-                        "outlet: processing assistant message for indexing and expansion"
+            # If not, try common body fields
+            if not assistant_content:
+                for field in ("content", "output", "response", "assistant"):
+                    val = body.get(field)
+                    if isinstance(val, str) and val.strip():
+                        assistant_content = val
+                        assistant_source = f"body['{field}']"
+                        break
+                    if isinstance(val, dict):
+                        val = val.get("content", "")
+                        if val:
+                            assistant_content = val
+                            assistant_source = f"body['{field}']['content']"
+                            break
+
+            if not assistant_content:
+                self._log_debug(
+                    "outlet: no assistant response found in body — "
+                    "_update_active_code skipped. "
+                    f"(keys={list(body.keys())})"
+                )
+                # Still run other outlet tasks (slot save, etc.)
+                return body
+
+            # ── Step 2: deduplicate by content hash ──────────────────────────
+            response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
+            if pstate.get("last_outlet_response_hash") == response_hash:
+                self._log_debug(
+                    f"outlet: response already processed (hash={response_hash}), skipping"
+                )
+                return body
+
+            pstate["last_outlet_response_hash"] = response_hash
+            self._log_debug(
+                f"outlet: processing assistant response "
+                f"(source={assistant_source}, hash={response_hash}, "
+                f"{len(assistant_content.split())} words)"
+            )
+
+            # ── Step 3: process the assistant message ────────────────────────
+            await self._llm_orchestrator.wait_for_llm_tasks()
+
+            # Intercept /expand commands in the assistant content
+            if is_code_session and "/expand" in assistant_content:
+                modified_content, did_expand = (
+                    await self._commands.outlet_intercept_expand(
+                        assistant_content, project_id
                     )
-                    if is_code_session and "/expand" in last_msg.get("content", ""):
-                        self._log_debug(
-                            "🔥 STATE MANAGEMENT – Intercepting /expand command to inject real code"
+                )
+                if did_expand:
+                    # Update the message in body if it exists
+                    if assistant_source == "messages[-1]":
+                        messages[-1]["content"] = modified_content
+                    # Otherwise, we can't update the body directly; log it.
+                    assistant_content = modified_content
+                    self._log_debug(
+                        "outlet: /expand intercepted and expanded in assistant content"
+                    )
+
+            # Store in LTM and update active blocks
+            assistant_msg = {"role": "assistant", "content": assistant_content}
+            if is_code_session:
+                self._log_debug(
+                    "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
+                )
+                await self._update_active_code(assistant_msg, project_id)
+
+                # ── C6: wrap store_messages with signal ──────────────────────────
+                self._ltm_store_complete.clear()
+
+                async def _store_and_signal():
+                    try:
+                        await self._ltm.store_messages(
+                            project_id, [assistant_msg], wait=False
                         )
-                        modified_content, did_expand = (
-                            await self._commands.outlet_intercept_expand(
-                                last_msg.get("content", ""), project_id
+                    except Exception as e:
+                        self._log_debug(f"LTM: store_messages failed: {e}")
+                    finally:
+                        self._ltm_store_complete.set()
+
+                asyncio.create_task(_store_and_signal())
+
+                if self.valves.enable_auto_docstrings_background:
+                    state = self._conversation_state_manager.get(project_id)
+                    pending = []
+                    for block in state.active_blocks.values():
+                        if block.obsolete:
+                            continue
+                        for sym in block.symbols:
+                            if sym.kind in ("function", "method") and not sym.docstring:
+                                pending.append((sym.name, sym.signature))
+                    if pending:
+                        self._enrichment.start_docstring_loop(project_id)
+            else:
+                if not self.valves.ltm_store_only_code_sessions:
+                    self._log_debug(
+                        "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
+                    )
+                    self._ltm_store_complete.clear()
+
+                    async def _store_and_signal_noncode():
+                        try:
+                            await self._ltm.store_messages(
+                                project_id, [assistant_msg], wait=False
                             )
-                        )
-                        if did_expand:
-                            messages[-1]["content"] = modified_content
-                            body["messages"] = messages
-                            self._log_debug(
-                                "outlet: /expand intercepted — history rewritten with real code"
-                            )
+                        except Exception as e:
+                            self._log_debug(f"LTM: store_messages failed: {e}")
+                        finally:
+                            self._ltm_store_complete.set()
 
-                    await self._llm_orchestrator.wait_for_llm_tasks()
-                    if is_code_session:
-                        self._log_debug(
-                            "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
-                        )
-                        await self._update_active_code(last_msg, project_id)
-
-                        # ── C6: wrap store_messages with signal ──────────────────────────
-                        self._ltm_store_complete.clear()
-
-                        async def _store_and_signal():
-                            try:
-                                await self._ltm.store_messages(
-                                    project_id, [last_msg], wait=False
-                                )
-                            except Exception as e:
-                                self._log_debug(f"LTM: store_messages failed: {e}")
-                            finally:
-                                self._ltm_store_complete.set()
-
-                        asyncio.create_task(_store_and_signal())
-
-                        if self.valves.enable_auto_docstrings_background:
-                            state = self._conversation_state_manager.get(project_id)
-                            pending = []
-                            for block in state.active_blocks.values():
-                                if block.obsolete:
-                                    continue
-                                for sym in block.symbols:
-                                    if (
-                                        sym.kind in ("function", "method")
-                                        and not sym.docstring
-                                    ):
-                                        pending.append((sym.name, sym.signature))
-                            if pending:
-                                self._enrichment.start_docstring_loop(project_id)
-                    else:
-                        if not self.valves.ltm_store_only_code_sessions:
-                            self._log_debug(
-                                "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
-                            )
-                            # ── C6: also signal for non‑code stores ──────────────────
-                            self._ltm_store_complete.clear()
-
-                            async def _store_and_signal_noncode():
-                                try:
-                                    await self._ltm.store_messages(
-                                        project_id, [last_msg], wait=False
-                                    )
-                                except Exception as e:
-                                    self._log_debug(f"LTM: store_messages failed: {e}")
-                                finally:
-                                    self._ltm_store_complete.set()
-
-                            asyncio.create_task(_store_and_signal_noncode())
-
-                else:
-                    if last_idx <= pstate.get("last_processed_message_idx", -1):
-                        self._log_debug(
-                            "outlet: last user message already processed in inlet, skipping"
-                        )
-                    else:
-                        await self._llm_orchestrator.wait_for_llm_tasks()
-                        if is_code_session:
-                            # ── C6: signal for user message in code session ──────────
-                            self._ltm_store_complete.clear()
-
-                            async def _store_and_signal_user_code():
-                                try:
-                                    await self._ltm.store_messages(
-                                        project_id, [last_msg], wait=False
-                                    )
-                                except Exception as e:
-                                    self._log_debug(f"LTM: store_messages failed: {e}")
-                                finally:
-                                    self._ltm_store_complete.set()
-
-                            asyncio.create_task(_store_and_signal_user_code())
-                            await self._update_active_code(last_msg, project_id)
-                        else:
-                            if not self.valves.ltm_store_only_code_sessions:
-                                self._ltm_store_complete.clear()
-
-                                async def _store_and_signal_user_noncode():
-                                    try:
-                                        await self._ltm.store_messages(
-                                            project_id, [last_msg], wait=False
-                                        )
-                                    except Exception as e:
-                                        self._log_debug(
-                                            f"LTM: store_messages failed: {e}"
-                                        )
-                                    finally:
-                                        self._ltm_store_complete.set()
-
-                                asyncio.create_task(_store_and_signal_user_noncode())
+                    asyncio.create_task(_store_and_signal_noncode())
 
             # ─────────────────────────────────────────────────────────────────────
             # 🔥 Save slot NOW (stable state, before long tasks)
@@ -22853,117 +22777,80 @@ class Filter:
                     self._log_debug(f"outlet: token estimation failed: {e}")
                 await self._project_state_manager.slot_save(project_id)
 
-            # ── Response cache ─────────────────────────────────────────
-            self._log_debug("outlet: before cache store")
+            # ── Response cache (use assistant_content for cache) ──
             if (
                 self.valves.enable_response_cache
                 and HAS_SENTENCE
                 and len(messages) >= 2
             ):
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Storing response in cache (to avoid recomputation for similar future requests)"
-                )
                 last_user = next(
                     (m for m in reversed(messages) if m.get("role") == "user"), None
                 )
-                last_assistant = next(
-                    (m for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
-                if last_user and last_assistant:
+                if last_user:
+                    # Use the potentially modified assistant_content
                     _is_partial_mp = self.valves.enable_multi_phase_response and any(
-                        marker in last_assistant.get("content", "")
+                        marker in assistant_content
                         for marker in self._MULTI_PHASE_MARKERS
                     )
-                    if _is_partial_mp:
-                        self._log_debug(
-                            "Response cache: skipping storage for partial multi-phase response"
-                        )
-                    else:
-                        context_hash = self._activation.compute_context_hash(
-                            messages[:-1]
-                        )
+                    if not _is_partial_mp:
+                        context_hash = self._activation.compute_context_hash(messages)
                         code_state_hash = self._activation.compute_code_state_hash(
                             project_id
                         )
                         await self._ltm.store_response_in_cache(
                             last_user.get("content", ""),
-                            last_assistant.get("content", ""),
+                            assistant_content,
                             context_hash,
                             state,
                             code_state_hash,
                             wait=False,
                         )
-            self._log_debug("outlet: after cache store")
 
             # ── LOD adaptive ───────────────────────────────────────────
-            self._log_debug("outlet: before LOD adaptive")
             if self.valves.enable_lod_adaptive and is_code_session:
-                last_assistant = next(
-                    (m for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
-                if last_assistant and last_assistant.get("content"):
-                    _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
-                        any(
-                            marker in last_assistant["content"]
-                            for marker in self._MULTI_PHASE_MARKERS
-                        )
-                        or bool(
-                            re.search(
-                                r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
-                                last_assistant["content"],
-                                re.IGNORECASE,
-                            )
+                _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
+                    any(
+                        marker in assistant_content
+                        for marker in self._MULTI_PHASE_MARKERS
+                    )
+                    or bool(
+                        re.search(
+                            r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
+                            assistant_content,
+                            re.IGNORECASE,
                         )
                     )
-                    if _is_partial_mp_lod:
-                        self._log_debug(
-                            "LOD adaptive: skipping feedback for partial multi-phase response"
-                        )
-                    else:
-                        await self._enrichment.update_lod_thresholds_from_response(
-                            project_id, last_assistant["content"]
-                        )
-            self._log_debug("outlet: after LOD adaptive")
+                )
+                if not _is_partial_mp_lod:
+                    await self._enrichment.update_lod_thresholds_from_response(
+                        project_id, assistant_content
+                    )
 
             # ── Speculative prefetch ───────────────────────────────────
-            self._log_debug("outlet: before speculative prefetch")
             if self.valves.enable_speculative_prefetch and is_code_session:
                 last_activated = pstate.get("last_activation_scores", {})
                 if last_activated:
-                    self._log_debug(
-                        f"outlet: speculative prefetch with {len(last_activated)} activated nodes"
-                    )
                     await self._activation.speculative_prefetch(
                         project_id, last_activated
                     )
-                else:
-                    self._log_debug("outlet: no activation scores, skipping prefetch")
-            self._log_debug("outlet: after speculative prefetch")
 
             # ── Purge expired memories ─────────────────────────────────
-            self._log_debug("outlet: before purge expired memories")
             await self._ltm.purge_expired_memories()
-            self._log_debug("outlet: after purge expired memories")
 
             if not hasattr(self, "_write_counter"):
                 self._write_counter = 0
             self._write_counter += 1
-            self._log_debug(f"outlet: write_counter={self._write_counter}")
 
             interval = self.valves.purge_orphaned_data_interval
             if interval > 0 and self._write_counter % interval == 0:
                 await self._state_store.purge_orphaned_data(project_id)
 
             # ── RAPTOR rebuild ─────────────────────────────────────────
-            self._log_debug("outlet: before RAPTOR rebuild")
             if (
                 self.valves.enable_raptor
                 and self._write_counter % self.valves.raptor_rebuild_interval == 0
                 and self.memory_collection is not None
             ):
-                self._log_debug("RAPTOR: triggering index rebuild")
                 edges_out = self._symbol_index.get_all_edges_out(project_id)
                 graph_weight = (
                     self.valves.raptor_graph_weight
@@ -22982,19 +22869,12 @@ class Filter:
                     embedder=self.embedder,
                     graph_weight=graph_weight,
                 )
-            self._log_debug("outlet: after RAPTOR rebuild")
 
             # ── DB checkpoints ─────────────────────────────────────────
-            self._log_debug("outlet: before DB checkpoints")
             if self._write_counter % 100 == 0:
-                self._log_debug(
-                    "🚀 RESOURCE OPTIMISATION – Running DB checkpoints (to ensure data durability and prevent WAL buildup)"
-                )
                 await self._state_store.run_db_checkpoints()
-            self._log_debug("outlet: after DB checkpoints")
 
             # ── Purge old versions ─────────────────────────────────────
-            self._log_debug("outlet: before purge old versions")
             if (
                 self.valves.purge_old_code_versions_enabled
                 and self.valves.enable_block_paging
@@ -23008,31 +22888,32 @@ class Filter:
                     embedder=self.embedder,
                     max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
                 )
-            self._log_debug("outlet: after purge old versions")
 
             # ── Save edges ─────────────────────────────────────────────
-            self._log_debug("outlet: before save edges")
             if self.valves.enable_edge_persistence:
                 await self._state_store.save_symbol_edges_to_db(project_id)
-            self._log_debug("outlet: after save edges")
 
             # ── Save path views ───────────────────────────────────────
-            self._log_debug("outlet: before save path views")
             if self.valves.enable_path_analysis:
                 await self._state_store.save_path_views_to_db(
                     project_id, self._path_index.get_all(project_id)
                 )
-            self._log_debug("outlet: after save path views")
 
             # ── Save state if dirty ───────────────────────────────────
-            self._log_debug(
-                "🔥 STATE MANAGEMENT – Saving conversation state (to preserve context across restarts)"
-            )
             await self._conversation_state_manager.save_if_dirty(project_id)
 
-            self._log_debug(
-                "🚀 RESOURCE OPTIMISATION – Skipping model unload to preserve KV cache"
-            )
+            # ── Detect and persist continuation marker (for AC-A) ─────
+            genuine = self._detect_genuine_continuation(messages)
+            if genuine:
+                pstate["is_continuation"] = True
+                pstate["continuation_turns"] = pstate.get("continuation_turns", 0) + 1
+                self._log_debug(
+                    f"AutoContinue: genuine marker detected "
+                    f"(turn {pstate['continuation_turns']} of continuation)"
+                )
+            else:
+                pstate["is_continuation"] = False
+                pstate["continuation_turns"] = 0
 
         except Exception as e:
             self._log_debug(f"❌ outlet error: {e}")
@@ -23046,7 +22927,6 @@ class Filter:
 
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             await self._llm_orchestrator.wait_for_llm_tasks()
-            self._log_debug("outlet: background LLM tasks completed")
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
