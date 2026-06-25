@@ -7541,20 +7541,25 @@ class LongTermMemory:
         self,
         query: str,
         use_case_label: str = "General Programming",
-        slot_free: bool = True,
+        is_continuation: bool = False,
     ) -> List[str]:
         """
         Generate alternative search queries for LTM retrieval.
 
         Forces structured output using a strong system prompt and numbered list.
         Extracts queries using regex to handle variations in formatting.
+
+        Args:
+            query: The original user query.
+            use_case_label: Human-readable label of the resolved use case.
+            is_continuation: True only for genuine AutoContinue (skip multi-query).
         """
         # ------------------------------------------------------------------
         # REGION 1: Early exits
         # ------------------------------------------------------------------
         if not self._f.valves.enable_multi_query_retrieval:
             return [query]
-        if not slot_free:
+        if is_continuation:
             return [query]
         if len(query.strip()) < 15:
             return [query]
@@ -7590,31 +7595,55 @@ class LongTermMemory:
         # Log the raw response for debugging
         self._f._log_debug(f"Multi-query raw response: {response}")
 
+        # ── B1: strip <details> reasoning blocks ──────────────────────────
+        import re
+
+        raw_response = re.sub(
+            r"<details[^>]*>.*?</details>",
+            "",
+            response or "",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        # ── B1: line-level filter ──────────────────────────────────────────
+        _REASONING_LINE_PREFIXES = (
+            "thinking process",
+            "let me ",
+            "i will ",
+            "to answer",
+            "step ",
+            "note:",
+            "reasoning:",
+            "my approach",
+            "first,",
+            "here are",
+            "i need to",
+            "the user",
+            "analysis",  # keep this as fallback
+        )
+
         queries = [query]
-        if response:
-            # ------------------------------------------------------------------
-            # REGION 4: Extract numbered lines using regex
-            # ------------------------------------------------------------------
-            import re
+        pattern = re.compile(r"^\s*(?:\d+\.\s*|[-*]\s*)?(.+)$")
+        for line in raw_response.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if not match:
+                continue
+            cleaned = match.group(1).strip()
+            if not cleaned:
+                continue
+            lower = cleaned.lower()
+            # Skip lines that are clearly meta-commentary, not search queries
+            if any(lower.startswith(p) for p in _REASONING_LINE_PREFIXES):
+                continue
+            # Accept if it's a valid query (not empty, not meta-commentary)
+            if len(cleaned) > 5:
+                queries.append(cleaned)
 
-            pattern = re.compile(r"^\s*(?:\d+\.\s*|[-*]\s*)?(.+)$")
-            for line in response.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                match = pattern.match(line)
-                if match:
-                    cleaned = match.group(1).strip()
-                    # Accept if it's a valid query (not empty, not meta-commentary)
-                    if (
-                        cleaned
-                        and len(cleaned) > 5
-                        and "analysis" not in cleaned.lower()
-                    ):
-                        queries.append(cleaned)
-
-            # Limit to configured variants (+1 for original)
-            queries = queries[: self._f.valves.multi_query_variants + 1]
+        # Limit to configured variants (+1 for original)
+        queries = queries[: self._f.valves.multi_query_variants + 1]
 
         self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
         return queries
@@ -7792,8 +7821,8 @@ class LongTermMemory:
         # ------------------------------------------------------------------
         # REGION 2: Build query variants (thematic expansion)
         # ------------------------------------------------------------------
-        query_variants = await self._expand_query_for_retrieval(
-            query, use_case_label=use_case_label, slot_free=slot_free
+        expanded = await self._expand_query_for_retrieval(
+            query, use_case_label=use_case_label, is_continuation=is_continuation
         )
 
         try:
@@ -17337,7 +17366,7 @@ class SystemPromptBuilder:
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
             is_code_session=is_code_session,
-            is_continuation=is_continuation,  # <--- just to freeze
+            is_continuation=is_continuation,
         )
 
         # ── M7: Compute Block A hash and rebuild reason ──────────────────────
@@ -18384,7 +18413,7 @@ class MessageAssembler:
             user_question,
             prelim_system,
             project_id,
-            slot_free,
+            is_continuation,
             messages,
         )
 
@@ -18440,7 +18469,7 @@ class MessageAssembler:
         user_question: str,
         prelim_system: str,
         project_id: str,
-        slot_free: bool,
+        is_continuation: bool,
         messages: List[dict],
     ) -> None:
         """
@@ -22137,9 +22166,7 @@ class Filter:
 
         Args:
             slot_busy: True if the KV slot is occupied (cold-start, background tasks).
-                       Only affects slot-restore timing, not content.
             is_continuation: True only for genuine AutoContinue (▶ CONTINÚA: marker).
-                             Affects Block A freeze, CoT suppression, and intent inheritance.
         """
         return await self._system_prompt_builder.build(
             messages=messages,
@@ -22173,36 +22200,9 @@ class Filter:
         """
         Delegate final message assembly to MessageAssembler.
 
-        This method is a thin wrapper that forwards all arguments to
-        `MessageAssembler.assemble`, which orchestrates the final steps of
-        message preparation before sending to the LLM:
-          - Chain‑of‑Thought detection and reasoning generation
-          - Code‑history compression and lean‑user‑code stubbing
-          - LLMLingua‑2 compression of conversation prose
-          - Turn‑based window management (summarise/evict)
-          - Multi‑phase protocol injection when the token budget is tight
-          - Adaptive trimming of old messages with optional summarisation
-          - Assembly of the final system prompt (Block A + Block B) and injection
-
-        This separation keeps `inlet` focused on orchestration, delegating the
-        complex message‑assembly pipeline to a dedicated component.
-
         Args:
-            messages (list): The current list of conversation messages.
-            project_id (str): The project identifier.
-            static_block (str): The rendered Block A (static, KV‑cacheable).
-            dynamic_injections (list): List of (priority, text) dynamic content.
-            prelim_system (str): The preliminary system prompt (Block A + Block B).
-            last_user_msg (dict|None): The last user message, if any.
-            is_code_session (bool): Whether the session is code‑aware.
-            state (dict): The conversation state for the project.
-            __user__ (dict|None): The user context from OpenWebUI.
-            user_question (str): The extracted question from the user message.
-            has_code_blocks (bool): Whether the user message contained code fences.
-            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
-
-        Returns:
-            list: The final message list ready for the LLM.
+            slot_busy: True if the KV slot is occupied.
+            is_continuation: True only for genuine AutoContinue.
         """
         return await self._message_assembler.assemble(
             messages,
