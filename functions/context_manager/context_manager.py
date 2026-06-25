@@ -2608,21 +2608,6 @@ class ContextPager:
         self._f = filter_ref
         # project_id → set of block hashes currently paged out.
         self._paged_hashes: dict = {}
-        # Bounds concurrent background embedding tasks during page-out so a
-        # mass eviction can't spawn one embedder.encode per block at once.
-        # valves already exist at this point (Filter.__init__ sets self.valves
-        # before constructing the pager). Semaphore creation does not bind to
-        # an event loop until first use, so building it here is safe.
-        self._page_out_semaphore = asyncio.Semaphore(
-            max(
-                1,
-                getattr(
-                    filter_ref.valves,
-                    "block_paging_max_concurrent_embeddings",
-                    2,
-                ),
-            )
-        )
 
     def is_paged(self, block_hash: str, project_id: str) -> bool:
         """True if block_hash has been paged out to ChromaDB for this project."""
@@ -2854,12 +2839,12 @@ class ContextPager:
     ) -> None:
         """Background task for embedding and upserting a paged block.
 
-        The embedding is serialized through _page_out_semaphore so a burst of
+        The embedding is serialized through _chroma_semaphore so a burst of
         evictions can't run many encodes concurrently and spike embedder
         memory. The block has already been removed from active_blocks by the
         synchronous caller; this only affects how fast cold storage catches up.
         """
-        async with self._page_out_semaphore:
+        async with self._f._chroma_semaphore:
             try:
                 embedding = await anyio.to_thread.run_sync(
                     lambda: embedder.encode(safe_text).tolist()
@@ -2888,10 +2873,14 @@ class ContextPager:
         chroma_collection,
         embedder,
         max_versions_per_file: int = 3,
+        stop_event: asyncio.Event = None,
     ) -> int:
         """
         Move code blocks older than the N most recent versions per file to cold storage,
         with semantic relevance filtering.
+
+        This method modifies state.active_blocks, so it must acquire the
+        project_lock to avoid race conditions with the inlet.
 
         Cascade for each block:
         1. Heuristic: keep if pinned or high importance.
@@ -2901,113 +2890,139 @@ class ContextPager:
         5. Middle zone: use heuristic (keep if important).
 
         Restores KV slot after any LLM call.
+
+        Args:
+            project_id: Current project identifier.
+            state: The conversation state.
+            symbol_index: The SymbolIndex.
+            chroma_collection: ChromaDB collection for cold storage.
+            embedder: The embedder instance.
+            max_versions_per_file: Number of recent versions per file to keep.
+            stop_event: If set, stops processing gracefully after the current file.
+
+        Returns:
+            int: The number of blocks purged.
         """
-        from collections import defaultdict
+        # ── Acquire project lock to protect state modifications ──
+        lock = await self._f._state_store.get_project_lock(project_id)
+        async with lock:
+            from collections import defaultdict
 
-        by_file = defaultdict(list)
-        for h, block in state.active_blocks.items():
-            if block.file_path and not block.pinned and not block.obsolete:
-                by_file[block.file_path].append((h, block))
+            if stop_event and stop_event.is_set():
+                return 0
 
-        purged = 0
+            by_file = defaultdict(list)
+            for h, block in state.active_blocks.items():
+                if block.file_path and not block.pinned and not block.obsolete:
+                    by_file[block.file_path].append((h, block))
 
-        # ── Get current query from volatile project state (pstate) ──
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-        current_query = pstate.get("last_user_query", "")
+            purged = 0
 
-        h_weight = self._f.valves.heuristic_reinforcement_weight
+            # ── Get current query from volatile project state (pstate) ──
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            current_query = pstate.get("last_user_query", "")
 
-        for file_path, versions in by_file.items():
-            if len(versions) <= max_versions_per_file:
-                continue
+            h_weight = self._f.valves.heuristic_reinforcement_weight
 
-            versions.sort(key=lambda x: x[1].timestamp, reverse=True)
-            to_purge = versions[max_versions_per_file:]
+            for file_path, versions in by_file.items():
+                if stop_event and stop_event.is_set():
+                    self._f._log_debug(
+                        f"purge_old_versions: stopped after {purged} purged blocks"
+                    )
+                    break
 
-            for h, block in to_purge:
-                should_purge = True  # default: purge
+                if len(versions) <= max_versions_per_file:
+                    continue
 
-                # ── Heuristic reinforcement: keep if important ──
-                keep_boost = 0.2 * h_weight if block.importance_score > 5.0 else 0.0
+                versions.sort(key=lambda x: x[1].timestamp, reverse=True)
+                to_purge = versions[max_versions_per_file:]
 
-                # ── CrossEncoder evaluation ──
-                if current_query and self._f._cross_encoder is not None:
-                    content_snippet = block.content[:1500]
-                    pairs = [
-                        (
-                            current_query[:500],
-                            f"This old version is still relevant and should be kept:\n{content_snippet}",
-                        ),
-                        (
-                            current_query[:500],
-                            f"This old version is obsolete and can be purged:\n{content_snippet}",
-                        ),
-                    ]
-                    scores = await self._f._commands._predict_cross_encoder(pairs)
+                for h, block in to_purge:
+                    should_purge = True  # default: purge
 
-                    if scores is not None and len(scores) >= 2:
-                        # ── Apply heuristic reinforcement ──
-                        scores_reinforced = list(scores)
-                        scores_reinforced[0] += keep_boost  # boost "keep" side
+                    # ── Heuristic reinforcement: keep if important ──
+                    keep_boost = 0.2 * h_weight if block.importance_score > 5.0 else 0.0
 
-                        diff = scores_reinforced[0] - scores_reinforced[1]
-                        CE_CONFIDENCE_THRESHOLD = self._f.valves.purge_ce_threshold
-                        LLM_FALLBACK_THRESHOLD = self._f.valves.purge_llm_threshold
+                    # ── CrossEncoder evaluation ──
+                    if current_query and self._f._cross_encoder is not None:
+                        content_snippet = block.content[:1500]
+                        pairs = [
+                            (
+                                current_query[:500],
+                                f"This old version is still relevant and should be kept:\n{content_snippet}",
+                            ),
+                            (
+                                current_query[:500],
+                                f"This old version is obsolete and can be purged:\n{content_snippet}",
+                            ),
+                        ]
+                        scores = await self._f._commands._predict_cross_encoder(pairs)
 
-                        if diff >= CE_CONFIDENCE_THRESHOLD:
-                            # Confident → use CrossEncoder
-                            should_purge = scores_reinforced[1] > scores_reinforced[0]
-                            self._f._log_debug(
-                                f"purge_old_versions: CE confident (diff={diff:.2f}) → "
-                                f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                        if scores is not None and len(scores) >= 2:
+                            # ── Apply heuristic reinforcement ──
+                            scores_reinforced = list(scores)
+                            scores_reinforced[0] += keep_boost  # boost "keep" side
+
+                            diff = scores_reinforced[0] - scores_reinforced[1]
+                            CE_CONFIDENCE_THRESHOLD = self._f.valves.purge_ce_threshold
+                            LLM_FALLBACK_THRESHOLD = self._f.valves.purge_llm_threshold
+
+                            if diff >= CE_CONFIDENCE_THRESHOLD:
+                                # Confident → use CrossEncoder
+                                should_purge = (
+                                    scores_reinforced[1] > scores_reinforced[0]
+                                )
+                                self._f._log_debug(
+                                    f"purge_old_versions: CE confident (diff={diff:.2f}) → "
+                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                )
+                            elif diff < LLM_FALLBACK_THRESHOLD:
+                                # Extremely uncertain → LLM with CE context
+                                self._f._log_debug(
+                                    f"purge_old_versions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                                    f"using LLM for {block.hash[:8]}"
+                                )
+                                should_purge = await self._purge_old_version_with_llm(
+                                    block, current_query, scores_reinforced, project_id
+                                )
+                            else:
+                                # Middle zone: use heuristic (keep if important)
+                                should_purge = not (
+                                    block.importance_score > 5.0 or block.pinned
+                                )
+                                self._f._log_debug(
+                                    f"purge_old_versions: middle zone, heuristic: "
+                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                )
+
+                    # ── Execute purge if decided ──
+                    if should_purge:
+                        if (
+                            self._f.valves.enable_block_paging
+                            and chroma_collection is not None
+                        ):
+                            paged = await self.page_out_block(
+                                block=block,
+                                project_id=project_id,
+                                state=state,
+                                symbol_index=symbol_index,
+                                chroma_collection=chroma_collection,
+                                embedder=embedder,
                             )
-                        elif diff < LLM_FALLBACK_THRESHOLD:
-                            # Extremely uncertain → LLM with CE context
-                            self._f._log_debug(
-                                f"purge_old_versions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                                f"using LLM for {block.hash[:8]}"
-                            )
-                            should_purge = await self._purge_old_version_with_llm(
-                                block, current_query, scores_reinforced, project_id
-                            )
-                        else:
-                            # Middle zone: use heuristic (keep if important)
-                            should_purge = not (
-                                block.importance_score > 5.0 or block.pinned
-                            )
-                            self._f._log_debug(
-                                f"purge_old_versions: middle zone, heuristic: "
-                                f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
-                            )
-
-                # ── Execute purge if decided ──
-                if should_purge:
-                    if (
-                        self._f.valves.enable_block_paging
-                        and chroma_collection is not None
-                    ):
-                        paged = await self.page_out_block(
-                            block=block,
-                            project_id=project_id,
-                            state=state,
-                            symbol_index=symbol_index,
-                            chroma_collection=chroma_collection,
-                            embedder=embedder,
-                        )
-                        if paged:
+                            if paged:
+                                del state.active_blocks[h]
+                                purged += 1
+                                continue
+                        # Fallback: remove from active blocks without paging
+                        if h in state.active_blocks:
                             del state.active_blocks[h]
                             purged += 1
-                            continue
-                    # Fallback: remove from active blocks without paging
-                    if h in state.active_blocks:
-                        del state.active_blocks[h]
-                        purged += 1
 
-        if purged > 0:
-            self._f._log_debug(
-                f"Purged {purged} old code version(s) across {len(by_file)} file(s)"
-            )
-        return purged
+            if purged > 0:
+                self._f._log_debug(
+                    f"Purged {purged} old code version(s) across {len(by_file)} file(s)"
+                )
+            return purged
 
     async def _purge_old_version_with_llm(
         self,
@@ -3648,24 +3663,26 @@ class RaptorCodeIndex:
             "project_id": project_id,
             "is_raptor_summary": True,
             "raptor_level": level,
-            "level_tag": f"L{level}",  # ← FIX #10: string tag avoids int/float coercion
+            "level_tag": f"L{level}",
             "cluster_id": int(cluster_id),
             "member_count": len(member_names),
             "member_names": ",".join(member_names[:50]),
             "created_at": time.time(),
         }
         try:
-            emb = await anyio.to_thread.run_sync(
-                lambda: embedder.encode(summary).tolist()
-            )
-            await anyio.to_thread.run_sync(
-                lambda: chroma_collection.upsert(
-                    ids=[entry_id],
-                    embeddings=[emb],
-                    documents=[summary],
-                    metadatas=[metadata],
+            # Use the shared ChromaDB semaphore
+            async with self._f._chroma_semaphore:
+                emb = await anyio.to_thread.run_sync(
+                    lambda: embedder.encode(summary).tolist()
                 )
-            )
+                await anyio.to_thread.run_sync(
+                    lambda: chroma_collection.upsert(
+                        ids=[entry_id],
+                        embeddings=[emb],
+                        documents=[summary],
+                        metadatas=[metadata],
+                    )
+                )
             return True
         except Exception:
             return False
@@ -8912,7 +8929,6 @@ Output only "YES" or "NO".
         ctx_symbols: List[str] = []
         for blk in extracted[:3]:
             try:
-                # ── FIX 9: Pass language as keyword argument ──
                 syms = await SignatureExtractor.extract_async(
                     blk["code"], language=blk.get("language")
                 )
@@ -8941,9 +8957,11 @@ Output only "YES" or "NO".
         safe_text = self._f._tokens.truncate_text_to_tokens(contextual_doc, 32768)
         now = time.time()
 
-        embedding = await anyio.to_thread.run_sync(
-            lambda: self._f.embedder.encode(safe_text).tolist()
-        )
+        # Use the shared ChromaDB semaphore
+        async with self._f._chroma_semaphore:
+            embedding = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(safe_text).tolist()
+            )
 
         msg_id = (
             f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
@@ -8959,7 +8977,6 @@ Output only "YES" or "NO".
             all_syms = set()
             for blk in extracted:
                 try:
-                    # ── FIX 9: Pass language as keyword argument ──
                     syms = await SignatureExtractor.extract_async(
                         blk["code"], language=blk.get("language")
                     )
@@ -8987,14 +9004,16 @@ Output only "YES" or "NO".
             "memory_id": msg_id,
         }
 
-        await anyio.to_thread.run_sync(
-            lambda: self._f.memory_collection.upsert(
-                ids=[msg_id],
-                embeddings=[embedding],
-                metadatas=[metadata],
-                documents=[contextual_doc],
+        # The upsert itself also needs the semaphore because it's a ChromaDB operation
+        async with self._f._chroma_semaphore:
+            await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.upsert(
+                    ids=[msg_id],
+                    embeddings=[embedding],
+                    metadatas=[metadata],
+                    documents=[contextual_doc],
+                )
             )
-        )
 
     async def store_response_in_cache(
         self,
@@ -15624,6 +15643,74 @@ Output only the symbol name.
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
             await self._build_view_from_activation(sym_name, ag, project_id)
 
+    async def speculative_prefetch_background(
+        self,
+        project_id: str,
+        last_activated: dict,
+        stop_event: asyncio.Event = None,
+    ) -> None:
+        """
+        Background version of speculative_prefetch that accepts a stop_event.
+        Pre‑builds CodePathViews for symbols likely to be relevant in the next query.
+
+        Args:
+            project_id (str): The current project identifier.
+            last_activated (dict): Activation scores from the previous turn.
+            stop_event (asyncio.Event, optional): Event to signal cancellation.
+        """
+        if stop_event and stop_event.is_set():
+            return
+
+        if not self._f.valves.enable_speculative_prefetch:
+            return
+        if not last_activated:
+            return
+
+        # ── 1. Select top activated symbols ──
+        top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
+
+        # ── 2. Collect candidates (direct callees with high confidence) ──
+        prefetch_candidates: Set[str] = set()
+        for sym in top_syms:
+            for edge in self._f._symbol_index.get_edges_out(sym, project_id):
+                if (
+                    edge.type == "calls"
+                    and edge.effective_weight() >= 0.7
+                    and edge.dst not in last_activated
+                ):
+                    prefetch_candidates.add(edge.dst)
+
+        if not prefetch_candidates:
+            return
+
+        if stop_event and stop_event.is_set():
+            return
+
+        # ── 3. Build CodePathViews for candidates ──
+        candidates = list(prefetch_candidates)[
+            : self._f.valves.speculative_prefetch_max
+        ]
+        self._f._log_debug(
+            f"Speculative prefetch: pre-building {len(candidates)} CodePathView(s) "
+            f"for next likely query"
+        )
+
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        for idx, sym_name in enumerate(candidates):
+            if stop_event and stop_event.is_set():
+                self._f._log_debug(
+                    f"Speculative prefetch: stopped after {idx}/{len(candidates)} candidates"
+                )
+                break
+
+            if not self._f._symbol_index.find_blocks(sym_name, project_id):
+                continue
+            qids = self._f._symbol_index.get_qualified_names_for(sym_name, project_id)
+            ag = ActivationGraph()
+            ag.seed(list(qids), initial_score=1.0)
+            ag.propagate(edges_out, max_steps=2, min_score=0.1)
+            await self._build_view_from_activation(sym_name, ag, project_id)
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Hash utilities
     # ═══════════════════════════════════════════════════════════════════════════
@@ -17547,7 +17634,9 @@ class EnrichmentTasks:
 
         return sorted(qids, key=priority_key)
 
-    async def _docstring_generation_loop(self, project_id: str) -> None:
+    async def _docstring_generation_loop(
+        self, project_id: str, stop_event: asyncio.Event = None
+    ) -> None:
         """
         Background loop that generates docstrings for all pending symbols
         (functions, methods, and classes) that lack one.
@@ -17559,15 +17648,22 @@ class EnrichmentTasks:
         Processes in batches using `docstring_bg_batch_size` to reduce serial
         LLM calls from N to ceil(N / batch_size).
 
-        After all batches complete, calls `slot_restore_for_continuity()`
-        to return the KV slot to the stable prefix.
+        After all batches complete, we do NOT restore the KV slot here.
+        The slot is managed exclusively by the inlet to avoid interfering
+        with the user's KV cache.
+
+        Args:
+            project_id: The current project identifier.
+            stop_event: If set, stops the loop gracefully after the current batch.
         """
+        if stop_event is None:
+            stop_event = asyncio.Event()
+
         # ── 1. Snapshot: collect all symbols without docstrings ──────────
         state = self._f._conversation_state_manager.get(project_id)
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         pending_qids: List[str] = []
-
         for block in state.active_blocks.values():
             if block.obsolete:
                 continue
@@ -17606,8 +17702,16 @@ class EnrichmentTasks:
             f"{len(batches)} batches (batch_size={batch_size})"
         )
 
-        # ── 3. Process each batch ──────────────────────────────────────────
+        # ── 3. Process each batch with stop_event check ─────────────────────
+        total_docstrings = 0
         for batch_idx, batch in enumerate(batches):
+            if stop_event.is_set():
+                self._f._log_debug(
+                    f"bg_docstring: stop signal received, exiting after "
+                    f"{batch_idx}/{len(batches)} batches"
+                )
+                break
+
             try:
                 results: Dict[str, str] = await self.ensure_docstrings_batch(
                     batch, project_id
@@ -17615,8 +17719,9 @@ class EnrichmentTasks:
                 for qid, docstring in results.items():
                     if docstring:
                         self._f._symbol_index.update_docstring(
-                            qid, docstring, project_id
+                            qid, project_id, docstring
                         )
+                        total_docstrings += 1
                 self._f._log_debug(
                     f"bg_docstring batch {batch_idx + 1}/{len(batches)}: "
                     f"got {len(results)} docstrings"
@@ -17627,16 +17732,18 @@ class EnrichmentTasks:
                     "continuing with remaining batches"
                 )
 
-        # ── 4. Restore slot to stable prefix after all batch LLM calls ────
-        try:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+        # ── Log performance metrics if enabled ──────────────────────────────
+        if self._f.valves.bg_task_measure_performance:
             self._f._log_debug(
-                "bg_docstring: slot restored to stable prefix after batches"
+                f"bg_docstring: processed {len(batches)} batches, "
+                f"generated {total_docstrings} docstrings"
             )
-        except Exception as e:
-            self._f._log_debug(f"bg_docstring: slot restore failed (non-fatal): {e}")
 
-        self._f._log_debug("Background docstring loop: finished")
+        # ── 4. Slot restore REMOVED ─────────────────────────────────────────
+        # We do NOT call slot_restore_for_continuity here because the KV slot
+        # is managed exclusively by the inlet. Background tasks must not
+        # interfere with the user's KV cache.
+        self._f._log_debug("bg_docstring: finished (no slot restore)")
 
     def start_docstring_loop(self, project_id: str) -> None:
         """Launch the background docstring generation loop (if not already running)."""
@@ -22004,6 +22111,9 @@ class ProjectStateManager:
             "structure_hash_for_cache": None,
             # ── one‑shot flag for global‑scope queries ──
             "force_multi_phase_this_turn": False,
+            # ── Last assistant response for LOD adaptive lazy ──
+            "last_assistant_response": "",
+            "last_response_timestamp": 0.0,
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -22314,6 +22424,337 @@ class ProjectStateManager:
                     self._f._log_debug(f"Removed obsolete slot file: {fname}")
         except Exception as e:
             self._f._log_debug(f"Slot cleanup error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BackgroundTask — Definition of task lazy + background
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class BackgroundTask:
+    """
+    Definition of a task that can be executed both lazily (in inlet) and
+    in the background (between turns).
+
+    Each task has:
+        - A unique name and state key for persistent status in pstate.
+        - Optional lazy and background functions.
+        - An invalidation function that returns a hash to invalidate
+          the 'completed' status when the code changes.
+        - Valves to enable/disable each mode independently.
+        - A priority for background execution order.
+        - A flag to skip lazy execution if already completed.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        state_key: str,
+        lazy_func: Optional[Callable] = None,
+        bg_func: Optional[Callable] = None,
+        invalidation_func: Optional[Callable[[str], str]] = None,
+        valve_bg: Optional[str] = None,
+        valve_lazy: Optional[str] = None,
+        priority: int = 0,
+        skip_if_completed: bool = True,
+    ):
+        """
+        Args:
+            name: Unique identifier for the task.
+            state_key: Key in pstate to store completion status.
+            lazy_func: Coroutine to execute in inlet (under demand).
+            bg_func: Coroutine to execute in background (between turns).
+            invalidation_func: Callable(project_id) -> str hash; if the hash
+                changes, the task is considered not completed.
+            valve_bg: Name of the valve to enable/disable background execution.
+            valve_lazy: Name of the valve to enable/disable lazy execution.
+            priority: Default priority (higher = executed earlier in background).
+            skip_if_completed: If True, lazy execution is skipped when the task
+                is already completed (and not invalidated).
+        """
+        self.name = name
+        self.state_key = state_key
+        self.lazy_func = lazy_func
+        self.bg_func = bg_func
+        self.invalidation_func = invalidation_func
+        self.valve_bg = valve_bg
+        self.valve_lazy = valve_lazy
+        self.priority = priority
+        self.skip_if_completed = skip_if_completed
+        self._effective_priority = priority  # Will be overridden by valve
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. State management
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def is_completed(self, pstate: dict, project_id: str) -> bool:
+        """
+        Return True if the task is completed and not invalidated.
+
+        A task is considered completed if:
+            - 'completed' is True
+            - 'in_progress' is not True
+            - If invalidation_func is provided, the current hash matches
+              the stored invalidation_hash.
+        """
+        state = pstate.get(self.state_key, {})
+        if state.get("in_progress", False):
+            return False
+        if not state.get("completed", False):
+            return False
+        if self.invalidation_func:
+            current_inv = self.invalidation_func(project_id)
+            stored_inv = state.get("invalidation_hash")
+            if stored_inv != current_inv:
+                return False
+        return True
+
+    def should_skip_lazy(self, pstate: dict, project_id: str) -> bool:
+        """
+        Return True if lazy execution can be skipped.
+
+        If skip_if_completed is False, lazy is never skipped.
+        Otherwise, it's skipped when the task is completed.
+        """
+        if not self.skip_if_completed:
+            return False
+        return self.is_completed(pstate, project_id)
+
+    def mark_in_progress(self, pstate: dict) -> None:
+        """Mark the task as currently running in background."""
+        state = pstate.get(self.state_key, {})
+        state["in_progress"] = True
+        pstate[self.state_key] = state
+
+    def mark_completed(self, pstate: dict, project_id: str) -> None:
+        """Mark the task as completed successfully."""
+        inv_hash = (
+            self.invalidation_func(project_id) if self.invalidation_func else None
+        )
+        pstate[self.state_key] = {
+            "completed": True,
+            "in_progress": False,
+            "timestamp": time.time(),
+            "invalidation_hash": inv_hash,
+        }
+
+    def mark_not_completed(self, pstate: dict) -> None:
+        """Mark the task as not completed (e.g., after cancellation)."""
+        state = pstate.get(self.state_key, {})
+        state["in_progress"] = False
+        state["completed"] = False
+        pstate[self.state_key] = state
+
+
+class BackgroundTaskManager:
+    """
+    Orchestrates non-critical background tasks (docstrings, summaries, RAPTOR, etc.)
+    that run between turns. Tasks are started in outlet() and gracefully stopped
+    at the beginning of inlet().
+
+    Key principles:
+        - Tasks are cancellable via stop_event, but we never cancel them abruptly.
+        - stop_all() waits for running tasks to finish (graceful) with a timeout.
+        - During inlet, no new tasks are started (paused=True).
+        - Tasks respect the global LLM semaphore via LLMOrchestrator.
+        - All writes use _db_enqueue or mark_dirty to avoid races.
+    """
+
+    def __init__(self, filter_ref: "Filter", max_concurrent: int = 5):
+        self._f = filter_ref
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self._stop_events: Dict[str, asyncio.Event] = {}
+        self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._paused = True  # True during inlet; False during outlet
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Public API
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def start(self, name: str, coro, project_id: str, *args, **kwargs) -> None:
+        """
+        Start a background task if it is not already running and if not paused.
+
+        Args:
+            name: Unique identifier for the task (must match a task definition).
+            coro: Coroutine function to run (must accept a stop_event kwarg).
+            project_id: Current project identifier.
+            *args, **kwargs: Additional arguments passed to the coroutine.
+        """
+        # ── Master switch ──
+        if not self._f.valves.enable_background_tasks:
+            self._f._log_debug(
+                f"Background tasks disabled globally; '{name}' not started"
+            )
+            return
+
+        async with self._lock:
+            # Avoid duplicate running tasks
+            if name in self._tasks and not self._tasks[name].done():
+                self._f._log_debug(
+                    f"Background task '{name}' already running, skipping"
+                )
+                return
+
+            # Do not start if we are in inlet (paused)
+            if self._paused:
+                self._f._log_debug(
+                    f"Background task '{name}' not started (inlet paused)"
+                )
+                return
+
+            # Do not exceed concurrency limit
+            if len(self._tasks) >= self._semaphore._value:
+                self._f._log_debug(
+                    f"Background task '{name}' not started: max concurrency reached ({self._semaphore._value})"
+                )
+                return
+
+            # Create a new stop event for this task
+            stop_event = asyncio.Event()
+            self._stop_events[name] = stop_event
+
+            # Mark the task as in_progress in pstate
+            # FIX: Use _task_registry instead of _get_task_definition
+            task_def = self._f._task_registry.get_task_definition(name)
+            if task_def:
+                pstate = self._f._project_state_manager.get_pstate(project_id)
+                task_def.mark_in_progress(pstate)
+
+            # Create and store the task
+            task = asyncio.create_task(
+                self._run_task(name, coro, stop_event, project_id, *args, **kwargs)
+            )
+            self._tasks[name] = task
+            if self._f.valves.bg_task_log_detailed:
+                self._f._log_debug(
+                    f"Background task '{name}' started (concurrency: {len(self._tasks)})"
+                )
+
+    async def stop_all(self, timeout: float = None) -> None:
+        """
+        Gracefully stop all running background tasks.
+
+        Args:
+            timeout: Maximum seconds to wait for graceful shutdown.
+                     If None, uses valve bg_task_stop_timeout.
+        """
+        if timeout is None:
+            timeout = self._f.valves.bg_task_stop_timeout
+
+        async with self._lock:
+            if not self._tasks:
+                return
+
+            self._f._log_debug(
+                f"Stopping {len(self._tasks)} background task(s) gracefully..."
+            )
+
+            # Signal all tasks to stop
+            for name, ev in self._stop_events.items():
+                ev.set()
+                if self._f.valves.bg_task_log_detailed:
+                    self._f._log_debug(f"Sent stop signal to task '{name}'")
+
+            # Wait for tasks to finish gracefully
+            pending = [t for t in self._tasks.values() if not t.done()]
+            if pending:
+                try:
+                    done, pending = await asyncio.wait(pending, timeout=timeout)
+                    self._f._log_debug(
+                        f"{len(done)} task(s) finished gracefully, {len(pending)} still running"
+                    )
+                except asyncio.TimeoutError:
+                    self._f._log_debug(
+                        f"Stop timeout ({timeout}s) reached, {len(pending)} task(s) still running"
+                    )
+
+            # Cancel any remaining tasks (abrupt fallback)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+                    self._f._log_debug("Force-cancelled a background task")
+
+            # Clear task registry
+            self._tasks.clear()
+            self._stop_events.clear()
+
+    def set_paused(self, paused: bool) -> None:
+        """Set the paused state. When paused, start() will not launch new tasks."""
+        self._paused = paused
+        self._f._log_debug(f"Background tasks {'paused' if paused else 'resumed'}")
+
+    def is_running(self, name: str) -> bool:
+        """Check if a specific background task is currently running."""
+        return name in self._tasks and not self._tasks[name].done()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Internal methods
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _run_task(
+        self,
+        name: str,
+        coro,
+        stop_event: asyncio.Event,
+        project_id: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        """
+        Wrapper that runs the actual coroutine and handles exceptions.
+
+        This ensures that the stop_event is passed to the coroutine and that
+        any errors are logged without crashing the manager.
+        """
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        # FIX: Use _task_registry instead of _get_task_definition
+        task_def = self._f._task_registry.get_task_definition(name)
+
+        start_time = time.monotonic()
+        try:
+            # Acquire semaphore (concurrency control)
+            async with self._semaphore:
+                await coro(*args, stop_event=stop_event, **kwargs)
+
+            # Mark as completed if not cancelled
+            if task_def and not stop_event.is_set():
+                task_def.mark_completed(pstate, project_id)
+            elif task_def and stop_event.is_set():
+                task_def.mark_not_completed(pstate)
+
+            duration = time.monotonic() - start_time
+            if self._f.valves.bg_task_measure_performance:
+                self._f._log_debug(
+                    f"Background task '{name}' finished cleanly (duration: {duration:.2f}s)"
+                )
+            else:
+                self._f._log_debug(f"Background task '{name}' finished cleanly")
+        except asyncio.CancelledError:
+            # If cancelled, mark as not completed so it can be retried
+            if task_def:
+                task_def.mark_not_completed(pstate)
+            duration = time.monotonic() - start_time
+            if self._f.valves.bg_task_measure_performance:
+                self._f._log_debug(
+                    f"Background task '{name}' was cancelled (duration: {duration:.2f}s)"
+                )
+            else:
+                self._f._log_debug(f"Background task '{name}' was cancelled")
+            raise
+        except Exception as e:
+            duration = time.monotonic() - start_time
+            self._f._log_debug(
+                f"Background task '{name}' failed after {duration:.2f}s: {e}"
+            )
+            if task_def:
+                task_def.mark_not_completed(pstate)
+        finally:
+            # Clean up registry
+            async with self._lock:
+                self._tasks.pop(name, None)
+                self._stop_events.pop(name, None)
 
 
 class SemanticSeedInferencer:
@@ -22794,6 +23235,407 @@ Output only "YES" or "NO". When uncertain, output YES.
         return seeds
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# TaskRegistry — Definición y orquestación de tareas lazy + background
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TaskRegistry:
+    """
+    Registry and orchestrator for all background/lazy tasks.
+
+    Responsibilities:
+        - Defines all tasks with their metadata (priority, valves, functions).
+        - Validates and orders tasks based on priority valves.
+        - Manages task completion status via pstate.
+        - Executes lazy (on-demand) tasks in the inlet.
+        - Provides the list of background tasks to the outlet.
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialize the registry with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
+        self._f = filter_ref
+        self._bg_tasks: List[BackgroundTask] = self._build_tasks()
+        self._validate_and_order()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. Task definitions
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _build_tasks(self) -> List[BackgroundTask]:
+        """
+        Build the list of background task definitions.
+
+        Each task defines:
+            - A unique name and state key for persistent status in pstate.
+            - Optional lazy and background functions.
+            - An invalidation function that returns a hash to invalidate
+              the 'completed' status when the code changes.
+            - Valves to enable/disable each mode independently.
+            - A priority for background execution order.
+            - A flag to skip lazy execution if already completed.
+
+        Returns:
+            List[BackgroundTask]: The list of task definitions.
+        """
+        tasks = [
+            # ── 1. Session summary (highest priority: controls context size) ──
+            BackgroundTask(
+                name="session_summary",
+                state_key="bg_session_summary_state",
+                lazy_func=self._lazy_session_summary,
+                bg_func=self._f._enrichment.run_session_summary_task,
+                invalidation_func=None,
+                valve_bg="enable_bg_session_summary",
+                valve_lazy="enable_lazy_session_summary",
+                priority=1,
+                skip_if_completed=True,
+            ),
+            # ── 2. Speculative prefetch ──────────────────────────────────────
+            BackgroundTask(
+                name="prefetch",
+                state_key="bg_prefetch_state",
+                lazy_func=self._lazy_prefetch,
+                bg_func=self._f._activation.speculative_prefetch_background,
+                invalidation_func=lambda pid: self._f._activation.compute_code_state_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_prefetch",
+                valve_lazy="enable_lazy_prefetch",
+                priority=2,
+                skip_if_completed=True,
+            ),
+            # ── 3. Docstrings (lower priority, can be generated lazily) ───────
+            BackgroundTask(
+                name="docstrings",
+                state_key="bg_docstrings_state",
+                lazy_func=self._lazy_docstrings,
+                bg_func=self._f._enrichment._docstring_generation_loop,
+                invalidation_func=lambda pid: self._f._symbol_index.compute_structure_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_docstrings",
+                valve_lazy="enable_lazy_docstrings",
+                priority=3,
+                skip_if_completed=True,
+            ),
+            # ── 4. RAPTOR rebuild ─────────────────────────────────────────────
+            BackgroundTask(
+                name="raptor",
+                state_key="bg_raptor_state",
+                lazy_func=self._lazy_raptor,
+                bg_func=self._f._raptor.rebuild,
+                invalidation_func=lambda pid: self._f._symbol_index.compute_structure_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_raptor",
+                valve_lazy="enable_lazy_raptor",
+                priority=4,
+                skip_if_completed=True,
+            ),
+            # ── 5. Purge old versions (experimental, disabled by default) ──
+            BackgroundTask(
+                name="purge",
+                state_key="bg_purge_state",
+                lazy_func=self._lazy_purge,
+                bg_func=self._f._pager.purge_old_versions,
+                invalidation_func=lambda pid: self._f._activation.compute_code_state_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_purge",
+                valve_lazy="enable_lazy_purge",
+                priority=5,
+                skip_if_completed=True,
+            ),
+            # ── 6. LOD adaptive (invalidated every turn via message_count) ──
+            BackgroundTask(
+                name="lod_adaptive",
+                state_key="bg_lod_state",
+                lazy_func=self._lazy_lod,
+                bg_func=self._f._enrichment.update_lod_thresholds_from_response,
+                invalidation_func=lambda pid: str(
+                    self._f._conversation_state_manager.get(pid).message_count
+                ),
+                valve_bg="enable_bg_lod",
+                valve_lazy="enable_lazy_lod",
+                priority=6,
+                skip_if_completed=False,  # Always invalidated by message_count
+            ),
+        ]
+        return tasks
+
+    def _validate_and_order(self) -> None:
+        """
+        Validate the background_priority valve and order tasks by priority.
+
+        - Warns about unknown task names in the valve.
+        - Applies effective priority from the valve (or uses default).
+        - Sorts tasks in descending priority order (higher first).
+        """
+        # ── 1. Validate keys ──
+        valid_names = {t.name for t in self._bg_tasks}
+        for name in self._f.valves.background_priority:
+            if name not in valid_names:
+                self._f._log_debug(
+                    f"WARNING: background_priority contains unknown task '{name}'"
+                )
+
+        # ── 2. Apply effective priority ──
+        for task in self._bg_tasks:
+            task._effective_priority = self._f.valves.background_priority.get(
+                task.name, task.priority
+            )
+
+        # ── 3. Sort by effective priority (higher first) ──
+        self._bg_tasks.sort(key=lambda t: -t._effective_priority)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 2. Public API for Filter
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def get_background_tasks(self) -> List[BackgroundTask]:
+        """
+        Return the list of background tasks in execution order (priority order).
+
+        Returns:
+            List[BackgroundTask]: The ordered list of tasks.
+        """
+        return self._bg_tasks
+
+    def get_task_definition(self, name: str) -> Optional[BackgroundTask]:
+        """
+        Return the task definition for a given name, or None if not found.
+
+        Args:
+            name (str): The task name.
+
+        Returns:
+            Optional[BackgroundTask]: The task definition, or None.
+        """
+        for task in self._bg_tasks:
+            if task.name == name:
+                return task
+        return None
+
+    async def run_lazy_tasks(self, project_id: str, pstate: dict) -> None:
+        """
+        Execute lazy versions of all tasks that are not completed and
+        have their lazy valve enabled.
+
+        This is called at the beginning of the inlet, after background tasks
+        have been stopped.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        for task in self._bg_tasks:
+            # ── 1. Skip if no lazy function ──
+            if task.lazy_func is None:
+                continue
+
+            # ── 2. Check lazy valve ──
+            valve_name = task.valve_lazy
+            if valve_name and not getattr(self._f.valves, valve_name, True):
+                continue
+
+            # ── 3. Skip if completed and allowed ──
+            if task.should_skip_lazy(pstate, project_id):
+                continue
+
+            # ── 4. Execute the lazy function ──
+            try:
+                await task.lazy_func(project_id, pstate)
+                task.mark_completed(pstate, project_id)
+                self._f._log_debug(f"Lazy task '{task.name}' completed successfully")
+            except Exception as e:
+                self._f._log_debug(f"Lazy task '{task.name}' failed: {e}")
+                task.mark_not_completed(pstate)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. Lazy implementations (specific to each task)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _lazy_docstrings(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy generation of docstrings for symbols that are needed in the
+        current turn. This is a lightweight version that only processes
+        symbols that are about to be used (e.g., LOD-2 symbols).
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        # ── 1. Get the current conversation state ──
+        state = self._f._conversation_state_manager.get(project_id)
+        if not state or not state.active_blocks:
+            return
+
+        # ── 2. Determine which symbols need docstrings ──
+        pstate_local = self._f._project_state_manager.get_pstate(project_id)
+        skeleton_qids = set(pstate_local.get("skeleton_tier_qids", []))
+        lod2_qids = set(pstate_local.get("lod2_active_qids_prev", []))
+
+        qids_needed = set()
+        for block in state.active_blocks.values():
+            if block.obsolete:
+                continue
+            for sym in block.symbols:
+                qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                if (qid in skeleton_qids or qid in lod2_qids) and not sym.docstring:
+                    qids_needed.add(qid)
+
+        if not qids_needed:
+            return
+
+        # ── 3. Generate docstrings for the needed symbols ──
+        results = await self._f._enrichment.ensure_docstrings_batch(
+            list(qids_needed), project_id
+        )
+        if results:
+            self._f._log_debug(
+                f"_lazy_docstrings: generated {len(results)} docstrings for this turn"
+            )
+
+    async def _lazy_prefetch(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy prefetch: build CodePathView for symbols mentioned in the query.
+        This is a lightweight version that only builds views for symbols
+        that are explicitly needed now.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        # ── 1. Get the current user query (from pstate) ──
+        query = pstate.get("last_user_query", "")
+        if not query:
+            return
+
+        # ── 2. Build activation graph for the query ──
+        ag = self._f._activation.build_activation_graph(query, project_id)
+
+        # ── 3. For each seed node, build a CodePathView if not already built ──
+        for seed in ag.get_seed_nodes()[:3]:  # Limit to top seeds
+            if not self._f._path_index.get(seed, project_id):
+                await self._f._activation._build_view_from_activation(
+                    seed, ag, project_id
+                )
+
+    async def _lazy_session_summary(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy session summary generation. Executed if not already done in background.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        state = self._f._conversation_state_manager.get(project_id)
+        interval = self._f.valves.session_summary_interval_messages
+        if (
+            interval <= 0
+            or state.message_count % interval != 0
+            or state.message_count == 0
+        ):
+            return
+
+        await self._f._enrichment.run_session_summary_task(
+            {
+                "project_id": project_id,
+                "message_count": state.message_count,
+                "code_state_hash": self._f._activation.compute_code_state_hash(
+                    project_id
+                ),
+            },
+            self._f.valves.llm_model,
+            stop_event=None,  # No stop_event in lazy mode
+        )
+
+    async def _lazy_raptor(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy RAPTOR rebuild. Executed if not already done in background.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        if not self._f.valves.enable_raptor:
+            return
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        graph_weight = (
+            self._f.valves.raptor_graph_weight
+            if self._f.valves.raptor_use_call_graph_proximity
+            else 0.0
+        )
+        await self._f._raptor.rebuild(
+            project_id=project_id,
+            symbol_index=self._f._symbol_index,
+            edges_out=edges_out,
+            n_clusters=self._f.valves.raptor_clusters_per_level,
+            summary_model=self._f.valves.raptor_summary_model,
+            summary_max_tokens=self._f.valves.raptor_summary_max_tokens,
+            chroma_collection=self._f.memory_collection,
+            llm_caller=self._f._llm_orchestrator.call_llm,
+            embedder=self._f.embedder,
+            graph_weight=graph_weight,
+            stop_event=None,  # No stop_event in lazy mode
+        )
+
+    async def _lazy_purge(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy purge of old versions. Executed if not already done in background.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        if (
+            not self._f.valves.purge_old_code_versions_enabled
+            or not self._f.valves.enable_block_paging
+        ):
+            return
+        if self._f._pager is None:
+            return
+        state = self._f._conversation_state_manager.get(project_id)
+        await self._f._pager.purge_old_versions(
+            project_id=project_id,
+            state=state,
+            symbol_index=self._f._symbol_index,
+            chroma_collection=self._f.memory_collection,
+            embedder=self._f.embedder,
+            max_versions_per_file=self._f.valves.purge_old_code_versions_max_per_file,
+            stop_event=None,  # No stop_event in lazy mode
+        )
+
+    async def _lazy_lod(self, project_id: str, pstate: dict) -> None:
+        """
+        Lazy LOD adaptive adjustment. Uses the last assistant response
+        stored in pstate from the previous turn.
+
+        Args:
+            project_id (str): The current project identifier.
+            pstate (dict): The per-project volatile state.
+        """
+        # ── 1. Get the last response ──
+        last_response = pstate.get("last_assistant_response", "")
+        if not last_response:
+            return
+        # Optional: check timestamp to avoid using very old responses
+        ts = pstate.get("last_response_timestamp", 0)
+        if time.time() - ts > 60:  # 1 minute
+            return
+
+        # ── 2. Execute LOD adaptive adjustment ──
+        await self._f._enrichment.update_lod_thresholds_from_response(
+            project_id, last_response, stop_event=None
+        )
+
+
 # ---------------------------------------------------------------------------
 # Valves
 # ---------------------------------------------------------------------------
@@ -22882,37 +23724,33 @@ class Filter:
     class Valves(BaseModel):
         """
         Pydantic model holding every user‑facing configuration valve for
-        the filter, with descriptions, defaults, and constraints.
+        the CodeAware filter.
 
         ============================================================================
-        NAVIGATION INDEX
+        NAVIGATION INDEX (by functional area)
         ============================================================================
-        1.  CONTEXT WINDOW BUDGETS          — token limits for the LLM and context
-        2.  LONG‑TERM MEMORY (LTM)          — ChromaDB, RAPTOR, retrieval
-        3.  CONTEXT COMPRESSION             — LLMLingua, history, code compression
-        4.  SYMBOLGRAPH & ACTIVE CODE       — extraction, indexing, docstrings
-        5.  ACTIVATION GRAPH (PPR / LOD)    — path activation, LOD thresholds, seeds
-        6.  REASONING (CHAIN‑OF‑THOUGHT)    — detection, cascade, generation
-        7.  LLM & ORCHESTRATION             — endpoints, models, multi‑phase
-        8.  INTERACTION & COMMANDS          — explicit commands, suggestions, cleanup
-        9.  SESSION & STATE                 — project, summaries, feedback, cache
-        10. PERFORMANCE & PERSISTENCE       — KV cache, slots, compaction, prefetch
-        11. UTILITIES & TUNING              — debug, dumps, weighting, decay
-        12. ARCHITECTURE MAP                — Block A class outline
-        13. HUB‑BODIES TIER                 — stable full bodies of top hubs
-        14. SEMANTIC SEED INFERENCE         — LLM‑guided LOD‑3 seed selection
-        15. CLASSIFICATION THRESHOLDS       — cascade thresholds for Heuristic → CE → LLM
-            15.1 General
-            15.2 Features 1-4
-            15.3 Features 5-9
-            15.4 Auxiliary features (A-G)
+        1.  CONTEXT WINDOW BUDGETS         — global token limits
+        2.  LLM & ORCHESTRATION            — endpoints, models, multi‑phase
+        3.  SYMBOLGRAPH & ACTIVE CODE      — symbol extraction, indexing, deduplication
+            └── Docstrings & CFG generation  — auto‑generation and batching
+        4.  ARCHITECTURE MAP & HUB‑BODIES  — static class outline and stable hub bodies
+        5.  SEMANTIC SEED INFERENCE        — LLM‑guided seed selection for PPR
+        6.  ACTIVATION GRAPH (PPR / LOD)   — path activation, LOD thresholds, centrality
+        7.  CLASSIFICATION THRESHOLDS      — cascade (Heuristic → CE → LLM) tuning
+        8.  REASONING (CoT)                — chain‑of‑thought detection and generation
+        9.  LONG‑TERM MEMORY (LTM)         — ChromaDB, RAPTOR, retrieval
+        10. CONTEXT COMPRESSION            — history, code, and summary compression
+        11. SESSION & STATE                — project, summaries, feedback, cache
+        12. PERFORMANCE & PERSISTENCE      — KV slots, paging, edge persistence
+        13. INTERACTION & COMMANDS         — slash commands, suggestions, cleanup
+        14. UTILITIES & TUNING             — debug, context dumps, weighting
+        15. LAZY + BACKGROUND TASKS        — master switch and per‑task controls
         ============================================================================
         """
 
         # ═════════════════════════════════════════════════════════════════════════
         # 1. CONTEXT WINDOW BUDGETS
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Core capacity ────────────────────────────────────────────
         context_window_tokens: int = Field(
             default=262000,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
@@ -22927,18 +23765,13 @@ class Filter:
             default=120000,
             description="Hard cap for ALL system injections (Block A + Block B). 0 = disabled.",
         )
-
-        # ── Per‑component budgets ────────────────────────────────────
         active_context_max_tokens: int = Field(
             default=15000,
             description="Maximum tokens for LOD‑activated code context in Block B.",
         )
         history_max_tokens: int = Field(
             default=24000,
-            description=(
-                "Maximum tokens for conversation history (non‑system messages). "
-                "0 = disabled."
-            ),
+            description="Maximum tokens for conversation history (non‑system messages). 0 = disabled.",
         )
         ltm_retrieval_max_tokens: int = Field(
             default=6000,
@@ -22948,8 +23781,6 @@ class Filter:
             default=2500,
             description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
         )
-
-        # ── Per‑block limits ─────────────────────────────────────────
         max_code_block_tokens: int = Field(
             default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited.",
@@ -22958,8 +23789,6 @@ class Filter:
             default="summarize",
             description="Action when a block exceeds max_code_block_tokens: 'warn', 'truncate', or 'summarize'.",
         )
-        code_block_truncate_keep_head: int = Field(default=50)
-        code_block_truncate_keep_tail: int = Field(default=50)
         code_block_warn_message: str = Field(
             default="[Code block too large - truncated by system]"
         )
@@ -22973,19 +23802,748 @@ class Filter:
         )
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 2. LONG‑TERM MEMORY (LTM)
+        # 2. LLM & ORCHESTRATION
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Storage (ChromaDB) ───────────────────────────────────────
+        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
+        LLM_API_TOKEN: str = Field(default="")
+        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
+        llamacpp_endpoint_type: str = Field(default="chat")
+        llm_request_timeout: int = Field(default=900)
+        llm_per_call_timeout: int = Field(default=900, ge=1)
+        llm_retry_total_timeout: int = Field(default=950, ge=10)
+        LLM_CACHE_TTL: int = Field(default=300)
+        LLM_CACHE_MAX_SIZE: int = Field(default=100)
+
+        # ── Auxiliary models ──────────────────────────────────────────────────
+        code_block_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+        )
+        session_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+        )
+        natural_language_forget_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+        )
+
+        # ── Multi‑phase response ─────────────────────────────────────────────
+        enable_multi_phase_response: bool = Field(default=True)
+        force_multi_phase_response: bool = Field(
+            default=False,
+            description="Force multi‑phase protocol even when budget is not tight.",
+        )
+        multi_phase_effective_max_tokens: int = Field(
+            default=8000,
+            ge=1000,
+            le=200000,
+            description="Tokens per part in multi‑phase mode.",
+        )
+        multi_phase_response_threshold: int = Field(
+            default=7000,
+            ge=0,
+            le=200000,
+            description="Available tokens below which multi‑phase is activated.",
+        )
+        multi_phase_response_budget_warn: int = Field(
+            default=800,
+            ge=500,
+            le=40000,
+            description="Tokens below which a wrap‑up hint is appended to the user message.",
+        )
+        auto_budget_context_for_parts: bool = Field(default=True)
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 3. SYMBOLGRAPH & ACTIVE CODE
+        # ═════════════════════════════════════════════════════════════════════════
+        # ── Extraction & detection ──────────────────────────────────────────
+        enable_code_awareness: bool = Field(default=True)
+        auto_detect_code_blocks: bool = Field(default=True)
+        code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
+        track_file_paths: bool = Field(default=True)
+        file_path_pattern: str = Field(
+            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
+        )
+        track_line_numbers: bool = Field(default=True)
+        exclude_filter_internals: bool = Field(default=True)
+
+        # ── Call‑graph extraction ────────────────────────────────────────────
+        enable_call_graph_extraction: bool = Field(default=True)
+        enable_data_flow_analysis: bool = Field(default=True)
+
+        # ── Docstrings & CFG generation ─────────────────────────────────────
+        enable_auto_docstrings: bool = Field(
+            default=True,
+            description="Automatically generate missing docstrings using the LLM (both lazy and background).",
+        )
+        enable_cfg_skeletons: bool = Field(
+            default=True,
+            description="Generate control‑flow skeletons (branches preserved, bodies elided) "
+            "for LOD2 symbols in refactor or high‑debug‑intent queries.",
+        )
+        cfg_skeleton_debug_intent_threshold: float = Field(
+            default=0.4,
+            ge=0.0,
+            le=1.0,
+            description="Minimum debug intent weight to trigger CFG skeleton injection.",
+        )
+        cfg_skeleton_max_lines: int = Field(
+            default=40,
+            ge=5,
+            description="Skip CFG generation for functions with > this many lines.",
+        )
+
+        # ── Docstring batching (lazy / background) ──────────────────────────
+        lazy_docstring_max_per_turn: int = Field(
+            default=8,
+            ge=0,
+            description="Maximum docstrings generated on‑demand (lazy) per turn. 0 = unlimited.",
+        )
+        lazy_docstring_batch_size: int = Field(
+            default=8,
+            ge=1,
+            le=20,
+            description="Number of symbols per lazy docstring batch (foreground).",
+        )
+        docstring_bg_batch_size: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Number of symbols per background docstring batch.",
+        )
+
+        # ── Block deduplication ──────────────────────────────────────────────
+        code_similarity_threshold: float = Field(default=0.85)
+        enable_ast_deduplication: bool = Field(default=True)
+        auto_remove_duplicate_blocks: bool = Field(default=True)
+        max_duplicate_age_hours: float = Field(default=6.0)
+
+        # ── Active block management ──────────────────────────────────────────
+        max_active_blocks: int = Field(default=0, ge=0)
+        max_base_code_blocks: int = Field(default=3)
+        max_proposed_changes: int = Field(default=5)
+        max_committed_changes: int = Field(default=10)
+        prioritize_recent_code: bool = Field(default=True)
+        enable_obsolete_marking: bool = Field(default=True)
+        max_obsolete_versions_per_file: int = Field(
+            default=3,
+            ge=0,
+            description="N most recent obsolete versions kept per file. 0 = remove immediately.",
+        )
+
+        # ── Diffs & commits ──────────────────────────────────────────────────
+        enable_diff_application: bool = Field(default=True)
+        diff_pattern: str = Field(
+            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
+        )
+        commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 4. ARCHITECTURE MAP & HUB‑BODIES TIER
+        # ═════════════════════════════════════════════════════════════════════════
+        enable_architecture_map: bool = Field(
+            default=True,
+            description="Inject a compact class→methods outline into Block A.",
+        )
+        architecture_map_max_tokens: int = Field(
+            default=0,
+            ge=0,
+            description="Token budget for the class outline section. 0 = unlimited.",
+        )
+        enable_hub_callees: bool = Field(
+            default=True,
+            description="Show outgoing calls ('→ calls:') for hub symbols alongside incoming callers.",
+        )
+
+        # ── Hub‑Bodies Tier (stable full bodies of top hubs) ───────────────
+        enable_hub_bodies_tier: bool = Field(
+            default=True,
+            description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
+        )
+        hub_bodies_tier_top_n: int = Field(
+            default=7, ge=1, le=20, description="Number of top hubs to include."
+        )
+        hub_bodies_tier_min_centrality: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description="Minimum centrality score to qualify. 0.0 = no floor.",
+        )
+        hub_bodies_tier_max_tokens: int = Field(
+            default=10000,
+            ge=500,
+            description="Token budget for the entire tier. Auto‑capped to 6000 if multi‑phase is active.",
+        )
+        hub_bodies_tier_max_body_tokens: int = Field(
+            default=1500,
+            ge=200,
+            description="Maximum tokens for an individual hub body. Larger hubs go via LoD.",
+        )
+        hub_bodies_tier_protect_from_paging: bool = Field(
+            default=True,
+            description="Prevent code blocks that contain hubs in the tier from being paged out.",
+        )
+        hub_bodies_tier_recency_pointers: bool = Field(
+            default=True,
+            description="Include recency pointers for hub seeds in Block B.",
+        )
+        hub_bodies_tier_warmup_on_ingestion: bool = Field(
+            default=False,
+            description="Background prefill of the stable prefix (Block A + tier) after silent ingestion.",
+        )
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 5. SEMANTIC SEED INFERENCE
+        # ═════════════════════════════════════════════════════════════════════════
+        seed_inference_mode: str = Field(
+            default="auto", description="'auto', 'always', or 'off'."
+        )
+        seed_inference_model: str = Field(
+            default="", description="Model for seed inference. Empty = use llm_model."
+        )
+        seed_inference_min_lexical: int = Field(
+            default=2,
+            ge=0,
+            description="In 'auto' mode: infer if the query names fewer than N symbols literally.",
+        )
+        seed_inference_min_chars: int = Field(
+            default=15, ge=0, description="Minimum query length to trigger inference."
+        )
+        seed_inference_max_symbols: int = Field(
+            default=12, ge=1, le=40, description="Maximum symbols seeded by inference."
+        )
+        seed_inference_score: float = Field(
+            default=0.85,
+            ge=0.1,
+            le=1.0,
+            description="Seed score assigned to LLM‑validated symbols ( > lod3_threshold guarantees LOD‑3).",
+        )
+        seed_inference_skeleton_max_tokens: int = Field(
+            default=6000,
+            ge=500,
+            description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
+        )
+        seed_inference_max_tokens: int = Field(
+            default=200, ge=50, description="Token cap for the planner's response."
+        )
+        seed_inference_fuzzy_threshold: float = Field(
+            default=0.85,
+            ge=0.6,
+            le=1.0,
+            description="Minimum token_set_ratio for fuzzy matching of hallucinated ids.",
+        )
+        seed_inference_fuzzy_penalty: float = Field(
+            default=0.8,
+            ge=0.5,
+            le=1.0,
+            description="Score multiplier for symbols found via fuzzy matching.",
+        )
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 6. ACTIVATION GRAPH (PPR / LOD)
+        # ═════════════════════════════════════════════════════════════════════════
+        enable_path_analysis: bool = Field(default=True)
+        path_activation_threshold: float = Field(default=0.13, ge=0.01, le=1.0)
+        path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+        path_propagation_steps: int = Field(default=6, ge=1, le=8)
+        path_summary_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+        )
+        path_summary_max_tokens: int = Field(default=80)
+
+        # ── LOD thresholds ──────────────────────────────────────────────────
+        lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
+        lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+        lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+        enable_semantic_lod3_filter: bool = Field(
+            default=True,
+            description="Use CrossEncoder + LLM cascade to filter blocks for LOD‑3 based on semantic relevance.",
+        )
+
+        # ── LOD by use case ─────────────────────────────────────────────────
+        enable_lod_by_intent: bool = Field(
+            default=True,
+            description="Tune LOD policy per use case (Architecture, Planning, Programming, Refactor, Scaffolding).",
+        )
+        lod_intent_explicit_override: bool = Field(
+            default=True,
+            description="Allow explicit command prefix (/arch, /plan, /code, /refactor, /scaffold) to force the use case.",
+        )
+        lod_intent_refactor_callers_max: int = Field(
+            default=12,
+            ge=0,
+            description="Max direct callers pulled into Block B at LOD‑1 for refactor (case D). 0 = unlimited.",
+        )
+        lod2_exit_ratio: float = Field(
+            default=0.60,
+            ge=0.3,
+            le=0.9,
+            description="Fraction of lod2_threshold used as the exit threshold for LOD‑2 hysteresis.",
+        )
+
+        # ── Centrality ──────────────────────────────────────────────────────
+        enable_centrality_prior: bool = Field(default=True)
+        enable_centrality_lod_bump: bool = Field(default=True)
+        centrality_lod_bump_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+        centrality_lod_bump_weight: float = Field(default=0.15, ge=0.0, le=0.5)
+
+        # ── Seeds ──────────────────────────────────────────────────────────
+        enable_traceback_activation: bool = Field(default=True)
+        enable_history_seeds: bool = Field(default=True)
+        history_seeds_lookback: int = Field(default=6, ge=2, le=20)
+        history_seeds_max_boost: float = Field(default=0.6, ge=0.1, le=0.9)
+        enable_multi_seed_activation: bool = Field(default=True)
+        multi_seed_weight_lexical: float = Field(default=0.5, ge=0.0, le=1.0)
+        multi_seed_weight_structural: float = Field(default=0.3, ge=0.0, le=1.0)
+        multi_seed_weight_historical: float = Field(default=0.2, ge=0.0, le=1.0)
+        ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
+
+        # ── LOD adaptation ──────────────────────────────────────────────────
+        enable_lod_adaptive: bool = Field(default=True)
+        lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
+        lod_adapt_min: float = Field(default=0.25, ge=0.1, le=0.5)
+        lod_adapt_max: float = Field(default=0.75, ge=0.5, le=0.95)
+        lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
+        lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
+
+        # ── Call Graph Mode Resolution ─────────────────────────────────────
+        full_graph_min_free_token_ratio: float = Field(
+            default=0.38,
+            ge=0.0,
+            le=1.0,
+            description="Minimum ratio of free tokens (after Block A/B) to enable full_graph mode.",
+        )
+        expanded_hubs_min_free_token_ratio: float = Field(
+            default=0.076,
+            ge=0.0,
+            le=1.0,
+            description="Minimum ratio of free tokens to enable expanded_hubs mode.",
+        )
+        call_graph_context_mode: str = Field(
+            default="auto",
+            description="'auto', 'hubs_only', 'expanded_hubs', or 'full_graph'.",
+        )
+        call_graph_auto_full_graph_symbol_ceiling: int = Field(
+            default=300,
+            ge=10,
+            description="Max symbols in project to auto‑select full_graph.",
+        )
+        call_graph_auto_expanded_hubs_symbol_ceiling: int = Field(
+            default=1000,
+            ge=50,
+            description="Max symbols in project to auto‑select expanded_hubs.",
+        )
+        full_graph_max_tokens: int = Field(
+            default=20000, ge=1000, description="Token budget for full_graph mode."
+        )
+        expanded_hubs_max_tokens: int = Field(
+            default=4000, ge=500, description="Token budget for expanded_hubs mode."
+        )
+        call_graph_mode_downgrade_after_turns: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="Turns to keep upgraded mode before downgrading.",
+        )
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 7. CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM cascade)
+        # ═════════════════════════════════════════════════════════════════════════
+        # For each classification task, the cascade works as follows:
+        # 1. Heuristic reinforcement (keyword boosts) is applied to CE scores.
+        # 2. If the difference between top two CE scores >= CE_THRESHOLD → trust CE.
+        # 3. If diff < LLM_THRESHOLD → call LLM with CE context.
+        # 4. Otherwise (middle zone) → use heuristic fallback.
+        #
+        # The `heuristic_reinforcement_weight` multiplies all heuristic boosts.
+
+        heuristic_reinforcement_weight: float = Field(
+            default=1.0,
+            ge=0.0,
+            le=2.0,
+            description="Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores).",
+        )
+
+        # ── Session classification ─────────────────────────────────────────
+        session_classify_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for session classification.",
+        )
+        session_classify_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for session classification.",
+        )
+
+        # ── Code‑only detection ─────────────────────────────────────────────
+        code_only_ce_threshold: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for code‑only detection.",
+        )
+        code_only_llm_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for code‑only detection.",
+        )
+
+        # ── Seed extraction ─────────────────────────────────────────────────
+        seed_extract_ce_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for seed extraction.",
+        )
+        seed_extract_llm_threshold: float = Field(
+            default=0.10,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for seed extraction.",
+        )
+
+        # ── LTM deduplication ───────────────────────────────────────────────
+        ltm_dedup_ce_threshold: float = Field(
+            default=0.40,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for LTM deduplication.",
+        )
+        ltm_dedup_llm_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for LTM deduplication.",
+        )
+
+        # ── Code history compression ────────────────────────────────────────
+        code_history_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for code history compression.",
+        )
+        code_history_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for code history compression.",
+        )
+
+        # ── Intent classification ───────────────────────────────────────────
+        intent_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for intent classification.",
+        )
+        intent_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for intent classification.",
+        )
+
+        # ── Semantic seed inference (gate) ──────────────────────────────────
+        seed_infer_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for seed inference decision.",
+        )
+        seed_infer_llm_threshold: float = Field(
+            default=0.10,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for seed inference.",
+        )
+
+        # ── LOD‑3 block relevance filtering ─────────────────────────────────
+        lod3_relevance_ce_threshold: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for LOD‑3 block relevance.",
+        )
+        lod3_relevance_llm_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for LOD‑3 block relevance.",
+        )
+
+        # ── FULL vs SUMMARY decision ────────────────────────────────────────
+        keep_full_code_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for FULL vs SUMMARY decision.",
+        )
+        keep_full_code_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for FULL vs SUMMARY decision.",
+        )
+
+        # ── Natural language intents (forget, pin, obsolete) ───────────────
+        nl_intent_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for natural language intent detection.",
+        )
+        nl_intent_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for natural language intent detection.",
+        )
+
+        # ── Contradiction detection ─────────────────────────────────────────
+        contradiction_ce_threshold: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for contradiction detection.",
+        )
+        contradiction_llm_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for contradiction detection.",
+        )
+
+        # ── Duplicate question detection ────────────────────────────────────
+        duplicate_ce_threshold: float = Field(
+            default=0.40,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for duplicate question detection.",
+        )
+        duplicate_llm_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for duplicate question detection.",
+        )
+
+        # ── Use case classification ─────────────────────────────────────────
+        use_case_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for use case classification.",
+        )
+        use_case_llm_threshold: float = Field(
+            default=0.12,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for use case classification.",
+        )
+
+        # ── Call graph mode resolution ──────────────────────────────────────
+        graph_mode_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for call graph mode resolution.",
+        )
+        graph_mode_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for call graph mode resolution.",
+        )
+
+        # ── Block paging decision ───────────────────────────────────────────
+        paging_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for block paging decision.",
+        )
+        paging_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for block paging decision.",
+        )
+
+        # ── Purge old versions decision ─────────────────────────────────────
+        purge_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for purge decision.",
+        )
+        purge_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for purge decision.",
+        )
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 8. REASONING (Chain‑of‑Thought)
+        # ═════════════════════════════════════════════════════════════════════════
+        auto_cot_enabled: bool = Field(
+            default=True,
+            description="Enable automatic CoT detection. If disabled, CoT is only available via /think.",
+        )
+        enable_cot_on_demand: bool = Field(
+            default=True, description="Allow manual CoT activation via /think command."
+        )
+        enable_cot_llm_detection: bool = Field(
+            default=True,
+            description="Use CrossEncoder + LLM cascade for CoT detection; if False, use heuristic only.",
+        )
+        auto_cot_min_chars: int = Field(
+            default=0,
+            ge=0,
+            description="Minimum chars in user message to trigger auto CoT detection. 0 = always run.",
+        )
+        enable_cot_expand_resolution: bool = Field(
+            default=True,
+            description="Auto‑resolve /expand <Name> hints emitted by architecture CoT.",
+        )
+        cot_expand_max_symbols: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="Maximum /expand hints resolved per CoT turn.",
+        )
+        cot_expand_max_tokens: int = Field(
+            default=3000,
+            ge=200,
+            description="Token budget for all auto‑resolved expansions combined.",
+        )
+
+        # ── CoT cascade ─────────────────────────────────────────────────────
+        enable_cot_cascade: bool = Field(
+            default=True,
+            description="Use CrossEncoder as advisor to the LLM for CoT detection; if False, use LLM alone.",
+        )
+        cot_cascade_uncertainty_threshold: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff between top two CE scores to trust CE; below this, call LLM.",
+        )
+        enable_cot_heuristic_reinforcement: bool = Field(
+            default=True,
+            description="Apply keyword‑based heuristic reinforcement to CE scores before the confidence check.",
+        )
+
+        # ── Generation models ──────────────────────────────────────────────
+        cot_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used for CoT level 1 (inline reasoning prompt).",
+        )
+        cot_model_level2: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
+        )
+        cot_model_level3: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            description="Model used for CoT level 3 (scientific multi‑hypothesis).",
+        )
+
+        # ── Architecture‑mode ──────────────────────────────────────────────
+        enable_skeleton_cot: bool = Field(
+            default=True,
+            description="For architecture/design/refactor queries, use the code skeleton (contracts only) as context.",
+        )
+        skeleton_cot_max_tokens: int = Field(
+            default=1600,
+            ge=200,
+            le=2000,
+            description="Token budget for the architecture reasoning chain.",
+        )
+        enable_skeleton_ltm: bool = Field(
+            default=True,
+            description="Store the generated skeleton in LTM for future sessions.",
+        )
+        skeleton_ltm_expiration_days: int = Field(
+            default=14,
+            ge=0,
+            description="How long to keep skeleton snapshots in LTM. 0 = never expire.",
+        )
+        enable_scientific_arch_reasoning: bool = Field(
+            default=True,
+            description="At CoT level 3, use multi‑hypothesis scientific reasoning on the skeleton.",
+        )
+
+        # ── Scientific method (Level 3) ─────────────────────────────────────
+        enforce_scientific_method: bool = Field(
+            default=False,
+            description="Force level 3 scientific reasoning for all queries (very slow, very thorough).",
+        )
+        scientific_hypotheses_count: int = Field(
+            default=3,
+            ge=2,
+            le=6,
+            description="Number of hypotheses generated in scientific reasoning.",
+        )
+        scientific_confidence_threshold: float = Field(
+            default=0.75,
+            ge=0.0,
+            le=1.0,
+            description="Minimum combined score to stop hypothesis refinement early.",
+        )
+        scientific_max_iterations: int = Field(
+            default=2,
+            ge=1,
+            le=4,
+            description="Maximum refinement iterations for scientific reasoning.",
+        )
+
+        # ── Complementary features ─────────────────────────────────────────
+        enable_step_back_prompting: bool = Field(
+            default=True,
+            description="Generate step‑back architectural context before CoT reasoning.",
+        )
+        step_back_always: bool = Field(
+            default=False,
+            description="Always use step‑back prompting, even for non‑debug queries.",
+        )
+        step_back_max_tokens: int = Field(
+            default=150,
+            ge=50,
+            le=400,
+            description="Maximum tokens for step‑back context generation.",
+        )
+        enable_contradiction_detection: bool = Field(
+            default=True,
+            description="Detect if the last user message contradicts the conversation history.",
+        )
+        contradiction_detection_model: str = Field(
+            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+        )
+        contradiction_inject_warning: bool = Field(
+            default=True,
+            description="Inject a warning in the system prompt if a contradiction is detected.",
+        )
+        enable_confidence_scoring: bool = Field(
+            default=True,
+            description="Request a confidence score at the end of each response.",
+        )
+        confidence_prompt: str = Field(
+            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
+            description="Suffix appended to system prompt to request confidence score.",
+        )
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 9. LONG‑TERM MEMORY (LTM)
+        # ═════════════════════════════════════════════════════════════════════════
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
         long_term_memory_expiration_days: int = Field(default=30)
         ltm_store_only_code_sessions: bool = Field(default=True)
-
-        # ── Retrieval ─────────────────────────────────────────────────
         long_term_memory_top_k: int = Field(default=10)
         long_term_memory_similarity_threshold: float = Field(default=0.65)
         ltm_time_decay_hours: float = Field(default=12.0)
-
-        # ── Symbol indexing in LTM ──────────────────────────────────
         ltm_index_symbols_enabled: bool = Field(default=True)
         ltm_symbol_index_max_per_message: int = Field(default=20)
         ltm_symbol_boost_enabled: bool = Field(default=True)
@@ -22994,13 +24552,13 @@ class Filter:
         ltm_symbol_force_mode_enabled: bool = Field(default=False)
         ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
 
-        # ── Augmented retrieval ──────────────────────────────────────
+        # ── Augmented retrieval ─────────────────────────────────────────────
         enable_multi_query_retrieval: bool = Field(default=False)
         multi_query_variants: int = Field(default=2, ge=1, le=4)
         enable_contextual_retrieval: bool = Field(default=True)
         contextual_retrieval_mode: str = Field(default="metadata")
 
-        # ── Reranking ─────────────────────────────────────────────────
+        # ── Reranking ───────────────────────────────────────────────────────
         enable_reranking: bool = Field(default=True)
         reranker_model: str = Field(
             default="Qwen/Qwen3-Reranker-0.6B",
@@ -23008,7 +24566,7 @@ class Filter:
         )
         reranker_top_k: int = Field(default=5)
 
-        # ── RAPTOR (hierarchical clustering) ─────────────────────────
+        # ── RAPTOR ──────────────────────────────────────────────────────────
         enable_raptor: bool = Field(
             default=True,
             description="Enable RAPTOR hierarchical clustering of code symbols for faster LTM retrieval.",
@@ -23031,9 +24589,9 @@ class Filter:
         )
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 3. CONTEXT COMPRESSION
+        # 10. CONTEXT COMPRESSION
         # ═════════════════════════════════════════════════════════════════════════
-        # ── History compression (LLMLingua) ──────────────────────────
+        # ── History compression (LLMLingua) ────────────────────────────────
         enable_history_llmlingua: bool = Field(
             default=True,
             description="Apply LLMLingua‑2 compression to conversation history.",
@@ -23064,13 +24622,11 @@ class Filter:
         )
         enable_secondary_compaction: bool = Field(
             default=True,
-            description=(
-                "If True, run LLMLingua (secondary compactor) after the primary "
-                "compactor, restricted to prose that wasn't already summarized."
-            ),
+            description="Run LLMLingua (secondary compactor) after the primary compactor, "
+            "restricted to prose that wasn't already summarized.",
         )
 
-        # ── Code compression (LLMLingua) ─────────────────────────────
+        # ── Code compression (LLMLingua) ────────────────────────────────────
         enable_code_compression: bool = Field(
             default=False,
             description="Apply LLMLingua‑2 compression to individual code blocks in Block B (LOD‑3).",
@@ -23090,7 +24646,7 @@ class Filter:
             description="Preserve tokens relevant to the user's question during code compression.",
         )
 
-        # ── Multi‑phase code history ─────────────────────────────────
+        # ── Multi‑phase code history ────────────────────────────────────────
         enable_code_history_compression: bool = Field(
             default=True,
             description="Replace old multi‑phase code parts with compact commit summaries.",
@@ -23098,11 +24654,8 @@ class Filter:
         code_history_force_compress_after_turns: int = Field(
             default=8,
             ge=0,
-            description=(
-                "If a code-bearing history message stays blocked by the symbol‑index "
-                "ratio for more than this many turns, force‑compress without /expand "
-                "guarantee. 0 = never force."
-            ),
+            description="If a code‑bearing history message stays blocked by the symbol‑index "
+            "ratio for more than this many turns, force‑compress without /expand guarantee. 0 = never.",
         )
         code_history_keep_last_n_parts: int = Field(
             default=3,
@@ -23117,20 +24670,18 @@ class Filter:
             description="Minimum symbol‑index ratio to allow compression.",
         )
 
-        # ── User code in history ─────────────────────────────────────
+        # ── User code in history ────────────────────────────────────────────
         enable_lean_user_code: bool = Field(
             default=True,
-            description=(
-                "Replace large user code blocks in history with a compact stub. "
-                "The full code remains recoverable via /expand or LOD."
-            ),
+            description="Replace large user code blocks in history with a compact stub. "
+            "The full code remains recoverable via /expand or LOD.",
         )
         lean_user_code_min_tokens: int = Field(
             default=12000,
             description="Token threshold above which a user code block is stubbed.",
         )
 
-        # ── Conversation summaries ────────────────────────────────────
+        # ── Conversation summaries ──────────────────────────────────────────
         summarize_old_messages: bool = Field(
             default=True,
             description="Summarise conversation messages that are trimmed from history.",
@@ -23148,98 +24699,138 @@ class Filter:
         )
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 4. SYMBOLGRAPH & ACTIVE CODE
+        # 11. SESSION & STATE
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Extraction & detection ────────────────────────────────────
-        enable_code_awareness: bool = Field(default=True)
-        auto_detect_code_blocks: bool = Field(default=True)
-        code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
-        track_file_paths: bool = Field(default=True)
-        file_path_pattern: str = Field(
-            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
-        )
-        track_line_numbers: bool = Field(default=True)
-        exclude_filter_internals: bool = Field(default=True)
+        project_id: str = Field(default="default")
+        max_cached_projects: int = Field(default=10)
+        state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
+        preserve_tool_calls: bool = Field(default=True)
 
-        # ── Call‑graph extraction ─────────────────────────────────────
-        enable_call_graph_extraction: bool = Field(default=True)
-        enable_data_flow_analysis: bool = Field(default=True)
+        # ── Session summaries ───────────────────────────────────────────────
+        enable_session_summary: bool = Field(default=True)
+        session_summary_interval_messages: int = Field(default=8)
+        session_summary_max_tokens: int = Field(default=200)
 
-        # ── Missing symbol docstrings ─────────────────────────────────
-        enable_auto_docstrings: bool = Field(
-            default=True,
-            description="Automatically generate missing docstrings using the LLM.",
-        )
-        enable_cfg_skeletons: bool = Field(
-            default=True,
-            description=(
-                "Generate control‑flow skeletons (branches preserved, bodies elided) "
-                "for LOD2 symbols in refactor or high‑debug‑intent queries."
-            ),
-        )
-        cfg_skeleton_debug_intent_threshold: float = Field(
-            default=0.4,
-            ge=0.0,
-            le=1.0,
-            description="Minimum debug intent weight to trigger CFG skeleton injection.",
-        )
-        cfg_skeleton_max_lines: int = Field(
-            default=40,
-            ge=5,
-            description="Skip CFG generation for functions with > this many lines.",
-        )
-        lazy_docstring_max_per_turn: int = Field(
-            default=8,
-            ge=0,
-            description="Maximum docstrings generated on‑demand (lazy) per turn. 0 = unlimited.",
-        )
-        lazy_docstring_batch_size: int = Field(
-            default=8,
-            ge=1,
-            le=20,
-            description="Number of symbols per lazy docstring batch (foreground).",
-        )
-        docstring_bg_batch_size: int = Field(
+        # ── Turn‑based window ───────────────────────────────────────────────
+        summarize_batch_turns: int = Field(
             default=5,
             ge=1,
-            le=20,
-            description="Number of symbols per background docstring batch.",
+            le=30,
+            description="Minimum unsummarized turns before generating one summary.",
         )
-        enable_auto_docstrings_background: bool = Field(
+
+        # ── Hierarchical (L1 → L2) consolidation ───────────────────────────
+        enable_hierarchical_summaries: bool = Field(
             default=True,
-            description=(
-                "Launch background tasks to generate missing docstrings. "
-                "Requires --parallel > 1 on the server."
-            ),
+            description="Fold oldest L1 turn summaries into a single L2 summary.",
+        )
+        hierarchical_summary_group_size: int = Field(
+            default=4,
+            ge=2,
+            le=12,
+            description="Number of oldest L1 summaries folded into one L2 summary.",
+        )
+        max_hierarchical_summaries: int = Field(
+            default=2, ge=0, description="Maximum L2 summaries kept. 0 = keep all."
+        )
+        hierarchical_summary_max_tokens: int = Field(
+            default=250,
+            ge=80,
+            le=800,
+            description="Token budget for an L2 consolidated summary.",
         )
 
-        # ── Block deduplication ───────────────────────────────────────
-        code_similarity_threshold: float = Field(default=0.85)
-        enable_ast_deduplication: bool = Field(default=True)
-        auto_remove_duplicate_blocks: bool = Field(default=True)
-        max_duplicate_age_hours: float = Field(default=6.0)
+        # ── Feedback tracking ───────────────────────────────────────────────
+        enable_feedback_tracking: bool = Field(default=True)
+        feedback_history_limit: int = Field(default=10)
+        inject_feedback_context: bool = Field(default=True)
+        feedback_importance_penalty_for_failure: float = Field(default=2.0)
+        preserve_error_context: bool = Field(default=True)
 
-        # ── Active block management ───────────────────────────────────
-        max_active_blocks: int = Field(default=0, ge=0)
-        max_base_code_blocks: int = Field(default=3)
-        max_proposed_changes: int = Field(default=5)
-        max_committed_changes: int = Field(default=10)
-        prioritize_recent_code: bool = Field(default=True)
-        enable_obsolete_marking: bool = Field(default=True)
-        max_obsolete_versions_per_file: int = Field(
-            default=3,
+        # ── Response cache ──────────────────────────────────────────────────
+        enable_response_cache: bool = Field(default=True)
+        response_cache_similarity_threshold: float = Field(default=0.92)
+        response_cache_ttl_hours: float = Field(default=24.0)
+        response_cache_max_entries: int = Field(default=100)
+        response_cache_include_context_hash: bool = Field(default=True)
+
+        # ── Duplicate detection ─────────────────────────────────────────────
+        duplicate_question_threshold: float = Field(default=0.92)
+        duplicate_question_lookback: int = Field(default=20)
+        duplicate_question_lookback_hours: float = Field(default=24.0)
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # 12. PERFORMANCE & PERSISTENCE
+        # ═════════════════════════════════════════════════════════════════════════
+        # ── KV cache (slots) ──────────────────────────────────────────────────
+        enable_kv_cache_stability: bool = Field(default=True)
+        enable_slot_persistence: bool = Field(default=True)
+        slot_save_path: str = Field(default="/kvcache")
+        slot_id: int = Field(default=0, ge=0)
+        slot_save_max_context_tokens: int = Field(
+            default=0,
             ge=0,
-            description="N most recent obsolete versions kept per file. 0 = remove immediately.",
+            description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
         )
 
-        # ── Diffs & commits ───────────────────────────────────────────
-        enable_diff_application: bool = Field(default=True)
-        diff_pattern: str = Field(
-            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
+        # ── Volatility‑tiered context ──────────────────────────────────────
+        enable_skeleton_tier: bool = Field(
+            default=True,
+            description="Inject the project skeleton (signatures) as a stable cache tier inside Block A.",
         )
-        commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
+        skeleton_tier_max_tokens: int = Field(
+            default=0,
+            ge=0,
+            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget → tier skipped.",
+        )
+        skeleton_tier_suppresses_block_b_signatures: bool = Field(
+            default=True,
+            description="When skeleton tier is active, Block B omits bare signatures (LOD‑0/LOD‑1) "
+            "because they are already in the stable tier. Case D (refactor) is exempt.",
+        )
+        skeleton_include_docstrings: bool = Field(
+            default=True,
+            description="Include one‑line docstrings in the skeleton tier.",
+        )
+        emergency_max_turns: int = Field(
+            default=4,
+            ge=1,
+            le=20,
+            description="Turns to keep when an individual turn exceeds budget * 0.8 (emergency cap).",
+        )
 
-        # ── Soft‑eviction ─────────────────────────────────────────────
+        # ── Monotonic compaction ─────────────────────────────────────────────
+        compaction_defer_during_autocontinue: bool = Field(
+            default=True,
+            description="Skip turn‑based summarize/evict while an AutoContinue multi‑part session is active.",
+        )
+
+        # ── Graph persistence ────────────────────────────────────────────────
+        enable_edge_persistence: bool = Field(default=True)
+
+        # ── Speculative prefetch ─────────────────────────────────────────────
+        enable_speculative_prefetch: bool = Field(default=True)
+        speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
+
+        # ── Silent ingestion ──────────────────────────────────────────────────
+        enable_silent_ingestion: bool = Field(default=True)
+
+        # ── DB orphans cleanup ────────────────────────────────────────────────
+        purge_orphaned_data_interval: int = Field(
+            default=10,
+            ge=0,
+            description="Number of turns between automatic purges of orphaned DB rows. 0 = disabled.",
+        )
+
+        # ── AutoContinue watchdog ─────────────────────────────────────────────
+        max_autocontinue_turns: int = Field(
+            default=8,
+            ge=2,
+            le=30,
+            description="Maximum consecutive AutoContinue turns before the watchdog forces a reset.",
+        )
+
+        # ── Soft‑eviction ──────────────────────────────────────────────────────
         enable_block_paging: bool = Field(
             default=True,
             description="Soft‑evict low‑activation blocks to ChromaDB instead of dropping them.",
@@ -23260,10 +24851,10 @@ class Filter:
             default=2,
             ge=1,
             le=16,
-            description="Max concurrent background embedding tasks during page‑out.",
+            description="Max concurrent background embedding tasks during page‑out (overridden by global chroma semaphore).",
         )
 
-        # ── Purge old versions ────────────────────────────────────────
+        # ── Purge old versions ──────────────────────────────────────────────────
         purge_old_code_versions_enabled: bool = Field(
             default=True,
             description="Move code versions beyond the N most recent per file to cold storage.",
@@ -23276,351 +24867,8 @@ class Filter:
         )
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 5. ACTIVATION GRAPH (PPR / LOD)
+        # 13. INTERACTION & COMMANDS
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Path activation ───────────────────────────────────────────
-        enable_path_analysis: bool = Field(default=True)
-        path_activation_threshold: float = Field(default=0.13, ge=0.01, le=1.0)
-        path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-        path_propagation_steps: int = Field(default=6, ge=1, le=8)
-        path_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
-        path_summary_max_tokens: int = Field(default=80)
-
-        # ── LOD thresholds ────────────────────────────────────────────
-        lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
-        lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
-        lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
-
-        # ── LOD-3 semantic filter ──
-        enable_semantic_lod3_filter: bool = Field(
-            default=True,
-            description=(
-                "If True, use CrossEncoder + LLM cascade to filter blocks for LOD-3 "
-                "based on semantic relevance to the query. This improves quality by "
-                "avoiding irrelevant code, but adds latency (CE + occasional LLM)."
-            ),
-        )
-
-        # ── LOD by use case ──────────────────────────────────────────
-        enable_lod_by_intent: bool = Field(
-            default=True,
-            description=(
-                "Tune LOD policy per use case (A architecture, B plans, C programming, "
-                "D refactor, E scaffolding) instead of flat intent‑scaling."
-            ),
-        )
-        lod_intent_explicit_override: bool = Field(
-            default=True,
-            description=(
-                "Allow explicit command prefix (/arch, /plan, /code, /refactor, /scaffold) "
-                "to force the use case."
-            ),
-        )
-        lod_intent_refactor_callers_max: int = Field(
-            default=12,
-            ge=0,
-            description="Max direct callers pulled into Block B at LOD‑1 for refactor (case D). 0 = unlimited.",
-        )
-        lod2_exit_ratio: float = Field(
-            default=0.60,
-            ge=0.3,
-            le=0.9,
-            description=(
-                "Fraction of lod2_threshold used as the exit threshold for LOD‑2 hysteresis. "
-                "Lower values keep symbols in LOD‑2 longer."
-            ),
-        )
-
-        # ── Centrality ────────────────────────────────────────────────
-        enable_centrality_prior: bool = Field(default=True)
-        enable_centrality_lod_bump: bool = Field(default=True)
-        centrality_lod_bump_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-        centrality_lod_bump_weight: float = Field(default=0.15, ge=0.0, le=0.5)
-
-        # ── Seeds ─────────────────────────────────────────────────────
-        enable_traceback_activation: bool = Field(default=True)
-        enable_history_seeds: bool = Field(default=True)
-        history_seeds_lookback: int = Field(default=6, ge=2, le=20)
-        history_seeds_max_boost: float = Field(default=0.6, ge=0.1, le=0.9)
-        enable_multi_seed_activation: bool = Field(default=True)
-        multi_seed_weight_lexical: float = Field(default=0.5, ge=0.0, le=1.0)
-        multi_seed_weight_structural: float = Field(default=0.3, ge=0.0, le=1.0)
-        multi_seed_weight_historical: float = Field(default=0.2, ge=0.0, le=1.0)
-        ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
-
-        # ── LOD adaptation ────────────────────────────────────────────
-        enable_lod_adaptive: bool = Field(default=True)
-        lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
-        lod_adapt_min: float = Field(default=0.25, ge=0.1, le=0.5)
-        lod_adapt_max: float = Field(default=0.75, ge=0.5, le=0.95)
-        lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
-        lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 6. REASONING (CHAIN‑OF‑THOUGHT)
-        # ═════════════════════════════════════════════════════════════════════════
-        #
-        #   1. ACTIVATION & DETECTION   — SI y CÓMO se detecta CoT
-        #   2. CASCADE                  — CrossEncoder + LLM + heuristic
-        #   3. GENERATION               — modelos y límites
-        #   4. ARCHITECTURE‑MODE        — skeleton‑based CoT
-        #   5. SCIENTIFIC METHOD        — nivel 3 (multi‑hipótesis)
-        #   6. COMPLEMENTARY            — step‑back, contradictions, confidence
-        #
-
-        # ── 1. ACTIVATION & DETECTION ──────────────────────────────
-        auto_cot_enabled: bool = Field(
-            default=True,
-            description=(
-                "Enable automatic CoT detection. Adds 5‑20s per turn depending on the "
-                "level determined. If disabled, CoT is only available via /think."
-            ),
-        )
-        enable_cot_on_demand: bool = Field(
-            default=True, description="Allow manual CoT activation via /think command."
-        )
-        enable_cot_llm_detection: bool = Field(
-            default=True,
-            description=(
-                "If True, use CrossEncoder + LLM cascade for CoT detection. "
-                "If False, use only heuristic keyword detection (faster, less precise)."
-            ),
-        )
-        auto_cot_min_chars: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Minimum chars in user message to trigger auto CoT detection. "
-                "0 = always run detection. Not recommended to set > 0 because "
-                "short questions can be deep."
-            ),
-        )
-        enable_cot_expand_resolution: bool = Field(
-            default=True,
-            description=(
-                "Auto‑resolve /expand <Name> hints emitted by architecture CoT: "
-                "retrieve the full symbol body and annotate it directly in the reasoning."
-            ),
-        )
-        cot_expand_max_symbols: int = Field(
-            default=3,
-            ge=1,
-            le=10,
-            description="Maximum /expand hints resolved per CoT turn.",
-        )
-        cot_expand_max_tokens: int = Field(
-            default=3000,
-            ge=200,
-            description="Token budget for all auto‑resolved expansions combined.",
-        )
-
-        # ── 2. CASCADE ──────────────────────────────────────────────
-        enable_cot_cascade: bool = Field(
-            default=True,
-            description=(
-                "If True, use CrossEncoder as advisor to the LLM. "
-                "If False, use LLM alone for CoT detection (slower, more precise)."
-            ),
-        )
-        cot_cascade_uncertainty_threshold: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Minimum difference between top and second CrossEncoder scores to "
-                "trust the result. Below this threshold, the LLM is called with "
-                "CrossEncoder context."
-            ),
-        )
-        enable_cot_heuristic_reinforcement: bool = Field(
-            default=True,
-            description=(
-                "If True, heuristic keyword analysis reinforces the CrossEncoder "
-                "scores before the confidence check. If False, only raw CrossEncoder "
-                "scores are used. Only relevant when enable_cot_cascade=True and "
-                "the CrossEncoder is available."
-            ),
-        )
-
-        # ── 3. GENERATION ────────────────────────────────────────────
-        cot_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model used for CoT level 1 (inline reasoning prompt).",
-        )
-        cot_model_level2: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
-        )
-        cot_model_level3: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model used for CoT level 3 (scientific multi‑hypothesis).",
-        )
-        cot_max_tokens: int = Field(
-            default=2500,
-            ge=100,
-            description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
-        )
-
-        # ── 4. ARCHITECTURE‑MODE ────────────────────────────────────
-        enable_skeleton_cot: bool = Field(
-            default=True,
-            description=(
-                "For architecture / design / refactor queries, use the code "
-                "skeleton (contracts only) as the reasoning context. Produces "
-                "cleaner hypotheses and plans."
-            ),
-        )
-        skeleton_cot_max_tokens: int = Field(
-            default=1600,
-            ge=200,
-            le=2000,
-            description="Token budget for the architecture reasoning chain.",
-        )
-        enable_skeleton_ltm: bool = Field(
-            default=True,
-            description=(
-                "Store the generated skeleton in LTM so future sessions can "
-                "retrieve the architecture without re‑deriving it."
-            ),
-        )
-        skeleton_ltm_expiration_days: int = Field(
-            default=14,
-            ge=0,
-            description="How long to keep skeleton snapshots in LTM. 0 = never expire.",
-        )
-        enable_scientific_arch_reasoning: bool = Field(
-            default=True,
-            description=(
-                "For architecture queries at CoT level 3, use multi‑hypothesis "
-                "scientific reasoning on the skeleton (design options evaluated "
-                "against static evidence)."
-            ),
-        )
-
-        # ── 5. SCIENTIFIC METHOD ────────────────────────────────────
-        enforce_scientific_method: bool = Field(
-            default=False,
-            description=(
-                "If True, force level 3 scientific reasoning for all queries. "
-                "Very slow (adds 15‑30s) but extremely thorough."
-            ),
-        )
-        scientific_hypotheses_count: int = Field(
-            default=3,
-            ge=2,
-            le=6,
-            description="Number of hypotheses generated in scientific reasoning.",
-        )
-        scientific_confidence_threshold: float = Field(
-            default=0.75,
-            ge=0.0,
-            le=1.0,
-            description="Minimum combined score to stop hypothesis refinement early.",
-        )
-        scientific_max_iterations: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-            description="Maximum refinement iterations for scientific reasoning.",
-        )
-
-        # ── 6. COMPLEMENTARY ────────────────────────────────────────
-        enable_step_back_prompting: bool = Field(
-            default=True,
-            description="Generate step‑back architectural context before CoT reasoning.",
-        )
-        step_back_always: bool = Field(
-            default=False,
-            description="Always use step‑back prompting, even for non‑debug queries.",
-        )
-        step_back_max_tokens: int = Field(
-            default=150,
-            ge=50,
-            le=400,
-            description="Maximum tokens for step‑back context generation.",
-        )
-        enable_contradiction_detection: bool = Field(
-            default=True,
-            description="Detect if the last user message contradicts the conversation history.",
-        )
-        contradiction_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model for contradiction detection.",
-        )
-        contradiction_inject_warning: bool = Field(
-            default=True,
-            description="Inject a warning in the system prompt if a contradiction is detected.",
-        )
-        enable_confidence_scoring: bool = Field(
-            default=True,
-            description="Request a confidence score at the end of each response.",
-        )
-        confidence_prompt: str = Field(
-            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
-            description="Suffix appended to system prompt to request confidence score.",
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 7. LLM & ORCHESTRATION
-        # ═════════════════════════════════════════════════════════════════════════
-        # ── Endpoint & main model ────────────────────────────────────
-        LLM_BASE_URL: str = Field(default="http://host.docker.internal:8080")
-        LLM_API_TOKEN: str = Field(default="")
-        llm_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
-        llamacpp_endpoint_type: str = Field(default="chat")
-
-        # ── Timeouts ──────────────────────────────────────────────────
-        llm_request_timeout: int = Field(default=900)
-        llm_per_call_timeout: int = Field(default=900, ge=1)
-        llm_retry_total_timeout: int = Field(default=950, ge=10)
-
-        # ── Caching ───────────────────────────────────────────────────
-        LLM_CACHE_TTL: int = Field(default=300)
-        LLM_CACHE_MAX_SIZE: int = Field(default=100)
-
-        # ── Auxiliary models ──────────────────────────────────────────
-        code_block_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
-        session_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
-        natural_language_forget_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
-        )
-
-        # ── Multi‑phase response ─────────────────────────────────────
-        enable_multi_phase_response: bool = Field(default=True)
-        force_multi_phase_response: bool = Field(
-            default=False,
-            description="Force multi‑phase protocol even when budget is not tight.",
-        )
-        multi_phase_effective_max_tokens: int = Field(
-            default=8000,
-            ge=1000,
-            le=200000,
-            description="Tokens per part in multi‑phase mode.",
-        )
-        multi_phase_response_threshold: int = Field(
-            default=7000,
-            ge=0,
-            le=200000,
-            description="Available tokens below which multi‑phase is activated.",
-        )
-        multi_phase_response_budget_warn: int = Field(
-            default=800,
-            ge=500,
-            le=40000,
-            description="Tokens below which a wrap‑up hint is appended to the user message.",
-        )
-        auto_budget_context_for_parts: bool = Field(default=True)
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 8. INTERACTION & COMMANDS
-        # ═════════════════════════════════════════════════════════════════════════
-        # ── Explicit commands ─────────────────────────────────────────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         outlet_expand_intercept_enabled: bool = Field(default=True)
@@ -23632,12 +24880,12 @@ class Filter:
             description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
         )
 
-        # ── Proactive suggestions ─────────────────────────────────────
+        # ── Proactive suggestions ─────────────────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
         proactive_summary_threshold: float = Field(default=0.95)
 
-        # ── Context cleanup ───────────────────────────────────────────
+        # ── Context cleanup ────────────────────────────────────────────────────
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
         cleanup_excluded_content_types: list = Field(
@@ -23649,180 +24897,16 @@ class Filter:
         cleanup_command_enabled: bool = Field(default=True)
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 9. SESSION & STATE
+        # 14. UTILITIES & TUNING
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Project management ────────────────────────────────────────
-        project_id: str = Field(default="default")
-        max_cached_projects: int = Field(default=10)
-        state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
-        preserve_tool_calls: bool = Field(default=True)
-
-        # ── Session summaries ─────────────────────────────────────────
-        enable_session_summary: bool = Field(default=True)
-        session_summary_interval_messages: int = Field(default=8)
-        session_summary_max_tokens: int = Field(default=200)
-
-        # ── Turn‑based window ─────────────────────────────────────────
-        summarize_batch_turns: int = Field(
-            default=5,
-            ge=1,
-            le=30,
-            description="Minimum unsummarized turns before generating one summary.",
-        )
-
-        # ── Hierarchical (L1 → L2) consolidation ─────────────────────
-        enable_hierarchical_summaries: bool = Field(
-            default=True,
-            description="Fold oldest L1 turn summaries into a single L2 summary.",
-        )
-        hierarchical_summary_group_size: int = Field(
-            default=4,
-            ge=2,
-            le=12,
-            description="Number of oldest L1 summaries folded into one L2 summary.",
-        )
-        max_hierarchical_summaries: int = Field(
-            default=2,
-            ge=0,
-            description="Maximum L2 summaries kept. 0 = keep all.",
-        )
-        hierarchical_summary_max_tokens: int = Field(
-            default=250,
-            ge=80,
-            le=800,
-            description="Token budget for an L2 consolidated summary.",
-        )
-
-        # ── Feedback tracking ─────────────────────────────────────────
-        enable_feedback_tracking: bool = Field(default=True)
-        feedback_history_limit: int = Field(default=10)
-        inject_feedback_context: bool = Field(default=True)
-        feedback_importance_penalty_for_failure: float = Field(default=2.0)
-        preserve_error_context: bool = Field(default=True)
-
-        # ── Response cache ────────────────────────────────────────────
-        enable_response_cache: bool = Field(default=True)
-        response_cache_similarity_threshold: float = Field(default=0.92)
-        response_cache_ttl_hours: float = Field(default=24.0)
-        response_cache_max_entries: int = Field(default=100)
-        response_cache_include_context_hash: bool = Field(default=True)
-
-        # ── Duplicate detection ───────────────────────────────────────
-        duplicate_question_threshold: float = Field(default=0.92)
-        duplicate_question_lookback: int = Field(default=20)
-        duplicate_question_lookback_hours: float = Field(default=24.0)
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 10. PERFORMANCE & PERSISTENCE
-        # ═════════════════════════════════════════════════════════════════════════
-        # ── KV cache (slots) ──────────────────────────────────────────
-        enable_kv_cache_stability: bool = Field(default=True)
-        enable_slot_persistence: bool = Field(default=True)
-        slot_save_path: str = Field(default="/kvcache")
-        slot_id: int = Field(default=0, ge=0)
-        slot_save_max_context_tokens: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Skip slot save when total context exceeds this many tokens. "
-                "0 = no guard."
-            ),
-        )
-
-        # ── Volatility‑tiered context ─────────────────────────────────
-        enable_skeleton_tier: bool = Field(
-            default=True,
-            description=(
-                "Inject the project skeleton (signatures) as a stable cache tier "
-                "inside Block A. Cached by signature_hash; survives body edits."
-            ),
-        )
-        skeleton_tier_max_tokens: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Max tokens for the skeleton tier. 0 = unlimited. Over budget → "
-                "tier skipped, Block B keeps inline signatures."
-            ),
-        )
-        skeleton_tier_suppresses_block_b_signatures: bool = Field(
-            default=True,
-            description=(
-                "When skeleton tier is active, Block B omits bare signatures "
-                "(LOD‑0/LOD‑1) because they are already in the stable tier. "
-                "Case D (refactor) is exempt."
-            ),
-        )
-        skeleton_include_docstrings: bool = Field(
-            default=True,
-            description=(
-                "Include one‑line docstrings in the skeleton tier. Improves "
-                "comprehension at the cost of a docstring‑aware cache key."
-            ),
-        )
-        emergency_max_turns: int = Field(
-            default=4,
-            ge=1,
-            le=20,
-            description=(
-                "Turns to keep when an individual turn exceeds budget * 0.8 "
-                "(emergency cap)."
-            ),
-        )
-
-        # ── Monotonic compaction ──────────────────────────────────────
-        compaction_defer_during_autocontinue: bool = Field(
-            default=True,
-            description=(
-                "Skip turn‑based summarize/evict while an AutoContinue multi‑part "
-                "session is active, to avoid breaking KV cache mid‑generation."
-            ),
-        )
-
-        # ── Graph persistence ─────────────────────────────────────────
-        enable_edge_persistence: bool = Field(default=True)
-
-        # ── Speculative prefetch ──────────────────────────────────────
-        enable_speculative_prefetch: bool = Field(default=True)
-        speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
-
-        # ── Silent ingestion ──────────────────────────────────────────
-        enable_silent_ingestion: bool = Field(default=True)
-
-        # ── DB orphans cleanup ────────────────────────────────────────
-        purge_orphaned_data_interval: int = Field(
-            default=10,
-            ge=0,
-            description="Number of turns between automatic purges of orphaned DB rows. 0 = disabled.",
-        )
-
-        # ── AutoContinue watchdog ─────────────────────────────────────
-        max_autocontinue_turns: int = Field(
-            default=8,
-            ge=2,
-            le=30,
-            description=(
-                "Maximum consecutive AutoContinue turns before the watchdog forces "
-                "a reset. Must be higher than the longest expected multi‑phase "
-                "response (typically 3‑5 parts)."
-            ),
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 11. UTILITIES & TUNING
-        # ═════════════════════════════════════════════════════════════════════════
-        # ── Debug ─────────────────────────────────────────────────────
         debug: bool = Field(default=True)
         priority: int = Field(default=0)
         use_tiktoken: bool = Field(default=True)
 
-        # ── Context dump (evolution tracking) ────────────────────────
+        # ── Context dump (evolution tracking) ──────────────────────────────
         enable_context_dump: bool = Field(
             default=True,
-            description=(
-                "Dump per‑turn context (Block A, Block B, message window) to disk "
-                "for evolution tracking."
-            ),
+            description="Dump per‑turn context (Block A, Block B, message window) to disk for evolution tracking.",
         )
         context_dump_dir: str = Field(
             default="/app/backend/data/context_dumps",
@@ -23847,7 +24931,7 @@ class Filter:
             description="Append a compact metrics line per turn to evolution.jsonl.",
         )
 
-        # ── Weighting & decay ─────────────────────────────────────────
+        # ── Weighting & decay ─────────────────────────────────────────────────
         raw_file_priority_boost: float = Field(default=2.0)
         importance_mention_boost: float = Field(default=0.2)
         importance_recency_half_life_hours: float = Field(default=2.0)
@@ -23863,406 +24947,94 @@ class Filter:
         frequency_decay_hours: float = Field(default=12.0)
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 12. ARCHITECTURE MAP
+        # 15. LAZY + BACKGROUND TASKS CONTROL
         # ═════════════════════════════════════════════════════════════════════════
-        enable_architecture_map: bool = Field(
+        enable_background_tasks: bool = Field(
             default=True,
-            description=(
-                "Inject a compact class→methods outline into Block A, on top "
-                "of the existing hub‑symbols section. Cheap, deterministic, "
-                "cache‑stable while code is unchanged."
-            ),
-        )
-        architecture_map_max_tokens: int = Field(
-            default=0,
-            ge=0,
-            description="Token budget for the class outline section. 0 = unlimited.",
-        )
-        enable_hub_callees: bool = Field(
-            default=True,
-            description=(
-                "Show outgoing calls ('→ calls:') for hub symbols, alongside "
-                "the existing incoming‑callers line ('← used by:')."
-            ),
+            description="Master switch for ALL background tasks. If False, no background work is started.",
         )
 
-        # ═════════════════════════════════════════════════════════════════════════
-        # 13. HUB‑BODIES TIER
-        # ═════════════════════════════════════════════════════════════════════════
-        enable_hub_bodies_tier: bool = Field(
+        # ── Lazy task control (inlet) ─────────────────────────────────────────
+        enable_lazy_docstrings: bool = Field(
             default=True,
-            description=(
-                "Enable the stable hub‑bodies tier in Block A. Full bodies of "
-                "top‑N hubs are injected as a cacheable tier between Block A and "
-                "Block B. Estimated cost: +3.3s cold start, 0s on read‑only turns "
-                "(slot hit), +1.7s on first edit of a cold hub."
-            ),
+            description="Enable lazy generation of docstrings in inlet (if not completed in background).",
         )
-        hub_bodies_tier_top_n: int = Field(
-            default=7,
+        enable_lazy_prefetch: bool = Field(
+            default=True, description="Enable lazy prefetch of CodePathViews in inlet."
+        )
+        enable_lazy_session_summary: bool = Field(
+            default=True, description="Enable lazy session summary generation in inlet."
+        )
+        enable_lazy_raptor: bool = Field(
+            default=True, description="Enable lazy RAPTOR rebuild in inlet."
+        )
+        enable_lazy_purge: bool = Field(
+            default=False,
+            description="Enable lazy purge of old versions in inlet (experimental).",
+        )
+        enable_lazy_lod: bool = Field(
+            default=True,
+            description="Enable lazy LOD adaptive adjustment in inlet (uses last response).",
+        )
+
+        # ── Background task control (outlet) ──────────────────────────────────
+        enable_bg_docstrings: bool = Field(
+            default=True,
+            description="Enable background docstring generation between turns.",
+        )
+        enable_bg_prefetch: bool = Field(
+            default=True,
+            description="Enable background speculative prefetch between turns.",
+        )
+        enable_bg_session_summary: bool = Field(
+            default=True,
+            description="Enable background session summary generation between turns.",
+        )
+        enable_bg_raptor: bool = Field(
+            default=True, description="Enable background RAPTOR rebuild between turns."
+        )
+        enable_bg_purge: bool = Field(
+            default=False,
+            description="Enable background purge of old versions between turns (experimental).",
+        )
+        enable_bg_lod: bool = Field(
+            default=True,
+            description="Enable background LOD adaptive adjustment between turns.",
+        )
+
+        # ── Priority control ──────────────────────────────────────────────────
+        background_priority: Dict[str, int] = Field(
+            default_factory=lambda: {
+                "session_summary": 1,
+                "prefetch": 2,
+                "docstrings": 3,
+                "raptor": 4,
+                "purge": 5,
+                "lod_adaptive": 6,
+            },
+            description="Override default priority for background tasks. Higher number = higher priority.",
+        )
+
+        # ── Timeout and logging ──────────────────────────────────────────────
+        bg_task_stop_timeout: float = Field(
+            default=5.0,
+            ge=1.0,
+            le=30.0,
+            description="Maximum seconds to wait for background tasks to finish gracefully at inlet.",
+        )
+        bg_task_log_detailed: bool = Field(
+            default=False,
+            description="If True, log start/stop/duration for every background task.",
+        )
+        bg_task_measure_performance: bool = Field(
+            default=True,
+            description="If True, record and log execution time for each background task run.",
+        )
+        bg_task_max_concurrent: int = Field(
+            default=5,
             ge=1,
             le=20,
-            description="Number of top hubs to include. PageRank is heavy‑tailed; top‑7 are genuinely central.",
-        )
-        hub_bodies_tier_min_centrality: float = Field(
-            default=0.0,
-            ge=0.0,
-            le=1.0,
-            description="Minimum centrality score to qualify. 0.0 = no floor.",
-        )
-        hub_bodies_tier_max_tokens: int = Field(
-            default=10000,
-            ge=500,
-            description=(
-                "Token budget for the entire tier. Auto‑capped to 6000 if multi‑phase "
-                "response is active."
-            ),
-        )
-        hub_bodies_tier_max_body_tokens: int = Field(
-            default=1500,
-            ge=200,
-            description="Maximum tokens for an individual hub body. Larger hubs go via LoD.",
-        )
-        hub_bodies_tier_protect_from_paging: bool = Field(
-            default=True,
-            description=(
-                "Prevent code blocks that contain hubs in the tier from being paged out. "
-                "Required for tier correctness."
-            ),
-        )
-        hub_bodies_tier_recency_pointers: bool = Field(
-            default=True,
-            description=(
-                "Include recency pointers for hub seeds in Block B. Creates an anchor "
-                "near the query for effective recall."
-            ),
-        )
-        hub_bodies_tier_warmup_on_ingestion: bool = Field(
-            default=False,
-            description=(
-                "Background prefill of the stable prefix (Block A + tier) after "
-                "silent ingestion. Hides the +3.3s cold start cost. Default False."
-            ),
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 14. SEMANTIC SEED INFERENCE
-        # ═════════════════════════════════════════════════════════════════════════
-        seed_inference_mode: str = Field(
-            default="auto",
-            description=(
-                "'auto': infer when lexical seeds are scarce or use case is A/D. "
-                "'always': always in code sessions. 'off': disabled."
-            ),
-        )
-        seed_inference_model: str = Field(
-            default="",
-            description="Model for seed inference. Empty = use llm_model.",
-        )
-        seed_inference_min_lexical: int = Field(
-            default=2,
-            ge=0,
-            description="In 'auto' mode: infer if the query names fewer than N symbols literally.",
-        )
-        seed_inference_min_chars: int = Field(
-            default=15,
-            ge=0,
-            description="Minimum query length to trigger inference.",
-        )
-        seed_inference_max_symbols: int = Field(
-            default=12,
-            ge=1,
-            le=40,
-            description="Maximum symbols seeded by inference.",
-        )
-        seed_inference_score: float = Field(
-            default=0.85,
-            ge=0.1,
-            le=1.0,
-            description=(
-                "Seed score assigned to LLM‑validated symbols. High value "
-                "(> lod3_threshold) guarantees LOD‑3 (full body)."
-            ),
-        )
-        seed_inference_skeleton_max_tokens: int = Field(
-            default=6000,
-            ge=500,
-            description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
-        )
-        seed_inference_max_tokens: int = Field(
-            default=200,
-            ge=50,
-            description="Token cap for the planner's response.",
-        )
-        seed_inference_fuzzy_threshold: float = Field(
-            default=0.85,
-            ge=0.6,
-            le=1.0,
-            description="Minimum token_set_ratio for fuzzy matching of hallucinated ids.",
-        )
-        seed_inference_fuzzy_penalty: float = Field(
-            default=0.8,
-            ge=0.5,
-            le=1.0,
-            description="Score multiplier for symbols found via fuzzy matching.",
-        )
-
-        # ── Hub symbols in Block A ────────────────────────────────────
-        symbol_index_max_in_block_a: int = Field(
-            default=30,
-            ge=5,
-            le=200,
-            description="Maximum hub symbols (top‑N by centrality) kept in Block A.",
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 15. CLASSIFICATION THRESHOLDS (Cascade: Heuristic → CE → LLM)
-        # ═════════════════════════════════════════════════════════════════════════
-        #
-        # Each feature has two thresholds:
-        #   - CE_THRESHOLD: minimum diff to trust CrossEncoder
-        #   - LLM_THRESHOLD: maximum diff to trigger LLM fallback
-        #   - Middle zone: use heuristic (or conservative default)
-        #
-        # General heuristic weight multiplies all bonuses.
-
-        # ── 15.1 General ──────────────────────────────────────────────────────
-        heuristic_reinforcement_weight: float = Field(
-            default=1.0,
-            ge=0.0,
-            le=2.0,
-            description=(
-                "Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores). "
-                "Affects features 1-9 and auxiliary features uniformly. "
-                "Higher values make heuristics more influential."
-            ),
-        )
-
-        # ── 15.2 Features 1-4 ────────────────────────────────────────────────
-        # 1. Session classification
-        session_classify_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for session classification.",
-        )
-        session_classify_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for session classification.",
-        )
-
-        # 2. Code-only detection
-        code_only_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for code-only detection.",
-        )
-        code_only_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for code-only detection.",
-        )
-
-        # 3. Seed extraction
-        seed_extract_ce_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for seed extraction.",
-        )
-        seed_extract_llm_threshold: float = Field(
-            default=0.10,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for seed extraction.",
-        )
-
-        # 4. LTM deduplication
-        ltm_dedup_ce_threshold: float = Field(
-            default=0.40,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for LTM deduplication.",
-        )
-        ltm_dedup_llm_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for LTM deduplication.",
-        )
-
-        # ── 15.3 Features 5-9 ────────────────────────────────────────────────
-        # 5. Code history compression
-        code_history_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for code history compression.",
-        )
-        code_history_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for code history compression.",
-        )
-
-        # 6. Intent classification
-        intent_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for intent classification.",
-        )
-        intent_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for intent classification.",
-        )
-
-        # 7. Semantic seed inference
-        seed_infer_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for seed inference decision.",
-        )
-        seed_infer_llm_threshold: float = Field(
-            default=0.10,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for seed inference.",
-        )
-
-        # 8. LOD-3 block relevance filtering
-        lod3_relevance_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for LOD-3 block relevance.",
-        )
-        lod3_relevance_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for LOD-3 block relevance.",
-        )
-
-        # 9. Full code vs summary decision
-        keep_full_code_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for FULL vs SUMMARY decision.",
-        )
-        keep_full_code_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for FULL vs SUMMARY decision.",
-        )
-
-        # ── 15.4 Auxiliary features (A-G) ────────────────────────────────────
-        # A. Natural language intents (forget, pin, obsolete)
-        nl_intent_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for natural language intent detection.",
-        )
-        nl_intent_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for natural language intent detection.",
-        )
-
-        # B. Contradiction detection
-        contradiction_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for contradiction detection.",
-        )
-        contradiction_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for contradiction detection.",
-        )
-
-        # C. Duplicate question detection
-        duplicate_ce_threshold: float = Field(
-            default=0.40,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for duplicate question detection.",
-        )
-        duplicate_llm_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for duplicate question detection.",
-        )
-
-        # D. Use case classification
-        use_case_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for use case classification.",
-        )
-        use_case_llm_threshold: float = Field(
-            default=0.12,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for use case classification.",
-        )
-
-        # E. Call graph mode resolution
-        graph_mode_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for call graph mode resolution.",
-        )
-        graph_mode_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for call graph mode resolution.",
-        )
-
-        # F. Block paging decision
-        paging_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for block paging decision.",
-        )
-        paging_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for block paging decision.",
-        )
-
-        # G. Purge old versions decision
-        purge_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for purge decision.",
-        )
-        purge_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for purge decision.",
+            description="Maximum number of background tasks that can run concurrently (per manager).",
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -24348,6 +25120,7 @@ class Filter:
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(1)
+        self._chroma_semaphore = asyncio.Semaphore(2)  # Limits ChromaDB concurrency
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
         self._llm_orchestrator.init_cache()
@@ -24404,6 +25177,14 @@ class Filter:
         # ── C6: LTM store completion event ──────────────────────────────
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
         self._ltm_store_complete.set()  # initially "complete"
+
+        # ── Background task manager ────────────────────────────────────────
+        self._bg_manager = BackgroundTaskManager(
+            self, max_concurrent=self.valves.bg_task_max_concurrent
+        )
+
+        # ── Task registry ─────────────────────────────────────────────────────
+        self._task_registry = TaskRegistry(self)
 
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
@@ -24606,7 +25387,119 @@ class Filter:
             self._log_debug("Valve coherence check: no issues detected.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Code update helper
+    # 4. Background tasks registry & helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_bg_tasks(self) -> List[BackgroundTask]:
+        """Build the list of background task definitions."""
+        tasks = [
+            BackgroundTask(
+                name="session_summary",
+                state_key="bg_session_summary_state",
+                lazy_func=self._lazy_session_summary,
+                bg_func=self._enrichment.run_session_summary_task,
+                invalidation_func=None,
+                valve_bg="enable_bg_session_summary",
+                valve_lazy="enable_lazy_session_summary",
+                priority=1,
+                skip_if_completed=True,
+            ),
+            BackgroundTask(
+                name="prefetch",
+                state_key="bg_prefetch_state",
+                lazy_func=self._lazy_prefetch,
+                bg_func=self._activation.speculative_prefetch_background,
+                invalidation_func=lambda pid: self._activation.compute_code_state_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_prefetch",
+                valve_lazy="enable_lazy_prefetch",
+                priority=2,
+                skip_if_completed=True,
+            ),
+            BackgroundTask(
+                name="docstrings",
+                state_key="bg_docstrings_state",
+                lazy_func=self._lazy_docstrings,
+                bg_func=self._enrichment._docstring_generation_loop,
+                invalidation_func=lambda pid: self._symbol_index.compute_structure_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_docstrings",
+                valve_lazy="enable_lazy_docstrings",
+                priority=3,
+                skip_if_completed=True,
+            ),
+            BackgroundTask(
+                name="raptor",
+                state_key="bg_raptor_state",
+                lazy_func=self._lazy_raptor,
+                bg_func=self._raptor.rebuild,
+                invalidation_func=lambda pid: self._symbol_index.compute_structure_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_raptor",
+                valve_lazy="enable_lazy_raptor",
+                priority=4,
+                skip_if_completed=True,
+            ),
+            BackgroundTask(
+                name="purge",
+                state_key="bg_purge_state",
+                lazy_func=self._lazy_purge,
+                bg_func=self._pager.purge_old_versions,
+                invalidation_func=lambda pid: self._activation.compute_code_state_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_purge",
+                valve_lazy="enable_lazy_purge",
+                priority=5,
+                skip_if_completed=True,
+            ),
+            BackgroundTask(
+                name="lod_adaptive",
+                state_key="bg_lod_state",
+                lazy_func=self._lazy_lod,
+                bg_func=self._enrichment.update_lod_thresholds_from_response,
+                invalidation_func=lambda pid: str(
+                    self._conversation_state_manager.get(pid).message_count
+                ),
+                valve_bg="enable_bg_lod",
+                valve_lazy="enable_lazy_lod",
+                priority=6,
+                skip_if_completed=False,
+            ),
+        ]
+        return tasks
+
+    def _validate_and_order_bg_tasks(self) -> None:
+        """Validate background_priority valve and order tasks by priority."""
+        # ── 1. Validate keys ──
+        valid_names = {t.name for t in self._bg_tasks}
+        for name in self.valves.background_priority:
+            if name not in valid_names:
+                self._log_debug(
+                    f"WARNING: background_priority contains unknown task '{name}'"
+                )
+
+        # ── 2. Apply effective priority ──
+        for task in self._bg_tasks:
+            task._effective_priority = self.valves.background_priority.get(
+                task.name, task.priority
+            )
+
+        # ── 3. Sort by effective priority (higher first) ──
+        self._bg_tasks.sort(key=lambda t: -t._effective_priority)
+
+    def _get_task_definition(self, name: str) -> Optional[BackgroundTask]:
+        """Return the task definition for a given name, or None."""
+        for task in self._bg_tasks:
+            if task.name == name:
+                return task
+        return None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. Code update helper
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _update_active_code(
@@ -24616,7 +25509,7 @@ class Filter:
         await self._active_code_updater.process(message, project_id, is_continuation)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Inlet helpers
+    # 6. Inlet helpers
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _inlet_build_system_injections(
@@ -24730,6 +25623,14 @@ class Filter:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
+
+        # ── Stop background tasks gracefully ────────────────────────────────
+        # We stop any ongoing background work (docstrings, summaries, etc.)
+        # before processing the user's turn. The timeout is configurable via
+        # the bg_task_stop_timeout valve.
+        await self._bg_manager.stop_all()  # uses valve bg_task_stop_timeout
+        self._bg_manager.set_paused(True)
+        # ──────────────────────────────────────────────────────────────────────
 
         def _inlet_timing(step_name: str, start: float, end: float = None):
             if end is None:
@@ -25040,6 +25941,19 @@ class Filter:
                 user_query, project_id, intent_vector, is_continuation
             )
         )
+
+        # ─────────────────────────────────────────────────────────────────
+        # 🧠 ENRICHMENT – Run lazy tasks and prepare context
+        # ─────────────────────────────────────────────────────────────────
+        # Run lazy tasks (if not completed in background) before building
+        # the rest of the context. This includes LOD adaptive adjustment
+        # using the previous turn's response.
+        pstate = self._project_state_manager.get_pstate(project_id)
+        pstate["last_user_query"] = user_query
+
+        await self._task_registry.run_lazy_tasks(project_id, pstate)
+
+        # Now that lazy tasks are done, resolve call graph mode
         self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
 
         # ─────────────────────────────────────────────────────────────────
@@ -25049,9 +25963,6 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
         state = self._conversation_state_manager.get(project_id)
-
-        pstate = self._project_state_manager.get_pstate(project_id)
-        pstate["last_user_query"] = user_query
 
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._inlet_build_system_injections(
@@ -25265,18 +26176,6 @@ class Filter:
                         self._ltm_store_complete.set()
 
                 asyncio.create_task(_store_and_signal())
-
-                if self.valves.enable_auto_docstrings_background:
-                    state = self._conversation_state_manager.get(project_id)
-                    pending = []
-                    for block in state.active_blocks.values():
-                        if block.obsolete:
-                            continue
-                        for sym in block.symbols:
-                            if sym.kind in ("function", "method") and not sym.docstring:
-                                pending.append((sym.name, sym.signature))
-                    if pending:
-                        self._enrichment.start_docstring_loop(project_id)
             else:
                 if not self.valves.ltm_store_only_code_sessions:
                     self._log_debug(
@@ -25308,6 +26207,10 @@ class Filter:
                     self._log_debug(f"outlet: token estimation failed: {e}")
                 await self._project_state_manager.slot_save(project_id)
 
+            # ── Save last response for LOD adaptive lazy ──
+            pstate["last_assistant_response"] = assistant_content
+            pstate["last_response_timestamp"] = time.time()
+
             # ── Response cache (use assistant_content for cache) ──
             if (
                 self.valves.enable_response_cache
@@ -25337,33 +26240,34 @@ class Filter:
                             wait=False,
                         )
 
-            # ── LOD adaptive ───────────────────────────────────────────
-            if self.valves.enable_lod_adaptive and is_code_session:
-                _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
-                    any(
-                        marker in assistant_content
-                        for marker in self._MULTI_PHASE_MARKERS
-                    )
-                    or bool(
-                        re.search(
-                            r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
-                            assistant_content,
-                            re.IGNORECASE,
-                        )
-                    )
-                )
-                if not _is_partial_mp_lod:
-                    await self._enrichment.update_lod_thresholds_from_response(
-                        project_id, assistant_content
-                    )
+            # ── LOD adaptive (ELIMINADO – ahora solo background) ──
+            # # ── LOD adaptive ───────────────────────────────────────────
+            # if self.valves.enable_lod_adaptive and is_code_session:
+            #     _is_partial_mp_lod = self.valves.enable_multi_phase_response and (
+            #         any(
+            #             marker in assistant_content
+            #             for marker in self._MULTI_PHASE_MARKERS
+            #         )
+            #         or bool(
+            #             re.search(
+            #                 r"##\s*📋\s*(?:PROTOCOLO|CONTINUACIÓN)\s+MULTI-FASE",
+            #                 assistant_content,
+            #                 re.IGNORECASE,
+            #             )
+            #         )
+            #     )
+            #     if not _is_partial_mp_lod:
+            #         await self._enrichment.update_lod_thresholds_from_response(
+            #             project_id, assistant_content
+            #         )
 
-            # ── Speculative prefetch ───────────────────────────────────
-            if self.valves.enable_speculative_prefetch and is_code_session:
-                last_activated = pstate.get("last_activation_scores", {})
-                if last_activated:
-                    await self._activation.speculative_prefetch(
-                        project_id, last_activated
-                    )
+            # ── Speculative prefetch (ELIMINADO – ahora solo background) ──
+            # if self.valves.enable_speculative_prefetch and is_code_session:
+            #     last_activated = pstate.get("last_activation_scores", {})
+            #     if last_activated:
+            #         await self._activation.speculative_prefetch(
+            #             project_id, last_activated
+            #         )
 
             # ── Purge expired memories ─────────────────────────────────
             await self._ltm.purge_expired_memories()
@@ -25376,49 +26280,49 @@ class Filter:
             if interval > 0 and self._write_counter % interval == 0:
                 await self._state_store.purge_orphaned_data(project_id)
 
-            # ── RAPTOR rebuild ─────────────────────────────────────────
-            if (
-                self.valves.enable_raptor
-                and self._write_counter % self.valves.raptor_rebuild_interval == 0
-                and self.memory_collection is not None
-            ):
-                edges_out = self._symbol_index.get_all_edges_out(project_id)
-                graph_weight = (
-                    self.valves.raptor_graph_weight
-                    if self.valves.raptor_use_call_graph_proximity
-                    else 0.0
-                )
-                await self._raptor.rebuild(
-                    project_id=project_id,
-                    symbol_index=self._symbol_index,
-                    edges_out=edges_out,
-                    n_clusters=self.valves.raptor_clusters_per_level,
-                    summary_model=self.valves.raptor_summary_model,
-                    summary_max_tokens=self.valves.raptor_summary_max_tokens,
-                    chroma_collection=self.memory_collection,
-                    llm_caller=self._llm_orchestrator.call_llm,
-                    embedder=self.embedder,
-                    graph_weight=graph_weight,
-                )
+            # ── RAPTOR rebuild (ELIMINADO – ahora solo background) ──
+            # if (
+            #     self.valves.enable_raptor
+            #     and self._write_counter % self.valves.raptor_rebuild_interval == 0
+            #     and self.memory_collection is not None
+            # ):
+            #     edges_out = self._symbol_index.get_all_edges_out(project_id)
+            #     graph_weight = (
+            #         self.valves.raptor_graph_weight
+            #         if self.valves.raptor_use_call_graph_proximity
+            #         else 0.0
+            #     )
+            #     await self._raptor.rebuild(
+            #         project_id=project_id,
+            #         symbol_index=self._symbol_index,
+            #         edges_out=edges_out,
+            #         n_clusters=self.valves.raptor_clusters_per_level,
+            #         summary_model=self.valves.raptor_summary_model,
+            #         summary_max_tokens=self.valves.raptor_summary_max_tokens,
+            #         chroma_collection=self.memory_collection,
+            #         llm_caller=self._llm_orchestrator.call_llm,
+            #         embedder=self.embedder,
+            #         graph_weight=graph_weight,
+            #     )
 
             # ── DB checkpoints ─────────────────────────────────────────
             if self._write_counter % 100 == 0:
                 await self._state_store.run_db_checkpoints()
 
-            # ── Purge old versions ─────────────────────────────────────
-            if (
-                self.valves.purge_old_code_versions_enabled
-                and self.valves.enable_block_paging
-                and self._pager is not None
-            ):
-                await self._pager.purge_old_versions(
-                    project_id=project_id,
-                    state=state,
-                    symbol_index=self._symbol_index,
-                    chroma_collection=self.memory_collection,
-                    embedder=self.embedder,
-                    max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
-                )
+            # ── Purge old versions (ELIMINADO – ahora solo background) ──
+            # if (
+            #     self.valves.purge_old_code_versions_enabled
+            #     and self.valves.enable_block_paging
+            #     and self._pager is not None
+            # ):
+            #     await self._pager.purge_old_versions(
+            #         project_id=project_id,
+            #         state=state,
+            #         symbol_index=self._symbol_index,
+            #         chroma_collection=self.memory_collection,
+            #         embedder=self.embedder,
+            #         max_versions_per_file=self.valves.purge_old_code_versions_max_per_file,
+            #     )
 
             # ── Save edges ─────────────────────────────────────────────
             if self.valves.enable_edge_persistence:
@@ -25458,6 +26362,35 @@ class Filter:
 
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             await self._llm_orchestrator.wait_for_llm_tasks()
+
+        # ──────────────────────────────────────────────────────────────────────
+        # 🚀 BACKGROUND TASKS - Resume after critical work is done
+        # ──────────────────────────────────────────────────────────────────────
+        # Now that the user's turn is fully processed and the KV slot is saved,
+        # we can resume background tasks to prepare for the next turn.
+        # We unpause the manager first, then launch tasks in priority order.
+        # ──────────────────────────────────────────────────────────────────────
+        # First, drain SQLite writes to reduce lock contention
+        await self._state_store.drain_writes(timeout=2.0)
+
+        self._bg_manager.set_paused(False)
+
+        for task in self._task_registry.get_background_tasks():
+            if task.bg_func is None:
+                continue
+            valve_name = task.valve_bg
+            if valve_name and not getattr(self.valves, valve_name, True):
+                continue
+            # For LOD adaptive, pass the current response as an argument
+            if task.name == "lod_adaptive":
+                await self._bg_manager.start(
+                    task.name,
+                    task.bg_func,
+                    project_id,
+                    assistant_content,  # Pass the response for this turn
+                )
+            else:
+                await self._bg_manager.start(task.name, task.bg_func, project_id)
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
