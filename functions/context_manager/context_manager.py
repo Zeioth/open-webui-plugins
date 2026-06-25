@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 9.0.0
+version: 10.0.0
 license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0
 """
@@ -22909,7 +22909,7 @@ class ProjectStateManager:
         pstate = self.get_pstate(project_id)
         pstate["is_continuation"] = value
         if not value:
-            pstate["continuation_turns"] = 0
+            self.set_continuation_turns(project_id, 0)
 
     def increment_continuation_turns(self, project_id: str) -> int:
         """Increment and return the consecutive AutoContinue turn counter."""
