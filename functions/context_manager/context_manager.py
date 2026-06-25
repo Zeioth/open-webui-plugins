@@ -11727,101 +11727,107 @@ class CommandRouter:
         Detect if a message contains only code without a question.
 
         Resolution order:
-          1. Whole-message ast.parse: if it succeeds, this is unambiguously
-             a complete, syntactically valid Python module — silent
-             ingestion fires regardless of size, regardless of any '?' that
-             happens to live inside a docstring, comment, or regex literal
-             (ast.parse only succeeds on real code, so this can't misfire
-             the way the old line-based '?' check did).
-          2. Large pastes that aren't valid standalone Python (other
-             languages, or an incomplete snippet): structural-line
-             heuristic, with comments/strings blanked out first so a
-             leftover '?' reflects genuine prose, not regex/docstring noise.
-          3. Smaller pastes / fenced messages: tree-sitter-based code-span
-             extraction (unchanged).
+        1. Tree‑sitter: if the message parses as valid code in any language
+           → it's code‑only.
+        2. CrossEncoder: if tree‑sitter is uncertain or unavailable, use CE.
+        3. Heuristic fallback: structural line analysis (existing logic).
+
+        This improves accuracy by using tree‑sitter for all languages,
+        and CrossEncoder for ambiguous cases.
+
+        Args:
+            content (str): The message content to check.
+
+        Returns:
+            bool: True if the message contains only code.
         """
         if not content or len(content.strip()) < 20:
             return False
 
         stripped = content.strip()
-
-        # ── Step 1: unambiguous case — valid standalone Python ───────────
-        # Avoid blocking event loop on giant paste.
-        # if limit is surpassed, it falls to step 2 hueristic
-        if len(stripped.encode()) <= SignatureExtractor.MAX_PARSE_SIZE_BYTES:
-            try:
-                ast.parse(stripped)
-                self._f._log_debug(
-                    "is_code_only_message: Step1 (ast.parse) succeeded → code-only"
-                )
-                return True
-            except Exception:
-                # Fall through to Step 2
-                self._f._log_debug(
-                    "is_code_only_message: Step1 (ast.parse) failed, falling back to Step2 heuristic"
-                )
-                pass
-        else:
-            # Fall through to Step 2
-            self._f._log_debug(
-                f"is_code_only_message: content size ({len(stripped.encode())} bytes) exceeds MAX_PARSE_SIZE ({SignatureExtractor.MAX_PARSE_SIZE_BYTES}), skipping ast.parse, falling back to Step2 heuristic"
-            )
-
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
 
-        # ── Step 2: large paste, not valid standalone Python ─────────────
-        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens:
-            raw_lines = stripped.splitlines()
-            cleaned_lines = self._strip_code_noise(stripped).splitlines()
-            non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
-            total_lines = len(non_blank_idx)
-            if total_lines == 0:
-                return False
+        # ── Step 1: Tree‑sitter (all languages) ──
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
+                config = ProcessConfig()
+                # Try to detect language from content
+                blocks = process(content, config)
+                # If tree‑sitter finds code blocks and there's no natural language,
+                # it's likely code‑only. But we need to check if there's any text outside.
+                if blocks and hasattr(blocks, "blocks"):
+                    spans = [(b.start_byte, b.end_byte) for b in blocks.blocks]
+                    # Remove code spans and check if anything meaningful remains
+                    text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
+                    if not text_outside or len(text_outside) < 30:
+                        self._f._log_debug(
+                            "is_code_only_message: tree‑sitter found code blocks and no text → code‑only"
+                        )
+                        return True
+            except Exception:
+                # Fall through to next step
+                pass
 
-            structural_lines = 0
-            prose_candidates: List[str] = []
-            for i in non_blank_idx:
-                raw_line = raw_lines[i]
-                if self._STRUCTURAL_LINE_START.match(
-                    raw_line
-                ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
-                    structural_lines += 1
-                    continue
-                cleaned_line = (
-                    cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
-                )
-                if not cleaned_line:
-                    # Entire line was a string/comment/docstring body — code.
-                    structural_lines += 1
-                    continue
-                prose_candidates.append(cleaned_line)
+        # ── Step 2: CrossEncoder ──
+        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
+            query = content[:500]
+            pairs = [
+                (query, "This is a code snippet or technical content without a question."),
+                (query, "This is a natural language question or explanation."),
+            ]
+            scores = await self._f._commands._predict_cross_encoder(pairs)
+            if scores is not None and len(scores) >= 2:
+                diff = scores[0] - scores[1]
+                if diff >= 0.3:
+                    result = scores[0] > scores[1]
+                    self._f._log_debug(
+                        f"is_code_only_message: CrossEncoder confident (diff={diff:.2f}) → {result}"
+                    )
+                    return result
 
-            structural_ratio = structural_lines / total_lines
-            if structural_ratio > 0.70:
-                return True
+        # ── Step 3: Heuristic fallback (existing logic) ──
+        self._f._log_debug(
+            "is_code_only_message: falling back to heuristic (tree‑sitter + CE uncertain)"
+        )
 
-            prose_text = " ".join(prose_candidates).strip()
-            if not prose_text or len(prose_text) < 30:
-                return True
+        # Fallback to the original heuristic logic
+        raw_lines = stripped.splitlines()
+        cleaned_lines = self._strip_code_noise(stripped).splitlines()
+        non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
+        total_lines = len(non_blank_idx)
+        if total_lines == 0:
+            return False
 
-            if "?" in prose_text:
-                self._f._log_debug(
-                    "_is_code_only_message: explicit question detected → not silent"
-                )
-                return False
+        structural_lines = 0
+        prose_candidates: List[str] = []
+        for i in non_blank_idx:
+            raw_line = raw_lines[i]
+            if self._STRUCTURAL_LINE_START.match(
+                raw_line
+            ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
+                structural_lines += 1
+                continue
+            cleaned_line = (
+                cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
+            )
+            if not cleaned_line:
+                structural_lines += 1
+                continue
+            prose_candidates.append(cleaned_line)
 
+        structural_ratio = structural_lines / total_lines if total_lines else 0
+        if structural_ratio > 0.70:
             return True
 
-        # ── Step 3: smaller pastes / fenced messages ──────────────────────
-        code_blocks, _ = await self._f._code_blocks.extract_code_blocks(content)
-        if not code_blocks:
+        prose_text = " ".join(prose_candidates).strip()
+        if not prose_text or len(prose_text) < 30:
+            return True
+
+        if "?" in prose_text:
             return False
-        spans = await self._f._code_blocks.get_code_spans(content)
-        if not spans:
-            text_outside = re.sub(r"```[\s\S]*?```", "", content).strip()
-        else:
-            text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
-        return len(text_outside) < 30
+
+        return True
 
     @staticmethod
     def has_code_indicators(content: str) -> bool:
@@ -13535,23 +13541,68 @@ class ActivationEngine:
     ) -> Tuple[List[str], List[str]]:
         """
         Extract seed symbols from the query.
-        Returns (exact_matches, partial_matches).
+
+        Uses:
+        1. Exact matching (same as before).
+        2. CrossEncoder to score partial matches (symbols that are similar
+           to query words but not exact).
+        3. Partial matching (existing logic) as fallback.
+
+        Returns:
+            Tuple[List[str], List[str]]: (exact_matches, partial_matches)
+            where partial_matches are symbols that were scored highly by
+            the CrossEncoder or found by fuzzy matching.
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
 
+        # ── Exact matches ──
         exact = list(all_names.intersection(query_words))
 
+        # ── CrossEncoder for partial matches ──
         partial = []
-        if len(exact) < 3:
+        ce_partial = []
+
+        # Only run CE if there are candidates and we haven't found enough exact matches
+        if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
+            # Build candidates: all symbols that share a prefix or contain a query word
+            candidates = set()
+            for word in query_words:
+                if len(word) < 3:
+                    continue
+                for name in all_names:
+                    if word.lower() in name.lower() and name not in exact:
+                        candidates.add(name)
+                        if len(candidates) >= 20:  # limit for CE
+                            break
+                if len(candidates) >= 20:
+                    break
+
+            if candidates:
+                # Build pairs: (query, symbol_name) and score relevance
+                pairs = [(query, name) for name in candidates]
+                scores = self._f._commands._predict_cross_encoder(pairs)
+                if scores is not None:
+                    # Score threshold: keep symbols with score > 0.5
+                    for name, score in zip(candidates, scores):
+                        if score > 0.5:
+                            ce_partial.append(name)
+                    # Sort by score (descending)
+                    ce_partial.sort(key=lambda n: scores[list(candidates).index(n)], reverse=True)
+                    partial = ce_partial[:5]  # Keep top 5
+
+        # ── Fallback: existing partial matching ──
+        if len(partial) < 3:
             for word in query_words:
                 if len(word) < 4:
                     continue
                 for name in all_names:
-                    if word.lower() in name.lower() and name not in exact:
+                    if word.lower() in name.lower() and name not in exact and name not in partial:
                         partial.append(name)
-                        break
-            partial = partial[:5]
+                        if len(partial) >= 5:
+                            break
+                if len(partial) >= 5:
+                    break
 
         return exact, partial
 
@@ -17805,8 +17856,23 @@ class InletOrchestrator:
     async def classify_session(self, messages: list, project_id: str) -> bool:
         """
         Determine whether the current session is a coding session.
-        Uses cached results per project, then falls back to code indicators,
-        block extraction, and finally a CrossEncoder check on the last user message.
+
+        Uses a cascade approach:
+        1. CrossEncoder (fast) provides an initial assessment.
+        2. Heuristic reinforcement adds bonus based on code indicators.
+        3. If CrossEncoder is confident, use its result.
+        4. If uncertain, fallback to heuristic.
+        5. Cache results per project for TTL.
+
+        This inverts the previous order: CrossEncoder is now the primary
+        decision maker, with heuristic as reinforcement and fallback.
+
+        Args:
+            messages (list): The conversation messages.
+            project_id (str): The current project identifier.
+
+        Returns:
+            bool: True if the session is a coding session.
         """
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -17824,79 +17890,65 @@ class InletOrchestrator:
                     return result
                 del self._f._session_classify_cache[cache_key]
 
+        # ── Fast path: explicit code indicators ──
         state = self._f._conversation_state_manager.get(project_id)
         if state and state.active_blocks:
-            if cache_key:
-                self._f._session_classify_cache[cache_key] = (True, time.time())
+            self._cache_session_result(cache_key, True)
             return True
 
-        for msg in reversed(messages[-10:]):
-            if msg.get("role") != "user":
-                continue
-            if self._f._commands.has_code_indicators(msg.get("content", "")):
-                if cache_key:
-                    self._f._session_classify_cache[cache_key] = (True, time.time())
-                return True
+        # ── CrossEncoder primary ──
+        if last_user and len(last_user.get("content", "")) >= 20:
+            user_text = last_user.get("content", "")[:500]
 
-        if last_user and last_user.get("content", "").strip().startswith("/"):
-            if cache_key:
-                self._f._session_classify_cache[cache_key] = (True, time.time())
-            return True
+            # Enrich query with context tags
+            context_parts = []
+            if "```" in user_text or any(kw in user_text for kw in ("def ", "class ", "import ", "from ", "function ")):
+                context_parts.append("[CODE]")
+            if "traceback" in user_text.lower() or 'File "' in user_text:
+                context_parts.append("[TRACEBACK]")
+            context_prefix = " ".join(context_parts)
+            query = f"{context_prefix} {user_text}" if context_parts else user_text
 
-        if last_user and "```" in last_user.get("content", ""):
-            if cache_key:
-                self._f._session_classify_cache[cache_key] = (True, time.time())
-            return True
-
-        if (
-            last_user
-            and not state.active_blocks
-            and not self._f._commands.has_code_indicators(last_user.get("content", ""))
-        ):
-            if len(last_user.get("content", "")) > 200:
-                blocks, _ = await self._f._code_blocks.extract_code_blocks(
-                    last_user.get("content", "")
-                )
-                if blocks:
-                    if cache_key:
-                        self._f._session_classify_cache[cache_key] = (True, time.time())
-                    return True
-
-        if not last_user or len(last_user.get("content", "")) < 20:
-            result = False
-        else:
-            user_text = last_user.get("content", "")[:300]
             pairs = [
-                (
-                    user_text,
-                    "This message is about programming, code, or software development.",
-                ),
-                (
-                    user_text,
-                    "This message is not about programming or code.",
-                ),
+                (query, "This message is about programming, code, or software development."),
+                (query, "This message is not about programming or code."),
             ]
             scores = await self._f._commands._predict_cross_encoder(pairs)
-            if scores is None:
-                self._f._log_debug(
-                    "_classify_session: CrossEncoder not loaded, "
-                    "falling back to keyword detection."
-                )
-                result = any(
-                    kw in last_user.get("content", "").lower()
-                    for kw in (
-                        "code",
-                        "function",
-                        "def",
-                        "class",
-                        "error",
-                        "bug",
-                        "traceback",
-                    )
-                )
-            else:
-                result = scores[0] > scores[1]
 
+            if scores is not None and len(scores) >= 2:
+                # Apply heuristic reinforcement
+                scores_reinforced = list(scores)
+                if "```" in user_text or any(kw in user_text for kw in ("def ", "class ", "import ", "from ", "function ")):
+                    scores_reinforced[0] += 0.2  # bonus to "code" class
+                if len(user_text.split()) < 5:
+                    scores_reinforced[1] += 0.1  # very short messages are often not code
+
+                # Confidence check
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                if diff >= 0.3:  # confident
+                    result = scores_reinforced[0] > scores_reinforced[1]
+                    self._cache_session_result(cache_key, result)
+                    return result
+                # If uncertain, fall through to heuristic
+                self._f._log_debug(
+                    f"classify_session: CrossEncoder uncertain (diff={diff:.2f}), "
+                    "falling back to heuristic"
+                )
+
+        # ── Heuristic fallback ──
+        if last_user:
+            content = last_user.get("content", "").lower()
+            if any(kw in content for kw in ("code", "function", "def", "class", "error", "bug", "traceback")):
+                result = True
+                self._cache_session_result(cache_key, result)
+                return result
+
+        result = False
+        self._cache_session_result(cache_key, result)
+        return result
+
+    def _cache_session_result(self, cache_key: Optional[str], result: bool) -> None:
+        """Cache the session classification result."""
         if cache_key:
             self._f._session_classify_cache[cache_key] = (result, time.time())
             if len(self._f._session_classify_cache) >= 500:
@@ -17904,8 +17956,6 @@ class InletOrchestrator:
                     self._f._session_classify_cache.items(), key=lambda x: x[1][1]
                 )
                 self._f._session_classify_cache = dict(items[-400:])
-
-        return result
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. Message utilities
@@ -18219,22 +18269,23 @@ class SystemPromptBuilder:
             project_id, all_meta, current_messages=current_messages
         )
 
-    def _render_ltm_section(
-        self, project_id: str, memories: list, current_messages: list = None
-    ) -> str:
+    async def _render_ltm_section(self, project_id: str, memories: list, current_messages: list = None) -> str:
         """
         Render the LTM section with a clear header and per-fragment labels.
 
         If current_messages is provided, fragments that overlap with the current
-        conversation window are filtered out to avoid duplication. This ensures
-        that LTM only provides information from past sessions, not from the
-        current conversation (which is already in the message window).
+        conversation window are filtered out to avoid duplication.
 
-        The deduplication uses normalized text comparison and fuzzy matching
-        to catch semantically identical fragments even if formatting differs.
+        Uses a cascade for deduplication:
+        1. Quick substring containment (fast, cheap).
+        2. CrossEncoder (semantic) to compare fragments against the window.
+        3. Fuzzy matching (fallback) if CrossEncoder is unavailable.
+
+        The CrossEncoder branch significantly improves precision by detecting
+        semantic duplicates even when wording differs (e.g., paraphrases).
 
         Args:
-            project_id (str): The current project identifier.
+            project_id (str): The current project identifier (unused, kept for API).
             memories (list): List of memory fragments from LTM retrieval.
             current_messages (list, optional): The current conversation messages
                 to deduplicate against. Defaults to None.
@@ -18251,19 +18302,59 @@ class SystemPromptBuilder:
                 if m.get("role") in ("user", "assistant") and m.get("content")
             ]
             filtered = []
-            for m in memories:
-                body = self._strip_ltm_prefix(m["doc"])
-                norm = self._normalize_for_dedup(body)
-                if not norm:
-                    continue
-                if self._overlaps_window(norm, window_norms):
-                    continue  # already in the current conversation
-                filtered.append(m)
+
+            # Use CrossEncoder for semantic duplicate detection if available
+            if HAS_SENTENCE and HAS_CHROMA and self._f._cross_encoder is not None:
+                self._f._log_debug("LTM dedup: using CrossEncoder for semantic comparison")
+                for m in memories:
+                    body = self._strip_ltm_prefix(m["doc"])
+                    norm = self._normalize_for_dedup(body)
+                    if not norm:
+                        continue
+
+                    # ── Quick substring check (cheap) ──
+                    is_duplicate = False
+                    for w in window_norms:
+                        if not w:
+                            continue
+                        if norm in w or w in norm:
+                            is_duplicate = True
+                            break
+
+                    if not is_duplicate:
+                        # ── CrossEncoder for deeper semantic comparison ──
+                        best_prob = 0.0
+                        # Only compare against the first 3-5 window messages to keep it fast
+                        # (the most recent ones are usually the most relevant for dedup)
+                        for w in window_norms[:5]:
+                            if not w:
+                                continue
+                            # Truncate to 500 chars for speed (CE supports 32k but we don't
+                            # need that much context to detect a duplicate)
+                            scores = await self._f._commands._predict_cross_encoder([(norm[:500], w[:500])])
+                            if scores is not None and len(scores) > 0:
+                                # Normalize CrossEncoder logit to [0, 1] via sigmoid
+                                import math
+                                prob = 1.0 / (1.0 + math.exp(-scores[0]))
+                                if prob > best_prob:
+                                    best_prob = prob
+                        # If the best semantic similarity is < 0.5, keep it (not a duplicate)
+                        if best_prob < 0.5:
+                            filtered.append(m)
+            else:
+                # ── Fallback to substring + fuzzy matching ──
+                self._f._log_debug("LTM dedup: CrossEncoder unavailable, using substring + fuzzy fallback")
+                for m in memories:
+                    body = self._strip_ltm_prefix(m["doc"])
+                    norm = self._normalize_for_dedup(body)
+                    if not norm:
+                        continue
+                    if not self._overlaps_window(norm, window_norms):
+                        filtered.append(m)
+
             dropped = len(memories) - len(filtered)
             if dropped:
-                self._f._log_debug(
-                    f"LTM: filtered {dropped} fragment(s) from current session"
-                )
+                self._f._log_debug(f"LTM: filtered {dropped} fragment(s) from current session")
             memories = filtered
 
         if not memories:
@@ -18294,9 +18385,7 @@ class SystemPromptBuilder:
         for mem in unique:
             ts = mem.get("timestamp")
             if ts and ts > 1_000_000_000:
-                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%SZ"
-                )
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
                 text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
                 text = f"[Past conversation — unknown date]\n{mem['doc']}"
