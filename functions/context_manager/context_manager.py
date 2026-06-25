@@ -8924,7 +8924,11 @@ class ReasoningEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def detect_cot_level(
-        self, user_content: str, is_code_session: bool, state: dict
+        self,
+        user_content: str,
+        is_code_session: bool,
+        state: dict,
+        is_continuation: bool = False,
     ) -> int:
         """
         Determine CoT depth, optionally storing it in conversation state.
@@ -8934,6 +8938,12 @@ class ReasoningEngine:
             1 — simple, inject a think-step-by-step prompt
             2 — complex, generate a CoT reasoning chain
             3 — deep, generate CoT reasoning + self-reflection
+
+        Args:
+            user_content (str): The user's message content.
+            is_code_session (bool): Whether the session is code-aware.
+            state (dict): The conversation state (for sticky CoT).
+            is_continuation (bool): Whether this is a continuation turn.
         """
         if not user_content:
             return 0
@@ -8945,7 +8955,7 @@ class ReasoningEngine:
 
         if self._f.valves.enable_cot_llm_detection:
             level = await self._detect_cot_level_via_llm(
-                user_content, is_code_session, state
+                user_content, is_code_session, state, is_continuation
             )
         else:
             level = self._detect_cot_level_heuristic(
@@ -8959,11 +8969,30 @@ class ReasoningEngine:
         return level
 
     async def _detect_cot_level_via_llm(
-        self, user_content: str, is_code_session: bool, state: dict
+        self,
+        user_content: str,
+        is_code_session: bool,
+        state: dict,
+        is_continuation: bool = False,
     ) -> int:
         """
         Determine CoT depth using the CrossEncoder (instant CPU inference).
-        Falls back to heuristic if CrossEncoder is not available.
+        Falls back to heuristic if CrossEncoder is not available or uncertain.
+
+        The detection is improved by:
+        - Enriching the query with context tags ([CODE], [TRACEBACK], [CONTINUATION]).
+        - Using more specific level descriptions tailored to code questions.
+        - Applying a confidence threshold: if the top score is not clearly above
+          the second, fall back to the heuristic for robustness.
+
+        Args:
+            user_content (str): The user's message content.
+            is_code_session (bool): Whether the session is code-aware.
+            state (dict): The conversation state.
+            is_continuation (bool): Whether this is a continuation turn.
+
+        Returns:
+            int: 0 (no CoT), 1 (simple), 2 (complex), or 3 (deep).
         """
         session_type = "code" if is_code_session else "general"
         intent_hint = ""
@@ -8976,18 +9005,39 @@ class ReasoningEngine:
                 if self._f._user_intent_full_code
                 else "The user likely needs only a summary of the code."
             )
-        query = f"[Session: {session_type}] {intent_hint} {user_content}"
 
+        # ── Enrich query with context tags ──
+        context_parts = []
+        if "```" in user_content or any(
+            kw in user_content
+            for kw in ("def ", "class ", "import ", "from ", "function ")
+        ):
+            context_parts.append("[CODE]")
+        if "traceback" in user_content.lower() or 'File "' in user_content:
+            context_parts.append("[TRACEBACK]")
+        if is_continuation:
+            context_parts.append("[CONTINUATION]")
+        context_prefix = " ".join(context_parts)
+        base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+        query = f"{context_prefix} {base_query}" if context_parts else base_query
+
+        # ── Build pairs with improved level descriptions ──
         pairs = [
-            (query, "The user wants a simple, direct answer without reasoning."),
             (
                 query,
-                "The user asks a moderately complex question that requires step-by-step thinking.",
+                "The user asks a trivial question about code: a simple fact, a definition, or a direct command that does not require reasoning or analysis.",
             ),
-            (query, "The user asks a complex question that needs deep reasoning."),
             (
                 query,
-                "The user asks an extremely complex or open-ended question requiring exhaustive analysis.",
+                "The user asks a moderately complex question about code that requires some logical reasoning, but the answer is straightforward and does not require deep analysis.",
+            ),
+            (
+                query,
+                "The user asks a complex question about code that involves multiple steps, dependencies, architectural decisions, or debugging that requires step-by-step reasoning.",
+            ),
+            (
+                query,
+                "The user asks a deep, open-ended, or system-wide question about code that requires exhaustive analysis, impact evaluation, scientific reasoning, or multi-hypothesis validation.",
             ),
         ]
         scores = await self._f._commands._predict_cross_encoder(pairs)
@@ -8998,17 +9048,27 @@ class ReasoningEngine:
             return self._detect_cot_level_heuristic(
                 user_content, is_code_session, state
             )
-        import numpy as np
+
+        # ── Apply confidence threshold ──
+        # If the top score is not clearly above the second, the CrossEncoder is uncertain.
+        # Fall back to the heuristic to avoid misclassification.
+        max_score = max(scores)
+        # If only one score, second_max is 0
+        second_max = sorted(scores, reverse=True)[1] if len(scores) > 1 else 0
+        if max_score - second_max < 0.3:  # Configurable threshold
+            self._f._log_debug(
+                f"CoT detection: CrossEncoder uncertain (diff={max_score - second_max:.2f}), "
+                "falling back to heuristic"
+            )
+            return self._detect_cot_level_heuristic(
+                user_content, is_code_session, state
+            )
 
         best_level = int(np.argmax(scores))
-        if best_level == 0:
-            return 0
-        elif best_level == 1:
-            return 1
-        elif best_level == 2:
-            return 2
-        else:
-            return 3
+        self._f._log_debug(
+            f"CoT detection via CrossEncoder: best_level={best_level}, scores={scores}"
+        )
+        return best_level
 
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
@@ -17583,7 +17643,7 @@ class SystemPromptBuilder:
         self._f = filter_ref
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 1. Main orchestration – MODIFIED (M7 + AC-A)
+    # 1. Main orchestration
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def build(
@@ -17603,55 +17663,19 @@ class SystemPromptBuilder:
         Orchestrate the construction of the two-block system prompt.
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
-
-        Modified (M7): computes and stores block_a_rebuild_reason in pstate.
-        Modified (AC-A): derives slot_free from slot_busy for internal helpers.
         """
-        # ── REGION 1: Resolve per-project state ──────────────────────────────
+        # ── REGION 1: Resolve per-project state ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── M7: Get previous state for rebuild reason ──────────────────────────
-        prev_block_a_hash = pstate.get("block_a_hash")
-        prev_code_hash = pstate.get("code_state_hash")
-        prev_graph_mode = pstate.get("resolved_call_graph_mode")
-
-        # ── AC-A: derive slot_free from slot_busy ─────────────────────────────
+        # ── REGION 2: Build Block A (static) ──
         slot_free = not slot_busy
-
-        # ── REGION 2: Build Block A (static) ─────────────────────────────────
-        self._f._log_debug("🧱 Block A (static): building / retrieving from cache")
         static_block = await self._f._ctx_builder.build_block_a(
             project_id=project_id,
             is_code_session=is_code_session,
             is_continuation=is_continuation,
         )
 
-        # ── M7: Compute Block A hash and rebuild reason ──────────────────────
-        if static_block:
-            new_block_a_hash = hashlib.md5(static_block.encode()).hexdigest()[:16]
-        else:
-            new_block_a_hash = ""
-
-        # ── M7: Determine rebuild reason ──────────────────────────────────────
-        if prev_block_a_hash is None:
-            rebuild_reason = "first_build"
-        elif new_block_a_hash != prev_block_a_hash:
-            current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-            current_graph_mode = pstate.get("resolved_call_graph_mode")
-            if current_code_hash != prev_code_hash:
-                rebuild_reason = "code_changed"
-            elif current_graph_mode != prev_graph_mode:
-                rebuild_reason = "mode_changed"
-            else:
-                rebuild_reason = "other"  # docstring population, valve change, etc.
-        else:
-            rebuild_reason = None  # cache hit — no rebuild
-
-        # ── M7: Store for evolution tracking ─────────────────────────────────
-        pstate["block_a_hash"] = new_block_a_hash
-        pstate["block_a_rebuild_reason"] = rebuild_reason
-
-        # ── REGION 3: Build Hub‑Bodies Tier ──────────────────────────────────
+        # ── REGION 3: Build Hub‑Bodies Tier ──
         hub_tier_text, hub_tier_hash, hub_tier_qids = (
             self._f._ctx_builder._build_hub_bodies_tier(project_id)
         )
@@ -17661,7 +17685,7 @@ class SystemPromptBuilder:
         pstate["hub_tier_prev_seeds"] = pstate.get("hub_tier_seeds_this_turn", [])
         pstate["hub_tier_seeds_this_turn"] = list(hub_tier_qids)
 
-        # ── REGION 4: Block B — Dynamic per-query injections ────────────────
+        # ── REGION 4: Block B — Dynamic per-query injections ──
         dynamic_injections: List[Tuple[str, str]] = []
 
         # 4a: Compute use_case label
@@ -17669,7 +17693,7 @@ class SystemPromptBuilder:
             user_query, intent_vector or {}
         )
 
-        # 4b: LTM retrieval
+        # 4b: LTM retrieval (with current messages for deduplication)
         self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
         ltm_text = await self._build_ltm_injection(
             project_id,
@@ -17679,11 +17703,12 @@ class SystemPromptBuilder:
             slot_free,
             use_case_label,
             is_continuation=is_continuation,
+            current_messages=messages,  # <-- pass for deduplication
         )
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
 
-        # 4c: Parallel checks (contradiction, cache, duplicate)
+        # ── 4c: Parallel checks ──
         self._f._log_debug("🔄 Block B – Step 2/5: Parallel checks")
         contradiction_warning, cached_response, duplicate_match = (
             await self._build_parallel_checks(
@@ -17703,7 +17728,7 @@ class SystemPromptBuilder:
                 )
             )
 
-        # 4d: Activated code (per-query)
+        # ── 4d: Activated code ──
         self._f._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         active_ctx = await self._build_activated_code(
             user_query, project_id, messages, is_code_session, slot_free
@@ -17711,14 +17736,14 @@ class SystemPromptBuilder:
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
 
-        # 4e: Proactive suggestions
+        # ── 4e: Proactive suggestions ──
         self._f._log_debug("🔄 Block B – Step 4/5: Proactive suggestions")
         for prio, text in await self._build_suggestions(
             state, project_id, messages, is_code_session
         ):
             dynamic_injections.append((prio, text))
 
-        # 4f: Assemble prelim_system (budget-aware)
+        # ── 4f: Assemble prelim_system ──
         self._f._log_debug("🔄 Block B – Step 5/5: Assemble prelim_system")
         prelim_system = self._assemble_prelim_system(
             static_block,
@@ -17743,14 +17768,30 @@ class SystemPromptBuilder:
         slot_free: bool,
         use_case_label: str = "General Programming",
         is_continuation: bool = False,
+        current_messages: list = None,
     ) -> Optional[str]:
         """
-        Retrieve and format relevant LTM entries for the current query,
-        using RAPTOR‑first and thematic expansions.
+        Retrieve and format relevant LTM entries for the current query.
+
+        Uses RAPTOR refinement (if enabled) to improve the query before retrieval,
+        then calls retrieve_memories_unified and renders the results.
+
+        Args:
+            project_id (str): The current project identifier.
+            user_question (str): The cleaned user question.
+            user_query (str): The raw user query.
+            is_code_session (bool): Whether the session is code-aware.
+            slot_free (bool): Whether the LLM slot is free.
+            use_case_label (str): The use case label for retrieval.
+            is_continuation (bool): Whether this is a continuation turn.
+            current_messages (list, optional): The current conversation messages
+                for deduplication. Defaults to None.
+
+        Returns:
+            Optional[str]: The rendered LTM section, or None if no memories
+            are retrieved or the section is empty.
         """
-        # ------------------------------------------------------------------
-        # REGION 1: Early exits
-        # ------------------------------------------------------------------
+        # ── REGION 1: Early exits ──
         if not (
             self._f.valves.enable_code_awareness
             and is_code_session
@@ -17761,9 +17802,7 @@ class SystemPromptBuilder:
 
         _ltm_query = user_question if user_question else user_query
 
-        # ------------------------------------------------------------------
-        # REGION 2: RAPTOR refinement (if enabled)
-        # ------------------------------------------------------------------
+        # ── REGION 2: RAPTOR refinement ──
         refined_query = _ltm_query
         if (
             self._f.valves.enable_raptor
@@ -17783,9 +17822,7 @@ class SystemPromptBuilder:
             except Exception:
                 pass  # fall through to plain query on any error
 
-        # ------------------------------------------------------------------
-        # REGION 3: Retrieve memories with thematic expansion
-        # ------------------------------------------------------------------
+        # ── REGION 3: Retrieve memories ──
         all_meta = await self._f._ltm.retrieve_memories_unified(
             refined_query,
             project_id,
@@ -17798,18 +17835,62 @@ class SystemPromptBuilder:
             self._f._log_debug("LTM: no memories retrieved")
             return None
 
-        # ------------------------------------------------------------------
-        # REGION 4: Delegate formatting to dedicated renderer
-        # ------------------------------------------------------------------
-        return self._render_ltm_section(project_id, all_meta)
+        # ── REGION 4: Render with deduplication ──
+        return self._render_ltm_section(
+            project_id, all_meta, current_messages=current_messages
+        )
 
-    def _render_ltm_section(self, project_id: str, memories: list) -> str:
+    def _render_ltm_section(
+        self, project_id: str, memories: list, current_messages: list = None
+    ) -> str:
         """
         Render the LTM section with a clear header and per-fragment labels.
+
+        If current_messages is provided, fragments that overlap with the current
+        conversation window are filtered out to avoid duplication. This ensures
+        that LTM only provides information from past sessions, not from the
+        current conversation (which is already in the message window).
+
+        The deduplication uses normalized text comparison and fuzzy matching
+        to catch semantically identical fragments even if formatting differs.
+
+        Args:
+            project_id (str): The current project identifier.
+            memories (list): List of memory fragments from LTM retrieval.
+            current_messages (list, optional): The current conversation messages
+                to deduplicate against. Defaults to None.
+
+        Returns:
+            str: The rendered LTM section, or an empty string if no memories
+            remain after deduplication or truncation.
         """
-        # ------------------------------------------------------------------
-        # REGION 1: Sort and deduplicate
-        # ------------------------------------------------------------------
+        # ── REGION 1: Deduplicate against the current session ──
+        if current_messages:
+            window_norms = [
+                self._normalize_for_dedup(m.get("content", ""))
+                for m in current_messages
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+            filtered = []
+            for m in memories:
+                body = self._strip_ltm_prefix(m["doc"])
+                norm = self._normalize_for_dedup(body)
+                if not norm:
+                    continue
+                if self._overlaps_window(norm, window_norms):
+                    continue  # already in the current conversation
+                filtered.append(m)
+            dropped = len(memories) - len(filtered)
+            if dropped:
+                self._f._log_debug(
+                    f"LTM: filtered {dropped} fragment(s) from current session"
+                )
+            memories = filtered
+
+        if not memories:
+            return ""
+
+        # ── REGION 2: Sort and deduplicate ──
         memories.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
         seen = set()
         unique = []
@@ -17818,9 +17899,7 @@ class SystemPromptBuilder:
                 seen.add(m["doc"])
                 unique.append(m)
 
-        # ------------------------------------------------------------------
-        # REGION 2: Build header with explicit LTM origin
-        # ------------------------------------------------------------------
+        # ── REGION 3: Build header ──
         header = (
             "## Relevant Past Context (long-term memory)\n\n"
             "> The following fragments were retrieved from past conversations "
@@ -17828,39 +17907,21 @@ class SystemPromptBuilder:
             "They are NOT part of the current chat history.\n\n"
         )
 
-        # ------------------------------------------------------------------
-        # REGION 3: Render each fragment with proper label
-        # ------------------------------------------------------------------
+        # ── REGION 4: Render fragments with token budget ──
         parts = []
         max_tokens = self._f.valves.ltm_retrieval_max_tokens
         current_tokens = 0
 
         for mem in unique:
             ts = mem.get("timestamp")
-
-            # Build the label with timestamp if available
             if ts and ts > 1_000_000_000:
                 time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
                     "%Y-%m-%d %H:%M:%SZ"
                 )
-                # Check if this is a skeleton snapshot (special formatting)
-                if mem.get("meta", {}).get("is_skeleton"):
-                    saved_hash = mem.get("meta", {}).get("code_state_hash", "")
-                    current_hash = self._f._activation.compute_code_state_hash(
-                        project_id
-                    )
-                    fresh = (
-                        "current ✓"
-                        if saved_hash and saved_hash == current_hash
-                        else "stale — code changed since"
-                    )
-                    text = f"[Skeleton snapshot {time_str} — {fresh}]\n{mem['doc']}"
-                else:
-                    text = f"[Past conversation — {time_str}]\n{mem['doc']}"
+                text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
                 text = f"[Past conversation — unknown date]\n{mem['doc']}"
 
-            # Apply token budget
             tok = self._f._tokens.estimate_code_tokens(text)
             if max_tokens > 0 and current_tokens + tok > max_tokens:
                 break
@@ -17868,12 +17929,8 @@ class SystemPromptBuilder:
             current_tokens += tok
 
         if not parts:
-            self._f._log_debug("LTM: no parts after truncation")
             return ""
 
-        # ------------------------------------------------------------------
-        # REGION 4: Assemble and log
-        # ------------------------------------------------------------------
         full_text = header + "\n---\n".join(parts)
         self._f._log_debug(
             f"LTM section rendered ({len(parts)} fragments, ~{current_tokens} tokens)"
@@ -17905,6 +17962,70 @@ class SystemPromptBuilder:
             )
         )
         return contradiction_warning, cached_response, duplicate_match
+
+    @staticmethod
+    def _strip_ltm_prefix(doc: str) -> str:
+        """
+        Remove the LTM prefix from a document.
+
+        Prefixes like '[Context: ...]\n\n' or '[Past conversation — ...]\n'
+        are removed so that the raw content can be compared for deduplication
+        purposes.
+
+        Args:
+            doc (str): The document text, possibly with a prefix.
+
+        Returns:
+            str: The document text without the prefix.
+        """
+        return re.sub(r"^\s*\[[^\]]*\]\s*\n+", "", doc, count=1)
+
+    @staticmethod
+    def _normalize_for_dedup(text: str) -> str:
+        """
+        Normalize text for duplicate comparison.
+
+        The text is lower-cased, whitespace is collapsed, and it is truncated
+        to 600 characters to keep comparisons fast and focused on the most
+        important part of the content.
+
+        Args:
+            text (str): The text to normalize.
+
+        Returns:
+            str: The normalized text, or an empty string if the input is empty.
+        """
+        if not text:
+            return ""
+        return re.sub(r"\s+", " ", text).strip().lower()[:600]
+
+    def _overlaps_window(self, norm: str, window_norms: list) -> bool:
+        """
+        Check if a normalized fragment overlaps with any message in the current window.
+
+        Uses substring containment (cheap) and, if rapidfuzz is available,
+        partial_ratio with a threshold of 90 to catch semantic duplicates even
+        when wording differs slightly.
+
+        Args:
+            norm (str): The normalized fragment text.
+            window_norms (list): List of normalized window messages.
+
+        Returns:
+            bool: True if the fragment overlaps with any window message,
+            False otherwise.
+        """
+        for w in window_norms:
+            if not w:
+                continue
+            if norm in w or w in norm:
+                return True
+            if HAS_FUZZ:
+                from rapidfuzz import fuzz
+
+                if fuzz.partial_ratio(norm[:300], w[:300]) >= 90:
+                    return True
+        return False
 
     async def _build_activated_code(
         self,
@@ -18709,10 +18830,14 @@ class MessageAssembler:
         """
         Detect CoT level and generate reasoning.
         Modifies `dynamic_injections` in‑place.
+
+        Modified (M3): enforce_scientific_method forces cot_any_used=True.
+        Modified (AC-A): uses is_continuation to skip CoT on genuine continuations.
+        Modified (CoT fix): level 1 is a terminal lightweight path (no chain generation).
+        Modified (CoT detection): passes is_continuation to detect_cot_level for better
+        classification.
         """
-        # ══════════════════════════════════════════════════════════════
-        # REGION 1 — DETECT COT LEVEL
-        # ══════════════════════════════════════════════════════════════
+        # ── REGION 1: DETECT COT LEVEL ──
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
         manual_cot_used = False
         cot_any_used = False
@@ -18794,7 +18919,10 @@ class MessageAssembler:
                 )
                 parallel_tasks.append(
                     self._f._reasoning.detect_cot_level(
-                        cot_detection_content, is_code_session, state
+                        cot_detection_content,
+                        is_code_session,
+                        state,
+                        is_continuation=is_continuation,  # <-- NEW: pass is_continuation
                     )
                 )
             else:
@@ -18832,7 +18960,10 @@ class MessageAssembler:
                     else user_content
                 )
                 cot_level = await self._f._reasoning.detect_cot_level(
-                    cot_detection_content, is_code_session, state
+                    cot_detection_content,
+                    is_code_session,
+                    state,
+                    is_continuation=is_continuation,  # <-- NEW: pass is_continuation
                 )
                 if cot_level > 0:
                     cot_any_used = True
@@ -18882,21 +19013,12 @@ class MessageAssembler:
 
         self._last_cot_degraded = _mp_cot_degraded
 
-        # ══════════════════════════════════════════════════════════════
-        # REGION 2 — GENERATE REASONING (only for levels 2 and 3)
-        # ══════════════════════════════════════════════════════════════
+        # ── REGION 2: GENERATE REASONING (only for levels 2 and 3) ──
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
 
         # ── Level 1 is a terminal lightweight path ───────────────────────
-        # Level 1 = "push the model to reason inline", there is NO reasoning
-        # chain to generate. Both /think 1 (manual) and auto-detected level 1
-        # land here. Returning early avoids falling through to the generation
-        # region (which only covers levels 2 and 3) and hitting the final
-        # failure check that logged a misleading "Reasoning generation failed".
         if cot_level == 1:
             if not manual_cot_used and not _mp_cot_degraded:
-                # Genuine auto-detected level 1: add the prompt that the
-                # manual path already adds for /think 1.
                 dynamic_injections.append(
                     (
                         "high",
@@ -19025,9 +19147,7 @@ class MessageAssembler:
             )
             return
 
-        # ══════════════════════════════════════════════════════════════
-        # REGION 3 — INJECT INTO SYSTEM PROMPT
-        # ══════════════════════════════════════════════════════════════
+        # ── REGION 3: INJECT INTO SYSTEM PROMPT ──
         self._f._log_debug(
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
@@ -20887,7 +21007,7 @@ class Filter:
             description="Maximum tokens for long‑term memory retrieved per request. 0 = unlimited.",
         )
         cot_max_tokens: int = Field(
-            default=4000,
+            default=2500,
             description="Maximum tokens for Chain‑of‑Thought reasoning responses. 0 = unlimited.",
         )
         response_reserve_tokens: int = Field(
@@ -20970,14 +21090,9 @@ class Filter:
             description="0.0 = semantic only, 1.0 = graph only.",
         )
         # ── Augmented retrieval ─────────────────────────────────────
-        # This feature recover the current project history
-        # from previous sessions.
-        # On it's current form, it also extract from the current session,
-        # So part of the content, will be duplicated.
-        # It's also a pretty expensive LLM call, currently.
-        # It's more likely to add noise than value,
-        # but if we fix the fact it retrieves stuff from the current session
-        # it might at least work as intended.
+        # This feature recover the current project history.
+        # If you don't care about what you did in previous sessions,
+        # Keep it disabled and it will speed up every turn 5-10 secs.
         enable_multi_query_retrieval: bool = Field(default=False)
         multi_query_variants: int = Field(default=2, ge=1, le=4)
         enable_contextual_retrieval: bool = Field(default=True)
@@ -21520,9 +21635,11 @@ class Filter:
             ),
         )
         # ── Detection & generation ──────────────────────────────────
+        # Auto cot enables deep thinking. This adds 5-20s per turn
+        # depending the cot level stablished.
         enable_cot_on_demand: bool = Field(default=True)
-        auto_cot_enabled: bool = Field(default=False)
-        auto_cot_min_chars: int = Field(default=200)
+        auto_cot_enabled: bool = Field(default=True)
+        auto_cot_min_chars: int = Field(default=0)  # Not recommended
         cot_model: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         cot_model_level2: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
         cot_model_level3: str = Field(default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact")
