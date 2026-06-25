@@ -7546,17 +7546,9 @@ class LongTermMemory:
         """
         Generate alternative search queries for LTM retrieval.
 
-        Forces structured output using a strong system prompt and numbered list.
-        Extracts queries using regex to handle variations in formatting.
-
-        Args:
-            query: The original user query.
-            use_case_label: Human-readable label of the resolved use case.
-            is_continuation: True only for genuine AutoContinue (skip multi-query).
+        Modified (B1): strips <details> and filters reasoning lines.
+        Modified (AC-A): uses is_continuation to skip expansion.
         """
-        # ------------------------------------------------------------------
-        # REGION 1: Early exits
-        # ------------------------------------------------------------------
         if not self._f.valves.enable_multi_query_retrieval:
             return [query]
         if is_continuation:
@@ -7564,9 +7556,6 @@ class LongTermMemory:
         if len(query.strip()) < 15:
             return [query]
 
-        # ------------------------------------------------------------------
-        # REGION 2: Prompt with numbered list format
-        # ------------------------------------------------------------------
         prompt = (
             f"User question: {query[:300]}\n\n"
             f"Generate {self._f.valves.multi_query_variants} alternative search queries.\n"
@@ -7575,9 +7564,6 @@ class LongTermMemory:
             "1. "
         )
 
-        # ------------------------------------------------------------------
-        # REGION 3: Strong system prompt to enforce role
-        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -7592,12 +7578,9 @@ class LongTermMemory:
             label="multi_query_expand",
         )
 
-        # Log the raw response for debugging
         self._f._log_debug(f"Multi-query raw response: {response}")
 
         # ── B1: strip <details> reasoning blocks ──────────────────────────
-        import re
-
         raw_response = re.sub(
             r"<details[^>]*>.*?</details>",
             "",
@@ -7619,7 +7602,6 @@ class LongTermMemory:
             "here are",
             "i need to",
             "the user",
-            "analysis",  # keep this as fallback
         )
 
         queries = [query]
@@ -7635,16 +7617,12 @@ class LongTermMemory:
             if not cleaned:
                 continue
             lower = cleaned.lower()
-            # Skip lines that are clearly meta-commentary, not search queries
             if any(lower.startswith(p) for p in _REASONING_LINE_PREFIXES):
                 continue
-            # Accept if it's a valid query (not empty, not meta-commentary)
             if len(cleaned) > 5:
                 queries.append(cleaned)
 
-        # Limit to configured variants (+1 for original)
         queries = queries[: self._f.valves.multi_query_variants + 1]
-
         self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
         return queries
 
@@ -7795,6 +7773,7 @@ class LongTermMemory:
         project_id: str,
         use_case_label: str = "General Programming",
         slot_free: bool = True,
+        is_continuation: bool = False,
     ) -> list:
         """
         Retrieve relevant LTM entries, with multi‑query expansion and reranking.
@@ -7849,7 +7828,7 @@ class LongTermMemory:
             # ------------------------------------------------------------------
             # REGION 3: Retrieve for each variant
             # ------------------------------------------------------------------
-            for variant_query in query_variants:
+            for variant_query in expanded:  # <-- antes 'query_variants', corregido
                 q_emb = await anyio.to_thread.run_sync(
                     lambda q=variant_query: self._f.embedder.encode(
                         self._f._tokens.truncate_text_to_tokens(q, 32768)
@@ -7993,7 +7972,7 @@ class LongTermMemory:
             return []
 
     async def retrieve_historical_messages(
-        self, query: str, project_id: str, limit: int
+        self, query: str, project_id: str, limit: int, is_continuation: bool = False
     ) -> list:
         """Retrieve historically relevant messages from ChromaDB LTM."""
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
@@ -8017,7 +7996,6 @@ class LongTermMemory:
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
             # ── FIX 11: Expiration filter with OR for summaries ──
-            # Same as in retrieve_memories_unified: include summaries explicitly.
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append(
                     {
@@ -17330,7 +17308,7 @@ class SystemPromptBuilder:
         self._f = filter_ref
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 1. Main orchestration – MODIFIED (M7)
+    # 1. Main orchestration – MODIFIED (M7 + AC-A)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def build(
@@ -17352,6 +17330,7 @@ class SystemPromptBuilder:
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
 
         Modified (M7): computes and stores block_a_rebuild_reason in pstate.
+        Modified (AC-A): derives slot_free from slot_busy for internal helpers.
         """
         # ── REGION 1: Resolve per-project state ──────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
@@ -17360,6 +17339,9 @@ class SystemPromptBuilder:
         prev_block_a_hash = pstate.get("block_a_hash")
         prev_code_hash = pstate.get("code_state_hash")
         prev_graph_mode = pstate.get("resolved_call_graph_mode")
+
+        # ── AC-A: derive slot_free from slot_busy ─────────────────────────────
+        slot_free = not slot_busy
 
         # ── REGION 2: Build Block A (static) ─────────────────────────────────
         self._f._log_debug("🧱 Block A (static): building / retrieving from cache")
@@ -17421,6 +17403,7 @@ class SystemPromptBuilder:
             is_code_session,
             slot_free,
             use_case_label,
+            is_continuation=is_continuation,
         )
         if ltm_text:
             dynamic_injections.append(("high", ltm_text))
@@ -17473,7 +17456,7 @@ class SystemPromptBuilder:
         return static_block, dynamic_injections, None, prelim_system
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Block B – Dynamic injections
+    # 2. Block B – Dynamic injections (helpers)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _build_ltm_injection(
@@ -17484,27 +17467,11 @@ class SystemPromptBuilder:
         is_code_session: bool,
         slot_free: bool,
         use_case_label: str = "General Programming",
+        is_continuation: bool = False,
     ) -> Optional[str]:
         """
         Retrieve and format relevant LTM entries for the current query,
         using RAPTOR‑first and thematic expansions.
-
-        The formatted section explicitly indicates that the retrieved content
-        comes from long-term memory (past conversations, not the current chat
-        history), so the LLM can correctly interpret it as external context.
-
-        Formatting is delegated to _render_ltm_section for clarity and testability.
-
-        Args:
-            project_id (str): The current project identifier.
-            user_question (str): The cleaned user question (without code spans).
-            user_query (str): The full user query (with code).
-            is_code_session (bool): Whether the session is a code session.
-            slot_free (bool): Whether the LLM slot is free for auxiliary calls.
-            use_case_label (str): Human-readable label of the resolved use case.
-
-        Returns:
-            Optional[str]: The formatted LTM context, or None if no relevant memories.
         """
         # ------------------------------------------------------------------
         # REGION 1: Early exits
@@ -17549,6 +17516,7 @@ class SystemPromptBuilder:
             project_id,
             use_case_label=use_case_label,
             slot_free=slot_free,
+            is_continuation=is_continuation,
         )
 
         if not all_meta:
@@ -17563,16 +17531,6 @@ class SystemPromptBuilder:
     def _render_ltm_section(self, project_id: str, memories: list) -> str:
         """
         Render the LTM section with a clear header and per-fragment labels.
-
-        This method is separated from retrieval logic to make formatting
-        easier to test and debug independently.
-
-        Args:
-            project_id (str): The current project identifier.
-            memories (list): List of memory dicts with 'doc', 'timestamp', and 'meta'.
-
-        Returns:
-            str: The fully formatted LTM section, or empty string if no valid fragments.
         """
         # ------------------------------------------------------------------
         # REGION 1: Sort and deduplicate
@@ -17699,8 +17657,6 @@ class SystemPromptBuilder:
             )
 
             # --- Check suppression before falling back ---
-            # Replicate the suppression check from build_block_b to avoid
-            # falling back to full context when the skeleton tier is active.
             active_use_case, _, _ = self._f._ctx_builder.classify_use_case(
                 user_query, intent_vector
             )
@@ -18395,14 +18351,15 @@ class MessageAssembler:
             __user__: The user context from OpenWebUI.
             user_question: The extracted question from the user message.
             has_code_blocks: Whether the user message contained code fences.
-            slot_free: Whether the LLM slot is free for auxiliary calls.
-
-        Returns:
-            List[dict]: The final message list ready for the LLM.
+            slot_busy: Whether the LLM slot is busy (cold-start, background tasks).
+            is_continuation: True only for genuine AutoContinue (▶ CONTINÚA: marker).
         """
         self._f._log_debug(
             "Assembling final messages (CoT, trimming, system prompt injection)"
         )
+
+        # derive slot_free from slot_busy
+        slot_free = not slot_busy
 
         # 1. CoT detection and generation (modifies dynamic_injections in-place)
         await self._detect_and_generate_cot(
@@ -18414,6 +18371,7 @@ class MessageAssembler:
             prelim_system,
             project_id,
             is_continuation,
+            slot_free,
             messages,
         )
 
@@ -18430,7 +18388,6 @@ class MessageAssembler:
 
         # 4. WindowManager: unified history window policy
         #    Replaces: _apply_turn_based_window (M1) + _trim_and_summarize (M3 + M4)
-        #    ✅ state se pasa directamente (ya es ConversationState)
         messages, pending_summary = await self._window_manager.apply(
             messages, state, project_id, slot_free
         )
@@ -18443,7 +18400,8 @@ class MessageAssembler:
             messages,
             user_question,
             slot_free,
-            project_id,  # ← NEW: pass project_id for global-scope flag
+            is_continuation,
+            project_id,
         )
 
         # 6. Trim and summarize old messages (now handled by WindowManager)
@@ -18457,7 +18415,7 @@ class MessageAssembler:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 2. Chain‑of‑Thought (CoT) detection and generation – MODIFIED (M3)
+    # 2. Chain‑of‑Thought (CoT) detection and generation – MODIFIED (M3 + AC-A)
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _detect_and_generate_cot(
@@ -18470,6 +18428,7 @@ class MessageAssembler:
         prelim_system: str,
         project_id: str,
         is_continuation: bool,
+        slot_free: bool,
         messages: List[dict],
     ) -> None:
         """
@@ -18477,6 +18436,7 @@ class MessageAssembler:
         Modifies `dynamic_injections` in‑place.
 
         Modified (M3): enforce_scientific_method forces cot_any_used=True.
+        Modified (AC-A): uses is_continuation to skip CoT on genuine continuations.
         """
         # ══════════════════════════════════════════════════════════════
         # REGION 1 — DETECT COT LEVEL
@@ -18518,10 +18478,12 @@ class MessageAssembler:
                         )
 
         # Parallel CrossEncoder tasks (keep_full_code + auto CoT detection)
+        # --- AC-A: only run if NOT a genuine continuation ---
         if (
             slot_free
             and not manual_cot_used
             and not self._f.valves.enforce_scientific_method
+            and not is_continuation
         ):
             parallel_tasks = []
             _available_mp_pre = self._f.valves.context_window_tokens
@@ -18587,6 +18549,7 @@ class MessageAssembler:
                 not manual_cot_used
                 and slot_free
                 and not self._f.valves.enforce_scientific_method
+                and not is_continuation
             ):
                 cot_detection_content = (
                     user_question
@@ -18811,7 +18774,7 @@ class MessageAssembler:
             return messages
 
         if self._f.valves.enable_code_history_compression:
-            messages = self._f._history_compressor.compress_code_history(
+            messages = await self._f._history_compressor.compress_code_history(  # <-- AÑADIDO await
                 messages, project_id
             )
 
@@ -18846,14 +18809,6 @@ class MessageAssembler:
         enabled, it only compresses messages that were NOT already compressed
         by the primary compactor (looks for markers like `[🗜️ PARTE` or
         `## Código — Parte`). This prevents double-compression in cascade.
-
-        Args:
-            messages (List[dict]): The conversation messages.
-            project_id (str): The current project ID.
-            user_question (str): The user's query for question-aware compression.
-
-        Returns:
-            List[dict]: The messages with secondary compression applied (or unchanged).
         """
         # --- 1. Gate: secondary compaction is off by default ---
         if not self._f.valves.enable_secondary_compaction:
@@ -18870,8 +18825,6 @@ class MessageAssembler:
             return messages
 
         # --- 3. Filter out messages already compressed by the primary compactor ---
-        # Primary compactor marks messages with patterns like:
-        #   "[🗜️ PARTE ..." or "## Código — Parte ..."
         _PRIMARY_COMPACTED_MARKERS = (
             "[🗜️ PARTE",
             "## Código — Parte",
@@ -18881,7 +18834,6 @@ class MessageAssembler:
         def _is_primary_compacted(content: str) -> bool:
             return any(marker in content for marker in _PRIMARY_COMPACTED_MARKERS)
 
-        # Separate messages into those already compacted and those to compress.
         to_compress = []
         for msg in messages:
             role = msg.get("role", "")
@@ -18896,10 +18848,6 @@ class MessageAssembler:
             )
             return messages
 
-        # --- 4. Apply secondary compression (LLMLingua) on eligible messages ---
-        # We need to preserve the original order, so we rebuild the list.
-        # The compressor expects a full list, so we pass only the eligible ones
-        # and then merge back.
         compressed = await self._f._conv_compressor.compress_messages(
             messages=to_compress,
             project_id=project_id,
@@ -18912,9 +18860,6 @@ class MessageAssembler:
             query=user_question,
         )
 
-        # --- 5. Merge back: replace the original eligible messages with the compressed ones ---
-        # Build a mapping from original index to compressed message.
-        # Since we only compressed a subset, we need to iterate and replace.
         comp_iter = iter(compressed)
         out = []
         for msg in messages:
@@ -18937,11 +18882,8 @@ class MessageAssembler:
         return out
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 4. Turn‑based window management (now handled by WindowManager)
+    # 4. Turn‑based window management helpers (unchanged)
     # ═══════════════════════════════════════════════════════════════════════
-
-    # Los siguientes métodos auxiliares se mantienen sin cambios, ya que
-    # no tocan el estado persistente directamente (usan LTM o helpers).
 
     async def _persist_turn_summary_to_ltm(
         self, summary: str, project_id: str, turn_start: int, turn_end: int
@@ -19036,17 +18978,11 @@ class MessageAssembler:
     ) -> None:
         """
         Consolidate L1 summaries into L2 and apply level-aware cap.
-
-        Args:
-            state: The ConversationState for the project.
-            project_id: The project identifier.
-            slot_free: Whether the LLM slot is free for auxiliary calls.
         """
         summaries = state.conversation_summaries
         if not summaries:
             return
 
-        # Use WindowManager._summary_sort_key for consistent ordering
         if slot_free and self._f.valves.enable_hierarchical_summaries:
             group = self._f.valves.hierarchical_summary_group_size
             l1 = sorted(
@@ -19084,12 +19020,10 @@ class MessageAssembler:
             l1 = l1[-max_l1:]
         if max_l2 > 0:
             l2 = l2[-max_l2:]
-        # Reassign to state attribute
         state.conversation_summaries = sorted(
             l2 + l1,
             key=WindowManager._summary_sort_key,
         )
-        # ✅ Persistir el estado mediante ConversationStateManager
         self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -19103,7 +19037,8 @@ class MessageAssembler:
         messages: List[dict],
         user_question: str,
         slot_free: bool,
-        project_id: str,  # ← NEW
+        is_continuation: bool,
+        project_id: str,
     ) -> None:
         """
         Inject multi‑phase protocol if the token budget is tight or a global‑scope
@@ -19157,7 +19092,7 @@ class MessageAssembler:
                 available_tokens=_mp_budget_reported,
                 user_query=user_question,
                 cot_degraded_to_l1=False,
-                is_continuation=not slot_free,
+                is_continuation=is_continuation,
             )
             dynamic_injections.append(("critical", _mp_instructions))
             self._f._log_debug(
@@ -19186,19 +19121,12 @@ class MessageAssembler:
     ) -> List[dict]:
         """
         Assemble final system prompt, inject it, and log token breakdown.
-
-        The stable prefix (Block A + hub-bodies tier) is placed FIRST in the
-        system prompt to maximize KV cache reusability. User instructions
-        (base_content) are appended LAST — they are the dynamic tail and do
-        not affect the stable prefix.
         """
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-        # --- Resolve per-project state ---
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── Build dynamic_block from injections (budget-aware) ──
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
             selected_dynamic: List[str] = []
@@ -19215,8 +19143,6 @@ class MessageAssembler:
                 if getattr(self._f, "_original_system_prompt", "")
                 else 0
             )
-            # User system prompt is never truncated — only CodeAware's
-            # dynamic injections are rationed.
             dyn_budget = max(0, budget - static_tokens - user_prompt_tokens)
 
             for prio, text in dynamic_injections:
@@ -19237,21 +19163,14 @@ class MessageAssembler:
 
         separator = "\n\n---\n\n" if static_block and dynamic_block else ""
 
-        # ── Stable prefix: Block A + tier ────────────────────────────
-        # This is placed FIRST so it is KV-cacheable across turns.
         codeaware_block = static_block + separator + dynamic_block
-
-        # ── User instructions (dynamic tail) ─────────────────────────
-        # Appended LAST so changes to it do not shift the stable prefix.
         base_content = getattr(self._f, "_original_system_prompt", "") or ""
 
-        # ── Assemble final system ────────────────────────────────────
         final_system_parts = []
         if codeaware_block.strip():
             final_system_parts.append(codeaware_block)
         final_system = "\n\n---\n\n".join(final_system_parts)
 
-        # User instructions go LAST — they are the dynamic tail.
         if base_content.strip():
             if final_system.strip():
                 final_system = (
@@ -19262,11 +19181,9 @@ class MessageAssembler:
             else:
                 final_system = "## User instructions\n" + base_content.strip()
 
-        # Append pending summary if any
         if pending_summary:
             final_system = final_system + "\n\n" + pending_summary
 
-        # Inject final system message
         if final_system.strip():
             messages = [m for m in messages if m.get("role") != "system"]
             messages.insert(0, {"role": "system", "content": final_system})
@@ -19302,7 +19219,6 @@ class MessageAssembler:
             )
             total_system_tok = len(self._f.tokenizer.encode(final_system))
 
-            # --- store in pstate ---
             pstate["last_system_tokens"] = total_system_tok
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
