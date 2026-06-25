@@ -64,17 +64,19 @@ The average cost of each turn is **[constant]**. In order to be mathematically p
 ## Cascade hueristics
 All hueristic systems reinforce each other
 ```
-Heurística (keywords + use case)
+Use case detection
+       ↓
+Hueristics (keywords + use case)
        ↓
 CrossEncoder (scores)
        ↓
-¿Confianza suficiente?
+¿Trust high enough?
        ↓
-    SÍ → Usar Cross Encoder
+    SÍ → Use Cross Encoder
        ↓
-    NO → LLM con contexto Cross Encoder
+    NO → LLM with context from Cross Encoder
        ↓
-LLM falla → Inferir = True (conservador)
+LLM fail → Infere = True (conservative)
 ```
 
 ## NOTES
