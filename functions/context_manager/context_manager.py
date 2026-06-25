@@ -1527,7 +1527,7 @@ class AppliedChangeFeedback(BaseModel):
 # Reranker singleton factory (module level)
 # ---------------------------------------------------------------------------
 def _get_cross_encoder(
-    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    model_name: str = "Qwen/Qwen3-Reranker-0.6B",
 ) -> Optional[Any]:
     """Return the CrossEncoder singleton, loading it once. Thread‑safe."""
     global _CROSS_ENCODER
@@ -8778,11 +8778,11 @@ class LLMOrchestrator:
 
         pairs = [
             (
-                user_question[:500],
+                user_question,
                 "The user wants the full code, complete implementation, or exact details.",
             ),
             (
-                user_question[:500],
+                user_question,
                 "The user only needs a summary, brief explanation, or high-level overview.",
             ),
         ]
@@ -8922,7 +8922,7 @@ class ReasoningEngine:
                 if self._f._user_intent_full_code
                 else "The user likely needs only a summary of the code."
             )
-        query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+        query = f"[Session: {session_type}] {intent_hint} {user_content}"
 
         pairs = [
             (query, "The user wants a simple, direct answer without reasoning."),
@@ -10059,13 +10059,6 @@ class CommandRouter:
         """
         Run the CrossEncoder on (text_a, text_b) pairs.
         Returns raw scores (logits) or None if the model is not loaded.
-
-        Each pair is truncated to the model's maximum length (512) using the
-        CrossEncoder's own tokenizer BEFORE prediction. This is done centrally
-        so that no call site has to guess character limits, and it eliminates
-        the 'Token indices ... (N > 512)' warning triggered by LTM doc reranking,
-        contradiction detection, etc. The truncation runs inside the thread to
-        avoid blocking the event loop on large reranking batches.
         """
         if self._f._cross_encoder is None:
             if not self._f._cross_encoder_unavailable_logged:
@@ -10078,51 +10071,10 @@ class CommandRouter:
         ce = self._f._cross_encoder
 
         def _predict_safely():
-            return ce.predict(self._truncate_pairs_for_cross_encoder(ce, pairs))
+            return ce.predict(pairs)
 
         async with self._f._cross_encoder_lock:
             return await anyio.to_thread.run_sync(_predict_safely)
-
-    @staticmethod
-    def _truncate_pairs_for_cross_encoder(
-        ce, pairs: list, max_tokens: int = 512
-    ) -> list:
-        """
-        Truncate each pair (a, b) so that the combined length fits within the
-        CrossEncoder's token limit. Keeps the short side intact and truncates
-        the long side (only splits evenly when BOTH sides are long), so that a
-        short query is never clipped to make room, and the document retains as
-        much signal as possible. Falls back to a ~4 chars/token heuristic if no
-        tokenizer is available.
-        """
-        budget = max(8, max_tokens - 4)  # margin for [CLS] a [SEP] b [SEP]
-        tok = getattr(ce, "tokenizer", None)
-
-        if tok is None:
-            # Heuristic fallback: ~4 chars per token
-            cap = (budget // 2) * 4
-            return [(str(a)[:cap], str(b)[:cap]) for a, b in pairs]
-
-        enc = lambda t: tok.encode(str(t), add_special_tokens=False)
-        dec = lambda ids: tok.decode(ids, skip_special_tokens=True)
-
-        out = []
-        for a, b in pairs:
-            ai, bi = enc(a), enc(b)
-            la, lb = len(ai), len(bi)
-            if la + lb <= budget:
-                out.append((a, b))
-            elif la <= budget // 2:
-                # a is short, keep it intact and truncate b
-                out.append((a, dec(bi[: budget - la])))
-            elif lb <= budget // 2:
-                # b is short, keep it intact and truncate a
-                out.append((dec(ai[: budget - lb]), b))
-            else:
-                # both are long – split the budget evenly
-                half = budget // 2
-                out.append((dec(ai[:half]), dec(bi[:half])))
-        return out
 
     @staticmethod
     def _normalize_cross_encoder_score(raw_score: float) -> float:
@@ -10156,8 +10108,8 @@ class CommandRouter:
         if not history_text.strip():
             return None
 
-        new_msg = last_user["content"][:500]
-        hist = history_text[-2000:]
+        hist = history_text[-8000:]
+        new_msg = last_user["content"]
         pairs = [
             (
                 f"History: {hist}\n\nNew message: {new_msg}",
@@ -10237,10 +10189,10 @@ class CommandRouter:
         )
 
         pairs = [
-            (classifier_input[:500], "The user wants to understand or explain code."),
-            (classifier_input[:500], "The user wants to modify, fix, or create code."),
-            (classifier_input[:500], "The user is debugging an error or exception."),
-            (classifier_input[:500], "The user wants to refactor or restructure code."),
+            (classifier_input, "The user wants to understand or explain code."),
+            (classifier_input, "The user wants to modify, fix, or create code."),
+            (classifier_input, "The user is debugging an error or exception."),
+            (classifier_input, "The user wants to refactor or restructure code."),
         ]
         raw = await self._predict_cross_encoder(pairs)
         if raw is None:
