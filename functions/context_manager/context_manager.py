@@ -10056,8 +10056,16 @@ class CommandRouter:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
-        """Run the CrossEncoder on (text_a, text_b) pairs.
+        """
+        Run the CrossEncoder on (text_a, text_b) pairs.
         Returns raw scores (logits) or None if the model is not loaded.
+
+        Each pair is truncated to the model's maximum length (512) using the
+        CrossEncoder's own tokenizer BEFORE prediction. This is done centrally
+        so that no call site has to guess character limits, and it eliminates
+        the 'Token indices ... (N > 512)' warning triggered by LTM doc reranking,
+        contradiction detection, etc. The truncation runs inside the thread to
+        avoid blocking the event loop on large reranking batches.
         """
         if self._f._cross_encoder is None:
             if not self._f._cross_encoder_unavailable_logged:
@@ -10066,8 +10074,55 @@ class CommandRouter:
                 )
                 self._f._cross_encoder_unavailable_logged = True
             return None
+
+        ce = self._f._cross_encoder
+
+        def _predict_safely():
+            return ce.predict(self._truncate_pairs_for_cross_encoder(ce, pairs))
+
         async with self._f._cross_encoder_lock:
-            return await anyio.to_thread.run_sync(self._f._cross_encoder.predict, pairs)
+            return await anyio.to_thread.run_sync(_predict_safely)
+
+    @staticmethod
+    def _truncate_pairs_for_cross_encoder(
+        ce, pairs: list, max_tokens: int = 512
+    ) -> list:
+        """
+        Truncate each pair (a, b) so that the combined length fits within the
+        CrossEncoder's token limit. Keeps the short side intact and truncates
+        the long side (only splits evenly when BOTH sides are long), so that a
+        short query is never clipped to make room, and the document retains as
+        much signal as possible. Falls back to a ~4 chars/token heuristic if no
+        tokenizer is available.
+        """
+        budget = max(8, max_tokens - 4)  # margin for [CLS] a [SEP] b [SEP]
+        tok = getattr(ce, "tokenizer", None)
+
+        if tok is None:
+            # Heuristic fallback: ~4 chars per token
+            cap = (budget // 2) * 4
+            return [(str(a)[:cap], str(b)[:cap]) for a, b in pairs]
+
+        enc = lambda t: tok.encode(str(t), add_special_tokens=False)
+        dec = lambda ids: tok.decode(ids, skip_special_tokens=True)
+
+        out = []
+        for a, b in pairs:
+            ai, bi = enc(a), enc(b)
+            la, lb = len(ai), len(bi)
+            if la + lb <= budget:
+                out.append((a, b))
+            elif la <= budget // 2:
+                # a is short, keep it intact and truncate b
+                out.append((a, dec(bi[: budget - la])))
+            elif lb <= budget // 2:
+                # b is short, keep it intact and truncate a
+                out.append((dec(ai[: budget - lb]), b))
+            else:
+                # both are long – split the budget evenly
+                half = budget // 2
+                out.append((dec(ai[:half]), dec(bi[:half])))
+        return out
 
     @staticmethod
     def _normalize_cross_encoder_score(raw_score: float) -> float:
@@ -15373,7 +15428,9 @@ class EnrichmentTasks:
             f"<identifier>: <one short sentence>\n"
             f"Use the EXACT identifier as given above, including any "
             f"'ClassName.' prefix — do not drop it, do not add numbering, "
-            f"headers, or any other text."
+            f"headers, or any other text.\n"
+            f"Do not include any extra text, bullet points, numbers, reasoning steps, "
+            f"or headers like 'Input:', 'Task:', or 'Context:'."
         )
 
     _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
@@ -15474,9 +15531,6 @@ class EnrichmentTasks:
         """
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
-
-        M5 fix: batch_qids are passed to `_parse_docstring_batch_response`
-        to provide context for disambiguating dunders.
         """
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
@@ -15552,12 +15606,14 @@ class EnrichmentTasks:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
                 system_prompt=(
-                    "You are a code summarization assistant. Output only the "
-                    "requested lines, one per symbol, no extra commentary."
+                    "You are a code summarization assistant. Output ONLY the requested lines, "
+                    "one per symbol, with no extra text, no explanations, no markdown, no headers, "
+                    "and no reasoning. Each line must start with the EXACT identifier as given, "
+                    "followed by ': ' and a short sentence."
                 ),
                 model_override=self._f.valves.llm_model,
                 max_tokens=min(60 * len(batch), 600),
-                temperature=0.1,
+                temperature=0.0,
                 label="lazy_docstring_batch",
             )
             self._lazy_docstrings_generated_this_turn += len(batch)
@@ -18415,7 +18471,7 @@ class MessageAssembler:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 2. Chain‑of‑Thought (CoT) detection and generation – MODIFIED (M3 + AC-A)
+    # 2. Chain‑of‑Thought (CoT) detection and generation
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _detect_and_generate_cot(
@@ -18434,9 +18490,6 @@ class MessageAssembler:
         """
         Detect CoT level and generate reasoning.
         Modifies `dynamic_injections` in‑place.
-
-        Modified (M3): enforce_scientific_method forces cot_any_used=True.
-        Modified (AC-A): uses is_continuation to skip CoT on genuine continuations.
         """
         # ══════════════════════════════════════════════════════════════
         # REGION 1 — DETECT COT LEVEL
@@ -18449,11 +18502,14 @@ class MessageAssembler:
         cot_question = ""
         user_content = last_user_msg.get("content", "") if last_user_msg else ""
 
+        # Reset degradation flag for this turn
+        self._last_cot_degraded = False
+
         # ── M3: enforce_scientific_method forces level 3 and cot_any_used ──
         if self._f.valves.enforce_scientific_method:
             self._f._log_debug("CoT: enforce_scientific_method=True → forcing Level 3")
             cot_level = 3
-            cot_any_used = True  # ← M3: force generation path
+            cot_any_used = True
 
         if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
             if (
@@ -18608,9 +18664,34 @@ class MessageAssembler:
         self._last_cot_degraded = _mp_cot_degraded
 
         # ══════════════════════════════════════════════════════════════
-        # REGION 2 — GENERATE REASONING
+        # REGION 2 — GENERATE REASONING (only for levels 2 and 3)
         # ══════════════════════════════════════════════════════════════
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
+
+        # ── Level 1 is a terminal lightweight path ───────────────────────
+        # Level 1 = "push the model to reason inline", there is NO reasoning
+        # chain to generate. Both /think 1 (manual) and auto-detected level 1
+        # land here. Returning early avoids falling through to the generation
+        # region (which only covers levels 2 and 3) and hitting the final
+        # failure check that logged a misleading "Reasoning generation failed".
+        if cot_level == 1:
+            if not manual_cot_used and not _mp_cot_degraded:
+                # Genuine auto-detected level 1: add the prompt that the
+                # manual path already adds for /think 1.
+                dynamic_injections.append(
+                    (
+                        "high",
+                        "Please think step by step before answering. "
+                        "Show your reasoning, then provide the final answer.",
+                    )
+                )
+            self._f._log_debug(
+                "🧠 ENRICHMENT – CoT Step 2/3: level 1 — inline reasoning prompt, "
+                "no chain generated (this is expected, not a failure)"
+            )
+            return
+
+        # ── From here on, only levels 2 and 3 ──────────────────────────
         _model_ctx = self._f.valves.active_context_max_tokens or 28000
         _cot_context_limit = _model_ctx // 3
 
@@ -18637,7 +18718,7 @@ class MessageAssembler:
                     f"(~{self._f._tokens.estimate_code_tokens(_skeleton_ctx)} tokens)"
                 )
             else:
-                _is_arch = False  # no skeleton available; fall back to normal CoT
+                _is_arch = False
                 self._f._log_debug(
                     "🏗️ No skeleton available — falling back to standard CoT context"
                 )
@@ -19071,7 +19152,7 @@ class MessageAssembler:
         # --- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
 
-        # ── NEW: read the one‑shot global‑scope flag ──
+        # ── read the one‑shot global‑scope flag ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         force_global_scope = pstate.pop("force_multi_phase_this_turn", False)
 
@@ -19091,7 +19172,7 @@ class MessageAssembler:
             _mp_instructions = self._f._multi_phase.build_multi_phase_instructions(
                 available_tokens=_mp_budget_reported,
                 user_query=user_question,
-                cot_degraded_to_l1=False,
+                cot_degraded_to_l1=self._last_cot_degraded,  # <-- FIX: pass the real flag
                 is_continuation=is_continuation,
             )
             dynamic_injections.append(("critical", _mp_instructions))
@@ -20670,10 +20751,18 @@ class Filter:
             description="0.0 = semantic only, 1.0 = graph only.",
         )
         # ── Augmented retrieval ─────────────────────────────────────
+        # This feature recover the current project history
+        # from previous sessions.
+        # On it's current form, it also extract from the current session,
+        # So part of the content, will be duplicated.
+        # It's also a pretty expensive LLM call, currently.
+        # It's more likely to add noise than value,
+        # but if we fix the fact it retrieves stuff from the current session
+        # it might at least work as intended.
+        enable_multi_query_retrieval: bool = Field(default=False)
+        multi_query_variants: int = Field(default=2, ge=1, le=4)
         enable_contextual_retrieval: bool = Field(default=True)
         contextual_retrieval_mode: str = Field(default="metadata")
-        enable_multi_query_retrieval: bool = Field(default=True)
-        multi_query_variants: int = Field(default=2, ge=1, le=4)
 
         # ═══════════════════════════════════════════════════════════════════
         #  Context compression (conversation + code)
@@ -21086,7 +21175,7 @@ class Filter:
         # ═══════════════════════════════════════════════════════════════════
         # ── Path activation ─────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
-        path_activation_threshold: float = Field(default=0.3, ge=0.01, le=1.0)
+        path_activation_threshold: float = Field(default=0.13, ge=0.01, le=1.0)
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
@@ -21094,8 +21183,8 @@ class Filter:
         )
         path_summary_max_tokens: int = Field(default=80)
         # ── LOD thresholds ──────────────────────────────────────────
-        lod1_threshold: float = Field(default=0.20, ge=0.0, le=1.0)
-        lod2_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+        lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
+        lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
         lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
         # ── LOD by use case ───────────────────────────────────
         enable_lod_by_intent: bool = Field(
