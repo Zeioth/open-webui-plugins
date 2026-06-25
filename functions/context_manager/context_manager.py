@@ -12646,6 +12646,9 @@ class ActivationEngine:
       blocks, used to detect KV‑cache invalidations and staleness.
     * ``invalidate_lightweight_cache(project_id)`` — clears cached context
       and centrality so the next request rebuilds them from scratch.
+
+    Docs 10–13 backported:
+        E7 – normalizes PPR scores to [0,1] within the project distribution.
     """
 
     # ── Q2: PPR cache (nested class) ──────────────────────────────────────────
@@ -13546,7 +13549,7 @@ class ActivationEngine:
         self._f._last_activation_scores[project_id] = activated
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Main entry point: build_activation_graph (with Q2 cache integration)
+    # 5. Main entry point: build_activation_graph (with Q2 cache + E7 integration)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def build_activation_graph(
@@ -15008,6 +15011,9 @@ class EnrichmentTasks:
       blocking the request path.
     * Turn‑based conversation window management (summarise then evict old
       turns, with a no‑degradation guard).
+
+    Docs 10–13 backported:
+        M5 – dunder disambiguation in docstring batch parsing.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -15341,7 +15347,7 @@ class EnrichmentTasks:
         return contradiction, cached, duplicate
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Docstring generation (batch and background)
+    # 6. Docstring generation (batch and background) – MODIFIED (M5)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
@@ -15425,6 +15431,8 @@ class EnrichmentTasks:
         with the corresponding qid from the batch providing context for dunder disambiguation.
 
         Returns a dict mapping qualified id -> docstring.
+
+        Modified (M5): uses context_symbol to disambiguate dunders (__init__, __str__, etc.).
         """
         result: Dict[str, str] = {}
         pattern = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
@@ -16133,7 +16141,7 @@ class EnrichmentTasks:
         for qid in added_qids:
             block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
             for bh in block_hashes:
-                block = active_blocks.get(bh)  # ← Use local cache
+                block = active_blocks.get(bh)  # ← usar cache local
                 if block and not block.obsolete:
                     body = CodeBlockManager.extract_symbol_body(block, qid)
                     if body:
@@ -17324,13 +17332,16 @@ class SystemPromptBuilder:
       warning injection, activated code context via ``ContextBuilder``,
       proactive cleanup/summarisation suggestions, and persisted
       conversation summaries.
+
+    Docs 10–13 backported:
+        M7 – computes and stores block_a_rebuild_reason in pstate.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 1. Main orchestration
+    # 1. Main orchestration – MODIFIED (M7)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def build(
@@ -17349,6 +17360,8 @@ class SystemPromptBuilder:
         Orchestrate the construction of the two-block system prompt.
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
+
+        Modified (M7): computes and stores block_a_rebuild_reason in pstate.
         """
         # ── REGION 1: Resolve per-project state ──────────────────────────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
@@ -18340,6 +18353,9 @@ class MessageAssembler:
     * Adaptive trimming of old messages with optional summarisation.
     * Assembly of the final system prompt (Block A + Block B) and its
         injection as the first message.
+
+    Docs 10–13 backported:
+        M3 – enforce_scientific_method forces cot_any_used=True to guarantee generation.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -18436,7 +18452,7 @@ class MessageAssembler:
             messages,
             user_question,
             slot_free,
-            project_id,
+            project_id,  # ← NEW: pass project_id for global-scope flag
         )
 
         # 6. Trim and summarize old messages (now handled by WindowManager)
@@ -18450,7 +18466,7 @@ class MessageAssembler:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 2. Chain‑of‑Thought (CoT) detection and generation
+    # 2. Chain‑of‑Thought (CoT) detection and generation – MODIFIED (M3)
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _detect_and_generate_cot(
@@ -18468,6 +18484,8 @@ class MessageAssembler:
         """
         Detect CoT level and generate reasoning.
         Modifies `dynamic_injections` in‑place.
+
+        Modified (M3): enforce_scientific_method forces cot_any_used=True.
         """
         # ══════════════════════════════════════════════════════════════
         # REGION 1 — DETECT COT LEVEL
@@ -18479,6 +18497,12 @@ class MessageAssembler:
         reasoning = None
         cot_question = ""
         user_content = last_user_msg.get("content", "") if last_user_msg else ""
+
+        # ── M3: enforce_scientific_method forces level 3 and cot_any_used ──
+        if self._f.valves.enforce_scientific_method:
+            self._f._log_debug("CoT: enforce_scientific_method=True → forcing Level 3")
+            cot_level = 3
+            cot_any_used = True  # ← M3: force generation path
 
         if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
             if (
@@ -18503,7 +18527,11 @@ class MessageAssembler:
                         )
 
         # Parallel CrossEncoder tasks (keep_full_code + auto CoT detection)
-        if slot_free and not manual_cot_used:
+        if (
+            slot_free
+            and not manual_cot_used
+            and not self._f.valves.enforce_scientific_method
+        ):
             parallel_tasks = []
             _available_mp_pre = self._f.valves.context_window_tokens
             if (
@@ -18564,7 +18592,11 @@ class MessageAssembler:
                 )
         else:
             self._f._user_intent_full_code = True
-            if not manual_cot_used and slot_free:
+            if (
+                not manual_cot_used
+                and slot_free
+                and not self._f.valves.enforce_scientific_method
+            ):
                 cot_detection_content = (
                     user_question
                     if (user_question and len(user_question) >= 10)
@@ -18767,18 +18799,6 @@ class MessageAssembler:
                 "Use them to enhance your answer, but always prioritise the actual user query.",
             )
         )
-
-        # ── M3: enforce_scientific_method must set cot_any_used ──────────────
-        # If the valve is enabled, we force level=3 and ensure generation.
-        # The actual forcing is done above in REGION 1, but we also need
-        # to guarantee that cot_any_used is True so the reasoning block is generated.
-        # This is already handled by the early detection, but as a safety net:
-        if self._f.valves.enforce_scientific_method and not cot_any_used:
-            self._f._log_debug("M3: enforce_scientific_method forced cot_any_used=True")
-            cot_any_used = True
-            # If we're here, we need to generate reasoning again? No, we already
-            # generated it above, but we need to ensure the block is injected.
-            # The injection already happened, so we just log.
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Code history compression & lean user code
@@ -19125,7 +19145,7 @@ class MessageAssembler:
         # --- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
 
-        # ── Read the one‑shot global‑scope flag ──
+        # ── NEW: read the one‑shot global‑scope flag ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         force_global_scope = pstate.pop("force_multi_phase_this_turn", False)
 
@@ -19356,6 +19376,9 @@ class MessageAssembler:
 # ---------------------------------------------------------------------------
 # ContextDumper — per-turn context snapshots for evolution tracking
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ContextDumper — per-turn context snapshots for evolution tracking
+# ---------------------------------------------------------------------------
 class ContextDumper:
     """
     Captures per‑turn context snapshots and writes them to disk for
@@ -19376,6 +19399,9 @@ class ContextDumper:
     Writes are best‑effort and fully decoupled from the request path: any
     failure is swallowed with a debug log, so nothing here can break the
     inlet or outlet.
+
+    Docs 10–13 backported:
+        M7 – includes block_a_rebuild_reason in the JSONL record.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -19435,7 +19461,7 @@ class ContextDumper:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 2. Payload capture (sync, cheap, mutation‑safe)
+    # 2. Payload capture (sync, cheap, mutation‑safe) – MODIFIED (M7)
     # ═══════════════════════════════════════════════════════════════════════
 
     def _capture_payload(
@@ -19596,7 +19622,7 @@ class ContextDumper:
                 "n_active_blocks": payload["n_active_blocks"],
                 "n_symbols": payload["n_symbols"],
                 "block_a_hash": payload["block_a_hash"],
-                # ── Rebuild reason ──────────────────────────────────
+                # ── NEW: rebuild reason ──────────────────────────────────
                 "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
                 "code_state_hash": payload["code_state_hash"],
                 "slot_saved_hash": payload["slot_saved_hash"],
@@ -19622,6 +19648,8 @@ class ContextDumper:
     def _write_sync(self, payload: dict) -> None:
         """
         Synchronously write the context snapshot to disk (Markdown + JSONL).
+
+        Modified (M7): adds block_a_rebuild_reason to evolution.jsonl.
         """
         project_id = payload["project_id"]
         project_dir = self._project_dir(project_id)
@@ -20476,7 +20504,7 @@ class SemanticSeedInferencer:
             return [best_match]
         return []
 
-    # ── Parsing and resolution ────────────────────────────────
+    # ── Parsing and resolution ── MODIFIED (B2) ──────────────────────────────
 
     def _parse_and_resolve(self, response: str, project_id: str) -> Dict[str, float]:
         """
