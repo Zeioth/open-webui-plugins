@@ -17246,28 +17246,16 @@ class InletOrchestrator:
         user_query: str,
         project_id: str,
         intent_vector: Optional[dict] = None,
-        is_continuation: bool = False,  # ← nuevo
+        is_continuation: bool = False,
     ) -> Tuple[str, dict, str]:
-        """
-        Classify the user intent and apply continuation inheritance (E2).
-
-        If `is_continuation` is True, inherit the use_case from the previous turn.
-        """
-        # ── 1. Classify intent if not provided ──────────────────────────────
         if intent_vector is None:
             intent_vector = await self._f._commands.classify_intent(
                 user_query, project_id
             )
-
-        # ── 2. Get the use_case from ContextBuilder ──────────────────────
         use_case_key, profile_copy, human_label = (
             self._f._ctx_builder.classify_use_case(user_query, intent_vector)
         )
-
-        # ── 3. Compute classifier confidence ────────────────────────────
         confidence = max(intent_vector.values()) if intent_vector else 0.5
-
-        # ── 4. E2: inherit use_case only for genuine continuations ────────
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         if is_continuation:
@@ -17282,12 +17270,7 @@ class InletOrchestrator:
                     self._f._ctx_builder.LOD_PROFILES.get(inherited, {})
                 )
                 human_label = UseCase(inherited).label
-            else:
-                self._f._log_debug(
-                    f"use_case: continuation but no previous use_case found, using '{use_case_key}'"
-                )
         else:
-            # Normal classification — store for future continuations
             pstate["last_use_case"] = use_case_key
 
         return use_case_key, profile_copy, human_label
@@ -22145,11 +22128,18 @@ class Filter:
         is_code_session,
         last_user_msg,
         state,
-        slot_free=True,
+        slot_busy: bool = False,
+        is_continuation: bool = False,
         intent_vector=None,
     ):
         """
         Build system injections (Block A + Block B) via SystemPromptBuilder.
+
+        Args:
+            slot_busy: True if the KV slot is occupied (cold-start, background tasks).
+                       Only affects slot-restore timing, not content.
+            is_continuation: True only for genuine AutoContinue (▶ CONTINÚA: marker).
+                             Affects Block A freeze, CoT suppression, and intent inheritance.
         """
         return await self._system_prompt_builder.build(
             messages=messages,
@@ -22159,7 +22149,8 @@ class Filter:
             is_code_session=is_code_session,
             last_user_msg=last_user_msg,
             state=state,
-            slot_free=slot_free,
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
             intent_vector=intent_vector,
         )
 
@@ -22176,7 +22167,8 @@ class Filter:
         __user__,
         user_question,
         has_code_blocks,
-        slot_free=True,
+        slot_busy: bool = False,
+        is_continuation: bool = False,
     ):
         """
         Delegate final message assembly to MessageAssembler.
@@ -22224,7 +22216,8 @@ class Filter:
             __user__,
             user_question,
             has_code_blocks,
-            slot_free,
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
         )
 
     def _detect_genuine_continuation(self, messages: list) -> bool:
@@ -22248,6 +22241,21 @@ class Filter:
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
     # ═══════════════════════════════════════════════════════════════════════════
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        """
+        Pre‑process the request before the LLM sees it.
+
+        Orchestrates seven sequential steps:
+        1. Project‑switch detection, cache loading, and KV‑slot restore.
+        2. User‑info extraction (last message, question, explicit commands).
+        3. Explicit command dispatch (/forget, /status, /clean, /expand).
+        4. Natural‑language intent dispatch (forget, remember, obsolete).
+        5. Silent ingestion when the message is a large code‑only paste.
+        6. Session classification and active‑code update.
+        7. System‑prompt assembly (Block A + Block B) with CoT, compression,
+           multi‑phase, and adaptive trimming.
+
+        Returns the modified body with the final message list ready for the LLM.
+        """
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
@@ -22258,6 +22266,8 @@ class Filter:
             self._log_timing(step_name, start - inlet_start, end - start)
 
         project_id = self._inlet_orch.get_project_id()
+
+        # ── Get state early to decide slot_busy and is_continuation ──
         state = self._conversation_state_manager.get(project_id)
         pstate = self._project_state_manager.get_pstate(project_id)
 
@@ -22272,12 +22282,12 @@ class Filter:
         # is_continuation is read from pstate (set by outlet based on marker)
         is_continuation = pstate.get("is_continuation", False)
 
-        # ── Watchdog (AC-A-WD) ─────────────────────────────────────────────
+        # ── AC-A-WD: Watchdog for stuck continuations ──────────────────────
         if is_continuation:
             turns = pstate.get("continuation_turns", 1)
             max_turns = self.valves.max_autocontinue_turns
             if turns > max_turns:
-                self._log_warning(
+                self._log_debug(
                     f"AutoContinue watchdog: is_continuation has been True for "
                     f"{turns} consecutive turns (max={max_turns}) "
                     f"— forcing reset. Check if '▶ CONTINÚA:' marker is being "
@@ -22286,13 +22296,17 @@ class Filter:
                 pstate["is_continuation"] = False
                 pstate["continuation_turns"] = 0
                 is_continuation = False
-                # Restore slot to stable prefix if it was frozen
                 if self.valves.enable_slot_persistence:
                     await self._project_state_manager.slot_restore_for_continuity(
                         project_id
                     )
 
+        await self._enrichment.cancel_docstring_tasks()
+        self._enrichment._lazy_docstrings_generated_this_turn = 0
+
         # ── Phase A: Write barrier ──────────────────────────────────
+        # Wait for all pending writes from the previous turn to finish
+        # BEFORE we start reading SQLite.
         await self._state_store.drain_writes(timeout=5.0)
 
         # ─────────────────────────────────────────────────────────────────
@@ -22329,9 +22343,36 @@ class Filter:
                 )
                 self._log_debug("LTM: store completed — proceeding with retrieval")
             except asyncio.TimeoutError:
-                self._log_warning(
+                self._log_debug(
                     "LTM: store timeout (>3s) — retrieval may miss previous turn"
                 )
+
+        # ── Detect AutoContinue continuation ──────────────────────────────
+        # (This is now handled by pstate["is_continuation"] set in outlet.
+        #  We keep the old marker detection as a fallback for safety.)
+        _last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        _hint = ""
+        if _last_assistant and not is_continuation:
+            _ac = _last_assistant.get("content", "")
+            for _marker in self._MULTI_PHASE_MARKERS:
+                if _marker in _ac:
+                    is_continuation = True
+                    _idx = _ac.find(_marker)
+                    _hint_line = _ac[_idx:].split("\n")[0]
+                    _hint = re.sub(
+                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
+                        "",
+                        _hint_line,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    if _hint:
+                        user_question = _hint
+                        self._log_debug(
+                            f"AutoContinue detected — LOD query: '{user_question}'"
+                        )
+                    break
 
         # ─────────────────────────────────────────────────────────────────
         # ⚡ COMMAND HANDLING (High value)
@@ -22360,7 +22401,7 @@ class Filter:
             project_id,
             is_explicit_command,
             last_user_msg,
-            slot_free=not slot_busy,  # <--- solo para decidir si gastar slot
+            slot_free=not slot_busy,  # only allow if slot is free
         )
         _inlet_timing("Step 4/7: Handle natural language intents", step_start)
         if handled:
@@ -22452,22 +22493,28 @@ class Filter:
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
 
+                # Mark dirty and save via ConversationStateManager
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
+                # Get final counts after indexing
                 state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
+                # ── Generate and store stub (no truncation) ──
                 stub = self._history_compressor._build_user_stub(num_symbols)
 
+                # Store stub in state so it persists for future turns
                 content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
                 state.compressed_user_messages[content_hash] = stub
                 self._conversation_state_manager.mark_dirty(project_id)
 
+                # Replace the current user message with the stub
                 messages[-1] = {**messages[-1], "content": stub}
 
+                # Build the assistant response
                 response = (
                     f"✅ {num_symbols} symbols in {num_classes} classes "
                     f"({num_blocks} active blocks). Code is in the SymbolGraph. "
@@ -22475,6 +22522,7 @@ class Filter:
                 )
                 messages.append({"role": "assistant", "content": response})
 
+                # ── Context dump (if enabled) ────────────────────────────────────
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -22502,7 +22550,6 @@ class Filter:
         #   5. Prepare code session (classify, update code blocks)
         # ─────────────────────────────────────────────────────────────────
         step_start = time.monotonic()
-        # Pass is_continuation to avoid re-processing user message if it's a continuation
         is_code_session, user_question = (
             await self._inlet_orch.inlet_prepare_code_session(
                 messages, project_id, user_query, is_continuation=is_continuation
@@ -22540,12 +22587,14 @@ class Filter:
                 is_code_session,
                 last_user_msg,
                 state,
-                slot_busy=slot_busy,  # <--- pass slot_busy, not slot_free
-                is_continuation=is_continuation,  # <--- pass is_continuation
+                slot_busy=slot_busy,
+                is_continuation=is_continuation,
                 intent_vector=intent_vector,
             )
         )
         _inlet_timing("Step 6/7: Build system injections", step_start)
+
+        # ── PREMATURE slot_restore REMOVED (moved to the end) ──
 
         if cached_response:
             messages.pop()
@@ -22577,11 +22626,12 @@ class Filter:
             __user__,
             user_question,
             has_code_blocks,
-            slot_busy=slot_busy,  # <--- pass slot_busy
-            is_continuation=is_continuation,  # <--- pass is_continuation
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
         )
         _inlet_timing("Step 7/7: Assemble final messages", step_start)
 
+        # ✅ active_blocks Validation (attribute, not dict)
         if not isinstance(state.active_blocks, dict):
             state.active_blocks = {}
             self._conversation_state_manager.set(project_id, state)
@@ -22591,7 +22641,13 @@ class Filter:
         # ─────────────────────────────────────────────────────────────────
         # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
         # ─────────────────────────────────────────────────────────────────
-        # Only restore if the slot is NOT busy (cold-start, background tasks)
+        # slot_restore_for_continuity is independent of slot_restore:
+        #   - slot_restore: session start / first time Block A is built.
+        #   - slot_restore_for_continuity: end of each inlet, after CoT,
+        #     seed inference and other auxiliaries have dirtied the slot.
+        # One restore at the end covers ALL auxiliary calls of this turn.
+        # Gated by not slot_busy (in AutoContinue continuations the slot is already
+        # configured for streaming and should not be touched).
         if not slot_busy and self.valves.enable_slot_persistence:
             await self._project_state_manager.slot_restore_for_continuity(project_id)
 
