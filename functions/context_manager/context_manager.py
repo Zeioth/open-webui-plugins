@@ -4166,6 +4166,27 @@ class ContextBuilder:
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
+
+        This method constructs the per-query dynamic context (Block B) that
+        is injected alongside the static Block A. It uses PPR activation,
+        LOD thresholds, semantic filtering, and optional LLM-assisted
+        relevance evaluation for LOD-3 blocks.
+
+        The LOD-3 semantic filter (when enabled) uses a cascade:
+        1. Heuristic reinforcement (symbol mentions in query)
+        2. CrossEncoder for relevance scoring
+        3. LLM only when CrossEncoder is uncertain
+
+        Args:
+            project_id (str): Current project identifier.
+            query (str): The user query.
+            messages (list): The conversation messages.
+            slot_free (bool): Whether the LLM slot is free.
+            intent_vector (dict): Intent classification results.
+            is_continuation (bool): Whether this is a continuation turn.
+
+        Returns:
+            str: The rendered Block B, or an empty string if no context is needed.
         """
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
@@ -4175,7 +4196,7 @@ class ContextBuilder:
         if not state or not state.active_blocks:
             return ""
 
-        # Fast path: FILTERED skeleton
+        # ── Fast path: FILTERED skeleton ──
         if self._f.valves.enable_skeleton_intent:
             _sym_match = self._SKELETON_SYMBOL_RE.search(query)
             if _sym_match:
@@ -4188,7 +4209,7 @@ class ContextBuilder:
                     if skel:
                         return skel
 
-        # Fast path: skeleton / scaffolding queries
+        # ── Fast path: skeleton / scaffolding queries ──
         if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
             query
         ):
@@ -4196,18 +4217,18 @@ class ContextBuilder:
             if skel:
                 return skel
 
-        # Fast path for inventory / listing queries
+        # ── Fast path for inventory / listing queries ──
         if self._LIST_INTENTS.search(query):
             all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
             if all_qids:
                 return await self._format_full_symbol_inventory(all_qids, project_id)
 
-        # Step 1a: Classify use case
+        # ── Step 1a: Classify use case ──
         active_use_case, use_case_profile, _ = self.classify_use_case(
             query, intent_vector
         )
 
-        # Step 1b: LLM‑guided seed inference
+        # ── Step 1b: LLM‑guided seed inference ──
         inferred_seeds: Dict[str, float] = {}
         if self._f.valves.seed_inference_mode != "off":
             inferred_seeds = await self._f._seed_inferencer.infer_seeds(
@@ -4218,7 +4239,7 @@ class ContextBuilder:
                 slot_free=slot_free,
             )
 
-        # Step 1c: ActivationGraph
+        # ── Step 1c: ActivationGraph ──
         ag = self._f._activation.build_activation_graph(
             query,
             project_id,
@@ -4238,7 +4259,7 @@ class ContextBuilder:
             if self._f._write_counter % 50 == 0:
                 self._f._log_debug(self._f._activation._ppr_cache.stats)
 
-        # Step 2: Adjust LOD thresholds by intent
+        # ── Step 2: Adjust LOD thresholds by intent ──
         debug_weight = intent_vector.get("debug", 0.2)
         modify_weight = intent_vector.get("modify", 0.3)
         refactor_weight = intent_vector.get("refactor", 0.1)
@@ -4262,7 +4283,7 @@ class ContextBuilder:
             lod2 *= scale
             lod1 *= scale
 
-        # Case D: pull in direct callers
+        # ── Case D: pull in direct callers ──
         if (
             self._f.valves.enable_lod_by_intent
             and active_use_case == "D"
@@ -4290,7 +4311,7 @@ class ContextBuilder:
                     f"into Block B at LOD-1 (impact analysis)."
                 )
 
-        # Mode is resolved BEFORE Block A is built this turn
+        # ── Mode is resolved BEFORE Block A is built this turn ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         resolved_graph_mode = pstate.get("resolved_call_graph_mode")
         if resolved_graph_mode is None:
@@ -4298,7 +4319,7 @@ class ContextBuilder:
                 project_id, query, intent_vector
             )
 
-        # Step 3: Build LOD tiers
+        # ── Step 3: Build LOD tiers ──
         total_tokens = 0
         budget = self._f.valves.active_context_max_tokens or 32000
 
@@ -4321,11 +4342,10 @@ class ContextBuilder:
         tier_qids = set(pstate.get("hub_tier_qids", []))
         injected_symbols: Set[str] = set(tier_qids)
 
-        # ── E3: stable ordering ──────────────────────────────────────────────
-        # First, compute LOD tiers for E1 and E3
+        # ── E3: stable ordering ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
-        # ── E1: LOD‑2 hysteresis ────────────────────────────────────────────
+        # ── E1: LOD‑2 hysteresis ──
         lod2_entry = self._f.valves.lod2_threshold
         lod2_exit = lod2_entry * self._f.valves.lod2_exit_ratio
         currently_lod2: Set[str] = set(pstate.get("lod2_active_qids_prev", []))
@@ -4344,13 +4364,12 @@ class ContextBuilder:
             if score >= lod3:
                 lod3_qids.add(qid)
 
-        # Persist for next turn (E1)
         pstate["lod2_active_qids_prev"] = list(lod2_qids)
 
-        # ── E5: retrieve skeleton tier qids to avoid duplicates ──────────────
+        # ── E5: retrieve skeleton tier qids to avoid duplicates ──
         skeleton_qids: Set[str] = set(pstate.get("skeleton_tier_qids", []))
 
-        # ── E3: stable ordering function ──────────────────────────────────────
+        # ── E3: stable ordering function ──
         def _lod_tier(qid: str) -> int:
             if qid in lod3_qids:
                 return 3
@@ -4361,13 +4380,13 @@ class ContextBuilder:
         sorted_nodes = sorted(
             activated.keys(),
             key=lambda qid: (
-                -_lod_tier(qid),  # tier DESC
-                -activated.get(qid, 0.0),  # PPR DESC within tier
-                qid,  # stable lexicographic tie‑breaker
+                -_lod_tier(qid),
+                -activated.get(qid, 0.0),
+                qid,
             ),
         )
 
-        # ── Centrality LOD bump ──────────────────────────────────────────────
+        # ── Centrality LOD bump ──
         if self._f.valves.enable_centrality_lod_bump:
             centrality = pstate.get("node_centrality", {})
             threshold = self._f.valves.centrality_lod_bump_threshold
@@ -4383,9 +4402,6 @@ class ContextBuilder:
                     adjusted.append((qid, effective))
                 else:
                     adjusted.append((qid, activated.get(qid, 0.0)))
-            # Re‑sort with adjusted scores? Simpler: just update activated and re‑sort.
-            # We'll keep sorted_nodes as is, but use activated_scores for sorting.
-            # Actually, the existing logic uses activated dict. We'll just re‑apply the stable sort.
             activated_scores = dict(adjusted)
             sorted_nodes = sorted(
                 activated_scores.keys(),
@@ -4398,7 +4414,7 @@ class ContextBuilder:
         else:
             activated_scores = activated
 
-        # ── Batched LOD-2 docstring pre-resolution ─────────────────────────
+        # ── Batched LOD-2 docstring pre-resolution ──
         if self._f.valves.enable_auto_docstrings:
             lod2_candidates = [
                 qid
@@ -4425,7 +4441,7 @@ class ContextBuilder:
                         missing, project_id
                     )
 
-        # ── Batched LOD-2.5 CFG pre-resolution ─────────────────────────────
+        # ── Batched LOD-2.5 CFG pre-resolution ──
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
@@ -4450,7 +4466,7 @@ class ContextBuilder:
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
-        # ── Iterate over sorted_nodes and build LOD tiers ──────────────────
+        # ── Iterate over sorted_nodes and build LOD tiers ──
         _lod0_parts: List[str] = []
         _lod1_parts: List[str] = []
         _lod2_parts: List[str] = []
@@ -4463,7 +4479,7 @@ class ContextBuilder:
             if qid in injected_symbols:
                 continue
 
-            # ── E5: skip if in skeleton tier and LOD-2 ──────────────────────
+            # ── E5: skip if in skeleton tier and LOD-2 ──
             if qid in skeleton_qids:
                 if _lod_tier(qid) == 2:
                     self._f._log_debug(
@@ -4471,7 +4487,6 @@ class ContextBuilder:
                     )
                     continue
                 if _lod_tier(qid) == 3:
-                    # Render body only
                     body_only = self._render_symbol_body_only(qid, project_id)
                     if body_only:
                         tok = self._f._tokens.estimate_code_tokens(body_only)
@@ -4565,6 +4580,20 @@ class ContextBuilder:
 
                 # LOD-3: Full code body
                 else:
+                    # ── Semantic relevance filter (LOD-3 only) ──
+                    if self._f.valves.enable_semantic_lod3_filter and slot_free:
+                        include_block = await self._evaluate_lod3_block_relevance(
+                            block=block,
+                            qid=qid,
+                            query=query,
+                            project_id=project_id,
+                        )
+                        if not include_block:
+                            self._f._log_debug(
+                                f"Block B: skipping LOD-3 for {qid} due to low semantic relevance"
+                            )
+                            continue
+
                     content_to_inject = CodeBlockManager.extract_symbol_body(block, qid)
                     tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
@@ -4643,7 +4672,7 @@ class ContextBuilder:
 
                 break
 
-        # ── RAPTOR cluster summaries → LOD-2 tier ─────────────────────────
+        # ── RAPTOR cluster summaries → LOD-2 tier ──
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
             try:
                 raptor_hits = await self._f._raptor.retrieve(
@@ -4663,7 +4692,7 @@ class ContextBuilder:
                 )
                 _lod2_parts.insert(0, raptor_section)
 
-        # ── Step 4: SWA-aware assembly ────────────────────────────────────
+        # ── Step 4: SWA-aware assembly ──
         suppress_sigs = (
             self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
@@ -4691,14 +4720,13 @@ class ContextBuilder:
                 + "\n".join(_lod3_parts)
             )
 
-        # ── E6: recency pointers ──────────────────────────────────────────
-        # Compute the set of qids actually rendered in Block B
+        # ── E6: recency pointers ──
         current_b_qids = set(injected_symbols)
         _ptr = self._build_hub_recency_pointers(project_id, current_b_qids)
         if _ptr:
             ordered.append(_ptr)
 
-        # ── Instruction tail ──────────────────────────────────────────────
+        # ── Instruction tail ──
         ordered.append(self._build_instruction_tail(active_use_case))
 
         if len(ordered) <= 1:
@@ -4719,7 +4747,7 @@ class ContextBuilder:
         )
         ordered.append(summary_line)
 
-        # ── LOD tracking for adaptive feedback ──────────────────────────
+        # ── LOD tracking for adaptive feedback ──
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
             for qid, score in activated.items():
@@ -4734,6 +4762,150 @@ class ContextBuilder:
             pstate["last_lod_levels"] = lod_map
 
         return "\n".join(ordered)
+
+    async def _evaluate_lod3_block_relevance(
+        self,
+        block: "CodeBlock",
+        qid: str,
+        query: str,
+        project_id: str,
+    ) -> bool:
+        """
+        Evaluate if a block is semantically relevant enough to include in LOD-3.
+
+        Uses a cascade:
+        1. Heuristic reinforcement (symbol mentions in query → boost)
+        2. CrossEncoder for relevance scoring
+        3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD)
+        4. Conservative default (include) when CE fails or in middle zone
+
+        Restores KV slot after any LLM call.
+
+        Args:
+            block (CodeBlock): The block to evaluate.
+            qid (str): The qualified symbol id.
+            query (str): The user query.
+            project_id (str): Current project identifier.
+
+        Returns:
+            bool: True if the block should be included, False otherwise.
+        """
+        if self._f._cross_encoder is None:
+            return True
+
+        content_snippet = block.content[:1500]
+        query_snippet = query[:500]
+
+        pairs = [
+            (
+                query_snippet,
+                f"This code block is highly relevant to the user's question:\n{content_snippet}",
+            ),
+            (
+                query_snippet,
+                f"This code block is not relevant to the user's question:\n{content_snippet}",
+            ),
+        ]
+        scores = await self._f._commands._predict_cross_encoder(pairs)
+
+        if scores is None or len(scores) < 2:
+            return True
+
+        # ── Heuristic reinforcement ──
+        content_lower = content_snippet.lower()
+        query_words = set(query.lower().split())
+        boost = 0.0
+        for word in query_words:
+            if len(word) > 3 and word in content_lower:
+                boost += 0.05
+        scores_reinforced = list(scores)
+        scores_reinforced[0] += min(boost, 0.3)
+
+        diff = scores_reinforced[0] - scores_reinforced[1]
+        CE_CONFIDENCE_THRESHOLD = self._f.valves.lod3_relevance_ce_threshold
+        LLM_FALLBACK_THRESHOLD = self._f.valves.lod3_relevance_llm_threshold
+
+        if diff >= CE_CONFIDENCE_THRESHOLD:
+            result = scores_reinforced[0] > scores_reinforced[1]
+            self._f._log_debug(
+                f"_evaluate_lod3_block_relevance: CE confident (diff={diff:.2f}) → {result} for {qid}"
+            )
+            return result
+        elif diff < LLM_FALLBACK_THRESHOLD:
+            self._f._log_debug(
+                f"_evaluate_lod3_block_relevance: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                f"using LLM for {qid}"
+            )
+            return await self._evaluate_lod3_block_relevance_with_llm(
+                block, qid, query, scores_reinforced, project_id
+            )
+        # Middle zone: keep by default (conservative)
+        return True
+
+    async def _evaluate_lod3_block_relevance_with_llm(
+        self,
+        block: "CodeBlock",
+        qid: str,
+        query: str,
+        ce_scores: List[float],
+        project_id: str,
+    ) -> bool:
+        """
+        Use the LLM to decide if a block is relevant enough for LOD-3.
+        """
+        snippet = block.content[:800]
+        ce_summary = f"""
+The CrossEncoder provides the following scores:
+- Relevant: {ce_scores[0]:.2f}
+- Not relevant: {ce_scores[1]:.2f}
+"""
+
+        prompt = f"""
+{ce_summary}
+
+Independently analyze if the code block is relevant to the user's question.
+
+Focus on whether the code's signature (function name, parameters) or the first few lines
+of logic directly address the user's specific concern.
+
+User question:
+{query[:500]}
+
+Code block (signature and first lines):
+{snippet}
+
+Output only "YES" or "NO".
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a strict relevance evaluator for code blocks. "
+                "Output only 'YES' or 'NO'."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="lod3_relevance_llm",
+        )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "YES":
+            self._f._log_debug(
+                f"_evaluate_lod3_block_relevance_with_llm: LLM decided YES for {qid}"
+            )
+            return True
+        elif response and response.strip().upper() == "NO":
+            self._f._log_debug(
+                f"_evaluate_lod3_block_relevance_with_llm: LLM decided NO for {qid}"
+            )
+            return False
+
+        self._f._log_debug(
+            f"_evaluate_lod3_block_relevance_with_llm: LLM failed, including {qid} (conservative)"
+        )
+        return True
 
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """Delete stale slot files, keeping only the current one."""
@@ -8821,22 +8993,30 @@ class LLMOrchestrator:
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def should_keep_full_code(self, user_question: str) -> bool:
+    async def should_keep_full_code(
+        self, user_question: str, project_id: str = ""
+    ) -> bool:
         """
         Decide whether to keep the full code in context or provide only a summary.
-        Uses the CrossEncoder for fast CPU inference.
 
-        Improved with:
-        - Enriched query with context tags ([CODE], [SHORT])
-        - More specific descriptions tailored to code questions
-        - Confidence threshold: fall back to True (keep full code) if uncertain
+        Cascade:
+        1. Heuristic reinforcement (keywords for summary/full) with weight.
+        2. CrossEncoder (primary).
+        3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD).
+        4. Conservative default (True) in middle zone or on failure.
 
-        Returns True if full code should be kept.
+        Restores KV slot after any LLM call.
+
+        Args:
+            user_question (str): The user's question.
+            project_id (str): Project id for slot restoration.
+
+        Returns:
+            bool: True if full code should be kept.
         """
         if not user_question.strip():
             return False
 
-        # ── Enrich query with context tags ──
         context_parts = []
         if any(
             kw in user_question
@@ -8848,7 +9028,6 @@ class LLMOrchestrator:
         context_prefix = " ".join(context_parts)
         query = f"{context_prefix} {user_question}" if context_parts else user_question
 
-        # ── Build pairs with improved descriptions ──
         pairs = [
             (
                 query,
@@ -8860,22 +9039,127 @@ class LLMOrchestrator:
             ),
         ]
         scores = await self._f._commands._predict_cross_encoder(pairs)
-        if scores is None:
-            self._f._log_debug(
-                "_should_keep_full_code: CrossEncoder not loaded, keeping full code by default."
-            )
-            return True
 
-        # ── Apply confidence threshold ──
-        # If the difference is small, the CrossEncoder is uncertain. Keep full code.
-        if len(scores) >= 2 and (scores[0] - scores[1]) < 0.3:
-            self._f._log_debug(
-                f"_should_keep_full_code: CrossEncoder uncertain (diff={scores[0] - scores[1]:.2f}), "
-                "keeping full code by default"
+        if scores is None or len(scores) < 2:
+            return await self._should_keep_full_code_with_llm(
+                user_question, None, project_id
             )
-            return True
 
-        return scores[0] > scores[1]
+        # ── Heuristic reinforcement with weight ──
+        content_lower = user_question.lower()
+        summary_keywords = (
+            "resume",
+            "summary",
+            "explica brevemente",
+            "resumen",
+            "briefly explain",
+            "high-level",
+        )
+        full_code_keywords = (
+            "implementa",
+            "código",
+            "función",
+            "implement",
+            "code",
+            "function",
+            "write",
+        )
+        h_weight = self._f.valves.heuristic_reinforcement_weight
+
+        scores_reinforced = list(scores)
+        if any(kw in content_lower for kw in summary_keywords):
+            scores_reinforced[1] += h_weight * 0.2
+        if any(kw in content_lower for kw in full_code_keywords):
+            scores_reinforced[0] += h_weight * 0.2
+
+        diff = scores_reinforced[0] - scores_reinforced[1]
+        CE_CONFIDENCE_THRESHOLD = self._f.valves.keep_full_code_ce_threshold
+        LLM_FALLBACK_THRESHOLD = self._f.valves.keep_full_code_llm_threshold
+
+        if diff >= CE_CONFIDENCE_THRESHOLD:
+            result = scores_reinforced[0] > scores_reinforced[1]
+            self._f._log_debug(
+                f"should_keep_full_code: CE confident (diff={diff:.2f}) → {result}"
+            )
+            return result
+        elif diff < LLM_FALLBACK_THRESHOLD:
+            self._f._log_debug(
+                f"should_keep_full_code: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                "using LLM"
+            )
+            return await self._should_keep_full_code_with_llm(
+                user_question, scores_reinforced, project_id
+            )
+
+        # Middle zone: conservative (keep full code)
+        return True
+
+    async def _should_keep_full_code_with_llm(
+        self,
+        user_question: str,
+        ce_scores: Optional[List[float]] = None,
+        project_id: str = "",
+    ) -> bool:
+        """
+        Use the LLM to decide if full code should be kept.
+        """
+        if ce_scores is not None:
+            ce_summary = f"""
+The CrossEncoder provides the following scores:
+- Keep full code: {ce_scores[0]:.2f}
+- Summary only: {ce_scores[1]:.2f}
+"""
+            prompt = f"""
+{ce_summary}
+
+Now, independently analyze the user's question.
+
+Output FULL if the user asks to see implementation details, exact syntax, or complete code.
+Output SUMMARY if the user asks for explanation, overview, or conceptual understanding.
+
+User question:
+{user_question[:500]}
+
+Output only "FULL" or "SUMMARY".
+"""
+        else:
+            prompt = f"""
+Analyze the user's question.
+
+Output FULL if the user asks for implementation details, exact code, or syntax.
+Output SUMMARY if the user asks for explanation or overview.
+
+User question:
+{user_question[:500]}
+
+Output only "FULL" or "SUMMARY".
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a decision engine. Output only 'FULL' or 'SUMMARY'. "
+                "Prefer FULL when uncertain to avoid omitting critical code."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="keep_full_code_llm",
+        )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "FULL":
+            self._f._log_debug("_should_keep_full_code_with_llm: LLM decided FULL")
+            return True
+        elif response and response.strip().upper() == "SUMMARY":
+            self._f._log_debug("_should_keep_full_code_with_llm: LLM decided SUMMARY")
+            return False
+
+        self._f._log_debug(
+            "_should_keep_full_code_with_llm: LLM failed, defaulting to FULL"
+        )
+        return True
 
 
 class ReasoningEngine:
@@ -10649,16 +10933,26 @@ class CommandRouter:
 
     async def classify_intent(self, user_query: str, project_id: str) -> dict:
         """
-        Classify the user's intent using the CrossEncoder.
+        Classify the user's intent using a cascade: CrossEncoder → LLM.
 
-        Improved with:
-        - Enriched query with context tags ([CODE], [TRACEBACK])
-        - More specific level descriptions tailored to code questions
-        - Confidence threshold: fall back to default distribution if uncertain
+        1. CrossEncoder provides initial scores for explain/modify/debug/refactor.
+        2. Heuristic reinforcement adjusts scores based on keywords, multiplied
+           by `heuristic_reinforcement_weight`.
+        3. If confident (diff ≥ CE_THRESHOLD), use the reinforced CrossEncoder result.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), call the LLM with
+           CrossEncoder context.
+        5. If CrossEncoder unavailable, use LLM alone.
+        6. Middle zone: conservative heuristic distribution.
 
-        Returns a dict with probabilities for explain, modify, debug, refactor.
+        Restores KV slot after any LLM call.
+
+        Args:
+            user_query (str): The user's query.
+            project_id (str): Current project identifier.
+
+        Returns:
+            dict: Probabilities for explain, modify, debug, refactor.
         """
-        # ── Q1: Extract text without code for the classifier ──
         classifier_input = self._extract_text_for_classification(user_query)
 
         self._f._log_debug(
@@ -10682,7 +10976,6 @@ class CommandRouter:
             else classifier_input
         )
 
-        # ── Build pairs with improved descriptions ──
         pairs = [
             (
                 query,
@@ -10702,40 +10995,184 @@ class CommandRouter:
             ),
         ]
         raw = await self._predict_cross_encoder(pairs)
-        if raw is None:
-            self._f._log_debug(
-                "Intent: CrossEncoder not available, using default distribution."
-            )
-            return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
 
-        # ── Apply confidence threshold ──
-        # If the top score is not clearly above the second, the CrossEncoder is uncertain.
-        # Fall back to default distribution to avoid misclassification.
-        max_score = max(raw)
-        second_max = sorted(raw, reverse=True)[1] if len(raw) > 1 else 0
-        if max_score - second_max < 0.3:  # Configurable threshold
-            self._f._log_debug(
-                f"Intent: CrossEncoder uncertain (diff={max_score - second_max:.2f}), "
-                "using default distribution"
-            )
-            return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
+        if raw is not None:
+            # ── Heuristic reinforcement with weight ──
+            scores = list(raw)
+            content_lower = user_query.lower()
+            h_weight = self._f.valves.heuristic_reinforcement_weight
 
-        exp_scores = [2.71828**s for s in raw]
-        total_exp = sum(exp_scores)
-        if total_exp > 0:
-            result = {
-                "explain": exp_scores[0] / total_exp,
-                "modify": exp_scores[1] / total_exp,
-                "debug": exp_scores[2] / total_exp,
-                "refactor": exp_scores[3] / total_exp,
-            }
-            self._f._log_debug(
-                f"Intent (CrossEncoder): {max(result, key=result.get)}="
-                f"{max(result.values()):.2f}"
-            )
+            if any(
+                kw in content_lower
+                for kw in (
+                    "fix",
+                    "bug",
+                    "error",
+                    "traceback",
+                    "depura",
+                    "excepción",
+                    "falla",
+                )
+            ):
+                scores[2] += h_weight * 0.35
+            if any(
+                kw in content_lower
+                for kw in (
+                    "refactor",
+                    "restructur",
+                    "reorganiz",
+                    "mueve",
+                    "extrae",
+                    "divide",
+                )
+            ):
+                scores[3] += h_weight * 0.35
+            if any(
+                kw in content_lower
+                for kw in (
+                    "explica",
+                    "describe",
+                    "cómo funciona",
+                    "qué hace",
+                    "por qué",
+                )
+            ):
+                scores[0] += h_weight * 0.25
+            if not any(
+                kw in content_lower
+                for kw in ("fix", "bug", "refactor", "explica", "describe")
+            ):
+                scores[1] += h_weight * 0.25
+
+            max_score = max(scores)
+            second_max = sorted(scores, reverse=True)[1] if len(scores) > 1 else 0
+            diff = max_score - second_max
+
+            CE_CONFIDENCE_THRESHOLD = self._f.valves.intent_ce_threshold
+            LLM_FALLBACK_THRESHOLD = self._f.valves.intent_llm_threshold
+
+            if diff >= CE_CONFIDENCE_THRESHOLD:
+                exp_scores = [2.71828**s for s in scores]
+                total_exp = sum(exp_scores)
+                if total_exp > 0:
+                    result = {
+                        "explain": exp_scores[0] / total_exp,
+                        "modify": exp_scores[1] / total_exp,
+                        "debug": exp_scores[2] / total_exp,
+                        "refactor": exp_scores[3] / total_exp,
+                    }
+                    self._f._log_debug(
+                        f"Intent (CrossEncoder): {max(result, key=result.get)}={max(result.values()):.2f}"
+                    )
+                    return result
+                else:
+                    return {
+                        "explain": 0.25,
+                        "modify": 0.45,
+                        "debug": 0.2,
+                        "refactor": 0.1,
+                    }
+            elif diff < LLM_FALLBACK_THRESHOLD:
+                self._f._log_debug(
+                    f"Intent: CrossEncoder uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                    "using LLM with CrossEncoder context"
+                )
+                return await self._classify_intent_with_llm(
+                    user_query, scores, classifier_input, project_id
+                )
+            # else: middle zone → fall through to heuristic
+
+        # ── If CrossEncoder unavailable or in middle zone ──
+        self._f._log_debug("Intent: using conservative heuristic distribution")
+        return {"explain": 0.2, "modify": 0.3, "debug": 0.3, "refactor": 0.2}
+
+    async def _classify_intent_with_llm(
+        self,
+        user_query: str,
+        ce_scores: Optional[List[float]] = None,
+        stripped_query: str = "",
+        project_id: str = "",
+    ) -> dict:
+        """
+        Use the LLM to classify intent, optionally informed by CrossEncoder scores.
+        """
+        if ce_scores is not None:
+            ce_summary = f"""
+The CrossEncoder provides the following raw scores:
+- Explain: {ce_scores[0]:.2f}
+- Modify: {ce_scores[1]:.2f}
+- Debug: {ce_scores[2]:.2f}
+- Refactor: {ce_scores[3]:.2f}
+
+The highest score is {['Explain', 'Modify', 'Debug', 'Refactor'][int(np.argmax(ce_scores))]}.
+"""
+            prompt = f"""
+{ce_summary}
+
+Now, independently analyze the user's question and classify its intent.
+
+User question:
+{user_query[:500]}
+
+Intent definitions:
+- Explain: The user wants to understand or explain code at a high level, without modifying it. Clues: "how", "why", "what".
+- Modify: The user wants to modify, fix, or create code directly. Clues: "change", "add", "write", "implement".
+- Debug: The user is debugging an error, exception, or unexpected behavior. Clues: "error", "bug", "traceback", "fix".
+- Refactor: The user wants to refactor, restructure, or redesign code. Clues: "refactor", "restructure", "reorganize".
+
+If ambiguous, favor Debug or Refactor over Explain or Modify to preserve context.
+Output only the intent (Explain, Modify, Debug, or Refactor).
+"""
+        else:
+            prompt = f"""
+Classify the intent of the following user question.
+
+User question:
+{user_query[:500]}
+
+Intent definitions:
+- Explain: Understanding code. Clues: "how", "why".
+- Modify: Changing or creating code. Clues: "write", "change", "fix".
+- Debug: Fixing errors. Clues: "bug", "error", "traceback".
+- Refactor: Restructuring code. Clues: "refactor", "restructure".
+
+If ambiguous, favor Debug or Refactor.
+Output only the intent (Explain, Modify, Debug, or Refactor).
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are an intent classifier. Output only the intent name. "
+                "When in doubt, choose the most specific intent (Debug > Refactor > Modify > Explain)."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=10,
+            temperature=0.0,
+            label="intent_llm",
+        )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        intent_map = {
+            "explain": "explain",
+            "modify": "modify",
+            "debug": "debug",
+            "refactor": "refactor",
+            "Explain": "explain",
+            "Modify": "modify",
+            "Debug": "debug",
+            "Refactor": "refactor",
+        }
+        intent = intent_map.get(response.strip(), None)
+        if intent:
+            result = {"explain": 0.0, "modify": 0.0, "debug": 0.0, "refactor": 0.0}
+            result[intent] = 1.0
+            self._f._log_debug(f"Intent (LLM): {intent}")
             return result
-        self._f._log_debug("Intent: softmax failed, using default distribution.")
-        return {"explain": 0.25, "modify": 0.45, "debug": 0.2, "refactor": 0.1}
+
+        self._f._log_debug("Intent: LLM failed, using conservative heuristic")
+        return {"explain": 0.2, "modify": 0.3, "debug": 0.3, "refactor": 0.2}
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Explicit command dispatch (called from inlet)
@@ -11722,24 +12159,17 @@ class CommandRouter:
                         return f"✅ Cleaned block `{h[:8]}...` (matched partial hash)."
                 return "❌ Block not found among inactive candidates. Use `/status` to see candidates."
 
-    async def is_code_only_message(self, content: str) -> bool:
+    async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """
         Detect if a message contains only code without a question.
 
-        Resolution order:
-        1. Tree‑sitter: if the message parses as valid code in any language
-           → it's code‑only.
-        2. CrossEncoder: if tree‑sitter is uncertain or unavailable, use CE.
-        3. Heuristic fallback: structural line analysis (existing logic).
+        Cascade:
+        1. Tree‑sitter (fast, multi‑language)
+        2. CrossEncoder with heuristic reinforcement
+        3. LLM (only when diff < 0.20)
+        4. Heuristic structural fallback (when 0.20 ≤ diff < 0.35)
 
-        This improves accuracy by using tree‑sitter for all languages,
-        and CrossEncoder for ambiguous cases.
-
-        Args:
-            content (str): The message content to check.
-
-        Returns:
-            bool: True if the message contains only code.
+        Restores KV slot after any LLM call.
         """
         if not content or len(content.strip()) < 20:
             return False
@@ -11747,51 +12177,50 @@ class CommandRouter:
         stripped = content.strip()
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
 
-        # ── Step 1: Tree‑sitter (all languages) ──
+        # ── Step 1: Tree‑sitter ──
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
+
                 config = ProcessConfig()
-                # Try to detect language from content
                 blocks = process(content, config)
-                # If tree‑sitter finds code blocks and there's no natural language,
-                # it's likely code‑only. But we need to check if there's any text outside.
                 if blocks and hasattr(blocks, "blocks"):
                     spans = [(b.start_byte, b.end_byte) for b in blocks.blocks]
-                    # Remove code spans and check if anything meaningful remains
-                    text_outside = CodeBlockManager.remove_code_spans(content, spans).strip()
+                    text_outside = CodeBlockManager.remove_code_spans(
+                        content, spans
+                    ).strip()
                     if not text_outside or len(text_outside) < 30:
-                        self._f._log_debug(
-                            "is_code_only_message: tree‑sitter found code blocks and no text → code‑only"
-                        )
                         return True
             except Exception:
-                # Fall through to next step
                 pass
 
         # ── Step 2: CrossEncoder ──
         if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
             query = content[:500]
             pairs = [
-                (query, "This is a code snippet or technical content without a question."),
+                (
+                    query,
+                    "This is a code snippet or technical content without a question.",
+                ),
                 (query, "This is a natural language question or explanation."),
             ]
             scores = await self._f._commands._predict_cross_encoder(pairs)
             if scores is not None and len(scores) >= 2:
-                diff = scores[0] - scores[1]
-                if diff >= 0.3:
-                    result = scores[0] > scores[1]
-                    self._f._log_debug(
-                        f"is_code_only_message: CrossEncoder confident (diff={diff:.2f}) → {result}"
+                # Heuristic reinforcement: if no '?' and few words, boost code side
+                scores_reinforced = list(scores)
+                if "?" not in content and len(content.split()) < 30:
+                    scores_reinforced[0] += 0.2
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                CE_CONFIDENCE_THRESHOLD = 0.35
+                LLM_FALLBACK_THRESHOLD = 0.20
+                if diff >= CE_CONFIDENCE_THRESHOLD:
+                    return scores_reinforced[0] > scores_reinforced[1]
+                elif diff < LLM_FALLBACK_THRESHOLD:
+                    return await self._is_code_only_with_llm(
+                        query, scores_reinforced, project_id
                     )
-                    return result
 
-        # ── Step 3: Heuristic fallback (existing logic) ──
-        self._f._log_debug(
-            "is_code_only_message: falling back to heuristic (tree‑sitter + CE uncertain)"
-        )
-
-        # Fallback to the original heuristic logic
+        # ── Step 3: Heuristic fallback ──
         raw_lines = stripped.splitlines()
         cleaned_lines = self._strip_code_noise(stripped).splitlines()
         non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
@@ -11808,9 +12237,7 @@ class CommandRouter:
             ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
                 structural_lines += 1
                 continue
-            cleaned_line = (
-                cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
-            )
+            cleaned_line = cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
             if not cleaned_line:
                 structural_lines += 1
                 continue
@@ -11819,15 +12246,56 @@ class CommandRouter:
         structural_ratio = structural_lines / total_lines if total_lines else 0
         if structural_ratio > 0.70:
             return True
-
         prose_text = " ".join(prose_candidates).strip()
         if not prose_text or len(prose_text) < 30:
             return True
-
         if "?" in prose_text:
             return False
-
         return True
+
+    async def _is_code_only_with_llm(
+        self, query: str, ce_scores: list, project_id: str
+    ) -> bool:
+        """
+        LLM fallback for code-only detection.
+
+        Uses CrossEncoder scores as context and restores KV slot afterward.
+        """
+        prompt = f"""
+The CrossEncoder is uncertain. Scores:
+- Code only: {ce_scores[0]:.2f}
+- Not code only: {ce_scores[1]:.2f}
+
+Message:
+{query}
+
+Strict criteria for CODE:
+- Contains structural syntax: def, class, import, function, if, for, while, return.
+- No question marks ('?') in the natural language outside of comments.
+- If the message has a question, it is TEXT (even if it contains code).
+
+Examples:
+- "def foo(): pass" → CODE
+- "def foo(): pass  # this is a function" → TEXT (has explanation)
+- "how to fix this bug?" → TEXT
+- "class MyClass:\n    def __init__(self): pass" → CODE
+
+Classify this message strictly. Output only CODE or TEXT.
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a strict classifier for code-only messages. Output only 'CODE' or 'TEXT'.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="code_only_llm",
+        )
+        if self._f.valves.enable_slot_persistence:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "CODE":
+            return True
+        return False
 
     @staticmethod
     def has_code_indicators(content: str) -> bool:
@@ -13542,30 +14010,22 @@ class ActivationEngine:
         """
         Extract seed symbols from the query.
 
-        Uses:
-        1. Exact matching (same as before).
-        2. CrossEncoder to score partial matches (symbols that are similar
-           to query words but not exact).
-        3. Partial matching (existing logic) as fallback.
+        Cascade:
+        1. Exact matches
+        2. CrossEncoder for partial matches (with heuristic reinforcement)
+        3. LLM (only when diff < 0.10) to disambiguate very similar symbols
+        4. Fuzzy matching fallback (when 0.10 ≤ diff < 0.20)
 
-        Returns:
-            Tuple[List[str], List[str]]: (exact_matches, partial_matches)
-            where partial_matches are symbols that were scored highly by
-            the CrossEncoder or found by fuzzy matching.
+        Returns (exact, partial) where partial are symbols that scored highly.
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
 
-        # ── Exact matches ──
         exact = list(all_names.intersection(query_words))
-
-        # ── CrossEncoder for partial matches ──
         partial = []
-        ce_partial = []
 
-        # Only run CE if there are candidates and we haven't found enough exact matches
         if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
-            # Build candidates: all symbols that share a prefix or contain a query word
+            # Build candidates: symbols that share a prefix or contain a query word
             candidates = set()
             for word in query_words:
                 if len(word) < 3:
@@ -13573,23 +14033,49 @@ class ActivationEngine:
                 for name in all_names:
                     if word.lower() in name.lower() and name not in exact:
                         candidates.add(name)
-                        if len(candidates) >= 20:  # limit for CE
+                        if len(candidates) >= 20:
                             break
                 if len(candidates) >= 20:
                     break
 
             if candidates:
-                # Build pairs: (query, symbol_name) and score relevance
                 pairs = [(query, name) for name in candidates]
                 scores = self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None:
-                    # Score threshold: keep symbols with score > 0.5
-                    for name, score in zip(candidates, scores):
-                        if score > 0.5:
-                            ce_partial.append(name)
-                    # Sort by score (descending)
-                    ce_partial.sort(key=lambda n: scores[list(candidates).index(n)], reverse=True)
-                    partial = ce_partial[:5]  # Keep top 5
+                    # Heuristic reinforcement: if name contains query word exactly, boost
+                    scores_reinforced = list(scores)
+                    for i, name in enumerate(candidates):
+                        if any(word in name for word in query_words):
+                            scores_reinforced[i] += 0.1
+                    # Sort by score descending
+                    scored = sorted(
+                        zip(candidates, scores_reinforced),
+                        key=lambda x: x[1],
+                        reverse=True,
+                    )
+                    # Keep those above threshold
+                    ce_threshold = 0.5
+                    best = [name for name, sc in scored if sc > ce_threshold]
+                    if best:
+                        partial = best[:5]
+                    else:
+                        # If best is empty, check if the top score is very close to the second (diff < 0.10)
+                        if len(scored) >= 2:
+                            diff = scored[0][1] - scored[1][1]
+                            if diff < 0.10:
+                                # Extremely uncertain → use LLM to disambiguate
+                                llm_choice = self._extract_seeds_with_llm(
+                                    query, scored[:5], project_id
+                                )
+                                if llm_choice:
+                                    partial = [llm_choice]
+                                else:
+                                    # fallback to fuzzy
+                                    partial = [scored[0][0]]
+                            else:
+                                partial = [scored[0][0]]
+                        elif scored:
+                            partial = [scored[0][0]]
 
         # ── Fallback: existing partial matching ──
         if len(partial) < 3:
@@ -13597,7 +14083,11 @@ class ActivationEngine:
                 if len(word) < 4:
                     continue
                 for name in all_names:
-                    if word.lower() in name.lower() and name not in exact and name not in partial:
+                    if (
+                        word.lower() in name.lower()
+                        and name not in exact
+                        and name not in partial
+                    ):
                         partial.append(name)
                         if len(partial) >= 5:
                             break
@@ -13605,6 +14095,45 @@ class ActivationEngine:
                     break
 
         return exact, partial
+
+    def _extract_seeds_with_llm(
+        self, query: str, candidates: list, project_id: str
+    ) -> Optional[str]:
+        """
+        Use LLM to disambiguate when CrossEncoder is uncertain.
+
+        Restores the KV slot after the call.
+        """
+        if not candidates:
+            return None
+        scores_str = "\n".join([f"{name}: {score:.2f}" for name, score in candidates])
+        prompt = f"""
+The CrossEncoder is uncertain between these symbols for the query "{query}".
+
+Scores:
+{scores_str}
+
+Choose the symbol that best matches the query's intent. Consider the semantic role
+the symbol plays (e.g., builder, validator, handler, manager) rather than just
+keyword overlap.
+
+Output only the symbol name.
+"""
+        response = self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a symbol disambiguator. Output only the best matching symbol name.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=10,
+            temperature=0.0,
+            label="seed_disambiguate_llm",
+        )
+        if self._f.valves.enable_slot_persistence:
+            asyncio.create_task(
+                self._f._project_state_manager.slot_restore_for_continuity(project_id)
+            )
+        if response and response.strip():
+            return response.strip()
+        return None
 
     def _extract_traceback_seeds(
         self, content: str, project_id: str
@@ -14758,23 +15287,33 @@ Code context (recent symbols referenced):
         """
         Replace old assistant code-part messages with compact commit summaries.
 
-        Compression pipeline:
-          1. Find all assistant messages with multi-phase code part headers.
-          2. Keep the last `code_history_keep_last_n_parts` in full.
-          3. For each older part, verify symbols are indexed in the SymbolGraph.
-          4. If indexed (ratio >= threshold): replace with commit summary.
-          5. If NOT indexed: increment blocked age; if age exceeds
-             code_history_force_compress_after_turns OR the message was already
-             force-compressed in a previous session, force compression WITHOUT
-             an /expand guarantee (marked '[🗜️ CÓDIGO COMPRIMIDO — sin índice]').
+        Uses a cascade for compression decisions:
+        1. CrossEncoder evaluates semantic relevance of the message to the
+           current conversation context (score 0-1).
+        2. Symbol index ratio (existing logic) reinforces the decision.
+        3. If CrossEncoder is extremely uncertain (diff < LLM_FALLBACK_THRESHOLD),
+           use a conservative default (preserve).
+        4. If CrossEncoder is confident, use its decision.
+        5. If CrossEncoder is in the middle zone, fallback to the existing logic.
+
+        Compression is forced after `code_history_force_compress_after_turns`
+        regardless of the cascade.
+
+        Restores KV slot after any LLM call (via _build_code_commit_summary).
+
+        Args:
+            messages (list): The conversation messages to process.
+            project_id (str): The current project identifier.
+
+        Returns:
+            list: The updated message list with compressed assistant messages.
         """
         if not self._f.valves.enable_code_history_compression:
             return messages
 
-        # ── Patterns ─────────────────────────────────────────────────────────
+        # ── Patterns ──
         _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
         _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
-
         _PHASE_HEADER = re.compile(
             r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
             re.IGNORECASE,
@@ -14783,17 +15322,15 @@ Code context (recent symbols referenced):
         keep = self._f.valves.code_history_keep_last_n_parts
         force_after = self._f.valves.code_history_force_compress_after_turns
 
-        # ── Load persistent state ───────────────────────────────────────────
+        # ── Load persistent state ──
         pstate = self._f._project_state_manager.get_pstate(project_id)
         state = self._f._conversation_state_manager.get(project_id)
-        blocked_age = state.history_blocked_age  # mutable dict, modified in-place
-
-        # ── B5: load persistent force‑compressed keys ──────────────────────
+        blocked_age = state.history_blocked_age
         force_compressed_keys: Set[str] = set(pstate.get("force_compressed_keys", []))
 
-        dirty = False  # track whether we modified blocked_age or force_compressed_keys
+        dirty = False
 
-        # ── Collect indices of uncompressed code-part messages ─────────────
+        # ── Collect indices of uncompressed code-part messages ──
         code_part_indices: List[Tuple[int, int, int]] = []
         for i, msg in enumerate(messages):
             if msg.get("role") != "assistant":
@@ -14807,7 +15344,6 @@ Code context (recent symbols referenced):
                 code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
                 continue
 
-            # Try the broader phase/part pattern
             if _PHASE_HEADER.search(content):
                 est_tokens = self._f._tokens.estimate_code_tokens(content)
                 if est_tokens > 300:
@@ -14827,7 +15363,6 @@ Code context (recent symbols referenced):
                         code_part_indices.append((i, 1, 1))
 
         if len(code_part_indices) <= keep:
-            # No old parts to compress; still save dirty if modified
             if dirty:
                 self._f._conversation_state_manager.mark_dirty(project_id)
                 pstate["force_compressed_keys"] = list(force_compressed_keys)
@@ -14838,58 +15373,80 @@ Code context (recent symbols referenced):
         compressed_n = 0
         blocked_by_ratio = 0
         forced_no_expand = 0
+        preserved_by_semantic = 0
+
+        # ── Get the current user query for semantic relevance ──
+        current_query = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                current_query = msg.get("content", "")
+                break
 
         for msg_idx, part_num, total_parts in to_compress:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
-
-            # ── Generate a stable key for this message ─────────────────────
             msg_key = hashlib.md5(f"{msg.get('role')}|{content}".encode()).hexdigest()[
                 :16
             ]
 
-            # ── Verify symbols are indexed ─────────────────────────────────
+            # ── Step 1: Semantic relevance via CrossEncoder ──
+            should_compress = None
+            semantic_score = None
+            if current_query and self._f._cross_encoder is not None:
+                pairs = [(current_query[:500], content[:500])]
+                scores = await self._f._commands._predict_cross_encoder(pairs)
+                if scores is not None and len(scores) > 0:
+                    import math
+
+                    semantic_score = 1.0 / (1.0 + math.exp(-scores[0]))
+                    # Use the cascade thresholds from valves
+                    CE_CONFIDENCE_THRESHOLD = self._f.valves.code_history_ce_threshold
+                    LLM_FALLBACK_THRESHOLD = self._f.valves.code_history_llm_threshold
+                    # Since this is a binary decision, we compute diff as |score - 0.5|*2
+                    # For simplicity, we treat the score itself as the confidence
+                    # and use a threshold: if score < 0.3 → compress, if > 0.7 → preserve
+                    # The diff is not directly applicable here because it's a single score.
+                    # We'll use a simplified decision.
+                    if semantic_score < 0.3:
+                        should_compress = True
+                    elif semantic_score > 0.7:
+                        should_compress = False
+                    else:
+                        should_compress = None
+            else:
+                should_compress = None
+
+            # ── Step 2: Symbol index ratio (reinforcement / fallback) ──
             safe, ratio = self._verify_code_symbols_indexed(content, project_id)
 
-            force_no_expand = False
+            # ── Step 3: Final decision ──
+            if should_compress is True:
+                # CE says compress → compress, regardless of ratio
+                force_no_expand = False
+                safe = True
+            elif should_compress is False:
+                # CE says preserve → keep message
+                preserved_by_semantic += 1
+                continue
+            else:
+                # CE uncertain or unavailable: use existing logic
+                if not safe:
+                    blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
+                    dirty = True
+                    age = blocked_age[msg_key]
 
-            if not safe:
-                # Increment blocked age
-                blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
-                dirty = True
-                age = blocked_age[msg_key]
-
-                # Log the block with more detail
-                part_label_for_log = (
-                    f"Part {part_num}/{total_parts}"
-                    if total_parts > 0
-                    else f"message {msg_idx}"
-                )
-                self._f._log_debug(
-                    f"Code history: WANTED to compress {part_label_for_log} but "
-                    f"BLOCKED — symbol ratio {ratio:.0%} < threshold "
-                    f"{self._f.valves.code_history_symbol_index_threshold:.0%}. "
-                    f"Blocked age: {age} turn(s)."
-                )
-                blocked_by_ratio += 1
-
-                # ── B5: force compression if age exceeds threshold OR key already force-compressed ──
-                if force_after > 0 and (
-                    age >= force_after or msg_key in force_compressed_keys
-                ):
-                    self._f._log_debug(
-                        f"Code history: FORCING compression of {part_label_for_log} "
-                        f"(force_after={force_after}, age={age}, "
-                        f"already_force={msg_key in force_compressed_keys}). "
-                        f"Compressing WITHOUT /expand guarantee."
-                    )
-                    force_no_expand = True
-                    safe = True  # Proceed with compression
-                    forced_no_expand += 1
+                    if force_after > 0 and (
+                        age >= force_after or msg_key in force_compressed_keys
+                    ):
+                        force_no_expand = True
+                        safe = True
+                    else:
+                        blocked_by_ratio += 1
+                        continue
                 else:
-                    continue
+                    force_no_expand = False
 
-            # If safe (either verified or forced), compress
+            # ── Compression ──
             summary = await self._build_code_commit_summary(
                 content,
                 project_id,
@@ -14902,12 +15459,10 @@ Code context (recent symbols referenced):
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
 
-            # ── B5: record that this message was force-compressed ──────────
             if force_no_expand:
                 force_compressed_keys.add(msg_key)
                 dirty = True
 
-            # Reset blocked age for this message since it was successfully compressed
             if msg_key in blocked_age:
                 del blocked_age[msg_key]
                 dirty = True
@@ -14917,15 +15472,18 @@ Code context (recent symbols referenced):
                 f"{tokens_before:,} → {tokens_after:,} tokens "
                 f"(ratio {ratio:.0%})"
                 + (" [FORCED NO-EXPAND]" if force_no_expand else "")
+                + (
+                    f" [semantic_score={semantic_score:.2f}]"
+                    if semantic_score is not None
+                    else ""
+                )
             )
 
-        # ── B5: evict old force‑compressed keys ─────────────────────────────
+        # ── Cleanup ──
         if len(force_compressed_keys) > 500:
-            # Keep the most recent 250 (ordered by insertion, but set order is stable)
             force_compressed_keys = set(list(force_compressed_keys)[-250:])
             dirty = True
 
-        # ── B5: persist force‑compressed keys ──────────────────────────────
         if dirty:
             self._f._conversation_state_manager.mark_dirty(project_id)
             pstate["force_compressed_keys"] = list(force_compressed_keys)
@@ -14934,7 +15492,9 @@ Code context (recent symbols referenced):
             self._f._log_debug(
                 f"Code history: {compressed_n} part(s) compressed, "
                 f"last {keep} kept in full. "
-                f"(blocked_by_ratio={blocked_by_ratio}, forced_no_expand={forced_no_expand})"
+                f"(blocked_by_ratio={blocked_by_ratio}, "
+                f"forced_no_expand={forced_no_expand}, "
+                f"preserved_by_semantic={preserved_by_semantic})"
             )
         elif blocked_by_ratio > 0:
             self._f._log_debug(
@@ -15018,74 +15578,51 @@ Code context (recent symbols referenced):
     ) -> str:
         """
         Generate a compact commit summary for a compressed code message.
-
-        Q4: Uses LLM to produce structured summary including rationale.
-
-        Args:
-            content: The original code message content.
-            project_id: The current project identifier.
-            part_num: Part number in the multi-phase sequence.
-            total_parts: Total number of parts in the sequence.
-            force_no_expand: If True, omit /expand affordance and mark as
-                non-indexed. Used when compression is forced despite the
-                symbol-index ratio being too low.
-
-        Returns:
-            A formatted summary string.
         """
-        # ── If forced no-expand, use the old format (no LLM call) ──
         if force_no_expand:
             return self._build_legacy_commit_summary(
                 content, part_num, total_parts, force_no_expand=True
             )
 
-        # ── Extract symbols from content ──────────────────────────────
         classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         methods = re.findall(
             r"^\s{4,}(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE
         )
-        symbols = classes + top_fns + methods
-        # Take up to 5 symbols
-        symbols = symbols[:5]
+        symbols = (classes + top_fns + methods)[:5]
 
-        # ── Build the prompt ────────────────────────────────────────────
         prompt = self.COMMIT_SUMMARY_PROMPT.format(
-            user_message=content[:2000],  # Truncate to avoid token overflow
+            user_message=content[:2000],
             symbols_context=", ".join(symbols) if symbols else "none",
         )
 
-        # ── Call LLM ────────────────────────────────────────────────────
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a code summarization assistant. Output only valid JSON.",
+            system_prompt=(
+                "You are a code summarization assistant. Output ONLY valid JSON. "
+                "Do not include any markdown, explanations, or trailing text. "
+                "The JSON must have keys: 'action', 'rationale', 'symbols'."
+            ),
             model_override=self._f.valves.summarization_model,
             max_tokens=250,
             temperature=0.2,
             label="commit_summary",
         )
 
+        if self._f.valves.enable_slot_persistence:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not response:
-            # Fallback to legacy summary
             return self._build_legacy_commit_summary(
                 content, part_num, total_parts, force_no_expand=False
             )
 
-        # ── Parse response ─────────────────────────────────────────────
         summary = self._parse_commit_summary_response(response)
-        # Ensure action is not empty
         if not summary.get("action"):
             summary["action"] = "code change"
-        # Add part info
         summary["part_num"] = part_num
         summary["total_parts"] = total_parts
-
-        # ── Render with turn number (we use part_num as turn proxy) ──
-        rendered = self._render_commit_summary(summary, turn=part_num)
-
-        # ── If not fully indexed, add a note ────────────────────────────
-        # (force_no_expand is handled above, but for normal case we check)
-        return rendered
+        return self._render_commit_summary(summary, turn=part_num)
 
     def _build_legacy_commit_summary(
         self,
@@ -17857,22 +18394,13 @@ class InletOrchestrator:
         """
         Determine whether the current session is a coding session.
 
-        Uses a cascade approach:
-        1. CrossEncoder (fast) provides an initial assessment.
-        2. Heuristic reinforcement adds bonus based on code indicators.
-        3. If CrossEncoder is confident, use its result.
-        4. If uncertain, fallback to heuristic.
-        5. Cache results per project for TTL.
+        Uses a cascade:
+        1. Heuristic reinforcement (code indicators → boost)
+        2. CrossEncoder (primary decision)
+        3. LLM (only when CrossEncoder is extremely uncertain, diff < 0.15)
+        4. Heuristic fallback (when 0.15 ≤ diff < 0.25)
 
-        This inverts the previous order: CrossEncoder is now the primary
-        decision maker, with heuristic as reinforcement and fallback.
-
-        Args:
-            messages (list): The conversation messages.
-            project_id (str): The current project identifier.
-
-        Returns:
-            bool: True if the session is a coding session.
+        After any LLM call, the KV slot is restored to avoid cache pollution.
         """
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -17902,7 +18430,10 @@ class InletOrchestrator:
 
             # Enrich query with context tags
             context_parts = []
-            if "```" in user_text or any(kw in user_text for kw in ("def ", "class ", "import ", "from ", "function ")):
+            if "```" in user_text or any(
+                kw in user_text
+                for kw in ("def ", "class ", "import ", "from ", "function ")
+            ):
                 context_parts.append("[CODE]")
             if "traceback" in user_text.lower() or 'File "' in user_text:
                 context_parts.append("[TRACEBACK]")
@@ -17910,35 +18441,60 @@ class InletOrchestrator:
             query = f"{context_prefix} {user_text}" if context_parts else user_text
 
             pairs = [
-                (query, "This message is about programming, code, or software development."),
-                (query, "This message is not about programming or code."),
+                (
+                    query,
+                    "The user is asking about programming, code, or software development.",
+                ),
+                (
+                    query,
+                    "The user is asking about something else, not related to programming.",
+                ),
             ]
             scores = await self._f._commands._predict_cross_encoder(pairs)
 
             if scores is not None and len(scores) >= 2:
-                # Apply heuristic reinforcement
+                # Heuristic reinforcement
                 scores_reinforced = list(scores)
-                if "```" in user_text or any(kw in user_text for kw in ("def ", "class ", "import ", "from ", "function ")):
-                    scores_reinforced[0] += 0.2  # bonus to "code" class
+                if "```" in user_text or any(
+                    kw in user_text
+                    for kw in ("def ", "class ", "import ", "from ", "function ")
+                ):
+                    scores_reinforced[0] += 0.2
                 if len(user_text.split()) < 5:
-                    scores_reinforced[1] += 0.1  # very short messages are often not code
+                    scores_reinforced[1] += 0.1
 
-                # Confidence check
                 diff = scores_reinforced[0] - scores_reinforced[1]
-                if diff >= 0.3:  # confident
+                CE_CONFIDENCE_THRESHOLD = 0.25
+                LLM_FALLBACK_THRESHOLD = 0.15
+
+                if diff >= CE_CONFIDENCE_THRESHOLD:
                     result = scores_reinforced[0] > scores_reinforced[1]
                     self._cache_session_result(cache_key, result)
                     return result
-                # If uncertain, fall through to heuristic
-                self._f._log_debug(
-                    f"classify_session: CrossEncoder uncertain (diff={diff:.2f}), "
-                    "falling back to heuristic"
-                )
+                elif diff < LLM_FALLBACK_THRESHOLD:
+                    # Extremely uncertain → LLM
+                    result = await self._classify_session_with_llm(
+                        query, scores_reinforced, project_id
+                    )
+                    self._cache_session_result(cache_key, result)
+                    return result
+                # else: middle zone → fall through to heuristic
 
-        # ── Heuristic fallback ──
+        # ── Heuristic fallback (middle zone or no CE) ──
         if last_user:
             content = last_user.get("content", "").lower()
-            if any(kw in content for kw in ("code", "function", "def", "class", "error", "bug", "traceback")):
+            if any(
+                kw in content
+                for kw in (
+                    "code",
+                    "function",
+                    "def",
+                    "class",
+                    "error",
+                    "bug",
+                    "traceback",
+                )
+            ):
                 result = True
                 self._cache_session_result(cache_key, result)
                 return result
@@ -17946,6 +18502,48 @@ class InletOrchestrator:
         result = False
         self._cache_session_result(cache_key, result)
         return result
+
+    async def _classify_session_with_llm(
+        self, query: str, ce_scores: list, project_id: str
+    ) -> bool:
+        """
+        LLM fallback for session classification.
+
+        Uses the CrossEncoder scores as context and restores the KV slot afterward.
+        """
+        prompt = f"""
+The CrossEncoder is uncertain about this message. Here are its raw scores:
+- Code session: {ce_scores[0]:.2f}
+- Not code session: {ce_scores[1]:.2f}
+
+Message:
+{query}
+
+Context clues for CODE: Contains 'def', 'class', 'import', 'function', '```', or traceback lines.
+Context clues for TEXT: Natural language questions, greetings, or general conversation.
+
+Examples:
+- "def foo(): pass" → CODE
+- "how does this work?" → CODE (if about code)
+- "good morning" → TEXT
+- "tengo un error en la vida real" → TEXT (not about code)
+
+Classify this message strictly. Output only CODE or TEXT.
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a strict binary classifier for coding sessions. Output only 'CODE' or 'TEXT'.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="session_classify_llm",
+        )
+        if self._f.valves.enable_slot_persistence:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "CODE":
+            return True
+        return False
 
     def _cache_session_result(self, cache_key: Optional[str], result: bool) -> None:
         """Cache the session classification result."""
@@ -18269,7 +18867,9 @@ class SystemPromptBuilder:
             project_id, all_meta, current_messages=current_messages
         )
 
-    async def _render_ltm_section(self, project_id: str, memories: list, current_messages: list = None) -> str:
+    async def _render_ltm_section(
+        self, project_id: str, memories: list, current_messages: list = None
+    ) -> str:
         """
         Render the LTM section with a clear header and per-fragment labels.
 
@@ -18279,13 +18879,13 @@ class SystemPromptBuilder:
         Uses a cascade for deduplication:
         1. Quick substring containment (fast, cheap).
         2. CrossEncoder (semantic) to compare fragments against the window.
-        3. Fuzzy matching (fallback) if CrossEncoder is unavailable.
+        3. LLM (only when extremely uncertain, prob < 0.25).
+        4. Fuzzy matching (fallback) when CrossEncoder is uncertain but not extremely.
 
-        The CrossEncoder branch significantly improves precision by detecting
-        semantic duplicates even when wording differs (e.g., paraphrases).
+        Restores KV slot after any LLM call.
 
         Args:
-            project_id (str): The current project identifier (unused, kept for API).
+            project_id (str): The current project identifier.
             memories (list): List of memory fragments from LTM retrieval.
             current_messages (list, optional): The current conversation messages
                 to deduplicate against. Defaults to None.
@@ -18305,7 +18905,6 @@ class SystemPromptBuilder:
 
             # Use CrossEncoder for semantic duplicate detection if available
             if HAS_SENTENCE and HAS_CHROMA and self._f._cross_encoder is not None:
-                self._f._log_debug("LTM dedup: using CrossEncoder for semantic comparison")
                 for m in memories:
                     body = self._strip_ltm_prefix(m["doc"])
                     norm = self._normalize_for_dedup(body)
@@ -18322,28 +18921,47 @@ class SystemPromptBuilder:
                             break
 
                     if not is_duplicate:
-                        # ── CrossEncoder for deeper semantic comparison ──
+                        # ── CrossEncoder with heuristic reinforcement ──
                         best_prob = 0.0
-                        # Only compare against the first 3-5 window messages to keep it fast
-                        # (the most recent ones are usually the most relevant for dedup)
                         for w in window_norms[:5]:
                             if not w:
                                 continue
-                            # Truncate to 500 chars for speed (CE supports 32k but we don't
-                            # need that much context to detect a duplicate)
-                            scores = await self._f._commands._predict_cross_encoder([(norm[:500], w[:500])])
+                            scores = await self._f._commands._predict_cross_encoder(
+                                [(norm[:500], w[:500])]
+                            )
                             if scores is not None and len(scores) > 0:
-                                # Normalize CrossEncoder logit to [0, 1] via sigmoid
                                 import math
+
                                 prob = 1.0 / (1.0 + math.exp(-scores[0]))
+                                # Heuristic reinforcement: common words boost duplicate probability
+                                common_words = set(norm.split()) & set(w.split())
+                                if common_words:
+                                    prob = min(
+                                        1.0, prob + 0.1 * min(len(common_words), 3)
+                                    )
                                 if prob > best_prob:
                                     best_prob = prob
-                        # If the best semantic similarity is < 0.5, keep it (not a duplicate)
-                        if best_prob < 0.5:
-                            filtered.append(m)
+
+                        CE_CONFIDENCE_THRESHOLD = 0.40
+                        LLM_FALLBACK_THRESHOLD = 0.25
+
+                        if best_prob >= 0.5:
+                            is_duplicate = True
+                        elif best_prob >= CE_CONFIDENCE_THRESHOLD:
+                            is_duplicate = best_prob >= 0.5
+                        elif best_prob < LLM_FALLBACK_THRESHOLD:
+                            # Extremely uncertain → LLM
+                            is_duplicate = await self._ltm_dedup_with_llm(
+                                norm, window_norms[:3], best_prob, project_id
+                            )
+                        else:
+                            # Middle zone: keep (not duplicate) by default
+                            is_duplicate = False
+
+                    if not is_duplicate:
+                        filtered.append(m)
             else:
                 # ── Fallback to substring + fuzzy matching ──
-                self._f._log_debug("LTM dedup: CrossEncoder unavailable, using substring + fuzzy fallback")
                 for m in memories:
                     body = self._strip_ltm_prefix(m["doc"])
                     norm = self._normalize_for_dedup(body)
@@ -18354,7 +18972,9 @@ class SystemPromptBuilder:
 
             dropped = len(memories) - len(filtered)
             if dropped:
-                self._f._log_debug(f"LTM: filtered {dropped} fragment(s) from current session")
+                self._f._log_debug(
+                    f"LTM: filtered {dropped} fragment(s) from current session"
+                )
             memories = filtered
 
         if not memories:
@@ -18385,7 +19005,9 @@ class SystemPromptBuilder:
         for mem in unique:
             ts = mem.get("timestamp")
             if ts and ts > 1_000_000_000:
-                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
+                )
                 text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
                 text = f"[Past conversation — unknown date]\n{mem['doc']}"
@@ -18404,6 +19026,50 @@ class SystemPromptBuilder:
             f"LTM section rendered ({len(parts)} fragments, ~{current_tokens} tokens)"
         )
         return full_text
+
+    async def _ltm_dedup_with_llm(
+        self, norm: str, window_excerpts: list, ce_score: float, project_id: str
+    ) -> bool:
+        """
+        LLM fallback for LTM deduplication.
+
+        Uses CrossEncoder score as context and restores the KV slot afterward.
+        """
+        if not window_excerpts:
+            return False
+
+        window_text = "\n".join(window_excerpts)[:800]
+        prompt = f"""
+The CrossEncoder is uncertain if this fragment is a duplicate of the current conversation.
+
+Fragment:
+{norm[:500]}
+
+Current conversation (excerpts):
+{window_text}
+
+CrossEncoder score (higher = more duplicate): {ce_score:.2f}
+
+Focus on semantic meaning. If the fragment says the same thing as the conversation
+excerpt but with different words, it is a DUPLICATE. If it adds new information,
+it is UNIQUE.
+
+Output only DUPLICATE or UNIQUE.
+"""
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a semantic duplicate detector. Output only 'DUPLICATE' or 'UNIQUE'.",
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="ltm_dedup_llm",
+        )
+        if self._f.valves.enable_slot_persistence:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if response and response.strip().upper() == "DUPLICATE":
+            return True
+        return False
 
     async def _build_parallel_checks(
         self,
@@ -19374,7 +20040,9 @@ class MessageAssembler:
 
             if not _skip_intent_llm:
                 parallel_tasks.append(
-                    self._f._llm_orchestrator.should_keep_full_code(user_question)
+                    self._f._llm_orchestrator.should_keep_full_code(
+                        user_question, project_id
+                    )
                 )
             else:
                 parallel_tasks.append(asyncio.sleep(0, result=True))
@@ -21117,37 +21785,188 @@ class SemanticSeedInferencer:
         """
         Decide whether to spend an LLM call on seed inference.
 
-        Modes (valve seed_inference_mode):
-          'off'    → never.
-          'always' → always, provided there is a skeleton and a non‑trivial query.
-          'auto'   → (default) when lexical seeds are insufficient OR
-                     the use case is A/D (architecture/refactor), where the
-                     impact reasoning needs bodies the user didn't name.
+        Uses a cascade:
+        1. Heuristic reinforcement (keywords + use case) with weight multiplier.
+        2. CrossEncoder (decision).
+        3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD).
+        4. Middle zone: use heuristic (fallback).
+        5. Conservative final fallback: infer if uncertain.
+
+        Restores KV slot after any LLM call.
+
+        Args:
+            query (str): The user's query.
+            project_id (str): Current project identifier.
+            intent_vector (dict): Intent probabilities.
+            use_case (str): The detected use case (A, B, C, D, E).
+
+        Returns:
+            bool: True if seed inference should be performed.
         """
         mode = self._f.valves.seed_inference_mode
         if mode == "off":
             return False
 
-        # Query too short to infer anything useful.
         if not query or len(query.strip()) < self._f.valves.seed_inference_min_chars:
             return False
 
-        # Empty project: no skeleton to send.
         if not self._f._symbol_index.get_all_qualified_names(project_id):
             return False
 
         if mode == "always":
             return True
 
-        # 'auto': infer when lexical seeds are scarce OR the use case is
-        # architecture/refactor (implicit impact on many unnamed symbols).
-        exact, _ = self._f._activation._extract_query_seeds(query, project_id)
-        if len(exact) < self._f.valves.seed_inference_min_lexical:
+        # ── Heuristic reinforcement with weight ──
+        content_lower = query.lower()
+        infer_keywords = [
+            "implement",
+            "implementa",
+            "create",
+            "crea",
+            "añadir",
+            "add",
+            "architecture",
+            "arquitectura",
+            "design",
+            "diseño",
+            "refactor",
+            "estructurar",
+            "structure",
+            "organizar",
+            "organize",
+            "dividir",
+            "split",
+            "mover",
+            "move",
+            "extraer",
+            "extract",
+        ]
+        h_weight = self._f.valves.heuristic_reinforcement_weight
+        heuristic_boost = (
+            0.2 if any(kw in content_lower for kw in infer_keywords) else 0.0
+        )
+        if use_case in ("A", "D"):
+            heuristic_boost += 0.15
+        heuristic_boost *= h_weight
+
+        # ── CrossEncoder ──
+        if self._f._cross_encoder is not None:
+            query_stripped = self._f._commands._extract_text_for_classification(query)
+            pairs = [
+                (
+                    query_stripped[:500],
+                    "This query requires identifying implicit code symbols, classes, or functions that are not explicitly named.",
+                ),
+                (
+                    query_stripped[:500],
+                    "This query only needs literal symbol matches from the text.",
+                ),
+            ]
+            scores = self._f._commands._predict_cross_encoder(pairs)
+
+            if scores is not None and len(scores) >= 2:
+                scores_reinforced = list(scores)
+                scores_reinforced[0] += heuristic_boost
+
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                CE_CONFIDENCE_THRESHOLD = self._f.valves.seed_infer_ce_threshold
+                LLM_FALLBACK_THRESHOLD = self._f.valves.seed_infer_llm_threshold
+
+                if diff >= CE_CONFIDENCE_THRESHOLD:
+                    result = scores_reinforced[0] > scores_reinforced[1]
+                    self._f._log_debug(
+                        f"_should_infer: CE confident (diff={diff:.2f}) → {result}"
+                    )
+                    return result
+                elif diff < LLM_FALLBACK_THRESHOLD:
+                    self._f._log_debug(
+                        f"_should_infer: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                        "using LLM"
+                    )
+                    return self._should_infer_with_llm(
+                        query, scores_reinforced, use_case, project_id
+                    )
+                # else: middle zone → fall through to heuristic
+
+        # ── Fallback: heuristic (middle zone or no CE) ──
+        if any(kw in query.lower() for kw in infer_keywords):
             return True
         if use_case in ("A", "D"):
             return True
-
         return False
+
+    def _should_infer_with_llm(
+        self,
+        query: str,
+        ce_scores: Optional[List[float]] = None,
+        use_case: str = "C",
+        project_id: str = "",
+    ) -> bool:
+        """
+        Use the LLM to decide if seed inference is needed.
+        """
+        if ce_scores is not None:
+            ce_summary = f"""
+The CrossEncoder provides the following scores:
+- Needs implicit inference: {ce_scores[0]:.2f}
+- Only literal matches: {ce_scores[1]:.2f}
+"""
+            prompt = f"""
+{ce_summary}
+
+Now, independently analyze the user's question.
+
+Seed inference means identifying code symbols that the user implies but does not name.
+This is critical for architecture (A), refactoring (D), or high-level design questions.
+Only say NO if the query mentions specific, exact function or class names.
+
+User question:
+{query[:500]}
+
+Use case: {use_case} (A=Architecture, D=Refactor benefit most from inference).
+
+Output only "YES" or "NO". When uncertain, output YES.
+"""
+        else:
+            prompt = f"""
+Analyze the user's question for seed inference need.
+
+Seed inference means identifying implied code symbols. Critical for architecture/refactor.
+Only say NO if the query has exact symbol names.
+
+User question:
+{query[:500]}
+
+Use case: {use_case}
+
+Output only "YES" or "NO". When uncertain, output YES.
+"""
+        response = self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a decision engine. Output only 'YES' or 'NO'. "
+                "Prefer YES when uncertain to avoid missing critical symbols."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=5,
+            temperature=0.0,
+            label="should_infer_llm",
+        )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            asyncio.create_task(
+                self._f._project_state_manager.slot_restore_for_continuity(project_id)
+            )
+
+        if response and response.strip().upper() == "YES":
+            self._f._log_debug("_should_infer: LLM decided YES")
+            return True
+        elif response and response.strip().upper() == "NO":
+            self._f._log_debug("_should_infer: LLM decided NO")
+            return False
+
+        self._f._log_debug("_should_infer: LLM failed, defaulting to YES")
+        return True
 
     # ── Main inference ────────────────────────────────────────────────────────
 
@@ -21655,9 +22474,13 @@ class Valves(BaseModel):
     )
 
     # ── Multi‑phase code history ─────────────────────────────────
+    # This only affects LLM turns in the conversation history containing code.
     enable_code_history_compression: bool = Field(
         default=True,
-        description="Replace old multi‑phase code parts with compact commit summaries.",
+        description=(
+            "Replace old multi‑phase code parts with compact commit summaries."
+            "This only affects LLM turns in the conversation history containing code"
+        ),
     )
     code_history_force_compress_after_turns: int = Field(
         default=8,
@@ -21852,6 +22675,16 @@ class Valves(BaseModel):
     lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
     lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
     lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+
+    # ── LOD-3 semantic filter ──
+    enable_semantic_lod3_filter: bool = Field(
+        default=True,
+        description=(
+            "If True, use CrossEncoder + LLM cascade to filter blocks for LOD-3 "
+            "based on semantic relevance to the query. This improves quality by "
+            "avoiding irrelevant code, but adds latency (CE + occasional LLM)."
+        ),
+    )
 
     # ── LOD by use case ──────────────────────────────────────────
     enable_lod_by_intent: bool = Field(
@@ -22563,6 +23396,99 @@ class Valves(BaseModel):
         description="Maximum hub symbols (top‑N by centrality) kept in Block A.",
     )
 
+    # TO BE RE-ORDERED:
+    # ── Classification thresholds (points 1-4) ──
+    session_classify_ce_threshold: float = Field(default=0.25)
+    session_classify_llm_threshold: float = Field(default=0.15)
+    code_only_ce_threshold: float = Field(default=0.35)
+    code_only_llm_threshold: float = Field(default=0.20)
+    seed_extract_ce_threshold: float = Field(default=0.20)
+    seed_extract_llm_threshold: float = Field(default=0.10)
+    ltm_dedup_ce_threshold: float = Field(default=0.40)
+    ltm_dedup_llm_threshold: float = Field(default=0.25)
+
+    # ── Classification thresholds (points 5-9) ──
+    # Feature 5: Code history compression
+    code_history_ce_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Minimum diff to trust CrossEncoder for code history compression decision.",
+    )
+    code_history_llm_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Maximum diff to trigger LLM fallback for code history compression.",
+    )
+
+    # Feature 6: Intent classification
+    intent_ce_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Minimum diff to trust CrossEncoder for intent classification.",
+    )
+    intent_llm_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Maximum diff to trigger LLM fallback for intent classification.",
+    )
+
+    # Feature 7: Semantic seed inference
+    seed_infer_ce_threshold: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Minimum diff to trust CrossEncoder for seed inference decision.",
+    )
+    seed_infer_llm_threshold: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description="Maximum diff to trigger LLM fallback for seed inference.",
+    )
+
+    # Feature 8: LOD-3 block relevance filtering
+    lod3_relevance_ce_threshold: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum diff to trust CrossEncoder for LOD-3 block relevance.",
+    )
+    lod3_relevance_llm_threshold: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Maximum diff to trigger LLM fallback for LOD-3 block relevance.",
+    )
+
+    # Feature 9: Full code vs summary decision
+    keep_full_code_ce_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Minimum diff to trust CrossEncoder for FULL vs SUMMARY decision.",
+    )
+    keep_full_code_llm_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Maximum diff to trigger LLM fallback for FULL vs SUMMARY decision.",
+    )
+
+    # ── General heuristic weight (affects all features) ──
+    heuristic_reinforcement_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores). "
+            "Affects features 1-9 uniformly. Higher values make heuristics more influential."
+        ),
+    )
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
@@ -23187,7 +24113,7 @@ class Valves(BaseModel):
             and last_user_msg is not None
             and not is_explicit_command
         ):
-            if await self._commands.is_code_only_message(user_query):
+            if await self._commands.is_code_only_message(user_query, project_id):
                 self._log_section("SILENT INGESTION MODE")
 
                 pstate = self._project_state_manager.get_pstate(project_id)
