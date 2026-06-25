@@ -70,9 +70,9 @@ CrossEncoder (scores)
        ↓
 ¿Confianza suficiente?
        ↓
-    SÍ → Usar CE
+    SÍ → Usar Cross Encoder
        ↓
-    NO → LLM con contexto CE
+    NO → LLM con contexto Cross Encoder
        ↓
 LLM falla → Inferir = True (conservador)
 ```
