@@ -2947,13 +2947,30 @@ class RaptorCodeIndex:
         llm_caller,
         embedder,
         graph_weight: float = 0.5,
+        stop_event: Optional[asyncio.Event] = None,
     ) -> None:
         """
         Full rebuild: build L1 (symbol clusters) and, if enough L1 clusters
         exist, L2 (clusters of L1 summaries). Uses upsert over stable ids —
         a failed rebuild leaves the prior set intact. After a successful
         build, prunes stale higher-numbered cluster ids (FIX #7).
+
+        Args:
+            project_id: Current project identifier.
+            symbol_index: The SymbolIndex instance.
+            edges_out: Call graph edges (outgoing).
+            n_clusters: Number of clusters per level.
+            summary_model: Model to use for cluster summaries.
+            summary_max_tokens: Maximum tokens for each summary.
+            chroma_collection: ChromaDB collection.
+            llm_caller: Async function to call the LLM.
+            embedder: Embedder instance.
+            graph_weight: Weight for graph distance in clustering.
+            stop_event: Optional event to signal early termination.
         """
+        if stop_event and stop_event.is_set():
+            return
+
         names = []
         try:
             names = list(symbol_index.get_all_names(project_id))
@@ -2975,7 +2992,11 @@ class RaptorCodeIndex:
             llm_caller=llm_caller,
             embedder=embedder,
             graph_weight=graph_weight,
+            stop_event=stop_event,
         )
+
+        if stop_event and stop_event.is_set():
+            return
 
         # Build L2 from L1 summaries if enough L1 clusters exist
         if n_l1 >= 4:
@@ -2991,6 +3012,7 @@ class RaptorCodeIndex:
                 llm_caller=llm_caller,
                 embedder=embedder,
                 graph_weight=graph_weight,
+                stop_event=stop_event,
             )
 
         # Prune stale cluster ids (FIX #7)
@@ -13166,7 +13188,7 @@ class CodeBlockManager:
         Returns:
             bool: True if the text is likely code, False otherwise.
         """
-        SAMPLE_SIZE = 2500  # Enough to detect keywords and structure
+        SAMPLE_SIZE = 5000  # Enough to detect keywords and structure
 
         if not text or len(text.strip()) < 20:
             return False
@@ -13224,7 +13246,7 @@ class CodeBlockManager:
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
         Extract fenced and indented code blocks from message content.
-    
+
         Avoids parsing the entire message with tree‑sitter if there are no
         fenced blocks and the content is large. Instead, it extracts blocks
         manually and processes only the extracted chunks.
@@ -13233,12 +13255,12 @@ class CodeBlockManager:
         if project_id is None:
             project_id = self._f.valves.project_id
         pstate = self._f._project_state_manager.get_pstate(project_id)
-    
+
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
-    
+
         # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
         raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
@@ -13262,12 +13284,12 @@ class CodeBlockManager:
                     return [], []
             block["file_path"] = blk_file
             return [block], [(0, len(content))]
-    
+
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line) + 1)
-    
+
         # ── Path 2a: Fenced blocks (extracted via regex, no full parse) ──
         has_fenced = "```" in content
         if has_fenced:
@@ -13275,7 +13297,9 @@ class CodeBlockManager:
                 lang = match.group(1) or "text"
                 code = match.group(2).strip()
                 if len(code) > 200_000:
-                    self._f._log_debug(f"Skipping oversized fenced block ({len(code)} chars)")
+                    self._f._log_debug(
+                        f"Skipping oversized fenced block ({len(code)} chars)"
+                    )
                     continue
                 start_line = next(
                     (i for i, off in enumerate(line_offsets) if off > match.start()),
@@ -13299,7 +13323,7 @@ class CodeBlockManager:
             # If we found fenced blocks, return them immediately (don't fall through to indented)
             if blocks:
                 return blocks, spans
-    
+
         # ── Path 2b: Indented blocks (manual extraction, no full parse) ──
         # We only reach this if there were NO fenced blocks.
         # Only extract indented blocks if the overall content is not too large,
@@ -13310,7 +13334,7 @@ class CodeBlockManager:
                 "skipping indented block extraction to avoid performance issues."
             )
             return [], []
-    
+
         indented = []
         i = 0
         while i < len(lines):
@@ -13322,14 +13346,19 @@ class CodeBlockManager:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
                     # Only process if it looks like code and is not huge
-                    if SignatureExtractor._is_likely_code(code) and len(code) <= 200_000:
+                    if (
+                        SignatureExtractor._is_likely_code(code)
+                        and len(code) <= 200_000
+                    ):
                         start_line = i - len(indented) + 1
                         end_line = i
                         # Detect language from the indented block
                         lang = SignatureExtractor._guess_language(None, code)
                         if lang == "unknown":
                             lang = "text"
-                        pre_syms = await SignatureExtractor.extract_async(code, None, lang)
+                        pre_syms = await SignatureExtractor.extract_async(
+                            code, None, lang
+                        )
                         blocks.append(
                             {
                                 "language": lang,
@@ -13345,7 +13374,7 @@ class CodeBlockManager:
                 else:
                     indented = []
                 i += 1
-    
+
         if len(indented) >= 3:
             code = "\n".join(indented)
             if SignatureExtractor._is_likely_code(code) and len(code) <= 200_000:
@@ -13364,11 +13393,17 @@ class CodeBlockManager:
                     }
                 )
                 start_offset = line_offsets[len(lines) - len(indented)]
-                end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                end_offset = (
+                    line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                )
                 spans.append((start_offset, end_offset))
-    
+
         # ── Path 2c: If no blocks were found, but the whole content is small and looks like code ──
-        if not blocks and len(content) <= 20_000 and SignatureExtractor._is_likely_code(content):
+        if (
+            not blocks
+            and len(content) <= 20_000
+            and SignatureExtractor._is_likely_code(content)
+        ):
             # Treat the whole content as a single code block (useful for short snippets without fences)
             lang = SignatureExtractor._guess_language(None, content)
             if lang == "unknown":
@@ -13383,8 +13418,10 @@ class CodeBlockManager:
                 }
             )
             spans.append((0, len(content)))
-            self._f._log_debug(f"extract_code_blocks: treating entire small message as code ({len(content)} chars)")
-    
+            self._f._log_debug(
+                f"extract_code_blocks: treating entire small message as code ({len(content)} chars)"
+            )
+
         # ── 3. Post-process blocks (file paths, etc.) ──────────────────────
         processed_blocks = []
         processed_spans = []
@@ -13395,18 +13432,18 @@ class CodeBlockManager:
             if not blk_file and len(blocks) == 1:
                 extracted_paths = self.extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
-    
+
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
                     continue
-    
+
             block["file_path"] = blk_file
             processed_blocks.append(block)
             processed_spans.append(spans[idx])
-    
+
         return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
@@ -17440,8 +17477,26 @@ class EnrichmentTasks:
 
             await self._f._state_store._db_enqueue(_write)
 
-    async def run_session_summary_task(self, params: dict, model: str) -> bool:
-        """Generate an autobiographical session summary and store it in LTM."""
+    async def run_session_summary_task(
+        self,
+        params: dict,
+        model: str,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        """
+        Generate an autobiographical session summary and store it in LTM.
+
+        Args:
+            params (dict): Parameters including 'project_id' and optionally 'code_state_hash'.
+            model (str): Model to use for summarization.
+            stop_event (Optional[asyncio.Event]): Optional event to signal early termination.
+
+        Returns:
+            bool: True if the summary was generated and stored successfully.
+        """
+        if stop_event and stop_event.is_set():
+            return False
+
         project_id = params["project_id"]
         code_state_hash = params.get("code_state_hash", "")
 
@@ -17451,6 +17506,9 @@ class EnrichmentTasks:
             limit=self._f.valves.session_summary_interval_messages,
         )
         if not recent:
+            return False
+
+        if stop_event and stop_event.is_set():
             return False
 
         conversation_text = "\n".join(
@@ -17471,6 +17529,9 @@ class EnrichmentTasks:
             label="session_summary",
         )
         if not summary:
+            return False
+
+        if stop_event and stop_event.is_set():
             return False
 
         msg_id = f"{project_id}_session_summary_{int(time.time())}"
@@ -17577,19 +17638,27 @@ class EnrichmentTasks:
                 self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 3. LOD adaptive adjustment (MIGRADO)
+    # 3. LOD adaptive adjustment
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def update_lod_thresholds_from_response(
         self,
         project_id: str,
         response_text: str,
-        stop_event: asyncio.Event = None,
+        stop_event: Optional[asyncio.Event] = None,
     ) -> None:
         """
         Adjust lod3_threshold based on which symbols appear in the LLM's
         response compared to the LOD level they received.
+
+        Args:
+            project_id (str): The current project identifier.
+            response_text (str): The assistant's response text.
+            stop_event (Optional[asyncio.Event]): Optional event to signal early termination.
         """
+        if stop_event and stop_event.is_set():
+            return
+
         if not self._f.valves.enable_lod_adaptive:
             return
 
@@ -18125,7 +18194,9 @@ class EnrichmentTasks:
         return sorted(qids, key=priority_key)
 
     async def _docstring_generation_loop(
-        self, project_id: str, stop_event: asyncio.Event = None
+        self,
+        project_id: str,
+        stop_event: Optional[asyncio.Event] = None,
     ) -> None:
         """
         Background loop that generates docstrings for all pending symbols
@@ -27198,6 +27269,9 @@ class Filter:
         # First, drain SQLite writes to reduce lock contention
         await self._state_store.drain_writes(timeout=2.0)
 
+        # Get last_activated for prefetch
+        last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
+
         self._bg_manager.set_paused(False)
 
         for task in self._task_registry.get_background_tasks():
@@ -27212,7 +27286,14 @@ class Filter:
                     task.name,
                     task.bg_func,
                     project_id,
-                    assistant_content,  # Pass the response for this turn
+                    assistant_content,  # response_text
+                )
+            elif task.name == "prefetch":
+                await self._bg_manager.start(
+                    task.name,
+                    task.bg_func,
+                    project_id,
+                    last_activated,  # last_activated
                 )
             else:
                 await self._bg_manager.start(task.name, task.bg_func, project_id)
