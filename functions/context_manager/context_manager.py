@@ -13272,14 +13272,16 @@ class CodeBlockManager:
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
         Extract fenced and indented code blocks from message content.
-    
+
         For large content without fenced blocks, it scans all lines to extract
-        indented blocks, ensuring silent ingestion works for full files.
-    
+        indented blocks, enabling silent ingestion for complete files.
+        If no indented blocks are found but the content looks like code,
+        it treats the whole content as a single code block.
+
         Args:
             content (str): The raw message content.
             project_id (Optional[str]): The project ID for per-project state.
-    
+
         Returns:
             Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
                 A tuple of (blocks_list, spans_list).
@@ -13288,12 +13290,12 @@ class CodeBlockManager:
         if project_id is None:
             project_id = self._f.valves.project_id
         pstate = self._f._project_state_manager.get_pstate(project_id)
-    
+
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
-    
+
         # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
         raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
@@ -13317,19 +13319,19 @@ class CodeBlockManager:
                     return [], []
             block["file_path"] = blk_file
             return [block], [(0, len(content))]
-    
+
         # ── Quick rejection: if the whole message doesn't look like code, return empty ──
         if not self._is_likely_code(content):
             self._f._log_debug(
                 "extract_code_blocks: content does not appear to be code, skipping"
             )
             return [], []
-    
+
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line) + 1)
-    
+
         # ── Path 2a: Fenced blocks (extracted via regex, no full parse) ──
         has_fenced = "```" in content
         if has_fenced:
@@ -13363,27 +13365,27 @@ class CodeBlockManager:
             # If we found fenced blocks, return them immediately (don't fall through to indented)
             if blocks:
                 return blocks, spans
-    
+
         # ── Path 2b: Indented blocks (manual extraction, full scan) ──
         # We only reach this if there were NO fenced blocks.
-        # For large content, we scan ALL lines to extract indented blocks,
-        # enabling silent ingestion for complete files.
         total_lines = len(lines)
-        scan_limit = total_lines  # Scan all lines, no limit
-    
+        scan_limit = total_lines
+
         if total_lines > 2000:
             self._f._log_debug(
                 f"extract_code_blocks: content has {total_lines} lines, "
                 f"scanning all lines for indented blocks"
             )
-    
+
         indented = []
         i = 0
+        found_indented = False
         while i < scan_limit:
             line = lines[i]
             if line.startswith(("    ", "\t")):
                 indented.append(line.lstrip(" \t"))
                 i += 1
+                found_indented = True
             else:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
@@ -13413,7 +13415,7 @@ class CodeBlockManager:
                 else:
                     indented = []
                 i += 1
-    
+
         # Check for indented block at the end
         if len(indented) >= 3:
             code = "\n".join(indented)
@@ -13435,8 +13437,8 @@ class CodeBlockManager:
                 start_offset = line_offsets[scan_limit - len(indented)]
                 end_offset = line_offsets[scan_limit] - 1
                 spans.append((start_offset, end_offset))
-    
-        # ── Path 2c: If no blocks were found, but the whole content is small and looks like code ──
+
+        # ── Path 2c: If no blocks were found and the whole content is small and looks like code ──
         if not blocks and len(content) <= 20_000 and self._is_likely_code(content):
             # Treat the whole content as a single code block (useful for short snippets without fences)
             lang = SignatureExtractor._guess_language(None, content)
@@ -13455,7 +13457,34 @@ class CodeBlockManager:
             self._f._log_debug(
                 f"extract_code_blocks: treating entire small message as code ({len(content)} chars)"
             )
-    
+
+        # ── Path 2d: NEW: If no blocks were found but the content is large and looks like code ──
+        # This handles files without indentation (e.g., top-level definitions at column 0).
+        if not blocks and self._is_likely_code(content):
+            # Limit the block size to avoid memory issues
+            code = content[:200_000]  # Take first 200k chars
+            if len(content) > 200_000:
+                self._f._log_debug(
+                    f"extract_code_blocks: content too large ({len(content)} chars), "
+                    f"truncating to 200k chars for block processing"
+                )
+            lang = SignatureExtractor._guess_language(None, code)
+            if lang == "unknown":
+                lang = "text"
+            pre_syms = await SignatureExtractor.extract_async(code, None, lang)
+            blocks.append(
+                {
+                    "language": lang,
+                    "code": code,
+                    "type": "indented",
+                    "precomputed_symbols": pre_syms,
+                }
+            )
+            spans.append((0, len(code)))
+            self._f._log_debug(
+                f"extract_code_blocks: treating large content as a single code block ({len(code)} chars)"
+            )
+
         # ── 3. Post-process blocks (file paths, etc.) ──────────────────────
         processed_blocks = []
         processed_spans = []
@@ -13466,18 +13495,18 @@ class CodeBlockManager:
             if not blk_file and len(blocks) == 1:
                 extracted_paths = self.extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
-    
+
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
                     continue
-    
+
             block["file_path"] = blk_file
             processed_blocks.append(block)
             processed_spans.append(spans[idx])
-    
+
         return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
