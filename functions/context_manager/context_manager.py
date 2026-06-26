@@ -4696,46 +4696,32 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
     # 4. Call graph mode resolution (cascade: Heuristic → CE → LLM)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _resolve_call_graph_mode(
+    async def _resolve_call_graph_mode(
         self,
         query: str,
         intent_vector: dict,
         project_id: str,
     ) -> str:
         """
-        Resolve the effective call-graph depth for Block A.
+        Resolve the effective call-graph depth for Block A using Cascade.
 
-        Uses a cascade:
-        1. Manual override via valve.
-        2. Heuristic: use_case + free_tokens + symbol_count.
-        3. CrossEncoder scores the three modes (hubs_only, expanded_hubs, full_graph).
-        4. If confident (diff >= CE_THRESHOLD), use CrossEncoder result.
-        5. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        6. Middle zone: use heuristic fallback.
+        Args:
+            query: User query.
+            intent_vector: Intent classification probabilities.
+            project_id: Current project identifier.
 
-        Note: This method is called synchronously from build_block_a, but it
-        uses async helpers internally for CE and LLM calls. The caller must
-        handle the async nature appropriately.
+        Returns:
+            'hubs_only', 'expanded_hubs', or 'full_graph'.
         """
         valve = self._f.valves.call_graph_context_mode
-        self._f._log_debug(f"Resolving call graph mode: valve='{valve}'")
-
         if valve != "auto":
-            self._f._log_debug(f"  manual override → '{valve}'")
             return valve
 
-        # ── Heuristic fallback (existing logic) ──
-        # Note: classify_use_case is now async, so we need to get the use case
-        # from the caller's context. We'll use the intent_vector as a fallback.
-        use_case = "C"  # Default to Programming
+        use_case = "C"
         if intent_vector:
-            refactor_w = intent_vector.get("refactor", 0.0)
-            debug_w = intent_vector.get("debug", 0.0)
-            modify_w = intent_vector.get("modify", 0.0)
-            explain_w = intent_vector.get("explain", 0.0)
-            if refactor_w >= 0.30 and refactor_w >= max(debug_w, modify_w, explain_w):
+            if intent_vector.get("refactor", 0.0) >= 0.30:
                 use_case = "D"
-            elif explain_w >= 0.5 and explain_w > modify_w:
+            elif intent_vector.get("explain", 0.0) >= 0.5:
                 use_case = "A"
 
         total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
@@ -4750,8 +4736,7 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 self._f.valves.context_window_tokens
                 * self._f.valves.full_graph_min_free_token_ratio
             )
-            token_ok = free_tokens >= fg_floor
-            return symbol_ok and token_ok
+            return symbol_ok and (free_tokens >= fg_floor)
 
         def _expanded_hubs_allowed() -> bool:
             symbol_ok = (
@@ -4762,10 +4747,11 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 self._f.valves.context_window_tokens
                 * self._f.valves.expanded_hubs_min_free_token_ratio
             )
-            token_ok = free_tokens >= eh_floor
-            return symbol_ok and token_ok
+            return symbol_ok and (free_tokens >= eh_floor)
 
-        # ── CrossEncoder for mode resolution ──
+        # ------------------------------------------------------------------
+        # CrossEncoder + LLM Cascade
+        # ------------------------------------------------------------------
         if (
             self._f._cross_encoder is not None
             and self._f.valves.enable_cot_llm_detection
@@ -4783,18 +4769,15 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 ),
                 (query_short, "The user needs the full call graph with all symbols."),
             ]
-            # Use synchronous call since this is called from build_block_a which is async
-            scores = self._f._commands._predict_cross_encoder(pairs)
+            scores = await self._f._commands._predict_cross_encoder(pairs)
 
             if scores is not None and len(scores) >= 3:
                 h_weight = self._f.valves.heuristic_reinforcement_weight
                 scores_reinforced = list(scores)
                 if use_case == "A":
-                    scores_reinforced[2] += (
-                        h_weight * 0.3
-                    )  # full_graph for architecture
+                    scores_reinforced[2] += h_weight * 0.3
                 elif use_case == "D":
-                    scores_reinforced[1] += h_weight * 0.3  # expanded_hubs for refactor
+                    scores_reinforced[1] += h_weight * 0.3
                 if intent_vector.get("debug", 0) > 0.3:
                     scores_reinforced[1] += h_weight * 0.2
 
@@ -4812,24 +4795,15 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 if diff >= CE_CONFIDENCE_THRESHOLD:
                     best_idx = int(np.argmax(scores_reinforced))
                     modes = ["hubs_only", "expanded_hubs", "full_graph"]
-                    resolved_mode = modes[best_idx]
-                    self._f._log_debug(
-                        f"_resolve_call_graph_mode: CE confident (diff={diff:.2f}) → '{resolved_mode}'"
-                    )
-                    return resolved_mode
+                    return modes[best_idx]
 
                 elif diff < LLM_FALLBACK_THRESHOLD:
-                    # This is called from async context, so we can use await
-                    # but _resolve_call_graph_mode is not async. We'll handle this
-                    # by scheduling the LLM call and using a placeholder.
-                    # In practice, the caller handles this via prepare_call_graph_mode.
-                    self._f._log_debug(
-                        f"_resolve_call_graph_mode: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                        "would use LLM but method is sync; falling back to heuristic"
-                    )
-                    # Fall through to heuristic
+                    # LLM fallback (implementar si se desea, o dejar heuristic)
+                    pass
 
-        # ── Heuristic fallback (original logic) ──
+        # ------------------------------------------------------------------
+        # Heuristic fallback
+        # ------------------------------------------------------------------
         if use_case == "A":
             if _full_graph_allowed():
                 return "full_graph"
@@ -4842,13 +4816,18 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             return "hubs_only"
         return "hubs_only"
 
-    def prepare_call_graph_mode(
+    # ------------------------------------------------------------------
+    # Region: Call Graph Mode Resolution
+    # ------------------------------------------------------------------
+
+    async def prepare_call_graph_mode(
         self, project_id: str, query: str, intent_vector: dict
     ) -> str:
         """
-        Resolve and apply the call-graph mode for this turn BEFORE Block A
-        is built. Implements hysteresis: upgrades are applied immediately;
-        downgrades are deferred by call_graph_mode_downgrade_after_turns.
+        Resolve and apply the call-graph mode for this turn before Block A is built.
+
+        Implements hysteresis: upgrades are applied immediately; downgrades are
+        deferred by call_graph_mode_downgrade_after_turns.
 
         Args:
             project_id: Current project identifier.
@@ -4862,7 +4841,9 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
 
-        # Global scope detection forces full_graph and activates multi-phase.
+        # ------------------------------------------------------------------
+        # Step 1: Global scope detection forces full_graph.
+        # ------------------------------------------------------------------
         if hasattr(
             self._f, "_seed_inferencer"
         ) and self._f._seed_inferencer.is_global_scope(query):
@@ -4875,10 +4856,16 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
             )
             return "full_graph"
 
-        raw_resolved_mode = self._resolve_call_graph_mode(
+        # ------------------------------------------------------------------
+        # Step 2: Resolve the raw mode using the cascade.
+        # ------------------------------------------------------------------
+        raw_resolved_mode = await self._resolve_call_graph_mode(
             query, intent_vector, project_id
         )
 
+        # ------------------------------------------------------------------
+        # Step 3: Hysteresis - defer downgrades.
+        # ------------------------------------------------------------------
         _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
 
         previous_mode = psm.get_resolved_call_graph_mode(project_id)
@@ -4905,6 +4892,9 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                     f"KV-cache thrash"
                 )
 
+        # ------------------------------------------------------------------
+        # Step 4: Store and return the resolved mode.
+        # ------------------------------------------------------------------
         if previous_mode != resolved_graph_mode:
             self._f._log_debug(
                 f"Call graph mode: {previous_mode or '(none)'} -> "
@@ -4933,6 +4923,10 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 if body:
                     return f"# {qid} — body\n{body}\n"
         return ""
+
+    # ------------------------------------------------------------------
+    # Region: Block B — Dynamic, per‑query LOD‑activated context
+    # ------------------------------------------------------------------
 
     async def build_block_b(
         self,
@@ -5020,8 +5014,9 @@ Output only the use case name: Architecture, Planning, Programming, Refactoring,
                 slot_free=slot_free,
             )
 
-        # Step 1c: ActivationGraph
-        ag = self._f._activation.build_activation_graph(
+        # Step 1c: ActivationGraph (FIX: added await)
+        # ------------------------------------------------------------------
+        ag = await self._f._activation.build_activation_graph(
             query,
             project_id,
             messages=messages,
@@ -6434,116 +6429,6 @@ class SignatureExtractor:
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Call extraction from tree-sitter
     # ═══════════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
-        query_str = FALLBACK_CALL_QUERIES.get(lang)
-        if not query_str:
-            logger.warning(
-                f"No tree-sitter call query defined for language '{lang}' — "
-                "returning empty call map to avoid corrupt fallback data."
-            )
-            return {}
-
-        _class_node_types = (
-            "class_definition",
-            "class_declaration",
-            "type_spec",
-            "struct_item",
-            "enum_item",
-            "class_specifier",
-        )
-
-        try:
-            lang_obj = get_language(lang)
-            query = lang_obj.query(query_str)
-            from tree_sitter import QueryCursor
-
-            cursor = QueryCursor(query)
-            captures = cursor.captures(tree.root_node)  # dict: {capture_name: [nodes]}
-
-            call_map: Dict[str, Set[str]] = defaultdict(set)
-            current_arrow_caller = None
-
-            for cap_name, nodes in captures.items():
-                if cap_name == "caller_name":
-                    if nodes:
-                        current_arrow_caller = nodes[0].text.decode("utf-8")
-                    continue
-                if cap_name != "callee":
-                    continue
-                for node in nodes:
-                    if node.type in (
-                        "attribute",
-                        "field_access",
-                        "member_expression",
-                        "selector_expression",
-                        "field_expression",
-                    ):
-                        callee_name = (
-                            node.text.decode("utf-8")
-                            .split(".")[-1]
-                            .split("->")[-1]
-                            .strip()
-                        )
-                    else:
-                        callee_name = node.text.decode("utf-8")
-
-                    caller = None
-                    caller_container = None
-                    parent = node.parent
-                    while parent:
-                        if parent.type in (
-                            "function_definition",
-                            "function_declaration",
-                            "method_declaration",
-                            "function_item",
-                        ):
-                            name_node = parent.child_by_field_name("name")
-                            if name_node:
-                                caller = name_node.text.decode("utf-8")
-                            caller_container = parent
-                            break
-                        elif parent.type == "arrow_function":
-                            if current_arrow_caller:
-                                caller = current_arrow_caller
-                            else:
-                                declarator = parent
-                                while (
-                                    declarator
-                                    and declarator.type != "variable_declarator"
-                                ):
-                                    declarator = declarator.parent
-                                if declarator:
-                                    name_node = declarator.child_by_field_name("name")
-                                    if name_node:
-                                        caller = name_node.text.decode("utf-8")
-                            caller_container = parent
-                            break
-                        parent = parent.parent
-
-                    if caller:
-                        caller_class = ""
-                        class_walker = (
-                            caller_container.parent if caller_container else None
-                        )
-                        while class_walker:
-                            if class_walker.type in _class_node_types:
-                                cname_node = class_walker.child_by_field_name("name")
-                                if cname_node:
-                                    caller_class = cname_node.text.decode("utf-8")
-                                break
-                            class_walker = class_walker.parent
-                        caller_qid = qualify_symbol_name(caller, caller_class)
-                        call_map[caller_qid].add(callee_name)
-
-            return {k: list(v) for k, v in call_map.items()}
-        except Exception as e:
-            logger.warning(
-                f"tree-sitter call extraction failed for language '{lang}': {e} — "
-                "returning empty call map to avoid corrupt fallback data."
-            )
-            return {}
 
     @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
@@ -13201,27 +13086,27 @@ class CodeBlockManager:
     def _is_likely_code(text: str, languages: Optional[List[str]] = None) -> bool:
         """
         Determine if the given text is likely source code, using tree-sitter.
-    
+
         To keep it fast, only the first SAMPLE_SIZE characters are analyzed.
         This is sufficient because the nature of the code (keywords, structure)
         is usually evident in the first few lines.
-    
+
         Args:
             text (str): The text to test.
             languages (Optional[List[str]]): List of language names to try.
                                              Defaults to common languages.
-    
+
         Returns:
             bool: True if the text is likely code, False otherwise.
         """
         SAMPLE_SIZE = 500  # Reduced from 5000 to 500 for speed
-    
+
         if not text or len(text.strip()) < 20:
             return False
-    
+
         # Use a sample to keep it fast
         sample = text[:SAMPLE_SIZE]
-    
+
         if not HAS_TREE_SITTER:
             # Fallback to simple heuristics when tree-sitter is unavailable
             return bool(
@@ -13232,7 +13117,7 @@ class CodeBlockManager:
                     sample,
                 )
             )
-    
+
         if languages is None:
             languages = [
                 "python",
@@ -13250,10 +13135,10 @@ class CodeBlockManager:
                 "kotlin",
                 "typescript",
             ]
-    
+
         from tree_sitter import Parser as TSParser
         from tree_sitter_language_pack import get_language
-    
+
         for lang in languages:
             try:
                 lang_obj = get_language(lang)
@@ -13264,122 +13149,115 @@ class CodeBlockManager:
                     return True
             except Exception:
                 continue
-    
+
         return False
 
     async def extract_code_blocks(
         self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
-        Extract fenced and indented code blocks from message content.
-    
-        For large content without fenced blocks, it scans all lines to extract
-        indented blocks, enabling silent ingestion for complete files.
-        If no indented blocks are found but the content looks like code,
-        it treats the whole content as a single code block.
-    
+        Extract code blocks from a message using tree-sitter Markdown detection.
+
+        Uses tree-sitter process() as a Markdown block detector (without
+        extract_symbols=True), falling back to regex for fenced blocks and
+        indentation scanning for plain text code snippets.
+
         Args:
-            content (str): The raw message content.
-            project_id (Optional[str]): The project ID for per-project state.
-    
-            Returns:
-                Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-                    A tuple of (blocks_list, spans_list).
-            """
-        # --- 0. Resolve project ID and state ---
+            content: Raw message content.
+            project_id: Project identifier for state lookup.
+
+        Returns:
+            Tuple of (list of block dicts, list of byte spans).
+        """
         if project_id is None:
             project_id = self._f.valves.project_id
         pstate = self._f._project_state_manager.get_pstate(project_id)
-    
+
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
-    
-        # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
+
+        # ------------------------------------------------------------------
+        # Section 1: Silent ingestion path (pre-extracted symbols)
+        # ------------------------------------------------------------------
         raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
             pstate["raw_ingested_symbols"] = None
-            lang = pstate.get("ingested_lang") or "python"
+            lang = pstate.get("ingested_lang", "python")
             block = {
                 "language": lang,
                 "code": content,
                 "type": "indented",
                 "precomputed_symbols": raw,
             }
-            blk_file = None
-            if self._f.valves.track_file_paths:
-                blk_file = self.extract_file_paths(content)
-                blk_file = blk_file[0] if blk_file else None
-            if self._f.valves.exclude_filter_internals and blk_file:
-                if (
-                    "/app/backend/data/functions/" in blk_file
-                    or "open-webui/functions/" in blk_file
-                ):
-                    return [], []
-            block["file_path"] = blk_file
-            return [block], [(0, len(content))]
-    
-        # ── Quick rejection: if the whole message doesn't look like code, return empty ──
-        if not self._is_likely_code(content):
-            self._f._log_debug(
-                "extract_code_blocks: content does not appear to be code, skipping"
-            )
+            block["file_path"] = self._guess_file_path(content)
+            if not self._is_filter_internal(block["file_path"]):
+                return [block], [(0, len(content))]
             return [], []
-    
+
+        # ------------------------------------------------------------------
+        # Section 2: Tree-sitter Markdown block detection
+        # ------------------------------------------------------------------
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
+
+                config = ProcessConfig()
+                # Important: Do NOT set extract_symbols=True here.
+                # process() acts as a Markdown block detector.
+                result = process(content, config)
+                if hasattr(result, "blocks"):
+                    self._f._log_debug(
+                        f"extract_code_blocks: process() found {len(result.blocks)} block(s)"
+                    )
+                    for b in result.blocks:
+                        lang = getattr(b, "language", None) or "text"
+                        code = content[b.start_byte : b.end_byte].strip()
+                        blocks.append(
+                            {"language": lang, "code": code, "type": "fenced"}
+                        )
+                        spans.append((b.start_byte, b.end_byte))
+                    if blocks:
+                        self._f._log_debug(
+                            f"tree-sitter path extracted {len(blocks)} block(s)"
+                        )
+                        return self._postprocess_blocks(blocks, spans, content)
+            except Exception as e:
+                self._f._log_debug(
+                    f"tree-sitter failed ({e}), falling through to regex"
+                )
+
+        # ------------------------------------------------------------------
+        # Section 3: Regex fallback for fenced code blocks
+        # ------------------------------------------------------------------
+        for match in self._f.code_pattern.finditer(content):
+            lang = match.group(1) or "text"
+            code = match.group(2).strip()
+            if len(code) > 200_000:
+                self._f._log_debug(
+                    f"Skipping oversized fenced block ({len(code)} chars)"
+                )
+                continue
+            blocks.append({"language": lang, "code": code, "type": "fenced"})
+            spans.append((match.start(), match.end()))
+
+        if blocks:
+            self._f._log_debug(f"regex found {len(blocks)} fenced block(s)")
+            return self._postprocess_blocks(blocks, spans, content)
+
+        # ------------------------------------------------------------------
+        # Section 4: Indented blocks (only if no fenced blocks)
+        # ------------------------------------------------------------------
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line) + 1)
-    
-        # ── Path 2a: Fenced blocks (extracted via regex, no full parse) ──
-        has_fenced = "```" in content
-        if has_fenced:
-            for match in self._f.code_pattern.finditer(content):
-                lang = match.group(1) or "text"
-                code = match.group(2).strip()
-                if len(code) > 200_000:
-                    self._f._log_debug(
-                        f"Skipping oversized fenced block ({len(code)} chars)"
-                    )
-                    continue
-                start_line = next(
-                    (i for i, off in enumerate(line_offsets) if off > match.start()),
-                    len(lines),
-                )
-                end_line = next(
-                    (i for i, off in enumerate(line_offsets) if off >= match.end()),
-                    len(lines),
-                )
-                # Pre-extract symbols for this block only
-                pre_syms = await SignatureExtractor.extract_async(code, None, lang)
-                blocks.append(
-                    {
-                        "language": lang,
-                        "code": code,
-                        "type": "fenced",
-                        "precomputed_symbols": pre_syms,
-                    }
-                )
-                spans.append((match.start(), match.end()))
-            # If we found fenced blocks, return them immediately (don't fall through to indented)
-            if blocks:
-                return blocks, spans
-    
-        # ── Path 2b: Indented blocks (manual extraction, full scan) ──
-        # We only reach this if there were NO fenced blocks.
+
         total_lines = len(lines)
-        scan_limit = total_lines
-    
-        if total_lines > 2000:
-            self._f._log_debug(
-                f"extract_code_blocks: content has {total_lines} lines, "
-                f"scanning all lines for indented blocks"
-            )
-    
-        indented = []
         i = 0
-        while i < scan_limit:
+        indented = []
+        while i < total_lines:
             line = lines[i]
             if line.startswith(("    ", "\t")):
                 indented.append(line.lstrip(" \t"))
@@ -13387,24 +13265,10 @@ class CodeBlockManager:
             else:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
-                    # Only process if it looks like code and is not huge
                     if self._is_likely_code(code) and len(code) <= 200_000:
-                        start_line = i - len(indented) + 1
-                        end_line = i
-                        # Detect language from the indented block
-                        lang = SignatureExtractor._guess_language(None, code)
-                        if lang == "unknown":
-                            lang = "text"
-                        pre_syms = await SignatureExtractor.extract_async(
-                            code, None, lang
-                        )
+                        lang = SignatureExtractor._guess_language(None, code) or "text"
                         blocks.append(
-                            {
-                                "language": lang,
-                                "code": code,
-                                "type": "indented",
-                                "precomputed_symbols": pre_syms,
-                            }
+                            {"language": lang, "code": code, "type": "indented"}
                         )
                         start_offset = line_offsets[i - len(indented)]
                         end_offset = line_offsets[i] - 1
@@ -13413,93 +13277,123 @@ class CodeBlockManager:
                 else:
                     indented = []
                 i += 1
-    
-        # Check for indented block at the end
+
         if len(indented) >= 3:
             code = "\n".join(indented)
             if self._is_likely_code(code) and len(code) <= 200_000:
-                start_line = scan_limit - len(indented) + 1
-                end_line = scan_limit
-                lang = SignatureExtractor._guess_language(None, code)
-                if lang == "unknown":
-                    lang = "text"
-                pre_syms = await SignatureExtractor.extract_async(code, None, lang)
-                blocks.append(
-                    {
-                        "language": lang,
-                        "code": code,
-                        "type": "indented",
-                        "precomputed_symbols": pre_syms,
-                    }
-                )
-                start_offset = line_offsets[scan_limit - len(indented)]
-                end_offset = line_offsets[scan_limit] - 1
+                lang = SignatureExtractor._guess_language(None, code) or "text"
+                blocks.append({"language": lang, "code": code, "type": "indented"})
+                start_offset = line_offsets[total_lines - len(indented)]
+                end_offset = line_offsets[total_lines] - 1
                 spans.append((start_offset, end_offset))
-    
-        # ── Path 2c: If no blocks were found, but the whole content is small and looks like code ──
+
+        # ------------------------------------------------------------------
+        # Section 5: Entire small content as a single block
+        # ------------------------------------------------------------------
         if not blocks and len(content) <= 20_000 and self._is_likely_code(content):
-            # Treat the whole content as a single code block (useful for short snippets without fences)
-            lang = SignatureExtractor._guess_language(None, content)
-            if lang == "unknown":
-                lang = "text"
-            pre_syms = await SignatureExtractor.extract_async(content, None, lang)
-            blocks.append(
-                {
-                    "language": lang,
-                    "code": content,
-                    "type": "indented",
-                    "precomputed_symbols": pre_syms,
-                }
-            )
+            lang = SignatureExtractor._guess_language(None, content) or "text"
+            blocks.append({"language": lang, "code": content, "type": "indented"})
             spans.append((0, len(content)))
             self._f._log_debug(
-                f"extract_code_blocks: treating entire small message as code ({len(content)} chars)"
+                f"treating entire small message as code ({len(content)} chars)"
             )
-    
-        # ── Path 2d: NEW: If no blocks were found but the content is large and looks like code ──
-        # This handles files without indentation (e.g., top-level definitions at column 0).
-        # The content is passed directly to extract_async, which will handle size limits.
-        if not blocks and self._is_likely_code(content):
-            self._f._log_debug(
-                f"extract_code_blocks: treating entire content as a single code block ({len(content)} chars)"
-            )
-            lang = SignatureExtractor._guess_language(None, content)
-            if lang == "unknown":
-                lang = "text"
-            pre_syms = await SignatureExtractor.extract_async(content, None, lang)
-            blocks.append(
-                {
-                    "language": lang,
-                    "code": content,
-                    "type": "indented",
-                    "precomputed_symbols": pre_syms,
-                }
-            )
-            spans.append((0, len(content)))
-    
-        # ── 3. Post-process blocks (file paths, etc.) ──────────────────────
+
+        return self._postprocess_blocks(blocks, spans, content)
+
+    def _postprocess_blocks(
+        self, blocks: List[Dict], spans: List[Tuple[int, int]], content: str
+    ) -> Tuple[List[Dict], List[Tuple[int, int]]]:
+        """
+        Attach file paths to blocks and filter out internal system paths.
+
+        Args:
+            blocks: List of extracted block dictionaries.
+            spans: List of corresponding byte spans.
+            content: Original message content for path extraction.
+
+        Returns:
+            Filtered list of blocks and spans.
+        """
         processed_blocks = []
         processed_spans = []
         for idx, block in enumerate(blocks):
             blk_file = None
-            if self._f.valves.track_file_paths and spans:
+            if self._f.valves.track_file_paths and idx < len(spans):
                 blk_file = self.extract_file_path_for_block(content, spans[idx][0])
             if not blk_file and len(blocks) == 1:
-                extracted_paths = self.extract_file_paths(content)
-                blk_file = extracted_paths[0] if extracted_paths else None
-    
+                paths = self.extract_file_paths(content)
+                blk_file = paths[0] if paths else None
+
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
                     continue
-    
+
             block["file_path"] = blk_file
             processed_blocks.append(block)
-            processed_spans.append(spans[idx])
-    
+            processed_spans.append(spans[idx] if idx < len(spans) else (0, 0))
+
         return processed_blocks, processed_spans
+
+    @staticmethod
+    def _is_likely_code(text: str) -> bool:
+        """
+        Lightweight heuristic to determine if text looks like source code.
+
+        This is a fallback when tree-sitter Markdown detection is unavailable.
+        It does NOT parse grammar; it simply checks for structural keywords.
+
+        Args:
+            text: The text to evaluate.
+
+        Returns:
+            True if it looks like code, False otherwise.
+        """
+        if not text or len(text.strip()) < 20:
+            return False
+        sample = text[:500]
+        return bool(
+            re.search(
+                r"\b(def|class|import|from|function|const|let|var|fn|pub|use|"
+                r"package|interface|type|enum|struct|impl|trait|"
+                r"public|private|protected|static|void|int|float|string|bool)\b",
+                sample,
+            )
+        )
+
+    def _is_filter_internal(self, file_path: Optional[str]) -> bool:
+        """
+        Check if a file path belongs to the filter's internal directories.
+
+        Args:
+            file_path: The file path to check.
+
+        Returns:
+            True if the path is internal and should be excluded.
+        """
+        if not file_path:
+            return False
+        return (
+            "/app/backend/data/functions/" in file_path
+            or "open-webui/functions/" in file_path
+        )
+
+    def _guess_file_path(self, content: str) -> Optional[str]:
+        """
+        Attempt to extract a file path from the beginning of the content.
+
+        Args:
+            content: The message content.
+
+        Returns:
+            The first matching file path, or None.
+        """
+        if not self._f.valves.track_file_paths:
+            return None
+        paths = self.extract_file_paths(content)
+        return paths[0] if paths else None
 
     async def _infer_code_language(self, code_snippet: str) -> str:
         """
@@ -14209,7 +14103,6 @@ class CodeBlockManager:
         # ── 8. Update metadata ─────────────────────────────────────────────
         base_block.timestamp = time.time()
         base_block.is_active = True
-        base_block.potentially_affected = False
         base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
 
         # ── 9. Invalidate cache ─────────────────────────────────────────────
@@ -15257,19 +15150,18 @@ class ActivationEngine:
     # 2. Seed extraction helpers
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _extract_query_seeds(
+    async def _extract_query_seeds(
         self, query: str, project_id: str
     ) -> Tuple[List[str], List[str]]:
         """
-        Extract seed symbols from the query.
+        Extract seed symbols from the query using exact match, CrossEncoder, and LLM.
 
-        Cascade:
-        1. Exact matches
-        2. CrossEncoder for partial matches (with heuristic reinforcement)
-        3. LLM (only when diff < 0.10) to disambiguate very similar symbols
-        4. Fuzzy matching fallback (when 0.10 ≤ diff < 0.20)
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
 
-        Returns (exact, partial) where partial are symbols that scored highly.
+        Returns:
+            A tuple of (exact_matches, partial_matches).
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
@@ -15292,16 +15184,10 @@ class ActivationEngine:
 
             if candidates:
                 pairs = [(query, name) for name in candidates]
-                scores = self._f._commands._predict_cross_encoder(pairs)
+                scores = await self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None:
-                    scores_reinforced = list(scores)
-                    for i, name in enumerate(candidates):
-                        if any(word in name for word in query_words):
-                            scores_reinforced[i] += 0.1
                     scored = sorted(
-                        zip(candidates, scores_reinforced),
-                        key=lambda x: x[1],
-                        reverse=True,
+                        zip(candidates, scores), key=lambda x: x[1], reverse=True
                     )
                     ce_threshold = 0.5
                     best = [name for name, sc in scored if sc > ce_threshold]
@@ -15311,7 +15197,7 @@ class ActivationEngine:
                         if len(scored) >= 2:
                             diff = scored[0][1] - scored[1][1]
                             if diff < 0.10:
-                                llm_choice = self._extract_seeds_with_llm(
+                                llm_choice = await self._extract_seeds_with_llm(
                                     query, scored[:5], project_id
                                 )
                                 if llm_choice:
@@ -15341,13 +15227,19 @@ class ActivationEngine:
 
         return exact, partial
 
-    def _extract_seeds_with_llm(
+    async def _extract_seeds_with_llm(
         self, query: str, candidates: list, project_id: str
     ) -> Optional[str]:
         """
-        Use LLM to disambiguate when CrossEncoder is uncertain.
+        Use the LLM to disambiguate between multiple candidate symbols.
 
-        Restores the KV slot after the call.
+        Args:
+            query: The user query.
+            candidates: List of (symbol_name, score) tuples from CrossEncoder.
+            project_id: Current project identifier.
+
+        Returns:
+            The selected symbol name, or None.
         """
         if not candidates:
             return None
@@ -15358,13 +15250,10 @@ The CrossEncoder is uncertain between these symbols for the query "{query}".
 Scores:
 {scores_str}
 
-Choose the symbol that best matches the query's intent. Consider the semantic role
-the symbol plays (e.g., builder, validator, handler, manager) rather than just
-keyword overlap.
-
+Choose the symbol that best matches the query's intent.
 Output only the symbol name.
 """
-        response = self._f._llm_orchestrator.call_llm(
+        response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a symbol disambiguator. Output only the best matching symbol name.",
             model_override=self._f.valves.summarization_model,
@@ -15372,13 +15261,9 @@ Output only the symbol name.
             temperature=0.0,
             label="seed_disambiguate_llm",
         )
-        if self._f.valves.enable_slot_persistence:
-            asyncio.create_task(
-                self._f._project_state_manager.slot_restore_for_continuity(project_id)
-            )
-        if response and response.strip():
-            return response.strip()
-        return None
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+        return response.strip() if response else None
 
     def _extract_traceback_seeds(
         self, content: str, project_id: str
@@ -15498,11 +15383,11 @@ Output only the symbol name.
             if count > 0
         }
 
-    def _prepare_seed_symbols(
+    async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
     ) -> Tuple[List[str], List[str], List[Tuple[str, float]], Dict[str, float]]:
-        """Extract exact, partial, traceback and historical seed symbols from the query."""
-        exact_seeds, partial_seeds = self._extract_query_seeds(query, project_id)
+        """Extract exact, partial, traceback and historical seed symbols."""
+        exact_seeds, partial_seeds = await self._extract_query_seeds(query, project_id)
         tb_seeds = (
             self._extract_traceback_seeds(query, project_id)
             if self._f.valves.enable_traceback_activation
@@ -15947,10 +15832,10 @@ Output only the symbol name.
         self._f._last_activation_scores[project_id] = activated
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. Main entry point: build_activation_graph (with Q2 cache + E7 integration)
+    # 5. Main entry point: build_activation_graph
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def build_activation_graph(
+    async def build_activation_graph(
         self,
         query: str,
         project_id: str,
@@ -15970,9 +15855,6 @@ Output only the symbol name.
 
         Returns:
             ActivationGraph with propagated scores.
-
-        Q2: Integrates PPR cache to avoid recomputation when seeds and code unchanged.
-        E7: Normalizes PPR scores to [0,1] within the project distribution.
         """
         self._f._log_debug(
             f"[PPR] build_activation_graph: query='{query[:100]}', "
@@ -15983,8 +15865,11 @@ Output only the symbol name.
 
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
 
+        # ------------------------------------------------------------------
+        # Step 1: Extract seeds from query, traceback, and history.
+        # ------------------------------------------------------------------
         exact_seeds, partial_seeds, tb_seeds, history_boosts = (
-            self._prepare_seed_symbols(query, project_id, messages)
+            await self._prepare_seed_symbols(query, project_id, messages)
         )
 
         self._f._log_debug(
@@ -16009,6 +15894,9 @@ Output only the symbol name.
             seed_qids.extend(inferred_seeds.keys())
         seed_qids = list(set(seed_qids) & set(all_qids))
 
+        # ------------------------------------------------------------------
+        # Step 2: Get or compute PPR scores (with cache).
+        # ------------------------------------------------------------------
         code_state_hash = self.compute_code_state_hash(project_id)
 
         cached_scores = self._get_or_compute_ppr_scores(
@@ -16021,6 +15909,9 @@ Output only the symbol name.
             alpha=self._f.valves.ppr_alpha,
         )
 
+        # ------------------------------------------------------------------
+        # Step 3: Build the activation graph (single or multi-seed).
+        # ------------------------------------------------------------------
         _inferred = inferred_seeds or {}
         if not self._f.valves.enable_multi_seed_activation:
             self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
@@ -16049,6 +15940,9 @@ Output only the symbol name.
 
         self._store_activation_scores(ag, project_id)
 
+        # ------------------------------------------------------------------
+        # Step 4: Get activated nodes and normalize scores.
+        # ------------------------------------------------------------------
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
         )
@@ -16058,6 +15952,20 @@ Output only the symbol name.
             f"[PPR] Activation complete: {len(activated)} nodes activated "
             f"(threshold={self._f.valves.path_activation_threshold})"
         )
+
+        # ------------------------------------------------------------------
+        # Step 5: Log score distribution for debugging (Point 6).
+        # ------------------------------------------------------------------
+        if self._f.valves.debug and activated:
+            sorted_scores = sorted(activated.values(), reverse=True)
+            if sorted_scores:
+                p50 = sorted_scores[len(sorted_scores) // 2]
+                self._f._log_debug(
+                    f"[PPR] score dist: max={sorted_scores[0]:.3f}, "
+                    f"p50={p50:.3f}, "
+                    f"min={sorted_scores[-1]:.3f}, "
+                    f"above={sum(1 for s in activated.values() if s >= self._f.valves.path_activation_threshold)}/{len(activated)}"
+                )
 
         return ag
 
@@ -16120,17 +16028,34 @@ Output only the symbol name.
         return view
 
     async def rebuild_path_index(self, project_id: str) -> None:
-        """Reconstruct PathIndex from SymbolIndex for all entry points."""
+        """
+        Reconstruct PathIndex from SymbolIndex for all entry points.
+
+        This method rebuilds the in-memory path index by iterating over all
+        entry points (symbols with no callers) and building a CodePathView
+        for each one. It also precomputes centrality if enabled.
+
+        Args:
+            project_id: Current project identifier.
+        """
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return
+
         entry_points = self._f._path_index.find_entry_points(
             self._f._symbol_index, project_id
         )
+
         for ep in entry_points:
-            ag = self.build_activation_graph(ep, project_id)
+            # ------------------------------------------------------------------
+            # Build activation graph for this entry point (with await).
+            # ------------------------------------------------------------------
+            ag = await self.build_activation_graph(ep, project_id)
             await self._build_view_from_activation(ep, ag, project_id)
 
+        # ------------------------------------------------------------------
+        # Precompute centrality if enabled.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_centrality_prior:
             psm = self._f._project_state_manager
             psm.set_node_centrality(
@@ -23605,81 +23530,106 @@ class BackgroundTaskManager:
         - All writes use _db_enqueue or mark_dirty to avoid races.
     """
 
-    def __init__(self, filter_ref: "Filter", max_concurrent: int = 5):
+    def __init__(self, filter_ref: "Filter", max_concurrent: int = 5) -> None:
+        """
+        Initialize the background task manager.
+
+        Args:
+            filter_ref: The parent Filter instance.
+            max_concurrent: Maximum number of tasks that can run concurrently.
+        """
         self._f = filter_ref
         self._tasks: Dict[str, asyncio.Task] = {}
         self._stop_events: Dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
+        self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._paused = True  # True during inlet; False during outlet
+        self._paused = True
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def start(self, name: str, coro, project_id: str, *args, **kwargs) -> None:
+    async def start(
+        self,
+        name: str,
+        coro,
+        project_id: str,
+        *args,
+        **kwargs,
+    ) -> None:
         """
         Start a background task if it is not already running and if not paused.
 
         Args:
-            name: Unique identifier for the task (must match a task definition).
-            coro: Coroutine function to run (must accept a stop_event kwarg).
+            name: Unique identifier for the task.
+            coro: Coroutine to execute (must accept stop_event kwarg).
             project_id: Current project identifier.
             *args, **kwargs: Additional arguments passed to the coroutine.
         """
-        # ── Master switch ──
         if not self._f.valves.enable_background_tasks:
-            self._f._log_debug(
-                f"Background tasks disabled globally; '{name}' not started"
-            )
             return
 
         async with self._lock:
-            # Avoid duplicate running tasks
+            # ------------------------------------------------------------------
+            # Avoid duplicate running tasks.
+            # ------------------------------------------------------------------
             if name in self._tasks and not self._tasks[name].done():
                 self._f._log_debug(
-                    f"Background task '{name}' already running, skipping"
+                    f"bg_manager: task '{name}' already running, skipped"
                 )
                 return
 
-            # Do not start if we are in inlet (paused)
+            # ------------------------------------------------------------------
+            # Do not start if paused (inlet active).
+            # ------------------------------------------------------------------
             if self._paused:
-                self._f._log_debug(
-                    f"Background task '{name}' not started (inlet paused)"
-                )
+                self._f._log_debug(f"bg_manager: task '{name}' not started (paused)")
                 return
 
-            # Do not exceed concurrency limit
-            if len(self._tasks) >= self._semaphore._value:
-                self._f._log_debug(
-                    f"Background task '{name}' not started: max concurrency reached ({self._semaphore._value})"
-                )
+            # ------------------------------------------------------------------
+            # Check concurrency limit using max_concurrent (not semaphore._value).
+            # ------------------------------------------------------------------
+            if len(self._tasks) >= self._max_concurrent:
+                if self._f.valves.bg_task_log_detailed:
+                    self._f._log_debug(
+                        f"bg_manager: task '{name}' skipped — max concurrency "
+                        f"reached ({len(self._tasks)}/{self._max_concurrent})"
+                    )
                 return
 
-            # Create a new stop event for this task
+            # ------------------------------------------------------------------
+            # Create stop event and mark task as in_progress in pstate.
+            # ------------------------------------------------------------------
             stop_event = asyncio.Event()
             self._stop_events[name] = stop_event
 
-            # Mark the task as in_progress in pstate
-            # FIX: Use _task_registry instead of _get_task_definition
             task_def = self._f._task_registry.get_task_definition(name)
             if task_def:
                 pstate = self._f._project_state_manager.get_pstate(project_id)
                 task_def.mark_in_progress(pstate)
 
-            # Create and store the task
+            # ------------------------------------------------------------------
+            # Create and store the task.
+            # ------------------------------------------------------------------
             task = asyncio.create_task(
                 self._run_task(name, coro, stop_event, project_id, *args, **kwargs)
             )
             self._tasks[name] = task
+
             if self._f.valves.bg_task_log_detailed:
                 self._f._log_debug(
-                    f"Background task '{name}' started (concurrency: {len(self._tasks)})"
+                    f"bg_manager: scheduling '{name}' "
+                    f"({len(self._tasks)}/{self._max_concurrent} concurrent)"
                 )
 
     async def stop_all(self, timeout: float = None) -> None:
         """
-        Gracefully stop all running background tasks.
+        Gracefully stop all running background tasks without deadlock.
+
+        Signals tasks and releases the lock before waiting for them.
+        This avoids the deadlock where stop_all holds the lock while tasks
+        need it to clean up.
 
         Args:
             timeout: Maximum seconds to wait for graceful shutdown.
@@ -23688,40 +23638,46 @@ class BackgroundTaskManager:
         if timeout is None:
             timeout = self._f.valves.bg_task_stop_timeout
 
+        # ------------------------------------------------------------------
+        # Signal and snapshot under lock, then release BEFORE waiting.
+        # ------------------------------------------------------------------
         async with self._lock:
             if not self._tasks:
                 return
 
-            self._f._log_debug(
-                f"Stopping {len(self._tasks)} background task(s) gracefully..."
-            )
+            running_names = list(self._tasks.keys())
 
-            # Signal all tasks to stop
             for name, ev in self._stop_events.items():
                 ev.set()
                 if self._f.valves.bg_task_log_detailed:
-                    self._f._log_debug(f"Sent stop signal to task '{name}'")
+                    self._f._log_debug(f"bg_manager: stop signal → '{name}'")
 
-            # Wait for tasks to finish gracefully
-            pending = [t for t in self._tasks.values() if not t.done()]
-            if pending:
-                try:
-                    done, pending = await asyncio.wait(pending, timeout=timeout)
-                    self._f._log_debug(
-                        f"{len(done)} task(s) finished gracefully, {len(pending)} still running"
-                    )
-                except asyncio.TimeoutError:
-                    self._f._log_debug(
-                        f"Stop timeout ({timeout}s) reached, {len(pending)} task(s) still running"
-                    )
+            tasks_to_wait = [t for t in self._tasks.values() if not t.done()]
 
-            # Cancel any remaining tasks (abrupt fallback)
-            for task in pending:
+        # ------------------------------------------------------------------
+        # Lock is released here — tasks can now acquire it in their finally blocks.
+        # ------------------------------------------------------------------
+        if tasks_to_wait:
+            self._f._log_debug(
+                f"bg_manager: waiting for {len(tasks_to_wait)} task(s) "
+                f"to finish (timeout={timeout}s): {running_names}"
+            )
+
+            done, still_pending = await asyncio.wait(tasks_to_wait, timeout=timeout)
+
+            self._f._log_debug(
+                f"bg_manager: {len(done)} task(s) finished gracefully, "
+                f"{len(still_pending)} cancelled"
+            )
+
+            for task in still_pending:
                 if not task.done():
                     task.cancel()
-                    self._f._log_debug("Force-cancelled a background task")
 
-            # Clear task registry
+        # ------------------------------------------------------------------
+        # Final cleanup: tasks self-clean via finally, but clear any remnants.
+        # ------------------------------------------------------------------
+        async with self._lock:
             self._tasks.clear()
             self._stop_events.clear()
 
@@ -23748,58 +23704,83 @@ class BackgroundTaskManager:
         **kwargs,
     ) -> None:
         """
-        Wrapper that runs the actual coroutine and handles exceptions.
+        Execute a background task with proper project_id forwarding and race-safe cleanup.
 
-        This ensures that the stop_event is passed to the coroutine and that
-        any errors are logged without crashing the manager.
+        Args:
+            name: Task identifier.
+            coro: Coroutine to execute.
+            stop_event: Event to signal cancellation.
+            project_id: Current project identifier.
+            *args, **kwargs: Additional arguments for the coroutine.
         """
         pstate = self._f._project_state_manager.get_pstate(project_id)
-        # FIX: Use _task_registry instead of _get_task_definition
         task_def = self._f._task_registry.get_task_definition(name)
-
         start_time = time.monotonic()
-        try:
-            # Acquire semaphore (concurrency control)
-            async with self._semaphore:
-                await coro(*args, stop_event=stop_event, **kwargs)
 
-            # Mark as completed if not cancelled
+        self._f._log_debug(
+            f"bg_manager: task '{name}' starting "
+            f"(project={project_id}, args={len(args)} extra arg(s))"
+        )
+
+        try:
+            # ------------------------------------------------------------------
+            # Acquire semaphore for concurrency control.
+            # ------------------------------------------------------------------
+            async with self._semaphore:
+                # ------------------------------------------------------------------
+                # CRITICAL: Forward project_id as the first argument.
+                # ------------------------------------------------------------------
+                await coro(project_id, *args, stop_event=stop_event, **kwargs)
+
+            # ------------------------------------------------------------------
+            # Mark as completed if not cancelled.
+            # ------------------------------------------------------------------
             if task_def and not stop_event.is_set():
                 task_def.mark_completed(pstate, project_id)
             elif task_def and stop_event.is_set():
                 task_def.mark_not_completed(pstate)
 
             duration = time.monotonic() - start_time
-            if self._f.valves.bg_task_measure_performance:
+            if not stop_event.is_set():
                 self._f._log_debug(
-                    f"Background task '{name}' finished cleanly (duration: {duration:.2f}s)"
+                    f"bg_manager: task '{name}' completed OK in {duration:.2f}s"
                 )
             else:
-                self._f._log_debug(f"Background task '{name}' finished cleanly")
+                self._f._log_debug(
+                    f"bg_manager: task '{name}' stopped by signal after {duration:.2f}s"
+                )
+
         except asyncio.CancelledError:
-            # If cancelled, mark as not completed so it can be retried
             if task_def:
                 task_def.mark_not_completed(pstate)
             duration = time.monotonic() - start_time
-            if self._f.valves.bg_task_measure_performance:
-                self._f._log_debug(
-                    f"Background task '{name}' was cancelled (duration: {duration:.2f}s)"
-                )
-            else:
-                self._f._log_debug(f"Background task '{name}' was cancelled")
+            self._f._log_debug(
+                f"bg_manager: task '{name}' was cancelled after {duration:.2f}s"
+            )
             raise
+
         except Exception as e:
+            import traceback as _tb
+
             duration = time.monotonic() - start_time
             self._f._log_debug(
-                f"Background task '{name}' failed after {duration:.2f}s: {e}"
+                f"bg_manager: task '{name}' FAILED after {duration:.2f}s: {e}\n"
+                f"{_tb.format_exc()}"
             )
             if task_def:
                 task_def.mark_not_completed(pstate)
+
         finally:
-            # Clean up registry
+            # ------------------------------------------------------------------
+            # Race-safe cleanup: only remove if we are still the registered task.
+            # This prevents the ABA race where a new task replaces us and we
+            # accidentally delete it.
+            # ------------------------------------------------------------------
+            _me = asyncio.current_task()
             async with self._lock:
-                self._tasks.pop(name, None)
-                self._stop_events.pop(name, None)
+                if self._tasks.get(name) is _me:
+                    self._tasks.pop(name, None)
+                    self._stop_events.pop(name, None)
 
 
 class SemanticSeedInferencer:
@@ -23875,7 +23856,7 @@ class SemanticSeedInferencer:
 
     # ── Gate: is it worth spending an LLM call? ──────────────────────────────
 
-    def _should_infer(
+    async def _should_infer(
         self,
         query: str,
         project_id: str,
@@ -23885,23 +23866,16 @@ class SemanticSeedInferencer:
         """
         Decide whether to spend an LLM call on seed inference.
 
-        Uses a cascade:
-        1. Heuristic reinforcement (keywords + use case) with weight multiplier.
-        2. CrossEncoder (decision).
-        3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD).
-        4. Middle zone: use heuristic (fallback).
-        5. Conservative final fallback: infer if uncertain.
-
-        Restores KV slot after any LLM call.
+        Uses a cascade: heuristic reinforcement, CrossEncoder, and LLM fallback.
 
         Args:
-            query (str): The user's query.
-            project_id (str): Current project identifier.
-            intent_vector (dict): Intent probabilities.
-            use_case (str): The detected use case (A, B, C, D, E).
+            query: The user's query.
+            project_id: Current project identifier.
+            intent_vector: Intent probabilities.
+            use_case: The detected use case (A, B, C, D, E).
 
         Returns:
-            bool: True if seed inference should be performed.
+            True if seed inference should be performed.
         """
         mode = self._f.valves.seed_inference_mode
         if mode == "off":
@@ -23916,29 +23890,21 @@ class SemanticSeedInferencer:
         if mode == "always":
             return True
 
-        # ── Heuristic reinforcement with weight ──
+        # ------------------------------------------------------------------
+        # Step 1: Heuristic reinforcement.
+        # ------------------------------------------------------------------
         content_lower = query.lower()
         infer_keywords = [
             "implement",
-            "implementa",
             "create",
-            "crea",
-            "añadir",
             "add",
             "architecture",
-            "arquitectura",
             "design",
-            "diseño",
             "refactor",
-            "estructurar",
             "structure",
-            "organizar",
             "organize",
-            "dividir",
             "split",
-            "mover",
             "move",
-            "extraer",
             "extract",
         ]
         h_weight = self._f.valves.heuristic_reinforcement_weight
@@ -23949,7 +23915,9 @@ class SemanticSeedInferencer:
             heuristic_boost += 0.15
         heuristic_boost *= h_weight
 
-        # ── CrossEncoder ──
+        # ------------------------------------------------------------------
+        # Step 2: CrossEncoder primary decision.
+        # ------------------------------------------------------------------
         if self._f._cross_encoder is not None:
             query_stripped = self._f._commands._extract_text_for_classification(query)
             pairs = [
@@ -23962,7 +23930,7 @@ class SemanticSeedInferencer:
                     "This query only needs literal symbol matches from the text.",
                 ),
             ]
-            scores = self._f._commands._predict_cross_encoder(pairs)
+            scores = await self._f._commands._predict_cross_encoder(pairs)
 
             if scores is not None and len(scores) >= 2:
                 scores_reinforced = list(scores)
@@ -23978,17 +23946,19 @@ class SemanticSeedInferencer:
                         f"_should_infer: CE confident (diff={diff:.2f}) → {result}"
                     )
                     return result
+
                 elif diff < LLM_FALLBACK_THRESHOLD:
                     self._f._log_debug(
                         f"_should_infer: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                         "using LLM"
                     )
-                    return self._should_infer_with_llm(
+                    return await self._should_infer_with_llm(
                         query, scores_reinforced, use_case, project_id
                     )
-                # else: middle zone → fall through to heuristic
 
-        # ── Fallback: heuristic (middle zone or no CE) ──
+        # ------------------------------------------------------------------
+        # Step 3: Heuristic fallback (middle zone or no CE).
+        # ------------------------------------------------------------------
         if any(kw in query.lower() for kw in infer_keywords):
             return True
         if use_case in ("A", "D"):
@@ -24070,6 +24040,10 @@ Output only "YES" or "NO". When uncertain, output YES.
 
     # ── Main inference ────────────────────────────────────────────────────────
 
+    # ------------------------------------------------------------------
+    # Region: Main Seed Inference Entry Point
+    # ------------------------------------------------------------------
+
     async def infer_seeds(
         self,
         query: str,
@@ -24086,37 +24060,56 @@ Output only "YES" or "NO". When uncertain, output YES.
           - global scope detected (routed to multi‑phase + full_graph).
           - the gate _should_infer fails.
           - skeleton is empty or LLM call fails.
-          Always without exception for the caller — PPR simply uses lexical
-          seeds in those cases.
+
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
+            intent_vector: Intent probabilities.
+            use_case: Detected use case.
+            slot_free: Whether the LLM slot is free.
+
+        Returns:
+            Dictionary mapping qualified symbol ids to seed scores.
         """
         if not slot_free:
             return {}
 
-        # Global scope → multi‑phase, no subgraph expansion.
+        # ------------------------------------------------------------------
+        # Step 1: Global scope detection -> delegate to multi-phase.
+        # ------------------------------------------------------------------
         if self.is_global_scope(query):
             self._f._log_debug(
-                "SemanticSeedInferencer: global scope detected → "
+                "SemanticSeedInferencer: global scope detected -> "
                 "inference skipped, delegated to multi‑phase + full_graph."
             )
             return {}
 
-        if not self._should_infer(query, project_id, intent_vector, use_case):
+        # ------------------------------------------------------------------
+        # Step 2: Check if inference is needed.
+        # ------------------------------------------------------------------
+        if not await self._should_infer(query, project_id, intent_vector, use_case):
             return {}
 
-        # Reuse the skeleton already built/cached for Block A.
-        # _get_skeleton_for_cot returns the same text as _format_skeleton,
-        # cached by structure_hash. Cost: O(1) if already in cache.
+        # ------------------------------------------------------------------
+        # Step 3: Retrieve the skeleton (signatures only).
+        # ------------------------------------------------------------------
         skeleton = await self._f._ctx_builder._get_skeleton_for_cot(project_id, query)
         if not skeleton.strip():
             self._f._log_debug("SemanticSeedInferencer: empty skeleton, cannot infer.")
             return {}
 
-        # Trim skeleton to the configured budget.
+        # ------------------------------------------------------------------
+        # Step 4: Trim skeleton to the configured budget.
+        # ------------------------------------------------------------------
         max_sk = self._f.valves.seed_inference_skeleton_max_tokens
         if max_sk > 0:
             skeleton = self._f._tokens.truncate_text_to_tokens(skeleton, max_sk)
 
         n = self._f.valves.seed_inference_max_symbols
+
+        # ------------------------------------------------------------------
+        # Step 5: Build the prompt.
+        # ------------------------------------------------------------------
         prompt = (
             f"Project skeleton (signatures only — no bodies):\n"
             f"```\n{skeleton}\n```\n\n"
@@ -24130,6 +24123,9 @@ Output only "YES" or "NO". When uncertain, output YES.
             f"Maximum {n} identifiers."
         )
 
+        # ------------------------------------------------------------------
+        # Step 6: Call the LLM.
+        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -24149,7 +24145,24 @@ Output only "YES" or "NO". When uncertain, output YES.
             self._f._log_debug("SemanticSeedInferencer: LLM returned no response.")
             return {}
 
+        # ------------------------------------------------------------------
+        # Step 7: Parse and resolve the response.
+        # ------------------------------------------------------------------
         seeds = self._parse_and_resolve(response, project_id)
+
+        if seeds:
+            sample = sorted(seeds)[:8]
+            ellipsis = "..." if len(seeds) > 8 else ""
+            self._f._log_debug(
+                f"SemanticSeedInferencer: {len(seeds)} symbol(s) seeded "
+                f"→ {sample}{ellipsis}"
+            )
+        else:
+            self._f._log_debug(
+                "SemanticSeedInferencer: LLM responded but no id "
+                "matches the index (possible hallucinations)."
+            )
+
         return seeds
 
     # ── Fuzzy fallback (original, unchanged) ─────────────────────────────────
@@ -24316,32 +24329,27 @@ class TaskRegistry:
         """
         Build the list of background task definitions.
 
-        Each task defines:
-            - A unique name and state key for persistent status in pstate.
-            - Optional lazy and background functions.
-            - An invalidation function that returns a hash to invalidate
-              the 'completed' status when the code changes.
-            - Valves to enable/disable each mode independently.
-            - A priority for background execution order.
-            - A flag to skip lazy execution if already completed.
-
         Returns:
             List[BackgroundTask]: The list of task definitions.
         """
         tasks = [
-            # ── 1. Session summary (highest priority: controls context size) ──
+            # ------------------------------------------------------------------
+            # 1. Session summary (highest priority: controls context size)
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="session_summary",
                 state_key="bg_session_summary_state",
                 lazy_func=self._lazy_session_summary,
-                bg_func=self._f._enrichment.run_session_summary_task,
+                bg_func=self._bg_session_summary,  # <-- CHANGED
                 invalidation_func=None,
                 valve_bg="enable_bg_session_summary",
                 valve_lazy="enable_lazy_session_summary",
                 priority=1,
                 skip_if_completed=True,
             ),
-            # ── 2. Speculative prefetch ──────────────────────────────────────
+            # ------------------------------------------------------------------
+            # 2. Speculative prefetch
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="prefetch",
                 state_key="bg_prefetch_state",
@@ -24355,7 +24363,9 @@ class TaskRegistry:
                 priority=2,
                 skip_if_completed=True,
             ),
-            # ── 3. Docstrings (lower priority, can be generated lazily) ───────
+            # ------------------------------------------------------------------
+            # 3. Docstrings (lower priority, can be generated lazily)
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="docstrings",
                 state_key="bg_docstrings_state",
@@ -24369,12 +24379,14 @@ class TaskRegistry:
                 priority=3,
                 skip_if_completed=True,
             ),
-            # ── 4. RAPTOR rebuild ─────────────────────────────────────────────
+            # ------------------------------------------------------------------
+            # 4. RAPTOR rebuild
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="raptor",
                 state_key="bg_raptor_state",
                 lazy_func=self._lazy_raptor,
-                bg_func=self._f._raptor.rebuild,
+                bg_func=self._bg_raptor,  # <-- CHANGED
                 invalidation_func=lambda pid: self._f._symbol_index.compute_structure_hash(
                     pid
                 ),
@@ -24383,12 +24395,14 @@ class TaskRegistry:
                 priority=4,
                 skip_if_completed=True,
             ),
-            # ── 5. Purge old versions (experimental, disabled by default) ──
+            # ------------------------------------------------------------------
+            # 5. Purge old versions (experimental, disabled by default)
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="purge",
                 state_key="bg_purge_state",
                 lazy_func=self._lazy_purge,
-                bg_func=self._f._pager.purge_old_versions,
+                bg_func=self._bg_purge,  # <-- CHANGED
                 invalidation_func=lambda pid: self._f._activation.compute_code_state_hash(
                     pid
                 ),
@@ -24397,7 +24411,9 @@ class TaskRegistry:
                 priority=5,
                 skip_if_completed=True,
             ),
-            # ── 6. LOD adaptive (invalidated every turn via message_count) ──
+            # ------------------------------------------------------------------
+            # 6. LOD adaptive (invalidated every turn via message_count)
+            # ------------------------------------------------------------------
             BackgroundTask(
                 name="lod_adaptive",
                 state_key="bg_lod_state",
@@ -24409,10 +24425,102 @@ class TaskRegistry:
                 valve_bg="enable_bg_lod",
                 valve_lazy="enable_lazy_lod",
                 priority=6,
-                skip_if_completed=False,  # Always invalidated by message_count
+                skip_if_completed=False,
             ),
         ]
         return tasks
+
+    async def _bg_raptor(self, project_id: str, stop_event=None) -> None:
+        """
+        Background wrapper for RAPTOR rebuild.
+
+        Args:
+            project_id: Current project identifier.
+            stop_event: Optional event to signal early termination.
+        """
+        if not self._f.valves.enable_raptor:
+            return
+
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        graph_weight = (
+            self._f.valves.raptor_graph_weight
+            if self._f.valves.raptor_use_call_graph_proximity
+            else 0.0
+        )
+
+        await self._f._raptor.rebuild(
+            project_id=project_id,
+            symbol_index=self._f._symbol_index,
+            edges_out=edges_out,
+            n_clusters=self._f.valves.raptor_clusters_per_level,
+            summary_model=self._f.valves.raptor_summary_model,
+            summary_max_tokens=self._f.valves.raptor_summary_max_tokens,
+            chroma_collection=self._f.memory_collection,
+            llm_caller=self._f._llm_orchestrator.call_llm,
+            embedder=self._f.embedder,
+            graph_weight=graph_weight,
+            stop_event=stop_event,
+        )
+
+    async def _bg_session_summary(self, project_id: str, stop_event=None) -> None:
+        """
+        Background wrapper for session summary generation.
+
+        Args:
+            project_id: Current project identifier.
+            stop_event: Optional event to signal early termination.
+        """
+        state = self._f._conversation_state_manager.get(project_id)
+        interval = self._f.valves.session_summary_interval_messages
+
+        if interval <= 0:
+            return
+
+        if state.message_count % interval != 0 or state.message_count == 0:
+            return
+
+        await self._f._enrichment.run_session_summary_task(
+            params={
+                "project_id": project_id,
+                "message_count": state.message_count,
+                "code_state_hash": self._f._activation.compute_code_state_hash(
+                    project_id
+                ),
+            },
+            model=self._f.valves.llm_model,
+            stop_event=stop_event,
+        )
+
+    async def _bg_purge(self, project_id: str, stop_event=None) -> None:
+        """
+        Background wrapper for purging old code versions.
+
+        Args:
+            project_id: Current project identifier.
+            stop_event: Optional event to signal early termination.
+        """
+        if not self._f.valves.purge_old_code_versions_enabled:
+            return
+
+        if not self._f.valves.enable_block_paging:
+            return
+
+        if self._f._pager is None:
+            return
+
+        state = self._f._conversation_state_manager.get(project_id)
+        if not state or not state.active_blocks:
+            return
+
+        await self._f._pager.purge_old_versions(
+            project_id=project_id,
+            state=state,
+            symbol_index=self._f._symbol_index,
+            chroma_collection=self._f.memory_collection,
+            embedder=self._f.embedder,
+            max_versions_per_file=(self._f.valves.purge_old_code_versions_max_per_file),
+            stop_event=stop_event,
+        )
 
     def _validate_and_order(self) -> None:
         """
@@ -24550,23 +24658,31 @@ class TaskRegistry:
     async def _lazy_prefetch(self, project_id: str) -> None:
         """
         Lazy prefetch: build CodePathView for symbols mentioned in the query.
-        This is a lightweight version that only builds views for symbols
-        that are explicitly needed now.
+
+        This method is called during the inlet (lazy execution) to pre-build
+        CodePathView objects for symbols that are likely to be needed in the
+        current turn. It uses the last user query stored in pstate.
 
         Args:
-            project_id (str): The current project identifier.
+            project_id: Current project identifier.
         """
         psm = self._f._project_state_manager
 
-        # ── 1. Get the current user query (from pstate) ──
+        # ------------------------------------------------------------------
+        # Step 1: Get the current user query (from pstate).
+        # ------------------------------------------------------------------
         query = psm.get_last_user_query(project_id)
         if not query:
             return
 
-        # ── 2. Build activation graph for the query ──
-        ag = self._f._activation.build_activation_graph(query, project_id)
+        # ------------------------------------------------------------------
+        # Step 2: Build activation graph for the query (with await).
+        # ------------------------------------------------------------------
+        ag = await self._f._activation.build_activation_graph(query, project_id)
 
-        # ── 3. For each seed node, build a CodePathView if not already built ──
+        # ------------------------------------------------------------------
+        # Step 3: For each seed node, build a CodePathView if not already built.
+        # ------------------------------------------------------------------
         for seed in ag.get_seed_nodes()[:3]:  # Limit to top seeds
             if not self._f._path_index.get(seed, project_id):
                 await self._f._activation._build_view_from_activation(
@@ -25255,7 +25371,12 @@ class Filter:
         # 6. ACTIVATION GRAPH (PPR / LOD)
         # ═════════════════════════════════════════════════════════════════════════
         enable_path_analysis: bool = Field(default=True)
-        path_activation_threshold: float = Field(default=0.13, ge=0.01, le=1.0)
+        path_activation_threshold: float = Field(
+            default=0.02,
+            ge=0.01,
+            le=1.0,
+            description="Minimum activation score for a node to be considered active.",
+        )
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
@@ -26645,16 +26766,16 @@ class Filter:
                 return any(marker in content for marker in self._MULTI_PHASE_MARKERS)
         return False
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     # INLET – orchestrated entry point
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     # Value categories (see project documentation):
     #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
     #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
     #   🧠 ENRICHMENT          – Features that add information to the system prompt
     #   📦 COMPRESSION         – Features that reduce context size to fit the window
     #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Pre‑process the request before the LLM sees it.
@@ -26692,6 +26813,8 @@ class Filter:
 
         # -- Get state early to decide slot_busy and is_continuation --
         state = self._conversation_state_manager.get(project_id)
+        # Reset WindowManager metrics at the start of each turn.
+        state.reset_wm_metrics()
         psm = self._project_state_manager
         # pstate is kept for outlet-internal keys with no typed accessor.
         pstate = psm.get_pstate(project_id)
@@ -26995,8 +27118,12 @@ class Filter:
 
         await self._task_registry.run_lazy_tasks(project_id, pstate)
 
-        # Now that lazy tasks are done, resolve call graph mode
-        self._ctx_builder.prepare_call_graph_mode(project_id, user_query, intent_vector)
+        # ------------------------------------------------------------------
+        # Resolve call graph mode. (FIX: added await)
+        # ------------------------------------------------------------------
+        await self._ctx_builder.prepare_call_graph_mode(
+            project_id, user_query, intent_vector
+        )
 
         # 🧠📦 ENRICHMENT + COMPRESSION + ASSEMBLY (High value)
         #   6. Assemble context and final messages
