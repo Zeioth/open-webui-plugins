@@ -12838,6 +12838,8 @@ Example: FORGET: forget_last
 
         stripped = content.strip()
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
+        total_lines = len(stripped.splitlines())
+        non_empty_lines = [l for l in stripped.splitlines() if l.strip()]
 
         # ── Step 1: Tree‑sitter ──
         if HAS_TREE_SITTER:
@@ -12871,6 +12873,30 @@ Example: FORGET: forget_last
                 scores_reinforced = list(scores)
                 if "?" not in content and len(content.split()) < 30:
                     scores_reinforced[0] += 0.2
+
+                # ---- Heuristic reinforcement for large files ----
+                # If the message is very long and has a high proportion of structural lines,
+                # force code classification even if the CrossEncoder is uncertain.
+                if total_lines > 500:
+                    # Count lines that look like code (def, class, import, etc.)
+                    structural_lines = sum(
+                        1
+                        for l in non_empty_lines
+                        if self._STRUCTURAL_LINE_START.match(l)
+                        or self._CONTINUATION_OR_LITERAL.match(l)
+                    )
+                    ratio = (
+                        structural_lines / len(non_empty_lines)
+                        if non_empty_lines
+                        else 0
+                    )
+                    if ratio > 0.6:
+                        # High code proportion -> force True
+                        return True
+                    # If there are very few questions and many lines, also force True
+                    if total_lines > 1000 and content.count("?") < 3:
+                        return True
+
                 diff = scores_reinforced[0] - scores_reinforced[1]
                 CE_CONFIDENCE_THRESHOLD = self._f.valves.code_only_ce_threshold
                 LLM_FALLBACK_THRESHOLD = self._f.valves.code_only_llm_threshold
