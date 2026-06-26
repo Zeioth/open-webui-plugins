@@ -5944,7 +5944,7 @@ class SignatureExtractor:
             List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
         # ── Quick rejection: is this text likely code? ──────────────────────
-        if not SignatureExtractor._is_likely_code(code):
+        if not CodeBlockManager._is_likely_code(code):
             logger.debug("Skipping extraction: text does not appear to be code.")
             return []
 
