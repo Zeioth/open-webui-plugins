@@ -5921,6 +5921,11 @@ class SignatureExtractor:
         Returns:
             List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
+        # ── Quick rejection: is this text likely code? ──────────────────────
+        if not SignatureExtractor._is_likely_code(code):
+            logger.debug("Skipping extraction: text does not appear to be code.")
+            return []
+
         # ── Cache check ──────────────────────────────────────────────────────────
         cache_key = SignatureExtractor._cache_key(code, file_path, language)
         with SignatureExtractor._EXTRACTION_CACHE_LOCK:
@@ -5933,6 +5938,10 @@ class SignatureExtractor:
 
         # ── Size validation ────────────────────────────────────────────────────
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
+            logger.warning(
+                f"Code block too large ({len(code.encode())} bytes) — "
+                "skipping symbol extraction to avoid memory issues."
+            )
             return []
 
         # ── Language detection ────────────────────────────────────────────────
@@ -13140,218 +13149,168 @@ class CodeBlockManager:
             and chunk_start_line <= s.line_start <= chunk_end_line
         ]
 
+    @staticmethod
+    def _is_likely_code(text: str, languages: Optional[List[str]] = None) -> bool:
+        """
+        Determine if the given text is likely source code, using tree-sitter.
+
+        To keep it fast, only the first SAMPLE_SIZE characters are analyzed.
+        This is sufficient because the nature of the code (keywords, structure)
+        is usually evident in the first few lines.
+
+        Args:
+            text (str): The text to test.
+            languages (Optional[List[str]]): List of language names to try.
+                                             Defaults to common languages.
+
+        Returns:
+            bool: True if the text is likely code, False otherwise.
+        """
+        SAMPLE_SIZE = 2500  # Enough to detect keywords and structure
+
+        if not text or len(text.strip()) < 20:
+            return False
+
+        # Use a sample to keep it fast
+        sample = text[:SAMPLE_SIZE]
+
+        if not HAS_TREE_SITTER:
+            # Fallback to simple heuristics when tree-sitter is unavailable
+            return bool(
+                re.search(
+                    r"\b(def|class|import|from|function|const|let|var|fn|pub|use|"
+                    r"package|interface|type|enum|struct|impl|trait|"
+                    r"public|private|protected|static|void|int|float|string|bool)\b",
+                    sample,
+                )
+            )
+
+        if languages is None:
+            languages = [
+                "python",
+                "javascript",
+                "tsx",
+                "go",
+                "rust",
+                "java",
+                "cpp",
+                "c",
+                "ruby",
+                "php",
+                "c_sharp",
+                "swift",
+                "kotlin",
+                "typescript",
+            ]
+
+        from tree_sitter import Parser as TSParser
+        from tree_sitter_language_pack import get_language
+
+        for lang in languages:
+            try:
+                lang_obj = get_language(lang)
+                parser = TSParser(lang_obj)
+                tree = parser.parse(sample.encode())
+                root = tree.root_node
+                if root.children and any(n.type != "ERROR" for n in root.children):
+                    return True
+            except Exception:
+                continue
+
+        return False
+
     async def extract_code_blocks(
         self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
         Extract fenced and indented code blocks from message content.
-
-        This method handles three extraction paths in order of preference:
-        1. Pre-extracted symbols (silent ingestion path) — returns a single block.
-        2. Tree-sitter processing (recommended) — uses AST for accurate symbol extraction.
-        3. Regex fallback — handles fenced blocks and indented code.
-
-        Args:
-            content (str): The raw message content.
-            project_id (Optional[str]): The project ID for per-project state.
-                                        If None, uses self._f.valves.project_id.
-
-        Returns:
-            Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
-                A tuple of (blocks_list, spans_list) where each block is a dict with:
-                    - language: Detected programming language.
-                    - code: The source code string.
-                    - type: "fenced" or "indented".
-                    - precomputed_symbols: Optional list of pre-extracted symbols.
-                    - file_path: Optional file path associated with the block.
+    
+        Avoids parsing the entire message with tree‑sitter if there are no
+        fenced blocks and the content is large. Instead, it extracts blocks
+        manually and processes only the extracted chunks.
         """
         # --- 0. Resolve project ID and state ---
         if project_id is None:
             project_id = self._f.valves.project_id
         pstate = self._f._project_state_manager.get_pstate(project_id)
-
+    
         blocks = []
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
-
+    
         # ── Path 1: Pre-extracted symbols (silent ingestion) ──────────────
         raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
-            # Consume the symbols so they are not used again in the same turn.
             pstate["raw_ingested_symbols"] = None
             lang = pstate.get("ingested_lang") or "python"
-
             block = {
                 "language": lang,
                 "code": content,
                 "type": "indented",
                 "precomputed_symbols": raw,
             }
-
-            # ── 1a. Extract file path ──────────────────────────────────────
             blk_file = None
             if self._f.valves.track_file_paths:
                 blk_file = self.extract_file_paths(content)
                 blk_file = blk_file[0] if blk_file else None
-
-            # ── 1b. Filter internal code ──────────────────────────────────
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
                     return [], []
-
             block["file_path"] = blk_file
             return [block], [(0, len(content))]
-
-        # ── Path 2: Full-document parse with tree-sitter ───────────────────
+    
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line) + 1)
-
-        # Parse the whole document once so class context is never lost.
-        full_doc_symbols, full_doc_lang = await self._extract_full_document_symbols(
-            content, None, project_id
-        )
-
-        ingested_lang = pstate.get("ingested_lang")
-
-        # ── 2a. Tree-sitter processing ──────────────────────────────────────
-        if HAS_TREE_SITTER:
-            try:
-                config = ProcessConfig()
-                if ingested_lang:
-                    try:
-                        config.language = ingested_lang
-                    except Exception:
-                        pass
-
-                ts_blocks = await anyio.to_thread.run_sync(
-                    lambda: process(content, config)
+    
+        # ── Path 2a: Fenced blocks (extracted via regex, no full parse) ──
+        has_fenced = "```" in content
+        if has_fenced:
+            for match in self._f.code_pattern.finditer(content):
+                lang = match.group(1) or "text"
+                code = match.group(2).strip()
+                if len(code) > 200_000:
+                    self._f._log_debug(f"Skipping oversized fenced block ({len(code)} chars)")
+                    continue
+                start_line = next(
+                    (i for i, off in enumerate(line_offsets) if off > match.start()),
+                    len(lines),
                 )
-                if hasattr(ts_blocks, "blocks"):
-                    ts_blocks = ts_blocks.blocks
-
-                for tsb in ts_blocks:
-                    start, end = tsb.start_byte, tsb.end_byte
-                    raw_text = content[start:end].strip()
-
-                    # ── 2a.i. Detect language ──────────────────────────────
-                    lang = tsb.language or "text"
-                    if ingested_lang:
-                        lang = ingested_lang
-                    elif lang in ("text", ""):
-                        guessed = SignatureExtractor._guess_language(None, raw_text)
-                        if guessed != "unknown":
-                            lang = guessed
-                        else:
-                            lang = await self._infer_code_language(raw_text)
-
-                    # ── 2a.ii. Extract code content ─────────────────────────
-                    lines_in_block = raw_text.splitlines()
-                    if lines_in_block and lines_in_block[0].startswith("```"):
-                        lines_in_block = lines_in_block[1:]
-                        if lines_in_block and lines_in_block[-1].startswith("```"):
-                            lines_in_block = lines_in_block[:-1]
-                        code = "\n".join(lines_in_block).strip()
-                        block_type = "fenced"
-                    else:
-                        code = raw_text
-                        block_type = "indented"
-
-                    # ── 2a.iii. Assign symbols from full-document parse ────
-                    start_line = next(
-                        (i for i, off in enumerate(line_offsets) if off > start),
-                        len(lines),
-                    )
-                    end_line = next(
-                        (i for i, off in enumerate(line_offsets) if off >= end),
-                        len(lines),
-                    )
-                    pre_syms = (
-                        self._assign_symbols_to_span(
-                            full_doc_symbols, start_line, end_line
-                        )
-                        if full_doc_symbols
-                        else []
-                    )
-
-                    blocks.append(
-                        {
-                            "language": lang,
-                            "code": code,
-                            "type": block_type,
-                            "precomputed_symbols": pre_syms,
-                        }
-                    )
-                    spans.append((start, end))
-
-                if pstate.get("ingested_lang") is not None:
-                    pstate["ingested_lang"] = None
-
-                # ── 2a.iv. Post-process blocks ─────────────────────────────
-                if blocks:
-                    processed_blocks = []
-                    processed_spans = []
-                    for idx, block in enumerate(blocks):
-                        blk_file = None
-                        if self._f.valves.track_file_paths and spans:
-                            blk_file = self.extract_file_path_for_block(
-                                content, spans[idx][0]
-                            )
-                        if not blk_file and len(blocks) == 1:
-                            extracted_paths = self.extract_file_paths(content)
-                            blk_file = extracted_paths[0] if extracted_paths else None
-
-                        if self._f.valves.exclude_filter_internals and blk_file:
-                            if (
-                                "/app/backend/data/functions/" in blk_file
-                                or "open-webui/functions/" in blk_file
-                            ):
-                                continue
-
-                        block["file_path"] = blk_file
-                        processed_blocks.append(block)
-                        processed_spans.append(spans[idx])
-
-                    return processed_blocks, processed_spans
-
-            except Exception:
-                # Fall through to regex fallback
-                pass
-
-        # ── Path 3: Regex fallback ──────────────────────────────────────────
-        # 3a. Fenced blocks
-        for match in self._f.code_pattern.finditer(content):
-            lang = match.group(1) or "text"
-            code = match.group(2).strip()
-            start_line = next(
-                (i for i, off in enumerate(line_offsets) if off > match.start()),
-                len(lines),
+                end_line = next(
+                    (i for i, off in enumerate(line_offsets) if off >= match.end()),
+                    len(lines),
+                )
+                # Pre-extract symbols for this block only
+                pre_syms = await SignatureExtractor.extract_async(code, None, lang)
+                blocks.append(
+                    {
+                        "language": lang,
+                        "code": code,
+                        "type": "fenced",
+                        "precomputed_symbols": pre_syms,
+                    }
+                )
+                spans.append((match.start(), match.end()))
+            # If we found fenced blocks, return them immediately (don't fall through to indented)
+            if blocks:
+                return blocks, spans
+    
+        # ── Path 2b: Indented blocks (manual extraction, no full parse) ──
+        # We only reach this if there were NO fenced blocks.
+        # Only extract indented blocks if the overall content is not too large,
+        # to avoid treating a whole large file as a single code block.
+        if len(content) > 100_000:
+            self._f._log_debug(
+                f"extract_code_blocks: content too large ({len(content)} chars) without fenced blocks, "
+                "skipping indented block extraction to avoid performance issues."
             )
-            end_line = next(
-                (i for i, off in enumerate(line_offsets) if off >= match.end()),
-                len(lines),
-            )
-            pre_syms = (
-                self._assign_symbols_to_span(full_doc_symbols, start_line, end_line)
-                if full_doc_symbols
-                else []
-            )
-            blocks.append(
-                {
-                    "language": lang,
-                    "code": code,
-                    "type": "fenced",
-                    "precomputed_symbols": pre_syms,
-                }
-            )
-            spans.append((match.start(), match.end()))
-
-        # 3b. Indented blocks
+            return [], []
+    
         indented = []
         i = 0
         while i < len(lines):
@@ -13362,51 +13321,71 @@ class CodeBlockManager:
             else:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
-                    start_line = i - len(indented) + 1
-                    end_line = i
-                    pre_syms = (
-                        self._assign_symbols_to_span(
-                            full_doc_symbols, start_line, end_line
+                    # Only process if it looks like code and is not huge
+                    if SignatureExtractor._is_likely_code(code) and len(code) <= 200_000:
+                        start_line = i - len(indented) + 1
+                        end_line = i
+                        # Detect language from the indented block
+                        lang = SignatureExtractor._guess_language(None, code)
+                        if lang == "unknown":
+                            lang = "text"
+                        pre_syms = await SignatureExtractor.extract_async(code, None, lang)
+                        blocks.append(
+                            {
+                                "language": lang,
+                                "code": code,
+                                "type": "indented",
+                                "precomputed_symbols": pre_syms,
+                            }
                         )
-                        if full_doc_symbols
-                        else []
-                    )
-                    blocks.append(
-                        {
-                            "language": "text",
-                            "code": code,
-                            "type": "indented",
-                            "precomputed_symbols": pre_syms,
-                        }
-                    )
-                    start_offset = line_offsets[i - len(indented)]
-                    end_offset = line_offsets[i] - 1
-                    spans.append((start_offset, end_offset))
-                indented = []
+                        start_offset = line_offsets[i - len(indented)]
+                        end_offset = line_offsets[i] - 1
+                        spans.append((start_offset, end_offset))
+                    indented = []
+                else:
+                    indented = []
                 i += 1
-
+    
         if len(indented) >= 3:
             code = "\n".join(indented)
-            start_line = len(lines) - len(indented) + 1
-            end_line = len(lines)
-            pre_syms = (
-                self._assign_symbols_to_span(full_doc_symbols, start_line, end_line)
-                if full_doc_symbols
-                else []
-            )
+            if SignatureExtractor._is_likely_code(code) and len(code) <= 200_000:
+                start_line = len(lines) - len(indented) + 1
+                end_line = len(lines)
+                lang = SignatureExtractor._guess_language(None, code)
+                if lang == "unknown":
+                    lang = "text"
+                pre_syms = await SignatureExtractor.extract_async(code, None, lang)
+                blocks.append(
+                    {
+                        "language": lang,
+                        "code": code,
+                        "type": "indented",
+                        "precomputed_symbols": pre_syms,
+                    }
+                )
+                start_offset = line_offsets[len(lines) - len(indented)]
+                end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
+                spans.append((start_offset, end_offset))
+    
+        # ── Path 2c: If no blocks were found, but the whole content is small and looks like code ──
+        if not blocks and len(content) <= 20_000 and SignatureExtractor._is_likely_code(content):
+            # Treat the whole content as a single code block (useful for short snippets without fences)
+            lang = SignatureExtractor._guess_language(None, content)
+            if lang == "unknown":
+                lang = "text"
+            pre_syms = await SignatureExtractor.extract_async(content, None, lang)
             blocks.append(
                 {
-                    "language": "text",
-                    "code": code,
+                    "language": lang,
+                    "code": content,
                     "type": "indented",
                     "precomputed_symbols": pre_syms,
                 }
             )
-            start_offset = line_offsets[len(lines) - len(indented)]
-            end_offset = line_offsets[-1] - 1 if line_offsets[-1] > 0 else len(content)
-            spans.append((start_offset, end_offset))
-
-        # ── 3c. Post-process fallback blocks ───────────────────────────────
+            spans.append((0, len(content)))
+            self._f._log_debug(f"extract_code_blocks: treating entire small message as code ({len(content)} chars)")
+    
+        # ── 3. Post-process blocks (file paths, etc.) ──────────────────────
         processed_blocks = []
         processed_spans = []
         for idx, block in enumerate(blocks):
@@ -13416,18 +13395,18 @@ class CodeBlockManager:
             if not blk_file and len(blocks) == 1:
                 extracted_paths = self.extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
-
+    
             if self._f.valves.exclude_filter_internals and blk_file:
                 if (
                     "/app/backend/data/functions/" in blk_file
                     or "open-webui/functions/" in blk_file
                 ):
                     continue
-
+    
             block["file_path"] = blk_file
             processed_blocks.append(block)
             processed_spans.append(spans[idx])
-
+    
         return processed_blocks, processed_spans
 
     async def _infer_code_language(self, code_snippet: str) -> str:
