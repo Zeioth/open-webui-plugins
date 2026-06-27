@@ -11862,7 +11862,9 @@ class CommandRouter:
     # 3. Contradiction detection (cascade: Heuristic → CE → LLM)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _detect_contradictions(self, messages: list, project_id: str) -> Optional[str]:
+    async def _detect_contradictions(
+        self, messages: list, project_id: str
+    ) -> Optional[str]:
         """
         Check if the last user message contradicts recent conversation history.
         Returns a warning string if a contradiction is detected, else None.
@@ -11896,19 +11898,29 @@ class CommandRouter:
         # Heuristic reinforcement
         content_lower = new_msg.lower()
         contradiction_keywords = (
-            "but", "actually", "instead", "wait", "no", "not", "error", "wrong", "correction"
+            "but",
+            "actually",
+            "instead",
+            "wait",
+            "no",
+            "not",
+            "error",
+            "wrong",
+            "correction",
         )
         h_weight = self._f.valves.heuristic_reinforcement_weight
-        heuristic_boost = 0.2 if any(kw in content_lower for kw in contradiction_keywords) else 0.0
+        heuristic_boost = (
+            0.2 if any(kw in content_lower for kw in contradiction_keywords) else 0.0
+        )
 
         pairs = [
             (
                 f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message directly contradicts a specific previous statement or decision in the conversation."
+                "The new message directly contradicts a specific previous statement or decision in the conversation.",
             ),
             (
                 f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message is consistent with and builds upon the previous conversation history."
+                "The new message is consistent with and builds upon the previous conversation history.",
             ),
         ]
         scores = await self._predict_cross_encoder(pairs)
@@ -17772,7 +17784,9 @@ class EnrichmentTasks:
         """
         tasks = [
             (
-                self._f._commands._detect_contradictions(messages, project_id)   # <-- project_id added
+                self._f._commands._detect_contradictions(
+                    messages, project_id
+                )  # <-- project_id added
                 if (
                     self._f.valves.enable_contradiction_detection
                     and not skip_contradiction
@@ -17813,41 +17827,64 @@ class EnrichmentTasks:
     )
 
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
-        """
-        Ultra-minimalist prompt for docstring generation.
-
-        Only the identifiers and their signatures are listed, without code blocks.
-        This reduces the model's tendency to "reason" and encourages direct output.
-        """
         lines = []
         for qid, signature, _ in items:
             sig = signature[:80] if signature else qid
-            lines.append(f"- {sig}")
+            lines.append(f"  - {qid}: {sig}")
         listing = "\n".join(lines)
+
         return (
-            f"Write one short sentence for each symbol. Format: <identifier>: <description>.\n"
-            f"Symbols:\n{listing}\n\n"
-            f"Now output:"
+            f"Generate a compact JSON object mapping these identifiers to one-sentence descriptions.\n"
+            f"Each description must be a single sentence, ideally under {self._f.valves.docstring_max_chars} characters.\n"
+            f"Keys: exact identifiers (including class prefix if present).\n"
+            f"Values: one-sentence descriptions.\n"
+            f"Output only the JSON object, no explanations, no markdown.\n\n"
+            f"Identifiers:\n{listing}\n\n"
+            f"JSON: {{"
         )
 
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
         """
-        Parse the LLM response line by line.
-
-        Only lines matching 'identifier: description' are accepted.
-        Supports bullet points and numbering.
+        Parse the LLM response as JSON, handling both:
+        - Proper JSON object with braces: {"key": "value", ...}
+        - Raw key-value pairs without braces: "key": "value", ...
         """
-        result: Dict[str, str] = {}
-        for line in response.splitlines():
-            m = self._BATCH_DOCSTRING_LINE_RE.match(line.strip())
-            if not m:
-                continue
-            name, desc = m.group(1), m.group(2).strip()
-            if name in expected_names and desc:
-                result[name] = desc[:200]
-        return result
+        try:
+            # Remove <think> blocks (if any)
+            clean = re.sub(
+                r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE
+            )
+            clean = clean.strip()
+            # Remove markdown code fences
+            clean = re.sub(r"^```json\s*", "", clean)
+            clean = re.sub(r"\s*```$", "", clean)
+
+            data = {}
+            # Case 1: Try to find a JSON object with braces
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
+            if start != -1 and end > start:
+                json_str = clean[start:end]
+                data = json.loads(json_str)
+            else:
+                # Case 2: No braces found. Wrap with braces and parse.
+                # Remove trailing commas before closing brace
+                wrapped = "{" + clean + "}"
+                wrapped = re.sub(r",\s*}", "}", wrapped)
+                data = json.loads(wrapped)
+
+            # Filter only expected names
+            result = {}
+            for key, value in data.items():
+                if key in expected_names and isinstance(value, str) and value.strip():
+                    result[key] = value.strip()[:200]
+            return result
+        except json.JSONDecodeError as e:
+            self._f._log_debug(f"JSON parse error in docstring response: {e}")
+            # Fallback: try to extract manually? But we'll return empty.
+            return {}
 
     async def ensure_docstrings_batch(
         self, qids: List[str], project_id: str
@@ -17856,12 +17893,11 @@ class EnrichmentTasks:
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
 
-        Cache hits (already in memory or in SQLite) are resolved for free.
-        Cache misses are generated in groups of `lazy_docstring_batch_size`,
-        ONE LLM call per group instead of one call per symbol.
+        Uses a prompt that forces JSON output by prepending '{"' so the model
+        completes a valid JSON object without inserting reasoning.
 
-        Uses the completion endpoint with an empty system prompt to avoid
-        the model generating reasoning instead of output lines.
+        Cache hits (already in memory or in SQLite) are resolved for free.
+        Cache misses are generated in groups of `lazy_docstring_batch_size`.
 
         Returns {qid: docstring} for every qid that has (or now has) a
         non-empty docstring.
@@ -17870,7 +17906,7 @@ class EnrichmentTasks:
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # Build a qid → (sym, block) index
+        # Build a qid → (sym, block) index ONCE
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -17934,28 +17970,29 @@ class EnrichmentTasks:
                 signature, snippet = qid, ""
             items.append((qid, signature, snippet))
 
-        # Use the foreground batch size (lazy) – valve name in v10
         batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
             prompt = self._build_docstring_batch_prompt(batch)
 
-            # --- CORRECTED LLM CALL ---
+            # --- LLM call without 'stop' (not needed, but keep endpoint_type) ---
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
-                system_prompt="",
+                system_prompt="You are a data extraction engine. Output only raw JSON, never explanations.",
                 model_override=self._f.valves.llm_model,
-                max_tokens=min(60 * len(batch), 600),
-                temperature=0.1,
+                max_tokens=0,  # no limit per batch
+                temperature=0.0,
                 label="lazy_docstring_batch",
-                endpoint_type="completion",
+                endpoint_type="completion",  # <-- force completion endpoint
             )
             self._lazy_docstrings_generated_this_turn += len(batch)
 
-            # --- DEBUG LOG: show raw response for first batch ---
+            # Debug log for the first batch
             if i == 0 and response:
-                self._f._log_debug(f"RAW DOCSTRING RESPONSE (first 500 chars): {response[:500]}")
+                self._f._log_debug(
+                    f"RAW DOCSTRING RESPONSE (first 500 chars): {response[:500]}"
+                )
 
             if not response:
                 continue
@@ -17973,6 +18010,7 @@ class EnrichmentTasks:
                 rows = [
                     (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
                 ]
+
                 def _write_batch(rows=rows):
                     self._f._db_conn.executemany(
                         "INSERT OR REPLACE INTO symbol_docstrings "
@@ -17981,6 +18019,7 @@ class EnrichmentTasks:
                         rows,
                     )
                     self._f._db_conn.commit()
+
                 await self._f._state_store._db_enqueue(_write_batch)
 
         return resolved
@@ -25288,6 +25327,16 @@ class Filter:
             ge=1,
             le=20,
             description="Number of symbols per background docstring batch.",
+        )
+        docstring_max_chars: int = Field(
+            default=200,
+            ge=0,
+            description="Maximum docstring chars to suggest to the LLM.",
+        )
+        docstring_max_chars: int = Field(
+            default=200,
+            ge=0,
+            description="Maximum docstring tokens to truncate the LLM to (extra security against allucinations).",
         )
 
         # ── Block deduplication ──────────────────────────────────────────────
