@@ -7669,7 +7669,6 @@ class StateStore:
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Database lifecycle (DDL, connection, worker)
     # ═══════════════════════════════════════════════════════════════════════
-
     def init_db(self) -> None:
         """
         Create all necessary tables and indexes (idempotent).
@@ -7680,9 +7679,15 @@ class StateStore:
           - `busy_timeout` – tells SQLite to wait up to `llm_per_call_timeout`
             seconds before giving up on a locked database.
           - `synchronous = NORMAL` – reduces the number of `fsync()` calls,
-            increasing throughput under write-heavy workloads (background
-            docstrings, edge persistence, etc.) without compromising crash
-            safety, because WAL already guarantees durability.
+            increasing throughput under write-heavy workloads without compromising
+            crash safety, because WAL already guarantees durability.
+
+        This method also creates the `acquire_write` table used by the OpenWebUI
+        framework's SQLite-based locking mechanism. The "no such table: acquire_write"
+        error is resolved by creating this table with the appropriate schema.
+
+        Returns:
+            None. The database connection is stored as `self._f._db_conn`.
         """
         db_path = self._f.valves.state_db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -7706,6 +7711,17 @@ class StateStore:
         # ------------------------------------------------------------------
         # REGION 3 — Create all tables and indexes (idempotent)
         # ------------------------------------------------------------------
+
+        # --- Framework lock table (required to avoid "no such table: acquire_write") ---
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS acquire_write (
+                key TEXT PRIMARY KEY,
+                owner TEXT,
+                acquired_at REAL
+            )
+        """)
+
+        # --- Main conversation state table ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 project_id TEXT PRIMARY KEY,
@@ -7713,6 +7729,8 @@ class StateStore:
                 updated_at REAL NOT NULL
             )
         """)
+
+        # --- Code content storage (externalized from state JSON) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS code_contents (
                 hash TEXT PRIMARY KEY,
@@ -7720,7 +7738,11 @@ class StateStore:
                 created_at REAL NOT NULL
             )
         """)
+
+        # --- Enable WAL mode for better concurrency ---
         self._f._db_conn.execute("PRAGMA journal_mode=WAL")
+
+        # --- Block change summaries (for change tracking) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS block_change_summaries (
                 block_hash TEXT PRIMARY KEY,
@@ -7728,6 +7750,8 @@ class StateStore:
                 created_at REAL NOT NULL
             )
         """)
+
+        # --- Code path views (cached subgraph projections) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS code_path_views (
                 path_id             TEXT NOT NULL,
@@ -7750,6 +7774,8 @@ class StateStore:
             "CREATE INDEX IF NOT EXISTS idx_cpv_project "
             "ON code_path_views(project_id)"
         )
+
+        # --- Symbol edges (call graph, data flow, etc.) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_edges (
                 project_id  TEXT NOT NULL,
@@ -7765,6 +7791,8 @@ class StateStore:
             "CREATE INDEX IF NOT EXISTS idx_edges_project_src "
             "ON symbol_edges(project_id, src)"
         )
+
+        # --- RAPTOR clusters (hierarchical summarization) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS raptor_clusters (
                 cluster_id      TEXT PRIMARY KEY,
@@ -7780,6 +7808,8 @@ class StateStore:
             "CREATE INDEX IF NOT EXISTS idx_raptor_project_level "
             "ON raptor_clusters(project_id, level)"
         )
+
+        # --- Edges metadata (for invalidation detection) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_edges_meta (
                 project_id      TEXT PRIMARY KEY,
@@ -7788,15 +7818,19 @@ class StateStore:
                 saved_at        REAL NOT NULL
             )
         """)
+
+        # --- Symbol docstrings (persisted cache) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_docstrings (
                 project_id  TEXT NOT NULL,
                 symbol_name TEXT NOT NULL,
-                docstring    TEXT NOT NULL,
+                docstring   TEXT NOT NULL,
                 updated_at  REAL NOT NULL,
                 PRIMARY KEY (project_id, symbol_name)
             )
         """)
+
+        # --- Control-flow skeletons (CFG) cache ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_cfg (
                 project_id   TEXT NOT NULL,
@@ -7807,6 +7841,7 @@ class StateStore:
                 PRIMARY KEY (project_id, symbol_name)
             )
         """)
+
         self._f._db_conn.commit()
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -8355,6 +8390,7 @@ class LongTermMemory:
             self._f._log_debug("ChromaDB not available")
             return
 
+        # --- Memory collection (LTM) ---
         self._f.memory_collection = self._f.chroma_client.get_or_create_collection(
             name="conversation_memory", metadata={"hnsw:space": "cosine"}
         )
@@ -8363,16 +8399,39 @@ class LongTermMemory:
             f"{self._f.memory_collection.metadata.get('dimension', '?')}"
         )
 
-        self._f._response_cache_collection = (
-            self._f.chroma_client.get_or_create_collection(
-                name=f"response_cache_{self._f.valves.project_id or 'default'}",
-                metadata={"hnsw:space": "cosine"},
+        # --- Response cache collection with recovery ---
+        cache_name = f"response_cache_{self._f.valves.project_id or 'default'}"
+        try:
+            self._f._response_cache_collection = (
+                self._f.chroma_client.get_or_create_collection(
+                    name=cache_name,
+                    metadata={"hnsw:space": "cosine"},
+                )
             )
-        )
-        self._f._log_debug("LTM ready")
+            self._f._log_debug(f"Response cache collection '{cache_name}' ready")
+        except Exception as e:
+            self._f._log_debug(
+                f"Failed to get/create cache collection '{cache_name}': {e}"
+            )
+            # If the collection is corrupted, try to delete it and recreate
+            try:
+                self._f.chroma_client.delete_collection(cache_name)
+                self._f._log_debug(f"Deleted corrupted collection '{cache_name}'")
+            except Exception:
+                pass
+            try:
+                self._f._response_cache_collection = (
+                    self._f.chroma_client.create_collection(
+                        name=cache_name,
+                        metadata={"hnsw:space": "cosine"},
+                    )
+                )
+                self._f._log_debug(f"Recreated cache collection '{cache_name}'")
+            except Exception as e2:
+                self._f._log_debug(f"Could not recreate cache collection: {e2}")
+                self._f._response_cache_collection = None
 
-        # ── C4: validate embedding model after collection is ready ──────────
-        self._validate_embedding_model()
+        self._f._log_debug("LTM ready")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Response cache & duplicate detection
@@ -9506,40 +9565,58 @@ Output only "YES" or "NO".
         code_state_hash: str,
     ) -> None:
         """
-        Store a response in the ChromaDB response cache synchronously.
+        Synchronously store a response in the ChromaDB response cache.
 
         This method embeds the query, stores the response document, and
         updates metadata including the code_state_hash for staleness detection.
-        The query is truncated to 500 characters in metadata to keep the
-        metadata compact and human‑readable; this does not affect the
-        embedding or retrieval quality.
+        The query is truncated to 500 characters in metadata to keep the field
+        compact and human-readable; this does not affect the embedding or
+        retrieval quality.
+
+        If the cache collection is missing or corrupted, this method attempts
+        to recreate it automatically, preventing the common
+        "Error getting collection: Failed to get segments" error.
 
         Args:
             query (str): The user query that generated the response.
             response (str): The assistant's response.
-            context_hash (str): Hash of the context (unused, kept for API).
-            state (dict): The conversation state (unused, kept for API).
+            context_hash (str): Hash of the context (unused, kept for API compatibility).
+            state (dict): The conversation state (unused, kept for API compatibility).
             code_state_hash (str): Hash of the code state for staleness detection.
         """
-        # ── REGION 1: Prerequisites ──
+        # --- Get the cache collection, recreating it if necessary ---
         col = getattr(self._f, "_response_cache_collection", None)
-        if col is None:
-            return
 
-        # ── REGION 2: Embed the query ──
+        if col is None:
+            self._f._log_debug(
+                "Response cache collection missing, attempting to recreate..."
+            )
+            try:
+                cache_name = f"response_cache_{self._f.valves.project_id or 'default'}"
+                col = self._f.chroma_client.get_or_create_collection(
+                    name=cache_name,
+                    metadata={"hnsw:space": "cosine"},
+                )
+                self._f._response_cache_collection = col
+                self._f._log_debug("Recreated response cache collection during store")
+            except Exception as e:
+                self._f._log_debug(f"Could not recreate cache collection: {e}")
+                return
+
+        # --- Prepare the entry ---
+        project = self._f.valves.project_id
+        entry_id = hashlib.md5(f"{project}|{query}".encode()).hexdigest()[:32]
+
+        # Embed the query
         embedding = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
-        entry_id = hashlib.md5(
-            f"{self._f.valves.project_id}|{query}".encode()
-        ).hexdigest()[:32]
-        max_entries = self._f.valves.response_cache_max_entries
-        project = self._f.valves.project_id
 
-        # ── REGION 3: Enforce cache size limit ──
+        max_entries = self._f.valves.response_cache_max_entries
         pstate = self._f._project_state_manager.get_pstate(project)
         current_size = pstate.get("response_cache_count", 0)
 
+        # Enforce cache size limit (LRU eviction)
         if current_size >= max_entries:
             to_delete_count = max(1, max_entries // 10)
             try:
@@ -9557,28 +9634,32 @@ Output only "YES" or "NO".
                     pstate["response_cache_count"] = max(
                         0, current_size - len(old_entries["ids"])
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                self._f._log_debug(f"Failed to evict old cache entries: {e}")
 
-        # ── REGION 4: Store the entry ──
-        # Query is truncated to 500 chars in metadata to keep the field compact
-        await anyio.to_thread.run_sync(
-            lambda: col.upsert(
-                ids=[entry_id],
-                embeddings=[embedding],
-                documents=[response],
-                metadatas=[
-                    {
-                        "query": query[:500],
-                        "project_id": project,
-                        "context_hash": "",
-                        "code_state_hash": code_state_hash,
-                        "timestamp": time.time(),
-                    }
-                ],
+        # Upsert the new entry
+        try:
+            await anyio.to_thread.run_sync(
+                lambda: col.upsert(
+                    ids=[entry_id],
+                    embeddings=[embedding],
+                    documents=[response],
+                    metadatas=[
+                        {
+                            "query": query[:500],
+                            "project_id": project,
+                            "context_hash": "",  # Kept for compatibility
+                            "code_state_hash": code_state_hash,
+                            "timestamp": time.time(),
+                        }
+                    ],
+                )
             )
-        )
-        pstate["response_cache_count"] = pstate.get("response_cache_count", 0) + 1
+            pstate["response_cache_count"] = pstate.get("response_cache_count", 0) + 1
+        except Exception as e:
+            self._f._log_debug(f"Failed to store response in cache: {e}")
+            # If the operation fails, mark the collection as invalid so it gets recreated next time
+            self._f._response_cache_collection = None
 
     async def _store_response_in_cache_async(
         self,
@@ -9755,6 +9836,7 @@ class LLMOrchestrator:
         temperature: float = 0.3,
         label: str = "",
         total_timeout: Optional[float] = None,
+        endpoint_type: Optional[str] = None,  # NEW: explicit endpoint override
     ) -> Optional[str]:
         """
         Call the LLM with cache and deduplication. Retries are handled by
@@ -9763,6 +9845,12 @@ class LLMOrchestrator:
         All calls to this method are serialized via `_llm_semaphore` to prevent
         concurrent LLM requests, which avoids cancellation issues when using
         `--parallel 1` in llama.cpp.
+
+        Args:
+            endpoint_type: Optional override for the inference endpoint.
+                If provided, uses this value directly. Otherwise defaults to
+                "chat", except for models starting with "llamacpp/" which use
+                the valve-defined llamacpp_endpoint_type.
         """
         # ── Silent ingestion guard ──
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
@@ -9789,9 +9877,6 @@ class LLMOrchestrator:
         label_str = f" ({label})" if label else ""
 
         # ── SERIALIZATION WITH THE SEMAPHORE ──────────────────────────────────
-        # All LLM calls (main response, CoT, docstrings, summaries...)
-        # are serialized here. This guarantees that only one executes at a time,
-        # preventing concurrency cancellations when the server uses --parallel 1.
         async with self._f._llm_semaphore:
             try:
                 base_url = self._f.valves.LLM_BASE_URL.rstrip("/")
@@ -9818,9 +9903,15 @@ class LLMOrchestrator:
                     )
                     return cached
 
-                ep_type = "chat"
-                if model.startswith("llamacpp/"):
-                    ep_type = self._f.valves.llamacpp_endpoint_type
+                # ── Determine endpoint type ──
+                # If caller explicitly provided endpoint_type, use it.
+                # Otherwise, default to "chat", but for llamacpp models use valve.
+                if endpoint_type is not None:
+                    ep_type = endpoint_type
+                else:
+                    ep_type = "chat"
+                    if model.startswith("llamacpp/"):
+                        ep_type = self._f.valves.llamacpp_endpoint_type
 
                 if self._f.tokenizer:
                     prompt_tokens = len(self._f.tokenizer.encode(prompt))
@@ -9842,7 +9933,7 @@ class LLMOrchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=self._f.valves.llm_request_timeout,
-                        endpoint_type=ep_type,
+                        endpoint_type=ep_type,  # Pass the resolved endpoint type
                     )
 
                     if content:
@@ -11771,27 +11862,14 @@ class CommandRouter:
     # 3. Contradiction detection (cascade: Heuristic → CE → LLM)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _detect_contradictions(
-        self, messages: list, project_id: str
-    ) -> Optional[str]:
+    async def _detect_contradictions(self, messages: list, project_id: str) -> Optional[str]:
         """
         Check if the last user message contradicts recent conversation history.
-
-        Cascade:
-        1. Heuristic reinforcement: boost contradiction if explicit contradiction keywords present.
-        2. CrossEncoder scores the contradiction vs consistency pair.
-        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
-        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        5. Middle zone: default to None (no warning, conservative).
-
-        Restores KV slot after any LLM call.
+        Returns a warning string if a contradiction is detected, else None.
 
         Args:
-            messages (list): The conversation messages.
-            project_id (str): Current project identifier.
-
-        Returns:
-            Optional[str]: A warning string if a contradiction is detected, else None.
+            messages: The list of conversation messages.
+            project_id: The current project identifier (used for slot restoration if needed).
         """
         if not self._f.valves.enable_contradiction_detection or len(messages) < 3:
             return None
@@ -11815,40 +11893,27 @@ class CommandRouter:
         hist = history_text[-8000:]
         new_msg = last_user["content"]
 
-        # ── Heuristic reinforcement ──
+        # Heuristic reinforcement
         content_lower = new_msg.lower()
         contradiction_keywords = (
-            "but",
-            "actually",
-            "instead",
-            "wait",
-            "no",
-            "not",
-            "error",
-            "wrong",
-            "correction",
+            "but", "actually", "instead", "wait", "no", "not", "error", "wrong", "correction"
         )
         h_weight = self._f.valves.heuristic_reinforcement_weight
-        heuristic_boost = (
-            0.2 if any(kw in content_lower for kw in contradiction_keywords) else 0.0
-        )
+        heuristic_boost = 0.2 if any(kw in content_lower for kw in contradiction_keywords) else 0.0
 
         pairs = [
             (
                 f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message directly contradicts a specific previous statement or decision in the conversation.",
+                "The new message directly contradicts a specific previous statement or decision in the conversation."
             ),
             (
                 f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message is consistent with and builds upon the previous conversation history.",
+                "The new message is consistent with and builds upon the previous conversation history."
             ),
         ]
         scores = await self._predict_cross_encoder(pairs)
 
         if scores is None or len(scores) < 2:
-            self._f._log_debug(
-                "_detect_contradictions: CrossEncoder not loaded, skipping."
-            )
             return None
 
         scores_reinforced = list(scores)
@@ -11867,10 +11932,7 @@ class CommandRouter:
             return None
 
         elif diff < LLM_FALLBACK_THRESHOLD:
-            self._f._log_debug(
-                f"_detect_contradictions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                "using LLM"
-            )
+            # LLM fallback
             return await self._detect_contradictions_with_llm(
                 hist, new_msg, scores_reinforced, project_id
             )
@@ -11884,11 +11946,7 @@ class CommandRouter:
         ce_scores: List[float],
         project_id: str,
     ) -> Optional[str]:
-        """
-        LLM fallback for contradiction detection.
-
-        Restores KV slot after the call.
-        """
+        """LLM fallback for contradiction detection."""
         prompt = f"""
 The CrossEncoder is uncertain. Scores:
 - Contradiction: {ce_scores[0]:.2f}
@@ -17714,7 +17772,7 @@ class EnrichmentTasks:
         """
         tasks = [
             (
-                self._f._commands._detect_contradictions(messages)
+                self._f._commands._detect_contradictions(messages, project_id)   # <-- project_id added
                 if (
                     self._f.valves.enable_contradiction_detection
                     and not skip_contradiction
@@ -17747,120 +17805,48 @@ class EnrichmentTasks:
         return contradiction, cached, duplicate
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 6. Docstring generation (batch and background) – MODIFIED (M5)
+    # 6. Docstring generation (batch and background)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    _BATCH_DOCSTRING_LINE_RE = re.compile(
+        r"^\s*(?:\d+\.\s*|[-*]\s*)?([A-Za-z_][\w.]*)\s*:\s*(.+)$"
+    )
+
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
-        """items: list of (qid, signature, snippet).  `qid` may be a bare
-        function name or a qualified 'ClassName.method' id — it is always
-        repeated EXACTLY as given, dot included, so the response can be
-        matched back to the correct symbol without ambiguity."""
-        parts = []
-        for qid, signature, snippet in items:
-            parts.append(f"### {qid}\n```\n{signature}\n{snippet[:300]}\n```")
-        listing = "\n\n".join(parts)
+        """
+        Ultra-minimalist prompt for docstring generation.
+
+        Only the identifiers and their signatures are listed, without code blocks.
+        This reduces the model's tendency to "reason" and encourages direct output.
+        """
+        lines = []
+        for qid, signature, _ in items:
+            sig = signature[:80] if signature else qid
+            lines.append(f"- {sig}")
+        listing = "\n".join(lines)
         return (
-            f"For each of the following {len(items)} code symbols, write ONE "
-            f"short sentence describing what it does.\n\n{listing}\n\n"
-            f"Output exactly one line per symbol, in this exact format:\n"
-            f"<identifier>: <one short sentence>\n"
-            f"Use the EXACT identifier as given above, including any "
-            f"'ClassName.' prefix — do not drop it, do not add numbering, "
-            f"headers, or any other text.\n"
-            f"Do not include any extra text, bullet points, numbers, reasoning steps, "
-            f"or headers like 'Input:', 'Task:', or 'Context:'."
+            f"Write one short sentence for each symbol. Format: <identifier>: <description>.\n"
+            f"Symbols:\n{listing}\n\n"
+            f"Now output:"
         )
 
-    _BATCH_DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
-
-    # ── M5: Resolve dunders with context ─────────────────────────────────────
-
-    def _resolve_parsed_docstring_name(
-        self,
-        bare_name: str,
-        project_id: str,
-        context_symbol: Optional[str] = None,
-    ) -> Optional[str]:
-        """Resolve a bare name from the batch docstring response to a qid.
-
-        M5: dunder disambiguation via context_symbol.
-        Step 1: bare-name lookup (returns single qid if unambiguous).
-        Step 2: for dunders (__init__, __str__, etc.), use context_symbol's
-                parent class to construct the full qid.
-        Step 3: if multiple bare-name matches and no context, return None.
-        """
-        # Step 1: bare-name lookup
-        results = self._f._symbol_index.get_qualified_names_for(bare_name, project_id)
-        if len(results) == 1:
-            return next(iter(results))
-
-        # Step 2: dunder disambiguation via context_symbol parent
-        if bare_name.startswith("__") and bare_name.endswith("__") and context_symbol:
-            # Extract parent class from context_symbol (e.g. "ContextBuilder.build" → "ContextBuilder")
-            parent = (
-                context_symbol.rsplit(".", 1)[0]
-                if "." in context_symbol
-                else context_symbol
-            )
-            candidate = f"{parent}.{bare_name}"
-            # Verify the candidate exists in the index
-            if candidate in self._f._symbol_index.get_all_qualified_names(project_id):
-                return candidate
-
-        # Step 3: ambiguous bare name
-        if len(results) > 1:
-            self._f._log_debug(
-                f"_resolve_parsed_docstring_name: ambiguous bare name '{bare_name}' "
-                f"→ {len(results)} candidates, skipping"
-            )
-            return None
-
-        return None
-
     def _parse_docstring_batch_response(
-        self,
-        response: str,
-        expected_names: Set[str],
-        batch_qids: List[str],
+        self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
         """
-        Parse the LLM response for batch docstrings.
+        Parse the LLM response line by line.
 
-        Each line is expected to be in the format:
-            <identifier>: <one short sentence>
-
-        The identifier is resolved to a qualified id using `_resolve_parsed_docstring_name`,
-        with the corresponding qid from the batch providing context for dunder disambiguation.
-
-        Returns a dict mapping qualified id -> docstring.
-
-        Modified (M5): uses context_symbol to disambiguate dunders (__init__, __str__, etc.).
+        Only lines matching 'identifier: description' are accepted.
+        Supports bullet points and numbering.
         """
         result: Dict[str, str] = {}
-        pattern = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
-
-        for idx, line in enumerate(response.splitlines()):
-            m = pattern.match(line.strip())
+        for line in response.splitlines():
+            m = self._BATCH_DOCSTRING_LINE_RE.match(line.strip())
             if not m:
                 continue
-
-            bare_name, docstring = m.group(1), m.group(2).strip()
-            if not docstring:
-                continue
-
-            # ── M5: resolve with context hint ──────────────────────────────
-            context_hint = batch_qids[idx] if idx < len(batch_qids) else None
-            qid = self._resolve_parsed_docstring_name(
-                bare_name, self._f.valves.project_id, context_hint
-            )
-
-            if qid and qid in expected_names:
-                result[qid] = docstring[:200]
-            else:
-                self._f._log_debug(
-                    f"_parse_docstring_batch_response: could not resolve '{bare_name}'"
-                )
-
+            name, desc = m.group(1), m.group(2).strip()
+            if name in expected_names and desc:
+                result[name] = desc[:200]
         return result
 
     async def ensure_docstrings_batch(
@@ -17870,32 +17856,21 @@ class EnrichmentTasks:
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
 
-        This method is called during LOD‑2 pre‑resolution. It batches symbols
-        to reduce the number of LLM calls and uses the SymbolIndex and SQLite
-        as a two‑level cache.
+        Cache hits (already in memory or in SQLite) are resolved for free.
+        Cache misses are generated in groups of `lazy_docstring_batch_size`,
+        ONE LLM call per group instead of one call per symbol.
 
-        Docstrings are generated with adaptive context based on symbol priority:
-        - Skeleton tier symbols (visible in Block A every turn) → 4000 chars.
-        - LOD-2 symbols (active in the current query) → 3500 chars.
-        - Other symbols → 2000 chars.
+        Uses the completion endpoint with an empty system prompt to avoid
+        the model generating reasoning instead of output lines.
 
-        Once generated, docstrings are cached permanently in SQLite and the
-        SymbolIndex, so the cost is paid only once.
-
-        Args:
-            qids (List[str]): Qualified symbol ids to resolve.
-            project_id (str): The current project identifier.
-
-        Returns:
-            Dict[str, str]: A mapping from qid to docstring for all
-            symbols that were successfully resolved (either from cache
-            or newly generated).
+        Returns {qid: docstring} for every qid that has (or now has) a
+        non-empty docstring.
         """
-        # ── REGION 1: Load state and build a fast symbol lookup index ──
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
+        # Build a qid → (sym, block) index
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -17906,7 +17881,7 @@ class EnrichmentTasks:
         def _find_symbol(qid: str):
             return _qid_index.get(qid, (None, None))
 
-        # ── REGION 2: Check in‑memory cache and persistent SQLite ──
+        # Cache check (memory + SQLite)
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
@@ -17934,7 +17909,7 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
-        # ── REGION 3: Enforce per‑turn budget ──
+        # Enforce per-turn budget
         budget = self._f.valves.lazy_docstring_max_per_turn
         if budget > 0:
             remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
@@ -17942,67 +17917,50 @@ class EnrichmentTasks:
         if not pending:
             return resolved
 
-        # ── REGION 4: Determine priority for each qid (MIGRADO) ──
-        psm = self._f._project_state_manager
-        skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
-        lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
-
-        # ── REGION 5: Build items with adaptive context ──
+        # Build items (qid, signature, snippet)
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
             if sym is not None and block is not None:
                 signature = sym.signature
-
-                # Priority-based max_chars
-                if qid in skeleton_qids:
-                    max_snippet_chars = 4000  # Most important (Block A)
-                elif qid in lod2_qids:
-                    max_snippet_chars = 3500  # Important (current query)
+                if sym.line_start:
+                    lines = block.content.split("\n")
+                    start_idx = max(0, sym.line_start - 1)
+                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
+                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
                 else:
-                    max_snippet_chars = 2000  # Standard
-
-                snippet = self._get_optimal_snippet(
-                    sym=sym,
-                    block=block,
-                    project_id=project_id,
-                    max_chars=max_snippet_chars,
-                    context_lines=5,
-                )
+                    snippet = block.content[:500]
             else:
                 signature, snippet = qid, ""
             items.append((qid, signature, snippet))
 
-        # ── REGION 6: Process in batches ──
+        # Use the foreground batch size (lazy) – valve name in v10
         batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
-            batch_qids = [qid for qid, _, _ in batch]
-
             prompt = self._build_docstring_batch_prompt(batch)
+
+            # --- CORRECTED LLM CALL ---
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
-                system_prompt=(
-                    "You are a code summarization assistant. Output ONLY the requested lines, "
-                    "one per symbol, with no extra text, no explanations, no markdown, no headers, "
-                    "and no reasoning. Each line must start with the EXACT identifier as given, "
-                    "followed by ': ' and a short sentence."
-                ),
+                system_prompt="",
                 model_override=self._f.valves.llm_model,
                 max_tokens=min(60 * len(batch), 600),
-                temperature=0.0,
+                temperature=0.1,
                 label="lazy_docstring_batch",
+                endpoint_type="completion",
             )
             self._lazy_docstrings_generated_this_turn += len(batch)
+
+            # --- DEBUG LOG: show raw response for first batch ---
+            if i == 0 and response:
+                self._f._log_debug(f"RAW DOCSTRING RESPONSE (first 500 chars): {response[:500]}")
+
             if not response:
                 continue
 
-            # ── REGION 7: Parse and store results ──
-            parsed = self._parse_docstring_batch_response(
-                response, expected, batch_qids
-            )
-
+            parsed = self._parse_docstring_batch_response(response, expected)
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -18010,12 +17968,11 @@ class EnrichmentTasks:
                     sym.docstring = docstring
                 self._f._symbol_index.update_docstring(qid, project_id, docstring)
 
-            # Persist to SQLite in a single batch
+            # Batch write to SQLite
             if parsed:
                 rows = [
                     (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
                 ]
-
                 def _write_batch(rows=rows):
                     self._f._db_conn.executemany(
                         "INSERT OR REPLACE INTO symbol_docstrings "
@@ -18024,7 +17981,6 @@ class EnrichmentTasks:
                         rows,
                     )
                     self._f._db_conn.commit()
-
                 await self._f._state_store._db_enqueue(_write_batch)
 
         return resolved
@@ -20103,7 +20059,7 @@ class SystemPromptBuilder:
                 if raptor_summaries:
                     refined_query = _ltm_query + "\n" + "\n".join(raptor_summaries[:2])
             except Exception:
-                pass  # fall through to plain query on any error
+                pass
 
         # ── REGION 3: Retrieve memories ──
         all_meta = await self._f._ltm.retrieve_memories_unified(
@@ -20119,7 +20075,7 @@ class SystemPromptBuilder:
             return None
 
         # ── REGION 4: Render with deduplication ──
-        return self._render_ltm_section(
+        return await self._render_ltm_section(
             project_id, all_meta, current_messages=current_messages
         )
 
