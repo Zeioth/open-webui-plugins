@@ -13409,25 +13409,8 @@ class CommandRouter:
         return None
 
     def _get_inactive_block_candidates(self, project_id: str) -> List[str]:
-        """Return hashes of blocks that haven't been mentioned recently."""
-        state = self._f._conversation_state_manager.get(project_id)
-        if not state or not state.active_blocks:
-            return []
-        threshold = self._f.valves.cleanup_inactive_threshold_messages
-        excluded_types = set(self._f.valves.cleanup_excluded_content_types)
-        current_msg_idx = state.message_count
-        candidates = []
-        for h, block in state.active_blocks.items():
-            if block.pinned or block.obsolete:
-                continue
-            if block.content_type.value in excluded_types:
-                continue
-            last_idx = block.last_mentioned_msg_idx
-            if last_idx is None:
-                last_idx = current_msg_idx
-            if current_msg_idx - last_idx > threshold:
-                candidates.append(h)
-        return candidates
+        """Delegate to ActivationEngine — single source of truth for inactive block detection."""
+        return self._f._activation.get_inactive_block_candidates(project_id)
 
     async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
         """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
