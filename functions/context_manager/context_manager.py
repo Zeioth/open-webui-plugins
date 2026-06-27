@@ -2837,7 +2837,7 @@ class ContextPager:
             label="paging_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         if self._f.valves.enable_slot_persistence and project_id:
@@ -3070,7 +3070,7 @@ class ContextPager:
             label="purge_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         if self._f.valves.enable_slot_persistence and project_id:
@@ -3383,17 +3383,12 @@ class RaptorCodeIndex:
         """
         import numpy as np
 
-        # ------------------------------------------------------------------
-        # Step 0: Early exit if stop requested.
-        # ------------------------------------------------------------------
+        # ── Step 0: Early exit if stop requested ──────────────────────────
         if stop_event and stop_event.is_set():
             return 0
 
-        # ------------------------------------------------------------------
-        # Step 1: Gather items + embeddings for this level.
-        # ------------------------------------------------------------------
+        # ── Step 1: Gather items + embeddings for this level ──────────────
         if level == 1:
-            # Use qualified ids so that every distinct symbol gets its own embedding.
             names = list(symbol_index.get_all_qualified_names(project_id))
             texts = []
             for n in names:
@@ -3419,14 +3414,12 @@ class RaptorCodeIndex:
                 return 0
             item_ids = [p["id"] for p in prev]
             texts = [p["text"] for p in prev]
-            names = item_ids  # no graph identity at L2
+            names = item_ids
 
         if len(texts) < max(2 * n_clusters, 4):
             return 0
 
-        # ------------------------------------------------------------------
-        # Step 2: Semantic embeddings.
-        # ------------------------------------------------------------------
+        # ── Step 2: Semantic embeddings ────────────────────────────────────
         try:
             sem = await anyio.to_thread.run_sync(
                 lambda: np.asarray(embedder.encode(texts), dtype=np.float32)
@@ -3434,9 +3427,7 @@ class RaptorCodeIndex:
         except Exception:
             return 0
 
-        # ------------------------------------------------------------------
-        # Step 3: Augmented features (semantic | graph).
-        # ------------------------------------------------------------------
+        # ── Step 3: Augmented features (semantic | graph) ─────────────────
         if level == 1 and graph_weight > 0.0:
             graph_feats = self._build_graph_features(names, edges_out)
             sem_scaled = sem * (1.0 - graph_weight)
@@ -3445,9 +3436,7 @@ class RaptorCodeIndex:
         else:
             features = sem
 
-        # ------------------------------------------------------------------
-        # Step 4: KMeans fit.
-        # ------------------------------------------------------------------
+        # ── Step 4: KMeans fit ────────────────────────────────────────────
         # Check stop before the potentially long KMeans operation.
         if stop_event and stop_event.is_set():
             return 0
@@ -3463,23 +3452,44 @@ class RaptorCodeIndex:
             )
         except ImportError:
             self._f._log_debug(
-                "scikit-learn not installed; RAPTOR clustering disabled."
+                "RAPTOR clustering disabled: scikit-learn not installed."
             )
             return 0
         except Exception as e:
-            self._f._log_debug(f"RAPTOR clustering failed: {e}")
+            err_str = str(e)
+            # Detect sklearn ABI mismatch — Cython extension compiled against
+            # a different sklearn version than currently installed.
+            # Symptom: "C function sklearn.utils._sorting.__pyx_fuse_N...
+            # has wrong signature" or similar _sorting import errors.
+            # Fix: pip install --force-reinstall scikit-learn==1.9.0
+            # Prevention: scikit-learn==1.9.0 is pinned in requirements.
+            if (
+                "wrong signature" in err_str
+                or "_sorting" in err_str
+                or "simultaneous_sort" in err_str
+            ):
+                logger.warning(
+                    "[CodeAware] RAPTOR clustering failed: sklearn ABI mismatch "
+                    f"(level={level}, k={k}, sklearn version may have been "
+                    "reinstalled without the correct .so files). "
+                    "Run: docker exec open-webui pip install --force-reinstall "
+                    "scikit-learn==1.9.0 --break-system-packages "
+                    "&& docker restart open-webui"
+                )
+            else:
+                logger.warning(
+                    f"[CodeAware] RAPTOR clustering failed "
+                    f"(level={level}, k={k}, n_items={len(texts)}): {e}"
+                )
             return 0
 
-        # ------------------------------------------------------------------
-        # Step 5: Per-cluster summary + store.
-        # ------------------------------------------------------------------
+        # ── Step 5: Per-cluster summary + store ───────────────────────────
         clusters: dict = {}
         for idx, lab in enumerate(labels):
             clusters.setdefault(int(lab), []).append(idx)
 
         created = 0
         for lab, member_idxs in clusters.items():
-            # Check stop before each cluster summary.
             if stop_event and stop_event.is_set():
                 break
 
@@ -5135,7 +5145,7 @@ class ContextBuilder:
             label="use_case_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -6528,25 +6538,24 @@ class SignatureExtractor:
         Extract symbols and call relationships from source code.
 
         Uses AST for Python (fast and precise) and tree-sitter for all other
-        languages via `tree_sitter_language_pack.process()`. The result is a list
-        of `CodeSymbol` objects with qualified names, line ranges, and call lists.
+        languages via `tree_sitter_language_pack.process()`. The result is a
+        list of `CodeSymbol` objects with qualified names, line ranges, and
+        call lists.
 
-        Results are cached with a 1‑hour TTL to avoid re‑parsing the same block.
+        Results are cached with a 1-hour TTL to avoid re-parsing the same block.
 
         Args:
-            code (str): The source code.
-            file_path (Optional[str]): The file path (used for language detection).
-            language (Optional[str]): Explicit language hint.
+            code: The source code.
+            file_path: The file path (used for language detection).
+            language: Explicit language hint.
 
         Returns:
             List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
-        # ── Quick rejection: is this text likely code? ──────────────────────
         if not CodeBlockManager._is_likely_code(code):
             logger.debug("Skipping extraction: text does not appear to be code.")
             return []
 
-        # ── Cache check ──────────────────────────────────────────────────────────
         cache_key = SignatureExtractor._cache_key(code, file_path, language)
         with SignatureExtractor._EXTRACTION_CACHE_LOCK:
             if cache_key in SignatureExtractor._extraction_cache:
@@ -6556,7 +6565,6 @@ class SignatureExtractor:
                 else:
                     del SignatureExtractor._extraction_cache[cache_key]
 
-        # ── Size validation ────────────────────────────────────────────────────
         if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
             logger.warning(
                 f"Code block too large ({len(code.encode())} bytes) — "
@@ -6564,20 +6572,21 @@ class SignatureExtractor:
             )
             return []
 
-        # ── Language detection ────────────────────────────────────────────────
         lang = language or SignatureExtractor._guess_language(file_path, code)
-        if lang == "unknown":
+
+        # Guard against empty string returned by detect_language_from_extension
+        # or any other path that produces a falsy value instead of "unknown".
+        # Both '' and "unknown" mean we cannot reliably parse this block.
+        if not lang or lang == "unknown":
             logger.warning(
                 "Could not detect language for code block — skipping symbol extraction."
             )
             return []
 
-        # ── Python: use AST ──────────────────────────────────────────────────
         if lang == "python":
             try:
                 symbols = SignatureExtractor._extract_symbols_from_ast(code, file_path)
                 call_map = SignatureExtractor._extract_calls_from_ast(code)
-                # Attach calls to symbols
                 for sym in symbols:
                     qid = qualify_symbol_name(
                         sym.name, sym.parent_symbol, sym.file_path
@@ -6588,7 +6597,6 @@ class SignatureExtractor:
                             if c not in calls:
                                 calls.append(c)
                     sym.calls = calls
-                # Cache and return
                 with SignatureExtractor._EXTRACTION_CACHE_LOCK:
                     if (
                         len(SignatureExtractor._extraction_cache)
@@ -6608,9 +6616,7 @@ class SignatureExtractor:
                 logger.warning(
                     f"AST extraction failed for Python: {e} — falling back to tree-sitter"
                 )
-                # Fall through to tree-sitter for Python if AST fails
 
-        # ── Other languages: use tree-sitter language pack ──────────────────
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
@@ -6626,17 +6632,16 @@ class SignatureExtractor:
                     for sym in result.symbols:
                         code_sym = CodeSymbol(
                             name=sym.name,
-                            kind=sym.kind,  # 'function', 'class', 'method'
+                            kind=sym.kind,
                             signature=sym.signature or sym.name,
                             file_path=file_path,
-                            line_start=sym.line_start + 1,  # convert to 1‑based
+                            line_start=sym.line_start + 1,
                             line_end=sym.line_end + 1,
                             language=lang,
                             parent_symbol=sym.parent or "",
                         )
                         symbols.append(code_sym)
 
-                # Build call map
                 call_map: Dict[str, List[str]] = {}
                 if hasattr(result, "calls"):
                     from collections import defaultdict
@@ -6647,7 +6652,6 @@ class SignatureExtractor:
                             tmp[call.caller].add(call.callee)
                     call_map = {k: list(v) for k, v in tmp.items()}
 
-                # Attach calls to symbols
                 for sym in symbols:
                     qid = qualify_symbol_name(
                         sym.name, sym.parent_symbol, sym.file_path
@@ -6659,7 +6663,6 @@ class SignatureExtractor:
                                 calls.append(c)
                     sym.calls = calls
 
-                # Cache and return
                 with SignatureExtractor._EXTRACTION_CACHE_LOCK:
                     if (
                         len(SignatureExtractor._extraction_cache)
@@ -6681,10 +6684,9 @@ class SignatureExtractor:
                     f"tree-sitter process() extraction failed for language '{lang}': {e}"
                 )
 
-        # ── Fallback: empty ──────────────────────────────────────────────────
         logger.warning(
             "No extraction method available — returning empty symbol list. "
-            "Install tree-sitter-language-pack for non‑Python languages."
+            "Install tree-sitter-language-pack for non-Python languages."
         )
         return []
 
@@ -8913,8 +8915,14 @@ Output only "YES" or "NO".
         return f"[{context_line}]\n\n"
 
     async def _build_retrieval_context_llm(self, content: str, project_id: str) -> str:
-        """Use the LLM to generate a one‑sentence contextual description
-        of *content* for improved long‑term memory retrieval."""
+        """
+        Use the LLM to generate a one-sentence contextual description of
+        *content* for improved long-term memory retrieval.
+
+        The prompt constrains output to 10-20 words, so no max_tokens ceiling
+        is needed — the model terminates naturally. enable_thinking=False avoids
+        reasoning overhead on a deterministic single-sentence task.
+        """
         prompt = (
             "In one sentence (10-20 words), describe what the following "
             "code/conversation excerpt is about, for search retrieval:\n\n"
@@ -8927,8 +8935,10 @@ Output only "YES" or "NO".
                 "Be specific about functions, files, or errors mentioned."
             ),
             model_override=self._f.valves.llm_model,
-            max_tokens=40,
+            max_tokens=0,
             temperature=0.2,
+            label="retrieval_context_llm",
+            enable_thinking=False,
         )
         if context and context.strip():
             return f"[Context: {context.strip()}]\n\n"
@@ -10237,7 +10247,7 @@ class LLMOrchestrator:
             label="keep_full_code_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -11207,10 +11217,10 @@ Output only the number (0, 1, 2, or 3):
         6. Synthesize a final reasoning from the best hypothesis + evidence.
 
         Args:
-            question (str): The user's question to reason about.
-            context (str): The context (code, system prompt, etc.) to reason on.
-            project_id (str): The current project identifier.
-            label (str): Optional label for LLM call logging.
+            question: The user's question to reason about.
+            context: The context (code, system prompt, etc.) to reason on.
+            project_id: The current project identifier.
+            label: Optional label for LLM call logging.
 
         Returns:
             str: A formatted reasoning chain with the best hypothesis and
@@ -11294,11 +11304,9 @@ Output only the number (0, 1, 2, or 3):
                 f"(obj={best_obj:.3f}, llm_conf={best_llm_conf:.3f})"
             )
 
-            # ── Stop if threshold met or max iterations reached ──
             if best_combined >= threshold or iteration >= max_iters:
                 break
 
-            # ── Feed evidence back to refine hypotheses ──
             evidence_feedback = (
                 f"Previous best hypothesis (score {best_combined:.2f}):\n"
                 f"{best_hypothesis}\n\n"
@@ -11356,11 +11364,10 @@ Output only the number (0, 1, 2, or 3):
                 "based on verified evidence."
             ),
             model_override=self._f.valves.cot_model_level3,
-            max_tokens=(
-                self._f.valves.cot_max_tokens
-                if self._f.valves.cot_max_tokens > 0
-                else None
-            ),
+            # cot_max_tokens=0 means no limit (omitted from payload by call_llm).
+            # The previous pattern (cot_max_tokens if > 0 else None) was
+            # inconsistent with the rest of the codebase.
+            max_tokens=self._f.valves.cot_max_tokens,
             temperature=0.3,
             label=label + "_synthesize" if label else "sci_synthesize",
         )
@@ -12093,7 +12100,7 @@ class CommandRouter:
             label="contradiction_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -12364,7 +12371,7 @@ class CommandRouter:
             label="intent_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -12690,7 +12697,7 @@ class CommandRouter:
             label="nl_intent_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -13522,10 +13529,13 @@ class CommandRouter:
         Detect if a message contains only code without a question.
 
         Cascade:
-        1. Tree‑sitter (fast, multi‑language).
-        2. CrossEncoder with heuristic reinforcement.
-        3. LLM (only when diff < 0.20).
-        4. Heuristic structural fallback (when 0.20 ≤ diff < 0.35).
+        1. Tree-sitter (fast): parses the message as markdown to detect fenced
+           code blocks. If the text outside the fences is minimal and contains
+           no question marker, classifies as code-only immediately.
+        2. CrossEncoder with heuristic reinforcement: handles large files and
+           unfenced code with high structural line ratios.
+        3. LLM (only when CrossEncoder diff < llm_threshold).
+        4. Heuristic structural fallback (when ce_threshold > diff >= llm_threshold).
 
         Restores KV slot after any LLM call.
         """
@@ -13537,19 +13547,33 @@ class CommandRouter:
         total_lines = len(stripped.splitlines())
         non_empty_lines = [l for l in stripped.splitlines() if l.strip()]
 
-        # ── Step 1: Tree‑sitter ──
+        # ── Step 1: Tree-sitter ──
+        # Parse the message as markdown to locate fenced code block spans.
+        # ProcessConfig() without a language defaults to '' which triggers a
+        # grammar download attempt for an unknown language and always fails.
+        # "markdown" is the correct grammar: we want fence detection, not
+        # source-code parsing.
+        #
+        # Threshold is 80 chars (not the original 30) so that short questions
+        # adjacent to a fence — e.g. "¿Puedes arreglarlo?" (22 chars) or
+        # "can you fix this?" (17 chars) — are not misclassified as code-only.
+        # The '?' guard catches interrogative sentences regardless of length.
+        # Unfenced code is handled by Step 3 (structural heuristic).
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
 
                 config = ProcessConfig()
+                config.language = "markdown"
                 blocks = process(content, config)
                 if blocks and hasattr(blocks, "blocks"):
                     spans = [(b.start_byte, b.end_byte) for b in blocks.blocks]
                     text_outside = CodeBlockManager.remove_code_spans(
                         content, spans
                     ).strip()
-                    if not text_outside or len(text_outside) < 30:
+                    if not text_outside or (
+                        len(text_outside) < 80 and "?" not in text_outside
+                    ):
                         return True
             except Exception:
                 pass
@@ -13570,11 +13594,7 @@ class CommandRouter:
                 if "?" not in content and len(content.split()) < 30:
                     scores_reinforced[0] += 0.2
 
-                # ---- Heuristic reinforcement for large files ----
-                # If the message is very long and has a high proportion of structural lines,
-                # force code classification even if the CrossEncoder is uncertain.
                 if total_lines > 500:
-                    # Count lines that look like code (def, class, import, etc.)
                     structural_lines = sum(
                         1
                         for l in non_empty_lines
@@ -13587,9 +13607,7 @@ class CommandRouter:
                         else 0
                     )
                     if ratio > 0.6:
-                        # High code proportion -> force True
                         return True
-                    # If there are very few questions and many lines, also force True
                     if total_lines > 1000 and content.count("?") < 3:
                         return True
 
@@ -13680,7 +13698,7 @@ class CommandRouter:
             label="code_only_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any LLM call (auxiliary calls dirty the slot
@@ -13785,40 +13803,44 @@ class CodeBlockManager:
         """
         Return tree-sitter code spans for the given content, with caching.
 
-        Uses tree-sitter to identify code regions in the text. Results are cached
-        by MD5 hash of the content to avoid re-parsing the same text repeatedly.
+        Parses the content as markdown to identify fenced code regions.
+        Results are cached by MD5 hash to avoid re-parsing the same text.
 
         Args:
             content: The raw text to scan for code spans.
 
         Returns:
-            A list of (start_byte, end_byte) tuples identifying code regions.
-            Returns an empty list if tree-sitter is unavailable or parsing fails.
+            List of (start_byte, end_byte) tuples identifying code regions.
+            Empty list if tree-sitter is unavailable or parsing fails.
         """
-        # ── 1. Early exit: tree-sitter unavailable ─────────────────────────
         if not HAS_TREE_SITTER:
             return []
 
-        # ── 2. Check cache ───────────────────────────────────────────────────
         cache_key = hashlib.md5(content.encode()).hexdigest()[:16]
         if cache_key in self._code_spans_cache:
             return self._code_spans_cache[cache_key]
 
-        # ── 3. Parse with tree-sitter ──────────────────────────────────────
         try:
+            from tree_sitter_language_pack import process, ProcessConfig
+
+            # Parse as markdown to detect fenced code block spans.
+            # ProcessConfig() without a language defaults to '' which triggers
+            # a grammar download attempt for an unknown language and always
+            # fails. "markdown" is the correct grammar for this use case —
+            # we want to find fence boundaries, not parse source code.
             config = ProcessConfig()
+            config.language = "markdown"
             blocks = process(content, config)
             spans = [(b.start_byte, b.end_byte) for b in blocks]
         except Exception:
             spans = []
 
-        # ── 4. Store in cache with LRU eviction ─────────────────────────────
         if len(self._code_spans_cache) >= 200:
             keys_to_evict = list(self._code_spans_cache.keys())[:50]
             for key in keys_to_evict:
                 del self._code_spans_cache[key]
-        self._code_spans_cache[cache_key] = spans
 
+        self._code_spans_cache[cache_key] = spans
         return spans
 
     @staticmethod
@@ -14019,9 +14041,7 @@ class CodeBlockManager:
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # ------------------------------------------------------------------
-        # Section 1: Silent ingestion path (pre-extracted symbols)
-        # ------------------------------------------------------------------
+        # ── Section 1: Silent ingestion path (pre-extracted symbols) ──────
         raw = pstate.get("raw_ingested_symbols")
         if raw is not None:
             pstate["raw_ingested_symbols"] = None
@@ -14037,16 +14057,18 @@ class CodeBlockManager:
                 return [block], [(0, len(content))]
             return [], []
 
-        # ------------------------------------------------------------------
-        # Section 2: Tree-sitter Markdown block detection
-        # ------------------------------------------------------------------
+        # ── Section 2: Tree-sitter Markdown block detection ───────────────
+        # Parse as markdown to locate fenced code block spans.
+        # ProcessConfig() without a language defaults to '' which triggers a
+        # grammar download attempt for an unknown language and always fails.
+        # "markdown" is the correct grammar: we want fence detection, not
+        # source-code parsing. extract_symbols is intentionally NOT set here.
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
 
                 config = ProcessConfig()
-                # Important: Do NOT set extract_symbols=True here.
-                # process() acts as a Markdown block detector.
+                config.language = "markdown"
                 result = process(content, config)
                 if hasattr(result, "blocks"):
                     self._f._log_debug(
@@ -14069,9 +14091,7 @@ class CodeBlockManager:
                     f"tree-sitter failed ({e}), falling through to regex"
                 )
 
-        # ------------------------------------------------------------------
-        # Section 3: Regex fallback for fenced code blocks
-        # ------------------------------------------------------------------
+        # ── Section 3: Regex fallback for fenced code blocks ──────────────
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
@@ -14087,9 +14107,7 @@ class CodeBlockManager:
             self._f._log_debug(f"regex found {len(blocks)} fenced block(s)")
             return self._postprocess_blocks(blocks, spans, content)
 
-        # ------------------------------------------------------------------
-        # Section 4: Indented blocks (only if no fenced blocks)
-        # ------------------------------------------------------------------
+        # ── Section 4: Indented blocks (only if no fenced blocks) ─────────
         lines = content.split("\n")
         line_offsets = [0]
         for line in lines:
@@ -14128,9 +14146,7 @@ class CodeBlockManager:
                 end_offset = line_offsets[total_lines] - 1
                 spans.append((start_offset, end_offset))
 
-        # ------------------------------------------------------------------
-        # Section 5: Entire small content as a single block
-        # ------------------------------------------------------------------
+        # ── Section 5: Entire small content as a single block ─────────────
         if not blocks and len(content) <= 20_000 and self._is_likely_code(content):
             lang = SignatureExtractor._guess_language(None, content) or "text"
             blocks.append({"language": lang, "code": content, "type": "indented"})
@@ -17118,7 +17134,7 @@ Code context (recent symbols referenced):
             label="commit_summary",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         if self._f.valves.enable_slot_persistence:
@@ -17510,7 +17526,13 @@ Code context (recent symbols referenced):
     async def summarize_messages(
         self, old_messages: list, is_code_context: bool = False
     ) -> Optional[str]:
-        """Summarise a list of old conversation messages into a single paragraph."""
+        """
+        Summarise a list of old conversation messages into a single paragraph.
+
+        Input is capped at 4000 chars in the prompt; the model terminates
+        naturally so no max_tokens ceiling is needed. enable_thinking=False
+        avoids reasoning overhead on a straightforward summarization task.
+        """
         if not old_messages:
             return None
         combined = "\n".join(
@@ -17519,8 +17541,8 @@ Code context (recent symbols referenced):
         if not combined.strip():
             return None
         prompt = (
-            f"Summarize the following conversation segment, preserving key decisions "
-            f"and code changes:\n\n{combined[:4000]}"
+            f"Summarize the following conversation segment, preserving key "
+            f"decisions and code changes:\n\n{combined[:4000]}"
         )
         system_prompt = (
             "You produce concise summaries of technical conversations."
@@ -17531,8 +17553,10 @@ Code context (recent symbols referenced):
             prompt=prompt,
             system_prompt=system_prompt,
             model_override=self._f.valves.summarization_model,
-            max_tokens=500,
+            max_tokens=0,
             temperature=0.3,
+            label="summarize_messages",
+            enable_thinking=False,
         )
         return summary.strip() if summary else None
 
@@ -17727,7 +17751,14 @@ class EnrichmentTasks:
         prev_content: str,
         new_content: str,
     ) -> None:
-        """Generate and persist a change summary immediately (no deferral)."""
+        """
+        Generate and persist a one-sentence change summary immediately.
+
+        The prompt constrains output to a single sentence of max 15 words,
+        so no max_tokens ceiling is needed — the model terminates naturally.
+        enable_thinking=False avoids reasoning overhead on a deterministic
+        single-sentence task.
+        """
         model = self._f.valves.llm_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
@@ -17737,10 +17768,14 @@ class EnrichmentTasks:
         )
         summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a code change summariser. Output only one short sentence.",
+            system_prompt=(
+                "You are a code change summariser. " "Output only one short sentence."
+            ),
             model_override=model,
-            max_tokens=40,
+            max_tokens=0,
             temperature=0.1,
+            label="change_summary",
+            enable_thinking=False,
         )
         if summary:
             now = time.time()
@@ -17756,7 +17791,8 @@ class EnrichmentTasks:
                 )
                 self._f._db_conn.execute(
                     "DELETE FROM block_change_summaries WHERE block_hash NOT IN "
-                    "(SELECT block_hash FROM block_change_summaries ORDER BY created_at DESC LIMIT ?)",
+                    "(SELECT block_hash FROM block_change_summaries "
+                    "ORDER BY created_at DESC LIMIT ?)",
                     (self._f._MAX_CHANGE_SUMMARIES,),
                 )
                 self._f._db_conn.commit()
@@ -18355,7 +18391,7 @@ class EnrichmentTasks:
                 temperature=0.0,
                 label=label,
                 response_format={"type": "json_object"},
-                log_raw_response=True,
+                log_raw_response=False,
                 enable_thinking=False,
             )
 
@@ -20171,7 +20207,7 @@ class InletOrchestrator:
             label="session_classify_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -20748,7 +20784,7 @@ class SystemPromptBuilder:
             label="ltm_dedup_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         if self._f.valves.enable_slot_persistence:
@@ -22325,7 +22361,7 @@ class MessageAssembler:
             self._f._log_debug(f"Turn summary LTM persist failed: {e}")
 
     async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
-        """Fuse several L1 turn‑range summaries into one L2 summary via the LLM."""
+        """Fuse several L1 turn-range summaries into one L2 summary via the LLM."""
         texts: List[str] = []
         starts: List[int] = []
         ends: List[int] = []
@@ -22339,11 +22375,9 @@ class MessageAssembler:
                 starts.append(ct[0])
                 ends.append(ct[1])
             total_msgs += s.get("covers_msgs", 0)
-
         combined = "\n\n".join(f"- {t}" for t in texts)
         if not combined.strip():
             return None
-
         prompt = (
             "Consolidate these conversation summaries into ONE higher-level "
             "summary (3-5 sentences). Preserve key decisions, files modified, and "
@@ -22360,10 +22394,10 @@ class MessageAssembler:
             max_tokens=self._f.valves.hierarchical_summary_max_tokens,
             temperature=0.2,
             label="hierarchical_summary",
+            enable_thinking=False,
         )
         if not merged or not merged.strip():
             return None
-
         return {
             "text": merged.strip(),
             "created_at": time.time(),
@@ -25190,7 +25224,7 @@ class SemanticSeedInferencer:
             label="should_infer_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         # Restore the KV slot after any auxiliary LLM call.
@@ -25306,7 +25340,7 @@ class SemanticSeedInferencer:
             label="seed_inference",
             response_format={"type": "json_object"},
             enable_thinking=True,
-            log_raw_response=True,
+            log_raw_response=False,
         )
 
         if not response:
@@ -25334,10 +25368,20 @@ class SemanticSeedInferencer:
                 f"SemanticSeedInferencer: {len(seeds)} symbol(s) seeded "
                 f"→ {sample}{ellipsis}"
             )
-        else:
+        elif not tokens:
+            # LLM returned {"symbols": []} intentionally — query doesn't
+            # require any specific symbol bodies (e.g. general questions).
             self._f._log_debug(
-                "SemanticSeedInferencer: LLM responded but no id "
-                "matches the index (possible hallucinations)."
+                "SemanticSeedInferencer: LLM returned empty symbol list "
+                "(no symbols needed for this query)."
+            )
+        else:
+            # LLM returned symbol names but none matched the index —
+            # likely hallucinated identifiers not present in the skeleton.
+            self._f._log_debug(
+                f"SemanticSeedInferencer: LLM returned {len(tokens)} symbol(s) "
+                f"but none matched the index (possible hallucinations): "
+                f"{tokens[:5]}"
             )
 
         return seeds
