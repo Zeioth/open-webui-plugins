@@ -99,7 +99,9 @@ from shared_resources import (
     get_http_session as _shared_get_http_session,
     call_llm as _shared_call_llm,
     unload_all_models as _shared_unload_all_models,
-    get_conversation_compressor as _shared_get_conversation_compressor,  # ← v8
+    get_conversation_compressor as _shared_get_conversation_compressor,
+    get_model_name,
+    get_model_backend,
 )
 
 _db_global_lock = threading.Lock()
@@ -2795,59 +2797,72 @@ class ContextPager:
         project_id: str,
     ) -> bool:
         """
-        LLM fallback for paging decision when CrossEncoder is uncertain.
+        LLM fallback for paging decision when the CrossEncoder diff falls
+        below paging_llm_threshold.
+
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is False (keep) to
+        avoid discarding potentially relevant blocks.
 
         Args:
             block: The block being considered for paging.
-            query: Current user query.
-            ce_scores: CrossEncoder scores (Keep, Pageout).
-            project_id: Current project identifier.
+            query: Current user query (truncated to 400 chars).
+            ce_scores: [keep_score, pageout_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
 
         Returns:
-            True if the block should be paged out.
+            bool: True if the block should be paged out, False to keep it.
         """
-        # ------------------------------------------------------------------
-        # Step 1: Build the prompt with CrossEncoder context.
-        # ------------------------------------------------------------------
-        snippet = block.content[:500]
         prompt = (
-            f"CrossEncoder uncertain. Scores — Keep: {ce_scores[0]:.2f}, "
-            f"Page out: {ce_scores[1]:.2f}\n\n"
-            f"Code block (snippet):\n{snippet}\n\n"
+            f"CrossEncoder scores — keep: {ce_scores[0]:.2f}, "
+            f"page_out: {ce_scores[1]:.2f}\n\n"
+            f"Code block (snippet):\n{block.content[:500]}\n\n"
             f"Current query:\n{query[:400]}\n\n"
-            f"Is this block needed to answer the query?\n"
-            f"Output only KEEP or PAGEOUT."
+            f"Is this block needed to answer the query? "
+            f"When uncertain, prefer keeping it.\n\n"
+            f'Output only the JSON object, e.g. {{"page_out": false}}'
         )
 
-        # ------------------------------------------------------------------
-        # Step 2: Call the LLM.
-        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a memory manager. Output only 'KEEP' or 'PAGEOUT'. "
-                "When uncertain, output KEEP."
+                "You are a memory manager. "
+                "Output ONLY a valid JSON object with a single boolean field 'page_out'. "
+                "When uncertain, output false (keep the block). "
+                "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="paging_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
-        # ------------------------------------------------------------------
-        # Step 3: Restore KV slot if persistence is enabled.
-        # ------------------------------------------------------------------
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # ------------------------------------------------------------------
-        # Step 4: Log and return the decision.
-        # ------------------------------------------------------------------
-        self._f._log_debug(
-            f"_page_out_block_with_llm: '{(response or '').strip()}' "
-            f"for block {block.hash[:8]}"
-        )
-        return bool(response and response.strip().upper() == "PAGEOUT")
+        if not response:
+            self._f._log_debug(
+                f"_page_out_block_with_llm: empty response, keeping block {block.hash[:8]}"
+            )
+            return False
+
+        try:
+            data = json.loads(response)
+            result = bool(data.get("page_out", False))
+            self._f._log_debug(
+                f"_page_out_block_with_llm: "
+                f"{'page out' if result else 'keep'} for block {block.hash[:8]}"
+            )
+            return result
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_page_out_block_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, keeping block {block.hash[:8]}"
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Region: Purge Old Versions
@@ -3015,56 +3030,73 @@ class ContextPager:
         project_id: str,
     ) -> bool:
         """
-        LLM fallback for purge decision.
+        LLM fallback for purge decision when the CrossEncoder diff falls
+        below purge_llm_threshold.
+
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is False (keep) to
+        avoid discarding potentially valuable context.
 
         Args:
             block: The block to evaluate.
-            query: The current user query.
-            ce_scores: CrossEncoder scores (reinforced).
-            project_id: Current project identifier.
+            query: Current user query (truncated to 500 chars).
+            ce_scores: [keep_score, purge_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
 
         Returns:
-            True if the block should be purged, False if kept.
+            bool: True if the block should be purged, False to keep it.
         """
-        # ------------------------------------------------------------------
-        # Step 1: Build the prompt.
-        # ------------------------------------------------------------------
-        snippet = block.content[:500]
         prompt = (
-            f"The CrossEncoder is uncertain. Scores:\n"
-            f"- Keep: {ce_scores[0]:.2f}\n"
-            f"- Purge: {ce_scores[1]:.2f}\n\n"
-            f"Old version (snippet):\n{snippet}\n\n"
+            f"CrossEncoder scores — keep: {ce_scores[0]:.2f}, "
+            f"purge: {ce_scores[1]:.2f}\n\n"
+            f"Old version (snippet):\n{block.content[:500]}\n\n"
             f"Current query:\n{query[:500]}\n\n"
-            f"Is this old version still valuable for context, or can it be safely purged?\n"
-            f"Consider: is it likely to be referenced again?\n\n"
-            f"Output only 'KEEP' or 'PURGE'."
+            f"Is this old version still valuable for context, "
+            f"or can it be safely purged? "
+            f"Consider whether it is likely to be referenced again.\n\n"
+            f'Output only the JSON object, e.g. {{"purge": false}}'
         )
 
-        # ------------------------------------------------------------------
-        # Step 2: Call the LLM.
-        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a memory manager. Output only 'KEEP' or 'PURGE'.",
+            system_prompt=(
+                "You are a memory manager. "
+                "Output ONLY a valid JSON object with a single boolean field 'purge'. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="purge_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
-        # ------------------------------------------------------------------
-        # Step 3: Restore KV slot if persistence is enabled.
-        # ------------------------------------------------------------------
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # ------------------------------------------------------------------
-        # Step 4: Parse and return.
-        # ------------------------------------------------------------------
-        if response and response.strip().upper() == "PURGE":
-            return True
-        return False
+        if not response:
+            self._f._log_debug(
+                f"_purge_old_version_with_llm: empty response, "
+                f"keeping block {block.hash[:8]}"
+            )
+            return False
+
+        try:
+            data = json.loads(response)
+            result = bool(data.get("purge", False))
+            self._f._log_debug(
+                f"_purge_old_version_with_llm: "
+                f"{'purge' if result else 'keep'} for block {block.hash[:8]}"
+            )
+            return result
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_purge_old_version_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, keeping block {block.hash[:8]}"
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Region: Page-In
@@ -5051,73 +5083,94 @@ class ContextBuilder:
         project_id: str,
     ) -> Tuple[str, dict, str]:
         """
-        LLM fallback for use case classification.
+        LLM fallback for use case classification when the CrossEncoder diff
+        falls below use_case_llm_threshold.
 
-        Uses CrossEncoder scores as context and restores the KV slot afterward.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on unknown response is 'C'
+        (Programming) — the most common use case.
+
+        Args:
+            query: The user's message (truncated to 500 chars).
+            ce_scores: List of 5 CE scores [Architecture, Planning, Programming,
+                       Refactoring, Scaffolding].
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            Tuple[str, dict, str]: (use_case_key, lod_profile, human_label)
         """
-        scores_summary = "\n".join(
-            [
-                f"- Architecture/Design: {ce_scores[0]:.2f}",
-                f"- Planning/Roadmap: {ce_scores[1]:.2f}",
-                f"- General Programming: {ce_scores[2]:.2f}",
-                f"- Refactoring/Impact: {ce_scores[3]:.2f}",
-                f"- Scaffolding: {ce_scores[4]:.2f}",
-            ]
+        ce_block = (
+            f"CrossEncoder scores — "
+            f"Architecture: {ce_scores[0]:.2f}, "
+            f"Planning: {ce_scores[1]:.2f}, "
+            f"Programming: {ce_scores[2]:.2f}, "
+            f"Refactoring: {ce_scores[3]:.2f}, "
+            f"Scaffolding: {ce_scores[4]:.2f}\n\n"
         )
 
-        prompt = f"""
-The CrossEncoder is uncertain. Scores:
-{scores_summary}
+        prompt = (
+            f"{ce_block}"
+            f"User question:\n{query[:500]}\n\n"
+            f"Choose the most appropriate use case:\n"
+            f"  Architecture — design, structure, high-level system decisions\n"
+            f"  Planning     — roadmap, steps, implementation plan\n"
+            f"  Programming  — general coding, writing code, debugging\n"
+            f"  Refactoring  — restructuring, impact analysis, code changes\n"
+            f"  Scaffolding  — stubs, boilerplate, skeleton code\n\n"
+            f'Output only the JSON object, e.g. {{"use_case": "Programming"}}'
+        )
 
-User question:
-{query[:500]}
-
-Choose the most appropriate use case.
-Options:
-- Architecture: design, structure, high-level system decisions
-- Planning: roadmap, steps, implementation plan
-- Programming: general coding, writing code, debugging
-- Refactoring: restructuring, impact analysis, code changes
-- Scaffolding: stubs, boilerplate, skeleton code
-
-Output only the use case name: Architecture, Planning, Programming, Refactoring, or Scaffolding.
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a use case classifier. Output only the use case name.",
+            system_prompt=(
+                "You are a use case classifier. "
+                "Output ONLY a valid JSON object with a single string field 'use_case' "
+                "whose value is one of: Architecture, Planning, Programming, "
+                "Refactoring, Scaffolding. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=10,
+            max_tokens=0,
             temperature=0.0,
             label="use_case_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        label_map = {
+        # Map the string value to the internal use case key.
+        _label_map = {
             "architecture": "A",
-            "design": "A",
             "planning": "B",
-            "roadmap": "B",
             "programming": "C",
-            "general": "C",
             "refactoring": "D",
-            "refactor": "D",
-            "impact": "D",
             "scaffolding": "E",
-            "stub": "E",
-            "boilerplate": "E",
         }
-        resp_lower = response.strip().lower()
-        case_key = label_map.get(resp_lower, None)
 
-        if case_key is None:
-            self._f._log_debug(
-                f"classify_use_case: LLM returned unknown '{resp_lower}', defaulting to Programming"
-            )
-            case_key = "C"
-        else:
-            self._f._log_debug(f"classify_use_case: LLM decided '{case_key}'")
+        case_key = "C"  # default: Programming
+        if response:
+            try:
+                data = json.loads(response)
+                raw = str(data.get("use_case", "")).strip().lower()
+                case_key = _label_map.get(raw, "C")
+                if case_key == "C" and raw not in _label_map:
+                    self._f._log_debug(
+                        f"_classify_use_case_with_llm: unknown value {raw!r}, "
+                        f"defaulting to Programming"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"_classify_use_case_with_llm: LLM decided {raw!r} → {case_key!r}"
+                    )
+            except (json.JSONDecodeError, Exception):
+                self._f._log_debug(
+                    f"_classify_use_case_with_llm: JSON parse error — "
+                    f"response: {response[:200]!r}, defaulting to Programming"
+                )
 
         case = UseCase(case_key)
         return case.value, dict(self.LOD_PROFILES[case.value]), case.label
@@ -9836,28 +9889,56 @@ class LLMOrchestrator:
         temperature: float = 0.3,
         label: str = "",
         total_timeout: Optional[float] = None,
-        endpoint_type: Optional[str] = None,  # NEW: explicit endpoint override
+        endpoint_type: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        enable_thinking: bool = True,
+        log_raw_response: bool = False,
     ) -> Optional[str]:
         """
-        Call the LLM with cache and deduplication. Retries are handled by
-        shared_resources.call_llm internally.
+        Call the LLM with in-memory response cache and call deduplication.
 
-        All calls to this method are serialized via `_llm_semaphore` to prevent
-        concurrent LLM requests, which avoids cancellation issues when using
-        `--parallel 1` in llama.cpp.
+        All calls are serialised through _llm_semaphore (limit=1) to avoid
+        concurrent inference requests against a --parallel 1 llama.cpp server.
 
         Args:
-            endpoint_type: Optional override for the inference endpoint.
-                If provided, uses this value directly. Otherwise defaults to
-                "chat", except for models starting with "llamacpp/" which use
-                the valve-defined llamacpp_endpoint_type.
+            prompt: User-turn text to send.
+            system_prompt: System-turn text.
+            model_override: Override the default llm_model valve for this call.
+            max_tokens: Maximum tokens to generate. None or 0 lets the server
+                        apply its own default.
+            temperature: Sampling temperature.
+            label: Identifier logged alongside timing data (e.g. 'bg_docstring').
+            total_timeout: Unused placeholder kept for API compatibility.
+            endpoint_type: Override the inference endpoint type ('chat' or
+                           'completion'). Defaults to 'chat', except for models
+                           whose backend prefix is 'llamacpp' which use the
+                           llamacpp_endpoint_type valve.
+            response_format: Optional server-side format constraint, e.g.
+                             {"type": "json_object"}.
+            enable_thinking: Whether to allow chain-of-thought reasoning.
+                             True by default. Set to False for deterministic
+                             structured-output tasks (docstrings, classifiers)
+                             to save tokens and avoid JSON being buried in a
+                             reasoning preamble.
+            log_raw_response: When True, passes through to shared_resources
+                             call_llm which logs the full outgoing payload and
+                             raw server response at INFO level, prefixed with
+                             [RAW][label]. Use for black-box debugging of new
+                             callers. Remove before committing to production.
+
+        Returns:
+            Optional[str]: Generated text, or None on failure.
         """
-        # ── Silent ingestion guard ──
+        # Silent ingestion guard: only docstring background calls are allowed
+        # while a large code paste is being indexed without a user response.
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
+            "lazy_docstring_batch",
         ):
             return None
 
+        # Deduplication: if an identical prompt is already in-flight, wait for
+        # that future instead of firing a second LLM request.
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -9876,22 +9957,15 @@ class LLMOrchestrator:
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
 
-        # ── SERIALIZATION WITH THE SEMAPHORE ──────────────────────────────────
         async with self._f._llm_semaphore:
             try:
-                base_url = self._f.valves.LLM_BASE_URL.rstrip("/")
-                if base_url.endswith("/v1"):
-                    base_url = base_url[:-3].rstrip("/")
-
-                is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
-
                 model = model_override or self._f.valves.llm_model
                 if not model:
-                    logger.warning(f"[LLM]{label_str} No model available")
+                    logger.warning(f"[LLM]{label_str} No model configured")
                     future.set_result(None)
                     return None
 
-                # ── Cache LLM ──
+                # Check in-memory LLM response cache before calling the server.
                 cache_key = hashlib.md5(
                     f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
                 ).hexdigest()
@@ -9899,30 +9973,31 @@ class LLMOrchestrator:
                 if cached is not None:
                     future.set_result(cached)
                     self._f._log_debug(
-                        f"[LLM] {model}{label_str} (cached) took {time.monotonic() - t_start:.3f}s"
+                        f"[LLM] {model}{label_str} (cached) "
+                        f"took {time.monotonic() - t_start:.3f}s"
                     )
                     return cached
 
-                # ── Determine endpoint type ──
-                # If caller explicitly provided endpoint_type, use it.
-                # Otherwise, default to "chat", but for llamacpp models use valve.
+                # Determine endpoint type from backend prefix when not overridden.
                 if endpoint_type is not None:
                     ep_type = endpoint_type
                 else:
                     ep_type = "chat"
-                    if model.startswith("llamacpp/"):
+                    if get_model_backend(model) == "llamacpp":
                         ep_type = self._f.valves.llamacpp_endpoint_type
 
                 if self._f.tokenizer:
                     prompt_tokens = len(self._f.tokenizer.encode(prompt))
                     self._f._log_debug(
-                        f"LLM call to {model}{label_str} – prompt size: ~{prompt_tokens} tokens"
+                        f"LLM call to {model}{label_str} – "
+                        f"prompt size: ~{prompt_tokens} tokens"
                     )
 
-                # ── Real call (with internal retries in shared_resources) ──
+                # Track this task so wait_for_llm_tasks() can join it.
                 task = asyncio.current_task()
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.add(task)
+
                 try:
                     content = await _shared_call_llm(
                         prompt=prompt,
@@ -9933,7 +10008,11 @@ class LLMOrchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=self._f.valves.llm_request_timeout,
-                        endpoint_type=ep_type,  # Pass the resolved endpoint type
+                        endpoint_type=ep_type,
+                        response_format=response_format,
+                        enable_thinking=enable_thinking,
+                        log_raw_response=log_raw_response,
+                        label=label,
                     )
 
                     if content:
@@ -9952,8 +10031,9 @@ class LLMOrchestrator:
                             else "?"
                         )
                         self._f._log_debug(
-                            f"[LLM] {model}{label_str} – in:{in_tokens} out:{out_tokens}"
-                            f" took {time.monotonic() - t_start:.3f}s"
+                            f"[LLM] {model}{label_str} – "
+                            f"in:{in_tokens} out:{out_tokens} "
+                            f"took {time.monotonic() - t_start:.3f}s"
                         )
                         return content
                     else:
@@ -9964,8 +10044,8 @@ class LLMOrchestrator:
                     async with self._f._active_llm_tasks_lock:
                         self._f._active_llm_tasks.discard(task)
 
-            except Exception as e:
-                future.set_exception(e)
+            except Exception as exc:
+                future.set_exception(exc)
                 raise
             finally:
                 async with self._f._pending_llm_lock:
@@ -10108,65 +10188,81 @@ class LLMOrchestrator:
         project_id: str = "",
     ) -> bool:
         """
-        Use the LLM to decide if full code should be kept.
+        LLM fallback to decide whether to show full code or a summary.
+
+        Called when the CrossEncoder diff falls below keep_full_code_llm_threshold.
+        Uses response_format={"type":"json_object"} and enable_thinking=False for
+        a clean structured answer with no reasoning preamble.
+
+        The default on parse failure is True (keep full code) to avoid silently
+        omitting implementation details the user may need.
+
+        Args:
+            user_question: The user's message (truncated to 500 chars).
+            ce_scores: Optional [full_score, summary_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            bool: True to keep full code, False to use summary only.
         """
         if ce_scores is not None:
-            ce_summary = f"""
-The CrossEncoder provides the following scores:
-- Keep full code: {ce_scores[0]:.2f}
-- Summary only: {ce_scores[1]:.2f}
-"""
-            prompt = f"""
-{ce_summary}
-
-Now, independently analyze the user's question.
-
-Output FULL if the user asks to see implementation details, exact syntax, or complete code.
-Output SUMMARY if the user asks for explanation, overview, or conceptual understanding.
-
-User question:
-{user_question[:500]}
-
-Output only "FULL" or "SUMMARY".
-"""
+            ce_block = (
+                f"CrossEncoder scores — keep_full: {ce_scores[0]:.2f}, "
+                f"summary_only: {ce_scores[1]:.2f}\n\n"
+            )
         else:
-            prompt = f"""
-Analyze the user's question.
+            ce_block = ""
 
-Output FULL if the user asks for implementation details, exact code, or syntax.
-Output SUMMARY if the user asks for explanation or overview.
+        prompt = (
+            f"{ce_block}"
+            f"User question:\n{user_question[:500]}\n\n"
+            f"Decide whether to show the full code or a summary.\n"
+            f'Output {{"keep_full": true}} when the user asks for implementation '
+            f"details, exact syntax, or complete code.\n"
+            f'Output {{"keep_full": false}} when the user asks for explanation, '
+            f"overview, or conceptual understanding.\n"
+            f"When uncertain, prefer true to avoid omitting critical code."
+        )
 
-User question:
-{user_question[:500]}
-
-Output only "FULL" or "SUMMARY".
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a decision engine. Output only 'FULL' or 'SUMMARY'. "
-                "Prefer FULL when uncertain to avoid omitting critical code."
+                "You are a decision engine. "
+                "Output ONLY a valid JSON object with a single boolean field 'keep_full'. "
+                "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="keep_full_code_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        if response and response.strip().upper() == "FULL":
-            self._f._log_debug("_should_keep_full_code_with_llm: LLM decided FULL")
+        if not response:
+            self._f._log_debug(
+                "_should_keep_full_code_with_llm: empty response, defaulting to FULL"
+            )
             return True
-        elif response and response.strip().upper() == "SUMMARY":
-            self._f._log_debug("_should_keep_full_code_with_llm: LLM decided SUMMARY")
-            return False
 
-        self._f._log_debug(
-            "_should_keep_full_code_with_llm: LLM failed, defaulting to FULL"
-        )
-        return True
+        try:
+            data = json.loads(response)
+            result = bool(data.get("keep_full", True))
+            self._f._log_debug(
+                f"_should_keep_full_code_with_llm: decided {'FULL' if result else 'SUMMARY'}"
+            )
+            return result
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_should_keep_full_code_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, defaulting to FULL"
+            )
+            return True
 
 
 class ReasoningEngine:
@@ -11958,39 +12054,70 @@ class CommandRouter:
         ce_scores: List[float],
         project_id: str,
     ) -> Optional[str]:
-        """LLM fallback for contradiction detection."""
-        prompt = f"""
-The CrossEncoder is uncertain. Scores:
-- Contradiction: {ce_scores[0]:.2f}
-- Consistent: {ce_scores[1]:.2f}
+        """
+        LLM fallback for contradiction detection when the CrossEncoder diff
+        falls below contradiction_llm_threshold.
 
-History (excerpt):
-{history[:1500]}
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer with no reasoning preamble.
 
-New message:
-{new_msg[:500]}
+        Args:
+            history: Excerpt of the conversation history (truncated to 1500 chars).
+            new_msg: The new user message to check (truncated to 500 chars).
+            ce_scores: [contradiction_score, consistent_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
 
-Does the new message contradict something established in the history?
-Output only "YES" or "NO".
-"""
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You are a contradiction detector. Output only 'YES' or 'NO'.",
-            model_override=self._f.valves.summarization_model,
-            max_tokens=5,
-            temperature=0.0,
-            label="contradiction_llm",
+        Returns:
+            Optional[str]: A warning string if a contradiction is detected,
+                           or None if the message is consistent.
+        """
+        prompt = (
+            f"CrossEncoder scores — contradiction: {ce_scores[0]:.2f}, "
+            f"consistent: {ce_scores[1]:.2f}\n\n"
+            f"Conversation history (excerpt):\n{history[:1500]}\n\n"
+            f"New message:\n{new_msg[:500]}\n\n"
+            f"Does the new message contradict something established in the history?\n"
+            f'Output {{"contradiction": true}} if yes, {{"contradiction": false}} if no.'
         )
 
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a contradiction detector. "
+                "Output ONLY a valid JSON object with a single boolean field 'contradiction'. "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=0,
+            temperature=0.0,
+            label="contradiction_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
+        )
+
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        if response and response.strip().upper() == "YES":
-            return (
-                "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
-                "Please review and clarify if needed."
+        if not response:
+            return None
+
+        try:
+            data = json.loads(response)
+            if data.get("contradiction", False):
+                return (
+                    "⚠️ **Contradiction detected**: The last message appears to "
+                    "contradict something established earlier. "
+                    "Please review and clarify if needed."
+                )
+            return None
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_detect_contradictions_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}"
             )
-        return None
+            return None
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Text extraction & intent classification (cascade: Heuristic → CE → LLM)
@@ -12176,86 +12303,107 @@ Output only "YES" or "NO".
         project_id: str = "",
     ) -> dict:
         """
-        Use the LLM to classify intent, optionally informed by CrossEncoder scores.
+        LLM fallback for intent classification when the CrossEncoder diff falls
+        below intent_llm_threshold.
 
-        Restores the KV slot after the LLM call.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is a conservative
+        distribution across all intents.
+
+        Args:
+            user_query: The user's message (truncated to 500 chars).
+            ce_scores: Optional [explain, modify, debug, refactor] CE scores.
+            stripped_query: Pre-cleaned version of the query (unused here,
+                            kept for API compatibility).
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            dict: Intent vector with keys explain/modify/debug/refactor,
+                  where the winning intent is 1.0 and the rest are 0.0.
+                  Falls back to a conservative distribution on failure.
         """
+        _INTENT_NAMES = ["Explain", "Modify", "Debug", "Refactor"]
+
         if ce_scores is not None:
-            ce_summary = f"""
-The CrossEncoder provides the following raw scores:
-- Explain: {ce_scores[0]:.2f}
-- Modify: {ce_scores[1]:.2f}
-- Debug: {ce_scores[2]:.2f}
-- Refactor: {ce_scores[3]:.2f}
-
-The highest score is {['Explain', 'Modify', 'Debug', 'Refactor'][int(np.argmax(ce_scores))]}.
-"""
-            prompt = f"""
-{ce_summary}
-
-Now, independently analyze the user's question and classify its intent.
-
-User question:
-{user_query[:500]}
-
-Intent definitions:
-- Explain: The user wants to understand or explain code at a high level, without modifying it.
-- Modify: The user wants to modify, fix, or create code directly, requiring changes to the codebase.
-- Debug: The user is debugging an error, exception, or unexpected behavior in the code.
-- Refactor: The user wants to refactor, restructure, or redesign code without changing its external behavior.
-
-Output only the intent (Explain, Modify, Debug, or Refactor).
-"""
+            best = _INTENT_NAMES[int(np.argmax(ce_scores))]
+            ce_block = (
+                f"CrossEncoder scores — "
+                f"Explain: {ce_scores[0]:.2f}, "
+                f"Modify: {ce_scores[1]:.2f}, "
+                f"Debug: {ce_scores[2]:.2f}, "
+                f"Refactor: {ce_scores[3]:.2f}. "
+                f"Best: {best}.\n\n"
+            )
         else:
-            prompt = f"""
-Classify the intent of the following user question.
+            ce_block = ""
 
-User question:
-{user_query[:500]}
+        prompt = (
+            f"{ce_block}"
+            f"User question:\n{user_query[:500]}\n\n"
+            f"Classify the intent. When ambiguous, prefer the more specific intent "
+            f"(Debug > Refactor > Modify > Explain).\n\n"
+            f"Intent definitions:\n"
+            f"  Explain   — understand or explain code; clues: 'how', 'why'\n"
+            f"  Modify    — change or create code; clues: 'write', 'fix', 'add'\n"
+            f"  Debug     — fix errors or unexpected behaviour; clues: 'bug', 'error', 'traceback'\n"
+            f"  Refactor  — restructure without changing behaviour; clues: 'refactor', 'clean'\n\n"
+            f'Output only the JSON object, e.g. {{"intent": "Debug"}}'
+        )
 
-Intent definitions:
-- Explain: Understanding code. Clues: "how", "why".
-- Modify: Changing or creating code. Clues: "write", "change", "fix".
-- Debug: Fixing errors. Clues: "bug", "error", "traceback".
-- Refactor: Restructuring code. Clues: "refactor", "restructure".
-
-If ambiguous, favor Debug or Refactor.
-Output only the intent (Explain, Modify, Debug, or Refactor).
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are an intent classifier. Output only the intent name. "
-                "When in doubt, choose the most specific intent (Debug > Refactor > Modify > Explain)."
+                "You are an intent classifier. "
+                "Output ONLY a valid JSON object with a single string field 'intent' "
+                "whose value is one of: Explain, Modify, Debug, Refactor. "
+                "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=10,
+            max_tokens=0,
             temperature=0.0,
             label="intent_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        intent_map = {
-            "explain": "explain",
-            "modify": "modify",
-            "debug": "debug",
-            "refactor": "refactor",
-            "Explain": "explain",
-            "Modify": "modify",
-            "Debug": "debug",
-            "Refactor": "refactor",
+        _CONSERVATIVE_FALLBACK = {
+            "explain": 0.2,
+            "modify": 0.3,
+            "debug": 0.3,
+            "refactor": 0.2,
         }
-        intent = intent_map.get(response.strip(), None)
-        if intent:
-            result = {"explain": 0.0, "modify": 0.0, "debug": 0.0, "refactor": 0.0}
-            result[intent] = 1.0
-            self._f._log_debug(f"Intent (LLM): {intent}")
-            return result
 
-        self._f._log_debug("Intent: LLM failed, using conservative heuristic")
-        return {"explain": 0.2, "modify": 0.3, "debug": 0.3, "refactor": 0.2}
+        if not response:
+            self._f._log_debug(
+                "_classify_intent_with_llm: empty response, using conservative fallback"
+            )
+            return _CONSERVATIVE_FALLBACK
+
+        try:
+            data = json.loads(response)
+            raw = str(data.get("intent", "")).strip().lower()
+            _valid = {"explain", "modify", "debug", "refactor"}
+            if raw in _valid:
+                result = {"explain": 0.0, "modify": 0.0, "debug": 0.0, "refactor": 0.0}
+                result[raw] = 1.0
+                self._f._log_debug(f"_classify_intent_with_llm: intent={raw!r}")
+                return result
+            self._f._log_debug(
+                f"_classify_intent_with_llm: unknown intent {raw!r}, "
+                f"using conservative fallback"
+            )
+            return _CONSERVATIVE_FALLBACK
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_classify_intent_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, using conservative fallback"
+            )
+            return _CONSERVATIVE_FALLBACK
 
     # ═══════════════════════════════════════════════════════════════════════
     # 5. Natural language intents (forget, remember, obsolete)
@@ -12477,72 +12625,115 @@ Output only the intent (Explain, Modify, Debug, or Refactor).
         ce_scores: List[float],
         project_id: str,
     ) -> Dict[str, Any]:
-        """LLM fallback for natural language intent detection."""
-        scored_candidates = list(zip(candidates, ce_scores))
-        scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_three = scored_candidates[:3]
-        ce_summary = "\n".join(
-            [
-                f"Action: {cat} (score: {score:.2f}) — {desc}"
-                for (cat, desc, _), score in top_three
-            ]
+        """
+        LLM fallback for natural language intent detection when the CrossEncoder
+        diff falls below nl_intent_llm_threshold.
+
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Falls back to the heuristic parser on
+        any parse failure.
+
+        Args:
+            query: The user's message (truncated to 500 chars).
+            candidates: List of (category, description, meta) tuples.
+            ce_scores: CE score for each candidate (parallel list).
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            Dict[str, Any]: Intent dict with keys forget/remember/obsolete,
+                            each containing {"action": <action_name>}.
+        """
+        # Build the CE summary showing the top-3 candidates by score.
+        scored = sorted(zip(candidates, ce_scores), key=lambda x: x[1], reverse=True)
+        ce_block = "\n".join(
+            f"  {cat} (score: {score:.2f}) — {desc}"
+            for (cat, desc, _), score in scored[:3]
         )
 
-        prompt = f"""
-The CrossEncoder is uncertain about the user's intent. Here are the top candidates:
+        _VALID_ACTIONS = {
+            "forget_last",
+            "forget_all",
+            "pin_last",
+            "unpin_last",
+            "unpin_all",
+            "obsolete_last",
+            "obsolete_all",
+            "revive_last",
+            "revive_all",
+            "none",
+        }
 
-{ce_summary}
+        prompt = (
+            f"CrossEncoder top candidates:\n{ce_block}\n\n"
+            f"User message:\n{query[:500]}\n\n"
+            f"Determine if the user wants to perform one of these memory actions:\n"
+            f"  forget_last / forget_all      — remove code block(s) from context\n"
+            f"  pin_last / unpin_last / unpin_all — keep or release a code block\n"
+            f"  obsolete_last / obsolete_all  — mark code block(s) as obsolete\n"
+            f"  revive_last / revive_all      — un-mark obsolete code block(s)\n"
+            f"  none                          — no memory action intended\n\n"
+            f'Output only the JSON object, e.g. {{"action": "forget_last"}}'
+        )
 
-User message:
-{query[:500]}
-
-Determine if the user wants to:
-- FORGET: remove a code block from context
-- REMEMBER/PIN: keep a code block in context
-- OBSOLETE: mark a code block as obsolete or revive it
-
-Output only the action type (FORGET, REMEMBER, OBSOLETE, or NONE) and the specific action.
-Use the exact action names: forget_last, forget_all, pin_last, unpin_last, unpin_all, obsolete_last, obsolete_all, revive_last, revive_all.
-
-Format: ACTION: <action_name>
-Example: FORGET: forget_last
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are an intent disambiguator. Output only the action in the specified format.",
+            system_prompt=(
+                "You are a memory action classifier. "
+                "Output ONLY a valid JSON object with a single string field 'action' "
+                "whose value is one of: forget_last, forget_all, pin_last, unpin_last, "
+                "unpin_all, obsolete_last, obsolete_all, revive_last, revive_all, none. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=20,
+            max_tokens=0,
             temperature=0.0,
             label="nl_intent_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        import re
+        _NONE = {"action": "none"}
+        _FALLBACK = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
 
-        match = re.match(
-            r"^\s*(?:ACTION\s*:\s*)?([a-z_]+)", response.strip(), re.IGNORECASE
-        )
-        if match:
-            action_name = match.group(1).lower()
-            none = {"action": "none"}
-            result = {"forget": none, "remember": none, "obsolete": none}
-            if action_name.startswith("forget"):
-                result["forget"] = {"action": action_name}
-            elif action_name.startswith("pin") or action_name.startswith("unpin"):
-                result["remember"] = {"action": action_name}
-            elif action_name.startswith("obsolete") or action_name.startswith("revive"):
-                result["obsolete"] = {"action": action_name}
+        if not response:
             self._f._log_debug(
-                f"_parse_all_intents_with_llm: LLM decided {action_name}"
+                "_parse_all_intents_with_llm: empty response, falling back to heuristic"
             )
+            return await self._parse_all_intents_heuristic(query)
+
+        try:
+            data = json.loads(response)
+            action = str(data.get("action", "none")).strip().lower()
+
+            if action not in _VALID_ACTIONS:
+                self._f._log_debug(
+                    f"_parse_all_intents_with_llm: unknown action {action!r}, "
+                    f"falling back to heuristic"
+                )
+                return await self._parse_all_intents_heuristic(query)
+
+            result = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
+            if action.startswith("forget"):
+                result["forget"] = {"action": action}
+            elif action.startswith("pin") or action.startswith("unpin"):
+                result["remember"] = {"action": action}
+            elif action.startswith("obsolete") or action.startswith("revive"):
+                result["obsolete"] = {"action": action}
+
+            self._f._log_debug(f"_parse_all_intents_with_llm: action={action!r}")
             return result
 
-        self._f._log_debug(
-            "_parse_all_intents_with_llm: LLM failed, falling back to heuristic"
-        )
-        return await self._parse_all_intents_heuristic(query)
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_parse_all_intents_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, falling back to heuristic"
+            )
+            return await self._parse_all_intents_heuristic(query)
 
     async def _parse_all_intents_heuristic(self, prose: str) -> Dict[str, Any]:
         """Heuristic fallback for natural language intent detection."""
@@ -13448,36 +13639,66 @@ Example: FORGET: forget_last
     async def _is_code_only_with_llm(
         self, query: str, ce_scores: list, project_id: str
     ) -> bool:
-        """LLM fallback for code-only detection, with KV slot restoration."""
-        prompt = f"""
-The CrossEncoder is uncertain. Scores:
-- Code only: {ce_scores[0]:.2f}
-- Not code only: {ce_scores[1]:.2f}
+        """
+        LLM fallback for code-only detection when the CrossEncoder diff is below
+        the confidence threshold.
 
-Message:
-{query}
+        Uses response_format={"type":"json_object"} and enable_thinking=False to
+        get a clean structured answer with no reasoning preamble. The server-side
+        GBNF grammar guarantees the response is valid JSON, so no text stripping
+        is needed.
 
-Examples:
-- "def foo(): pass" → CODE
-- "def foo(): pass  # this is a function" → TEXT (has explanation)
-- "how to fix this bug?" → TEXT
+        Args:
+            query: The message text to classify (truncated to 500 chars).
+            ce_scores: [code_score, text_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
 
-Classify this message strictly. Output only CODE or TEXT.
-"""
+        Returns:
+            bool: True if the message is code-only, False otherwise.
+        """
+        prompt = (
+            f"CrossEncoder scores — code_only: {ce_scores[0]:.2f}, "
+            f"not_code_only: {ce_scores[1]:.2f}\n\n"
+            f"Message:\n{query}\n\n"
+            f"Examples:\n"
+            f'  "def foo(): pass"                    → {{"is_code_only": true}}\n'
+            f'  "def foo(): pass  # what does this?" → {{"is_code_only": false}}\n'
+            f'  "how to fix this bug?"               → {{"is_code_only": false}}\n\n'
+            f"Classify the message. Output only the JSON object."
+        )
+
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a strict classifier for code-only messages. Output only 'CODE' or 'TEXT'.",
+            system_prompt=(
+                "You are a strict binary classifier. "
+                "Output ONLY a valid JSON object with a single boolean field 'is_code_only'. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="code_only_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
+
+        # Restore the KV slot after any LLM call (auxiliary calls dirty the slot
+        # due to the SWA architecture).
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        if response and response.strip().upper() == "CODE":
-            return True
-        return False
+        if not response:
+            return False
+
+        try:
+            data = json.loads(response)
+            return bool(data.get("is_code_only", False))
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_is_code_only_with_llm: JSON parse error — response: {response[:200]!r}"
+            )
+            return False
 
     @staticmethod
     def has_code_indicators(content: str) -> bool:
@@ -16789,17 +17010,33 @@ Code context (recent symbols referenced):
         """
         Parse the LLM response for a commit summary.
 
-        Strips markdown fences and any explanatory text before parsing JSON.
-        Falls back to treating the whole response as the action if parsing fails.
+        With response_format={"type":"json_object"} and enable_thinking=False,
+        the server-side GBNF grammar guarantees the response is valid JSON
+        starting with { and ending with }. No artifact stripping is needed.
+
+        Falls back to a minimal dict on any parse failure so the caller can
+        always safely access 'action', 'rationale', and 'symbols'.
+
+        Args:
+            raw: Raw LLM response string.
+
+        Returns:
+            dict: Parsed summary with keys action (str), rationale (str),
+                  symbols (list[str]). Empty strings/lists on failure.
         """
         try:
-            # Strip potential reasoning blocks before parsing
-            clean = re.sub(r"<details[^>]*>.*?</details>", "", raw, flags=re.DOTALL)
-            clean = clean.strip().lstrip("```json").rstrip("```").strip()
-            return json.loads(clean)
-        except (json.JSONDecodeError, ValueError):
-            # Fallback: treat the whole response as the action
-            return {"action": raw[:100], "rationale": None, "symbols": []}
+            data = json.loads(raw)
+            return {
+                "action": str(data.get("action", "")).strip(),
+                "rationale": str(data.get("rationale", "")).strip(),
+                "symbols": [str(s) for s in data.get("symbols", []) if s],
+            }
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_parse_commit_summary_response: JSON parse error — "
+                f"response: {raw[:200]!r}"
+            )
+            return {"action": "", "rationale": "", "symbols": []}
 
     def _render_commit_summary(self, summary: dict, turn: int) -> str:
         """
@@ -16832,12 +17069,27 @@ Code context (recent symbols referenced):
     ) -> str:
         """
         Generate a compact commit summary for a compressed code message.
+
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        to get a guaranteed clean JSON object with keys: action, rationale,
+        symbols. Falls back to _build_legacy_commit_summary on any failure.
+
+        Args:
+            content: The code message content (truncated to 2000 chars in prompt).
+            project_id: Current project identifier, used for slot restoration.
+            part_num: The part number within a multi-phase message.
+            total_parts: Total number of parts.
+            force_no_expand: If True, skip LLM and use legacy summary directly.
+
+        Returns:
+            str: A rendered commit summary string.
         """
         if force_no_expand:
             return self._build_legacy_commit_summary(
                 content, part_num, total_parts, force_no_expand=True
             )
 
+        # Extract top symbols to give the LLM structural context.
         classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         methods = re.findall(
@@ -16853,14 +17105,20 @@ Code context (recent symbols referenced):
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a code summarization assistant. Output ONLY valid JSON. "
-                "Do not include any markdown, explanations, or trailing text. "
-                "The JSON must have keys: 'action', 'rationale', 'symbols'."
+                "You are a code summarization assistant. "
+                "Output ONLY a valid JSON object with exactly three keys: "
+                "'action' (string: one-line description of what changed), "
+                "'rationale' (string: why this change matters), "
+                "'symbols' (list of strings: affected symbol names). "
+                "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=250,
+            max_tokens=0,
             temperature=0.2,
             label="commit_summary",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
         if self._f.valves.enable_slot_persistence:
@@ -17822,91 +18080,156 @@ class EnrichmentTasks:
     # 6. Docstring generation (batch and background)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    _BATCH_DOCSTRING_LINE_RE = re.compile(
-        r"^\s*(?:\d+\.\s*|[-*]\s*)?([A-Za-z_][\w.]*)\s*:\s*(.+)$"
-    )
-
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
-        lines = []
+        """
+        Build the user-turn prompt for a batch docstring generation call.
+
+        The server-side response_format={"type": "json_object"} enforces JSON
+        at the API level; the prompt text repeats the constraint so the model
+        never falls back to prose or a numbered list.
+
+        Args:
+            items: List of (qid, signature, snippet) tuples. Only qid and
+                   signature are consumed; snippet is reserved for future use.
+
+        Returns:
+            str: Ready-to-send prompt string.
+        """
+        lines: List[str] = []
         for qid, signature, _ in items:
+            # Truncate long signatures to keep the prompt compact and
+            # avoid pushing context beyond the model's effective attention span.
             sig = signature[:80] if signature else qid
             lines.append(f"  - {qid}: {sig}")
+
         listing = "\n".join(lines)
+        max_chars = self._f.valves.docstring_max_chars
 
         return (
-            f"Generate a compact JSON object mapping these identifiers to one-sentence descriptions.\n"
-            f"Each description must be a single sentence, ideally under {self._f.valves.docstring_max_chars} characters.\n"
-            f"Keys: exact identifiers (including class prefix if present).\n"
-            f"Values: one-sentence descriptions.\n"
-            f"Output only the JSON object, no explanations, no markdown.\n\n"
-            f"Identifiers:\n{listing}\n\n"
-            f"JSON: {{"
+            f"Generate a JSON object mapping each identifier below to a "
+            f"one-sentence description (under {max_chars} characters).\n\n"
+            f"Rules:\n"
+            f"  - Keys: exact identifiers as listed "
+            f"(preserve 'ClassName.method' dot notation).\n"
+            f"  - Values: plain strings, one sentence each.\n"
+            f"  - Output ONLY the JSON object. "
+            f"No markdown fences, no preamble, no explanation.\n\n"
+            f"Identifiers:\n{listing}"
         )
 
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
         """
-        Parse the LLM response as JSON, handling both:
-        - Proper JSON object with braces: {"key": "value", ...}
-        - Raw key-value pairs without braces: "key": "value", ...
+        Parse the LLM response as a JSON object mapping identifiers to docstrings.
+
+        The response is expected to be a valid JSON object produced under
+        response_format={"type":"json_object"} with enable_thinking=False.
+        The server-side GBNF grammar guarantees the output starts with { and
+        ends with }, so no stripping of think blocks, markdown fences, or
+        leading prose is needed.
+
+        Only entries whose key is present in expected_names and whose value
+        is a non-empty string are returned.
+
+        Args:
+            response: Raw LLM response string.
+            expected_names: Set of qualified symbol identifiers that are valid.
+
+        Returns:
+            Dict[str, str]: Accepted {qid: docstring} mapping. Values are
+            truncated to docstring_max_chars. Empty dict on any parse failure.
         """
-        try:
-            # Remove <think> blocks (if any)
-            clean = re.sub(
-                r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE
+        if not response or not response.strip():
+            self._f._log_debug(
+                "_parse_docstring_batch_response: received empty response"
             )
-            clean = clean.strip()
-            # Remove markdown code fences
-            clean = re.sub(r"^```json\s*", "", clean)
-            clean = re.sub(r"\s*```$", "", clean)
+            return {}
 
-            data = {}
-            # Case 1: Try to find a JSON object with braces
-            start = clean.find("{")
-            end = clean.rfind("}") + 1
-            if start != -1 and end > start:
-                json_str = clean[start:end]
-                data = json.loads(json_str)
-            else:
-                # Case 2: No braces found. Wrap with braces and parse.
-                # Remove trailing commas before closing brace
-                wrapped = "{" + clean + "}"
-                wrapped = re.sub(r",\s*}", "}", wrapped)
-                data = json.loads(wrapped)
+        self._f._log_debug(
+            f"_parse_docstring_batch_response: parsing {len(response)}-char response "
+            f"(expecting {len(expected_names)} identifiers)"
+        )
 
-            # Filter only expected names
-            result = {}
+        try:
+            data = json.loads(response)
+
+            if not isinstance(data, dict):
+                self._f._log_debug(
+                    f"_parse_docstring_batch_response: top-level JSON value is "
+                    f"{type(data).__name__}, expected dict"
+                )
+                return {}
+
+            # Accept only entries matching expected identifiers; silently drop
+            # hallucinated keys and non-string values.
+            max_chars = self._f.valves.docstring_max_chars
+            result: Dict[str, str] = {}
             for key, value in data.items():
                 if key in expected_names and isinstance(value, str) and value.strip():
-                    result[key] = value.strip()[:200]
+                    result[key] = value.strip()[:max_chars]
+
+            skipped = len(data) - len(result)
+            self._f._log_debug(
+                f"_parse_docstring_batch_response: accepted {len(result)} / {len(data)} "
+                f"entries ({skipped} skipped — not in expected_names or invalid type)"
+            )
             return result
-        except json.JSONDecodeError as e:
-            self._f._log_debug(f"JSON parse error in docstring response: {e}")
-            # Fallback: try to extract manually? But we'll return empty.
+
+        except json.JSONDecodeError as exc:
+            self._f._log_debug(
+                f"_parse_docstring_batch_response: JSON decode error — {exc}. "
+                f"Offending text preview: {response[:300]!r}"
+            )
+            return {}
+
+        except Exception as exc:
+            self._f._log_debug(
+                f"_parse_docstring_batch_response: unexpected error — {exc}"
+            )
             return {}
 
     async def ensure_docstrings_batch(
-        self, qids: List[str], project_id: str
+        self,
+        qids: List[str],
+        project_id: str,
+        background: bool = False,
     ) -> Dict[str, str]:
         """
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
 
-        Uses a prompt that forces JSON output by prepending '{"' so the model
-        completes a valid JSON object without inserting reasoning.
+        Uses response_format={"type": "json_object"} and enable_thinking=False
+        to force clean JSON output from the server with no reasoning preamble.
+        The server-side GBNF grammar guarantees valid JSON, so the parser
+        calls json.loads directly with no artifact stripping.
 
-        Cache hits (already in memory or in SQLite) are resolved for free.
-        Cache misses are generated in groups of `lazy_docstring_batch_size`.
+        Cache hits (already in memory or SQLite) are resolved for free.
+        Cache misses are generated in groups of lazy_docstring_batch_size.
 
-        Returns {qid: docstring} for every qid that has (or now has) a
-        non-empty docstring.
+        Args:
+            qids: List of qualified symbol ids to resolve.
+            project_id: Current project identifier.
+            background: If True, this is a background task — uses label
+                        'bg_docstring' (whitelisted during silent ingestion)
+                        and bypasses the per-turn lazy_docstring_max_per_turn
+                        budget. If False, uses label 'lazy_docstring_batch'
+                        and respects the per-turn budget.
+
+        Returns:
+            Dict[str, str]: Mapping of qid to docstring for resolved symbols.
         """
+        self._f._log_debug(
+            f"ensure_docstrings_batch: starting with {len(qids)} qids "
+            f"(background={background})"
+        )
+
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # Build a qid → (sym, block) index ONCE
+        # Build a qid → (sym, block) lookup index once to avoid O(N²) scans
+        # across the active_blocks dict during cache and batch phases.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -17914,13 +18237,16 @@ class EnrichmentTasks:
                 if _q not in _qid_index:
                     _qid_index[_q] = (_sym, _block)
 
-        def _find_symbol(qid: str):
+        def _find_symbol(
+            qid: str,
+        ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
             return _qid_index.get(qid, (None, None))
 
-        # Cache check (memory + SQLite)
+        # ── Phase 1: resolve from in-memory symbol index then SQLite ─────────
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
+
             if not found:
                 try:
                     row = await self._f._state_store._db_read(
@@ -17932,28 +18258,47 @@ class EnrichmentTasks:
                     )
                 except Exception:
                     row = None
+
                 if row and row[0]:
                     found = row[0]
                     if sym is not None:
                         sym.docstring = found
                     self._f._symbol_index.update_docstring(qid, project_id, found)
+
             if found:
                 resolved[qid] = found
             else:
                 pending.append(qid)
 
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(pending)} pending after cache check"
+        )
+
         if not pending:
+            self._f._log_debug(
+                "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
+            )
             return resolved
 
-        # Enforce per-turn budget
-        budget = self._f.valves.lazy_docstring_max_per_turn
-        if budget > 0:
-            remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
-            pending = pending[:remaining]
-        if not pending:
-            return resolved
+        # ── Phase 2: apply per-turn budget (foreground/lazy mode only) ────────
+        if not background:
+            budget = self._f.valves.lazy_docstring_max_per_turn
+            if budget > 0:
+                remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
+                pending = pending[:remaining]
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: {len(pending)} remaining after "
+                    f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
+                    f"limit={budget})"
+                )
+            if not pending:
+                return resolved
+        else:
+            self._f._log_debug(
+                "ensure_docstrings_batch: background mode — per-turn budget skipped"
+            )
 
-        # Build items (qid, signature, snippet)
+        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
@@ -17971,33 +18316,70 @@ class EnrichmentTasks:
             items.append((qid, signature, snippet))
 
         batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
+        label = "bg_docstring" if background else "lazy_docstring_batch"
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(items)} items to generate, "
+            f"batch_size={batch_size}, label={label!r}"
+        )
+
+        # ── Phase 4: LLM batch loop ───────────────────────────────────────────
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
             prompt = self._build_docstring_batch_prompt(batch)
 
-            # --- LLM call without 'stop' (not needed, but keep endpoint_type) ---
+            batch_num = i // batch_size + 1
+            total_batches = (len(items) + batch_size - 1) // batch_size
+            prompt_tokens = (
+                len(self._f.tokenizer.encode(prompt))
+                if self._f.tokenizer
+                else len(prompt) // 4
+            )
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
+                f"{len(batch)} symbols, ~{prompt_tokens} prompt tokens, "
+                f"label={label!r}"
+            )
+
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
-                system_prompt="You are a data extraction engine. Output only raw JSON, never explanations.",
+                system_prompt=(
+                    "You are a code documentation assistant. "
+                    "Output ONLY a valid JSON object. "
+                    "Your entire response must start with { and end with }. "
+                    "No text before { and no text after }."
+                ),
                 model_override=self._f.valves.llm_model,
-                max_tokens=0,  # no limit per batch
+                max_tokens=0,
                 temperature=0.0,
-                label="lazy_docstring_batch",
-                endpoint_type="completion",  # <-- force completion endpoint
+                label=label,
+                response_format={"type": "json_object"},
+                log_raw_response=True,
+                enable_thinking=False,
             )
-            self._lazy_docstrings_generated_this_turn += len(batch)
 
-            # Debug log for the first batch
-            if i == 0 and response:
+            if not background:
+                self._lazy_docstrings_generated_this_turn += len(batch)
+
+            if response is None:
                 self._f._log_debug(
-                    f"RAW DOCSTRING RESPONSE (first 500 chars): {response[:500]}"
+                    f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
                 )
-
-            if not response:
                 continue
 
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num} — "
+                f"received {len(response)}-char response"
+            )
+
             parsed = self._parse_docstring_batch_response(response, expected)
+
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num} — "
+                f"parsed {len(parsed)} docstrings"
+            )
+
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -18005,13 +18387,12 @@ class EnrichmentTasks:
                     sym.docstring = docstring
                 self._f._symbol_index.update_docstring(qid, project_id, docstring)
 
-            # Batch write to SQLite
             if parsed:
                 rows = [
                     (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
                 ]
 
-                def _write_batch(rows=rows):
+                def _write_batch(rows: list = rows) -> None:
                     self._f._db_conn.executemany(
                         "INSERT OR REPLACE INTO symbol_docstrings "
                         "(project_id, symbol_name, docstring, updated_at) "
@@ -18022,6 +18403,10 @@ class EnrichmentTasks:
 
                 await self._f._state_store._db_enqueue(_write_batch)
 
+        self._f._log_debug(
+            f"ensure_docstrings_batch: done — "
+            f"resolved {len(resolved)} / {len(qids)} total"
+        )
         return resolved
 
     async def ensure_cfg_batch(
@@ -18159,12 +18544,10 @@ class EnrichmentTasks:
         then prioritizes them using `_prioritize_docstring_targets` so that
         skeleton-tier symbols are documented first.
 
-        Processes in batches using `docstring_bg_batch_size` to reduce serial
-        LLM calls from N to ceil(N / batch_size).
-
-        After all batches complete, we do NOT restore the KV slot here.
-        The slot is managed exclusively by the inlet to avoid interfering
-        with the user's KV cache.
+        Uses `background=True` so that the calls to `ensure_docstrings_batch`
+        use the `bg_docstring` label, which is whitelisted during silent
+        ingestion. This allows docstring generation to proceed even if the
+        system is in the middle of a silent ingestion operation.
 
         Args:
             project_id: The current project identifier.
@@ -18201,7 +18584,7 @@ class EnrichmentTasks:
 
         self._f._log_debug(
             f"bg_docstring: prioritized {len(prioritized_qids)} symbols, "
-            f"skeleton-tier first"
+            "skeleton-tier first"
         )
 
         # ── 2. Batch configuration ──────────────────────────────────────────
@@ -18228,7 +18611,9 @@ class EnrichmentTasks:
 
             try:
                 results: Dict[str, str] = await self.ensure_docstrings_batch(
-                    batch, project_id
+                    batch,
+                    project_id,
+                    background=True,  # <-- background mode
                 )
                 for qid, docstring in results.items():
                     if docstring:
@@ -18253,10 +18638,6 @@ class EnrichmentTasks:
                 f"generated {total_docstrings} docstrings"
             )
 
-        # ── 4. Slot restore REMOVED ─────────────────────────────────────────
-        # We do NOT call slot_restore_for_continuity here because the KV slot
-        # is managed exclusively by the inlet. Background tasks must not
-        # interfere with the user's KV cache.
         self._f._log_debug("bg_docstring: finished (no slot restore)")
 
     def start_docstring_loop(self, project_id: str) -> None:
@@ -19739,46 +20120,76 @@ class InletOrchestrator:
         return result
 
     async def _classify_session_with_llm(
-        self, query: str, ce_scores: list, project_id: str
+        self,
+        query: str,
+        ce_scores: list,
+        project_id: str,
     ) -> bool:
         """
-        LLM fallback for session classification.
+        LLM fallback for session classification when the CrossEncoder diff falls
+        below session_classify_llm_threshold.
 
-        Uses the CrossEncoder scores as context and restores the KV slot afterward.
+        Uses response_format={"type":"json_object"} and enable_thinking=False for
+        a clean structured answer with no reasoning preamble.
+
+        Args:
+            query: The user message to classify.
+            ce_scores: [code_score, text_score] from the CrossEncoder.
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            bool: True if the message belongs to a coding session, False otherwise.
         """
-        prompt = f"""
-The CrossEncoder is uncertain about this message. Here are its raw scores:
-- Code session: {ce_scores[0]:.2f}
-- Not code session: {ce_scores[1]:.2f}
+        prompt = (
+            f"CrossEncoder scores — code_session: {ce_scores[0]:.2f}, "
+            f"not_code_session: {ce_scores[1]:.2f}\n\n"
+            f"Message:\n{query}\n\n"
+            f"Classify whether this message belongs to a coding session.\n\n"
+            f"Code session signals: contains 'def', 'class', 'import', backticks, "
+            f"tracebacks, or questions about code behaviour.\n"
+            f"Non-code session signals: greetings, general conversation, "
+            f"questions unrelated to programming.\n\n"
+            f"Examples:\n"
+            f'  "def foo(): pass"              → {{"is_code_session": true}}\n'
+            f'  "how does this function work?" → {{"is_code_session": true}}\n'
+            f'  "good morning"                 → {{"is_code_session": false}}\n'
+            f'  "tengo un error en la vida"    → {{"is_code_session": false}}\n\n'
+            f"Output only the JSON object."
+        )
 
-Message:
-{query}
-
-Context clues for CODE: Contains 'def', 'class', 'import', 'function', '```', or traceback lines.
-Context clues for TEXT: Natural language questions, greetings, or general conversation.
-
-Examples:
-- "def foo(): pass" → CODE
-- "how does this work?" → CODE (if about code)
-- "good morning" → TEXT
-- "tengo un error en la vida real" → TEXT (not about code)
-
-Classify this message strictly. Output only CODE or TEXT.
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a strict binary classifier for coding sessions. Output only 'CODE' or 'TEXT'.",
+            system_prompt=(
+                "You are a strict binary classifier. "
+                "Output ONLY a valid JSON object with a single boolean field "
+                "'is_code_session'. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="session_classify_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
+
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        if response and response.strip().upper() == "CODE":
-            return True
-        return False
+        if not response:
+            return False
+
+        try:
+            data = json.loads(response)
+            return bool(data.get("is_code_session", False))
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_classify_session_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}"
+            )
+            return False
 
     def _cache_session_result(self, cache_key: Optional[str], result: bool) -> None:
         """Cache the session classification result."""
@@ -20282,45 +20693,79 @@ class SystemPromptBuilder:
         self, norm: str, window_excerpts: list, ce_score: float, project_id: str
     ) -> bool:
         """
-        LLM fallback for LTM deduplication.
+        LLM fallback for LTM deduplication when the CrossEncoder diff falls
+        below ltm_dedup_llm_threshold.
 
-        Uses CrossEncoder score as context and restores the KV slot afterward.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is False (unique) to
+        avoid silently dropping memories that may be relevant.
+
+        Excerpts are limited to the 3 most recent entries, each capped at 250
+        chars individually, rather than truncating the concatenated string at
+        an arbitrary byte boundary. This avoids feeding the model incomplete
+        sentences that corrupt semantic comparison.
+
+        Args:
+            norm: Normalized fragment to check for duplication. Passed as-is
+                  without truncation — it is already a condensed LTM fragment.
+            window_excerpts: List of current conversation excerpts to compare
+                             against. Only the first 3 are used.
+            ce_score: CrossEncoder duplicate score (higher = more likely duplicate).
+            project_id: Current project identifier, used for slot restoration.
+
+        Returns:
+            bool: True if the fragment is a duplicate, False if unique.
         """
         if not window_excerpts:
             return False
 
-        window_text = "\n".join(window_excerpts)[:800]
-        prompt = f"""
-The CrossEncoder is uncertain if this fragment is a duplicate of the current conversation.
+        # Limit to the 3 most recent excerpts, each capped individually.
+        # Truncating the joined string would risk cutting mid-sentence and
+        # feeding the model incomplete context that corrupts semantic comparison.
+        window_text = "\n".join(excerpt[:250] for excerpt in window_excerpts[:3])
 
-Fragment:
-{norm[:500]}
+        prompt = (
+            f"CrossEncoder duplicate score: {ce_score:.2f} "
+            f"(higher = more likely duplicate)\n\n"
+            f"Fragment to check:\n{norm}\n\n"
+            f"Current conversation excerpts:\n{window_text}\n\n"
+            f"Is the fragment a duplicate of the conversation excerpts? "
+            f"Focus on semantic meaning — different words but same meaning = duplicate. "
+            f"New information = unique.\n\n"
+            f'Output only the JSON object, e.g. {{"is_duplicate": false}}'
+        )
 
-Current conversation (excerpts):
-{window_text}
-
-CrossEncoder score (higher = more duplicate): {ce_score:.2f}
-
-Focus on semantic meaning. If the fragment says the same thing as the conversation
-excerpt but with different words, it is a DUPLICATE. If it adds new information,
-it is UNIQUE.
-
-Output only DUPLICATE or UNIQUE.
-"""
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a semantic duplicate detector. Output only 'DUPLICATE' or 'UNIQUE'.",
+            system_prompt=(
+                "You are a semantic duplicate detector. "
+                "Output ONLY a valid JSON object with a single boolean field 'is_duplicate'. "
+                "Your entire response must start with { and end with }."
+            ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="ltm_dedup_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
+
         if self._f.valves.enable_slot_persistence:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        if response and response.strip().upper() == "DUPLICATE":
-            return True
-        return False
+        if not response:
+            return False
+
+        try:
+            data = json.loads(response)
+            return bool(data.get("is_duplicate", False))
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_ltm_dedup_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}"
+            )
+            return False
 
     async def _build_parallel_checks(
         self,
@@ -23222,6 +23667,11 @@ class TaskRegistry:
         current turn. This is a lightweight version that only processes
         symbols that are about to be used (e.g., LOD-2 symbols).
 
+        This runs in the foreground (inlet) and uses `background=False` so
+        that it respects the per‑turn budget and uses the `lazy_docstring_batch`
+        label (which is not whitelisted for silent ingestion, which is fine
+        because this method is never called during silent ingestion).
+
         Args:
             project_id: The current project identifier.
         """
@@ -23253,10 +23703,12 @@ class TaskRegistry:
             return
 
         # ------------------------------------------------------------------
-        # Step 3: Generate docstrings for the needed symbols.
+        # Step 3: Generate docstrings for the needed symbols (foreground).
         # ------------------------------------------------------------------
-        results = await self._f._enrichment.ensure_docstrings_batch(
-            list(qids_needed), project_id
+        results = await self.ensure_docstrings_batch(
+            list(qids_needed),
+            project_id,
+            background=False,  # <-- foreground (lazy)
         )
         if results:
             self._f._log_debug(
@@ -23829,7 +24281,6 @@ class ProjectStateManager:
         # --- 3. Get the structural hash from pstate (set by build_block_a) ---
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
-            # Fallback: compute from cache if available (should not happen in normal flow)
             cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
@@ -23855,7 +24306,10 @@ class ProjectStateManager:
             async with session.post(
                 f"{base}/slots/{self._f.valves.slot_id}",
                 params={"action": "save"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
             ) as resp:
                 if resp.status == 200:
                     self.set_last_saved_slot_hash(project_id, static_hash)
@@ -23903,7 +24357,6 @@ class ProjectStateManager:
         # --- 3. Get the structural hash from pstate ---
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
-            # Fallback: compute from cache if available
             cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
@@ -23932,7 +24385,10 @@ class ProjectStateManager:
             async with session.post(
                 f"{base}/slots/{self._f.valves.slot_id}",
                 params={"action": "restore"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
             ) as resp:
                 if resp.status == 200:
                     self.set_slot_restored(project_id, True)
@@ -24020,7 +24476,10 @@ class ProjectStateManager:
             async with session.post(
                 f"{base}/slots/{self._f.valves.slot_id}",
                 params={"action": "restore"},
-                json={"filename": filename, "model": self._f.valves.llm_model},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -24050,6 +24509,10 @@ class ProjectStateManager:
         The static_hash must be the structural hash (signatures only, no docstrings)
         to ensure slot persistence survives docstring population.
 
+        The model hash uses the bare model name without backend prefix so that
+        renaming the valve from "Qwopus3.6" to "llamacpp/Qwopus3.6" does not
+        invalidate existing slot files.
+
         Args:
             project_id (str): The project identifier.
             static_hash (str): The structural hash of the code state.
@@ -24057,7 +24520,9 @@ class ProjectStateManager:
         Returns:
             str: The filename for the slot file.
         """
-        model_hash = hashlib.md5(self._f.valves.llm_model.encode()).hexdigest()[:8]
+        model_hash = hashlib.md5(
+            get_model_name(self._f.valves.llm_model).encode()
+        ).hexdigest()[:8]
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
         return f"slot{self._f.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
 
@@ -24514,9 +24979,6 @@ class SemanticSeedInferencer:
         re.IGNORECASE,
     )
 
-    # A line from the LLM that contains a qualified id (with or without backticks/bullets).
-    _ID_LINE_RE = re.compile(r"^[\s\-*\d.]*`?([A-Za-z_][\w.]*)`?\s*(?:#.*)?$")
-
     # ------------------------------------------------------------------
     # Region: Initialization
     # ------------------------------------------------------------------
@@ -24676,92 +25138,84 @@ class SemanticSeedInferencer:
         project_id: str = "",
     ) -> bool:
         """
-        LLM fallback for seed inference decision.
+        LLM fallback for seed inference decision when the CrossEncoder diff
+        falls below seed_infer_llm_threshold.
 
-        Uses CrossEncoder scores as context and restores the KV slot afterward.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is True (infer) to
+        avoid missing critical symbols.
 
         Args:
-            query: The user's query.
-            ce_scores: CrossEncoder scores (optional).
-            use_case: The detected use case.
-            project_id: Current project identifier.
+            query: The user's query (truncated to 500 chars).
+            ce_scores: Optional [needs_inference, literal_only] CE scores.
+            use_case: The detected use case key (A-E).
+            project_id: Current project identifier, used for slot restoration.
 
         Returns:
-            True if seed inference should be performed.
+            bool: True if seed inference should be performed, False otherwise.
         """
-        # ------------------------------------------------------------------
-        # Step 1: Build the prompt, optionally with CE context.
-        # ------------------------------------------------------------------
         if ce_scores is not None:
-            ce_summary = f"""
-The CrossEncoder provides the following scores:
-- Needs implicit inference: {ce_scores[0]:.2f}
-- Only literal matches: {ce_scores[1]:.2f}
-"""
-            prompt = f"""
-{ce_summary}
-
-Now, independently analyze the user's question.
-
-Seed inference means identifying code symbols that the user implies but does not name.
-This is critical for architecture (A), refactoring (D), or high-level design questions.
-Only say NO if the query mentions specific, exact function or class names.
-
-User question:
-{query[:500]}
-
-Use case: {use_case} (A=Architecture, D=Refactor benefit most from inference).
-
-Output only "YES" or "NO". When uncertain, output YES.
-"""
+            ce_block = (
+                f"CrossEncoder scores — "
+                f"needs_inference: {ce_scores[0]:.2f}, "
+                f"literal_only: {ce_scores[1]:.2f}\n\n"
+            )
         else:
-            prompt = f"""
-Analyze the user's question for seed inference need.
+            ce_block = ""
 
-Seed inference means identifying implied code symbols. Critical for architecture/refactor.
-Only say NO if the query has exact symbol names.
+        prompt = (
+            f"{ce_block}"
+            f"User question:\n{query[:500]}\n\n"
+            f"Use case: {use_case} "
+            f"(A=Architecture and D=Refactor benefit most from inference)\n\n"
+            f"Decide whether seed inference is needed. Seed inference means "
+            f"identifying code symbols the user implies but does not name explicitly.\n"
+            f"Output 'false' ONLY when the query already contains exact function "
+            f"or class names. When uncertain, prefer 'true'.\n\n"
+            f'Output only the JSON object, e.g. {{"should_infer": true}}'
+        )
 
-User question:
-{query[:500]}
-
-Use case: {use_case}
-
-Output only "YES" or "NO". When uncertain, output YES.
-"""
-
-        # ------------------------------------------------------------------
-        # Step 2: Call the LLM.
-        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a decision engine. Output only 'YES' or 'NO'. "
-                "Prefer YES when uncertain to avoid missing critical symbols."
+                "You are a decision engine. "
+                "Output ONLY a valid JSON object with a single boolean field "
+                "'should_infer'. "
+                "Prefer true when uncertain to avoid missing critical symbols. "
+                "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.summarization_model,
-            max_tokens=5,
+            max_tokens=0,
             temperature=0.0,
             label="should_infer_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=True,
         )
 
-        # ------------------------------------------------------------------
-        # Step 3: Restore KV slot if persistence is enabled.
-        # ------------------------------------------------------------------
+        # Restore the KV slot after any auxiliary LLM call.
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # ------------------------------------------------------------------
-        # Step 4: Parse and return the decision.
-        # ------------------------------------------------------------------
-        if response and response.strip().upper() == "YES":
-            self._f._log_debug("_should_infer_with_llm: LLM decided YES")
+        if not response:
+            self._f._log_debug(
+                "_should_infer_with_llm: empty response, defaulting to True"
+            )
             return True
-        elif response and response.strip().upper() == "NO":
-            self._f._log_debug("_should_infer_with_llm: LLM decided NO")
-            return False
 
-        self._f._log_debug("_should_infer_with_llm: LLM failed, defaulting to YES")
-        return True
+        try:
+            data = json.loads(response)
+            result = bool(data.get("should_infer", True))
+            self._f._log_debug(
+                f"_should_infer_with_llm: decided {'YES' if result else 'NO'}"
+            )
+            return result
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_should_infer_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}, defaulting to True"
+            )
+            return True
 
     # ------------------------------------------------------------------
     # Region: Main Seed Inference Entry Point
@@ -24780,7 +25234,7 @@ Output only "YES" or "NO". When uncertain, output YES.
 
         Returns {} when:
           - slot is not free (AutoContinue active: no inference on parts).
-          - global scope detected (routed to multi‑phase + full_graph).
+          - global scope detected (routed to multi-phase + full_graph).
           - the gate _should_infer fails.
           - skeleton is empty or LLM call fails.
 
@@ -24794,66 +25248,55 @@ Output only "YES" or "NO". When uncertain, output YES.
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
         """
-        # ------------------------------------------------------------------
-        # Step 1: Early exits.
-        # ------------------------------------------------------------------
         if not slot_free:
             return {}
 
-        # Global scope detection -> delegate to multi-phase.
+        # Global scope detection → delegate to multi-phase + full_graph.
         if self.is_global_scope(query):
             self._f._log_debug(
-                "SemanticSeedInferencer: global scope detected -> "
-                "inference skipped, delegated to multi‑phase + full_graph."
+                "SemanticSeedInferencer: global scope detected → "
+                "inference skipped, delegated to multi-phase + full_graph."
             )
             return {}
 
-        # Check if inference is needed.
         if not await self._should_infer(query, project_id, intent_vector, use_case):
             return {}
 
-        # ------------------------------------------------------------------
-        # Step 2: Retrieve the skeleton (signatures only).
-        # ------------------------------------------------------------------
+        # Retrieve the skeleton (signatures only).
         skeleton = await self._f._ctx_builder._get_skeleton_for_cot(project_id, query)
         if not skeleton.strip():
             self._f._log_debug("SemanticSeedInferencer: empty skeleton, cannot infer.")
             return {}
 
-        # ------------------------------------------------------------------
-        # Step 3: Trim skeleton to the configured budget.
-        # ------------------------------------------------------------------
+        # Trim skeleton to the configured token budget.
         max_sk = self._f.valves.seed_inference_skeleton_max_tokens
         if max_sk > 0:
             skeleton = self._f._tokens.truncate_text_to_tokens(skeleton, max_sk)
 
         n = self._f.valves.seed_inference_max_symbols
 
-        # ------------------------------------------------------------------
-        # Step 4: Build the prompt.
-        # ------------------------------------------------------------------
         prompt = (
             f"Project skeleton (signatures only — no bodies):\n"
             f"```\n{skeleton}\n```\n\n"
             f'User request:\n"{query[:600]}"\n\n'
-            f"List the qualified symbol identifiers whose FULL implementation body "
-            f"must be read to fulfill this request correctly. "
-            f"Use the exact identifiers from the skeleton (e.g. `ClassName.method` "
-            f"or `module_function`). Include direct dependencies implied by the "
-            f"request even if not named explicitly by the user. "
-            f"Output ONLY identifiers, one per line, no explanations, no numbering. "
-            f"Maximum {n} identifiers."
+            f"List the qualified symbol identifiers whose FULL implementation "
+            f"body must be read to fulfill this request correctly. "
+            f"Use the exact identifiers from the skeleton "
+            f"(e.g. 'ClassName.method' or 'module_function'). "
+            f"Include direct dependencies implied by the request even if not "
+            f"named explicitly by the user. "
+            f"Maximum {n} identifiers.\n\n"
+            f"Output only the JSON object, "
+            f'e.g. {{"symbols": ["ClassName.method", "other_fn"]}}'
         )
 
-        # ------------------------------------------------------------------
-        # Step 5: Call the LLM.
-        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a code retrieval planner. Given a project skeleton and a "
-                "user request, output only the qualified symbol identifiers whose "
-                "full bodies must be read. One identifier per line, nothing else."
+                "You are a code retrieval planner. Given a project skeleton "
+                "and a user request, output ONLY a valid JSON object with a "
+                "single key 'symbols' containing a list of qualified identifier "
+                "strings. Your entire response must start with { and end with }."
             ),
             model_override=(
                 self._f.valves.seed_inference_model or self._f.valves.llm_model
@@ -24861,20 +25304,29 @@ Output only "YES" or "NO". When uncertain, output YES.
             max_tokens=self._f.valves.seed_inference_max_tokens,
             temperature=0.0,
             label="seed_inference",
+            response_format={"type": "json_object"},
+            enable_thinking=True,
+            log_raw_response=True,
         )
 
         if not response:
             self._f._log_debug("SemanticSeedInferencer: LLM returned no response.")
             return {}
 
-        # ------------------------------------------------------------------
-        # Step 6: Parse and resolve the response.
-        # ------------------------------------------------------------------
-        seeds = self._parse_and_resolve(response, project_id)
+        # Parse the JSON response and resolve tokens.
+        tokens: List[str] = []
+        try:
+            data = json.loads(response)
+            tokens = [str(s) for s in data.get("symbols", []) if s]
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"SemanticSeedInferencer: JSON parse error — "
+                f"response: {response[:200]!r}"
+            )
+            return {}
 
-        # ------------------------------------------------------------------
-        # Step 7: Log results.
-        # ------------------------------------------------------------------
+        seeds = self._parse_and_resolve(tokens, project_id)
+
         if seeds:
             sample = sorted(seeds)[:8]
             ellipsis = "..." if len(seeds) > 8 else ""
@@ -24894,22 +25346,18 @@ Output only "YES" or "NO". When uncertain, output YES.
     # Region: Parsing and Resolution
     # ------------------------------------------------------------------
 
-    def _parse_and_resolve(self, response: str, project_id: str) -> Dict[str, float]:
+    def _parse_and_resolve(
+        self, tokens: List[str], project_id: str
+    ) -> Dict[str, float]:
         """
-        Parse one‑id‑per‑line and resolve each token to actual qualified ids.
+        Resolve a list of symbol tokens to actual qualified ids.
 
-        Resolution rules:
-            - Token in all_qids → exact match, full score.
-            - Dotted name (e.g. 'Filter.inlet') → split on last dot,
-              construct the qualified id via qualify_symbol_name(method, parent).
-            - Bare token (no '.') → get_qualified_names_for → all qids sharing
-              that bare name; score divided among ambiguities.
-            - Hallucinated token → fuzzy matching with rapidfuzz (token_set_ratio)
-              threshold 0.85, score penalty 0.8.
-            - If fuzzy fails, discard silently.
+        Receives a pre-parsed list of strings extracted from the JSON response
+        instead of raw LLM text. The resolution logic is unchanged:
+        exact match → dotted decomposition → bare name → fuzzy fallback.
 
         Args:
-            response: The LLM response containing one identifier per line.
+            tokens: List of identifier strings from the LLM JSON response.
             project_id: Current project identifier.
 
         Returns:
@@ -24921,38 +25369,27 @@ Output only "YES" or "NO". When uncertain, output YES.
 
         seeds: Dict[str, float] = {}
 
-        # ------------------------------------------------------------------
-        # Parse each line.
-        # ------------------------------------------------------------------
-        for line in response.splitlines():
+        for token in tokens:
             if len(seeds) >= max_syms:
                 break
 
-            m = self._ID_LINE_RE.match(line)
-            if not m:
-                continue
-
-            token = m.group(1).strip()
+            token = str(token).strip()
             if not token:
                 continue
 
-            # ------------------------------------------------------------------
-            # Step 1: Exact match.
-            # ------------------------------------------------------------------
+            # Exact match.
             if token in all_qids:
                 seeds[token] = max(seeds.get(token, 0.0), score)
                 continue
 
-            # ------------------------------------------------------------------
-            # Step 2: Dotted‑name decomposition.
-            # ------------------------------------------------------------------
+            # Dotted-name decomposition (e.g. "ClassName.method").
             if "." in token:
                 parent_name, method_part = token.rsplit(".", 1)
                 constructed_qid = qualify_symbol_name(method_part, parent_name)
                 if constructed_qid in all_qids:
                     seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
                     continue
-                # Fallback: try bare method name lookup.
+                # Fallback: bare method name lookup.
                 by_method = self._f._symbol_index.get_qualified_names_for(
                     method_part, project_id
                 )
@@ -24963,9 +25400,7 @@ Output only "YES" or "NO". When uncertain, output YES.
                             seeds[q] = max(seeds.get(q, 0.0), share)
                     continue
 
-            # ------------------------------------------------------------------
-            # Step 3: Bare name resolution.
-            # ------------------------------------------------------------------
+            # Bare name resolution.
             qids = {
                 q
                 for q in self._f._symbol_index.get_qualified_names_for(
@@ -24979,61 +25414,14 @@ Output only "YES" or "NO". When uncertain, output YES.
                     seeds[q] = max(seeds.get(q, 0.0), share)
                 continue
 
-            # ------------------------------------------------------------------
-            # Step 4: Fuzzy matching.
-            # ------------------------------------------------------------------
+            # Fuzzy matching fallback.
             fuzzy_matches = self._fuzzy_resolve(token, project_id)
             if fuzzy_matches:
                 fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
                 for q in fuzzy_matches:
                     seeds[q] = max(seeds.get(q, 0.0), fuzzy_score)
-                continue
-
-            # If no match, discard silently.
 
         return seeds
-
-    # ------------------------------------------------------------------
-    # Region: Fuzzy Fallback
-    # ------------------------------------------------------------------
-
-    def _fuzzy_resolve(self, token: str, project_id: str) -> List[str]:
-        """
-        Fallback fuzzy resolution for hallucinated tokens.
-
-        Uses rapidfuzz token_set_ratio against all qualified ids in the project.
-
-        Args:
-            token: The token to resolve.
-            project_id: Current project identifier.
-
-        Returns:
-            List of matching qualified ids, or empty list if none match.
-        """
-        if not HAS_FUZZ:
-            return []
-
-        from rapidfuzz import fuzz
-
-        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
-        best_match = None
-        best_ratio = 0.0
-        token_lower = token.lower()
-
-        for qid in all_qids:
-            ratio = fuzz.token_set_ratio(token_lower, qid.lower())
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = qid
-
-        if best_match and best_ratio >= self._f.valves.seed_inference_fuzzy_threshold:
-            self._f._log_debug(
-                f"SemanticSeedInferencer: fuzzy matched '{token}' → '{best_match}' "
-                f"(ratio={best_ratio:.0f}%)"
-            )
-            return [best_match]
-
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -25165,9 +25553,11 @@ class Filter:
             default=6000,
             description="Maximum tokens for LTM retrieved per request. 0 = unlimited.",
         )
-        cot_max_tokens: int = Field(
-            default=2500,
-            description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
+        cot_max_tokens: int = (
+            Field(  # Non zero values are faster, but potencially incomplete.
+                default=0,
+                description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
+            )
         )
         max_code_block_tokens: int = Field(
             default=6000,
@@ -25201,7 +25591,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -25233,15 +25623,15 @@ class Filter:
 
         # ── Auxiliary models ──────────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -25332,11 +25722,6 @@ class Filter:
             default=200,
             ge=0,
             description="Maximum docstring chars to suggest to the LLM.",
-        )
-        docstring_max_chars: int = Field(
-            default=200,
-            ge=0,
-            description="Maximum docstring tokens to truncate the LLM to (extra security against allucinations).",
         )
 
         # ── Block deduplication ──────────────────────────────────────────────
@@ -25485,7 +25870,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         path_summary_max_tokens: int = Field(default=80)
 
@@ -25871,15 +26256,15 @@ class Filter:
 
         # ── Generation models ──────────────────────────────────────────────
         cot_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
 
@@ -25952,7 +26337,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -26005,7 +26390,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_rebuild_interval: int = Field(default=20)
@@ -26121,11 +26506,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used for all general-purpose summarization tasks (history, sessions, hierarchical consolidation).",
         )
         summary_fallback_model: str = Field(
-            default="Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Fallback model for summarization when the primary summarization_model is unavailable.",
         )
 
@@ -26152,7 +26537,7 @@ class Filter:
         # ── Session summaries ───────────────────────────────────────────────
         enable_session_summary: bool = Field(default=True)
         session_summary_interval_messages: int = Field(default=8)
-        session_summary_max_tokens: int = Field(default=200)
+        session_summary_max_tokens: int = Field(default=0)  # concise by prompt petition
 
         # ── Turn‑based window ───────────────────────────────────────────────
         summarize_batch_turns: int = Field(
