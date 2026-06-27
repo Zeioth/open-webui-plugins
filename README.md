@@ -79,6 +79,9 @@ CrossEncoder (scores)
 LLM fail → Infere = True (conservative)
 ```
 
+## Fully compliant with the scientific method
+WIP
+
 ## NOTES
 - It's vital to disable `settings > UI > Enriched text`. It's buggy on open-webui, and it will cause the LLM to break the code you paste into weird symbols that do not actually exist on the code (it confuses them with markdown).
 - It's vital to disable `settings > UI > Long text as file`, we read the prompt. We do not search for files.
