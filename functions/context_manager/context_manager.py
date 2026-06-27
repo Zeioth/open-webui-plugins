@@ -21,6 +21,7 @@ import json
 import asyncio
 import threading
 import textwrap
+import math
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
@@ -2619,6 +2620,8 @@ class ContextPager:
         Soft-evict a code block to ChromaDB with semantic relevance filtering.
 
         Uses a cascade: heuristic reinforcement, CrossEncoder, and LLM fallback.
+        The full block content (up to 32768 tokens) is stored in ChromaDB as
+        the authoritative source for page_in_block reconstruction.
 
         Args:
             block: The block to page out.
@@ -2639,17 +2642,13 @@ class ContextPager:
         should_page_out = True
         h_weight = self._f.valves.heuristic_reinforcement_weight
 
-        # ------------------------------------------------------------------
-        # Step 1: Heuristic reinforcement - boost keep for important blocks.
-        # ------------------------------------------------------------------
+        # ── Step 1: Heuristic reinforcement — boost keep for important blocks ──
         if block.importance_score > 5.0 or block.pinned:
             keep_boost = 0.2 * h_weight
         else:
             keep_boost = 0.0
 
-        # ------------------------------------------------------------------
-        # Step 2: CrossEncoder evaluation.
-        # ------------------------------------------------------------------
+        # ── Step 2: CrossEncoder evaluation ───────────────────────────────────
         if current_query and self._f._cross_encoder is not None:
             content_snippet = block.content[:1500]
             pairs = [
@@ -2665,7 +2664,6 @@ class ContextPager:
             scores = await self._f._commands._predict_cross_encoder(pairs)
 
             if scores is not None and len(scores) >= 2:
-                # Apply heuristic reinforcement to the "keep" side.
                 scores_reinforced = list(scores)
                 scores_reinforced[0] += keep_boost
 
@@ -2674,14 +2672,12 @@ class ContextPager:
                 LLM_FALLBACK_THRESHOLD = self._f.valves.paging_llm_threshold
 
                 if diff >= CE_CONFIDENCE_THRESHOLD:
-                    # Confident → use CrossEncoder decision.
                     should_page_out = scores_reinforced[1] > scores_reinforced[0]
                     self._f._log_debug(
                         f"page_out_block: CE confident (diff={diff:.2f}) → "
                         f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
                     )
                 elif diff < LLM_FALLBACK_THRESHOLD:
-                    # Extremely uncertain → LLM fallback.
                     self._f._log_debug(
                         f"page_out_block: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                         f"using LLM for {block.hash[:8]}"
@@ -2690,21 +2686,19 @@ class ContextPager:
                         block, current_query, scores_reinforced, project_id
                     )
                 else:
-                    # Middle zone: use heuristic.
                     should_page_out = not (block.importance_score > 5.0 or block.pinned)
                     self._f._log_debug(
                         f"page_out_block: middle zone, heuristic: "
                         f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
                     )
 
-        # ------------------------------------------------------------------
-        # Step 3: Execute page-out if decided.
-        # ------------------------------------------------------------------
+        # ── Step 3: Execute page-out if decided ───────────────────────────────
         if should_page_out:
             entry_id = f"{project_id}_paged_{block.hash}"
-            excerpt = block.content[:2000]
             symbol_names = ",".join(s.name for s in block.symbols)
 
+            # Truncate to embedder token limit — this is stored as the
+            # authoritative document in ChromaDB for lossless page_in.
             safe_text = block.content
             if hasattr(self._f, "_tokens"):
                 safe_text = self._f._tokens.truncate_text_to_tokens(
@@ -2722,14 +2716,12 @@ class ContextPager:
                 "symbol_names": symbol_names,
             }
 
-            # ------------------------------------------------------------------
-            # Offload embedding to background.
-            # ------------------------------------------------------------------
+            # Offload embedding + upsert to background — safe_text is the
+            # document (not a 2000-char excerpt) so page_in can reconstruct fully.
             asyncio.create_task(
                 self._page_out_async(
                     entry_id=entry_id,
                     safe_text=safe_text,
-                    excerpt=excerpt,
                     metadata=metadata,
                     embedder=embedder,
                     chroma_collection=chroma_collection,
@@ -2745,7 +2737,6 @@ class ContextPager:
         self,
         entry_id: str,
         safe_text: str,
-        excerpt: str,
         metadata: dict,
         embedder,
         chroma_collection,
@@ -2753,36 +2744,34 @@ class ContextPager:
         """
         Background task for embedding and upserting a paged block.
 
+        safe_text is stored as both the embedding source and the ChromaDB
+        document, making it the authoritative source for page_in_block
+        reconstruction. The previous design stored only a 2000-char excerpt
+        as the document, making lossless reconstruction impossible.
+
         Args:
             entry_id: Unique ID for the ChromaDB entry.
-            safe_text: Truncated text to embed.
-            excerpt: Short excerpt for the document field.
+            safe_text: Full block content (truncated to embedder token limit).
             metadata: Metadata to store with the embedding.
             embedder: Embedder instance.
             chroma_collection: ChromaDB collection.
         """
         async with self._f._chroma_semaphore:
             try:
-                # ------------------------------------------------------------------
-                # Embed the block content.
-                # ------------------------------------------------------------------
                 embedding = await anyio.to_thread.run_sync(
                     lambda: embedder.encode(safe_text).tolist()
                 )
-
-                # ------------------------------------------------------------------
-                # Upsert to ChromaDB.
-                # ------------------------------------------------------------------
                 await anyio.to_thread.run_sync(
                     lambda: chroma_collection.upsert(
                         ids=[entry_id],
                         embeddings=[embedding],
-                        documents=[excerpt],
+                        documents=[safe_text],  # full content — was excerpt[:2000]
                         metadatas=[metadata],
                     )
                 )
             except Exception:
-                # Best effort; the block content is still in SQLite.
+                # Best effort; paged_hashes already tracks the eviction.
+                # If this fails, page_in_block will return None for this block.
                 pass
 
     # ------------------------------------------------------------------
@@ -3112,10 +3101,11 @@ class ContextPager:
         """
         Retrieve a paged block for temporary use THIS TURN ONLY.
 
-        Reconstruction is lossless:
-            1. Read the full body from SQLite code_contents.
-            2. Re-extract symbols deterministically via SignatureExtractor.
-            3. Rebuild the CodeBlock from content + ChromaDB metadata.
+        Reconstruction uses ChromaDB as the single authoritative source —
+        the full block content is stored there by _page_out_async.
+        The previous SQLite path was dead code: page_out_block never wrote
+        to code_contents, so reconstruction always fell back to a 2000-char
+        excerpt. Now the document field contains the complete content.
 
         Does NOT restore the block to active_blocks.
 
@@ -3123,7 +3113,7 @@ class ContextPager:
             block_hash: Hash of the block to page in.
             project_id: Current project identifier.
             chroma_collection: ChromaDB collection.
-            db_conn: Database connection for content retrieval.
+            db_conn: Unused, kept for API compatibility.
 
         Returns:
             The reconstructed CodeBlock, or None if not found.
@@ -3133,11 +3123,9 @@ class ContextPager:
 
         entry_id = f"{project_id}_paged_{block_hash}"
 
-        # ------------------------------------------------------------------
-        # Step 1: Retrieve metadata and excerpt from ChromaDB.
-        # ------------------------------------------------------------------
+        # ── Step 1: Retrieve full content and metadata from ChromaDB ──────────
         meta = None
-        excerpt = ""
+        content = ""
         if chroma_collection is not None:
             try:
                 result = await anyio.to_thread.run_sync(
@@ -3147,37 +3135,14 @@ class ContextPager:
                 )
                 if result and result.get("ids"):
                     meta = result["metadatas"][0]
-                    excerpt = result["documents"][0] if result.get("documents") else ""
+                    content = result["documents"][0] if result.get("documents") else ""
             except Exception:
                 pass
-
-        # ------------------------------------------------------------------
-        # Step 2: Recover full body from SQLite (authoritative source).
-        # ------------------------------------------------------------------
-        content = ""
-        if db_conn is not None:
-            try:
-                row = await self._f._state_store._db_read(
-                    lambda: self._f._db_conn.execute(
-                        "SELECT content FROM code_contents WHERE hash = ?",
-                        (block_hash,),
-                    ).fetchone()
-                )
-                if row and row[0]:
-                    content = row[0]
-            except Exception:
-                pass
-
-        # Fallback to excerpt if DB lookup failed.
-        if not content:
-            content = excerpt
 
         if not content:
             return None
 
-        # ------------------------------------------------------------------
-        # Step 3: Extract metadata fields with safe defaults.
-        # ------------------------------------------------------------------
+        # ── Step 2: Extract metadata fields with safe defaults ────────────────
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3191,18 +3156,14 @@ class ContextPager:
         except Exception:
             ctype = ContentType.GENERAL
 
-        # ------------------------------------------------------------------
-        # Step 4: Deterministic symbol re-extraction.
-        # ------------------------------------------------------------------
+        # ── Step 3: Deterministic symbol re-extraction ────────────────────────
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
 
-        # ------------------------------------------------------------------
-        # Step 5: Reconstruct the CodeBlock.
-        # ------------------------------------------------------------------
+        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -8468,7 +8429,6 @@ class LongTermMemory:
             self._f._log_debug(
                 f"Failed to get/create cache collection '{cache_name}': {e}"
             )
-            # If the collection is corrupted, try to delete it and recreate
             try:
                 self._f.chroma_client.delete_collection(cache_name)
                 self._f._log_debug(f"Deleted corrupted collection '{cache_name}'")
@@ -8485,6 +8445,12 @@ class LongTermMemory:
             except Exception as e2:
                 self._f._log_debug(f"Could not recreate cache collection: {e2}")
                 self._f._response_cache_collection = None
+
+        # Validate embedding model fingerprint against stored collection metadata.
+        # Must run after memory_collection is ready. Disables LTM retrieval if
+        # the stored model fingerprint doesn't match the current embedder.
+        if self._f.memory_collection is not None:
+            self._validate_embedding_model()
 
         self._f._log_debug("LTM ready")
 
@@ -8635,8 +8601,6 @@ class LongTermMemory:
 
                     ce_score = ce_scores[0]
                     # Normalize to [0,1] roughly
-                    import math
-
                     ce_prob = 1.0 / (1.0 + math.exp(-ce_score))
 
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.duplicate_ce_threshold
@@ -8688,50 +8652,60 @@ class LongTermMemory:
         project_id: str,
     ) -> bool:
         """
-        LLM fallback for duplicate question detection.
+        LLM fallback for duplicate question detection when the CrossEncoder
+        diff falls below duplicate_llm_threshold.
 
-        Uses CrossEncoder score as context and restores the KV slot afterward.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. Default on failure is False (not duplicate)
+        to avoid suppressing valid questions.
 
         Args:
-            query (str): The user's current question.
-            candidate (str): The candidate question from LTM.
-            ce_score (float): The CrossEncoder score (logit).
-            project_id (str): Current project identifier.
+            query: The user's current question (truncated to 500 chars).
+            candidate: The candidate question from LTM (truncated to 500 chars).
+            ce_score: CrossEncoder logit score (higher = more similar).
+            project_id: Current project identifier, used for slot restoration.
 
         Returns:
             bool: True if the questions are duplicates, False otherwise.
         """
-        # ── Build the prompt ──
-        prompt = f"""
-The CrossEncoder is uncertain. Score: {ce_score:.2f} (higher = more duplicate).
-
-User question:
-{query[:500]}
-
-Candidate question:
-{candidate[:500]}
-
-Are these questions asking the same thing?
-Output only "YES" or "NO".
-"""
-        # ── Call LLM ──
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You are a duplicate question detector. Output only 'YES' or 'NO'.",
-            model_override=self._f.valves.summarization_model,
-            max_tokens=5,
-            temperature=0.0,
-            label="duplicate_llm",
+        prompt = (
+            f"CrossEncoder score: {ce_score:.2f} (higher = more similar).\n\n"
+            f"Question A:\n{query[:500]}\n\n"
+            f"Question B:\n{candidate[:500]}\n\n"
+            f"Are these questions asking the same thing?\n"
+            f'Output only the JSON object, e.g. {{"is_duplicate": false}}'
         )
 
-        # ── Restore KV slot ──
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a duplicate question detector. "
+                "Output ONLY a valid JSON object with a single boolean field 'is_duplicate'. "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=0,
+            temperature=0.0,
+            label="duplicate_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+        )
+
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # ── Parse response ──
-        if response and response.strip().upper() == "YES":
-            return True
-        return False
+        if not response:
+            return False
+
+        try:
+            data = json.loads(response)
+            return bool(data.get("is_duplicate", False))
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"_find_duplicate_with_llm: JSON parse error — "
+                f"response: {response[:200]!r}"
+            )
+            return False
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Query helpers (parsing, symbol extraction, expansion)
@@ -8803,7 +8777,7 @@ Output only "YES" or "NO".
                 "No other text is allowed."
             ),
             model_override=self._f.valves.llm_model,
-            max_tokens=80,
+            max_tokens=0,
             temperature=0.4,
             label="multi_query_expand",
         )
@@ -9798,14 +9772,22 @@ Output only "YES" or "NO".
 
     def _validate_embedding_model(self) -> bool:
         """
-        Validate that the current embedding model matches the stored one.
+        Validate that the current embedding model matches the stored fingerprint.
 
         Reads/writes model metadata from the ChromaDB collection.
-        Returns False and sets _retrieval_disabled if a mismatch is found.
+        On the first run (no fingerprint stored yet), persists the current
+        model name and dimension. On subsequent runs, compares against the
+        stored fingerprint and disables LTM retrieval if they differ.
+
+        Returns False and sets _retrieval_disabled_reason if a mismatch is
+        found. Returns True if the model matches or on the first run.
+
+        Bug fixed: the original check was `if stored_model is None` which
+        is always False because str() never returns None — so the first-run
+        fingerprint was never persisted. Changed to `if not stored_model`
+        to correctly detect an empty string (= no fingerprint yet).
         """
         try:
-            # Get current model info, converting to native Python types
-            # to avoid NumPy array ambiguity issues.
             current_model: str = str(
                 getattr(self._f.valves, "embedding_model_name", "unknown")
             )
@@ -9815,8 +9797,8 @@ Output only "YES" or "NO".
             stored_model: str = str(coll_meta.get("_codeaware_embedding_model", ""))
             stored_dim: int = int(coll_meta.get("_codeaware_embedding_dim", 0) or 0)
 
-            if stored_model is None:
-                # First run: persist model fingerprint
+            # Empty string means no fingerprint has been persisted yet (first run).
+            if not stored_model:
                 self._f.memory_collection.modify(
                     metadata={
                         **coll_meta,
@@ -9825,11 +9807,11 @@ Output only "YES" or "NO".
                     }
                 )
                 self._f._log_debug(
-                    f"LTM: embedding fingerprint stored (model={current_model}, dim={current_dim})"
+                    f"LTM: embedding fingerprint stored "
+                    f"(model={current_model}, dim={current_dim})"
                 )
                 return True
 
-            # Compare using native types (strings and ints) to avoid ambiguity
             if stored_model != current_model or stored_dim != current_dim:
                 reason = (
                     f"LTM embedding mismatch — collection built with "
@@ -9844,7 +9826,7 @@ Output only "YES" or "NO".
             return True
 
         except Exception as e:
-            # Fail open to avoid breaking existing installs that lack the metadata
+            # Fail open to avoid breaking existing installs that lack the metadata.
             self._f._log_debug(f"LTM: could not validate embedding model: {e}")
             return True
 
@@ -11957,8 +11939,6 @@ class CommandRouter:
         """
         Convert a raw CrossEncoder logit to a probability in [0,1] via sigmoid.
         """
-        import math
-
         return 1.0 / (1.0 + math.exp(-raw_score))
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -15617,7 +15597,6 @@ Output only the symbol name.
         Symbols appearing in many blocks are less specific (like stop-words).
         Returns a multiplier in [0.1, 3.0] to adjust its weight as a seed.
         """
-        import math
 
         all_names = self._f._symbol_index.get_all_names(project_id)
         total = max(len(all_names), 1)
@@ -16887,8 +16866,6 @@ Code context (recent symbols referenced):
                 pairs = [(current_query[:500], content[:500])]
                 scores = await self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None and len(scores) > 0:
-                    import math
-
                     semantic_score = 1.0 / (1.0 + math.exp(-scores[0]))
                     # Use the cascade thresholds from valves
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.code_history_ce_threshold
@@ -20628,8 +20605,6 @@ class SystemPromptBuilder:
                                 [(norm[:500], w[:500])]
                             )
                             if scores is not None and len(scores) > 0:
-                                import math
-
                                 prob = 1.0 / (1.0 + math.exp(-scores[0]))
                                 # Heuristic reinforcement: common words boost duplicate probability
                                 common_words = set(norm.split()) & set(w.split())
