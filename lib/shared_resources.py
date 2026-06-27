@@ -7,7 +7,7 @@ description: Shared singletons (embedder, ChromaDB, HTTP session, tiktoken, LRU 
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 2.1.0
+version: 2.2.0
 license: GPL3
 requirements: aiohttp, chromadb, tiktoken, sentence-transformers, llmlingua>=0.2.0
 """
@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
+import random
 import re
 import threading
 import time
-import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
+import aiohttp
 
 # ============================================================================
 # SECTION 1: Embedding & Vector DB (sentence-transformers + ChromaDB)
@@ -380,7 +385,6 @@ async def get_http_session(timeout_seconds: int = 120):
         aiohttp.ClientSession: The shared HTTP session.
     """
     global _HTTP_SESSION, _HTTP_TIMEOUT_SECONDS
-    import aiohttp
 
     async with _get_http_lock():
         needs_recreate = (
@@ -421,6 +425,261 @@ async def close_http_session():
 _logger = logging.getLogger(__name__)
 
 
+# 3.2.1 ── Typed errors ──────────────────────────────────────────────────────
+# All subclass RuntimeError so existing callers that do `except RuntimeError`
+# keep working unchanged, while new callers can branch on the specific type
+# (and read `.status` on HTTP errors) instead of parsing exception strings.
+
+class LLMError(RuntimeError):
+    """Base class for every error raised by call_llm."""
+
+
+class LLMConfigError(LLMError):
+    """Invalid/missing configuration (no model, bad endpoint_type). Never retried."""
+
+
+class LLMEmptyResponseError(LLMError):
+    """Server returned an empty body / no content. Retried unless retry_on_empty=False."""
+
+
+class LLMHTTPError(LLMError):
+    """Non-2xx HTTP response. `.status` holds the code; 5xx and 429 are retryable."""
+
+    def __init__(self, status: int, body: str = "") -> None:
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body[:300]}" if body else f"HTTP {status}")
+
+
+# 3.2.2 ── Result type ───────────────────────────────────────────────────────
+@dataclass
+class LLMResult:
+    """Structured result, returned by call_llm(..., return_meta=True).
+
+    Lets callers track cost (token counts), detect truncation (finish_reason /
+    truncated) and observe latency / retries without re-instrumenting each
+    call site.
+    """
+    content: str
+    backend: str
+    model: str
+    url: str
+    attempts: int
+    latency_s: float
+    finish_reason: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    truncated: bool = False
+
+
+# 3.2.3 ── Helpers ───────────────────────────────────────────────────────────
+_REDACT_KEYS = frozenset({"authorization", "api_key", "api_token", "token", "bearer", "key"})
+_TRUNCATION_REASONS = frozenset({"length", "max_tokens"})
+
+
+def _resolve_backend(
+    backend: Optional[str], base_url: str, model: str
+) -> Literal["ollama", "llamacpp", "openai"]:
+    """Resolve the backend, honouring an explicit override before heuristics.
+
+    The heuristic is best-effort: a model prefix `llamacpp/` wins, then an
+    `ollama` / `:11434` hint in the URL, else assume an OpenAI-compatible
+    server. Pass `backend=` explicitly whenever the heuristic might misfire
+    (e.g. llama.cpp served on :11434, or "ollama" appearing in a proxy host).
+    """
+    if backend is not None:
+        return backend  # type: ignore[return-value]
+    if model.startswith("llamacpp/"):
+        return "llamacpp"
+    low = base_url.lower()
+    if "ollama" in low or ":11434" in low:
+        return "ollama"
+    return "openai"
+
+
+def _redact(obj: Any) -> Any:
+    """Recursively mask credential-like values before logging a payload."""
+    if isinstance(obj, dict):
+        return {
+            k: ("***REDACTED***" if str(k).lower() in _REDACT_KEYS else _redact(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
+def _is_retryable(exc: BaseException, retry_on_empty: bool) -> bool:
+    """Decide whether an exception is worth another attempt.
+
+    Decisions use the exception *type*, never its message text, so log/string
+    changes can never silently flip retry behaviour. Specific subclasses are
+    checked before the generic RuntimeError fallback.
+    """
+    if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, LLMHTTPError):
+        return exc.status == 429 or 500 <= exc.status < 600
+    if isinstance(exc, LLMEmptyResponseError):
+        return retry_on_empty
+    if isinstance(exc, LLMConfigError):
+        return False
+    if isinstance(exc, RuntimeError):
+        # Unknown RuntimeError: preserve the original "retry transient" behaviour.
+        return True
+    return False
+
+
+def _build_request(
+    *,
+    backend: str,
+    base_url_clean: str,
+    endpoint_type: str,
+    model_str: str,
+    prompt: str,
+    system: str,
+    temperature: float,
+    forward_max_tokens: Optional[int],
+    response_format: Optional[Dict[str, Any]],
+    enable_thinking: bool,
+    seed: Optional[int],
+    stop: Optional[List[str]],
+    top_p: Optional[float],
+    extra_body: Optional[Dict[str, Any]],
+) -> Tuple[str, Dict[str, Any]]:
+    """Build the (url, payload) for the resolved backend."""
+    if backend == "ollama":
+        url = f"{base_url_clean}/api/generate"
+        options: Dict[str, Any] = {"temperature": temperature}
+        if forward_max_tokens is not None:
+            options["num_predict"] = forward_max_tokens
+        if seed is not None:
+            options["seed"] = seed
+        if top_p is not None:
+            options["top_p"] = top_p
+        if stop:
+            options["stop"] = stop
+        # Ollama 0.7.0+: disable chain-of-thought when not needed.
+        if not enable_thinking:
+            options["think"] = False
+        payload: Dict[str, Any] = {
+            "model": model_str,
+            "prompt": prompt,
+            "system": system,
+            "stream": False,
+            "options": options,
+        }
+        # Ollama supports structured output via `format` rather than
+        # `response_format`. Translate the common OpenAI shapes instead of
+        # silently dropping the constraint.
+        if isinstance(response_format, dict):
+            rf_type = response_format.get("type")
+            if rf_type == "json_object":
+                payload["format"] = "json"
+            elif rf_type == "json_schema":
+                schema = (response_format.get("json_schema") or {}).get("schema")
+                if schema is not None:
+                    payload["format"] = schema
+
+    else:
+        # openai-compatible path, shared by the "openai" and "llamacpp" backends.
+        if endpoint_type == "completion":
+            url = f"{base_url_clean}/v1/completions"
+            payload = {
+                "model": model_str,
+                "prompt": prompt if not system else f"{system}\n\n{prompt}",
+                "temperature": temperature,
+            }
+        else:
+            url = f"{base_url_clean}/v1/chat/completions"
+            payload = {
+                "model": model_str,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+            }
+        if forward_max_tokens is not None:
+            payload["max_tokens"] = forward_max_tokens
+        if seed is not None:
+            payload["seed"] = seed
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if stop:
+            payload["stop"] = stop
+        if response_format is not None:
+            payload["response_format"] = response_format
+        # `thinking` / `chat_template_kwargs` are llama.cpp-specific. Only send
+        # them when the backend is *known* to be llama.cpp — a real OpenAI
+        # endpoint may reject unknown fields with HTTP 400. For a prefix-less
+        # llama.cpp server, pass backend="llamacpp" to re-enable this.
+        if not enable_thinking and backend == "llamacpp":
+            payload["thinking"] = False
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    # Caller-supplied overrides win. For Ollama, a nested "options" dict is
+    # merged into options rather than replacing the whole sub-dict.
+    if extra_body:
+        for k, v in extra_body.items():
+            if k == "options" and isinstance(v, dict) and isinstance(payload.get("options"), dict):
+                payload["options"].update(v)
+            else:
+                payload[k] = v
+
+    return url, payload
+
+
+def _parse_response(
+    *, backend: str, endpoint_type: str, data: Dict[str, Any]
+) -> Tuple[str, Optional[str], Optional[int], Optional[int]]:
+    """Extract (content, finish_reason, prompt_tokens, completion_tokens).
+
+    Raises LLMEmptyResponseError when no usable content is present.
+    """
+    if backend == "ollama":
+        content = data.get("response", "")
+        finish_reason = data.get("done_reason")
+        prompt_tokens = data.get("prompt_eval_count")
+        completion_tokens = data.get("eval_count")
+        if not content:
+            err = data.get("error", "")
+            if err:
+                raise LLMError(f"Ollama error: {err}")
+            raise LLMEmptyResponseError("Empty response")
+        return content, finish_reason, prompt_tokens, completion_tokens
+
+    # openai-compatible
+    choices = data.get("choices", [])
+    if not choices:
+        raise LLMEmptyResponseError("No choices")
+    choice0 = choices[0] or {}
+    finish_reason = choice0.get("finish_reason")
+    usage = data.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+
+    if endpoint_type == "completion":
+        content = choice0.get("text", "")
+        if not content:
+            raise LLMEmptyResponseError("Empty content")
+    else:
+        msg = choice0.get("message") or {}
+        content = msg.get("content", "")
+        if not content:
+            # Some reasoning models put the answer in reasoning_content when
+            # content is empty — fall back to it rather than failing.
+            reasoning = msg.get("reasoning_content", "")
+            if reasoning:
+                content = reasoning.strip()
+            else:
+                raise LLMEmptyResponseError("Empty content")
+
+    return content, finish_reason, prompt_tokens, completion_tokens
+
+
+# 3.2.4 ── Public entry point ────────────────────────────────────────────────
+# NOTE: get_model_backend / get_model_name are defined elsewhere in this same module.
 async def call_llm(
     prompt: str,
     *,
@@ -432,149 +691,265 @@ async def call_llm(
     max_tokens: Optional[int] = None,
     timeout: int = 120,
     endpoint_type: str = "chat",
-) -> str:
+    response_format: Optional[Dict[str, Any]] = None,
+    enable_thinking: bool = True,
+    # --- new: backend + sampling controls ---
+    backend: Optional[Literal["ollama", "llamacpp", "openai"]] = None,
+    seed: Optional[int] = None,
+    stop: Optional[List[str]] = None,
+    top_p: Optional[float] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+    # --- new: retry controls ---
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    deadline_seconds: Optional[float] = None,
+    retry_on_empty: bool = True,
+    # --- new: observability ---
+    return_meta: bool = False,
+    log_raw_response: bool = False,
+    label: str = "",
+) -> Union[str, LLMResult]:
     """
-    Async LLM call with automatic retries for empty responses and transient errors.
+    Async LLM call with retries, typed errors, and optional response metadata.
 
-    Handles Ollama, llama.cpp and OpenAI-compatible endpoints.
-    Retries up to 3 times with exponential backoff (1s, 2s, 4s).
-    Only logs when retries are exhausted or on non-retryable errors.
+    Supports Ollama (/api/generate), llama.cpp and OpenAI-compatible
+    (/v1/chat/completions, /v1/completions) endpoints. Transient failures
+    (network errors, timeouts, HTTP 5xx/429, empty responses) are retried with
+    exponential backoff + jitter; 4xx (except 429) and configuration errors
+    fail immediately.
+
+    Backward compatible: by default returns the response text as a stripped
+    str, and every error subclasses RuntimeError. Pass return_meta=True to get
+    an LLMResult with token counts, finish_reason, latency and resolved backend.
 
     Args:
-        prompt (str): The user prompt.
-        system (str): System prompt for chat completions.
-        base_url (str): The base URL of the LLM server.
-        model (Optional[str]): The model to use. Required.
-        api_token (str): API token for authenticated endpoints.
-        temperature (float): Sampling temperature. Defaults to 0.3.
-        max_tokens (Optional[int]): Maximum tokens to generate.
-        timeout (int): Request timeout in seconds. Defaults to 120.
-        endpoint_type (str): 'chat' or 'completion'. Defaults to 'chat'.
+        prompt: The user prompt.
+        system: System prompt (chat) or prepended to the prompt (completion).
+        base_url: Base URL of the LLM server.
+        model: Model name. Required. A vendor prefix is stripped before
+               sending ("llamacpp/mistral" → "mistral") and is also used to
+               auto-detect the llama.cpp backend.
+        api_token: Bearer token for authenticated endpoints. Sent as a header,
+                   never logged.
+        temperature: Sampling temperature. Must be >= 0.
+        max_tokens: Max tokens to generate. None or 0 means "no limit" — the
+                    key is omitted so the server uses its own default. Passing
+                    0 to llama.cpp would clamp generation to a single token, so
+                    we guard against that here.
+        timeout: Per-request timeout in seconds (applies to each attempt).
+        endpoint_type: 'chat' or 'completion'. Anything else raises
+                       LLMConfigError (previously it silently fell back to chat).
+        response_format: Server-side output constraint. For OpenAI-compatible
+                         backends it is passed through verbatim (e.g.
+                         {"type": "json_object"}). For Ollama it is translated
+                         to the `format` field ("json", or a JSON schema dict)
+                         instead of being dropped.
+        enable_thinking: Allow chain-of-thought before the answer. Set False
+                         for deterministic structured-output tasks. The
+                         llama.cpp opt-out fields are sent ONLY when the backend
+                         is known to be llama.cpp; for Ollama {"think": false}
+                         is used. They are never sent to a generic OpenAI
+                         endpoint (which may reject unknown fields).
+        backend: Force 'ollama' | 'llamacpp' | 'openai' instead of detecting it
+                 from base_url / model prefix. The heuristic can misfire
+                 (e.g. llama.cpp on :11434); set this when in doubt.
+        seed: Optional sampling seed for reproducibility.
+        stop: Optional list of stop sequences.
+        top_p: Optional nucleus-sampling value.
+        extra_body: Extra keys merged into the outgoing JSON (last, so they
+                    win). For Ollama, a nested "options" dict is merged into
+                    options rather than replacing it. Use this for
+                    backend-specific knobs without editing this function.
+        max_retries: Total attempts before giving up (default 3).
+        base_delay: Base backoff seconds; actual delay is
+                    base_delay * 2**(attempt-1) * jitter(0.5–1.5).
+        deadline_seconds: Optional hard cap on total wall-clock across all
+                          retries. Bounds the worst case
+                          (max_retries * timeout + backoff).
+        retry_on_empty: Whether an empty/unparseable response is retried
+                        (default True). Set False for deterministic callers
+                        where a retry cannot change the outcome.
+        return_meta: If True, return an LLMResult instead of a bare str.
+        log_raw_response: Log the outgoing request and raw response at INFO,
+                          each line prefixed [RAW][label]. Payloads are
+                          redacted for credential-like keys. Opt-in; do not
+                          leave on for high-frequency callers.
+
+                          Three lines are emitted per call:
+                            [RAW][label] → <url>\npayload: <json>   (before send)
+                            [RAW][label] ← HTTP 200\n<response_json> (on success)
+                            [RAW][label] ← HTTP <N>\n<error_body>    (on error)
+
+                          Isolate one caller's output with:
+                            docker logs open-webui 2>&1 | grep "\[RAW\]\[my_label\]"
+        label: Identifier used only in log prefixes. Always set it when
+               log_raw_response=True so the [RAW][label] prefix is meaningful.
 
     Returns:
-        str: The LLM response content.
+        str (default) or LLMResult (when return_meta=True). Content is stripped.
 
     Raises:
-        RuntimeError: If all retry attempts fail, or the model is not provided,
-                      or the response is malformed.
+        LLMConfigError: missing model / invalid endpoint_type (not retried).
+        LLMHTTPError: non-2xx response (`.status` set); 4xx except 429 fail fast.
+        LLMEmptyResponseError: empty / unparseable response.
+        LLMError: retries exhausted or deadline exceeded.
+        (All subclass RuntimeError for backward compatibility.)
     """
+    # --- Validation (fail fast, before any network work) ---
     if model is None:
-        _logger.error("LLM call requested but no model was provided. Please specify a model.")
-        raise RuntimeError("No model provided for LLM call.")
+        _logger.error("LLM call requested but no model was provided.")
+        raise LLMConfigError("No model provided for LLM call.")
+    if endpoint_type not in ("chat", "completion"):
+        raise LLMConfigError(
+            f"Invalid endpoint_type: {endpoint_type!r} (expected 'chat' or 'completion')."
+        )
+    if temperature < 0:
+        raise LLMConfigError(f"temperature must be >= 0, got {temperature}.")
+    if temperature > 2:
+        _logger.warning(
+            "temperature=%s is unusually high; most backends expect 0–2.", temperature
+        )
+    if max_retries < 1:
+        raise LLMConfigError(f"max_retries must be >= 1, got {max_retries}.")
 
-    max_retries = 3
-    base_delay = 1.0
-    last_exception = None
+    resolved_backend = _resolve_backend(backend, base_url, model)
+
+    base_url_clean = base_url.rstrip("/")
+    if base_url_clean.endswith("/v1"):
+        base_url_clean = base_url_clean[:-3].rstrip("/")
+
+    model_str = get_model_name(model)
+
+    headers = {"Content-Type": "application/json"}
+    if api_token and api_token.strip():
+        headers["Authorization"] = f"Bearer {api_token.strip()}"
+
+    # None or 0 means "no limit" — omit the key entirely (see max_tokens doc).
+    forward_max_tokens: Optional[int] = (
+        max_tokens if (max_tokens is not None and max_tokens > 0) else None
+    )
+
+    url, payload = _build_request(
+        backend=resolved_backend,
+        base_url_clean=base_url_clean,
+        endpoint_type=endpoint_type,
+        model_str=model_str,
+        prompt=prompt,
+        system=system,
+        temperature=temperature,
+        forward_max_tokens=forward_max_tokens,
+        response_format=response_format,
+        enable_thinking=enable_thinking,
+        seed=seed,
+        stop=stop,
+        top_p=top_p,
+        extra_body=extra_body,
+    )
+
+    start = time.monotonic()
+    tag = label or "-"
 
     for attempt in range(1, max_retries + 1):
         try:
             session = await get_http_session(timeout)
 
-            base_url_clean = base_url.rstrip("/")
-            if base_url_clean.endswith("/v1"):
-                base_url_clean = base_url_clean[:-3].rstrip("/")
-
-            is_ollama = "ollama" in base_url_clean.lower() or ":11434" in base_url_clean
-            is_llamacpp = model.startswith("llamacpp/")
-            if is_llamacpp:
-                is_ollama = False
-
-            model_str = model.split("/", 1)[1] if "/" in model else model
-
-            headers = {"Content-Type": "application/json"}
-            if api_token and api_token.strip():
-                headers["Authorization"] = f"Bearer {api_token.strip()}"
-
-            if is_ollama:
-                url = f"{base_url_clean}/api/generate"
-                payload: Dict[str, Any] = {
-                    "model": model_str,
-                    "prompt": prompt,
-                    "system": system,
-                    "stream": False,
-                    "options": {"temperature": temperature},
-                }
-                if max_tokens is not None:
-                    payload["options"]["num_predict"] = max_tokens
-            else:
-                if endpoint_type == "completion":
-                    url = f"{base_url_clean}/v1/completions"
-                    payload = {
-                        "model": model_str,
-                        "prompt": prompt if not system else f"{system}\n\n{prompt}",
-                        "temperature": temperature,
-                    }
-                else:
-                    url = f"{base_url_clean}/v1/chat/completions"
-                    payload = {
-                        "model": model_str,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": temperature,
-                    }
-                if max_tokens is not None:
-                    payload["max_tokens"] = max_tokens
-
-            import aiohttp
+            # Log the outgoing request before sending so the payload is visible
+            # even if the call times out or the server crashes. Credentials are
+            # masked even though the token normally lives only in the headers.
+            if log_raw_response:
+                _logger.info(
+                    f"[RAW][{label}] → {url}\n"
+                    f"payload: {json.dumps(_redact(payload), ensure_ascii=False, indent=2)}"
+                )
 
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    if 500 <= resp.status < 600 or resp.status == 429:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    else:
-                        raise RuntimeError(f"HTTP {resp.status}: {text[:300]}") from None
+                    if log_raw_response:
+                        _logger.info(f"[RAW][{label}] ← HTTP {resp.status}\n{text[:2000]}")
+                    raise LLMHTTPError(resp.status, text)
                 data = await resp.json()
 
-            if is_ollama:
-                content = data.get("response", "")
-                if not content:
-                    err = data.get("error", "")
-                    if err:
-                        raise RuntimeError(f"Ollama error: {err}")
-                    raise RuntimeError("Empty response")
-            else:
-                choices = data.get("choices", [])
-                if not choices:
-                    raise RuntimeError("No choices")
-                if endpoint_type == "completion":
-                    content = choices[0].get("text", "")
-                else:
-                    content = choices[0].get("message", {}).get("content", "")
-                    if not content:
-                        reasoning = choices[0].get("message", {}).get("reasoning_content", "")
-                        if reasoning:
-                            content = reasoning.strip()
-                        else:
-                            raise RuntimeError("Empty content")
+            if log_raw_response:
+                _logger.info(
+                    f"[RAW][{label}] ← HTTP 200\n"
+                    f"{json.dumps(data, ensure_ascii=False, indent=2)[:4000]}"
+                )
 
-            return content.strip()
+            content, finish_reason, ptok, ctok = _parse_response(
+                backend=resolved_backend, endpoint_type=endpoint_type, data=data
+            )
+
+            truncated = (finish_reason or "") in _TRUNCATION_REASONS
+            if truncated:
+                _logger.warning(
+                    "LLM output truncated (finish_reason=%s, label=%s, model=%s); "
+                    "consider raising max_tokens.",
+                    finish_reason, tag, model_str,
+                )
+            elif finish_reason == "content_filter":
+                _logger.warning("LLM output filtered (content_filter, label=%s).", tag)
+
+            if attempt > 1:
+                _logger.debug(
+                    "LLM call succeeded on attempt %d/%d (label=%s).",
+                    attempt, max_retries, tag,
+                )
+
+            result = LLMResult(
+                content=content.strip(),
+                backend=resolved_backend,
+                model=model_str,
+                url=url,
+                attempts=attempt,
+                latency_s=time.monotonic() - start,
+                finish_reason=finish_reason,
+                prompt_tokens=ptok,
+                completion_tokens=ctok,
+                truncated=truncated,
+            )
+            return result if return_meta else result.content
 
         except asyncio.CancelledError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
-            last_exception = exc
+            # Non-retryable (4xx except 429, config errors): re-raise the actual
+            # typed exception so callers keep `.status` etc. — no string parsing.
+            if not _is_retryable(exc, retry_on_empty):
+                _logger.warning("LLM call failed (non-retryable, label=%s): %s", tag, exc)
+                raise
 
-            # Non-retryable: 4xx (except 429) -> fail immediately
-            if isinstance(exc, RuntimeError) and "HTTP" in str(exc):
-                status_str = str(exc).split()[1] if len(str(exc).split()) > 1 else ""
-                if status_str.isdigit() and 400 <= int(status_str) < 500 and int(status_str) != 429:
-                    _logger.warning(f"LLM call failed: {exc}")
+            # Last attempt — re-raise the original typed exception, preserving
+            # its type/traceback rather than flattening to a generic message.
+            if attempt == max_retries:
+                _logger.error(
+                    "LLM call failed after %d attempts (label=%s): %s",
+                    max_retries, tag, exc,
+                )
+                raise
+
+            # Exponential backoff with jitter (0.5x–1.5x) to avoid thundering
+            # herd when many callers retry at once.
+            delay = base_delay * (2 ** (attempt - 1)) * (0.5 + random.random())
+
+            # Respect an overall deadline rather than running max_retries blind.
+            if deadline_seconds is not None:
+                elapsed = time.monotonic() - start
+                if elapsed + delay >= deadline_seconds:
+                    _logger.error(
+                        "LLM call exceeded deadline of %.1fs (label=%s): %s",
+                        deadline_seconds, tag, exc,
+                    )
                     raise
 
-            # Last attempt -> log error and raise
-            if attempt == max_retries:
-                _logger.error(f"LLM call failed after {max_retries} attempts: {last_exception}")
-                raise RuntimeError(f"LLM call failed after {max_retries} attempts") from last_exception
-
-            # Otherwise, wait and retry (silently)
-            delay = base_delay * (2 ** (attempt - 1))
+            _logger.debug(
+                "LLM call attempt %d/%d failed (label=%s), retrying in %.1fs: %s",
+                attempt, max_retries, tag, delay, exc,
+            )
             await asyncio.sleep(delay)
 
-    # Should never reach here
-    raise RuntimeError(f"LLM call failed after {max_retries} attempts")
+    # Defensive safety net — the loop always returns or raises above.
+    raise LLMError(f"LLM call failed after {max_retries} attempts")
 
 
 # ============================================================================
@@ -1001,7 +1376,6 @@ async def unload_all_models(base_url: str) -> None:
     Args:
         base_url (str): The base URL of the llama.cpp server.
     """
-    import aiohttp
     base_url = base_url.rstrip("/")
     if base_url.endswith("/v1"):
         base_url = base_url[:-3].rstrip("/")
@@ -1029,3 +1403,18 @@ async def unload_all_models(base_url: str) -> None:
             except Exception:
                 pass
         await asyncio.sleep(0.5)
+
+# ---------------------------------------------------------------------------
+# 5.3 Helpers to parse a "backend/model" formatted model identifier
+# ---------------------------------------------------------------------------
+DEFAULT_BACKEND = "llamacpp"
+
+
+def get_model_backend(model_id: str) -> str:
+    """Return the backend part of a "backend/model" id (default: "llamacpp")."""
+    return model_id.split("/", 1)[0] if "/" in model_id else DEFAULT_BACKEND
+
+
+def get_model_name(model_id: str) -> str:
+    """Return the model name without the backend prefix."""
+    return model_id.split("/", 1)[1] if "/" in model_id else model_id
