@@ -10554,6 +10554,616 @@ class ReasoningEngine:
 
         return reinforced_scores
 
+    async def detect_cot_configuration(
+        self,
+        user_content: str,
+        is_code_session: bool,
+        state: dict,
+        signal_vector: Optional[Dict[str, int]] = None,
+        is_continuation: bool = False,
+        project_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Four-stage cascade CoT feature detector.
+
+        Returns a CoTConfig dict:
+            level          int  0-3   reasoning depth
+            use_scientific bool       activate compete_hypotheses
+            decompose      bool       advisory: per-question focal reasoning
+            source         str        "forced"|"heuristic"|"crossencoder"|
+                                      "llm"|"heuristic_fallback"
+            rationale      str        one line, logging only
+
+        STAGE 0 — SymbolGraph signal (pre-computed by caller, sync, free)
+            Measures structural specificity of the query.
+            Passed as signal_vector. If None, treated as empty (no signal).
+
+        STAGE 1 — Heuristic (always, sync, free)
+            _detect_cot_level_heuristic → heuristic_level
+            _compute_feature_hints → ambiguity_score, traceback, multi_q,
+                                      heuristic_suggests_scientific
+            If enable_cot_llm_detection=False → returns here.
+
+        STAGE 2 — CrossEncoder (6 pairs)
+            [L0, L1, L2, L3] + [scientific, linear]
+            Reinforced by stage 0+1 via _reinforce_cot_scores.
+            If BOTH level AND scientific confident → CoTConfig, done.
+            If uncertain on ANY → stage 3.
+
+        STAGE 3 — LLM (summarization_model, cheap)
+            Full context: query + CE scores + signal_vector + hints.
+            Falls back to stage 1 estimate on failure.
+
+        Short-circuits:
+            enforce_scientific_method=True → {level:3, use_scientific:True}
+            is_continuation=True          → {level:0}
+            empty content                 → {level:0}
+            enable_cot_llm_detection=False → stage 1 only
+        """
+        _sv = signal_vector or {
+            "n_mentioned": 0,
+            "n_found": 0,
+            "n_relations": 0,
+            "structural_hits": 0,
+        }
+
+        # ── Short-circuits ─────────────────────────────────────────────────
+        if self._f.valves.enforce_scientific_method:
+            self._f._log_debug(
+                "detect_cot_configuration: enforce_scientific_method → L3 scientific"
+            )
+            return {
+                "level": 3,
+                "use_scientific": True,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "enforce_scientific_method=True",
+            }
+
+        if is_continuation:
+            return {
+                "level": 0,
+                "use_scientific": False,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "continuation turn",
+            }
+
+        if not user_content:
+            return {
+                "level": 0,
+                "use_scientific": False,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "empty content",
+            }
+
+        # ── STAGE 1: Heuristic ─────────────────────────────────────────────
+        heuristic_level = self._detect_cot_level_heuristic(
+            user_content, is_code_session, state
+        )
+        hints = self._compute_feature_hints(
+            user_content, is_code_session, _sv, heuristic_level
+        )
+
+        self._f._log_debug(
+            f"detect_cot_configuration stage1: "
+            f"heuristic_level={heuristic_level}, "
+            f"ambiguity={hints['ambiguity_score']}, "
+            f"traceback={hints['has_traceback']}, "
+            f"n_found={hints['n_found']}, "
+            f"suggests_sci={hints['heuristic_suggests_scientific']}"
+        )
+
+        # Heuristic-only mode
+        if not self._f.valves.enable_cot_llm_detection:
+            config = {
+                "level": heuristic_level,
+                "use_scientific": hints["heuristic_suggests_scientific"],
+                "decompose": hints["multi_question"],
+                "source": "heuristic",
+                "rationale": (
+                    f"heuristic-only: L{heuristic_level}, "
+                    f"ambiguity={hints['ambiguity_score']}"
+                ),
+            }
+            if self._f.ENABLE_COT_STICKY:
+                state.last_cot_level = heuristic_level
+            return config
+
+        # ── STAGE 2: CrossEncoder ──────────────────────────────────────────
+        # Build enriched query (same enrichment as existing _detect_cot_level_via_llm)
+        session_type = "code" if is_code_session else "general"
+        intent_hint = ""
+        if (
+            hasattr(self._f, "_user_intent_full_code")
+            and self._f._user_intent_full_code is not None
+        ):
+            intent_hint = (
+                "The user likely needs the full code."
+                if self._f._user_intent_full_code
+                else "The user likely needs only a summary."
+            )
+
+        context_parts = []
+        if "```" in user_content or any(
+            kw in user_content
+            for kw in ("def ", "class ", "import ", "from ", "function ")
+        ):
+            context_parts.append("[CODE]")
+        if hints["has_traceback"]:
+            context_parts.append("[TRACEBACK]")
+        if is_continuation:
+            context_parts.append("[CONTINUATION]")
+        context_prefix = " ".join(context_parts)
+        base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+        query = (
+            f"{context_prefix} {base_query}".strip() if context_parts else base_query
+        )
+
+        # 6 CE pairs: 4 level + 2 scientific
+        ce_pairs = [
+            (
+                query,
+                "The user asks a trivial question about code: a simple fact, "
+                "definition, or direct command that does not require reasoning.",
+            ),
+            (
+                query,
+                "The user asks a moderately complex question about code that "
+                "requires some logical reasoning but the answer is straightforward.",
+            ),
+            (
+                query,
+                "The user asks a complex question about code with a clear "
+                "direction: step-by-step implementation, explanation of how "
+                "something works, or debugging with an obvious likely cause.",
+            ),
+            (
+                query,
+                "The user asks a deep, system-wide, or multi-component question "
+                "requiring exhaustive analysis, impact evaluation across the "
+                "codebase, or architectural reasoning.",
+            ),
+            (
+                query,
+                "The root cause or best solution is genuinely ambiguous — "
+                "multiple structural hypotheses are plausible and need to be "
+                "evaluated and falsified against the codebase structure. "
+                "The query mentions specific symbols or methods.",
+            ),
+            (
+                query,
+                "The direction is clear — one implementation, explanation, or "
+                "diagnosis needs to be produced in detail. There are no "
+                "competing structural alternatives to evaluate.",
+            ),
+        ]
+
+        all_scores = await self._f._commands._predict_cross_encoder(ce_pairs)
+
+        if all_scores is not None and len(all_scores) >= 6:
+            raw_level = list(all_scores[:4])
+            raw_sci = list(all_scores[4:6])
+
+            # Apply existing level reinforcement (backward compat)
+            if self._f.valves.enable_cot_heuristic_reinforcement:
+                level_scores = self._reinforce_cot_level_detection_with_heuristic(
+                    user_content, raw_level
+                )
+            else:
+                level_scores = raw_level
+
+            # Apply full reinforcement (level + scientific)
+            level_scores, sci_scores = self._reinforce_cot_scores(
+                level_scores, raw_sci, hints
+            )
+
+            # Confidence check on both dimensions
+            sorted_lv = sorted(level_scores, reverse=True)
+            level_diff = sorted_lv[0] - sorted_lv[1]
+            sci_diff = sci_scores[0] - sci_scores[1]  # + = scientific wins
+
+            level_confident = (
+                level_diff >= self._f.valves.cot_cascade_uncertainty_threshold
+            )
+            sci_confident = abs(sci_diff) >= self._f.valves.cot_scientific_ce_threshold
+
+            self._f._log_debug(
+                f"detect_cot_configuration stage2 CE: "
+                f"lv={[f'{s:.2f}' for s in level_scores]}, "
+                f"sci={[f'{s:.2f}' for s in sci_scores]}, "
+                f"lv_diff={level_diff:.2f}({'✅' if level_confident else '❌'}), "
+                f"sci_diff={sci_diff:.2f}({'✅' if sci_confident else '❌'})"
+            )
+
+            if not self._f.valves.enable_cot_cascade:
+                # Cascade disabled → skip CE decision, go straight to LLM
+                self._f._log_debug("detect_cot_configuration: cascade disabled → LLM")
+                config = await self._classify_cot_config_with_llm(
+                    user_content,
+                    is_code_session,
+                    level_scores,
+                    sci_scores,
+                    hints,
+                    project_id,
+                )
+            elif level_confident and sci_confident:
+                # Both dimensions confident → return from CE
+                best_level = int(np.argmax(level_scores))
+                use_scientific = sci_diff > 0 and best_level >= 2
+
+                if self._f.ENABLE_COT_STICKY:
+                    state.last_cot_level = best_level
+
+                config = {
+                    "level": best_level,
+                    "use_scientific": use_scientific,
+                    "decompose": hints["multi_question"],
+                    "source": "crossencoder",
+                    "rationale": (
+                        f"CE confident: L{best_level} (diff={level_diff:.2f}), "
+                        f"sci={use_scientific} (sci_diff={sci_diff:.2f})"
+                    ),
+                }
+                self._f._log_debug(
+                    f"detect_cot_configuration → CE: "
+                    f"level={best_level}, scientific={use_scientific}"
+                )
+                return config
+            else:
+                # Some dimension uncertain → LLM with CE context
+                self._f._log_debug("detect_cot_configuration: CE uncertain → LLM")
+                config = await self._classify_cot_config_with_llm(
+                    user_content,
+                    is_code_session,
+                    level_scores,
+                    sci_scores,
+                    hints,
+                    project_id,
+                )
+        else:
+            # CE unavailable → LLM with heuristics only
+            self._f._log_debug("detect_cot_configuration: CE unavailable → LLM")
+            config = await self._classify_cot_config_with_llm(
+                user_content,
+                is_code_session,
+                None,
+                None,
+                hints,
+                project_id,
+            )
+
+        if self._f.ENABLE_COT_STICKY:
+            state.last_cot_level = config["level"]
+
+        return config
+
+    async def _classify_cot_config_with_llm(
+        self,
+        user_content: str,
+        is_code_session: bool,
+        level_scores: Optional[List[float]],
+        sci_scores: Optional[List[float]],
+        hints: Dict[str, Any],
+        project_id: str,
+    ) -> Dict[str, Any]:
+        """
+        LLM arbiter for CoT feature configuration.
+        Called when CrossEncoder lacks confidence on any dimension,
+        or when CrossEncoder is entirely unavailable.
+
+        Receives the full cascaded signal picture:
+        - Raw + reinforced CE scores (level + scientific) if available
+        - SymbolGraph signal (n_found, structural_hits, n_relations)
+        - Heuristic estimates (ambiguity_score, traceback, heuristic_level)
+        - The query itself
+
+        This is the ONLY stage where human-quality semantic judgment
+        is applied. Every prior stage has already filtered and enriched
+        the context so the LLM can make the most informed decision.
+
+        Falls back to heuristic estimate on any failure.
+        Uses summarization_model (fast, cheap).
+        """
+        _fallback = {
+            "level": max(hints.get("heuristic_level", 2), 1),
+            "use_scientific": hints.get("heuristic_suggests_scientific", False),
+            "decompose": hints.get("multi_question", False),
+            "source": "heuristic_fallback",
+            "rationale": "LLM classification unavailable",
+        }
+
+        # ── Build CE summary ──────────────────────────────────────────────
+        if level_scores and len(level_scores) >= 4:
+            ce_level_line = (
+                f"L0 trivial={level_scores[0]:.2f}  "
+                f"L1 simple={level_scores[1]:.2f}  "
+                f"L2 step-by-step={level_scores[2]:.2f}  "
+                f"L3 system-wide={level_scores[3]:.2f}"
+            )
+        else:
+            ce_level_line = "Level scores: CrossEncoder unavailable"
+
+        if sci_scores and len(sci_scores) >= 2:
+            ce_sci_line = (
+                f"Scientific/multi-hypothesis={sci_scores[0]:.2f}  "
+                f"Linear/single-direction={sci_scores[1]:.2f}"
+            )
+        else:
+            ce_sci_line = "Mode scores: CrossEncoder unavailable"
+
+        prompt = (
+            f"=== CrossEncoder scores (after heuristic reinforcement) ===\n"
+            f"Level:  {ce_level_line}\n"
+            f"Mode:   {ce_sci_line}\n\n"
+            f"=== Heuristic and structural signals ===\n"
+            f"Heuristic level estimate:    L{hints.get('heuristic_level', '?')}\n"
+            f"Heuristic suggests sci:      {hints.get('heuristic_suggests_scientific', False)}\n"
+            f"Ambiguity patterns matched:  {hints.get('ambiguity_score', 0)}\n"
+            f"Traceback present:           {hints.get('has_traceback', False)}\n"
+            f"Multiple independent Qs:     {hints.get('multi_question', False)}\n"
+            f"Codebase symbols found:      {hints.get('n_found', 0)} verified, "
+            f"{hints.get('n_mentioned', 0)} mentioned, "
+            f"{hints.get('n_relations', 0)} call relations\n\n"
+            f"=== User query ===\n"
+            f"{user_content[:500]}\n\n"
+            f"=== Task ===\n"
+            "Determine the optimal reasoning configuration.\n\n"
+            "LEVEL (depth of reasoning chain to generate):\n"
+            "  0 — trivial: single fact, definition, direct command\n"
+            "  1 — simple: some logic, one clear answer\n"
+            "  2 — step-by-step: multi-step reasoning, clear direction\n"
+            "  3 — deep: system-wide, multi-component, impact analysis\n\n"
+            "USE_SCIENTIFIC — activate multi-hypothesis competition validated\n"
+            "against the codebase SymbolGraph. Set true ONLY when ALL hold:\n"
+            "  - level >= 2\n"
+            "  - root cause or best approach is genuinely ambiguous\n"
+            "    (multiple structural possibilities exist)\n"
+            "  - at least 1 known codebase symbol is mentioned (n_found >= 1)\n"
+            "  TRUE for: debugging with unclear cause, non-deterministic\n"
+            "    failures, cascading impact of a specific change.\n"
+            "  FALSE for: general explanations, implementing a known pattern,\n"
+            "    architecture descriptions, queries without specific symbols.\n\n"
+            "DECOMPOSE — query contains 2+ genuinely independent questions\n"
+            "  needing separate code contexts to answer well.\n\n"
+            'Output ONLY valid JSON: {"level": 0|1|2|3, '
+            '"use_scientific": true|false, "decompose": true|false, '
+            '"rationale": "one concise line explaining the key decision"}'
+        )
+
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a reasoning configuration classifier for a code-aware "
+                "AI assistant. Output ONLY a valid JSON object. "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=0,
+            temperature=0.0,
+            label="cot_config_llm",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+        )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if not response:
+            self._f._log_debug("cot_config_llm: no response → heuristic fallback")
+            return _fallback
+
+        try:
+            data = json.loads(response)
+            level = int(data.get("level", hints.get("heuristic_level", 2)))
+            if level not in (0, 1, 2, 3):
+                level = 2
+            config = {
+                "level": level,
+                "use_scientific": bool(data.get("use_scientific", False)),
+                "decompose": bool(data.get("decompose", False)),
+                "source": "llm",
+                "rationale": str(data.get("rationale", ""))[:120],
+            }
+            self._f._log_debug(
+                f"cot_config_llm: level={config['level']}, "
+                f"scientific={config['use_scientific']}, "
+                f"decompose={config['decompose']}, "
+                f"rationale='{config['rationale']}'"
+            )
+            return config
+        except (json.JSONDecodeError, Exception) as e:
+            self._f._log_debug(
+                f"cot_config_llm: parse error ({type(e).__name__}) → heuristic fallback"
+            )
+            return _fallback
+
+    def _compute_feature_hints(
+        self,
+        user_content: str,
+        is_code_session: bool,
+        signal_vector: Dict[str, int],
+        heuristic_level: int,
+    ) -> Dict[str, Any]:
+        """
+        Compute feature hints from deterministic signals.
+        No LLM. No GPU. Always runs after the heuristic.
+
+        Feeds three downstream consumers:
+        1. _reinforce_cot_scores — adjusts CE scores (additive nudges)
+        2. _classify_cot_config_with_llm — LLM prompt context
+        3. CoTConfig fallback when LLM is unavailable
+
+        ambiguity_score: count of patterns suggesting the query has multiple
+            plausible structural root causes. Primary signal for recommending
+            scientific (multi-hypothesis) mode. Weighted: strong patterns
+            count 2, medium patterns count 1.
+
+        heuristic_suggests_scientific: pre-computed recommendation.
+            True when: ambiguity_score >= 2
+                    OR (has_traceback AND n_found >= 1)
+                    OR (ambiguity_score >= 1 AND n_found >= 2)
+            Advisory — CE reinforcement and LLM can confirm or override.
+        """
+        content_lower = user_content.lower()
+        n_found = signal_vector.get("n_found", 0)
+
+        # ── Ambiguity patterns ────────────────────────────────────────────
+        # Strong (+2): explicit root-cause uncertainty, non-determinism
+        _STRONG: List[Tuple[str, int]] = [
+            (r"por\s+qu[eé]\s+(falla|no\s+funciona|devuelve|retorna|no\s+trabaja)", 2),
+            (
+                r"why\s+(does\s+it|is\s+it|do(?:es)?)\s+(?:fail|return|not\s+work|break|crash)",
+                2,
+            ),
+            (
+                r"\b(?:sometimes|intermitent(?:e|ly)|a\s+veces|no\s+siempre|not\s+always)\b",
+                2,
+            ),
+            (r"\b(?:root\s+cause|causa\s+ra[íi]z)\b", 2),
+            (r"returns?\s+(?:none|null)\b", 2),
+            (
+                r"(?:no\s+s[eé]|not\s+sure|can'?t\s+figure\s+out)\s+(?:why|por\s+qu[eé])",
+                2,
+            ),
+            (r"\b(?:unexpected|inesperado|not\s+what\s+i\s+expect)", 2),
+        ]
+        # Medium (+1): softer hints at ambiguity
+        _MEDIUM: List[Tuple[str, int]] = [
+            (r"\b(?:could\s+it\s+be|podr[íi]a\s+ser|might\s+be)\b", 1),
+            (r"\b(?:strange|raro|weird|odd|extra[ñn]o)\b", 1),
+            (r"(?:doesn'?t\s+make\s+sense|no\s+tiene\s+sentido)", 1),
+            (
+                r"\b(?:multiple|varios|varias)\s+(?:causes?|razones?|reasons?|posibilidades)",
+                1,
+            ),
+            (r"\b(?:randomly|aleator(?:io|iamente)|random(?:ly)?)\b", 1),
+            (r"(?:works?\s+(?:locally|in\s+dev)|fails?\s+in\s+(?:prod|production))", 1),
+            (r"(?:no\s+siempre|not\s+consistent)", 1),
+        ]
+
+        ambiguity_score = 0
+        for pattern, weight in _STRONG + _MEDIUM:
+            if re.search(pattern, content_lower):
+                ambiguity_score += weight
+
+        # ── Traceback ─────────────────────────────────────────────────────
+        has_traceback = bool(
+            re.search(
+                r"traceback\s*\(most\s+recent|"
+                r"file\s+\"[^\"]+\",\s+line\s+\d+|"
+                r"at\s+\w+\.\w+\([\w.:]+:\d+\)",
+                content_lower,
+            )
+        )
+
+        # ── Multi-question ─────────────────────────────────────────────────
+        paragraphs_with_q = [
+            p.strip()
+            for p in re.split(r"\n\s*\n", user_content)
+            if "?" in p and len(p.strip()) > 15
+        ]
+        spanish_questions = re.findall(r"¿[^¿?]+\?", user_content)
+        multi_question = len(paragraphs_with_q) >= 2 or len(spanish_questions) >= 2
+
+        # ── Derived recommendation ─────────────────────────────────────────
+        heuristic_suggests_scientific = bool(
+            ambiguity_score >= 2
+            or (has_traceback and n_found >= 1)
+            or (ambiguity_score >= 1 and n_found >= 2)
+        )
+
+        return {
+            "ambiguity_score": ambiguity_score,
+            "has_traceback": has_traceback,
+            "multi_question": multi_question,
+            "n_found": n_found,
+            "structural_hits": signal_vector.get("structural_hits", 0),
+            "n_mentioned": signal_vector.get("n_mentioned", 0),
+            "n_relations": signal_vector.get("n_relations", 0),
+            "heuristic_level": heuristic_level,
+            "heuristic_suggests_scientific": heuristic_suggests_scientific,
+        }
+
+    def _reinforce_cot_scores(
+        self,
+        level_scores: List[float],
+        sci_scores: List[float],
+        hints: Dict[str, Any],
+    ) -> Tuple[List[float], List[float]]:
+        """
+        Adjust CrossEncoder scores using deterministic heuristic signals.
+        Extends _reinforce_cot_level_detection_with_heuristic to also
+        handle the scientific/linear dimension.
+
+        Philosophy: additive nudges, never multiplicative overrides.
+        The CE's semantic understanding dominates; hints add factual
+        context the CE couldn't see in the text alone (e.g., "this query
+        mentions 3 known symbols verified in the SymbolGraph").
+
+        All scores clamped to [0.0, 1.0].
+
+        level_scores: [L0, L1, L2, L3] from CrossEncoder
+        sci_scores:   [scientific, linear] from CrossEncoder
+
+        Returns reinforced (level_scores, sci_scores).
+        """
+        lv = list(level_scores)
+        sc = list(sci_scores)
+
+        ambiguity = hints.get("ambiguity_score", 0)
+        has_tb = hints.get("has_traceback", False)
+        n_found = hints.get("n_found", 0)
+        s_hits = hints.get("structural_hits", 0)
+        multi_q = hints.get("multi_question", False)
+        h_level = hints.get("heuristic_level", 0)
+        h_sci = hints.get("heuristic_suggests_scientific", False)
+
+        # ── Level reinforcement ───────────────────────────────────────────
+        if has_tb:
+            lv[3] = min(1.0, lv[3] + 0.20)  # traceback → deep analysis
+            lv[0] = max(0.0, lv[0] - 0.20)  # definitely not trivial
+            lv[1] = max(0.0, lv[1] - 0.10)
+
+        if multi_q:
+            lv[3] = min(1.0, lv[3] + 0.10)
+
+        if h_level == 3:
+            lv[3] = min(1.0, lv[3] + 0.15)
+        elif h_level == 2:
+            lv[2] = min(1.0, lv[2] + 0.10)
+        elif h_level <= 0:
+            lv[0] = min(1.0, lv[0] + 0.10)
+
+        # ── Scientific reinforcement ──────────────────────────────────────
+        # Ambiguity patterns
+        if ambiguity >= 2:
+            sc[0] = min(1.0, sc[0] + min(0.30, 0.10 * ambiguity))
+        elif ambiguity == 1:
+            sc[0] = min(1.0, sc[0] + 0.08)
+
+        # Traceback: cause unknown → multi-hypothesis value
+        if has_tb:
+            sc[0] = min(1.0, sc[0] + 0.15)
+
+        # Rich structural context → competition makes sense
+        if n_found >= 2 and s_hits >= 3:
+            sc[0] = min(1.0, sc[0] + 0.15)
+        elif n_found >= 1 and s_hits >= 2:
+            sc[0] = min(1.0, sc[0] + 0.08)
+
+        # No known symbols → suppress scientific (nothing to falsify)
+        if n_found == 0:
+            sc[0] = max(0.0, sc[0] - 0.20)
+            sc[1] = min(1.0, sc[1] + 0.10)
+
+        # Heuristic consensus
+        if h_sci:
+            sc[0] = min(1.0, sc[0] + 0.10)
+
+        return lv, sc
+
     async def detect_cot_level(
         self,
         user_content: str,
@@ -10562,42 +11172,21 @@ class ReasoningEngine:
         is_continuation: bool = False,
     ) -> int:
         """
-        Determine CoT depth, optionally storing it in conversation state.
+        Backward-compatible wrapper around detect_cot_configuration().
 
-        Returns:
-            0 — inconclusive, let LLM decide
-            1 — simple, inject a think-step-by-step prompt
-            2 — complex, generate a CoT reasoning chain
-            3 — deep, generate CoT reasoning + self-reflection
-
-        Args:
-            user_content (str): The user's message content.
-            is_code_session (bool): Whether the session is code-aware.
-            state (dict): The conversation state (for sticky CoT).
-            is_continuation (bool): Whether this is a continuation turn.
+        Returns the level int only. For full feature detection
+        (use_scientific, decompose), call detect_cot_configuration()
+        directly with a pre-computed signal_vector.
         """
-        if not user_content:
-            return 0
-
-        # ── v7 (PASO-15): force Level 3 Scientific CoT if valve is enabled ──
-        if self._f.valves.enforce_scientific_method:
-            self._f._log_debug("CoT: enforce_scientific_method=True → forcing Level 3")
-            return 3
-
-        if self._f.valves.enable_cot_llm_detection:
-            level = await self._detect_cot_level_via_llm(
-                user_content, is_code_session, state, is_continuation
-            )
-        else:
-            level = self._detect_cot_level_heuristic(
-                user_content, is_code_session, state
-            )
-
-        # Persist level for conversational continuity if feature is enabled
-        if self._f.ENABLE_COT_STICKY:
-            state.last_cot_level = level
-
-        return level
+        config = await self.detect_cot_configuration(
+            user_content=user_content,
+            is_code_session=is_code_session,
+            state=state,
+            signal_vector=None,
+            is_continuation=is_continuation,
+            project_id="",
+        )
+        return config["level"]
 
     async def _classify_with_crossencoder_and_llm(
         self,
@@ -17115,6 +17704,73 @@ class MetacognitiveReasoningEngine:
             combined = obj_weight * obj_score + llm_weight * llm_conf
 
         return obj_score, combined, coverage_score
+
+    def _compute_signal_vector(
+        self,
+        user_content: str,
+        project_id: str,
+        min_symbol_length: int = 4,
+    ) -> Dict[str, int]:
+        """
+        Synchronous SymbolGraph pre-scan.
+
+        Runs gather_evidence() on the raw user message — treating it as
+        if it were a hypothesis — to measure how many known codebase symbols
+        it mentions and whether any call-relation patterns are detectable.
+
+        This is a reinforcement signal, not a trigger. High count means
+        the user is asking about specific indexed code. Low count means
+        the query is generic — fine for linear CoT, poor fit for
+        compete_hypotheses (nothing to falsify structurally).
+
+        min_symbol_length filters short generic words that happen to
+        match symbol names ('id', 'db', 'run'). Default 4.
+
+        Called synchronously BEFORE the parallel gather in
+        _detect_and_generate_cot so it adds zero perceived latency.
+
+        Returns:
+            n_mentioned:     symbols from query present in index
+                             (regardless of active block presence)
+            n_found:         symbols both mentioned AND verified in graph
+            n_relations:     call-relation patterns detected in query text
+            structural_hits: n_mentioned + n_relations (total signal)
+        """
+        _empty = {
+            "n_mentioned": 0,
+            "n_found": 0,
+            "n_relations": 0,
+            "structural_hits": 0,
+        }
+
+        if not user_content or not project_id:
+            return _empty
+
+        try:
+            evidence = self.gather_evidence(user_content, project_id)
+
+            n_mentioned = sum(
+                1 for name in evidence.symbols_found if len(name) >= min_symbol_length
+            )
+            n_found = sum(
+                1
+                for name, found in evidence.symbols_found.items()
+                if found and len(name) >= min_symbol_length
+            )
+            n_relations = len(evidence.call_relations_valid)
+
+            return {
+                "n_mentioned": n_mentioned,
+                "n_found": n_found,
+                "n_relations": n_relations,
+                "structural_hits": n_mentioned + n_relations,
+            }
+        except Exception as e:
+            self._f._log_debug(
+                f"_compute_signal_vector: failed ({type(e).__name__}: {e}) "
+                f"→ returning empty signal"
+            )
+            return _empty
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Pre-evidence design and prediction generation
@@ -24146,41 +24802,55 @@ class MessageAssembler:
         messages: List[dict],
     ) -> None:
         """
-        Detect CoT level and generate reasoning.
-        Modifies `dynamic_injections` in‑place.
+        Detect CoT configuration and generate reasoning.
+        Modifies `dynamic_injections` in-place.
 
-        Integrations (Fase 3):
-        * QueryDecomposition: decompose_questions runs in the parallel gather
-          alongside detect_cot_level. Upgrades CoT level if ≥2 independent
-          questions detected. Signal: cot_any_used=True + len(sub_questions)≥2.
-        * FocalReasoning: per-question volatile activation + CoT synthesis.
-          Signal: enable_focal_reasoning + len(sub_questions)≥2 + cot_level≥2
-          + not arch mode. Falls back to unified path if produces nothing.
-        * H6 dialectical order: already in compete_hypotheses — no change here.
+        Detection cascade (Fase 3 + new):
+        * STAGE 0 — SymbolGraph pre-scan: sync, free, before parallel gather.
+          Computes structural specificity of the user query.
+        * STAGE 1 — Heuristic: always runs, feeds stages 2 and 3.
+        * STAGE 2 — CrossEncoder: 6 pairs (level + scientific/linear).
+          Reinforced by stages 0 and 1.
+        * STAGE 3 — LLM: receives full cascaded context. Falls back to
+          stage 1 if unavailable.
 
-        Modified (M3): enforce_scientific_method forces cot_any_used=True.
-        Modified (AC-A): uses is_continuation to skip CoT on genuine continuations.
-        Modified (CoT fix): level 1 is a terminal lightweight path.
+        Generation routing:
+        * use_scientific=True OR level==3 → generate_scientific_reasoning_L3
+        * use_scientific=False AND level==2 → generate_cot_reasoning (linear)
+        * Architecture path mirrors: sci/L3 → scientific_arch, else arch.
+
+        QueryDecomposition (Fase 3):
+          decompose_questions runs in Task 2 of the parallel gather.
+          Upgrades CoT level if ≥2 independent questions detected.
+
+        FocalReasoning (Fase 3):
+          per-question volatile activation + CoT synthesis.
+          Signal: enable_focal_reasoning + len(sub_questions)≥2 + level≥2
+                  + not arch mode. Falls back to unified if produces nothing.
         """
         # ── REGION 1: DETECT COT LEVEL ──
-        self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT level")
+        self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT configuration")
         manual_cot_used = False
         cot_any_used = False
         cot_level = 2
+        _use_scientific = False
         reasoning = None
         cot_question = ""
         user_content = last_user_msg.get("content", "") if last_user_msg else ""
-        sub_questions: List[str] = [user_content]  # ← QueryDecomposition default
+        sub_questions: List[str] = [user_content]
 
-        # Reset degradation flag for this turn
         self._last_cot_degraded = False
 
-        # ── M3: enforce_scientific_method forces level 3 and cot_any_used ──
+        # ── enforce_scientific_method ─────────────────────────────────────
         if self._f.valves.enforce_scientific_method:
-            self._f._log_debug("CoT: enforce_scientific_method=True → forcing Level 3")
+            self._f._log_debug(
+                "CoT: enforce_scientific_method=True → forcing L3 scientific"
+            )
             cot_level = 3
+            _use_scientific = True
             cot_any_used = True
 
+        # ── Manual /think command ─────────────────────────────────────────
         if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
             if (
                 last_user_msg
@@ -24203,8 +24873,35 @@ class MessageAssembler:
                             )
                         )
 
-        # ── Parallel gather: keep_full_code + detect_cot_level + decompose ──
-        # AC-A: only run if NOT a genuine continuation
+        # ── STAGE 0: SymbolGraph pre-scan ─────────────────────────────────
+        # Synchronous, zero LLM cost. Computed before the parallel gather
+        # so it's available as reinforcement in Task 1.
+        _signal_vector: Dict[str, int] = {
+            "n_mentioned": 0,
+            "n_found": 0,
+            "n_relations": 0,
+            "structural_hits": 0,
+        }
+        if (
+            is_code_session
+            and self._f.valves.enable_symbol_graph_cot_signal
+            and project_id
+            and not is_continuation
+            and not self._f.valves.enforce_scientific_method
+            and user_content
+        ):
+            _signal_vector = self._f._meta_reasoning._compute_signal_vector(
+                user_content,
+                project_id,
+                min_symbol_length=self._f.valves.auto_scientific_min_symbol_length,
+            )
+            if _signal_vector["n_found"] > 0:
+                self._f._log_debug(
+                    f"SymbolGraph pre-scan: {_signal_vector['n_found']} symbols "
+                    f"found, {_signal_vector['structural_hits']} total hits"
+                )
+
+        # ── Parallel gather (slot_free, auto-detect path) ─────────────────
         if (
             slot_free
             and not manual_cot_used
@@ -24223,7 +24920,8 @@ class MessageAssembler:
                     [m for m in messages if m.get("role") != "system"]
                 )
                 _available_mp_pre = max(
-                    0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
+                    0,
+                    self._f.valves.context_window_tokens - _prelim_tok - _hist_tok,
                 )
             _skip_intent_llm = (
                 self._f.valves.enable_multi_phase_response
@@ -24240,7 +24938,8 @@ class MessageAssembler:
             else:
                 parallel_tasks.append(asyncio.sleep(0, result=True))
 
-            # Task 1: detect_cot_level
+            # Task 1: detect_cot_configuration (replaces detect_cot_level)
+            # Passes signal_vector from Stage 0 so it feeds CE reinforcement.
             if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
                 cot_detection_content = (
                     user_question
@@ -24248,20 +24947,29 @@ class MessageAssembler:
                     else user_content
                 )
                 parallel_tasks.append(
-                    self._f._reasoning.detect_cot_level(
+                    self._f._reasoning.detect_cot_configuration(
                         cot_detection_content,
                         is_code_session,
                         state,
+                        signal_vector=_signal_vector,
                         is_continuation=is_continuation,
+                        project_id=project_id,
                     )
                 )
             else:
-                parallel_tasks.append(asyncio.sleep(0, result=0))
+                parallel_tasks.append(
+                    asyncio.sleep(
+                        0,
+                        result={
+                            "level": 0,
+                            "use_scientific": False,
+                            "decompose": False,
+                            "source": "disabled",
+                        },
+                    )
+                )
 
             # Task 2: decompose_questions (QueryDecomposition)
-            # Signal: not _skip_intent_llm (budget not critical) AND
-            # CoT is potentially active (we need a level to upgrade).
-            # If _skip_intent_llm, context is critical — zero extra latency.
             if (
                 not _skip_intent_llm
                 and (
@@ -24280,31 +24988,42 @@ class MessageAssembler:
 
             results = await asyncio.gather(*parallel_tasks)
 
-            # Extract results
+            # Extract Task 0
             self._f._user_intent_full_code = (
                 results[0] if not _skip_intent_llm else True
             )
-            detected_level = (
-                results[1]
-                if (
-                    self._f.valves.enable_cot_on_demand
-                    or self._f.valves.auto_cot_enabled
-                )
-                else 0
-            )
+
+            # Extract Task 1 — CoTConfig
+            cot_config = results[1]
+            if isinstance(cot_config, dict):
+                detected_level = cot_config.get("level", 0)
+                _use_scientific = cot_config.get("use_scientific", False)
+                _decompose_hint = cot_config.get("decompose", False)
+                _cot_source = cot_config.get("source", "?")
+                _cot_rationale = cot_config.get("rationale", "")
+            else:
+                # Backward-compat fallback if result is an int
+                detected_level = int(cot_config) if cot_config else 0
+                _use_scientific = False
+                _decompose_hint = False
+                _cot_source = "compat"
+                _cot_rationale = ""
+
             if detected_level > 0:
                 cot_any_used = True
                 cot_level = detected_level
                 self._f._log_debug(
-                    f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
+                    f"🧠 CoT config detected: level={cot_level}, "
+                    f"scientific={_use_scientific}, "
+                    f"source={_cot_source}, "
+                    f"rationale='{_cot_rationale}'"
                 )
 
-            # QueryDecomposition result
+            # Extract Task 2 — QueryDecomposition
             sub_questions = results[2] if len(results) > 2 else [user_content]
 
             # Upgrade CoT level if multiple independent questions detected.
-            # Signal: CoT already active + decomposition confirmed ≥2 questions.
-            # Gradual: L1→L2, L2→L3 (2 simple questions ≠ L3 justification).
+            # Gradual: L1→L2, L2→L3.
             if (
                 cot_any_used
                 and not manual_cot_used
@@ -24324,6 +25043,7 @@ class MessageAssembler:
                 )
 
         else:
+            # Serial path (continuation, manual CoT already set, etc.)
             self._f._user_intent_full_code = True
             if (
                 not manual_cot_used
@@ -24336,16 +25056,22 @@ class MessageAssembler:
                     if (user_question and len(user_question) >= 10)
                     else user_content
                 )
-                cot_level = await self._f._reasoning.detect_cot_level(
+                cot_config = await self._f._reasoning.detect_cot_configuration(
                     cot_detection_content,
                     is_code_session,
                     state,
+                    signal_vector=_signal_vector,
                     is_continuation=is_continuation,
+                    project_id=project_id,
                 )
-                if cot_level > 0:
+                detected_level = cot_config.get("level", 0)
+                _use_scientific = cot_config.get("use_scientific", False)
+                if detected_level > 0:
                     cot_any_used = True
+                    cot_level = detected_level
                     self._f._log_debug(
-                        f"🧠 ENRICHMENT – CoT Step 1/3: Detected level {cot_level}"
+                        f"🧠 CoT config (serial): level={cot_level}, "
+                        f"scientific={_use_scientific}"
                     )
 
         if not cot_any_used:
@@ -24357,7 +25083,7 @@ class MessageAssembler:
             )
             return
 
-        # Multi-phase pre-check: degrade CoT if context is tight
+        # ── Multi-phase pre-check ─────────────────────────────────────────
         _mp_cot_degraded = False
         _available_mp_pre = self._f.valves.context_window_tokens
         if (
@@ -24370,7 +25096,8 @@ class MessageAssembler:
                 [m for m in messages if m.get("role") != "system"]
             )
             _available_mp_pre = max(
-                0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
+                0,
+                self._f.valves.context_window_tokens - _prelim_tok - _hist_tok,
             )
         if (
             self._f.valves.enable_multi_phase_response
@@ -24380,20 +25107,20 @@ class MessageAssembler:
             and slot_free
         ):
             self._f._log_debug(
-                f"🧠 Multi-phase pre-check: {_available_mp_pre} tokens available "
+                f"🧠 Multi-phase pre-check: {_available_mp_pre} tokens "
                 f"< threshold {self._f.valves.multi_phase_response_threshold}. "
-                f"Degrading CoT Level {cot_level} → 1 "
-                f"(Fase 1 of the protocol absorbs the reasoning)."
+                f"Degrading CoT L{cot_level}→1."
             )
             cot_level = 1
+            _use_scientific = False
             _mp_cot_degraded = True
 
         self._last_cot_degraded = _mp_cot_degraded
 
-        # ── REGION 2: GENERATE REASONING (only for levels 2 and 3) ──
+        # ── REGION 2: GENERATE REASONING ──
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
 
-        # ── Level 1 is a terminal lightweight path ───────────────────────
+        # Level 1 — terminal lightweight path
         if cot_level == 1:
             if not manual_cot_used and not _mp_cot_degraded:
                 dynamic_injections.append(
@@ -24404,12 +25131,11 @@ class MessageAssembler:
                     )
                 )
             self._f._log_debug(
-                "🧠 ENRICHMENT – CoT Step 2/3: level 1 — inline reasoning prompt, "
-                "no chain generated (this is expected, not a failure)"
+                "🧠 ENRICHMENT – CoT Step 2/3: level 1 — inline prompt, no chain"
             )
             return
 
-        # ── From here on, only levels 2 and 3 ──────────────────────────
+        # From here: levels 2 and 3 only
         _model_ctx = self._f.valves.active_context_max_tokens or 28000
         _cot_context_limit = _model_ctx // 3
 
@@ -24438,25 +25164,35 @@ class MessageAssembler:
             else:
                 _is_arch = False
                 self._f._log_debug(
-                    "🏗️ No skeleton available — falling back to standard CoT context"
+                    "🏗️ No skeleton available — falling back to standard CoT"
                 )
 
         if not _is_arch:
             if self._f.tokenizer:
                 _prelim_tokens = len(self._f.tokenizer.encode(prelim_system))
-                if _prelim_tokens > _cot_context_limit:
-                    prelim_for_cot = self._f._tokens.truncate_text_to_tokens(
+                prelim_for_cot = (
+                    self._f._tokens.truncate_text_to_tokens(
                         prelim_system, _cot_context_limit
                     )
-                else:
-                    prelim_for_cot = prelim_system
+                    if _prelim_tokens > _cot_context_limit
+                    else prelim_system
+                )
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-        # ── FocalReasoning path (Capa 2 — H4) ────────────────────────────
-        # Signal: multiple independent questions detected AND not arch mode
-        # (arch has its own skeleton-based reasoning per question).
-        # Falls back to unified generation if per-question reasoning fails.
+        # ── Generation routing ────────────────────────────────────────────
+        # use_scientific=True OR level==3 → compete_hypotheses (scientific)
+        # use_scientific=False AND level==2 → linear step-by-step CoT
+        # Architecture path mirrors this.
+        _go_scientific = _use_scientific or cot_level >= 3
+
+        if _go_scientific and _use_scientific and cot_level < 3:
+            self._f._log_debug(
+                f"use_scientific=True with cot_level={cot_level}: "
+                f"routing to scientific generation (L3 compete_hypotheses)"
+            )
+
+        # ── FocalReasoning path ───────────────────────────────────────────
         reasoning = None
         if (
             self._f.valves.enable_focal_reasoning
@@ -24466,7 +25202,7 @@ class MessageAssembler:
         ):
             self._f._log_debug(
                 f"🧠 FocalReasoning: {len(sub_questions)} questions, "
-                f"level {cot_level}"
+                f"level={cot_level}, scientific={_go_scientific}"
             )
             per_q = await self._f._meta_reasoning.reason_per_focus(
                 sub_questions, project_id, cot_level, prelim_for_cot
@@ -24474,80 +25210,60 @@ class MessageAssembler:
             if per_q:
                 reasoning = self._f._meta_reasoning.synthesize_focal_reasoning(per_q)
                 self._f._log_debug(
-                    f"🧠 FocalReasoning: synthesized {len(per_q)}/{len(sub_questions)} "
-                    f"questions ({len(reasoning)} chars)"
+                    f"🧠 FocalReasoning: synthesized {len(per_q)}/"
+                    f"{len(sub_questions)} questions ({len(reasoning)} chars)"
                 )
             else:
                 self._f._log_debug(
-                    "🧠 FocalReasoning: produced no results — "
-                    "falling back to unified generation"
+                    "🧠 FocalReasoning: no results — falling back to unified"
                 )
 
-        # ── Unified generation (if FocalReasoning didn't produce) ─────────
+        # ── Unified generation ────────────────────────────────────────────
         if not reasoning:
-            if not manual_cot_used:
-                question = user_question
-                if (
-                    _is_arch
-                    and cot_level == 3
-                    and self._f.valves.enable_scientific_arch_reasoning
-                ):
-                    reasoning = await self._f._reasoning.generate_scientific_architecture_reasoning(
-                        question, prelim_for_cot, project_id, label="sci_arch_cot"
+            question = cot_question if manual_cot_used else user_question
+
+            if _is_arch:
+                if _go_scientific and self._f.valves.enable_scientific_arch_reasoning:
+                    await self._f._emit_status(
+                        "🔬🏗️ Scientific architecture reasoning..."
                     )
-                elif _is_arch and cot_level >= 2:
+                    reasoning = await self._f._reasoning.generate_scientific_architecture_reasoning(
+                        question,
+                        prelim_for_cot,
+                        project_id,
+                        label="sci_arch_cot",
+                    )
+                else:
                     reasoning = (
                         await self._f._reasoning.generate_architecture_reasoning(
                             question, prelim_for_cot, project_id, label="arch_cot"
                         )
                     )
-                elif cot_level == 2:
-                    reasoning = await self._f._reasoning.generate_cot_reasoning(
-                        question, prelim_for_cot
-                    )
-                elif cot_level == 3:
-                    reasoning = (
-                        await self._f._reasoning.generate_scientific_reasoning_L3(
-                            question, prelim_for_cot, project_id, label="scientific_cot"
-                        )
-                    )
+            elif _go_scientific:
+                await self._f._emit_status(
+                    "🔬 Scientific reasoning — evaluating hypotheses..."
+                )
+                reasoning = await self._f._reasoning.generate_scientific_reasoning_L3(
+                    question,
+                    prelim_for_cot,
+                    project_id,
+                    label="scientific_cot",
+                )
             else:
-                if (
-                    _is_arch
-                    and cot_level == 3
-                    and self._f.valves.enable_scientific_arch_reasoning
-                ):
-                    reasoning = await self._f._reasoning.generate_scientific_architecture_reasoning(
-                        cot_question, prelim_for_cot, project_id, label="sci_arch_cot"
-                    )
-                elif _is_arch and cot_level >= 2:
-                    reasoning = (
-                        await self._f._reasoning.generate_architecture_reasoning(
-                            cot_question, prelim_for_cot, project_id, label="arch_cot"
-                        )
-                    )
-                elif cot_level == 2:
-                    reasoning = await self._f._reasoning.generate_cot_reasoning(
-                        cot_question, prelim_for_cot
-                    )
-                elif cot_level == 3:
-                    reasoning = (
-                        await self._f._reasoning.generate_scientific_reasoning_L3(
-                            cot_question,
-                            prelim_for_cot,
-                            project_id,
-                            label="scientific_cot",
-                        )
-                    )
+                # cot_level == 2, use_scientific == False → linear step-by-step
+                reasoning = await self._f._reasoning.generate_cot_reasoning(
+                    question, prelim_for_cot
+                )
 
+        # ── L3 scientific fallback → linear L2 ───────────────────────────
         _cot_error_msg = "Unable to generate reasoning."
         if (
             not manual_cot_used
-            and cot_level == 3
+            and _go_scientific
             and (reasoning is None or reasoning == _cot_error_msg)
         ):
             self._f._log_debug(
-                "🧠 ENRICHMENT – CoT Step 2/3: Level 3 failed, falling back to level 2"
+                "🧠 Scientific reasoning failed — falling back to linear L2"
             )
             reasoning = await self._f._reasoning.generate_cot_reasoning(
                 user_question, prelim_for_cot
@@ -24568,7 +25284,7 @@ class MessageAssembler:
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
 
-        # Auto-resolve /expand hints emitted by the architecture CoT
+        # Auto-resolve /expand hints from architecture CoT
         if _is_arch:
             try:
                 reasoning = await self._f._ctx_builder._resolve_cot_expands(
@@ -28906,6 +29622,52 @@ class Filter:
                 "and adapt strategy for future competitions in this project. "
                 "Enables long-term learning per project_id. "
                 "Stored in MetacognitiveReasoningEngine._performance_history."
+            ),
+        )
+
+        enable_symbol_graph_cot_signal: bool = Field(
+            default=True,
+            description=(
+                "Use SymbolGraph pre-scan as reinforcement signal for CoT "
+                "feature detection. Synchronous, zero LLM cost."
+            ),
+        )
+        auto_scientific_min_symbol_length: int = Field(
+            default=4,
+            description=(
+                "Symbols shorter than this are excluded from structural "
+                "hit count. Prevents 'id', 'db' from inflating the signal."
+            ),
+        )
+
+        # ── SymbolGraph CoT signal ────────────────────────────────────────
+        enable_symbol_graph_cot_signal: bool = Field(
+            default=True,
+            description=(
+                "Use a synchronous SymbolGraph pre-scan as reinforcement "
+                "signal for CoT feature detection. Zero LLM cost. "
+                "Boosts scientific mode detection when the query mentions "
+                "known symbols from the indexed codebase."
+            ),
+        )
+        auto_scientific_min_symbol_length: int = Field(
+            default=4,
+            ge=1,
+            le=10,
+            description=(
+                "Symbols shorter than this are excluded from the SymbolGraph "
+                "hit count. Prevents short generic names ('id', 'db', 'x') "
+                "from inflating the structural signal."
+            ),
+        )
+        cot_scientific_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.05,
+            le=1.0,
+            description=(
+                "Minimum score difference between the 'scientific' and 'linear' "
+                "CrossEncoder pairs to make a confident scientific/linear decision "
+                "without falling back to the LLM. Higher = stricter."
             ),
         )
 
