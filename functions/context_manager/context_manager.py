@@ -1397,6 +1397,7 @@ class ConversationStateManager:
             )
             raw_active = {}
 
+        # ── Batch fetch de code_contents ────────────────────────
         hash_to_block_key: Dict[str, str] = {}
         for k, v in raw_active.items():
             content_field = v.get("content", "")
@@ -1422,7 +1423,6 @@ class ConversationStateManager:
                     f"batch content fetch failed: {e}"
                 )
 
-        # Aplicar el resultado del batch al raw_active antes de construir bloques
         for content_hash, block_key in hash_to_block_key.items():
             raw_active[block_key]["content"] = content_lookup.get(
                 content_hash,
@@ -3199,50 +3199,59 @@ class ContextPager:
         db_conn=None,
     ) -> "Optional[CodeBlock]":
         """
-        Retrieve a paged block for temporary use THIS TURN ONLY.
-
-        Reconstruction uses ChromaDB as the single authoritative source —
-        the full block content is stored there by _page_out_async.
-        The previous SQLite path was dead code: page_out_block never wrote
-        to code_contents, so reconstruction always fell back to a 2000-char
-        excerpt. Now the document field contains the complete content.
-
+        Retrieve a soft-evicted block from ChromaDB for use in the current turn only.
         Does NOT restore the block to active_blocks.
-
-        Args:
-            block_hash: Hash of the block to page in.
-            project_id: Current project identifier.
-            chroma_collection: ChromaDB collection.
-            db_conn: Unused, kept for API compatibility.
-
-        Returns:
-            The reconstructed CodeBlock, or None if not found.
+    
+        ChromaDB is always consulted when the block is absent from the in-memory
+        registry. This handles the post-restart case where _paged_hashes was reset
+        but the block persists in ChromaDB. When found via this fallback path, the
+        block_hash is re-registered in _paged_hashes so that subsequent is_paged()
+        calls return correctly for the remainder of the session.
+    
+        db_conn is accepted for API compatibility but is unused; ChromaDB is the
+        single authoritative source for paged block content.
         """
-        if not self.is_paged(block_hash, project_id):
+        if chroma_collection is None:
             return None
-
+    
         entry_id = f"{project_id}_paged_{block_hash}"
-
-        # ── Step 1: Retrieve full content and metadata from ChromaDB ──────────
+    
+        # -- Step 1: log registry miss for diagnostics --
+        # The absence from _paged_hashes does not abort the lookup; it may
+        # simply indicate a post-restart access.
+        if not self.is_paged(block_hash, project_id):
+            self._f._log_debug(
+                f"page_in_block: {block_hash[:8]} not in paged registry, "
+                f"attempting ChromaDB lookup (possible post-restart access)"
+            )
+    
+        # -- Step 2: fetch full content and metadata from ChromaDB --
         meta = None
         content = ""
-        if chroma_collection is not None:
-            try:
-                result = await anyio.to_thread.run_sync(
-                    lambda: chroma_collection.get(
-                        ids=[entry_id], include=["metadatas", "documents"]
-                    )
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: chroma_collection.get(
+                    ids=[entry_id], include=["metadatas", "documents"]
                 )
-                if result and result.get("ids"):
-                    meta = result["metadatas"][0]
-                    content = result["documents"][0] if result.get("documents") else ""
-            except Exception:
-                pass
-
+            )
+            if result and result.get("ids"):
+                meta = result["metadatas"][0]
+                content = result["documents"][0] if result.get("documents") else ""
+        except Exception as e:
+            self._f._log_debug(
+                f"page_in_block: ChromaDB fetch failed for {block_hash[:8]}: {e}"
+            )
+            return None
+    
         if not content:
             return None
-
-        # ── Step 2: Extract metadata fields with safe defaults ────────────────
+    
+        # -- Step 3: re-register in paged_hashes --
+        # Ensures is_paged() returns True for the remainder of this session
+        # without requiring another ChromaDB round-trip.
+        self._paged_hashes.setdefault(project_id, set()).add(block_hash)
+    
+        # -- Step 4: extract metadata fields with safe defaults --
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3250,20 +3259,20 @@ class ContextPager:
             else ContentType.GENERAL.value
         )
         importance = meta.get("importance_score", 1.0) if meta else 1.0
-
+    
         try:
             ctype = ContentType(ctype_str)
         except Exception:
             ctype = ContentType.GENERAL
-
-        # ── Step 3: Deterministic symbol re-extraction ────────────────────────
+    
+        # -- Step 5: re-extract symbols from the restored content --
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
-
-        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────
+    
+        # -- Step 6: reconstruct and return the CodeBlock --
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -3274,6 +3283,7 @@ class ContextPager:
         )
         for s in block.symbols:
             s.parent_block_hash = block_hash
+    
         return block
 
 
@@ -4459,7 +4469,7 @@ class ContextBuilder:
                 )
                 pstate["skeleton_tier_cache_key"] = structure_hash
                 pstate["skeleton_tier_cached"] = ""
-                psm.set_skeleton_tier_qids(project_id, [])
+                psm.set_skeleton_tier_qids(project_id, [])  # FIX Bug 4
                 return ""
 
         tier = (
@@ -8229,29 +8239,28 @@ class StateStore:
 
     async def load_symbol_edges_from_db(self, project_id: str) -> int:
         """
-        Restore typed edges from SQLite.
+        Restore typed edges from SQLite into the SymbolIndex.
 
-        Only restores if the saved code_state_hash matches the current state.
-        Returns the number of edges restored (0 if stale or no data).
+        Restoration is skipped only when the in-memory edge count already matches
+        the count recorded in symbol_edges_meta, indicating a complete set is
+        present. A partial in-memory set (e.g. only 'calls' edges rebuilt by
+        _rebuild_symbol_index on cold load) does not prevent restoration.
 
-        Args:
-            project_id: The current project identifier.
+        add_edge is idempotent, so edges that already exist in memory are safely
+        re-added without creating duplicates.
 
-        Returns:
-            int: Number of edges restored.
+        Returns the number of edges restored, or 0 if restoration was skipped or
+        the saved metadata is stale relative to the current code state.
         """
         if not self._f.valves.enable_edge_persistence:
             return 0
 
-        # Skip if edges are already loaded in memory
-        existing = self._f._symbol_index.get_all_edges_out(project_id)
-        if existing:
-            return 0
-
+        # -- Step 1: validate code state hash --
         current_code_hash = self._f._activation.compute_code_state_hash(project_id)
         if not current_code_hash:
-            return 0  # no active code
+            return 0
 
+        # -- Step 2: read saved metadata --
         meta_row = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT code_state_hash, edge_count FROM symbol_edges_meta "
@@ -8273,6 +8282,19 @@ class StateStore:
             )
             return 0
 
+        # -- Step 3: compare in-memory count against saved count --
+        # _rebuild_symbol_index populates only 'calls' edges on cold load,
+        # so in_memory_count < saved_count signals an incomplete restore.
+        existing = self._f._symbol_index.get_all_edges_out(project_id)
+        in_memory_count = sum(len(edges) for edges in existing.values())
+        if in_memory_count >= saved_count:
+            self._f._log_debug(
+                f"Edge persistence: in-memory count ({in_memory_count}) matches "
+                f"saved count ({saved_count}), skipping reload"
+            )
+            return 0
+
+        # -- Step 4: fetch and register all saved edges --
         rows = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT src, dst, type, weight, confidence "
@@ -16476,57 +16498,63 @@ Output only the symbol name.
         inferred_seeds: Optional[Dict[str, float]] = None,
         cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
-        """Build activation graph combining lexical, structural and historical
-        seed vectors.
+        """
+        Build an ActivationGraph by combining three independent seed vectors
+        with configurable weights (lexical, structural, historical).
 
-        Q2: If cached_scores is provided, use it directly instead of recomputing.
+        When cached_scores is provided, the method skips all three PPR propagation
+        passes. The seed set is still resolved so that the source annotation
+        ('seed' vs 'propagation') on each node is accurate in the returned graph.
+
+        Weight configuration valves:
+            multi_seed_weight_lexical    — query-term and inferred seeds
+            multi_seed_weight_structural — entry-point seeds from PathIndex views
+            multi_seed_weight_historical — mention-frequency seeds from history
         """
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
         symbol_index = self._f._symbol_index
 
+        # -- Step 1: resolve lexical seed set (needed even on cache hit for
+        #            source annotation) --
         ag_lex = ActivationGraph()
         lexical_seed_qids: Set[str] = set()
-        if exact_seeds:
-            for sym_name in exact_seeds:
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    ag_lex._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
-        if partial_seeds:
-            for sym_name in partial_seeds:
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    ag_lex._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
+
+        for sym_name in exact_seeds:
+            specificity = self._compute_node_specificity(sym_name, project_id)
+            score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
+            share = score / len(qids) if qids else 0.0
+            for qid in qids:
+                ag_lex._activations[qid] = ActivationState(
+                    node_id=qid, score=share, depth=0, source="seed"
+                )
+
+        for sym_name in partial_seeds:
+            specificity = self._compute_node_specificity(sym_name, project_id)
+            score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
+            share = score / len(qids) if qids else 0.0
+            for qid in qids:
+                ag_lex._activations[qid] = ActivationState(
+                    node_id=qid, score=share, depth=0, source="seed"
+                )
+
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
             share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag_lex._activations.get(qid)
-                if existing:
-                    ag_lex._activations[qid] = ActivationState(
-                        node_id=qid,
-                        score=min(1.0, existing.score + share * 0.4),
-                        depth=0,
-                        source="seed",
-                    )
-                else:
-                    ag_lex._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
+                ag_lex._activations[qid] = ActivationState(
+                    node_id=qid,
+                    score=min(1.0, (existing.score if existing else 0.0) + share * 0.4),
+                    depth=0,
+                    source="seed",
+                )
 
         for qid, inf_score in (inferred_seeds or {}).items():
             lexical_seed_qids.add(qid)
@@ -16538,6 +16566,25 @@ Output only the symbol name.
                 source="seed",
             )
 
+        # -- Step 2: early return from cache --
+        # Avoids three PPR propagation passes (O(V·E·steps) each) on cache hit.
+        if cached_scores is not None:
+            ag_final = ActivationGraph()
+            for qid, score in cached_scores.items():
+                if score >= 0.01:
+                    source = "seed" if qid in lexical_seed_qids else "propagation"
+                    ag_final._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=score,
+                        depth=0,
+                        source=source,
+                    )
+            self._f._log_debug(
+                f"PPR multi-seed: loaded {len(cached_scores)} scores from cache"
+            )
+            return ag_final
+
+        # -- Step 3: propagate lexical graph --
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -16546,11 +16593,11 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # -- Step 4: build and propagate structural graph --
         ag_str = ActivationGraph()
-        seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
         for view in self._f._path_index.get_all(project_id):
-            for lex_seed in seed_qids_for_structural:
+            for lex_seed in lexical_seed_qids:
                 if lex_seed in view.induced_nodes:
                     structural_seeds.add(view.entry_point)
                     break
@@ -16571,6 +16618,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # -- Step 5: build and propagate historical graph --
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -16587,20 +16635,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        if cached_scores is not None:
-            ag_final = ActivationGraph()
-            for qid, score in cached_scores.items():
-                if score >= 0.01:
-                    source = "seed" if qid in lexical_seed_qids else "propagation"
-                    ag_final._activations[qid] = ActivationState(
-                        node_id=qid,
-                        score=score,
-                        depth=0,
-                        source=source,
-                    )
-            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
-            return ag_final
-
+        # -- Step 6: combine the three graphs --
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -16663,7 +16698,6 @@ Output only the symbol name.
             f"str={len(ag_str.get_activated_nodes(0.01))}, "
             f"his={len(ag_his.get_activated_nodes(0.01))})"
         )
-
         return ag_final
 
     def _store_activation_scores(self, ag: ActivationGraph, project_id: str) -> None:
@@ -27189,6 +27223,12 @@ class ProjectStateManager:
         """
         self.get_pstate(project_id)["skeleton_tier_qids"] = qids
 
+    def set_skeleton_tier_qids(self, project_id: str, qids: List[str]) -> None:
+        """
+        Store the qualified ids rendered in the skeleton tier.
+        """
+        self.get_pstate(project_id)["skeleton_tier_qids"] = qids
+
     def get_block_b_qids_this_turn(self, project_id: str) -> List[str]:
         """
         Return the qualified ids injected into Block B this turn.
@@ -28315,6 +28355,37 @@ class SemanticSeedInferencer:
             return True
 
     # ------------------------------------------------------------------
+    # Region: Fuzzy Resolution Fallback
+    # ------------------------------------------------------------------
+
+    def _fuzzy_resolve(self, token: str, project_id: str) -> List[str]:
+        """
+        Match a token against indexed qualified names using fuzzy string comparison.
+
+        Compares the token against the bare name of each qualified id (the part
+        after the last dot) using rapidfuzz token_set_ratio. Returns qualified ids
+        whose bare name meets or exceeds seed_inference_fuzzy_threshold.
+
+        Returns an empty list when rapidfuzz is unavailable or no match clears
+        the threshold.
+        """
+        if not HAS_FUZZ:
+            return []
+
+        threshold = self._f.valves.seed_inference_fuzzy_threshold
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+        token_lower = token.lower()
+        matches: List[str] = []
+
+        for qid in all_qids:
+            bare = qid.rsplit(".", 1)[-1].lower()
+            ratio = fuzz.token_set_ratio(token_lower, bare) / 100.0
+            if ratio >= threshold:
+                matches.append(qid)
+
+        return matches
+
+    # ------------------------------------------------------------------
     # Region: Main Seed Inference Entry Point
     # ------------------------------------------------------------------
 
@@ -28457,46 +28528,45 @@ class SemanticSeedInferencer:
         self, tokens: List[str], project_id: str
     ) -> Dict[str, float]:
         """
-        Resolve a list of symbol tokens to actual qualified ids.
+        Resolve raw symbol token strings returned by the LLM planner to actual
+        qualified ids present in the SymbolIndex.
 
-        Receives a pre-parsed list of strings extracted from the JSON response
-        instead of raw LLM text. The resolution logic is unchanged:
-        exact match → dotted decomposition → bare name → fuzzy fallback.
+        Resolution cascade applied per token (first match wins):
+          1. Exact qualified id match.
+          2. Dotted decomposition: split on the last dot into (parent, member),
+             construct the qualified id, then fall back to bare member lookup.
+          3. Bare name lookup via get_qualified_names_for.
+          4. Fuzzy matching against bare names when rapidfuzz is available.
 
-        Args:
-            tokens: List of identifier strings from the LLM JSON response.
-            project_id: Current project identifier.
-
-        Returns:
-            Dictionary mapping qualified symbol ids to seed scores.
+        Tokens that match nothing after all four stages are silently dropped.
+        Scores for fuzzy matches are penalised by seed_inference_fuzzy_penalty.
+        The result is capped at seed_inference_max_symbols entries.
         """
         score = self._f.valves.seed_inference_score
         max_syms = self._f.valves.seed_inference_max_symbols
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
-
         seeds: Dict[str, float] = {}
 
         for token in tokens:
+            # -- Guard: cap and sanitize --
             if len(seeds) >= max_syms:
                 break
-
             token = str(token).strip()
             if not token:
                 continue
 
-            # Exact match.
+            # -- Stage 1: exact qualified id match --
             if token in all_qids:
                 seeds[token] = max(seeds.get(token, 0.0), score)
                 continue
 
-            # Dotted-name decomposition (e.g. "ClassName.method").
+            # -- Stage 2: dotted-name decomposition --
             if "." in token:
                 parent_name, method_part = token.rsplit(".", 1)
                 constructed_qid = qualify_symbol_name(method_part, parent_name)
                 if constructed_qid in all_qids:
                     seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
                     continue
-                # Fallback: bare method name lookup.
                 by_method = self._f._symbol_index.get_qualified_names_for(
                     method_part, project_id
                 )
@@ -28507,7 +28577,7 @@ class SemanticSeedInferencer:
                             seeds[q] = max(seeds.get(q, 0.0), share)
                     continue
 
-            # Bare name resolution.
+            # -- Stage 3: bare name lookup --
             qids = {
                 q
                 for q in self._f._symbol_index.get_qualified_names_for(
@@ -28521,7 +28591,7 @@ class SemanticSeedInferencer:
                     seeds[q] = max(seeds.get(q, 0.0), share)
                 continue
 
-            # Fuzzy matching fallback.
+            # -- Stage 4: fuzzy fallback --
             fuzzy_matches = self._fuzzy_resolve(token, project_id)
             if fuzzy_matches:
                 fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
@@ -29556,7 +29626,7 @@ class Valves(BaseModel):
         description="Force level 3 scientific reasoning for all queries (very slow, very thorough).",
     )
     scientific_hypotheses_count: int = Field(
-        default=3,                              # ← sweet spot: N=2 loses 12% quality, N=4+ diminishing returns
+        default=3,  # ← sweet spot: N=2 loses 12% quality, N=4+ diminishing returns
         ge=2,
         le=6,
         description=(
@@ -29567,7 +29637,7 @@ class Valves(BaseModel):
         ),
     )
     scientific_confidence_threshold: float = Field(
-        default=0.72,                           # ← 0.72 vs 0.75: saves 10% time for -1% quality
+        default=0.72,  # ← 0.72 vs 0.75: saves 10% time for -1% quality
         ge=0.0,
         le=1.0,
         description=(
@@ -29577,7 +29647,7 @@ class Valves(BaseModel):
         ),
     )
     scientific_max_iterations: int = Field(
-        default=2,                              # ← best ROI; iter 3 ROI ≈ 0.027 (marginal)
+        default=2,  # ← best ROI; iter 3 ROI ≈ 0.027 (marginal)
         ge=1,
         le=4,
         description=(
@@ -29599,7 +29669,7 @@ class Valves(BaseModel):
     #   enable_experiment_design:   0.083  (foundational — required for above)
     #   enable_generate_predictions: 0.027 (most optional, same ROI as iter 3)
     enable_experiment_design: bool = Field(
-        default=True,                           # ← NEVER disable: foundational for all other features
+        default=True,  # ← NEVER disable: foundational for all other features
         description=(
             "Classify hypothesis claims as CRITICAL (hard kill if false) vs "
             "SUPPORTIVE (score penalty only) before gathering evidence. "
@@ -29609,7 +29679,7 @@ class Valves(BaseModel):
         ),
     )
     enable_generate_predictions: bool = Field(
-        default=True,                           # ← marginal ROI=0.027 but structurally complete
+        default=True,  # ← marginal ROI=0.027 but structurally complete
         description=(
             "Deduce structural consequences of each hypothesis and verify them. "
             "Closes the hypothetico-deductive cycle. "
@@ -29619,7 +29689,7 @@ class Valves(BaseModel):
         ),
     )
     enable_weighted_scoring: bool = Field(
-        default=True,                           # ← NEVER disable: free, depends on experiment_design
+        default=True,  # ← NEVER disable: free, depends on experiment_design
         description=(
             "Weight critical claims 10x in objective_score. "
             "Zero additional cost — uses experiment_design output. "
@@ -29628,7 +29698,7 @@ class Valves(BaseModel):
         ),
     )
     enable_experimentum_crucis: bool = Field(
-        default=True,                           # ← ROI=0.455: best non-free ROI in the system
+        default=True,  # ← ROI=0.455: best non-free ROI in the system
         description=(
             "When top-2 hypotheses score within crucis_threshold, "
             "design and verify a minimal tiebreaker experiment. "
@@ -29637,7 +29707,7 @@ class Valves(BaseModel):
         ),
     )
     crucis_threshold: float = Field(
-        default=0.12,                           # ← 0.12 vs 0.10: catches 10-12% margin ties worth investigating
+        default=0.12,  # ← 0.12 vs 0.10: catches 10-12% margin ties worth investigating
         description=(
             "Score difference below which experimentum crucis is triggered. "
             "0.12 vs 0.10: triggers ~33% more often, catching borderline ties "
@@ -29645,7 +29715,7 @@ class Valves(BaseModel):
         ),
     )
     enable_scope_delimitation: bool = Field(
-        default=True,                           # ← ROI=0.117: good communication quality gain
+        default=True,  # ← ROI=0.117: good communication quality gain
         description=(
             "After selecting the winning hypothesis, add conditions of validity. "
             "ROI=0.117: 0.60 expected calls, +7% quality. "
@@ -29653,7 +29723,7 @@ class Valves(BaseModel):
         ),
     )
     enable_devil_advocate: bool = Field(
-        default=True,                           # ← ROI=0.160: excellent given 0.25 expected calls
+        default=True,  # ← ROI=0.160: excellent given 0.25 expected calls
         description=(
             "Run a contrarian pass on the winning hypothesis when score > 0.8. "
             "ROI=0.160: 0.25 expected calls (25% activation), +4% quality. "
@@ -29667,7 +29737,7 @@ class Valves(BaseModel):
     # is already enabled). Activate only when peer_review_model differs
     # from cot_model_level3.
     enable_peer_review: bool = Field(
-        default=False,                          # ← ROI=0 without 2nd model
+        default=False,  # ← ROI=0 without 2nd model
         description=(
             "Enable peer review using a different model architecture. "
             "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
@@ -29693,7 +29763,7 @@ class Valves(BaseModel):
     # ── 8.9 Scientific method — active learning & coverage (H4 + H2) ────
     # Both free (deterministic, no LLM). Never disable.
     enable_active_learning: bool = Field(
-        default=True,                           # ← NEVER disable: free, ∞ ROI
+        default=True,  # ← NEVER disable: free, ∞ ROI
         description=(
             "Reclassify UNKNOWN claims as SUPPORTIVE when their symbols "
             "exist in the SymbolGraph. Deterministic — no LLM call. "
@@ -29719,7 +29789,7 @@ class Valves(BaseModel):
         ),
     )
     enable_coverage_guard_for_falsification: bool = Field(
-        default=True,                           # ← NEVER disable: free, prevents false kills
+        default=True,  # ← NEVER disable: free, prevents false kills
         description=(
             "Downgrade hard kill to score penalty when coverage < "
             "min_coverage_for_falsification. Prevents Popperian hard kill "
@@ -29728,7 +29798,7 @@ class Valves(BaseModel):
         ),
     )
     min_coverage_for_falsification: float = Field(
-        default=0.3,                            # ← equal to low_coverage_threshold: consistent policy
+        default=0.3,  # ← equal to low_coverage_threshold: consistent policy
         description=(
             "Minimum coverage_score required to apply hard kill. "
             "Keep equal to low_coverage_threshold for consistent policy: "
@@ -29741,7 +29811,7 @@ class Valves(BaseModel):
     # but break fires at iter 3 first). Valve coherence check warns about
     # this at startup. Useful when max_iters is set to 4.
     enable_stagnation_detection: bool = Field(
-        default=True,                           # ← harmless with max_iters=2; useful at max_iters=4
+        default=True,  # ← harmless with max_iters=2; useful at max_iters=4
         description=(
             "Detect local optima in hypothesis refinement and switch to "
             "divergent thinking (high temperature, contrarian prompt). "
@@ -29767,7 +29837,7 @@ class Valves(BaseModel):
     # ── 8.11 Scientific method — project‑level metacognition (H5) ───────
     # Free: deterministic analysis post-competition. Compounds over time.
     enable_metacognitive_debriefing: bool = Field(
-        default=True,                           # ← NEVER disable: free, long-term adaptive value
+        default=True,  # ← NEVER disable: free, long-term adaptive value
         description=(
             "Analyze failure patterns after each competition and adapt "
             "strategy for future calls in this project. "
