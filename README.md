@@ -80,7 +80,7 @@ LLM fail → Infere = True (conservative)
 ```
 
 ## Fully compliant with the scientific method
-### COMPREHENSIVE FRAMEWORK: METACOGNITIVE & SCIENTIFIC METHOD SKILLS
+With metacognitive & scientific method skills.
 
 ### Applied to a Hybrid LLM-Symbolic Reasoning Engine
 
