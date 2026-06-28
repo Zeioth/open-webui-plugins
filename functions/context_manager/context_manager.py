@@ -3201,21 +3201,21 @@ class ContextPager:
         """
         Retrieve a soft-evicted block from ChromaDB for use in the current turn only.
         Does NOT restore the block to active_blocks.
-    
+
         ChromaDB is always consulted when the block is absent from the in-memory
         registry. This handles the post-restart case where _paged_hashes was reset
         but the block persists in ChromaDB. When found via this fallback path, the
         block_hash is re-registered in _paged_hashes so that subsequent is_paged()
         calls return correctly for the remainder of the session.
-    
+
         db_conn is accepted for API compatibility but is unused; ChromaDB is the
         single authoritative source for paged block content.
         """
         if chroma_collection is None:
             return None
-    
+
         entry_id = f"{project_id}_paged_{block_hash}"
-    
+
         # -- Step 1: log registry miss for diagnostics --
         # The absence from _paged_hashes does not abort the lookup; it may
         # simply indicate a post-restart access.
@@ -3224,7 +3224,7 @@ class ContextPager:
                 f"page_in_block: {block_hash[:8]} not in paged registry, "
                 f"attempting ChromaDB lookup (possible post-restart access)"
             )
-    
+
         # -- Step 2: fetch full content and metadata from ChromaDB --
         meta = None
         content = ""
@@ -3242,15 +3242,15 @@ class ContextPager:
                 f"page_in_block: ChromaDB fetch failed for {block_hash[:8]}: {e}"
             )
             return None
-    
+
         if not content:
             return None
-    
+
         # -- Step 3: re-register in paged_hashes --
         # Ensures is_paged() returns True for the remainder of this session
         # without requiring another ChromaDB round-trip.
         self._paged_hashes.setdefault(project_id, set()).add(block_hash)
-    
+
         # -- Step 4: extract metadata fields with safe defaults --
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
@@ -3259,19 +3259,19 @@ class ContextPager:
             else ContentType.GENERAL.value
         )
         importance = meta.get("importance_score", 1.0) if meta else 1.0
-    
+
         try:
             ctype = ContentType(ctype_str)
         except Exception:
             ctype = ContentType.GENERAL
-    
+
         # -- Step 5: re-extract symbols from the restored content --
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
-    
+
         # -- Step 6: reconstruct and return the CodeBlock --
         block = CodeBlock(
             content=content,
@@ -3283,7 +3283,7 @@ class ContextPager:
         )
         for s in block.symbols:
             s.parent_block_hash = block_hash
-    
+
         return block
 
 
