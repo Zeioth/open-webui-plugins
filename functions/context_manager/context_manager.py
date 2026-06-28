@@ -28658,33 +28658,106 @@ class Filter:
     # 1. Configuration valves (nested class)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    class Valves(BaseModel):
+class Valves(BaseModel):
         """
         Pydantic model holding every user‑facing configuration valve for
         the CodeAware filter.
 
         ─── ÍNDICE DE SECCIONES ───
         1.  CONTEXT WINDOW BUDGETS
+              1.1  Core budgets
+              1.2  Code block overflow
         2.  LLM & ORCHESTRATION
+              2.1  Inference server
+              2.2  Timeouts & retries
+              2.3  LLM response cache
+              2.4  Auxiliary models
+              2.5  Multi‑phase response
         3.  SYMBOLGRAPH & ACTIVE CODE
+              3.1  Extraction & detection
+              3.2  Call‑graph & data flow
+              3.3  Docstrings & CFG generation
+              3.4  Block deduplication
+              3.5  Active block management
+              3.6  Diffs & commits
         4.  ARCHITECTURE MAP & HUB‑BODIES TIER
+              4.1  Architecture map
+              4.2  Hub‑bodies tier
         5.  SEMANTIC SEED INFERENCE
         6.  ACTIVATION GRAPH (PPR / LOD)
-        7.  CLASSIFICATION THRESHOLDS
+              6.1  Path analysis
+              6.2  LOD thresholds
+              6.3  LOD by use case
+              6.4  Centrality
+              6.5  Seeds
+              6.6  LOD adaptation
+              6.7  Call graph mode resolution
+        7.  CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM)
+              7.1  General multiplier
+              7.2  Session & code‑only detection
+              7.3  Seed & inference gate
+              7.4  Memory (LTM & code history)
+              7.5  Intent & use case
+              7.6  Structural decisions (relevance, paging, purge)
+              7.7  Quality & contradiction
         8.  REASONING (Chain‑of‑Thought)
+              8.1  Basic enabling
+              8.2  Detection cascade (Heuristic → CE → LLM)
+              8.3  SymbolGraph signal
+              8.4  QueryDecomposition (Metacognitive Layer 1)
+              8.5  FocalReasoning (Metacognitive Layer 2)
+              8.6  Scientific method — core
+              8.7  Scientific method — epistemic toolkit
+              8.8  Scientific method — peer review
+              8.9  Scientific method — active learning & coverage
+              8.10 Scientific method — stagnation detection
+              8.11 Scientific method — project‑level metacognition
+              8.12 Generation models
+              8.13 Architecture mode
+              8.14 Complementary features
         9.  LONG‑TERM MEMORY (LTM)
+              9.1  Storage & retrieval
+              9.2  Symbol boosting
+              9.3  Augmented retrieval
+              9.4  Reranking
+              9.5  RAPTOR
         10. CONTEXT COMPRESSION
+              10.1 History compression (LLMLingua)
+              10.2 Code compression (LLMLingua)
+              10.3 Code history management
+              10.4 Conversation summaries
         11. SESSION & STATE
+              11.1 Project & storage
+              11.2 Conversation summaries
+              11.3 Feedback tracking
+              11.4 Response & duplicate cache
         12. PERFORMANCE & PERSISTENCE
+              12.1 KV cache (slots)
+              12.2 Volatility‑tiered context
+              12.3 Graph & ingestion
+              12.4 Block lifecycle
+              12.5 Maintenance
         13. INTERACTION & COMMANDS
+              13.1 Commands & expansion
+              13.2 Proactive suggestions
+              13.3 Context cleanup
         14. UTILITIES & TUNING
-        15. LAZY + BACKGROUND TASKS CONTROL
+              14.1 Core
+              14.2 Context dump
+              14.3 Weighting & decay
+        15. LAZY + BACKGROUND TASKS
+              15.1 Master switch
+              15.2 Lazy tasks (inlet)
+              15.3 Background tasks (outlet)
+              15.4 Priority & performance
         ────────────────────────────
         """
 
         # ═════════════════════════════════════════════════════════════════════════
         # 1. CONTEXT WINDOW BUDGETS
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
             default=262000,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
@@ -28711,12 +28784,12 @@ class Filter:
             default=6000,
             description="Maximum tokens for LTM retrieved per request. 0 = unlimited.",
         )
-        cot_max_tokens: int = (
-            Field(  # Non zero values are faster, but potencially incomplete.
-                default=0,
-                description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
-            )
+        cot_max_tokens: int = Field(
+            default=0,
+            description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
         )
+
+        # ── 1.2 Code block overflow ───────────────────────────────────────────
         max_code_block_tokens: int = Field(
             default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited.",
@@ -28726,7 +28799,7 @@ class Filter:
             description="Action when a block exceeds max_code_block_tokens: 'warn', 'truncate', or 'summarize'.",
         )
         code_block_warn_message: str = Field(
-            default="[Code block too large - truncated by system]"
+            default="[Code block too large - truncated by system]",
         )
         summary_code_max_chars: int = Field(
             default=20000,
@@ -28740,6 +28813,8 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 2. LLM & ORCHESTRATION
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 2.1 Inference server ──────────────────────────────────────────────
         LLM_BASE_URL: str = Field(
             default="http://host.docker.internal:8080",
             description="Base URL of the llama.cpp or OpenAI-compatible inference server.",
@@ -28756,6 +28831,8 @@ class Filter:
             default="chat",
             description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
         )
+
+        # ── 2.2 Timeouts & retries ────────────────────────────────────────────
         llm_request_timeout: int = Field(
             default=900,
             description="HTTP timeout in seconds for individual LLM requests before the connection is dropped.",
@@ -28763,13 +28840,15 @@ class Filter:
         llm_per_call_timeout: int = Field(
             default=900,
             ge=1,
-            description="Per-call timeout in seconds passed to the HTTP session. Also used as the SQLite busy_timeout multiplier.",
+            description="Per-call timeout in seconds passed to the HTTP session.",
         )
         llm_retry_total_timeout: int = Field(
             default=950,
             ge=10,
             description="Total deadline in seconds for a single LLM call including all retries.",
         )
+
+        # ── 2.3 LLM response cache ────────────────────────────────────────────
         LLM_CACHE_TTL: int = Field(
             default=300,
             description="Time-to-live in seconds for entries in the in-memory LLM response cache.",
@@ -28779,7 +28858,7 @@ class Filter:
             description="Maximum number of entries kept in the in-memory LLM response cache.",
         )
 
-        # ── Auxiliary models ──────────────────────────────────────────────────
+        # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
@@ -28793,7 +28872,7 @@ class Filter:
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
-        # ── Multi‑phase response ─────────────────────────────────────────────
+        # ── 2.5 Multi‑phase response ──────────────────────────────────────────
         enable_multi_phase_response: bool = Field(default=True)
         force_multi_phase_response: bool = Field(
             default=False,
@@ -28822,22 +28901,23 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 3. SYMBOLGRAPH & ACTIVE CODE
         # ═════════════════════════════════════════════════════════════════════════
-        # ── Extraction & detection ──────────────────────────────────────────
+
+        # ── 3.1 Extraction & detection ────────────────────────────────────────
         enable_code_awareness: bool = Field(default=True)
         auto_detect_code_blocks: bool = Field(default=True)
         code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
         track_file_paths: bool = Field(default=True)
         file_path_pattern: str = Field(
-            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b"
+            default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b",
         )
         track_line_numbers: bool = Field(default=True)
         exclude_filter_internals: bool = Field(default=True)
 
-        # ── Call‑graph extraction ────────────────────────────────────────────
+        # ── 3.2 Call‑graph & data flow ────────────────────────────────────────
         enable_call_graph_extraction: bool = Field(default=True)
         enable_data_flow_analysis: bool = Field(default=True)
 
-        # ── Docstrings & CFG generation ─────────────────────────────────────
+        # ── 3.3 Docstrings & CFG generation ──────────────────────────────────
         enable_auto_docstrings: bool = Field(
             default=True,
             description="Automatically generate missing docstrings using the LLM (both lazy and background).",
@@ -28857,8 +28937,6 @@ class Filter:
             ge=5,
             description="Skip CFG generation for functions with > this many lines.",
         )
-
-        # ── Docstring batching (lazy / background) ──────────────────────────
         lazy_docstring_max_per_turn: int = Field(
             default=8,
             ge=0,
@@ -28882,13 +28960,13 @@ class Filter:
             description="Maximum docstring chars to suggest to the LLM.",
         )
 
-        # ── Block deduplication ──────────────────────────────────────────────
+        # ── 3.4 Block deduplication ───────────────────────────────────────────
         code_similarity_threshold: float = Field(default=0.85)
         enable_ast_deduplication: bool = Field(default=True)
         auto_remove_duplicate_blocks: bool = Field(default=True)
         max_duplicate_age_hours: float = Field(default=6.0)
 
-        # ── Active block management ──────────────────────────────────────────
+        # ── 3.5 Active block management ───────────────────────────────────────
         max_active_blocks: int = Field(default=0, ge=0)
         max_base_code_blocks: int = Field(default=3)
         max_proposed_changes: int = Field(default=5)
@@ -28901,16 +28979,18 @@ class Filter:
             description="N most recent obsolete versions kept per file. 0 = remove immediately.",
         )
 
-        # ── Diffs & commits ──────────────────────────────────────────────────
+        # ── 3.6 Diffs & commits ───────────────────────────────────────────────
         enable_diff_application: bool = Field(default=True)
         diff_pattern: str = Field(
-            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@"
+            default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@",
         )
         commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
 
         # ═════════════════════════════════════════════════════════════════════════
         # 4. ARCHITECTURE MAP & HUB‑BODIES TIER
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 4.1 Architecture map ──────────────────────────────────────────────
         enable_architecture_map: bool = Field(
             default=True,
             description="Inject a compact class→methods outline into Block A.",
@@ -28925,13 +29005,18 @@ class Filter:
             description="Show outgoing calls ('→ calls:') for hub symbols alongside incoming callers.",
         )
 
-        # ── Hub‑Bodies Tier (stable full bodies of top hubs) ───────────────
+        # ── 4.2 Hub‑bodies tier ───────────────────────────────────────────────
+        # Stable full bodies of top-N hubs, injected between Block A and Block B.
+        # High KV-cache stability: hub bodies change rarely.
         enable_hub_bodies_tier: bool = Field(
             default=True,
             description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
         )
         hub_bodies_tier_top_n: int = Field(
-            default=7, ge=1, le=20, description="Number of top hubs to include."
+            default=7,
+            ge=1,
+            le=20,
+            description="Number of top hubs to include.",
         )
         symbol_index_max_in_block_a: int = Field(
             default=30,
@@ -28972,10 +29057,12 @@ class Filter:
         # 5. SEMANTIC SEED INFERENCE
         # ═════════════════════════════════════════════════════════════════════════
         seed_inference_mode: str = Field(
-            default="auto", description="'auto', 'always', or 'off'."
+            default="auto",
+            description="'auto', 'always', or 'off'.",
         )
         seed_inference_model: str = Field(
-            default="", description="Model for seed inference. Empty = use llm_model."
+            default="",
+            description="Model for seed inference. Empty = use llm_model.",
         )
         seed_inference_min_lexical: int = Field(
             default=2,
@@ -28983,16 +29070,21 @@ class Filter:
             description="In 'auto' mode: infer if the query names fewer than N symbols literally.",
         )
         seed_inference_min_chars: int = Field(
-            default=15, ge=0, description="Minimum query length to trigger inference."
+            default=15,
+            ge=0,
+            description="Minimum query length to trigger inference.",
         )
         seed_inference_max_symbols: int = Field(
-            default=12, ge=1, le=40, description="Maximum symbols seeded by inference."
+            default=12,
+            ge=1,
+            le=40,
+            description="Maximum symbols seeded by inference.",
         )
         seed_inference_score: float = Field(
             default=0.85,
             ge=0.1,
             le=1.0,
-            description="Seed score assigned to LLM‑validated symbols ( > lod3_threshold guarantees LOD‑3).",
+            description="Seed score assigned to LLM‑validated symbols (> lod3_threshold guarantees LOD‑3).",
         )
         seed_inference_skeleton_max_tokens: int = Field(
             default=6000,
@@ -29000,7 +29092,9 @@ class Filter:
             description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
         )
         seed_inference_max_tokens: int = Field(
-            default=200, ge=50, description="Token cap for the planner's response."
+            default=200,
+            ge=50,
+            description="Token cap for the planner's response.",
         )
         seed_inference_fuzzy_threshold: float = Field(
             default=0.85,
@@ -29018,6 +29112,8 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 6. ACTIVATION GRAPH (PPR / LOD)
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 6.1 Path analysis ─────────────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
         path_activation_threshold: float = Field(
             default=0.02,
@@ -29028,11 +29124,12 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
         path_summary_max_tokens: int = Field(default=80)
+        ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
 
-        # ── LOD thresholds ──────────────────────────────────────────────────
+        # ── 6.2 LOD thresholds ────────────────────────────────────────────────
         lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
         lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
         lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
@@ -29041,7 +29138,7 @@ class Filter:
             description="Use CrossEncoder + LLM cascade to filter blocks for LOD‑3 based on semantic relevance.",
         )
 
-        # ── LOD by use case ─────────────────────────────────────────────────
+        # ── 6.3 LOD by use case ───────────────────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
             description="Tune LOD policy per use case (Architecture, Planning, Programming, Refactor, Scaffolding).",
@@ -29062,13 +29159,13 @@ class Filter:
             description="Fraction of lod2_threshold used as the exit threshold for LOD‑2 hysteresis.",
         )
 
-        # ── Centrality ──────────────────────────────────────────────────────
+        # ── 6.4 Centrality ────────────────────────────────────────────────────
         enable_centrality_prior: bool = Field(default=True)
         enable_centrality_lod_bump: bool = Field(default=True)
         centrality_lod_bump_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
         centrality_lod_bump_weight: float = Field(default=0.15, ge=0.0, le=0.5)
 
-        # ── Seeds ──────────────────────────────────────────────────────────
+        # ── 6.5 Seeds ─────────────────────────────────────────────────────────
         enable_traceback_activation: bool = Field(default=True)
         enable_history_seeds: bool = Field(default=True)
         history_seeds_lookback: int = Field(default=6, ge=2, le=20)
@@ -29077,9 +29174,8 @@ class Filter:
         multi_seed_weight_lexical: float = Field(default=0.5, ge=0.0, le=1.0)
         multi_seed_weight_structural: float = Field(default=0.3, ge=0.0, le=1.0)
         multi_seed_weight_historical: float = Field(default=0.2, ge=0.0, le=1.0)
-        ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
 
-        # ── LOD adaptation ──────────────────────────────────────────────────
+        # ── 6.6 LOD adaptation ────────────────────────────────────────────────
         enable_lod_adaptive: bool = Field(default=True)
         lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
         lod_adapt_min: float = Field(default=0.25, ge=0.1, le=0.5)
@@ -29087,7 +29183,7 @@ class Filter:
         lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
         lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
 
-        # ── Call Graph Mode Resolution ─────────────────────────────────────
+        # ── 6.7 Call graph mode resolution ───────────────────────────────────
         full_graph_min_free_token_ratio: float = Field(
             default=0.38,
             ge=0.0,
@@ -29115,10 +29211,14 @@ class Filter:
             description="Max symbols in project to auto‑select expanded_hubs.",
         )
         full_graph_max_tokens: int = Field(
-            default=20000, ge=1000, description="Token budget for full_graph mode."
+            default=20000,
+            ge=1000,
+            description="Token budget for full_graph mode.",
         )
         expanded_hubs_max_tokens: int = Field(
-            default=4000, ge=500, description="Token budget for expanded_hubs mode."
+            default=4000,
+            ge=500,
+            description="Token budget for expanded_hubs mode.",
         )
         call_graph_mode_downgrade_after_turns: int = Field(
             default=3,
@@ -29128,8 +29228,14 @@ class Filter:
         )
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 7. CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM cascade)
+        # 7. CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM)
         # ═════════════════════════════════════════════════════════════════════════
+        # Each classifier follows the same three-stage cascade:
+        #   Heuristic (free) → CrossEncoder (_ce_threshold = confident) →
+        #   LLM fallback (_llm_threshold = uncertain zone boundary)
+        # Middle zone [llm_threshold, ce_threshold) = conservative (no CE decision).
+
+        # ── 7.1 General multiplier ────────────────────────────────────────────
         heuristic_reinforcement_weight: float = Field(
             default=1.0,
             ge=0.0,
@@ -29137,7 +29243,7 @@ class Filter:
             description="Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores).",
         )
 
-        # ── Session classification ─────────────────────────────────────────
+        # ── 7.2 Session & code‑only detection ────────────────────────────────
         session_classify_ce_threshold: float = Field(
             default=0.25,
             ge=0.0,
@@ -29150,8 +29256,6 @@ class Filter:
             le=1.0,
             description="Maximum diff to trigger LLM fallback for session classification.",
         )
-
-        # ── Code‑only detection ─────────────────────────────────────────────
         code_only_ce_threshold: float = Field(
             default=0.35,
             ge=0.0,
@@ -29164,92 +29268,6 @@ class Filter:
             le=1.0,
             description="Maximum diff to trigger LLM fallback for code‑only detection.",
         )
-
-        # ── Seed extraction ─────────────────────────────────────────────────
-        seed_extract_ce_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for seed extraction.",
-        )
-        seed_extract_llm_threshold: float = Field(
-            default=0.10,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for seed extraction.",
-        )
-
-        # ── LTM deduplication ───────────────────────────────────────────────
-        ltm_dedup_ce_threshold: float = Field(
-            default=0.40,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for LTM deduplication.",
-        )
-        ltm_dedup_llm_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for LTM deduplication.",
-        )
-
-        # ── Code history compression ────────────────────────────────────────
-        code_history_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for code history compression.",
-        )
-        code_history_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for code history compression.",
-        )
-
-        # ── Intent classification ───────────────────────────────────────────
-        intent_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for intent classification.",
-        )
-        intent_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for intent classification.",
-        )
-
-        # ── Semantic seed inference (gate) ──────────────────────────────────
-        seed_infer_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for seed inference decision.",
-        )
-        seed_infer_llm_threshold: float = Field(
-            default=0.10,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for seed inference.",
-        )
-
-        # ── LOD‑3 block relevance filtering ─────────────────────────────────
-        lod3_relevance_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for LOD‑3 block relevance.",
-        )
-        lod3_relevance_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for LOD‑3 block relevance.",
-        )
-
-        # ── FULL vs SUMMARY decision ────────────────────────────────────────
         keep_full_code_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -29263,7 +29281,83 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for FULL vs SUMMARY decision.",
         )
 
-        # ── Natural language intents (forget, pin, obsolete) ───────────────
+        # ── 7.3 Seed & inference gate ─────────────────────────────────────────
+        seed_extract_ce_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for seed extraction.",
+        )
+        seed_extract_llm_threshold: float = Field(
+            default=0.10,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for seed extraction.",
+        )
+        seed_infer_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for seed inference decision.",
+        )
+        seed_infer_llm_threshold: float = Field(
+            default=0.10,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for seed inference.",
+        )
+
+        # ── 7.4 Memory (LTM & code history) ──────────────────────────────────
+        ltm_dedup_ce_threshold: float = Field(
+            default=0.40,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for LTM deduplication.",
+        )
+        ltm_dedup_llm_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for LTM deduplication.",
+        )
+        code_history_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for code history compression.",
+        )
+        code_history_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for code history compression.",
+        )
+
+        # ── 7.5 Intent & use case ─────────────────────────────────────────────
+        intent_ce_threshold: float = Field(
+            default=0.30,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for intent classification.",
+        )
+        intent_llm_threshold: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for intent classification.",
+        )
+        use_case_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for use case classification.",
+        )
+        use_case_llm_threshold: float = Field(
+            default=0.12,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for use case classification.",
+        )
         nl_intent_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -29277,49 +29371,19 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for natural language intent detection.",
         )
 
-        # ── Contradiction detection ─────────────────────────────────────────
-        contradiction_ce_threshold: float = Field(
+        # ── 7.6 Structural decisions (relevance, graph, paging, purge) ───────
+        lod3_relevance_ce_threshold: float = Field(
             default=0.35,
             ge=0.0,
             le=1.0,
-            description="Minimum diff to trust CrossEncoder for contradiction detection.",
+            description="Minimum diff to trust CrossEncoder for LOD‑3 block relevance.",
         )
-        contradiction_llm_threshold: float = Field(
+        lod3_relevance_llm_threshold: float = Field(
             default=0.20,
             ge=0.0,
             le=1.0,
-            description="Maximum diff to trigger LLM fallback for contradiction detection.",
+            description="Maximum diff to trigger LLM fallback for LOD‑3 block relevance.",
         )
-
-        # ── Duplicate question detection ────────────────────────────────────
-        duplicate_ce_threshold: float = Field(
-            default=0.40,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for duplicate question detection.",
-        )
-        duplicate_llm_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for duplicate question detection.",
-        )
-
-        # ── Use case classification ─────────────────────────────────────────
-        use_case_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for use case classification.",
-        )
-        use_case_llm_threshold: float = Field(
-            default=0.12,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for use case classification.",
-        )
-
-        # ── Call graph mode resolution ──────────────────────────────────────
         graph_mode_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -29332,8 +29396,6 @@ class Filter:
             le=1.0,
             description="Maximum diff to trigger LLM fallback for call graph mode resolution.",
         )
-
-        # ── Block paging decision ───────────────────────────────────────────
         paging_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -29346,8 +29408,6 @@ class Filter:
             le=1.0,
             description="Maximum diff to trigger LLM fallback for block paging decision.",
         )
-
-        # ── Purge old versions decision ─────────────────────────────────────
         purge_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -29361,15 +29421,44 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for purge decision.",
         )
 
+        # ── 7.7 Quality & contradiction ───────────────────────────────────────
+        contradiction_ce_threshold: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for contradiction detection.",
+        )
+        contradiction_llm_threshold: float = Field(
+            default=0.20,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for contradiction detection.",
+        )
+        duplicate_ce_threshold: float = Field(
+            default=0.40,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff to trust CrossEncoder for duplicate question detection.",
+        )
+        duplicate_llm_threshold: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=1.0,
+            description="Maximum diff to trigger LLM fallback for duplicate question detection.",
+        )
+
         # ═════════════════════════════════════════════════════════════════════════
         # 8. REASONING (Chain‑of‑Thought)
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 8.1 Basic enabling ────────────────────────────────────────────────
         auto_cot_enabled: bool = Field(
             default=True,
             description="Enable automatic CoT detection. If disabled, CoT is only available via /think.",
         )
         enable_cot_on_demand: bool = Field(
-            default=True, description="Allow manual CoT activation via /think command."
+            default=True,
+            description="Allow manual CoT activation via /think command.",
         )
         enable_cot_llm_detection: bool = Field(
             default=True,
@@ -29395,8 +29484,6 @@ class Filter:
             ge=200,
             description="Token budget for all auto‑resolved expansions combined.",
         )
-
-        # ── Status Updates ────────────────────────────────────────────────────
         enable_status_updates: bool = Field(
             default=True,
             description=(
@@ -29406,7 +29493,66 @@ class Filter:
             ),
         )
 
-        # ── QueryDecomposition (Metacognitive Layer 1) ────────────────────────
+        # ── 8.2 Detection cascade (Heuristic → CrossEncoder → LLM) ──────────
+        # Stage 1: heuristic → level estimate + feature hints (always, free).
+        # Stage 2: CE (6 pairs: [L0,L1,L2,L3] + [scientific,linear]).
+        #          Reinforced by stage 1 hints + stage 3 SymbolGraph signal.
+        # Stage 3: LLM with full context when CE uncertain on any dimension.
+        enable_cot_cascade: bool = Field(
+            default=True,
+            description="Use CrossEncoder as advisor to the LLM for CoT detection; if False, use LLM alone.",
+        )
+        cot_cascade_uncertainty_threshold: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description="Minimum diff between top two CE level scores to trust CE; below this, call LLM.",
+        )
+        cot_scientific_ce_threshold: float = Field(
+            default=0.25,
+            ge=0.05,
+            le=1.0,
+            description=(
+                "Minimum score difference between the 'scientific' and 'linear' "
+                "CrossEncoder pairs to make a confident scientific/linear decision "
+                "without falling back to the LLM. Higher = stricter."
+            ),
+        )
+        enable_cot_heuristic_reinforcement: bool = Field(
+            default=True,
+            description="Apply keyword‑based heuristic reinforcement to CE scores before the confidence check.",
+        )
+
+        # ── 8.3 SymbolGraph signal ────────────────────────────────────────────
+        # Synchronous pre-scan before the parallel gather. Calls gather_evidence()
+        # on the user message to measure structural specificity. Used as
+        # reinforcement for CE scores and as context for the LLM classifier.
+        # Zero LLM cost. Self-calibrates: sparse graphs never fire; dense graphs
+        # fire on specific queries.
+        enable_symbol_graph_cot_signal: bool = Field(
+            default=True,
+            description=(
+                "Use a synchronous SymbolGraph pre-scan as reinforcement signal "
+                "for CoT feature detection. Zero LLM cost. "
+                "Boosts scientific mode detection when the query mentions "
+                "known symbols from the indexed codebase."
+            ),
+        )
+        auto_scientific_min_symbol_length: int = Field(
+            default=4,
+            ge=1,
+            le=10,
+            description=(
+                "Symbols shorter than this are excluded from the SymbolGraph "
+                "hit count. Prevents short generic names ('id', 'db', 'x') "
+                "from inflating the structural signal."
+            ),
+        )
+
+        # ── 8.4 QueryDecomposition (Metacognitive Layer 1) ───────────────────
+        # Detects multiple independent questions and upgrades CoT level.
+        # Cascade: heuristic (paragraph / ¿? detection) → CE → LLM.
+        # Conservative: false negative (misses 2 Qs) = current behaviour.
         enable_query_decomposition: bool = Field(
             default=True,
             description=(
@@ -29434,7 +29580,10 @@ class Filter:
             description="Maximum independent questions to detect. Hard cap.",
         )
 
-        # ── FocalReasoning (Metacognitive Layer 2) ────────────────────────────
+        # ── 8.5 FocalReasoning (Metacognitive Layer 2) ───────────────────────
+        # Per-question volatile activation + CoT synthesis.
+        # Requires enable_query_decomposition=True.
+        # Disabled by default: N questions × (1 ActivationGraph + 1 CoT) = N× latency.
         enable_focal_reasoning: bool = Field(
             default=False,
             description=(
@@ -29451,7 +29600,41 @@ class Filter:
             ),
         )
 
-        # ── Epistemic Toolkit ─────────────────────────────────────────────────
+        # ── 8.6 Scientific method — core ─────────────────────────────────────
+        # Multi-hypothesis competition validated against the SymbolGraph.
+        # Activated when: CoT level == 3, OR use_scientific=True from
+        # detect_cot_configuration() (level 2 + ambiguous debugging + known symbols).
+        enforce_scientific_method: bool = Field(
+            default=False,
+            description="Force level 3 scientific reasoning for all queries (very slow, very thorough).",
+        )
+        scientific_hypotheses_count: int = Field(
+            default=3,
+            ge=2,
+            le=6,
+            description="Number of hypotheses generated in scientific reasoning.",
+        )
+        scientific_confidence_threshold: float = Field(
+            default=0.75,
+            ge=0.0,
+            le=1.0,
+            description="Minimum combined score to stop hypothesis refinement early.",
+        )
+        scientific_max_iterations: int = Field(
+            default=2,
+            ge=1,
+            le=4,
+            description=(
+                "Maximum refinement iterations for scientific reasoning. "
+                "Must be >= stagnation_window + 2 for stagnation detection to fire."
+            ),
+        )
+
+        # ── 8.7 Scientific method — epistemic toolkit ─────────────────────────
+        # Popperian falsification with asymmetric claim weighting.
+        # CRITICAL claims (×10): hard kill if false.
+        # SUPPORTIVE claims (×1): score penalty only.
+        # UNKNOWN claims: Active Learning attempts reclassification (see 8.9).
         enable_experiment_design: bool = Field(
             default=True,
             description=(
@@ -29508,15 +29691,18 @@ class Filter:
             ),
         )
 
-        # ── Peer Review ───────────────────────────────────────────────────────
+        # ── 8.8 Scientific method — peer review ──────────────────────────────
+        # External epistemic review using a different model architecture.
+        # H6 dialectical order: peer_review (antithesis) BEFORE delimit_scope (synthesis).
+        # Designed for future activation (currently degrades to devil's advocate
+        # when peer_review_model is empty or same as cot_model_level3).
         enable_peer_review: bool = Field(
             default=False,
             description=(
                 "Enable peer review of the winning hypothesis using a different "
                 "model architecture. "
                 "Degrades to internal devil's advocate if peer_review_model is "
-                "empty or identical to cot_model_level3. "
-                "Designed for future activation when a second model is available."
+                "empty or identical to cot_model_level3."
             ),
         )
         peer_review_model: str = Field(
@@ -29527,167 +29713,99 @@ class Filter:
                 "Empty → degrades to devil's advocate."
             ),
         )
+        peer_review_uncertainty_threshold: float = Field(
+            default=0.5,
+            description=(
+                "Only run peer review when epistemic_uncertainty exceeds this "
+                "threshold. Below it, peer review adds little value. "
+                "Range [0, 1] — 0.5 = trigger in uncertain zone."
+            ),
+        )
 
-        # ── Active Learning (H4) ──────────────────────────────────────────────
+        # ── 8.9 Scientific method — active learning & coverage (H4 + H2) ─────
+        # Active Learning: reclassify UNKNOWN claims as SUPPORTIVE when their
+        # mentioned symbols exist in the SymbolGraph. Deterministic, no LLM.
+        # Coverage guard: prevents hard kill when too few claims are verified.
         enable_active_learning: bool = Field(
             default=True,
             description=(
-                "When coverage is low, attempt to reclassify unknown_claims "
-                "as verifiable supportive_claims by matching them against the "
-                "SymbolGraph. Deterministic — no LLM call. "
-                "Increases coverage before falsification runs."
+                "When coverage is low, reclassify unknown_claims as verifiable "
+                "supportive_claims by matching them against the SymbolGraph. "
+                "Deterministic — no LLM call."
             ),
         )
         active_learning_max_reclassifications: int = Field(
             default=3,
             description=(
-                "Maximum number of unknown_claims to reclassify per hypothesis "
-                "per iteration. Caps the Active Learning step to avoid "
-                "over-expanding the verification scope."
+                "Maximum unknown_claims to reclassify per hypothesis per iteration. "
+                "Caps the Active Learning step to avoid over-expanding scope."
             ),
         )
-
-        # ── Coverage guard for falsification (H2 + H4 interaction) ───────────
+        low_coverage_threshold: float = Field(
+            default=0.3,
+            description=(
+                "Coverage below this ratio triggers: (1) Active Learning, "
+                "(2) coverage penalty in compute_weighted_score, "
+                "(3) atomic-claims constraint in _build_refinement_constraints. "
+                "Coverage = verifiable_claims / total_claims."
+            ),
+        )
         enable_coverage_guard_for_falsification: bool = Field(
             default=True,
             description=(
                 "When coverage_score < min_coverage_for_falsification, "
                 "downgrade hard kill (is_falsified) to a score penalty. "
-                "Prevents Popperian hard kill based on sparse evidence — "
-                "a failed critical claim is only trustworthy if we verified "
-                "enough of the hypothesis's total claims."
+                "Prevents Popperian hard kill based on sparse evidence."
             ),
         )
         min_coverage_for_falsification: float = Field(
             default=0.3,
             description=(
                 "Minimum coverage_score required to apply Popperian hard kill. "
-                "Below this threshold, critical claim failures become score "
-                "penalties instead of immediate falsification. "
                 "0.3 = need to verify at least 30% of claims before killing."
             ),
         )
 
-        # ── Peer review uncertainty gate (H2) ─────────────────────────────────
-        peer_review_uncertainty_threshold: float = Field(
-            default=0.5,
-            description=(
-                "Only run peer review when epistemic_uncertainty exceeds this "
-                "threshold. Below it (high confidence either way), peer review "
-                "adds little value. Range [0, 1] — 0.5 = trigger in uncertain zone."
-            ),
-        )
-
-        # ── Stagnation detection (H5 — iteration level) ───────────────────────
+        # ── 8.10 Scientific method — stagnation detection (H5) ───────────────
+        # Detects local optima in the hypothesis refinement loop and switches
+        # to divergent thinking (high temperature, contrarian prompt).
+        # Requires scientific_max_iterations >= stagnation_window + 2 to fire.
         enable_stagnation_detection: bool = Field(
             default=True,
             description=(
-                "Detect when hypothesis refinement is stuck in a local optimum "
-                "and switch to divergent thinking (high temperature, contrarian prompt). "
-                "Only effective when scientific_max_iterations >= stagnation_window + 2. "
-                "See valve coherence warning at startup."
+                "Detect when hypothesis refinement is stuck and switch to "
+                "divergent thinking. Only effective when "
+                "scientific_max_iterations >= stagnation_window + 2."
             ),
         )
         stagnation_window: int = Field(
             default=2,
             description=(
-                "Number of iterations without obj_score improvement to trigger stagnation. "
-                "stagnation_window=2 requires scientific_max_iterations >= 4 to be effective."
+                "Iterations without obj_score improvement to trigger stagnation. "
+                "stagnation_window=2 requires scientific_max_iterations >= 4."
             ),
         )
         stagnation_min_delta: float = Field(
             default=0.02,
             description=(
-                "Minimum obj_score improvement per stagnation_window to avoid detection. "
-                "0.02 = score must improve by at least 2% per window."
+                "Minimum obj_score improvement per window to avoid stagnation. "
+                "0.02 = must improve by at least 2% per window."
             ),
         )
 
-        # ── Coverage threshold ─────────────────────────────────────────────────
-        low_coverage_threshold: float = Field(
-            default=0.3,
-            description=(
-                "Coverage below this ratio triggers: (1) Active Learning reclassification, "
-                "(2) coverage penalty in compute_weighted_score, "
-                "(3) atomic-claims constraint in _build_refinement_constraints. "
-                "Coverage = verifiable_claims / total_claims."
-            ),
-        )
-
-        # ── Metacognitive debriefing (H5 — project level) ─────────────────────
+        # ── 8.11 Scientific method — project‑level metacognition (H5) ────────
+        # After each competition, analyze failure patterns (call_fail_rate,
+        # symbol_fail_rate, stagnation_rate) and adapt strategy for next call.
         enable_metacognitive_debriefing: bool = Field(
             default=True,
             description=(
                 "After each hypothesis competition, analyze failure patterns "
                 "and adapt strategy for future competitions in this project. "
-                "Enables long-term learning per project_id. "
                 "Stored in MetacognitiveReasoningEngine._performance_history."
             ),
         )
 
-        enable_symbol_graph_cot_signal: bool = Field(
-            default=True,
-            description=(
-                "Use SymbolGraph pre-scan as reinforcement signal for CoT "
-                "feature detection. Synchronous, zero LLM cost."
-            ),
-        )
-        auto_scientific_min_symbol_length: int = Field(
-            default=4,
-            description=(
-                "Symbols shorter than this are excluded from structural "
-                "hit count. Prevents 'id', 'db' from inflating the signal."
-            ),
-        )
-
-        # ── SymbolGraph CoT signal ────────────────────────────────────────
-        enable_symbol_graph_cot_signal: bool = Field(
-            default=True,
-            description=(
-                "Use a synchronous SymbolGraph pre-scan as reinforcement "
-                "signal for CoT feature detection. Zero LLM cost. "
-                "Boosts scientific mode detection when the query mentions "
-                "known symbols from the indexed codebase."
-            ),
-        )
-        auto_scientific_min_symbol_length: int = Field(
-            default=4,
-            ge=1,
-            le=10,
-            description=(
-                "Symbols shorter than this are excluded from the SymbolGraph "
-                "hit count. Prevents short generic names ('id', 'db', 'x') "
-                "from inflating the structural signal."
-            ),
-        )
-        cot_scientific_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.05,
-            le=1.0,
-            description=(
-                "Minimum score difference between the 'scientific' and 'linear' "
-                "CrossEncoder pairs to make a confident scientific/linear decision "
-                "without falling back to the LLM. Higher = stricter."
-            ),
-        )
-
-        # ── CoT cascade ─────────────────────────────────────────────────────
-        enable_cot_cascade: bool = Field(
-            default=True,
-            description="Use CrossEncoder as advisor to the LLM for CoT detection; if False, use LLM alone.",
-        )
-        cot_cascade_uncertainty_threshold: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff between top two CE scores to trust CE; below this, call LLM.",
-        )
-        enable_cot_heuristic_reinforcement: bool = Field(
-            default=True,
-            description="Apply keyword‑based heuristic reinforcement to CE scores before the confidence check.",
-        )
-
-        # ── Generation models ──────────────────────────────────────────────
+        # ── 8.12 Generation models ────────────────────────────────────────────
         cot_model: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
             description="Model used for CoT level 1 (inline reasoning prompt).",
@@ -29701,7 +29819,9 @@ class Filter:
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
 
-        # ── Architecture‑mode ──────────────────────────────────────────────
+        # ── 8.13 Architecture mode ────────────────────────────────────────────
+        # For architecture/design/refactor queries, the code skeleton
+        # (signatures only, bodies as `...`) replaces the full system prompt.
         enable_skeleton_cot: bool = Field(
             default=True,
             description="For architecture/design/refactor queries, use the code skeleton (contracts only) as context.",
@@ -29726,31 +29846,7 @@ class Filter:
             description="At CoT level 3, use multi‑hypothesis scientific reasoning on the skeleton.",
         )
 
-        # ── Scientific method (Level 3) ─────────────────────────────────────
-        enforce_scientific_method: bool = Field(
-            default=False,
-            description="Force level 3 scientific reasoning for all queries (very slow, very thorough).",
-        )
-        scientific_hypotheses_count: int = Field(
-            default=3,
-            ge=2,
-            le=6,
-            description="Number of hypotheses generated in scientific reasoning.",
-        )
-        scientific_confidence_threshold: float = Field(
-            default=0.75,
-            ge=0.0,
-            le=1.0,
-            description="Minimum combined score to stop hypothesis refinement early.",
-        )
-        scientific_max_iterations: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-            description="Maximum refinement iterations for scientific reasoning.",
-        )
-
-        # ── Complementary features ─────────────────────────────────────────
+        # ── 8.14 Complementary features ──────────────────────────────────────
         enable_step_back_prompting: bool = Field(
             default=True,
             description="Generate step‑back architectural context before CoT reasoning.",
@@ -29770,7 +29866,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -29788,12 +29884,16 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 9. LONG‑TERM MEMORY (LTM)
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 9.1 Storage & retrieval ───────────────────────────────────────────
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
         long_term_memory_expiration_days: int = Field(default=30)
         ltm_store_only_code_sessions: bool = Field(default=True)
         long_term_memory_top_k: int = Field(default=10)
         long_term_memory_similarity_threshold: float = Field(default=0.65)
         ltm_time_decay_hours: float = Field(default=12.0)
+
+        # ── 9.2 Symbol boosting ───────────────────────────────────────────────
         ltm_index_symbols_enabled: bool = Field(default=True)
         ltm_symbol_index_max_per_message: int = Field(default=20)
         ltm_symbol_boost_enabled: bool = Field(default=True)
@@ -29802,13 +29902,13 @@ class Filter:
         ltm_symbol_force_mode_enabled: bool = Field(default=False)
         ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
 
-        # ── Augmented retrieval ─────────────────────────────────────────────
+        # ── 9.3 Augmented retrieval ───────────────────────────────────────────
         enable_multi_query_retrieval: bool = Field(default=False)
         multi_query_variants: int = Field(default=2, ge=1, le=4)
         enable_contextual_retrieval: bool = Field(default=True)
         contextual_retrieval_mode: str = Field(default="metadata")
 
-        # ── Reranking ───────────────────────────────────────────────────────
+        # ── 9.4 Reranking ─────────────────────────────────────────────────────
         enable_reranking: bool = Field(default=True)
         reranker_model: str = Field(
             default="Qwen/Qwen3-Reranker-0.6B",
@@ -29816,14 +29916,14 @@ class Filter:
         )
         reranker_top_k: int = Field(default=5)
 
-        # ── RAPTOR ──────────────────────────────────────────────────────────
+        # ── 9.5 RAPTOR ────────────────────────────────────────────────────────
         enable_raptor: bool = Field(
             default=True,
             description="Enable RAPTOR hierarchical clustering of code symbols for faster LTM retrieval.",
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact"
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_rebuild_interval: int = Field(default=20)
@@ -29841,7 +29941,8 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 10. CONTEXT COMPRESSION
         # ═════════════════════════════════════════════════════════════════════════
-        # ── History compression (LLMLingua) ────────────────────────────────
+
+        # ── 10.1 History compression (LLMLingua) ─────────────────────────────
         enable_history_llmlingua: bool = Field(
             default=True,
             description="Apply LLMLingua‑2 compression to conversation history.",
@@ -29875,7 +29976,7 @@ class Filter:
             description="Run LLMLingua (secondary compactor) after the primary compactor, restricted to prose that wasn't already summarized.",
         )
 
-        # ── Code compression (LLMLingua) ────────────────────────────────────
+        # ── 10.2 Code compression (LLMLingua) ────────────────────────────────
         enable_code_compression: bool = Field(
             default=False,
             description="Apply LLMLingua‑2 compression to individual code blocks in Block B (LOD‑3).",
@@ -29895,7 +29996,7 @@ class Filter:
             description="Preserve tokens relevant to the user's question during code compression.",
         )
 
-        # ── Multi‑phase code history ────────────────────────────────────────
+        # ── 10.3 Code history management ─────────────────────────────────────
         enable_code_history_compression: bool = Field(
             default=True,
             description="Replace old multi‑phase code parts with compact commit summaries.",
@@ -29903,7 +30004,7 @@ class Filter:
         code_history_force_compress_after_turns: int = Field(
             default=8,
             ge=0,
-            description="If a code‑bearing history message stays blocked by the symbol‑index ratio for more than this many turns, force‑compress without /expand guarantee. 0 = never.",
+            description="Force‑compress code‑bearing history blocked by symbol‑index ratio for > N turns. 0 = never.",
         )
         code_history_keep_last_n_parts: int = Field(
             default=3,
@@ -29917,21 +30018,19 @@ class Filter:
             le=1.0,
             description="Minimum symbol‑index ratio to allow compression.",
         )
-
-        # ── User code in history ────────────────────────────────────────────
         enable_lean_user_code: bool = Field(
             default=True,
-            description="Replace large user code blocks in history with a compact stub. The full code remains recoverable via /expand or LOD.",
+            description="Replace large user code blocks in history with a compact stub.",
         )
         lean_user_code_min_tokens: int = Field(
             default=12000,
             description="Token threshold above which a user code block is stubbed.",
         )
 
-        # ── Conversation summaries ──────────────────────────────────────────
+        # ── 10.4 Conversation summaries ───────────────────────────────────────
         summarize_old_messages: bool = Field(
             default=True,
-            description="Summarise conversation messages that are trimmed from history by the WindowManager before discarding them.",
+            description="Summarise conversation messages trimmed from history before discarding.",
         )
         max_conversation_summaries: int = Field(
             default=3,
@@ -29940,47 +30039,45 @@ class Filter:
         )
         summarization_model: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Model used for all general-purpose summarization tasks (history, sessions, hierarchical consolidation).",
+            description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact",
-            description="Fallback model for summarization when the primary summarization_model is unavailable.",
+            description="Fallback model for summarization when the primary model is unavailable.",
         )
 
         # ═════════════════════════════════════════════════════════════════════════
         # 11. SESSION & STATE
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 11.1 Project & storage ────────────────────────────────────────────
         project_id: str = Field(
             default="default",
-            description="Logical project identifier that scopes all per-project state (symbol index, active blocks, LTM, etc.).",
+            description="Logical project identifier that scopes all per-project state.",
         )
         max_cached_projects: int = Field(
             default=10,
-            description="Maximum number of project states kept in the in-memory LRU cache before the least recently used is evicted.",
+            description="Maximum project states kept in the in-memory LRU cache.",
         )
         state_db_path: str = Field(
             default="/app/backend/data/conversation_state.db",
-            description="Filesystem path for the SQLite database that persists conversation state, edges, and docstrings.",
+            description="Filesystem path for the SQLite database that persists conversation state.",
         )
         preserve_tool_calls: bool = Field(
             default=True,
-            description="Strip orphaned tool-call messages from the front of history before window management to avoid API errors.",
+            description="Strip orphaned tool-call messages from history before window management.",
         )
 
-        # ── Session summaries ───────────────────────────────────────────────
+        # ── 11.2 Conversation summaries ───────────────────────────────────────
         enable_session_summary: bool = Field(default=True)
         session_summary_interval_messages: int = Field(default=8)
-        session_summary_max_tokens: int = Field(default=0)  # concise by prompt petition
-
-        # ── Turn‑based window ───────────────────────────────────────────────
+        session_summary_max_tokens: int = Field(default=0)
         summarize_batch_turns: int = Field(
             default=5,
             ge=1,
             le=30,
             description="Minimum unsummarized turns before generating one summary.",
         )
-
-        # ── Hierarchical (L1 → L2) consolidation ───────────────────────────
         enable_hierarchical_summaries: bool = Field(
             default=True,
             description="Fold oldest L1 turn summaries into a single L2 summary.",
@@ -29992,7 +30089,9 @@ class Filter:
             description="Number of oldest L1 summaries folded into one L2 summary.",
         )
         max_hierarchical_summaries: int = Field(
-            default=2, ge=0, description="Maximum L2 summaries kept. 0 = keep all."
+            default=2,
+            ge=0,
+            description="Maximum L2 summaries kept. 0 = keep all.",
         )
         hierarchical_summary_max_tokens: int = Field(
             default=250,
@@ -30001,21 +30100,19 @@ class Filter:
             description="Token budget for an L2 consolidated summary.",
         )
 
-        # ── Feedback tracking ───────────────────────────────────────────────
+        # ── 11.3 Feedback tracking ────────────────────────────────────────────
         enable_feedback_tracking: bool = Field(default=True)
         feedback_history_limit: int = Field(default=10)
         inject_feedback_context: bool = Field(default=True)
         feedback_importance_penalty_for_failure: float = Field(default=2.0)
         preserve_error_context: bool = Field(default=True)
 
-        # ── Response cache ──────────────────────────────────────────────────
+        # ── 11.4 Response & duplicate cache ──────────────────────────────────
         enable_response_cache: bool = Field(default=True)
         response_cache_similarity_threshold: float = Field(default=0.92)
         response_cache_ttl_hours: float = Field(default=24.0)
         response_cache_max_entries: int = Field(default=100)
         response_cache_include_context_hash: bool = Field(default=True)
-
-        # ── Duplicate detection ─────────────────────────────────────────────
         duplicate_question_threshold: float = Field(default=0.92)
         duplicate_question_lookback: int = Field(default=20)
         duplicate_question_lookback_hours: float = Field(default=24.0)
@@ -30023,7 +30120,8 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 12. PERFORMANCE & PERSISTENCE
         # ═════════════════════════════════════════════════════════════════════════
-        # ── KV cache (slots) ──────────────────────────────────────────────────
+
+        # ── 12.1 KV cache (slots) ─────────────────────────────────────────────
         enable_kv_cache_stability: bool = Field(default=True)
         enable_slot_persistence: bool = Field(default=True)
         slot_save_path: str = Field(default="/kvcache")
@@ -30034,7 +30132,7 @@ class Filter:
             description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
         )
 
-        # ── Volatility‑tiered context ──────────────────────────────────────
+        # ── 12.2 Volatility‑tiered context ───────────────────────────────────
         enable_skeleton_tier: bool = Field(
             default=True,
             description="Inject the project skeleton (signatures) as a stable cache tier inside Block A.",
@@ -30042,11 +30140,11 @@ class Filter:
         skeleton_tier_max_tokens: int = Field(
             default=0,
             ge=0,
-            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget -> tier skipped.",
+            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget → tier skipped.",
         )
         skeleton_tier_suppresses_block_b_signatures: bool = Field(
             default=True,
-            description="When skeleton tier is active, Block B omits bare signatures (LOD‑0/LOD‑1) because they are already in the stable tier. Case D (refactor) is exempt.",
+            description="When skeleton tier is active, Block B omits bare signatures already in the stable tier.",
         )
         skeleton_include_docstrings: bool = Field(
             default=True,
@@ -30056,41 +30154,20 @@ class Filter:
             default=4,
             ge=1,
             le=20,
-            description="Turns to keep when an individual turn exceeds budget * 0.8 (emergency cap).",
+            description="Turns to keep when an individual turn exceeds budget × 0.8 (emergency cap).",
         )
-
-        # ── Monotonic compaction ─────────────────────────────────────────────
         compaction_defer_during_autocontinue: bool = Field(
             default=True,
             description="Skip turn‑based summarize/evict while an AutoContinue multi‑part session is active.",
         )
 
-        # ── Graph persistence ────────────────────────────────────────────────
+        # ── 12.3 Graph & ingestion ────────────────────────────────────────────
         enable_edge_persistence: bool = Field(default=True)
-
-        # ── Speculative prefetch ─────────────────────────────────────────────
         enable_speculative_prefetch: bool = Field(default=True)
         speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
-
-        # ── Silent ingestion ──────────────────────────────────────────────────
         enable_silent_ingestion: bool = Field(default=True)
 
-        # ── DB orphans cleanup ────────────────────────────────────────────────
-        purge_orphaned_data_interval: int = Field(
-            default=10,
-            ge=0,
-            description="Number of turns between automatic purges of orphaned DB rows. 0 = disabled.",
-        )
-
-        # ── AutoContinue watchdog ─────────────────────────────────────────────
-        max_autocontinue_turns: int = Field(
-            default=8,
-            ge=2,
-            le=30,
-            description="Maximum consecutive AutoContinue turns before the watchdog forces a reset.",
-        )
-
-        # ── Soft‑eviction ──────────────────────────────────────────────────────
+        # ── 12.4 Block lifecycle ──────────────────────────────────────────────
         enable_block_paging: bool = Field(
             default=True,
             description="Soft‑evict low‑activation blocks to ChromaDB instead of dropping them.",
@@ -30111,10 +30188,8 @@ class Filter:
             default=2,
             ge=1,
             le=16,
-            description="Max concurrent background embedding tasks during page‑out (overridden by global chroma semaphore).",
+            description="Max concurrent background embedding tasks during page‑out.",
         )
-
-        # ── Purge old versions ──────────────────────────────────────────────────
         purge_old_code_versions_enabled: bool = Field(
             default=True,
             description="Move code versions beyond the N most recent per file to cold storage.",
@@ -30126,9 +30201,24 @@ class Filter:
             description="Number of recent code versions per file to keep in active context.",
         )
 
+        # ── 12.5 Maintenance ──────────────────────────────────────────────────
+        purge_orphaned_data_interval: int = Field(
+            default=10,
+            ge=0,
+            description="Turns between automatic purges of orphaned DB rows. 0 = disabled.",
+        )
+        max_autocontinue_turns: int = Field(
+            default=8,
+            ge=2,
+            le=30,
+            description="Maximum consecutive AutoContinue turns before the watchdog forces a reset.",
+        )
+
         # ═════════════════════════════════════════════════════════════════════════
         # 13. INTERACTION & COMMANDS
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 13.1 Commands & expansion ─────────────────────────────────────────
         enable_forget_command: bool = Field(default=True)
         enable_natural_language_forget: bool = Field(default=True)
         outlet_expand_intercept_enabled: bool = Field(default=True)
@@ -30140,16 +30230,16 @@ class Filter:
             description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
         )
 
-        # ── Proactive suggestions ─────────────────────────────────────────────
+        # ── 13.2 Proactive suggestions ────────────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
         proactive_summary_threshold: float = Field(default=0.95)
 
-        # ── Context cleanup ────────────────────────────────────────────────────
+        # ── 13.3 Context cleanup ──────────────────────────────────────────────
         cleanup_suggestions_enabled: bool = Field(default=True)
         cleanup_inactive_threshold_messages: int = Field(default=30)
         cleanup_excluded_content_types: list = Field(
-            default_factory=lambda: ["BASE_CODE"]
+            default_factory=lambda: ["BASE_CODE"],
         )
         cleanup_status_command_enabled: bool = Field(default=True)
         cleanup_proactive_suggestions: bool = Field(default=True)
@@ -30159,6 +30249,8 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
         # 14. UTILITIES & TUNING
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 14.1 Core ─────────────────────────────────────────────────────────
         debug: bool = Field(
             default=True,
             description="Enable verbose timestamped debug logging to stdout for all CodeAware subsystems.",
@@ -30169,10 +30261,10 @@ class Filter:
         )
         use_tiktoken: bool = Field(
             default=True,
-            description="Use tiktoken (cl100k_base) for accurate token counting. Falls back to a 4-chars-per-token heuristic if tiktoken is unavailable.",
+            description="Use tiktoken (cl100k_base) for accurate token counting.",
         )
 
-        # ── Context dump (evolution tracking) ──────────────────────────────
+        # ── 14.2 Context dump (evolution tracking) ────────────────────────────
         enable_context_dump: bool = Field(
             default=True,
             description="Dump per‑turn context (Block A, Block B, message window) to disk for evolution tracking.",
@@ -30200,7 +30292,7 @@ class Filter:
             description="Append a compact metrics line per turn to evolution.jsonl.",
         )
 
-        # ── Weighting & decay ─────────────────────────────────────────────────
+        # ── 14.3 Weighting & decay ────────────────────────────────────────────
         raw_file_priority_boost: float = Field(default=2.0)
         importance_mention_boost: float = Field(default=0.2)
         importance_recency_half_life_hours: float = Field(default=2.0)
@@ -30216,26 +30308,31 @@ class Filter:
         frequency_decay_hours: float = Field(default=12.0)
 
         # ═════════════════════════════════════════════════════════════════════════
-        # 15. LAZY + BACKGROUND TASKS CONTROL
+        # 15. LAZY + BACKGROUND TASKS
         # ═════════════════════════════════════════════════════════════════════════
+
+        # ── 15.1 Master switch ────────────────────────────────────────────────
         enable_background_tasks: bool = Field(
             default=True,
             description="Master switch for ALL background tasks. If False, no background work is started.",
         )
 
-        # ── Lazy task control (inlet) ─────────────────────────────────────────
+        # ── 15.2 Lazy tasks (inlet) ───────────────────────────────────────────
         enable_lazy_docstrings: bool = Field(
             default=True,
-            description="Enable lazy generation of docstrings in inlet (if not completed in background).",
+            description="Enable lazy generation of docstrings in inlet.",
         )
         enable_lazy_prefetch: bool = Field(
-            default=True, description="Enable lazy prefetch of CodePathViews in inlet."
+            default=True,
+            description="Enable lazy prefetch of CodePathViews in inlet.",
         )
         enable_lazy_session_summary: bool = Field(
-            default=True, description="Enable lazy session summary generation in inlet."
+            default=True,
+            description="Enable lazy session summary generation in inlet.",
         )
         enable_lazy_raptor: bool = Field(
-            default=True, description="Enable lazy RAPTOR rebuild in inlet."
+            default=True,
+            description="Enable lazy RAPTOR rebuild in inlet.",
         )
         enable_lazy_purge: bool = Field(
             default=False,
@@ -30246,7 +30343,7 @@ class Filter:
             description="Enable lazy LOD adaptive adjustment in inlet (uses last response).",
         )
 
-        # ── Background task control (outlet) ──────────────────────────────────
+        # ── 15.3 Background tasks (outlet) ────────────────────────────────────
         enable_bg_docstrings: bool = Field(
             default=True,
             description="Enable background docstring generation between turns.",
@@ -30260,7 +30357,8 @@ class Filter:
             description="Enable background session summary generation between turns.",
         )
         enable_bg_raptor: bool = Field(
-            default=True, description="Enable background RAPTOR rebuild between turns."
+            default=True,
+            description="Enable background RAPTOR rebuild between turns.",
         )
         enable_bg_purge: bool = Field(
             default=False,
@@ -30271,7 +30369,7 @@ class Filter:
             description="Enable background LOD adaptive adjustment between turns.",
         )
 
-        # ── Priority control ──────────────────────────────────────────────────
+        # ── 15.4 Priority & performance ───────────────────────────────────────
         background_priority: Dict[str, int] = Field(
             default_factory=lambda: {
                 "session_summary": 1,
@@ -30283,8 +30381,6 @@ class Filter:
             },
             description="Override default priority for background tasks. Higher number = higher priority.",
         )
-
-        # ── Timeout and logging ──────────────────────────────────────────────
         bg_task_stop_timeout: float = Field(
             default=5.0,
             ge=1.0,
