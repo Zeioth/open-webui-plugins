@@ -11315,11 +11315,13 @@ Output only the number (0, 1, 2, or 3):
         question: str,
         context: str,
         max_hypotheses: int,
+        project_id: str,
         label: str = "",
     ) -> List[Tuple[str, float]]:
         """
         Generate the initial set of hypotheses for the scientific reasoning loop.
         Extracted from generate_scientific_reasoning_L3 REGION 2.
+        Slot is restored after the LLM call.
         """
         prompt = (
             f"Context:\n{context[:3000]}\n\n"
@@ -11341,6 +11343,10 @@ Output only the number (0, 1, 2, or 3):
             temperature=0.4,
             label=f"{label}_gen_hypotheses" if label else "sci_gen_hypotheses",
         )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not response:
             return []
         return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
@@ -11350,11 +11356,13 @@ Output only the number (0, 1, 2, or 3):
         question: str,
         skeleton_context: str,
         max_hypotheses: int,
+        project_id: str,
         label: str = "",
     ) -> List[Tuple[str, float]]:
         """
         Generate initial design option hypotheses for architecture reasoning.
         Extracted from generate_scientific_architecture_reasoning Step 1.
+        Slot is restored after the LLM call.
         """
         prompt = (
             f"Code skeleton (contracts — bodies as `...`):\n"
@@ -11381,9 +11389,12 @@ Output only the number (0, 1, 2, or 3):
             temperature=0.4,
             label=f"{label}_gen_options" if label else "sci_arch_gen",
         )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not response:
             return []
-        # Architecture format: "Design Option N:" prefix — reuse the same parser
         return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
 
     async def _synthesize_scientific_reasoning(
@@ -11393,6 +11404,7 @@ Output only the number (0, 1, 2, or 3):
         best_hyp: str,
         best_score: float,
         best_evidence: "StaticEvidence",
+        project_id: str,
         peer_review: Optional["PeerReviewResult"] = None,
         label: str = "",
     ) -> str:
@@ -11428,6 +11440,10 @@ Output only the number (0, 1, 2, or 3):
             temperature=0.3,
             label=f"{label}_synthesize" if label else "sci_synthesize",
         )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not reasoning:
             return ""
 
@@ -11449,6 +11465,7 @@ Output only the number (0, 1, 2, or 3):
         best_hyp: str,
         best_score: float,
         best_evidence: "StaticEvidence",
+        project_id: str,
         peer_review: Optional["PeerReviewResult"] = None,
         label: str = "",
     ) -> str:
@@ -11500,6 +11517,10 @@ Output only the number (0, 1, 2, or 3):
             temperature=0.25,
             label=f"{label}_synthesize" if label else "sci_arch_synth",
         )
+
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not synthesis:
             return ""
 
@@ -11520,31 +11541,14 @@ Output only the number (0, 1, 2, or 3):
     ) -> str:
         """
         Generate scientific Chain-of-Thought reasoning with structural validation.
-
-        Thin wrapper — delegates hypothesis competition to
-        MetacognitiveReasoningEngine.compete_hypotheses(), which implements
-        the full scientific method loop with epistemic tools.
-
-        Pipeline:
-        ① _generate_initial_hypotheses()           — REGION 2 (prompt, parse)
-        ② _meta_reasoning.compete_hypotheses()      — full loop with:
-             design_critical_experiment, generate_predictions,
-             active_learning, is_falsified, weighted_scoring,
-             stagnation_detection, experimentum_crucis,
-             peer_review (antithesis), delimit_scope (synthesis),
-             debriefing
-        ③ _synthesize_scientific_reasoning()        — REGIONS 4-5 (final LLM call)
-
-        Falls back to generate_cot_reasoning (level 2) if hypothesis
-        generation fails or produces fewer than 2 candidates.
+        Thin wrapper — delegates to MetacognitiveReasoningEngine.compete_hypotheses().
         """
         max_hypotheses = self._f.valves.scientific_hypotheses_count
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
-        # ① Generate initial hypotheses
         hypotheses = await self._generate_initial_hypotheses(
-            question, context, max_hypotheses, label
+            question, context, max_hypotheses, project_id, label
         )
         if len(hypotheses) < 2:
             self._f._log_debug(
@@ -11552,7 +11556,6 @@ Output only the number (0, 1, 2, or 3):
             )
             return await self.generate_cot_reasoning(question, context, label)
 
-        # ② Compete — full scientific loop in MetacognitiveReasoningEngine
         best_hyp, best_score, best_evidence, peer_review = (
             await self._f._meta_reasoning.compete_hypotheses(
                 hypotheses=hypotheses,
@@ -11560,7 +11563,7 @@ Output only the number (0, 1, 2, or 3):
                 max_iters=max_iters,
                 threshold=threshold,
                 label=label,
-                obj_weight=0.5,  # verification: evidence and LLM equally weighted
+                obj_weight=0.5,
                 llm_weight=0.5,
             )
         )
@@ -11571,13 +11574,13 @@ Output only the number (0, 1, 2, or 3):
             )
             return await self.generate_cot_reasoning(question, context, label)
 
-        # ③ Synthesize final reasoning
         reasoning = await self._synthesize_scientific_reasoning(
             question,
             context,
             best_hyp,
             best_score,
             best_evidence,
+            project_id=project_id,
             peer_review=peer_review,
             label=label,
         )
@@ -11595,18 +11598,8 @@ Output only the number (0, 1, 2, or 3):
     ) -> str:
         """
         Scientific-method architecture reasoning on skeleton contracts.
-
-        Thin wrapper — delegates design option competition to
-        MetacognitiveReasoningEngine.compete_hypotheses().
-
-        Key difference from generate_scientific_reasoning_L3:
-          - Context is the skeleton (contracts), not compressed code.
-          - Hypotheses are DESIGN OPTIONS, not debugging explanations.
-          - obj_weight=0.4 / llm_weight=0.6: LLM design judgment matters
-            more when PROPOSING changes than when VERIFYING existing behavior.
-
-        Falls back to generate_architecture_reasoning (L2 arch) if skeleton
-        is empty, hypothesis parsing fails, or the LLM is unavailable.
+        Thin wrapper — delegates to MetacognitiveReasoningEngine.compete_hypotheses().
+        obj_weight=0.4 / llm_weight=0.6: proposing changes, LLM judgment weighted higher.
         """
         if not skeleton_context.strip():
             return await self.generate_architecture_reasoning(
@@ -11617,9 +11610,8 @@ Output only the number (0, 1, 2, or 3):
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
-        # ① Generate initial design hypotheses from skeleton
         hypotheses = await self._generate_initial_arch_hypotheses(
-            question, skeleton_context, max_hypotheses, label
+            question, skeleton_context, max_hypotheses, project_id, label
         )
         if len(hypotheses) < 2:
             self._f._log_debug(
@@ -11629,7 +11621,6 @@ Output only the number (0, 1, 2, or 3):
                 question, skeleton_context, project_id, label=label
             )
 
-        # ② Compete — architecture mode: LLM design judgment weighted higher
         best_hyp, best_score, best_evidence, peer_review = (
             await self._f._meta_reasoning.compete_hypotheses(
                 hypotheses=hypotheses,
@@ -11637,7 +11628,7 @@ Output only the number (0, 1, 2, or 3):
                 max_iters=max_iters,
                 threshold=threshold,
                 label=label,
-                obj_weight=0.4,  # proposing: LLM design judgment matters more
+                obj_weight=0.4,
                 llm_weight=0.6,
             )
         )
@@ -11650,13 +11641,13 @@ Output only the number (0, 1, 2, or 3):
                 question, skeleton_context, project_id, label=label
             )
 
-        # ③ Synthesize final architecture proposal
         synthesis = await self._synthesize_scientific_architecture_reasoning(
             question,
             skeleton_context,
             best_hyp,
             best_score,
             best_evidence,
+            project_id=project_id,
             peer_review=peer_review,
             label=label,
         )
@@ -16736,11 +16727,31 @@ class MetacognitiveReasoningEngine:
         Migrated from ActivationEngine._gather_static_evidence.
         No LLM. No GPU. Instant.
 
-        Verifies which symbols and call relations mentioned in the hypothesis
-        actually exist in the SymbolGraph (the ground truth of the codebase).
+        Called N × M times per competition turn (N hypotheses × M iterations +
+        Active Learning re-gathers). Must be fully side-effect free.
+        mark_stale_for_symbol intentionally omitted — path staleness is
+        managed by the main activation pipeline, not by evidence gathering.
         """
+        _EMPTY = StaticEvidence(
+            symbols_found={},
+            call_relations_valid={},
+            recent_changes=[],
+            entry_points_mentioned=[],
+            path_memberships={},
+            data_flow_upstream={},
+            objective_score=0.5,
+        )
+
         all_names = self._f._symbol_index.get_all_names(project_id)
         state = self._f._conversation_state_manager.get(project_id)
+
+        # Guard: state may be None on first turn or fresh project
+        if state is None:
+            self._f._log_debug(
+                "gather_evidence: state is None for project_id="
+                f"'{project_id}' — returning empty evidence"
+            )
+            return _EMPTY
 
         words = set(re.findall(r"\b\w+\b", hypothesis))
         mentioned = all_names.intersection(words)
@@ -16769,26 +16780,23 @@ class MetacognitiveReasoningEngine:
 
         now = time.time()
         recent_window = 3600
-        recent_changes = [
-            name
-            for name in mentioned
-            if any(
-                state.active_blocks.get(bh) is not None
-                and (now - state.active_blocks[bh].timestamp) < recent_window
-                for bh in self._f._symbol_index.find_blocks(name, project_id)
-            )
-        ]
+        recent_changes = []
+        for name in mentioned:
+            for bh in self._f._symbol_index.find_blocks(name, project_id):
+                block = state.active_blocks.get(bh)
+                if block is not None and (now - block.timestamp) < recent_window:
+                    recent_changes.append(name)
+                    break
 
         all_views = self._f._path_index.get_all(project_id)
         entry_points_mentioned = [
             v.entry_point for v in all_views if v.entry_point in mentioned
         ]
 
+        # Side-effect free: read path memberships without marking stale.
+        # mark_stale_for_symbol is intentionally omitted — gather_evidence
+        # is called N×M times per competition and must not degrade PathIndex.
         path_memberships: Dict[str, List[str]] = {}
-        for name in mentioned:
-            path_memberships[name] = self._f._path_index.mark_stale_for_symbol(
-                name, project_id
-            )
 
         data_flow_upstream: Dict[str, List[str]] = {}
         for sym_name in mentioned:
@@ -16903,16 +16911,30 @@ class MetacognitiveReasoningEngine:
     def _claim_verified(self, claim: str, evidence: "StaticEvidence") -> bool:
         """
         Check if a textual claim is confirmed by the structural evidence.
-        Unverifiable claims (no match in evidence) get benefit of the doubt.
+
+        Normalizes spaces→underscores before matching:
+            LLM claims use natural language: "foo calls bar"
+            Evidence keys use underscores:   "foo_calls_bar"
+        Both variants are tried to avoid false negatives caused by
+        format mismatch. Without normalization, is_falsified can never
+        detect call relation contradictions (critical bug D).
+
+        Unverifiable claims (no match in evidence) get benefit of the doubt
+        and return True.
         """
         claim_lower = claim.lower()
+        claim_normalized = claim_lower.replace(" ", "_")
+        claim_variants = {claim_lower, claim_normalized}
+
         for relation, valid in evidence.call_relations_valid.items():
-            if claim_lower in relation.lower():
+            relation_lower = relation.lower()
+            if any(v in relation_lower for v in claim_variants):
                 return valid
         for symbol, found in evidence.symbols_found.items():
-            if claim_lower in symbol.lower():
+            symbol_lower = symbol.lower()
+            if any(v in symbol_lower for v in claim_variants):
                 return found
-        return True
+        return True  # unverifiable → benefit of doubt
 
     def is_falsified(
         self,
@@ -16923,11 +16945,15 @@ class MetacognitiveReasoningEngine:
         """
         Popperian asymmetric falsification with coverage guard.
 
+        Claim matching normalizes spaces→underscores in both directions
+        so that natural language claims ("foo calls bar") match
+        underscore-keyed evidence ("foo_calls_bar").
+
         Coverage guard (H4 + H2 interaction):
             If coverage_score < min_coverage_for_falsification and
             enable_coverage_guard_for_falsification=True, we've only
             verified a small fraction of the hypothesis's claims.
-            A failed critical claim may reflect incomplete sampling —
+            A failed critical claim may reflect incomplete sampling,
             not a true structural contradiction.
             In this case: returns (False, reason) — caller applies
             a penalty via compute_weighted_score instead of killing.
@@ -16936,7 +16962,7 @@ class MetacognitiveReasoningEngine:
             ANY critical claim False → immediate hard kill.
             Supportive claim failures → score penalty only.
 
-        Without design (fallback):
+        Without design (fallback — enable_experiment_design=False):
             Symmetric ratio > 0.5 → falsified.
 
         Returns (falsified, reason_string).
@@ -16949,6 +16975,7 @@ class MetacognitiveReasoningEngine:
         )
 
         if not self._f.valves.enable_experiment_design or not design.critical_claims:
+            # Symmetric fallback — existing behaviour when design is disabled
             neg = self.negative_evidence(evidence)
             total = len(evidence.symbols_found) + len(evidence.call_relations_valid)
             if total == 0:
@@ -16961,10 +16988,16 @@ class MetacognitiveReasoningEngine:
                 )
             return False, None
 
+        # Asymmetric: ONE critical claim failure → hard kill (or downgrade)
         for claim in design.critical_claims:
             claim_lower = claim.lower()
+            # Normalize spaces→underscores to match evidence key format
+            # LLM writes "foo calls bar", evidence uses "foo_calls_bar"
+            claim_normalized = claim_lower.replace(" ", "_")
+            claim_variants = {claim_lower, claim_normalized}
+
             for relation, valid in evidence.call_relations_valid.items():
-                if claim_lower in relation.lower() and not valid:
+                if any(v in relation.lower() for v in claim_variants) and not valid:
                     reason = (
                         f"Critical claim falsified: '{claim}' — "
                         f"relation '{relation}' does not exist in SymbolGraph"
@@ -16976,11 +17009,11 @@ class MetacognitiveReasoningEngine:
                             f"{self._f.valves.min_coverage_for_falsification:.2f}) "
                             f"→ downgrading hard kill to penalty"
                         )
-                        return False, reason
-                    return True, reason
+                        return False, reason  # caller applies penalty
+                    return True, reason  # hard kill
 
             for symbol, found in evidence.symbols_found.items():
-                if claim_lower in symbol.lower() and not found:
+                if any(v in symbol.lower() for v in claim_variants) and not found:
                     reason = (
                         f"Critical claim falsified: '{claim}' — "
                         f"symbol '{symbol}' not found in SymbolGraph"
@@ -16991,8 +17024,8 @@ class MetacognitiveReasoningEngine:
                             f"(coverage={coverage_score:.2f}) "
                             f"→ downgrading hard kill to penalty"
                         )
-                        return False, reason
-                    return True, reason
+                        return False, reason  # caller applies penalty
+                    return True, reason  # hard kill
 
         return False, None
 
@@ -17191,15 +17224,27 @@ class MetacognitiveReasoningEngine:
 
         These predictions are verified by gather_evidence() in the next
         iteration, closing the hypothetico-deductive cycle.
+
+        Note: skeleton context is fetched via _format_skeleton (synchronous).
+        If unavailable, predictions are generated without code structure
+        context and will be more generic. This degrades gracefully —
+        the absence is logged explicitly.
         """
         if not self._f.valves.enable_generate_predictions:
             return []
 
+        skeleton_ctx = ""
         try:
-            skeleton = await self._f._ctx_builder._format_skeleton(project_id)
+            skeleton = self._f._ctx_builder._format_skeleton(
+                project_id
+            )  # sync — no await
             skeleton_ctx = skeleton[:2000] if skeleton else ""
-        except Exception:
-            skeleton_ctx = ""
+        except Exception as e:
+            self._f._log_debug(
+                f"generate_predictions: skeleton unavailable "
+                f"({type(e).__name__}: {e}) — "
+                f"predictions generated without code structure context"
+            )
 
         prompt = (
             f"Hypothesis:\n{hypothesis}\n\n"
@@ -17243,10 +17288,14 @@ class MetacognitiveReasoningEngine:
             data = json.loads(response)
             predictions = [str(p) for p in data.get("predictions", []) if p]
             self._f._log_debug(
-                f"generate_predictions: {len(predictions)} prediction(s)"
+                f"generate_predictions: {len(predictions)} prediction(s) "
+                f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
             )
             return predictions
         except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"generate_predictions: parse error — {response[:200]!r}"
+            )
             return []
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -17588,30 +17637,42 @@ class MetacognitiveReasoningEngine:
         max_iters: int = 3,
         threshold: float = 0.75,
         label: str = "",
-        obj_weight: float = 0.5,  # ← NEW
-        llm_weight: float = 0.5,  # ← NEW
+        obj_weight: float = 0.5,
+        llm_weight: float = 0.5,
     ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
         """
         Full scientific hypothesis competition loop.
 
         Temporal hierarchy (H5):
-        ITERATION:     stagnation, constraints, divergent thinking
-        TURN:          design, predictions, active learning, falsification,
-                       scoring, uncertainty
-        CONVERSATION:  experimentum crucis, peer_review (antithesis),
-                       delimit_scope (synthesis) — H6 dialectical order
-        PROJECT:       debriefing → adaptive strategy
+        ITERATION:     stagnation detection on obj_score_history (NOT combined —
+                       llm_conf excluded as self-reported signal),
+                       _build_refinement_constraints (PID output → LLM input),
+                       divergent thinking on stagnation escape
+        TURN:          design_critical_experiment, generate_predictions (iter 1),
+                       gather_evidence, Active Learning (H4),
+                       is_falsified (with coverage guard), compute_weighted_score,
+                       _compute_epistemic_uncertainty
+        CONVERSATION:  experimentum_crucis (tiebreaker when top-2 within threshold),
+                       devil's advocate (signal: score > 0.8, overconfidence risk),
+                       peer_review (antithesis, gated by uncertainty + valve),
+                       delimit_scope (synthesis, H6 dialectical order —
+                       always AFTER peer_review so critique informs synthesis)
+        PROJECT:       _debrief_competition → _performance_history (all iterations,
+                       including total-failure case — Bug B fix)
+                       → _get_adaptive_strategy (next call)
 
-        H6 (Dialectical order):
-            peer_review BEFORE delimit_scope.
-            The critique (antithesis) must be known before synthesis.
-            delimit_scope receives peer_review to produce an informed synthesis.
+        H6 (Dialectical order): peer_review BEFORE delimit_scope.
+        The antithesis (critique) must be known before synthesis (scope).
+
+        obj_weight / llm_weight:
+            0.5/0.5 default — verification: evidence and LLM equally weighted
+            0.4/0.6 for architecture — proposing changes, design judgment > evidence
 
         Returns (best_hypothesis_text, best_score, best_evidence, peer_review).
         """
         max_hypotheses = len(hypotheses)
 
-        # Null hypothesis baseline — always included
+        # Null hypothesis baseline — always included as floor comparison
         null_hyp = (
             "The behavior follows the most direct structural path "
             "without additional indirection or hidden dependencies.",
@@ -17633,6 +17694,7 @@ class MetacognitiveReasoningEngine:
         obj_score_history: List[float] = []  # obj_score ONLY — no llm_conf
         stagnated_this_run = False
         valid_scored: List["ScoredHypothesis"] = []
+        all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
         iteration = 0
 
         while iteration < max_iters:
@@ -17644,7 +17706,7 @@ class MetacognitiveReasoningEngine:
                 f"(iteration {iteration}/{max_iters})..."
             )
 
-            # ITERATION LEVEL: build constraints for this iteration (PID)
+            # ITERATION LEVEL: PID constraints from previous iteration's results
             _constraints = self._build_refinement_constraints(
                 coverage_score=best_scored.coverage_score if best_scored else 1.0,
                 strategy=strategy,
@@ -17657,7 +17719,7 @@ class MetacognitiveReasoningEngine:
                 # ① Design experiment (cached after first occurrence)
                 design = await self.design_critical_experiment(hyp_text, project_id)
 
-                # ② Generate predictions (first iteration only)
+                # ② Generate predictions (first iteration only — costly LLM call)
                 predictions: List[str] = []
                 if iteration == 1:
                     predictions = await self.generate_predictions(hyp_text, project_id)
@@ -17665,7 +17727,7 @@ class MetacognitiveReasoningEngine:
                 # ③ Gather primary evidence
                 evidence = self.gather_evidence(hyp_text, project_id)
 
-                # ④ Verify predictions
+                # ④ Verify predictions via secondary evidence pass
                 pred_verified = 0
                 pred_total = 0
                 if predictions:
@@ -17680,6 +17742,8 @@ class MetacognitiveReasoningEngine:
                     )
 
                 # ⑤ Active Learning (H4) — reclassify unknown claims
+                # Signal: initial coverage below threshold AND unknown claims
+                # mention verifiable symbols
                 initial_coverage = self._compute_coverage_score(design)
                 if initial_coverage < self._f.valves.low_coverage_threshold:
                     resolvable = self._identify_missing_information(design, project_id)
@@ -17687,7 +17751,7 @@ class MetacognitiveReasoningEngine:
                         design = self._resolve_unknown_claims(
                             design, resolvable, project_id
                         )
-                        # ⑥ Re-gather with improved design
+                        # ⑥ Re-gather with improved design (more claims verifiable)
                         evidence = self.gather_evidence(hyp_text, project_id)
                         self._f._log_debug(
                             f"active_learning: re-gathered after reclassification "
@@ -17720,10 +17784,10 @@ class MetacognitiveReasoningEngine:
                     )
                     continue
 
-                # Downgrade: reason returned but not killed (coverage guard)
+                # Downgrade: reason returned but not killed (coverage guard active)
                 downgraded_reason = reason if (not falsified and reason) else None
 
-                # ⑧ Weighted scoring → 3-tuple
+                # ⑧ Weighted scoring with obj/llm balance
                 obj_score, combined, coverage_score = self.compute_weighted_score(
                     evidence,
                     design,
@@ -17735,7 +17799,7 @@ class MetacognitiveReasoningEngine:
                     llm_weight=llm_weight,
                 )
 
-                # ⑨ Epistemic uncertainty (H2)
+                # ⑨ Epistemic uncertainty (H2 — Bayesian-inspired, deterministic)
                 epistemic_uncertainty = self._compute_epistemic_uncertainty(
                     obj_score, coverage_score, pred_verified, pred_total
                 )
@@ -17767,6 +17831,9 @@ class MetacognitiveReasoningEngine:
                     )
                 )
 
+            # Bug 7: accumulate ALL iterations for project-level debriefing
+            all_scored.extend(current_scored)
+
             # Sort: non-falsified by combined score descending
             valid_scored = [s for s in current_scored if not s.falsified]
             valid_scored.sort(key=lambda x: x.score, reverse=True)
@@ -17780,13 +17847,17 @@ class MetacognitiveReasoningEngine:
             best_scored = valid_scored[0]
             runner_up = valid_scored[1] if len(valid_scored) >= 2 else None
 
-            # ITERATION LEVEL: track obj_score (deterministic signal only)
+            # ITERATION LEVEL: track obj_score ONLY (deterministic SymbolGraph signal)
+            # llm_conf excluded — self-reported by LLM, unreliable for convergence
             obj_score_history.append(best_scored.obj_score)
 
             if best_scored.score >= threshold or iteration >= max_iters:
                 break
 
             # ITERATION LEVEL: stagnation detection → diverge or refine
+            # Note: requires len(obj_score_history) >= stagnation_window + 1.
+            # Only effective when scientific_max_iterations >= stagnation_window + 2.
+            # See _validate_valve_coherence for the coherence warning (Bug C).
             if self._f.valves.enable_stagnation_detection and self._detect_stagnation(
                 obj_score_history,
                 window=self._f.valves.stagnation_window,
@@ -17806,10 +17877,10 @@ class MetacognitiveReasoningEngine:
                 if not refined:
                     break
                 hypotheses = refined
-                obj_score_history = []  # reset — new direction
+                obj_score_history = []  # reset — new direction, new baseline
 
             else:
-                # Convergent refinement with deterministic constraints
+                # Convergent refinement with deterministic PID constraints
                 refined = await self._refine_hypotheses(
                     best_scored,
                     max_hypotheses,
@@ -17823,7 +17894,27 @@ class MetacognitiveReasoningEngine:
 
         # ── Post-loop guard ───────────────────────────────────────────────
         if best_scored is None:
-            self._f._log_debug("compete_hypotheses: no valid hypothesis found")
+            self._f._log_debug(
+                "compete_hypotheses: no valid hypothesis survived — "
+                "all falsified across all iterations"
+            )
+            # Bug B fix: record total-failure in performance history so
+            # _get_adaptive_strategy can learn from this failure mode.
+            # Without this, the project's persistent failure pattern
+            # (e.g., always falsified by call_relations) is invisible.
+            _avg_cov = (
+                sum(s.coverage_score for s in all_scored) / len(all_scored)
+                if all_scored
+                else 0.0
+            )
+            await self._debrief_competition(
+                scored_list=all_scored,
+                final_score=0.0,
+                coverage_score=_avg_cov,
+                score_trajectory=obj_score_history,
+                stagnated=stagnated_this_run,
+                project_id=project_id,
+            )
             return (
                 "Unable to validate any hypothesis against the codebase structure.",
                 0.0,
@@ -17839,7 +17930,8 @@ class MetacognitiveReasoningEngine:
                 None,
             )
 
-        # CONVERSATION LEVEL: experimentum crucis (tiebreaker)
+        # CONVERSATION LEVEL: experimentum crucis
+        # Signal: top-2 hypotheses within crucis_threshold of each other
         if (
             self._f.valves.enable_experimentum_crucis
             and runner_up is not None
@@ -17856,30 +17948,65 @@ class MetacognitiveReasoningEngine:
                 )
                 best_scored, runner_up = runner_up, best_scored
 
-        # CONVERSATION LEVEL (H6): peer_review BEFORE delimit_scope
-        # Dialectical order: antithesis (critique) must precede synthesis.
-        # Gated by epistemic uncertainty — low uncertainty means the
-        # hypothesis already won clearly, peer review adds no value.
+        # CONVERSATION LEVEL: devil's advocate
+        # Signal: score > 0.8 (overconfidence risk) AND peer_review disabled.
+        # When enable_peer_review=True, challenge_hypothesis() runs internally
+        # inside the degraded peer review path — no duplication needed.
+        # Result stored as PeerReviewResult so delimit_scope (H6) can use
+        # the critique as antithesis material.
         peer_review: Optional["PeerReviewResult"] = None
 
-        _uncertainty_justifies_review = (
-            best_scored.epistemic_uncertainty
-            >= self._f.valves.peer_review_uncertainty_threshold
-        )
-
-        if _uncertainty_justifies_review or self._f.valves.enable_peer_review:
-            peer_review = await self.peer_review_hypothesis(
-                best_scored.text,
-                best_scored.evidence,
-                best_scored.design,
-                project_id,
-            )
-        else:
+        if (
+            self._f.valves.enable_devil_advocate
+            and not self._f.valves.enable_peer_review
+            and best_scored.score > 0.8
+        ):
             self._f._log_debug(
-                f"compete_hypotheses: peer review skipped "
-                f"(uncertainty={best_scored.epistemic_uncertainty:.2f} < "
-                f"threshold={self._f.valves.peer_review_uncertainty_threshold:.2f})"
+                f"compete_hypotheses: devil's advocate triggered "
+                f"(score={best_scored.score:.3f} > 0.8, overconfidence risk)"
             )
+            await self._f._emit_status("😈 Running devil's advocate...")
+            critique = await self.challenge_hypothesis(
+                best_scored.text, best_scored.evidence, project_id
+            )
+            if critique:
+                peer_review = PeerReviewResult(
+                    verdict="QUALIFY",
+                    critiques=[critique],
+                    reviewer_model="internal_devil_advocate",
+                    is_external=False,
+                )
+                self._f._log_debug(
+                    "compete_hypotheses: devil's advocate found flaw — "
+                    "will inform dialectical scope delimitation"
+                )
+
+        # CONVERSATION LEVEL: peer review (antithesis — H6)
+        # Signal: enable_peer_review=True AND uncertainty >= threshold.
+        # Epistemic uncertainty gate:
+        #   score < 0.4 → uncertainty high but hypothesis already failed → noise
+        #   score > 0.85 → uncertainty low, hypothesis won clearly → wasteful
+        #   useful range [0.4, 0.85] maps to uncertainty >= threshold
+        # Bug 2 fix: only call when valve is enabled (avoids needless None returns)
+        if self._f.valves.enable_peer_review:
+            _uncertainty_justifies_review = (
+                best_scored.epistemic_uncertainty
+                >= self._f.valves.peer_review_uncertainty_threshold
+            )
+            if _uncertainty_justifies_review:
+                peer_review = await self.peer_review_hypothesis(
+                    best_scored.text,
+                    best_scored.evidence,
+                    best_scored.design,
+                    project_id,
+                )
+            else:
+                self._f._log_debug(
+                    f"compete_hypotheses: peer review skipped — "
+                    f"uncertainty={best_scored.epistemic_uncertainty:.2f} < "
+                    f"threshold={self._f.valves.peer_review_uncertainty_threshold:.2f} "
+                    f"(hypothesis result is clear enough)"
+                )
 
         # Promote runner-up if peer review rejects winner
         if (
@@ -17889,11 +18016,25 @@ class MetacognitiveReasoningEngine:
         ):
             self._f._log_debug(
                 f"compete_hypotheses: winner REJECTED by peer review, "
-                f"promoting runner-up. Critiques: {peer_review.critiques}"
+                f"promoting runner-up. "
+                f"Critiques (about demoted winner): {peer_review.critiques}"
             )
             best_scored = runner_up
+            # Bug 16 fix: peer_review critiques describe the DEMOTED winner,
+            # not the promoted runner-up. Passing them to delimit_scope would
+            # synthesize scope for the wrong hypothesis using irrelevant critiques.
+            # Clear peer_review — the runner-up has not been independently reviewed.
+            peer_review = PeerReviewResult(
+                verdict="APPROVE",
+                critiques=[],
+                reviewer_model="runner_up_promotion",
+                is_external=False,
+            )
 
-        # CONVERSATION LEVEL (H6): delimit_scope WITH peer_review (synthesis)
+        # CONVERSATION LEVEL: delimit_scope (synthesis — H6)
+        # Receives peer_review AFTER antithesis is known.
+        # If peer_review is APPROVE (or runner-up was promoted), only
+        # negative structural evidence informs the scope.
         final_text = best_scored.text
         if self._f.valves.enable_scope_delimitation:
             await self._f._emit_status("📐 Synthesizing scope and critique...")
@@ -17907,9 +18048,12 @@ class MetacognitiveReasoningEngine:
             if scoped:
                 final_text = scoped
 
-        # PROJECT LEVEL: debriefing → update performance history
+        # PROJECT LEVEL: debriefing with ALL iterations (Bug 7)
+        # all_scored includes hypotheses from every iteration — gives accurate
+        # picture of failure patterns across the full competition, not just
+        # the final iteration.
         await self._debrief_competition(
-            scored_list=valid_scored,
+            scored_list=all_scored,
             final_score=best_scored.score,
             coverage_score=best_scored.coverage_score,
             score_trajectory=obj_score_history,
@@ -17921,7 +18065,8 @@ class MetacognitiveReasoningEngine:
             f"compete_hypotheses: winner score={best_scored.score:.3f}, "
             f"coverage={best_scored.coverage_score:.2f}, "
             f"uncertainty={best_scored.epistemic_uncertainty:.2f}, "
-            f"stagnated={stagnated_this_run}"
+            f"stagnated={stagnated_this_run}, "
+            f"total_evaluated={len(all_scored)} across {iteration} iter(s)"
         )
 
         return final_text, best_scored.score, best_scored.evidence, peer_review
@@ -17941,6 +18086,8 @@ class MetacognitiveReasoningEngine:
         CONVERSATION LEVEL (H5).
 
         Returns the winning hypothesis text, or None if inconclusive.
+        Returns None when the tiebreaker claim is unverifiable in the SymbolGraph
+        — an unverifiable claim gives no information and must not be used to decide.
         """
         prompt = (
             f"Two competing hypotheses with similar scores:\n\n"
@@ -17948,7 +18095,8 @@ class MetacognitiveReasoningEngine:
             f"What is the single simplest structural claim that:\n"
             f"  - Would be TRUE if H1 is correct and FALSE if H2 is correct\n"
             f"  - OR: TRUE if H2 is correct and FALSE if H1 is correct\n"
-            f"The claim must be verifiable in a symbol graph.\n\n"
+            f"The claim must be verifiable in a symbol graph "
+            f"(e.g. 'X calls Y', 'Z exists', 'A inherits B').\n\n"
             f'Output only: {{"claim": "...", "supports": "H1" or "H2"}}'
         )
 
@@ -17982,13 +18130,23 @@ class MetacognitiveReasoningEngine:
                 return None
 
             evidence = self.gather_evidence(claim, project_id)
+
+            # If claim mentions no symbols or relations from the SymbolGraph,
+            # it is unverifiable — returning a winner would be arbitrary.
+            if not evidence.symbols_found and not evidence.call_relations_valid:
+                self._f._log_debug(
+                    f"experimentum_crucis: claim '{claim[:60]}' is unverifiable "
+                    f"in SymbolGraph — inconclusive, returning None"
+                )
+                return None
+
             pos = self.positive_evidence(evidence)
             claim_true = (
                 len(pos["symbols_confirmed"]) > 0 or len(pos["relations_confirmed"]) > 0
             )
 
             self._f._log_debug(
-                f"experimentum_crucis: claim='{claim}', "
+                f"experimentum_crucis: claim='{claim[:60]}', "
                 f"supports={supports}, claim_true={claim_true}"
             )
 
@@ -18566,6 +18724,7 @@ class MetacognitiveReasoningEngine:
         CrossEncoder confirms candidates are genuinely independent.
         LLM fallback if CE diff is below threshold.
         Middle zone → conservative (return [original]).
+        Guards against malformed CE scores (None or len < 2).
         """
         if len(candidates) < 2:
             return [original]
@@ -18589,9 +18748,11 @@ class MetacognitiveReasoningEngine:
 
             scores = await self._f._commands._predict_cross_encoder(pairs)
 
-            if scores is None:
+            # Guard: CE unavailable or malformed response
+            if scores is None or len(scores) < 2:
                 self._f._log_debug(
-                    "decompose_questions: CE unavailable, trusting heuristic"
+                    "decompose_questions: CE unavailable or malformed scores "
+                    f"(scores={scores}), trusting heuristic"
                 )
                 continue
 
@@ -18677,7 +18838,7 @@ class MetacognitiveReasoningEngine:
             return False
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 8. FocalReasoning (Capa 2)
+    # 8. FocalReasoning (Layer 2)
     # ═══════════════════════════════════════════════════════════════════════
 
     async def reason_per_focus(
@@ -18692,17 +18853,19 @@ class MetacognitiveReasoningEngine:
         CONVERSATION LEVEL (H5). Gated by enable_focal_reasoning valve.
 
         Each iteration:
-            slot_save()                              — isolate from main state
+            slot_save()                              — isolate from open_webui.main state
             build_activation_graph(persist=False)   — volatile, no side effects
             _build_volatile_context()               — read-only, no side effects
             generate_cot_reasoning()                — LLM call
             slot_restore_for_continuity()           — restore main state
 
         If a question fails, it is skipped (not fatal).
+        "Unable to generate reasoning." is treated as failure (not added to results).
         """
         if not self._f.valves.enable_focal_reasoning:
             return []
 
+        _COT_ERROR = "Unable to generate reasoning."
         per_q_level = min(cot_level, self._f.valves.focal_reasoning_max_level)
         results: List[Tuple[str, str]] = []
 
@@ -18736,8 +18899,17 @@ class MetacognitiveReasoningEngine:
                     question, context
                 )
 
-                if reasoning:
+                # Guard: error string is truthy but not valid reasoning
+                if reasoning and reasoning != _COT_ERROR:
                     results.append((question, reasoning))
+                    self._f._log_debug(
+                        f"reason_per_focus: Q{i + 1} reasoning generated "
+                        f"({len(reasoning)} chars)"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"reason_per_focus: Q{i + 1} returned error or empty"
+                    )
 
             except Exception as e:
                 self._f._log_debug(
@@ -28687,6 +28859,53 @@ class Filter:
                 "Only run peer review when epistemic_uncertainty exceeds this "
                 "threshold. Below it (high confidence either way), peer review "
                 "adds little value. Range [0, 1] — 0.5 = trigger in uncertain zone."
+            ),
+        )
+
+        # ── Stagnation detection (H5 — iteration level) ───────────────────────
+        enable_stagnation_detection: bool = Field(
+            default=True,
+            description=(
+                "Detect when hypothesis refinement is stuck in a local optimum "
+                "and switch to divergent thinking (high temperature, contrarian prompt). "
+                "Only effective when scientific_max_iterations >= stagnation_window + 2. "
+                "See valve coherence warning at startup."
+            ),
+        )
+        stagnation_window: int = Field(
+            default=2,
+            description=(
+                "Number of iterations without obj_score improvement to trigger stagnation. "
+                "stagnation_window=2 requires scientific_max_iterations >= 4 to be effective."
+            ),
+        )
+        stagnation_min_delta: float = Field(
+            default=0.02,
+            description=(
+                "Minimum obj_score improvement per stagnation_window to avoid detection. "
+                "0.02 = score must improve by at least 2% per window."
+            ),
+        )
+
+        # ── Coverage threshold ─────────────────────────────────────────────────
+        low_coverage_threshold: float = Field(
+            default=0.3,
+            description=(
+                "Coverage below this ratio triggers: (1) Active Learning reclassification, "
+                "(2) coverage penalty in compute_weighted_score, "
+                "(3) atomic-claims constraint in _build_refinement_constraints. "
+                "Coverage = verifiable_claims / total_claims."
+            ),
+        )
+
+        # ── Metacognitive debriefing (H5 — project level) ─────────────────────
+        enable_metacognitive_debriefing: bool = Field(
+            default=True,
+            description=(
+                "After each hypothesis competition, analyze failure patterns "
+                "and adapt strategy for future competitions in this project. "
+                "Enables long-term learning per project_id. "
+                "Stored in MetacognitiveReasoningEngine._performance_history."
             ),
         )
 
