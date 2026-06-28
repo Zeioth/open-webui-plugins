@@ -1317,13 +1317,6 @@ class ConversationStateManager:
     async def save_if_dirty(self, project_id: str) -> None:
         """
         Persist the state if dirty and at least 2 seconds have passed since last save.
-
-        Replaces: StateStore.save_state_if_dirty(project_id)
-
-        Debounce: if called within 2 seconds of the previous save, it returns
-        without saving but leaves the dirty flag active, so the next turn will retry.
-        To guarantee persistence on shutdown, call _save_to_db_async directly or
-        ignore debounce.
         """
         if project_id not in self._dirty:
             return
@@ -1331,7 +1324,6 @@ class ConversationStateManager:
         if now - self._last_saved.get(project_id, 0.0) < 2.0:
             return
 
-        self._last_saved[project_id] = now
         self._dirty.discard(project_id)
 
         state = self._cache.get(project_id)
@@ -1340,6 +1332,7 @@ class ConversationStateManager:
 
         try:
             await self._save_to_db_async(project_id, state)
+            self._last_saved[project_id] = now
         except Exception as e:
             import traceback
 
@@ -1347,7 +1340,6 @@ class ConversationStateManager:
                 f"ConversationStateManager.save_if_dirty: failed for "
                 f"'{project_id}': {e}\n{traceback.format_exc()}"
             )
-            # Re-mark dirty to retry on the next turn.
             self._dirty.add(project_id)
 
     def clear_project(self, project_id: str) -> None:
@@ -1363,14 +1355,6 @@ class ConversationStateManager:
     def _load_from_db(self, project_id: str) -> Optional[ConversationState]:
         """
         Load ConversationState from SQLite.
-
-        Migrated from StateStore._load_state_from_db().
-        Differences:
-          - Returns ConversationState instead of a dict.
-          - Uses wm_* aliases for compatibility with pre-Phase-1 DBs (names with '_').
-          - Reads history_blocked_age (migrated from pstate in Phase 1).
-          - Reads hub_tier_* tracker fields for cross‑restart stability.
-          - ALL SQLite reads are serialized with _db_global_lock.
         """
         try:
             with _db_global_lock:
@@ -1397,9 +1381,6 @@ class ConversationStateManager:
             )
             return None
 
-        # Defaults for keys that may be absent in old DBs are handled by the
-        # explicit data.get() fallbacks in the constructor below.
-
         # ── Validate active_blocks ─────────────────────────────────────────
         raw_active = data.get("active_blocks")
         if raw_active is None:
@@ -1416,24 +1397,42 @@ class ConversationStateManager:
             )
             raw_active = {}
 
+        hash_to_block_key: Dict[str, str] = {}
+        for k, v in raw_active.items():
+            content_field = v.get("content", "")
+            if content_field.startswith("@@hash:"):
+                content_hash = content_field[7:]
+                hash_to_block_key[content_hash] = k
+
+        content_lookup: Dict[str, str] = {}
+        if hash_to_block_key:
+            try:
+                placeholders = ",".join("?" * len(hash_to_block_key))
+                with _db_global_lock:
+                    cur2 = self._f._db_conn.execute(
+                        f"SELECT hash, content FROM code_contents "
+                        f"WHERE hash IN ({placeholders})",
+                        list(hash_to_block_key.keys()),
+                    )
+                    rows2 = cur2.fetchall()
+                content_lookup = {r[0]: r[1] for r in rows2}
+            except Exception as e:
+                self._f._log_debug(
+                    f"ConversationStateManager._load_from_db: "
+                    f"batch content fetch failed: {e}"
+                )
+
+        # Aplicar el resultado del batch al raw_active antes de construir bloques
+        for content_hash, block_key in hash_to_block_key.items():
+            raw_active[block_key]["content"] = content_lookup.get(
+                content_hash,
+                f"[Content not found for hash {content_hash}]",
+            )
+
         # ── Rebuild active_blocks ──────────────────────────────────────────
         active: Dict[str, CodeBlock] = {}
         for k, v in raw_active.items():
             try:
-                content_field = v.get("content", "")
-                if content_field.startswith("@@hash:"):
-                    content_hash = content_field[7:]
-                    with _db_global_lock:
-                        cur2 = self._f._db_conn.execute(
-                            "SELECT content FROM code_contents WHERE hash = ?",
-                            (content_hash,),
-                        )
-                        row2 = cur2.fetchone()
-                    v["content"] = (
-                        row2[0]
-                        if row2
-                        else f"[Content not found for hash {content_hash}]"
-                    )
                 v["content_type"] = (
                     ContentType(v["content_type"])
                     if "content_type" in v
@@ -1529,7 +1528,6 @@ class ConversationStateManager:
             conversation_summaries=data.get("conversation_summaries", []),
             summarized_turn_hwm=data.get("summarized_turn_hwm", 0),
             history_blocked_age=data.get("history_blocked_age", {}),
-            # Aliases for compatibility with pre-Phase-1 DBs (fields with leading '_')
             wm_fired=data.get("wm_fired", data.get("_wm_fired", False)),
             wm_msgs_evicted=data.get(
                 "wm_msgs_evicted", data.get("_wm_msgs_evicted", 0)
@@ -1553,7 +1551,6 @@ class ConversationStateManager:
                 "pending_slot_resave",
                 data.get("_pending_slot_resave", False),
             ),
-            # ── Hub‑Bodies Tier tracker (cross‑restart) ──
             hub_tier_last_modified=data.get("hub_tier_last_modified", {}),
             hub_tier_body_hashes=data.get("hub_tier_body_hashes", {}),
             hub_tier_query_heat=data.get("hub_tier_query_heat", {}),
@@ -1679,55 +1676,31 @@ class ConversationStateManager:
     def _evict_lru(self) -> None:
         """
         Evict the least recently used projects when max_cached_projects is exceeded.
-
-        Migrated from the while loop in StateStore.get_state().
-        Centralised here so both get() and set() can trigger it.
-
-        IMPORTANT: Flushes dirty state before eviction to avoid data loss.
-        The blocking DB write is offloaded to the thread pool with a timeout
-        to prevent event-loop stalls. If the write times out or fails, the
-        state may be lost (logged) but eviction proceeds to keep the cache
-        within bounds.
         """
         max_cached = self._f.valves.max_cached_projects
         while len(self._cache) > max_cached:
             oldest_pid, oldest_state = next(iter(self._cache.items()))
 
-            # ── Flush dirty state before eviction ─────────────────────────
             if oldest_pid in self._dirty:
                 try:
-                    # Offload blocking DB write to the thread pool
-                    # so the event loop is not stalled during eviction.
-                    import concurrent.futures
-
-                    future = self._f._db_executor.submit(
+                    # Fire-and-forget: submit al thread pool sin esperar resultado.
+                    # El thread pool tiene sus propios workers y procesará el write
+                    # en background sin bloquear el event loop.
+                    self._f._db_executor.submit(
                         self._f._state_store._db_conn_write_sync,
                         oldest_pid,
                         oldest_state,
                     )
-                    # Wait with a timeout to prevent indefinite blocking
-                    future.result(timeout=10.0)
                     self._f._log_debug(
-                        f"ConversationStateManager: flushed dirty state for "
-                        f"'{oldest_pid}' before LRU eviction"
-                    )
-                except concurrent.futures.TimeoutError:
-                    self._f._log_debug(
-                        f"ConversationStateManager: flush timed out for "
-                        f"'{oldest_pid}' — state may be lost"
-                    )
-                except AttributeError:
-                    self._f._log_debug(
-                        f"ConversationStateManager: StateStore._db_conn_write_sync "
-                        f"not implemented; dirty state for '{oldest_pid}' may be lost."
+                        f"ConversationStateManager: flush dispatched (non-blocking) "
+                        f"for '{oldest_pid}' before LRU eviction"
                     )
                 except Exception as e:
                     self._f._log_debug(
-                        f"ConversationStateManager: flush before eviction failed "
-                        f"for '{oldest_pid}': {e} — state may be lost"
+                        f"ConversationStateManager: flush dispatch failed for "
+                        f"'{oldest_pid}': {e} — state may be lost"
                     )
 
-            # ── Clear all per-project state ────────────────────────────────
             self._f._symbol_index.clear_project(oldest_pid)
             self._f._path_index.clear_project(oldest_pid)
             self._f._pager.clear_project(oldest_pid)
@@ -4420,11 +4393,8 @@ class ContextBuilder:
         psm = self._f._project_state_manager
         psm.set_block_a_cache_key(project_id, None)
         psm.set_block_a_cached(project_id, None)
-        # Skeleton tier cache keys are internal to _build_skeleton_tier;
-        # use raw pstate for them.
+
         raw = psm.get_pstate(project_id)
-        raw["skeleton_cache_key"] = None
-        raw["skeleton_cached"] = None
         raw["skeleton_tier_cache_key"] = None
         raw["skeleton_tier_cached"] = None
 
@@ -4450,27 +4420,33 @@ class ContextBuilder:
         tier, cached by structure_hash so body edits and docstring additions
         do not invalidate it. Returns "" when disabled, empty, or over budget.
         """
+        psm = self._f._project_state_manager
+
         if not self._f.valves.enable_skeleton_tier:
+            psm.set_skeleton_tier_qids(project_id, [])
             return ""
 
-        psm = self._f._project_state_manager
-        # Use raw pstate for skeleton-tier-specific keys that have no typed
-        # accessor (they are only read/written inside this method).
         pstate = psm.get_pstate(project_id)
 
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
         if not structure_hash:
+            psm.set_skeleton_tier_qids(project_id, [])
             return ""
 
         cached_hash = pstate.get("skeleton_tier_cache_key")
         cached_tier = pstate.get("skeleton_tier_cached")
         if cached_hash and cached_hash == structure_hash and cached_tier is not None:
+            rendered_qids = sorted(
+                self._f._symbol_index.get_all_qualified_names(project_id)
+            )
+            psm.set_skeleton_tier_qids(project_id, rendered_qids)
             return cached_tier
 
         skel = self._format_skeleton(project_id)
         if not skel:
             pstate["skeleton_tier_cache_key"] = structure_hash
             pstate["skeleton_tier_cached"] = ""
+            psm.set_skeleton_tier_qids(project_id, [])
             return ""
 
         budget = self._f.valves.skeleton_tier_max_tokens
@@ -4483,6 +4459,7 @@ class ContextBuilder:
                 )
                 pstate["skeleton_tier_cache_key"] = structure_hash
                 pstate["skeleton_tier_cached"] = ""
+                psm.set_skeleton_tier_qids(project_id, [])
                 return ""
 
         tier = (
@@ -4495,9 +4472,15 @@ class ContextBuilder:
         pstate["skeleton_tier_cache_key"] = structure_hash
         pstate["skeleton_tier_cached"] = tier
 
+        rendered_qids = sorted(
+            self._f._symbol_index.get_all_qualified_names(project_id)
+        )
+        psm.set_skeleton_tier_qids(project_id, rendered_qids)
+
         self._f._log_debug(
             f"Skeleton tier rendered (structure_hash={structure_hash}, "
-            f"~{self._f._tokens.estimate_code_tokens(tier)} tokens)"
+            f"~{self._f._tokens.estimate_code_tokens(tier)} tokens, "
+            f"{len(rendered_qids)} qids registered)"
         )
 
         return tier
@@ -8063,14 +8046,6 @@ class StateStore:
     async def _db_worker_loop(self) -> None:
         """
         Single run of the DB write loop. Exits on CancelledError.
-
-        Each job is executed with a retry loop that uses **exponential backoff**
-        when encountering a `database is locked` error. This gives SQLite's WAL
-        mechanism enough time to resolve contention.
-
-        The lock is acquired INSIDE the thread (not crossing an await) to avoid
-        blocking the event loop. On exhaustion of retries, the job is dropped
-        (no raise) to prevent worker crashes and closure accumulation.
         """
         while True:
             try:
@@ -8082,33 +8057,36 @@ class StateStore:
 
             func, args, kwargs = job
 
-            # Lock acquired inside the thread, not across an await
             def _run_batch(fn=func, a=args, kw=kwargs):
                 with _db_global_lock:
                     fn(*a, **kw)
 
-            for attempt in range(5):
-                try:
-                    await anyio.to_thread.run_sync(_run_batch)
-                    break  # success
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e).lower() and attempt < 4:
-                        # Exponential backoff: 0.1, 0.2, 0.4, 0.8 seconds
-                        backoff = 0.1 * (2**attempt)
+            try:
+                for attempt in range(5):
+                    try:
+                        await anyio.to_thread.run_sync(_run_batch)
+                        break  # success
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() and attempt < 4:
+                            backoff = 0.1 * (2**attempt)
+                            self._f._log_debug(
+                                f"DB worker: locked (attempt {attempt+1}/5), "
+                                f"retrying in {backoff:.1f}s"
+                            )
+                            await asyncio.sleep(backoff)
+                        else:
+                            self._f._log_debug(
+                                f"DB worker: job dropped after {attempt+1} attempts: {e}"
+                            )
+                            break
+                    except Exception as e:
                         self._f._log_debug(
-                            f"DB worker: locked (attempt {attempt+1}/5), "
-                            f"retrying in {backoff:.1f}s"
-                        )
-                        await asyncio.sleep(backoff)
-                    else:
-                        # Drop the job instead of crashing/restarting the worker
-                        self._f._log_debug(
-                            f"DB worker: job dropped after {attempt+1} attempts: {e}"
+                            f"DB worker: unexpected error, dropping job: "
+                            f"{type(e).__name__}: {e}"
                         )
                         break
-
-            # Mark the item as processed (enables queue.join())
-            self._f._db_write_queue.task_done()
+            finally:
+                self._f._db_write_queue.task_done()
 
     def _db_conn_write_sync(self, project_id: str, state: ConversationState) -> None:
         """
@@ -10015,49 +9993,13 @@ class LLMOrchestrator:
     ) -> Optional[str]:
         """
         Call the LLM with in-memory response cache and call deduplication.
-
-        All calls are serialised through _llm_semaphore (limit=1) to avoid
-        concurrent inference requests against a --parallel 1 llama.cpp server.
-
-        Args:
-            prompt: User-turn text to send.
-            system_prompt: System-turn text.
-            model_override: Override the default llm_model valve for this call.
-            max_tokens: Maximum tokens to generate. None or 0 lets the server
-                        apply its own default.
-            temperature: Sampling temperature.
-            label: Identifier logged alongside timing data (e.g. 'bg_docstring').
-            total_timeout: Unused placeholder kept for API compatibility.
-            endpoint_type: Override the inference endpoint type ('chat' or
-                           'completion'). Defaults to 'chat', except for models
-                           whose backend prefix is 'llamacpp' which use the
-                           llamacpp_endpoint_type valve.
-            response_format: Optional server-side format constraint, e.g.
-                             {"type": "json_object"}.
-            enable_thinking: Whether to allow chain-of-thought reasoning.
-                             True by default. Set to False for deterministic
-                             structured-output tasks (docstrings, classifiers)
-                             to save tokens and avoid JSON being buried in a
-                             reasoning preamble.
-            log_raw_response: When True, passes through to shared_resources
-                             call_llm which logs the full outgoing payload and
-                             raw server response at INFO level, prefixed with
-                             [RAW][label]. Use for black-box debugging of new
-                             callers. Remove before committing to production.
-
-        Returns:
-            Optional[str]: Generated text, or None on failure.
         """
-        # Silent ingestion guard: only docstring background calls are allowed
-        # while a large code paste is being indexed without a user response.
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
             "lazy_docstring_batch",
         ):
             return None
 
-        # Deduplication: if an identical prompt is already in-flight, wait for
-        # that future instead of firing a second LLM request.
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
         ).hexdigest()
@@ -10084,10 +10026,11 @@ class LLMOrchestrator:
                     future.set_result(None)
                     return None
 
-                # Check in-memory LLM response cache before calling the server.
                 cache_key = hashlib.md5(
-                    f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}".encode()
+                    f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}"
+                    f"|{response_format}|{enable_thinking}".encode()
                 ).hexdigest()
+
                 cached = await self._f._llm_cache.get(cache_key)
                 if cached is not None:
                     future.set_result(cached)
@@ -10097,7 +10040,6 @@ class LLMOrchestrator:
                     )
                     return cached
 
-                # Determine endpoint type from backend prefix when not overridden.
                 if endpoint_type is not None:
                     ep_type = endpoint_type
                 else:
@@ -10112,7 +10054,6 @@ class LLMOrchestrator:
                         f"prompt size: ~{prompt_tokens} tokens"
                     )
 
-                # Track this task so wait_for_llm_tasks() can join it.
                 task = asyncio.current_task()
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.add(task)
@@ -27241,6 +27182,12 @@ class ProjectStateManager:
         for symbols visible in Block A every turn.
         """
         return self.get_pstate(project_id).get("skeleton_tier_qids", [])
+
+    def set_skeleton_tier_qids(self, project_id: str, qids: List[str]) -> None:
+        """
+        Store the qualified ids rendered in the skeleton tier.
+        """
+        self.get_pstate(project_id)["skeleton_tier_qids"] = qids
 
     def get_block_b_qids_this_turn(self, project_id: str) -> List[str]:
         """
