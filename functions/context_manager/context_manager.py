@@ -600,14 +600,45 @@ class SymbolIndex:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def add(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        """Register *symbol* in the index, keyed by its qualified id.
-        Updates the bare‑name reverse index and call‑relationship storage."""
+        """
+        Register a symbol in the index under its qualified id.
+
+        A qualified id has the form ``"ClassName.method"`` for class members and
+        ``"module_name.function"`` (or the bare function name when no file path
+        is available) for module-level functions. Using qualified ids prevents
+        same-named methods in different classes from colliding in the index.
+
+        If the symbol was previously indexed (same qualified id), the new block
+        hash is added to the existing entry rather than replacing it. Any
+        existing docstring is preserved when the incoming symbol does not carry
+        one, preventing background docstring writes from being lost on re-index.
+
+        Atomicity in asyncio
+        ────────────────────
+        Synchronous method; atomic within a single asyncio event loop tick.
+        Writes performed here are visible immediately to the next synchronous
+        call on the same thread, without any lock or barrier.
+
+        Args:
+            symbol:     The ``CodeSymbol`` to register.
+            block_hash: Hash of the ``CodeBlock`` that owns this symbol.
+            project_id: The project scope under which to index the symbol.
+        """
+        # ── Resolve qualified id and primary key ──────────────────────────────────
         qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
+
+        # ── Update primary block-hash mapping and access statistics ──────────────
         self._name_to_blocks[key].add(block_hash)
         self._stats[key] += 1
+
+        # ── Update the bare-name reverse index ───────────────────────────────────
         self._bare_index[(project_id, symbol.name)].add(qid)
 
+        # ── Upsert symbol metadata ────────────────────────────────────────────────
+        # Preserve the existing docstring and parent_symbol when the incoming
+        # symbol does not supply them: re-indexing after a block update must
+        # not silently discard docstrings that were generated asynchronously.
         prev = self._symbol_meta.get(key)
         self._symbol_meta[key] = {
             "name": symbol.name,
@@ -620,41 +651,101 @@ class SymbolIndex:
             "parent_symbol": symbol.parent_symbol
             or (prev.get("parent_symbol", "") if prev else ""),
             "line_start": symbol.line_start,
-            "cfg_skeleton": "",  # Lazy CFG skeleton (populated by ensure_cfg_batch)
-            "cfg_body_hash": "",  # Hash of the source body that generated cfg_skeleton
+            "cfg_skeleton": "",
+            "cfg_body_hash": "",
         }
 
+        # ── Register legacy caller → callee relationships ─────────────────────────
         for callee in symbol.calls:
-            callee_key = (project_id, callee)
-            self._callee_to_callers[callee_key].add(qid)
+            self._callee_to_callers[(project_id, callee)].add(qid)
+
+        # ── Evict the least-used entry if the index is over capacity ─────────────
         self._evict_if_needed()
 
     def remove(self, symbol: "CodeSymbol", block_hash: str, project_id: str) -> None:
-        """Remove *symbol* from the index.  If the block hash was the last
-        reference to that qualified id, the entry is fully deleted from all
-        internal structures."""
+        """
+        Remove a single block-hash reference for a symbol from the index.
+
+        If ``block_hash`` was the last reference pointing to the symbol's
+        qualified id, all associated data (bare-name entry, access statistics,
+        metadata dict) is also removed. If other blocks still reference the same
+        qualified id, only the specific ``block_hash`` is discarded and the
+        remainder of the entry stays intact.
+
+        For deregistering all symbols belonging to an entire block at once,
+        use ``remove_all_for_block`` which additionally cleans up typed edges.
+
+        Atomicity in asyncio
+        ────────────────────
+        Synchronous method; atomic within a single asyncio event loop tick.
+
+        Args:
+            symbol:     The ``CodeSymbol`` to remove.
+            block_hash: The specific block-hash reference to discard.
+            project_id: The project scope that owns this entry.
+        """
+        # ── Resolve qualified id and primary key ──────────────────────────────────
         qid = qualify_symbol_name(symbol.name, symbol.parent_symbol, symbol.file_path)
         key = (project_id, qid)
-        s = self._name_to_blocks.get(key)
-        if s:
-            s.discard(block_hash)
-            if not s:
-                del self._name_to_blocks[key]
-                self._stats.pop(key, None)
-                self._symbol_meta.pop(key, None)
-                bare_key = (project_id, symbol.name)
-                bare_set = self._bare_index.get(bare_key)
-                if bare_set:
-                    bare_set.discard(qid)
-                    if not bare_set:
-                        del self._bare_index[bare_key]
+
+        # ── Discard the block-hash reference ─────────────────────────────────────
+        block_set = self._name_to_blocks.get(key)
+        if not block_set:
+            return
+
+        block_set.discard(block_hash)
+
+        # ── When the last reference is gone, remove the entire entry ─────────────
+        if not block_set:
+            del self._name_to_blocks[key]
+            self._stats.pop(key, None)
+            self._symbol_meta.pop(key, None)
+
+            # Remove the qualified id from the bare-name reverse index.
+            # If this was the last qualified id for that bare name, remove the
+            # bare-name entry too to keep the index clean.
+            bare_key = (project_id, symbol.name)
+            bare_set = self._bare_index.get(bare_key)
+            if bare_set:
+                bare_set.discard(qid)
+                if not bare_set:
+                    del self._bare_index[bare_key]
 
     def remove_all_for_block(
-        self, block_hash: str, symbols: List["CodeSymbol"], project_id: str
+        self,
+        block_hash: str,
+        symbols: List["CodeSymbol"],
+        project_id: str,
     ) -> None:
-        """Remove every symbol belonging to *block_hash* and their edges."""
+        """
+        Remove every symbol belonging to a given block and all their typed edges.
+
+        This is the correct method to call when a ``CodeBlock`` is being evicted,
+        made obsolete, or replaced by a newer version. It ensures that both the
+        symbol registrations and all inbound/outbound call-graph edges for those
+        symbols are cleaned up in the same operation.
+
+        Calling ``remove`` individually for each symbol and then separately
+        calling ``remove_edges_for_symbol`` is equivalent but less convenient
+        and easier to get wrong. Prefer this method at all block-eviction sites.
+
+        Atomicity in asyncio
+        ────────────────────
+        Synchronous method; atomic within a single asyncio event loop tick.
+
+        Args:
+            block_hash: Hash of the block being removed.
+            symbols:    List of ``CodeSymbol`` instances that belonged to the block.
+            project_id: The project scope that owns these entries.
+        """
+        # ── Remove each symbol entry and its associated typed edges ───────────────
         for sym in symbols:
             self.remove(sym, block_hash, project_id)
+
+            # Edge cleanup uses the same qualified-id convention as add():
+            # class-scoped symbols use their full qualified id; module-level
+            # symbols use the qualified id produced by qualify_symbol_name
+            # (which may be just the bare name when no parent_symbol exists).
             qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
             self.remove_edges_for_symbol(qid, project_id)
 
@@ -690,25 +781,85 @@ class SymbolIndex:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def find_blocks(self, name_or_qid: str, project_id: str) -> Set[str]:
-        """Block hashes for a symbol.  Exact qualified-id match first; if
-        not found, falls back to a bare‑name lookup that UNIONS all blocks
-        of every symbol sharing that bare name (e.g. every __init__ of every
-        class), instead of returning just one."""
+        """
+        Return the set of block hashes that contain a given symbol.
+
+        Resolution order
+        ────────────────
+        1. Exact qualified-id lookup in ``_name_to_blocks``. This is the precise
+           path; callers that hold a qualified id should always take it.
+        2. Bare-name fallback via ``_bare_index``: collects every qualified id
+           that shares the bare name and unions their block sets. This is
+           inherently ambiguous — e.g. ``"__init__"`` matches every class's
+           constructor. Callers that need a deterministic single result should
+           first resolve the qualified id via ``get_qualified_names_for``.
+
+        Atomicity in asyncio
+        ────────────────────
+        This method is synchronous. In Python's single-threaded asyncio event
+        loop, synchronous code runs to completion without yielding control, so
+        this call is atomic with respect to any other concurrently scheduled
+        coroutine.
+
+        The atomicity guarantee applies to *this single call only*. If an async
+        caller performs multiple sequential calls to this method with ``await``
+        expressions between them, each call is individually atomic but the
+        sequence as a whole is not: another coroutine may call ``add`` or
+        ``remove`` during those await points, so the second call may observe
+        a different state than the first.
+
+        Args:
+            name_or_qid: A fully-qualified symbol id (e.g. ``"Cls.method"``) or
+                         a bare name (e.g. ``"method"``).
+            project_id:  The project scope to search within.
+
+        Returns:
+            A set of block hash strings. Empty set when the symbol is not found
+            under either resolution strategy.
+        """
+        # ── Step 1: exact qualified-id lookup ─────────────────────────────────────
         exact = self._name_to_blocks.get((project_id, name_or_qid))
         if exact is not None:
             return exact
+
+        # ── Step 2: bare-name fallback via the reverse index ─────────────────────
         qids = self._bare_index.get((project_id, name_or_qid))
         if not qids:
             return set()
+
         result: Set[str] = set()
         for qid in qids:
             result |= self._name_to_blocks.get((project_id, qid), set())
         return result
 
     def get_all_names(self, project_id: str) -> Set[str]:
-        """Bare names indexed in this project (deduplicated).  Use for
-        coarse text/query matching, where the caller doesn't know — and
-        doesn't need to know — which concrete class a name belongs to."""
+        """
+        Return the set of bare (unqualified) symbol names indexed for a project.
+
+        Bare names are deduplicated: if three different classes each define a
+        ``process`` method, only one ``"process"`` entry appears in the result.
+        This method is intended for coarse text or query matching where the
+        caller does not need to distinguish between same-named symbols in
+        different classes.
+
+        For inventories, skeleton hashes, or centrality computation where every
+        distinct symbol occurrence must be separately visible, use
+        ``get_all_qualified_names`` instead.
+
+        Atomicity in asyncio
+        ────────────────────
+        Synchronous method; atomic within a single asyncio event loop tick.
+        See ``find_blocks`` for the note on multi-call sequences across await
+        points.
+
+        Args:
+            project_id: The project scope to enumerate.
+
+        Returns:
+            A set of bare name strings. Empty set if no symbols are indexed for
+            the given project.
+        """
+        # ── Collect every bare name registered under this project ─────────────────
         return {bare for (pid, bare) in self._bare_index if pid == project_id}
 
     def get_all_qualified_names(self, project_id: str) -> Set[str]:
@@ -719,11 +870,36 @@ class SymbolIndex:
         return {qid for (pid, qid) in self._symbol_meta if pid == project_id}
 
     def get_qualified_names_for(self, bare_name: str, project_id: str) -> Set[str]:
-        """All qualified ids that share this bare name (e.g. every class's
-        __init__).  If nothing is indexed under that bare name, returns
-        {bare_name} as-is — defensive, and also makes passing an ALREADY-
-        qualified id through here (not found as bare) a correct no-op,
-        returning it unchanged."""
+        """
+        Return all qualified ids that share a given bare name within a project.
+
+        This is the inverse of the bare-name index: given ``"process"``, it
+        returns every qualified id such as ``"Fetcher.process"``,
+        ``"Validator.process"``, etc. that is registered in the project.
+
+        Defensive fallback
+        ──────────────────
+        When no entry is found in the bare-name index, the bare name itself is
+        returned as a singleton set. This makes it safe to pass an already-
+        qualified id (which will not appear as a bare-name key) through this
+        method without special-casing the caller: an already-qualified id that
+        is not found as a bare name simply passes through unchanged.
+
+        Atomicity in asyncio
+        ────────────────────
+        Synchronous method; atomic within a single asyncio event loop tick.
+        See ``find_blocks`` for the note on multi-call sequences across await
+        points.
+
+        Args:
+            bare_name:  The unqualified symbol name to resolve.
+            project_id: The project scope to search within.
+
+        Returns:
+            A set of qualified id strings. Never empty: at minimum, contains
+            ``{bare_name}`` as a fallback when no match is found.
+        """
+        # ── Bare-name reverse-index lookup ────────────────────────────────────────
         qids = self._bare_index.get((project_id, bare_name))
         return set(qids) if qids else {bare_name}
 
@@ -1273,24 +1449,64 @@ class ConversationStateManager:
 
     def get(self, project_id: str) -> ConversationState:
         """
-        Return the ConversationState for the given project.
+        Return the ``ConversationState`` for a project, loading it from SQLite
+        on a cache miss and creating a fresh empty state when no persisted
+        record exists.
 
-        Loads from DB if not cached; creates a fresh empty state if not in DB either.
+        Cache semantics
+        ───────────────
+        States are kept in an LRU ``OrderedDict`` bounded by
+        ``valves.max_cached_projects``. A hit moves the entry to most-recently-
+        used position. A miss triggers a synchronous SQLite load, followed by
+        a ``SymbolIndex`` rebuild when the loaded state contains active blocks,
+        and then an LRU eviction pass.
 
-        Replaces: StateStore.get_state(project_id)
+        Atomicity in asyncio
+        ────────────────────
+        This method is synchronous (no ``await`` inside, and ``_load_from_db``
+        is also synchronous). In Python's single-threaded asyncio runtime,
+        synchronous code runs to completion without yielding control to other
+        coroutines. The cache-miss path — check, load, insert — therefore
+        executes as a single atomic sequence. A second concurrent call for the
+        same ``project_id`` will either:
+          - arrive while this call is still running and cannot be scheduled
+            (asyncio single-thread guarantee), or
+          - arrive after this call has returned, at which point the project is
+            already in the cache and the second call takes the hit path.
+
+        No per-project lock is required under the current synchronous
+        implementation. If ``_load_from_db`` is ever made asynchronous (e.g.
+        by adopting an async SQLite driver), this method must become
+        ``async def`` and the miss path must be protected by a per-project
+        ``asyncio.Lock`` stored in ``self._loading_locks`` to prevent redundant
+        concurrent loads.
+
+        Args:
+            project_id: The project identifier to look up.
+
+        Returns:
+            The cached or freshly loaded ``ConversationState``. Never ``None``:
+            an empty state is returned when no persisted record is found.
         """
+        # ── Cache hit: promote to MRU and return immediately ─────────────────────
         if project_id in self._cache:
             self._cache.move_to_end(project_id)
             return self._cache[project_id]
 
+        # ── Cache miss: load from SQLite ──────────────────────────────────────────
         state = self._load_from_db(project_id)
         if state is None:
             state = ConversationState()
 
+        # ── Insert into cache and enforce LRU capacity ────────────────────────────
         self._cache[project_id] = state
         self._cache.move_to_end(project_id)
         self._evict_lru()
 
+        # ── Rebuild the SymbolIndex from the loaded active blocks ─────────────────
+        # Only triggered on a cold load (cache miss) when the index for this
+        # project has not yet been populated. The rebuild is idempotent: calling
+        # it on an already-populated index would add duplicate entries.
         if state.active_blocks:
             self._rebuild_symbol_index(state, project_id)
 
@@ -6072,6 +6288,11 @@ Output only the option name.
         # ------------------------------------------------------------------
         # Step 13: Batched LOD-2 docstring pre-resolution.
         # ------------------------------------------------------------------
+        # Symbols at LOD-2 are shown with their docstring as the only context
+        # beyond the signature. Missing docstrings at this tier mean the model
+        # sees a bare signature with no description, reducing the quality of
+        # reasoning about that symbol. Generating them here, before the render
+        # loop, ensures they are available when the LOD-2 entry is formatted.
         if self._f.valves.enable_auto_docstrings:
             lod2_only_candidates = [
                 qid
@@ -6085,8 +6306,16 @@ Output only the option name.
                     for bh in self._f._symbol_index.find_blocks(qid, project_id):
                         blk = state.active_blocks.get(bh)
                         if blk and any(
-                            qualify_symbol_name(s.name, s.parent_symbol) == qid
-                            and s.docstring
+                            # qualify_symbol(s) includes file_path so that
+                            # module-level functions produce "module.func"
+                            # rather than bare "func", matching the qualified
+                            # ids in lod2_only_candidates which were built by
+                            # the SymbolIndex using the same convention.
+                            # Using qualify_symbol_name(s.name, s.parent_symbol)
+                            # without file_path would produce bare "func" for
+                            # module-level functions, never matching qid and
+                            # always treating the docstring as missing.
+                            qualify_symbol(s) == qid and s.docstring
                             for s in blk.symbols
                         ):
                             has_doc = True
@@ -8236,25 +8465,48 @@ class StateStore:
                 self._f._log_debug(f"DB worker crashed: {e} — restarting in 2s")
                 await asyncio.sleep(2)
 
-    async def drain_writes(self, timeout: float = 5.0) -> None:
+    async def drain_writes(self, timeout: Optional[float] = None) -> None:
         """
-        Blocks until all pending items in _db_write_queue have been processed
-        (task_done called by the worker).
+        Block until every pending item in the write queue has been processed
+        by the database worker.
 
-        Called at the start of each inlet to ensure that docstring writes from
-        the previous turn finish BEFORE inlet_preprocess() starts reading from
-        SQLite. Eliminates reader/writer overlap on _db_conn.
+        This method acts as a mandatory write barrier at the start of each inlet.
+        Write jobs enqueued by the previous outlet (docstring updates, state saves,
+        edge persistence, conversation summaries, etc.) must complete before the
+        inlet reads anything from SQLite. If the inlet reads state while writes
+        are still pending, it loads a stale snapshot. Any changes the inlet then
+        makes to that snapshot are saved on top of the pending writes, permanently
+        discarding the outlet's intent for the previous turn.
+
+        The default behaviour is to block indefinitely. Passing a finite timeout
+        trades correctness for responsiveness: the inlet proceeds even if the
+        queue still contains unfinished jobs, potentially reading stale state.
+        Only pass a finite timeout when the caller has explicitly decided to
+        accept that trade-off and has a concrete reason to bound the wait.
 
         Args:
-            timeout: maximum seconds to wait. If timeout elapses, logs and
-                     continues (soft degradation, no exception).
+            timeout: Maximum seconds to block. ``None`` (the default) means
+                     wait until the queue is fully drained with no time limit.
+                     A finite positive value causes the method to proceed after
+                     the timeout even if writes are still in flight.
         """
+        # ── Blocking drain: the correct path for write barriers ───────────────────
+        # Queue.join() blocks until every enqueued item has had task_done() called
+        # by the worker. No time limit means the guarantee holds unconditionally.
+        if timeout is None:
+            await self._f._db_write_queue.join()
+            return
+
+        # ── Timed drain: explicit opt-in to partial correctness ───────────────────
+        # Callers that pass a timeout must be prepared for the case where the
+        # queue was not fully drained and subsequent reads return stale data.
         try:
             await asyncio.wait_for(self._f._db_write_queue.join(), timeout=timeout)
         except asyncio.TimeoutError:
+            pending = self._f._db_write_queue.qsize()
             self._f._log_debug(
-                f"drain_writes: timeout {timeout}s; "
-                "writes still in progress, continuing (soft degradation)"
+                f"drain_writes: {pending} write job(s) still pending after "
+                f"{timeout:.1f}s — proceeding; reads may observe pre-write state"
             )
 
     async def _db_read(self, fn, *args, **kwargs):
@@ -16494,99 +16746,127 @@ class ActivationEngine:
         """
         LRU cache for Personalised PageRank computation results.
 
-        Key:   (code_state_hash: str, seed_qids: frozenset[str])
-        Value: dict[str, float] — qid → PPR score
+        Stores the activated score dictionaries produced by
+        ``_get_or_compute_ppr_scores`` so that repeated calls with the same
+        code state and seed set skip the power-iteration loop entirely.
 
-        Invalidation is automatic via code_state_hash: any code change produces
-        a new hash, naturally evicting stale entries for that project without
-        requiring an explicit flush.
+        Cache key:   (code_state_hash: str, seed_qids: frozenset[str])
+        Cache value: dict[str, float]  —  qualified-id → PPR score
+
+        Invalidation strategy
+        ─────────────────────
+        The ``code_state_hash`` component changes whenever the active-block set
+        changes (new code ingested, block evicted, etc.). Any code change
+        therefore maps to a new key automatically, letting stale entries age out
+        through normal LRU eviction rather than requiring explicit invalidation.
+
+        Concurrency safety
+        ──────────────────
+        All public methods on this class are synchronous (no ``await`` anywhere
+        inside them). In Python's single-threaded asyncio runtime, a synchronous
+        function that does not yield control is guaranteed to run to completion
+        without interruption from any other coroutine. ``get`` and ``set`` are
+        therefore fully atomic with respect to concurrent asyncio tasks, and no
+        additional lock is required in an asyncio-only deployment.
+
+        If the codebase is ever extended to call these methods from multiple OS
+        threads (e.g. via ``loop.run_in_executor``), a ``threading.Lock`` must
+        be added to protect the ``_cache`` OrderedDict.
         """
 
         def __init__(self, maxsize: int = 20) -> None:
             """
-            Initialise the cache with a fixed capacity.
+            Initialise the cache with a fixed LRU capacity.
 
             Args:
-                maxsize: Maximum number of (code_hash, seeds) entries to retain.
-                         Oldest entries are evicted first when the limit is reached.
+                maxsize: Maximum number of (code_hash, seed_frozenset) entries
+                         to retain before the oldest is evicted.
             """
-            self._cache: OrderedDict[tuple, dict[str, float]] = OrderedDict()
+            # ── Primary storage ───────────────────────────────────────────────────
+            # OrderedDict preserves insertion order; move_to_end() implements
+            # the MRU promotion needed for correct LRU eviction.
+            self._cache: OrderedDict[tuple, Dict[str, float]] = OrderedDict()
             self._maxsize = maxsize
+
+            # ── Diagnostics counters ──────────────────────────────────────────────
             self._hits = 0
             self._misses = 0
 
-        # ------------------------------------------------------------------
-        # Region: Cache reads
-        # ------------------------------------------------------------------
-
         def get(self, code_hash: str, seeds: frozenset) -> Optional[Dict[str, float]]:
             """
-            Retrieve cached PPR scores for a (code_hash, seeds) pair.
+            Return the cached PPR scores for a (code_hash, seeds) pair, or
+            ``None`` on a cache miss.
 
-            On a hit, the entry is promoted to most-recently-used so it is
-            the last to be evicted under LRU policy.
+            On a hit the entry is promoted to most-recently-used so it is the
+            last to be evicted under the LRU policy.
+
+            This method is synchronous and therefore atomic in asyncio. No lock
+            is required; see class docstring for the threading caveat.
 
             Args:
-                code_hash: Hash of the current code state.
-                seeds:     Frozenset of seed qualified ids used in the PPR run.
+                code_hash: Structural or MD5 hash of the current code state.
+                seeds:     Frozenset of qualified-id strings used as PPR seeds.
 
             Returns:
-                The cached score dict on a hit, or None on a miss.
+                The cached score dict on a hit, or ``None`` on a miss. The
+                returned object is the live internal dict — callers must not
+                mutate it.
             """
             key = (code_hash, seeds)
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._hits += 1
-                return self._cache[key]
 
-            self._misses += 1
-            return None
+            # ── Cache miss ────────────────────────────────────────────────────────
+            if key not in self._cache:
+                self._misses += 1
+                return None
 
-        # ------------------------------------------------------------------
-        # Region: Cache writes
-        # ------------------------------------------------------------------
+            # ── Cache hit: promote to MRU ─────────────────────────────────────────
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return self._cache[key]
 
         def set(
             self, code_hash: str, seeds: frozenset, scores: Dict[str, float]
         ) -> None:
             """
-            Store PPR scores in the cache under a (code_hash, seeds) key.
+            Store PPR scores under a (code_hash, seeds) key.
 
-            A defensive copy of the scores dict is stored so that subsequent
-            caller mutations cannot corrupt the cached entry.  The entry is
-            promoted to most-recently-used, and the oldest entry is evicted
-            if the capacity limit is exceeded.
+            A defensive copy of ``scores`` is stored so that subsequent mutations
+            by the caller do not silently corrupt the cached entry. After
+            insertion the entry is marked as most-recently-used. If the cache
+            has reached its capacity the oldest entry is evicted.
+
+            This method is synchronous and therefore atomic in asyncio. No lock
+            is required; see class docstring for the threading caveat.
 
             Args:
-                code_hash: Hash of the current code state (invalidation key).
-                seeds:     Frozenset of seed qualified ids used to produce scores.
-                scores:    Dict mapping qualified ids to PPR activation scores.
+                code_hash: Hash of the code state that produced these scores.
+                seeds:     Frozenset of seed qualified-ids used in the PPR run.
+                scores:    Mapping from qualified ids to PPR activation scores.
             """
             key = (code_hash, seeds)
 
-            # -- Store a defensive copy to prevent caller mutations from
-            # corrupting the cached entry.
+            # ── Store a defensive copy so caller mutations cannot corrupt the cache
             self._cache[key] = dict(scores)
             self._cache.move_to_end(key)
 
-            # -- Evict the oldest entry when the cache exceeds its capacity.
+            # ── Evict the LRU entry when capacity is exceeded ─────────────────────
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
-
-        # ------------------------------------------------------------------
-        # Region: Diagnostics
-        # ------------------------------------------------------------------
 
         @property
         def stats(self) -> str:
             """
-            Return a human-readable cache hit/miss statistics string.
+            Human-readable cache hit/miss statistics string.
 
-            Exposed as a property so callers can embed it directly in
-            f-strings without an explicit method call.
+            Exposed as a property so callers can embed it directly in f-strings
+            without an explicit method call.
+
+            Returns:
+                A formatted string such as ``"PPR cache: 42/60 hits (70%)"`` or
+                ``"PPR cache: 0/0 hits (0%)"`` before any lookups have occurred.
             """
             total = self._hits + self._misses
-            rate = self._hits / total if total else 0
+            rate = self._hits / total if total else 0.0
             return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -17074,55 +17354,78 @@ Output only the symbol name.
         alpha: float = 0.85,
     ) -> Dict[str, float]:
         """
-        Compute Personalised PageRank scores with LRU caching.
+        Return Personalised PageRank scores for a given seed set, reading from
+        the in-process LRU cache when possible and computing from scratch on a
+        miss.
+
+        Cache key selection
+        ───────────────────
+        The structural hash (symbol signatures only, no docstrings) is preferred
+        over the raw ``code_state_hash`` as the cache key. The structural hash is
+        stable across the docstring-fill-in period, preventing spurious cache
+        misses while background docstring generation is running. It falls back to
+        ``code_state_hash`` during the cold-start window before ``build_block_a``
+        has computed and stored the structural hash in pstate.
+
+        Atomicity in asyncio
+        ────────────────────
+        This is a regular (non-async) function. It runs to completion without
+        yielding the event loop, so the cache read, the PPR computation, and the
+        cache write form a single atomic sequence from the perspective of any
+        other concurrently scheduled coroutine. No lock is required.
+
+        Empty-seed fallback
+        ───────────────────
+        When ``seed_qids`` is empty (e.g. a structural or inventory query that
+        does not mention any symbol by name), the method seeds the graph from
+        the top-3 entry points weighted by their PageRank centrality score.
+        This produces a default activation distribution rather than an empty one.
 
         Args:
-            seed_qids: Qualified symbol ids to use as PPR seeds.
-            project_id: Current project identifier.
-            code_state_hash: Hash of active-block content — used as fallback
-                cache key only when the structure hash is not yet set.
-            edges_out: Outgoing call-graph edges for PPR propagation.
-            max_steps: Maximum power-iteration steps.
-            min_score: Minimum score for a node to appear in results.
-            alpha: PPR damping factor (restart probability = 1 - alpha).
+            seed_qids:        Qualified symbol ids to use as PPR seeds.
+            project_id:       Current project identifier.
+            code_state_hash:  Hash of the current active-block content; used as
+                              a fallback cache key when the structural hash is
+                              not yet available in pstate.
+            edges_out:        Outgoing call-graph edges for PPR propagation,
+                              keyed by source qualified-id.
+            max_steps:        Maximum number of power-iteration steps.
+            min_score:        Minimum score for a node to appear in the result.
+            alpha:            PPR damping factor; restart probability = 1 − alpha.
 
         Returns:
-            Dict mapping qualified symbol ids to PPR scores in [0, 1].
+            Dict mapping qualified symbol ids to PPR scores. Values are in
+            [0, 1] after normalisation (scores above ``min_score`` only).
+            Returns an empty dict when no seeds are available and no entry-point
+            fallback can be found.
         """
-        # ------------------------------------------------------------------
-        # Region: Resolve cache key
-        # Use structure hash (signatures only) so page-out events — which
-        # modify active_blocks but not the SymbolIndex graph — do not
-        # invalidate the cache.  Fall back to code_state_hash on cold start.
-        # ------------------------------------------------------------------
+        # ── Resolve the cache key ─────────────────────────────────────────────────
         psm = self._f._project_state_manager
         structure_hash = psm.get_structure_hash_for_cache(project_id)
-        cache_key = structure_hash if structure_hash else code_state_hash
-
-        # ------------------------------------------------------------------
-        # Region: Cache read
-        # Skip caching entirely when the key is empty to avoid cross-project
-        # collisions between sessions with no indexed code (Bug 69 fix).
-        # ------------------------------------------------------------------
-        use_cache = bool(cache_key)
+        cache_key_hash = structure_hash if structure_hash else code_state_hash
         seed_frozen = frozenset(seed_qids)
 
+        # ── Cache read ────────────────────────────────────────────────────────────
+        # Skip caching entirely when the key is empty to avoid false hits between
+        # sessions with no indexed code (e.g. two different projects both at cold
+        # start share the empty-string key).
+        use_cache = bool(cache_key_hash)
+
         if use_cache:
-            cached = self._ppr_cache.get(cache_key, seed_frozen)
+            cached = self._ppr_cache.get(cache_key_hash, seed_frozen)
             if cached is not None:
                 self._f._log_debug(
-                    f"PPR: cache hit (key={cache_key[:8]}, {self._ppr_cache.stats})"
+                    f"PPR: cache hit (key={cache_key_hash[:8]}, "
+                    f"{self._ppr_cache.stats})"
                 )
                 return cached
 
-        # ------------------------------------------------------------------
-        # Region: Build activation graph and seed
-        # When no seed qids are available, fall back to high-centrality entry
-        # points so the graph is still populated for structural queries.
-        # ------------------------------------------------------------------
+        # ── Build and seed the activation graph ──────────────────────────────────
         ag = ActivationGraph()
 
         if not seed_qids:
+            # Fallback: seed from the top-3 entry points by centrality so that
+            # structural queries receive a meaningful default distribution.
             centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
                 self._f._symbol_index, project_id
@@ -17137,15 +17440,16 @@ Output only the symbol name.
                     cent_score = centrality.get(sym_name, 0.0)
                     seed_score = 0.2 + 0.2 * cent_score
                     ag._activations[sym_name] = ActivationState(
-                        node_id=sym_name, score=seed_score, depth=0, source="seed"
+                        node_id=sym_name,
+                        score=seed_score,
+                        depth=0,
+                        source="seed",
                     )
         else:
             init_score = 1.0 / len(seed_qids)
             ag.seed(seed_qids, initial_score=init_score)
 
-        # ------------------------------------------------------------------
-        # Region: PPR propagation
-        # ------------------------------------------------------------------
+        # ── PPR power iteration ───────────────────────────────────────────────────
         ag.propagate(
             edges_out=edges_out,
             max_steps=max_steps,
@@ -17155,23 +17459,19 @@ Output only the symbol name.
 
         scores = ag.get_activated_nodes(threshold=min_score)
 
-        # ------------------------------------------------------------------
-        # Region: Cache write
-        # Store under the structure hash key so subsequent calls with the same
-        # graph topology (even after page-outs) get a cache hit.
-        # ------------------------------------------------------------------
+        # ── Cache write ───────────────────────────────────────────────────────────
         if use_cache:
-            self._ppr_cache.set(cache_key, seed_frozen, scores)
+            self._ppr_cache.set(cache_key_hash, seed_frozen, scores)
             self._f._log_debug(
                 f"PPR: computed and cached "
-                f"(key={cache_key[:8]}, {self._ppr_cache.stats})"
+                f"(key={cache_key_hash[:8]}, {self._ppr_cache.stats})"
             )
         else:
             self._f._log_debug(
                 "PPR: computed without caching (empty cache key — cold start)"
             )
 
-        # Periodic stats dump (avoid log spam).
+        # ── Periodic diagnostics dump ─────────────────────────────────────────────
         if hasattr(self._f, "_write_counter") and self._f._write_counter % 50 == 0:
             self._f._log_debug(self._ppr_cache.stats)
 
@@ -22328,38 +22628,47 @@ class EnrichmentTasks:
     ) -> Dict[str, str]:
         """
         Resolve docstrings for many symbols at once, identified by their
-        QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
+        QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
 
-        Uses response_format={"type": "json_object"} and enable_thinking=False
-        to force clean JSON output from the server with no reasoning preamble.
-        The server-side GBNF grammar guarantees valid JSON, so the parser
-        calls json.loads directly with no artifact stripping.
+        Uses ``response_format={"type": "json_object"}`` and
+        ``enable_thinking=False`` to force clean JSON output from the server
+        with no reasoning preamble. The server-side GBNF grammar guarantees
+        valid JSON, so the parser calls ``json.loads`` directly with no artifact
+        stripping.
 
         Cache hits (already in memory or SQLite) are resolved for free.
-        Cache misses are generated in groups of lazy_docstring_batch_size.
+        Cache misses are generated in groups of ``lazy_docstring_batch_size``.
+
+        Qualified id convention
+        ───────────────────────
+        Ids must be built with ``qualify_symbol(sym)`` (which includes
+        ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
+        (which omits ``file_path``). Module-level functions without a parent
+        class are indexed by the SymbolIndex as ``"module.function"`` when a
+        file path is available. Omitting the file path produces bare ``"function"``,
+        which never matches SymbolIndex lookups and prevents in-memory symbol
+        objects from being updated after generation.
 
         Args:
-            qids: List of qualified symbol ids to resolve. May contain duplicates.
+            qids:       List of qualified symbol ids to resolve. May contain
+                        duplicates; they are removed before processing.
             project_id: Current project identifier.
-            background: If True, uses label 'bg_docstring' (whitelisted during
-                        silent ingestion) and bypasses the per-turn budget.
-                        If False, uses label 'lazy_docstring_batch' and respects
-                        the per-turn budget.
+            background: When ``True``, uses the ``bg_docstring`` LLM label
+                        (whitelisted during silent ingestion) and bypasses the
+                        per-turn generation budget. When ``False``, uses
+                        ``lazy_docstring_batch`` and respects the budget.
 
         Returns:
-            Dict[str, str]: Mapping of qid to docstring for resolved symbols.
+            Mapping from qualified id to docstring for every symbol that was
+            successfully resolved, whether from cache or LLM generation.
         """
-        # ------------------------------------------------------------------
-        # Deduplicate qids while preserving insertion order.
-        # Without this, a symbol appearing twice in qids generates two LLM
-        # calls and two SQLite writes, one of which is always redundant.
+        # ── Deduplicate while preserving insertion order ──────────────────────────
         # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
-        # order (unlike set(), which does not).
-        # ------------------------------------------------------------------
+        # order, unlike set() which does not.
         qids = list(dict.fromkeys(qids))
 
         self._f._log_debug(
-            f"ensure_docstrings_batch: starting with {len(qids)} qids "
+            f"ensure_docstrings_batch: starting with {len(qids)} qid(s) "
             f"(background={background})"
         )
 
@@ -22367,15 +22676,20 @@ class EnrichmentTasks:
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # ------------------------------------------------------------------
-        # Region: Build qid → (sym, block) lookup index
-        # ------------------------------------------------------------------
-        # Built once to avoid O(N²) scans across active_blocks during cache
-        # and batch phases.
+        # ── Build qid → (symbol, block) lookup index ─────────────────────────────
+        # Built once here to avoid O(N²) scans across active_blocks during the
+        # cache and batch phases.
+        #
+        # qualify_symbol() is used (not qualify_symbol_name without file_path) so
+        # that module-level functions like "foo" in "mymodule.py" are indexed
+        # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
+        # Using qualify_symbol_name(name, parent_symbol) without file_path would
+        # produce bare "foo", which never matches SymbolIndex lookups and prevents
+        # in-memory symbol objects from being updated after docstring generation.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
-                _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
+                _q = qualify_symbol(_sym)
                 if _q not in _qid_index:
                     _qid_index[_q] = (_sym, _block)
 
@@ -22384,9 +22698,7 @@ class EnrichmentTasks:
         ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
             return _qid_index.get(qid, (None, None))
 
-        # ------------------------------------------------------------------
-        # Region: Phase 1 — resolve from in-memory symbol index then SQLite
-        # ------------------------------------------------------------------
+        # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
@@ -22415,7 +22727,7 @@ class EnrichmentTasks:
                 pending.append(qid)
 
         self._f._log_debug(
-            f"ensure_docstrings_batch: {len(pending)} pending after cache check"
+            f"ensure_docstrings_batch: {len(pending)} pending after cache phase"
         )
 
         if not pending:
@@ -22424,9 +22736,7 @@ class EnrichmentTasks:
             )
             return resolved
 
-        # ------------------------------------------------------------------
-        # Region: Phase 2 — apply per-turn budget (foreground/lazy mode only)
-        # ------------------------------------------------------------------
+        # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
         if not background:
             budget = self._f.valves.lazy_docstring_max_per_turn
             if budget > 0:
@@ -22444,9 +22754,7 @@ class EnrichmentTasks:
                 "ensure_docstrings_batch: background mode — per-turn budget skipped"
             )
 
-        # ------------------------------------------------------------------
-        # Region: Phase 3 — build (qid, signature, snippet) items for LLM
-        # ------------------------------------------------------------------
+        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
@@ -22467,13 +22775,11 @@ class EnrichmentTasks:
         label = "bg_docstring" if background else "lazy_docstring_batch"
 
         self._f._log_debug(
-            f"ensure_docstrings_batch: {len(items)} items to generate, "
+            f"ensure_docstrings_batch: {len(items)} item(s) to generate, "
             f"batch_size={batch_size}, label={label!r}"
         )
 
-        # ------------------------------------------------------------------
-        # Region: Phase 4 — LLM batch loop
-        # ------------------------------------------------------------------
+        # ── Phase 4: LLM batch generation loop ───────────────────────────────────
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
@@ -22488,7 +22794,7 @@ class EnrichmentTasks:
             )
             self._f._log_debug(
                 f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
-                f"{len(batch)} symbols, ~{prompt_tokens} prompt tokens, "
+                f"{len(batch)} symbol(s), ~{prompt_tokens} prompt tokens, "
                 f"label={label!r}"
             )
 
@@ -22527,9 +22833,10 @@ class EnrichmentTasks:
 
             self._f._log_debug(
                 f"ensure_docstrings_batch: batch {batch_num} — "
-                f"parsed {len(parsed)} docstrings"
+                f"parsed {len(parsed)} docstring(s)"
             )
 
+            # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -22563,37 +22870,75 @@ class EnrichmentTasks:
         self, qids: List[str], project_id: str
     ) -> Dict[str, str]:
         """
-        Resolve control-flow skeletons for many symbols, identified by their
-        QUALIFIED id. Pure CPU, deterministic, no LLM call.
+        Resolve control-flow skeletons for many symbols identified by their
+        qualified id. Extraction is deterministic and requires no LLM call.
+
+        A CFG skeleton preserves branch structure (if / try / for / while) and
+        call sites within each branch while collapsing straight-line statement
+        runs into ``...``. It is injected at LOD-2 for refactor or high-debug-
+        intent queries to give the model a compact view of a symbol's control
+        flow without exposing the full implementation body.
+
+        Qualified id convention
+        ───────────────────────
+        Ids must be built with ``qualify_symbol(sym)`` (which includes
+        ``file_path``) for the same reason documented in
+        ``ensure_docstrings_batch``: omitting ``file_path`` produces bare names
+        for module-level functions that never match SymbolIndex lookups.
+
+        Results are cached in the SymbolIndex by ``(qid, body_hash)`` so that
+        unchanged function bodies are never re-extracted across turns.
+
+        Args:
+            qids:       Qualified symbol ids to resolve.
+            project_id: Current project identifier.
+
+        Returns:
+            Mapping from qualified id to CFG skeleton string for every symbol
+            where extraction succeeded and the result is non-empty.
         """
         self._f._log_debug(f"CFG batch: invoked with {len(qids)} candidate(s): {qids}")
+
         state = self._f._conversation_state_manager.get(project_id)
-        cfg_rows = []
+        cfg_rows: List[Tuple] = []
         resolved: Dict[str, str] = {}
 
+        # ── Build qid → (symbol, block) lookup index ─────────────────────────────
+        # qualify_symbol() includes file_path so that module-level functions are
+        # indexed under "module.func" rather than bare "func", matching the
+        # qualified ids used by the SymbolIndex and by the callers of this method.
+        # Using qualify_symbol_name(name, parent_symbol) without file_path would
+        # produce bare names that never match, causing every lookup to miss and
+        # every skeleton to be re-extracted unnecessarily.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
-                _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
+                _q = qualify_symbol(_sym)
                 if _q not in _qid_index:
                     _qid_index[_q] = (_sym, _block)
 
-        def _find_symbol_and_block(qid: str):
+        def _find_symbol_and_block(
+            qid: str,
+        ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
             return _qid_index.get(qid, (None, None))
 
+        # ── Process each candidate ────────────────────────────────────────────────
         for qid in qids:
             sym, block = _find_symbol_and_block(qid)
+
             if sym is None or block is None:
                 self._f._log_debug(
-                    f"CFG batch: '{qid}' NOT FOUND in active_blocks — skipping"
+                    f"CFG batch: '{qid}' not found in active_blocks — skipping"
                 )
                 continue
+
             if not sym.line_start or not sym.line_end:
                 self._f._log_debug(
                     f"CFG batch: '{qid}' has no line_start/line_end — skipping"
                 )
                 continue
 
+            # ── Compute body hash and check the SymbolIndex cache ─────────────────
             lines = block.content.split("\n")
             snippet = "\n".join(lines[max(0, sym.line_start - 1) : sym.line_end])
             current_hash = hashlib.md5(snippet.encode()).hexdigest()[:16]
@@ -22601,28 +22946,36 @@ class EnrichmentTasks:
             meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
             cached_skeleton = meta.get("cfg_skeleton", "")
             cached_hash = meta.get("cfg_body_hash", "")
+
             if cached_skeleton and cached_hash == current_hash:
                 self._f._log_debug(f"CFG batch: '{qid}' cache HIT")
                 resolved[qid] = cached_skeleton
                 continue
 
+            # ── Extract CFG skeleton deterministically ────────────────────────────
             result = ControlFlowExtractor.extract_for_symbol(
-                block.content, sym, max_lines=self._f.valves.cfg_skeleton_max_lines
+                block.content,
+                sym,
+                max_lines=self._f.valves.cfg_skeleton_max_lines,
             )
             if result is None:
                 self._f._log_debug(f"CFG batch: '{qid}' extractor returned None")
                 continue
+
             skeleton, body_hash = result
             self._f._log_debug(
                 f"CFG batch: '{qid}' skeleton generated ({len(skeleton)} chars)"
             )
+
+            # ── Update SymbolIndex in-memory cache and collect for SQLite write ───
             self._f._symbol_index.update_cfg(qid, project_id, skeleton, body_hash)
             resolved[qid] = skeleton
             cfg_rows.append((project_id, qid, skeleton, body_hash, time.time()))
 
+        # ── Persist all new skeletons in a single batch write ─────────────────────
         if cfg_rows:
 
-            def _write_cfg_batch(rows=cfg_rows):
+            def _write_cfg_batch(rows: list = cfg_rows) -> None:
                 self._f._db_conn.executemany(
                     "INSERT OR REPLACE INTO symbol_cfg "
                     "(project_id, symbol_name, cfg_skeleton, body_hash, updated_at) "
@@ -22632,9 +22985,7 @@ class EnrichmentTasks:
                 self._f._db_conn.commit()
 
             await self._f._state_store._db_enqueue(_write_cfg_batch)
-            self._f._log_debug(
-                f"CFG batch: persisted {len(cfg_rows)} CFG entries in one batch"
-            )
+            self._f._log_debug(f"CFG batch: persisted {len(cfg_rows)} entry/entries")
 
         self._f._log_debug(f"CFG batch: resolved {len(resolved)}/{len(qids)}")
         return resolved
@@ -26013,20 +26364,36 @@ class MessageAssembler:
         """
         Orchestrate CoT, multi-phase, trimming, and final assembly.
 
+        Executes six sequential steps that transform the raw conversation message
+        list into the final payload sent to the LLM:
+
+          1. Chain-of-Thought detection and reasoning generation.
+          2. Code-history compression and lean-user-code stubbing.
+          3. LLMLingua-2 prose compression.
+          4. WindowManager: unified history window policy (summarise + evict).
+          5. Multi-phase protocol injection when the token budget is tight.
+          6. Final system-prompt assembly (Block A + Block B) and injection.
+
+        The ``pending_summary`` produced in step 4 must reach the final system
+        prompt via step 6. It must NOT be injected as a system message between
+        steps 4 and 6 because step 6 unconditionally strips all existing system
+        messages before rebuilding the list with the assembled final_system.
+        Any system message inserted before step 6 is silently discarded.
+
         Args:
-            messages: Current list of conversation messages.
-            project_id: Project identifier.
-            static_block: Rendered Block A (static, KV-cacheable).
+            messages:           Current list of conversation messages.
+            project_id:         Project identifier.
+            static_block:       Rendered Block A (static, KV-cacheable).
             dynamic_injections: List of (priority, text) dynamic content.
-            prelim_system: Preliminary system prompt (Block A + Block B).
-            last_user_msg: Last user message, if any.
-            is_code_session: Whether the session is code-aware.
-            state: ConversationState for the project.
-            __user__: User context from OpenWebUI.
-            user_question: Extracted question from the user message.
-            has_code_blocks: Whether the user message contained code fences.
-            slot_busy: Whether the LLM slot is busy.
-            is_continuation: True only for genuine AutoContinue.
+            prelim_system:      Preliminary system prompt (Block A + Block B).
+            last_user_msg:      Last user message, if any.
+            is_code_session:    Whether the session is code-aware.
+            state:              ConversationState for the project.
+            __user__:           User context from OpenWebUI.
+            user_question:      Extracted question from the user message.
+            has_code_blocks:    Whether the user message contained code fences.
+            slot_busy:          Whether the LLM slot is busy.
+            is_continuation:    True only for genuine AutoContinue turns.
 
         Returns:
             Final list of messages ready for the LLM.
@@ -26037,9 +26404,7 @@ class MessageAssembler:
 
         slot_free = not slot_busy
 
-        # ------------------------------------------------------------------
-        # Step 1: CoT detection and generation.
-        # ------------------------------------------------------------------
+        # ── Step 1: CoT detection and generation ──────────────────────────────────
         await self._detect_and_generate_cot(
             dynamic_injections,
             last_user_msg,
@@ -26053,44 +26418,34 @@ class MessageAssembler:
             messages,
         )
 
-        # ------------------------------------------------------------------
-        # Step 2: Code history compression + lean user code.
-        # ------------------------------------------------------------------
+        # ── Step 2: Code history compression and lean user code ───────────────────
         messages = await self._compress_code_history_and_lean(
             messages, project_id, dynamic_injections
         )
 
-        # ------------------------------------------------------------------
-        # Step 3: History LLMLingua compression.
-        # ------------------------------------------------------------------
+        # ── Step 3: History LLMLingua compression ─────────────────────────────────
         messages = await self._apply_history_llmlingua(
             messages, project_id, user_question
         )
 
-        # ------------------------------------------------------------------
-        # Step 4: WindowManager – unified history window policy.
-        # ------------------------------------------------------------------
+        # ── Step 4: WindowManager — unified history window policy ─────────────────
         messages, pending_summary = await self._window_manager.apply(
             messages, state, project_id, slot_free
         )
 
-        # ------------------------------------------------------------------
-        # Step 4b: Inject pending_summary if present (Bug 16).
-        # ------------------------------------------------------------------
+        # NOTE: pending_summary must NOT be injected as a system message here.
+        # Step 6 strips every existing system message unconditionally before
+        # rebuilding the list with final_system. A system message inserted at
+        # this point would be silently discarded, losing the summary entirely.
+        # pending_summary is instead passed directly to _assemble_final_system_and_log,
+        # which appends it to final_system before the message list is rebuilt.
         if pending_summary:
             self._f._log_debug(
-                f"WindowManager: injecting {len(pending_summary)} char summary "
-                f"into message history"
+                f"WindowManager: summary generated ({len(pending_summary)} chars), "
+                f"will be appended to final system prompt in step 6"
             )
-            # Inject the summary as a system message at the front of the history.
-            # This ensures the model sees it before the current conversation.
-            messages.insert(0, {"role": "system", "content": pending_summary})
-        elif pending_summary is not None:
-            self._f._log_debug("WindowManager: pending_summary empty, not injecting")
 
-        # ------------------------------------------------------------------
-        # Step 5: Multi-phase instructions injection.
-        # ------------------------------------------------------------------
+        # ── Step 5: Multi-phase protocol injection ────────────────────────────────
         await self._inject_multi_phase_instructions(
             dynamic_injections,
             prelim_system,
@@ -26101,11 +26456,13 @@ class MessageAssembler:
             project_id,
         )
 
-        # ------------------------------------------------------------------
-        # Step 6: Assemble final system message and inject.
-        # ------------------------------------------------------------------
+        # ── Step 6: Final system-prompt assembly and injection ────────────────────
+        # pending_summary is passed here so it can be appended to final_system
+        # before the message list is rebuilt. This is the only correct path:
+        # _assemble_final_system_and_log strips all existing system messages and
+        # inserts a single new one containing the fully assembled prompt.
         messages = self._assemble_final_system_and_log(
-            static_block, dynamic_injections, messages, project_id, ""
+            static_block, dynamic_injections, messages, project_id, pending_summary
         )
 
         return messages
@@ -28290,56 +28647,64 @@ class TaskRegistry:
 
     async def _lazy_docstrings(self, project_id: str) -> None:
         """
-        Lazy generation of docstrings for symbols that are needed in the
-        current turn. This is a lightweight version that only processes
-        symbols that are about to be used (e.g., LOD-2 symbols).
+        Generate docstrings on demand for symbols that will be visible in the
+        current turn's Block B or skeleton tier, before the context is assembled.
 
-        This runs in the foreground (inlet) and uses `background=False` so
-        that it respects the per‑turn budget and uses the `lazy_docstring_batch`
-        label (which is not whitelisted for silent ingestion, which is fine
-        because this method is never called during silent ingestion).
+        Targets only symbols about to appear in LOD-2 or in the skeleton tier
+        so the per-turn budget is spent where it has immediate impact on the
+        quality of what the model actually sees this turn.
+
+        Uses ``background=False`` to respect the per-turn budget valve and to
+        use the ``lazy_docstring_batch`` LLM label, which is correct here because
+        this method never runs during silent ingestion.
 
         Args:
-            project_id: The current project identifier.
+            project_id: Current project identifier.
         """
         psm = self._f._project_state_manager
 
-        # ------------------------------------------------------------------
-        # Step 1: Get the current conversation state.
-        # ------------------------------------------------------------------
+        # ── Load current conversation state ──────────────────────────────────────
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return
 
-        # ------------------------------------------------------------------
-        # Step 2: Determine which symbols need docstrings.
-        # ------------------------------------------------------------------
+        # ── Determine which symbols need docstrings this turn ─────────────────────
+        # Only symbols about to appear in LOD-2 or the skeleton tier are targeted.
+        # Generating docstrings for symbols that will not be shown wastes the
+        # per-turn budget without any immediate benefit to the model's context.
         skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
         lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
 
-        qids_needed = set()
+        qids_needed: Set[str] = set()
         for block in state.active_blocks.values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
-                qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                # qualify_symbol() includes file_path so that module-level
+                # functions produce "module.func" rather than bare "func",
+                # matching the qualified ids stored in skeleton_qids and lod2_qids
+                # which were built by the SymbolIndex using the same convention.
+                qid = qualify_symbol(sym)
                 if (qid in skeleton_qids or qid in lod2_qids) and not sym.docstring:
                     qids_needed.add(qid)
 
         if not qids_needed:
             return
 
-        # ------------------------------------------------------------------
-        # Step 3: Generate docstrings for the needed symbols (foreground).
-        # ------------------------------------------------------------------
-        results = await self.ensure_docstrings_batch(
+        # ── Generate missing docstrings via EnrichmentTasks ───────────────────────
+        # ensure_docstrings_batch lives on self._f._enrichment (EnrichmentTasks),
+        # not on self (TaskRegistry). Calling self.ensure_docstrings_batch would
+        # raise AttributeError at runtime.
+        results = await self._f._enrichment.ensure_docstrings_batch(
             list(qids_needed),
             project_id,
-            background=False,  # <-- foreground (lazy)
+            background=False,
         )
+
         if results:
             self._f._log_debug(
-                f"_lazy_docstrings: generated {len(results)} docstrings for this turn"
+                f"_lazy_docstrings: generated {len(results)} docstring(s) "
+                f"for this turn"
             )
 
     async def _lazy_prefetch(self, project_id: str) -> None:
@@ -32038,12 +32403,12 @@ class Valves(BaseModel):
     # ── 15.4 Priority & performance ───────────────────────────────────────
     background_priority: Dict[str, int] = Field(
         default_factory=lambda: {
-            "session_summary": 1,
-            "prefetch": 2,
-            "docstrings": 3,
-            "raptor": 4,
-            "purge": 5,
-            "lod_adaptive": 6,
+            "session_summary": 1,  # Controla el tamaño de la ventana — impacto directo
+            "docstrings": 2,  # LOD-2 calidad — beneficio inmediato cada turno
+            "prefetch": 3,  # CPU-only, no compite por LLM semaphore
+            "raptor": 4,  # Clustering — beneficio diferido
+            "lod_adaptive": 5,  # Ajuste fino — baja urgencia
+            "purge": 6,  # Mantenimiento — puede esperar
         },
         description="Override default priority for background tasks. Higher number = higher priority.",
     )
@@ -32656,7 +33021,7 @@ async def inlet(
         # ------------------------------------------------------------------
         # Region: write barrier — flush pending SQLite writes before reads
         # ------------------------------------------------------------------
-        await self._state_store.drain_writes(timeout=5.0)
+        await self._state_store.drain_writes()
 
         # 🔥 STATE MANAGEMENT
         #   1. Preprocess (project switch, cache load)
