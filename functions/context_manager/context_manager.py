@@ -3201,13 +3201,18 @@ class ContextPager:
         """
         Retrieve a paged block for temporary use THIS TURN ONLY.
 
-        Reconstruction uses ChromaDB as the single authoritative source —
-        the full block content is stored there by _page_out_async.
-        The previous SQLite path was dead code: page_out_block never wrote
-        to code_contents, so reconstruction always fell back to a 2000-char
-        excerpt. Now the document field contains the complete content.
-
+        Reconstruction uses ChromaDB as the single authoritative source.
         Does NOT restore the block to active_blocks.
+
+        Bug 31 fix: the previous implementation returned None immediately when
+        ``block_hash`` was not in ``_paged_hashes``.  Since ``_paged_hashes``
+        is an in-memory dict reset on every process restart, blocks paged out
+        in a previous session existed in ChromaDB but were unreachable.
+
+        The fix attempts a ChromaDB lookup regardless of ``_paged_hashes``
+        state.  If the entry is found in ChromaDB, the block is re-registered
+        in ``_paged_hashes`` so subsequent calls within the same session use
+        the fast registry path.
 
         Args:
             block_hash: Hash of the block to page in.
@@ -3218,31 +3223,41 @@ class ContextPager:
         Returns:
             The reconstructed CodeBlock, or None if not found.
         """
-        if not self.is_paged(block_hash, project_id):
+        if chroma_collection is None:
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
 
-        # ── Step 1: Retrieve full content and metadata from ChromaDB ──────────
+        # ── Step 1: Retrieve from ChromaDB (authoritative source) ─────────────────
+        # Attempt lookup regardless of _paged_hashes state so that blocks paged
+        # out in a previous session (before a process restart) can still be found.
         meta = None
         content = ""
-        if chroma_collection is not None:
-            try:
-                result = await anyio.to_thread.run_sync(
-                    lambda: chroma_collection.get(
-                        ids=[entry_id], include=["metadatas", "documents"]
-                    )
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: chroma_collection.get(
+                    ids=[entry_id], include=["metadatas", "documents"]
                 )
-                if result and result.get("ids"):
-                    meta = result["metadatas"][0]
-                    content = result["documents"][0] if result.get("documents") else ""
-            except Exception:
-                pass
+            )
+            if result and result.get("ids"):
+                meta = result["metadatas"][0]
+                content = result["documents"][0] if result.get("documents") else ""
+        except Exception:
+            pass
 
         if not content:
             return None
 
-        # ── Step 2: Extract metadata fields with safe defaults ────────────────
+        # ── Bug 31 fix: re-register in _paged_hashes if found via cold lookup ─────
+        # Ensures fast-path is used for subsequent calls within the same session.
+        if not self.is_paged(block_hash, project_id):
+            self._paged_hashes.setdefault(project_id, set()).add(block_hash)
+            self._f._log_debug(
+                f"page_in_block: re-registered block {block_hash[:8]} in "
+                f"_paged_hashes (found in ChromaDB after cold restart)"
+            )
+
+        # ── Step 2: Extract metadata fields with safe defaults ────────────────────
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3256,14 +3271,14 @@ class ContextPager:
         except Exception:
             ctype = ContentType.GENERAL
 
-        # ── Step 3: Deterministic symbol re-extraction ────────────────────────
+        # ── Step 3: Deterministic symbol re-extraction ────────────────────────────
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
 
-        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────
+        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────────
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -16563,40 +16578,70 @@ Output only the symbol name.
         inferred_seeds: Optional[Dict[str, float]] = None,
         cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
-        """Build activation graph combining lexical, structural and historical
+        """
+        Build an activation graph combining lexical, structural, and historical
         seed vectors.
 
-        Q2: If cached_scores is provided, use it directly instead of recomputing.
+        Bug 33 fix: the previous implementation ran all three PPR propagations
+        (lexical, structural, historical) before checking ``cached_scores``.
+        When the PPR cache was hit, the propagation work was discarded entirely.
+        The fix checks ``cached_scores`` immediately after building the seed
+        sets (which are cheap) and skips all propagations on a cache hit.
+
+        Args:
+            exact_seeds: Symbols found verbatim in the query.
+            partial_seeds: Symbols found via partial/fuzzy match.
+            tb_seeds: (symbol, score) pairs from traceback frames.
+            history_boosts: {symbol: boost} from recent message history.
+            edges_out: Call-graph outgoing edges for PPR propagation.
+            project_id: Current project identifier.
+            inferred_seeds: Optional {qid: score} from LLM seed inference.
+            cached_scores: Pre-computed PPR scores from the PPR cache.
+                           When not None, all propagations are skipped.
+
+        Returns:
+            ActivationGraph with propagated (or cache-loaded) scores.
         """
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
         symbol_index = self._f._symbol_index
 
-        ag_lex = ActivationGraph()
+        # ── Step 1: Build lexical seed set and initial activations ────────────────
+        # Always computed (cheap): needed for source="seed" attribution
+        # even when cached_scores is used.
         lexical_seed_qids: Set[str] = set()
-        if exact_seeds:
-            for sym_name in exact_seeds:
+
+        def _register_seeds(
+            names: List[str],
+            base_score_fn,
+            target: ActivationGraph,
+        ) -> None:
+            """Register a list of bare names as seeds with computed scores."""
+            for sym_name in names:
                 specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                score = base_score_fn(specificity)
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
                 lexical_seed_qids.update(qids)
                 share = score / len(qids) if qids else 0.0
                 for qid in qids:
-                    ag_lex._activations[qid] = ActivationState(
+                    target._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
                     )
-        if partial_seeds:
-            for sym_name in partial_seeds:
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    ag_lex._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
+
+        ag_lex = ActivationGraph()
+
+        _register_seeds(
+            exact_seeds,
+            lambda sp: min(1.0, 0.5 + 0.5 * min(sp, 1.0)),
+            ag_lex,
+        )
+        _register_seeds(
+            partial_seeds,
+            lambda sp: min(0.6, 0.3 + 0.3 * min(sp, 1.0)),
+            ag_lex,
+        )
+
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
@@ -16625,6 +16670,28 @@ Output only the symbol name.
                 source="seed",
             )
 
+        # ── Bug 33 fix: short-circuit before propagations on cache hit ────────────
+        # cached_scores is not None only when _get_or_compute_ppr_scores returned
+        # a cache hit.  Building ag_final directly from cached_scores avoids all
+        # three PPR propagations (which are the expensive part of this function).
+        if cached_scores is not None:
+            ag_final = ActivationGraph()
+            for qid, score in cached_scores.items():
+                if score >= 0.01:
+                    source = "seed" if qid in lexical_seed_qids else "propagation"
+                    ag_final._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=score,
+                        depth=0,
+                        source=source,
+                    )
+            self._f._log_debug(
+                f"PPR multi-seed: cache hit — {len(cached_scores)} scores loaded, "
+                f"all propagations skipped"
+            )
+            return ag_final
+
+        # ── Step 2: Propagate lexical graph ───────────────────────────────────────
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -16633,6 +16700,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # ── Step 3: Structural graph (entry-point seeds from PathIndex) ───────────
         ag_str = ActivationGraph()
         seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
@@ -16658,6 +16726,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
+        # ── Step 4: Historical graph (frequent mentions in recent messages) ────────
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -16674,20 +16743,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        if cached_scores is not None:
-            ag_final = ActivationGraph()
-            for qid, score in cached_scores.items():
-                if score >= 0.01:
-                    source = "seed" if qid in lexical_seed_qids else "propagation"
-                    ag_final._activations[qid] = ActivationState(
-                        node_id=qid,
-                        score=score,
-                        depth=0,
-                        source=source,
-                    )
-            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
-            return ag_final
-
+        # ── Step 5: Combine three graphs into ag_final ────────────────────────────
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -16696,6 +16752,7 @@ Output only the symbol name.
 
         ag_final = ActivationGraph()
         if not all_activated:
+            # Fallback: seed from entry points weighted by centrality
             psm = self._f._project_state_manager
             centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
@@ -27494,6 +27551,74 @@ class ProjectStateManager:
             self._f._log_debug(f"Slot save error: {e}")
             return False
 
+    def _find_most_recent_slot_hash(self, project_id: str) -> Optional[str]:
+        """
+        Scan the slot directory and return the structural hash embedded in the
+        most recently modified slot file for this project.
+
+        Used as a fallback by ``slot_restore`` when neither
+        ``structure_hash_for_cache`` nor ``block_a_cached`` are available in
+        pstate (e.g. after a cold process restart where pstate is empty but slot
+        files from the previous session still exist on disk).
+
+        The slot filename format is:
+            slot{slot_id}_{project_slug}_{static_hash16}_{model_hash8}.bin
+
+        The structural hash is always 16 lowercase hex characters, followed by
+        ``_`` and then 8 hex characters for the model hash, then ``.bin``.
+        A regex extracts it unambiguously regardless of underscores in the
+        project slug.
+
+        Args:
+            project_id: The project identifier used to build the filename prefix.
+
+        Returns:
+            The 16-character structural hash string, or None if no matching
+            slot file is found or the directory cannot be read.
+        """
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.isdir(slot_dir):
+            return None
+
+        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
+        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
+
+        # ── Collect all matching slot files with their mtime ──────────────────────
+        candidates: List[Tuple[float, str]] = []
+        try:
+            for fname in os.listdir(slot_dir):
+                if fname.startswith(prefix) and fname.endswith(".bin"):
+                    fpath = os.path.join(slot_dir, fname)
+                    try:
+                        candidates.append((os.path.getmtime(fpath), fname))
+                    except OSError:
+                        pass
+        except Exception as e:
+            self._f._log_debug(f"Slot directory scan failed: {e}")
+            return None
+
+        if not candidates:
+            return None
+
+        # ── Pick the most recently modified file ──────────────────────────────────
+        candidates.sort(reverse=True)
+        most_recent_fname = candidates[0][1]
+
+        # ── Extract structural hash via regex (16 hex chars before _8hex.bin) ─────
+        match = re.search(r"([0-9a-f]{16})_[0-9a-f]{8}\.bin$", most_recent_fname)
+        if not match:
+            self._f._log_debug(
+                f"Slot directory scan: could not parse hash from '{most_recent_fname}'"
+            )
+            return None
+
+        found_hash = match.group(1)
+        self._f._log_debug(
+            f"Slot directory scan: found hash '{found_hash}' "
+            f"from '{most_recent_fname}'"
+        )
+        return found_hash
+
     async def slot_restore(self, project_id: str) -> bool:
         """
         Restore the KV slot at session start.
@@ -27501,11 +27626,17 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) to locate the correct
         slot file, ensuring that docstring population does not cause a miss.
 
+        Bug 22 fix: when both ``structure_hash_for_cache`` and
+        ``block_a_cached`` are absent (cold restart with empty pstate),
+        the previous implementation returned False immediately.  The fix adds
+        a directory scan fallback via ``_find_most_recent_slot_hash`` so that
+        slot files from the previous session can still be restored.
+
         Args:
             project_id: The project identifier.
 
         Returns:
-            bool: True if the slot was restored successfully.
+            True if the slot was restored successfully, False otherwise.
         """
         if not self._f.valves.enable_slot_persistence:
             return False
@@ -27513,30 +27644,34 @@ class ProjectStateManager:
         # --- 1. Resolve per-project state ---
         pstate = self.get_pstate(project_id)
 
-        # --- 2. Skip if already attempted ---
+        # --- 2. Skip if already attempted this session ---
         if self.get_slot_restore_attempted(project_id):
             return self.get_slot_restored(project_id)
 
         self.set_slot_restore_attempted(project_id, True)
 
-        # --- 3. Get the structural hash from pstate ---
+        # --- 3. Resolve the structural hash ---
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
-            else:
+
+        # ── Bug 22 fix: fallback to directory scan when pstate has no hash ────────
+        if not static_hash:
+            self._f._log_debug(
+                "slot_restore: no hash in pstate — scanning slot directory for "
+                "most recent file (cold restart fallback)"
+            )
+            static_hash = self._find_most_recent_slot_hash(project_id)
+            if not static_hash:
+                self._f._log_debug(
+                    "slot_restore: no slot file found on disk — restore skipped"
+                )
                 return False
 
+        # --- 4. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
-
-        # --- 4. Check if file exists ---
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.exists(os.path.join(slot_dir, filename)):
-            self._f._log_debug(f"Slot restore: no file found for {filename}")
-            return False
-
-        # --- 5. Call llama.cpp API to restore ---
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3]
@@ -27575,17 +27710,29 @@ class ProjectStateManager:
 
     async def slot_restore_for_continuity(self, project_id: str) -> bool:
         """
-        Restore KV cache after auxiliary LLM calls (CoT, contradiction) have
-        dirtied the slot due to SWA architecture. Called at the end of every
-        inlet when slot_free=True.
+        Restore KV cache after auxiliary LLM calls (CoT, contradiction, etc.)
+        have dirtied the slot due to the SWA architecture.
 
-        Uses the structural hash for consistency with the slot filename.
+        Called at the end of every auxiliary LLM call when
+        ``enable_slot_persistence=True``.
+
+        Bug 23 fix: the previous implementation re-attempted the HTTP restore
+        on every invocation, regardless of whether a previous attempt in the
+        same turn had already succeeded or failed.  In a single turn with
+        multiple auxiliary calls (CoT + contradiction + use-case classification),
+        this could produce 5–10 redundant HTTP requests to the llama.cpp API.
+
+        The fix tracks attempt and outcome per slot filename in pstate.  A
+        filename-scoped key is used (rather than a plain boolean) so that a
+        code change mid-session (which produces a new filename) gets its own
+        fresh attempt, while the same filename within a turn is restored only
+        once.
 
         Args:
             project_id: The project identifier.
 
         Returns:
-            bool: True if the slot was restored successfully.
+            True if the slot was restored successfully, False otherwise.
         """
         if not self._f.valves.enable_slot_persistence:
             self._f._log_debug(
@@ -27610,6 +27757,20 @@ class ProjectStateManager:
 
         filename = self._slot_filename(project_id, static_hash)
 
+        # ── Bug 23 fix: per-filename attempt guard ────────────────────────────────
+        # Track attempt and outcome keyed by the slot filename so that:
+        #   - Multiple auxiliary calls in the same turn do not re-attempt.
+        #   - A code change that yields a new filename gets a fresh attempt.
+        _attempt_key = f"_slot_cont_attempted_{filename}"
+        _success_key = f"_slot_cont_succeeded_{filename}"
+
+        if pstate.get(_attempt_key):
+            # Already attempted (succeeded or failed) for this filename this session
+            return pstate.get(_success_key, False)
+
+        # Mark attempted before any await so concurrent calls (if any) also see it
+        pstate[_attempt_key] = True
+
         # --- 3. Check if file exists ---
         slot_dir = self._f.valves.slot_save_path.rstrip("/")
         file_path = os.path.join(slot_dir, filename)
@@ -27620,6 +27781,7 @@ class ProjectStateManager:
             self._f._log_debug(
                 f"slot_restore_for_continuity: file not found: {file_path}, skipping"
             )
+            pstate[_success_key] = False
             return False
 
         # --- 4. Call llama.cpp API to restore ---
@@ -27629,7 +27791,7 @@ class ProjectStateManager:
 
         self._f._log_debug(
             f"slot_restore_for_continuity: attempting restore for '{project_id}' "
-            f"with hash {static_hash} -> {filename}"
+            f"with hash {static_hash} → {filename}"
         )
 
         try:
@@ -27648,6 +27810,7 @@ class ProjectStateManager:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    pstate[_success_key] = True
                     self._f._log_debug(
                         f"✓ KV cache restored post-aux ← {filename} "
                         f"({data.get('n_restored', '?')} tokens)"
@@ -27655,6 +27818,7 @@ class ProjectStateManager:
                     return True
 
                 body = await resp.text()
+                pstate[_success_key] = False
                 self._f._log_debug(
                     f"slot_restore_for_continuity: restore failed: "
                     f"HTTP {resp.status} — {body}"
@@ -27662,6 +27826,7 @@ class ProjectStateManager:
                 return False
 
         except Exception as e:
+            pstate[_success_key] = False
             self._f._log_debug(f"slot_restore_for_continuity: error: {e}")
             return False
 
