@@ -3356,6 +3356,9 @@ class RaptorCodeIndex:
             graph_weight: Weight for graph distance in clustering.
             stop_event: Optional event to signal early termination.
         """
+        # ------------------------------------------------------------------
+        # Region: Early exit
+        # ------------------------------------------------------------------
         if stop_event and stop_event.is_set():
             return
 
@@ -3368,7 +3371,7 @@ class RaptorCodeIndex:
             return
 
         # ------------------------------------------------------------------
-        # Build L1 from symbols.
+        # Region: Build L1 from symbols
         # ------------------------------------------------------------------
         n_l1 = await self.build_layer(
             project_id=project_id,
@@ -3389,7 +3392,7 @@ class RaptorCodeIndex:
             return
 
         # ------------------------------------------------------------------
-        # Build L2 from L1 summaries if enough L1 clusters exist.
+        # Region: Build L2 from L1 summaries if enough L1 clusters exist
         # ------------------------------------------------------------------
         if n_l1 >= 4:
             await self.build_layer(
@@ -3408,7 +3411,16 @@ class RaptorCodeIndex:
             )
 
         # ------------------------------------------------------------------
-        # Prune stale cluster ids.
+        # Bug 34 fix: check stop_event AFTER L2 build and BEFORE pruning.
+        # The original code only checked after L1. If the task is cancelled
+        # while L2 is building, the prune step would still execute, which
+        # could incorrectly delete valid cluster ids from a concurrent build.
+        # ------------------------------------------------------------------
+        if stop_event and stop_event.is_set():
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Prune stale cluster ids
         # ------------------------------------------------------------------
         await self._prune_stale_clusters(
             project_id=project_id,
@@ -8659,25 +8671,37 @@ class LongTermMemory:
     async def find_cached_response(
         self, query: str, context_hash: str, state: dict
     ) -> Optional[dict]:
-        """Search the response cache for a semantically similar query.
-
-        Returns a dict with ``response``, ``query``, and ``timestamp`` on a
-        hit, or ``None`` if no valid cached entry is found.  Stale entries
-        (code state changed or TTL expired) are deleted on the fly.
         """
-        # ── Early exit: cache disabled or collection missing ──────────
+        Search the response cache for a semantically similar query.
+
+        Returns a dict with response, query, and timestamp on a hit, or None
+        if no valid cached entry is found. Stale entries (code state changed
+        or TTL expired) are deleted on the fly.
+
+        Args:
+            query: The current user query.
+            context_hash: Hash of the context (unused, kept for API compatibility).
+            state: The conversation state (unused, kept for API compatibility).
+
+        Returns:
+            Optional[dict]: Cache hit dict or None.
+        """
+        # ------------------------------------------------------------------
+        # Region: Early exit — cache disabled or prerequisites missing
+        # ------------------------------------------------------------------
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return None
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
             return None
 
-        # ── Embed query ───────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Embed query and retrieve nearest neighbour
+        # ------------------------------------------------------------------
         query_vec = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
 
-        # ── Retrieve nearest neighbour ─────────────────────────────────
         results = await anyio.to_thread.run_sync(
             lambda: col.query(
                 query_embeddings=[query_vec],
@@ -8689,26 +8713,37 @@ class LongTermMemory:
         if not results or not results["ids"] or not results["ids"][0]:
             return None
 
-        # ── Validate similarity ────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Validate similarity threshold
+        # ------------------------------------------------------------------
         dist = results["distances"][0][0]
         similarity = 1.0 - (dist / 2.0)
         if similarity < self._f.valves.response_cache_similarity_threshold:
             return None
 
-        # ── Check staleness: code state hash ───────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Check code-state staleness
+        # ------------------------------------------------------------------
         meta = results["metadatas"][0][0]
         stored_code_state = meta.get("code_state_hash", "")
-        if (
-            stored_code_state
-            and stored_code_state
-            != self._f._activation.compute_code_state_hash(self._f.valves.project_id)
-        ):
+        current_code_state = self._f._activation.compute_code_state_hash(
+            self._f.valves.project_id
+        )
+
+        # Bug 75 fix: compare unconditionally. The original code used
+        # ``if stored_code_state and stored_code_state != current``, which
+        # skipped the check when stored_code_state was '' (codeless session),
+        # allowing stale cross-state hits. Now any mismatch (including '' vs
+        # non-empty or vice versa) triggers invalidation.
+        if stored_code_state != current_code_state:
             await anyio.to_thread.run_sync(
                 lambda: col.delete(ids=[results["ids"][0][0]])
             )
             return None
 
-        # ── Check staleness: TTL ───────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Check TTL staleness
+        # ------------------------------------------------------------------
         ttl = self._f.valves.response_cache_ttl_hours * 3600
         ts = meta.get("timestamp", 0)
         if ttl > 0 and time.time() - ts > ttl:
@@ -9186,9 +9221,21 @@ class LongTermMemory:
         is_continuation: bool = False,
     ) -> list:
         """
-        Retrieve relevant LTM entries, with multi‑query expansion and reranking.
+        Retrieve relevant LTM entries, with multi-query expansion and reranking.
+
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
+            use_case_label: Label for the active use case (logging only).
+            slot_free: Whether the LLM slot is free (governs query expansion).
+            is_continuation: Whether this is a continuation turn.
+
+        Returns:
+            List of memory fragment dicts with keys doc, timestamp, meta.
         """
-        # ── C4: early exit if retrieval disabled ──────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Early exit if retrieval disabled
+        # ------------------------------------------------------------------
         if self._retrieval_disabled_reason:
             self._f._log_debug(
                 f"LTM retrieval skipped: {self._retrieval_disabled_reason}"
@@ -9196,7 +9243,7 @@ class LongTermMemory:
             return []
 
         # ------------------------------------------------------------------
-        # REGION 1: Early exits
+        # Region: Early exits — prerequisites
         # ------------------------------------------------------------------
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
@@ -9208,7 +9255,7 @@ class LongTermMemory:
             )
 
         # ------------------------------------------------------------------
-        # REGION 2: Build query variants (thematic expansion)
+        # Region: Build query variants (thematic expansion)
         # ------------------------------------------------------------------
         expanded = await self._expand_query_for_retrieval(
             query, use_case_label=use_case_label, is_continuation=is_continuation
@@ -9218,7 +9265,7 @@ class LongTermMemory:
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
-            # Expiration filter with OR for summaries
+            # Expiration filter with OR for summaries.
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append(
                     {
@@ -9232,13 +9279,40 @@ class LongTermMemory:
                     }
                 )
 
-            # ── C2: deduplicate results by memory_id, keeping highest raw score ──
+            # ------------------------------------------------------------------
+            # Bug 46 fix: get collection count ONCE before the variant loop
+            # to avoid InvalidArgumentException when n_results > collection size.
+            # This can happen on fresh projects or after purges, and throws in
+            # ChromaDB < 0.4. A single count() call is cheaper than catching
+            # the exception inside the loop.
+            # ------------------------------------------------------------------
+            try:
+                _coll_count = await anyio.to_thread.run_sync(
+                    lambda: self._f.memory_collection.count()
+                )
+                _safe_n = max(
+                    1,
+                    min(
+                        self._f.valves.long_term_memory_top_k * 2,
+                        _coll_count,
+                    ),
+                )
+            except Exception as _count_err:
+                self._f._log_debug(
+                    f"LTM: collection.count() failed ({_count_err}), "
+                    f"using top_k*2 without guard"
+                )
+                _safe_n = self._f.valves.long_term_memory_top_k * 2
+
+            # ------------------------------------------------------------------
+            # Region: Deduplicate results by memory_id, keeping highest raw score
+            # ------------------------------------------------------------------
             all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
 
             # ------------------------------------------------------------------
-            # REGION 3: Retrieve for each variant
+            # Region: Retrieve for each variant
             # ------------------------------------------------------------------
-            for variant_query in expanded:  # <-- antes 'query_variants', corregido
+            for variant_query in expanded:
                 q_emb = await anyio.to_thread.run_sync(
                     lambda q=variant_query: self._f.embedder.encode(
                         self._f._tokens.truncate_text_to_tokens(q, 32768)
@@ -9248,7 +9322,7 @@ class LongTermMemory:
                     variant_results = await anyio.to_thread.run_sync(
                         lambda emb=q_emb: self._f.memory_collection.query(
                             query_embeddings=[emb],
-                            n_results=self._f.valves.long_term_memory_top_k * 2,
+                            n_results=_safe_n,  # ← Bug 46 fix: use safe_n
                             where=where_filter,
                             include=["documents", "metadatas", "distances"],
                         )
@@ -9264,7 +9338,7 @@ class LongTermMemory:
                     meta = variant_results["metadatas"][0][i]
                     raw_sim = 1.0 - (variant_results["distances"][0][i] / 2.0)
 
-                    # ── C1: apply threshold on RAW similarity ──────────────────
+                    # Apply threshold on RAW similarity.
                     if raw_sim < self._f.valves.long_term_memory_similarity_threshold:
                         continue
 
@@ -9277,14 +9351,16 @@ class LongTermMemory:
                         hashlib.md5(doc.encode()).hexdigest()[:16],
                     )
 
-                    # ── C2: deduplicate, keep highest raw score ─────────────────
+                    # Deduplicate, keep highest raw score.
                     if (
                         mem_id not in all_raw_results
                         or raw_sim > all_raw_results[mem_id][1]
                     ):
                         all_raw_results[mem_id] = (doc, raw_sim, ts, meta)
 
-            # ── C1: apply time decay for ranking (not for filtering) ──────────
+            # ------------------------------------------------------------------
+            # Region: Apply time decay for ranking (not for filtering)
+            # ------------------------------------------------------------------
             docs_with_meta = []
             for mem_id, (doc, raw_sim, ts, meta) in all_raw_results.items():
                 if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
@@ -9311,6 +9387,9 @@ class LongTermMemory:
 
             docs_with_meta.sort(key=lambda x: x[1], reverse=True)
 
+            # ------------------------------------------------------------------
+            # Region: Symbol boost
+            # ------------------------------------------------------------------
             if self._f.valves.ltm_symbol_boost_enabled and query:
                 query_symbols = self._extract_query_symbols(query, project_id)
                 if query_symbols:
@@ -9330,6 +9409,9 @@ class LongTermMemory:
                     new_docs.sort(key=lambda x: x[1], reverse=True)
                     docs_with_meta = new_docs
 
+            # ------------------------------------------------------------------
+            # Region: Reranking
+            # ------------------------------------------------------------------
             if (
                 self._f.valves.enable_reranking
                 and self._f._cross_encoder
@@ -9356,7 +9438,7 @@ class LongTermMemory:
             docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
 
             # ------------------------------------------------------------------
-            # REGION 5: Normalize output
+            # Region: Normalize output
             # ------------------------------------------------------------------
             normalized = []
             for entry in docs_with_meta:
@@ -9384,10 +9466,28 @@ class LongTermMemory:
     async def retrieve_historical_messages(
         self, query: str, project_id: str, limit: int, is_continuation: bool = False
     ) -> list:
-        """Retrieve historically relevant messages from ChromaDB LTM."""
+        """
+        Retrieve historically relevant messages from ChromaDB LTM.
+
+        Args:
+            query: The user query used for semantic similarity search.
+            project_id: Current project identifier.
+            limit: Maximum number of messages to return.
+            is_continuation: Whether this is a continuation turn (unused here,
+                             kept for API compatibility).
+
+        Returns:
+            list: List of message dicts with role and content keys.
+        """
+        # ------------------------------------------------------------------
+        # Region: Early exit — prerequisites
+        # ------------------------------------------------------------------
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
+        # ------------------------------------------------------------------
+        # Region: Forced-symbol path
+        # ------------------------------------------------------------------
         forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
         if forced_symbol:
             memories = await self._retrieve_by_symbol(
@@ -9396,6 +9496,9 @@ class LongTermMemory:
             return [{"role": "user", "content": m["doc"]} for m in memories]
 
         try:
+            # ------------------------------------------------------------------
+            # Region: Embed query
+            # ------------------------------------------------------------------
             # Requires an embedder supporting 32768 context or more.
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(
@@ -9405,7 +9508,9 @@ class LongTermMemory:
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
-            # ── FIX 11: Expiration filter with OR for summaries ──
+            # ------------------------------------------------------------------
+            # Region: Expiration filter with OR for summaries
+            # ------------------------------------------------------------------
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append(
                     {
@@ -9419,15 +9524,39 @@ class LongTermMemory:
                     }
                 )
 
+            # ------------------------------------------------------------------
+            # Bug 91 fix: guard n_results against collection size.
+            # ChromaDB raises InvalidArgumentException when n_results > count().
+            # This happens on fresh projects or after bulk purges. A single
+            # count() call is cheaper than catching the exception inside the loop.
+            # ------------------------------------------------------------------
+            try:
+                _coll_count = await anyio.to_thread.run_sync(
+                    lambda: self._f.memory_collection.count()
+                )
+                _safe_n = max(1, min(limit * 3, _coll_count))
+            except Exception as _count_err:
+                self._f._log_debug(
+                    f"retrieve_historical_messages: collection.count() failed "
+                    f"({_count_err}), using limit*3 without guard"
+                )
+                _safe_n = limit * 3
+
+            # ------------------------------------------------------------------
+            # Region: Query ChromaDB
+            # ------------------------------------------------------------------
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
                     query_embeddings=[q_emb],
-                    n_results=limit * 3,
+                    n_results=_safe_n,  # Bug 91 fix: use safe_n
                     where=where_filter,
                     include=["documents", "metadatas", "distances"],
                 )
             )
 
+            # ------------------------------------------------------------------
+            # Region: Score and separate summaries from regular messages
+            # ------------------------------------------------------------------
             query_symbols = set()
             if self._f.valves.ltm_symbol_boost_enabled and query:
                 query_symbols = self._extract_query_symbols(query, project_id)
@@ -9466,6 +9595,9 @@ class LongTermMemory:
                 msg for _, msg in scored_regular
             ]
 
+            # ------------------------------------------------------------------
+            # Region: Reranking
+            # ------------------------------------------------------------------
             if (
                 self._f.valves.enable_reranking
                 and self._f._cross_encoder
@@ -9477,6 +9609,7 @@ class LongTermMemory:
                 messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
 
             return messages[:limit]
+
         except Exception as e:
             logger.warning(f"Historical message retrieval failed: {e}")
             return []
@@ -9917,23 +10050,35 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def purge_expired_memories(self) -> None:
-        """Remove memories whose expires_at timestamp is in the past."""
+        """
+        Remove memories whose expires_at timestamp is in the past.
+        """
+        # ------------------------------------------------------------------
+        # Region: Early exit — prerequisites
+        # ------------------------------------------------------------------
         await asyncio.sleep(0)
         if not HAS_CHROMA or self._f.memory_collection is None:
             return
         if self._f.valves.long_term_memory_expiration_days <= 0:
             return
-        try:
-            await anyio.to_thread.run_sync(self._do_purge)
-        except Exception as e:
-            logger.warning(f"Purge failed: {e}")
 
-    def _do_purge(self) -> None:
-        now = time.time()
-        expired = self._f.memory_collection.get(where={"expires_at": {"$lt": now}})
-        if expired and expired["ids"]:
-            self._f.memory_collection.delete(ids=expired["ids"])
-            self._f._log_debug(f"Purged {len(expired['ids'])} expired memories")
+        # ------------------------------------------------------------------
+        # lazy-initialize a per-instance lock to serialise purge
+        # calls. Two concurrent outlet() invocations can both reach here; the
+        # lock ensures only one runs _do_purge at a time.
+        # ------------------------------------------------------------------
+        if not hasattr(self, "_purge_lock"):
+            self._purge_lock = asyncio.Lock()
+
+        if self._purge_lock.locked():
+            self._f._log_debug("LTM purge: already in progress, skipping")
+            return
+
+        async with self._purge_lock:
+            try:
+                await anyio.to_thread.run_sync(self._do_purge)
+            except Exception as e:
+                logger.warning(f"Purge failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Project purge – NEW (C3)
@@ -10633,6 +10778,11 @@ class ReasoningEngine:
             is_continuation=True          → {level:0}
             empty content                 → {level:0}
             enable_cot_llm_detection=False → stage 1 only
+
+        Bug 156 fix: removed all ENABLE_COT_STICKY updates from this method.
+            state.last_cot_level is now updated only in _detect_and_generate_cot
+            after successful reasoning generation, preventing sticky pollution
+            when generation ultimately fails.
         """
         _sv = signal_vector or {
             "n_mentioned": 0,
@@ -10689,7 +10839,7 @@ class ReasoningEngine:
             f"suggests_sci={hints['heuristic_suggests_scientific']}"
         )
 
-        # Heuristic-only mode
+        # -- Heuristic-only mode (no CE/LLM) --------------------------------
         if not self._f.valves.enable_cot_llm_detection:
             config = {
                 "level": heuristic_level,
@@ -10701,164 +10851,193 @@ class ReasoningEngine:
                     f"ambiguity={hints['ambiguity_score']}"
                 ),
             }
-            if self._f.ENABLE_COT_STICKY:
-                state.last_cot_level = heuristic_level
+            # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
+            # state.last_cot_level is now managed in _detect_and_generate_cot
+            # so that it is only set when reasoning is actually generated.
             return config
 
         # ── STAGE 2: CrossEncoder ──────────────────────────────────────────
-        # Build enriched query (same enrichment as existing _detect_cot_level_via_llm)
-        session_type = "code" if is_code_session else "general"
-        intent_hint = ""
         if (
-            hasattr(self._f, "_user_intent_full_code")
-            and self._f._user_intent_full_code is not None
+            self._f._cross_encoder is not None
+            and self._f.valves.enable_cot_llm_detection
         ):
-            intent_hint = (
-                "The user likely needs the full code."
-                if self._f._user_intent_full_code
-                else "The user likely needs only a summary."
-            )
+            stripped = self._f._commands._extract_text_for_classification(user_content)
+            query_short = stripped[:500] if stripped else user_content[:500]
 
-        context_parts = []
-        if "```" in user_content or any(
-            kw in user_content
-            for kw in ("def ", "class ", "import ", "from ", "function ")
-        ):
-            context_parts.append("[CODE]")
-        if hints["has_traceback"]:
-            context_parts.append("[TRACEBACK]")
-        if is_continuation:
-            context_parts.append("[CONTINUATION]")
-        context_prefix = " ".join(context_parts)
-        base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
-        query = (
-            f"{context_prefix} {base_query}".strip() if context_parts else base_query
-        )
-
-        # 6 CE pairs: 4 level + 2 scientific
-        ce_pairs = [
-            (
-                query,
-                "The user asks a trivial question about code: a simple fact, "
-                "definition, or direct command that does not require reasoning.",
-            ),
-            (
-                query,
-                "The user asks a moderately complex question about code that "
-                "requires some logical reasoning but the answer is straightforward.",
-            ),
-            (
-                query,
-                "The user asks a complex question about code with a clear "
-                "direction: step-by-step implementation, explanation of how "
-                "something works, or debugging with an obvious likely cause.",
-            ),
-            (
-                query,
-                "The user asks a deep, system-wide, or multi-component question "
-                "requiring exhaustive analysis, cascading impact evaluation, or "
-                "reasoning that spans many interconnected modules simultaneously.",
-            ),
-            (
-                query,
-                "The root cause or best solution is genuinely ambiguous — "
-                "several competing explanations are plausible, each involving "
-                "different parts of the codebase. The query names specific "
-                "functions, classes, or files that could be the root cause."
-                "The query mentions specific symbols or methods.",
-            ),
-            (
-                query,
-                "The direction is clear — one implementation, explanation, or "
-                "diagnosis needs to be produced in detail. There are no "
-                "competing structural alternatives to evaluate.",
-            ),
-        ]
-
-        all_scores = await self._f._commands._predict_cross_encoder(ce_pairs)
-
-        if all_scores is not None and len(all_scores) >= 6:
-            raw_level = list(all_scores[:4])
-            raw_sci = list(all_scores[4:6])
-
-            # Apply existing level reinforcement (backward compat)
-            if self._f.valves.enable_cot_heuristic_reinforcement:
-                level_scores = self._reinforce_cot_level_detection_with_heuristic(
-                    user_content, raw_level
+            session_type = "code" if is_code_session else "general"
+            intent_hint = ""
+            if (
+                hasattr(self._f, "_user_intent_full_code")
+                and self._f._user_intent_full_code is not None
+            ):
+                intent_hint = (
+                    "The user likely needs the full code."
+                    if self._f._user_intent_full_code
+                    else "The user likely needs only a summary."
                 )
-            else:
-                level_scores = raw_level
 
-            # Apply full reinforcement (level + scientific)
-            level_scores, sci_scores = self._reinforce_cot_scores(
-                level_scores, raw_sci, hints
+            context_parts = []
+            if "```" in user_content or any(
+                kw in user_content
+                for kw in ("def ", "class ", "import ", "from ", "function ")
+            ):
+                context_parts.append("[CODE]")
+            if hints["has_traceback"]:
+                context_parts.append("[TRACEBACK]")
+            if is_continuation:
+                context_parts.append("[CONTINUATION]")
+            context_prefix = " ".join(context_parts)
+            base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+            query = (
+                f"{context_prefix} {base_query}".strip()
+                if context_parts
+                else base_query
             )
 
-            # Confidence check on both dimensions
-            sorted_lv = sorted(level_scores, reverse=True)
-            level_diff = sorted_lv[0] - sorted_lv[1]
-            sci_diff = sci_scores[0] - sci_scores[1]  # + = scientific wins
+            # 6 CE pairs: 4 level + 2 scientific
+            ce_pairs = [
+                (
+                    query,
+                    "The user asks a trivial question about code: a simple fact, "
+                    "definition, or direct command that does not require reasoning.",
+                ),
+                (
+                    query,
+                    "The user asks a moderately complex question about code that "
+                    "requires some logical reasoning but the answer is straightforward.",
+                ),
+                (
+                    query,
+                    "The user asks a complex question about code with a clear "
+                    "direction: step-by-step implementation, explanation of how "
+                    "something works, or debugging with an obvious likely cause.",
+                ),
+                (
+                    query,
+                    "The user asks a deep, system-wide, or multi-component question "
+                    "requiring exhaustive analysis, cascading impact evaluation, or "
+                    "reasoning that spans many interconnected modules simultaneously.",
+                ),
+                (
+                    query,
+                    "The root cause or best solution is genuinely ambiguous — "
+                    "several competing explanations are plausible, each involving "
+                    "different parts of the codebase. The query names specific "
+                    "functions, classes, or files that could be the root cause."
+                    "The query mentions specific symbols or methods.",
+                ),
+                (
+                    query,
+                    "The direction is clear — one implementation, explanation, or "
+                    "diagnosis needs to be produced in detail. There are no "
+                    "competing structural alternatives to evaluate.",
+                ),
+            ]
 
-            level_confident = (
-                level_diff >= self._f.valves.cot_cascade_uncertainty_threshold
-            )
-            sci_confident = abs(sci_diff) >= self._f.valves.cot_scientific_ce_threshold
+            all_scores = await self._f._commands._predict_cross_encoder(ce_pairs)
 
-            self._f._log_debug(
-                f"detect_cot_configuration stage2 CE: "
-                f"lv={[f'{s:.2f}' for s in level_scores]}, "
-                f"sci={[f'{s:.2f}' for s in sci_scores]}, "
-                f"lv_diff={level_diff:.2f}({'✅' if level_confident else '❌'}), "
-                f"sci_diff={sci_diff:.2f}({'✅' if sci_confident else '❌'})"
-            )
+            if all_scores is not None and len(all_scores) >= 6:
+                raw_level = list(all_scores[:4])
+                raw_sci = list(all_scores[4:6])
 
-            if not self._f.valves.enable_cot_cascade:
-                # Cascade disabled → skip CE decision, go straight to LLM
-                self._f._log_debug("detect_cot_configuration: cascade disabled → LLM")
-                config = await self._classify_cot_config_with_llm(
-                    user_content,
-                    is_code_session,
-                    level_scores,
-                    sci_scores,
-                    hints,
-                    project_id,
+                # Apply existing level reinforcement (backward compat)
+                if self._f.valves.enable_cot_heuristic_reinforcement:
+                    level_scores = self._reinforce_cot_level_detection_with_heuristic(
+                        user_content, raw_level
+                    )
+                else:
+                    level_scores = raw_level
+
+                # Apply full reinforcement (level + scientific)
+                level_scores, sci_scores = self._reinforce_cot_scores(
+                    level_scores, raw_sci, hints
                 )
-            elif level_confident and sci_confident:
-                # Both dimensions confident → return from CE
-                best_level = int(np.argmax(level_scores))
-                use_scientific = sci_diff > 0 and best_level >= 2
 
-                if self._f.ENABLE_COT_STICKY:
-                    state.last_cot_level = best_level
+                # Confidence check on both dimensions
+                sorted_lv = sorted(level_scores, reverse=True)
+                level_diff = sorted_lv[0] - sorted_lv[1]
+                sci_diff = sci_scores[0] - sci_scores[1]  # + = scientific wins
 
-                config = {
-                    "level": best_level,
-                    "use_scientific": use_scientific,
-                    "decompose": hints["multi_question"],
-                    "source": "crossencoder",
-                    "rationale": (
-                        f"CE confident: L{best_level} (diff={level_diff:.2f}), "
-                        f"sci={use_scientific} (sci_diff={sci_diff:.2f})"
-                    ),
-                }
+                level_confident = (
+                    level_diff >= self._f.valves.cot_cascade_uncertainty_threshold
+                )
+                sci_confident = (
+                    abs(sci_diff) >= self._f.valves.cot_scientific_ce_threshold
+                )
+
                 self._f._log_debug(
-                    f"detect_cot_configuration → CE: "
-                    f"level={best_level}, scientific={use_scientific}"
+                    f"detect_cot_configuration stage2 CE: "
+                    f"lv={[f'{s:.2f}' for s in level_scores]}, "
+                    f"sci={[f'{s:.2f}' for s in sci_scores]}, "
+                    f"lv_diff={level_diff:.2f}({'✅' if level_confident else '❌'}), "
+                    f"sci_diff={sci_diff:.2f}({'✅' if sci_confident else '❌'})"
                 )
-                return config
+
+                if not self._f.valves.enable_cot_cascade:
+                    # Cascade disabled → skip CE decision, go straight to LLM
+                    self._f._log_debug(
+                        "detect_cot_configuration: cascade disabled → LLM"
+                    )
+                    config = await self._classify_cot_config_with_llm(
+                        user_content,
+                        is_code_session,
+                        level_scores,
+                        sci_scores,
+                        hints,
+                        project_id,
+                    )
+                elif level_confident and sci_confident:
+                    # Both dimensions confident → return from CE
+                    best_level = int(np.argmax(level_scores))
+                    use_scientific = sci_diff > 0 and best_level >= 2
+
+                    # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
+                    # state.last_cot_level is now managed in _detect_and_generate_cot
+                    # so that it is only set when reasoning is actually generated.
+
+                    config = {
+                        "level": best_level,
+                        "use_scientific": use_scientific,
+                        "decompose": hints["multi_question"],
+                        "source": "crossencoder",
+                        "rationale": (
+                            f"CE confident: L{best_level} (diff={level_diff:.2f}), "
+                            f"sci={use_scientific} (sci_diff={sci_diff:.2f})"
+                        ),
+                    }
+                    self._f._log_debug(
+                        f"detect_cot_configuration → CE: "
+                        f"level={best_level}, scientific={use_scientific}"
+                    )
+                    return config
+                else:
+                    # Some dimension uncertain → LLM with CE context
+                    self._f._log_debug("detect_cot_configuration: CE uncertain → LLM")
+                    config = await self._classify_cot_config_with_llm(
+                        user_content,
+                        is_code_session,
+                        level_scores,
+                        sci_scores,
+                        hints,
+                        project_id,
+                    )
             else:
-                # Some dimension uncertain → LLM with CE context
-                self._f._log_debug("detect_cot_configuration: CE uncertain → LLM")
+                # CE unavailable or malformed response
+                self._f._log_debug(
+                    "detect_cot_configuration: CE unavailable or malformed scores "
+                    f"(scores={all_scores}), trusting heuristic"
+                )
                 config = await self._classify_cot_config_with_llm(
                     user_content,
                     is_code_session,
-                    level_scores,
-                    sci_scores,
+                    None,
+                    None,
                     hints,
                     project_id,
                 )
+
         else:
-            # CE unavailable → LLM with heuristics only
+            # CE not configured → LLM with heuristics only
             self._f._log_debug("detect_cot_configuration: CE unavailable → LLM")
             config = await self._classify_cot_config_with_llm(
                 user_content,
@@ -10869,8 +11048,9 @@ class ReasoningEngine:
                 project_id,
             )
 
-        if self._f.ENABLE_COT_STICKY:
-            state.last_cot_level = config["level"]
+        # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
+        # state.last_cot_level is now managed in _detect_and_generate_cot
+        # so that it is only set when reasoning is actually generated.
 
         return config
 
@@ -16365,15 +16545,13 @@ Output only the symbol name.
         """
         Compute PPR scores with LRU caching.
 
-        Q2 fix: Caches results by (code_state_hash, frozenset(seed_qids)).
-        Avoids recomputation when the same seeds are used on the same code.
-
         Args:
             seed_qids: List of qualified symbol ids to seed.
             project_id: Current project identifier.
             code_state_hash: Hash of the code state (cache invalidation key).
-            edges_out: Call graph edges (outgoing).
-            max_steps: PPR propagation steps.
+                             Empty string disables caching.
+            edges_out: Call-graph outgoing edges for PPR propagation.
+            max_steps: PPR propagation steps (from valves.path_propagation_steps).
             min_score: Minimum score to keep.
             alpha: Damping factor.
 
@@ -16382,11 +16560,21 @@ Output only the symbol name.
         """
         seed_frozenset = frozenset(seed_qids)
 
-        cached = self._ppr_cache.get(code_state_hash, seed_frozenset)
-        if cached is not None:
-            self._f._log_debug(f"PPR: cache hit ({self._ppr_cache.stats})")
-            return cached
+        # ------------------------------------------------------------------
+        # Bug 69 fix: skip cache on empty hash to prevent cross-project
+        # collisions between projects that have no indexed code.
+        # ------------------------------------------------------------------
+        use_cache = bool(code_state_hash)
 
+        if use_cache:
+            cached = self._ppr_cache.get(code_state_hash, seed_frozenset)
+            if cached is not None:
+                self._f._log_debug(f"PPR: cache hit ({self._ppr_cache.stats})")
+                return cached
+
+        # ------------------------------------------------------------------
+        # Region: Build activation graph and propagate
+        # ------------------------------------------------------------------
         ag = ActivationGraph()
 
         total_seed_score = len(seed_qids)
@@ -16408,6 +16596,9 @@ Output only the symbol name.
             init_score = 1.0 / total_seed_score
             ag.seed(seed_qids, initial_score=init_score)
 
+        # max_steps comes from the caller (which reads the valve),
+        # not hardcoded. Previously the default was 20 here but callers passed
+        # 4 (hardcoded default in build_activation_graph, ignoring the valve).
         ag.propagate(
             edges_out=edges_out,
             max_steps=max_steps,
@@ -16417,8 +16608,14 @@ Output only the symbol name.
 
         scores = ag.get_activated_nodes(threshold=min_score)
 
-        self._ppr_cache.set(code_state_hash, seed_frozenset, scores)
-        self._f._log_debug(f"PPR: computed and cached ({self._ppr_cache.stats})")
+        # ------------------------------------------------------------------
+        # Region: Store in cache (only when hash is non-empty)
+        # ------------------------------------------------------------------
+        if use_cache:
+            self._ppr_cache.set(code_state_hash, seed_frozenset, scores)
+            self._f._log_debug(f"PPR: computed and cached ({self._ppr_cache.stats})")
+        else:
+            self._f._log_debug("PPR: computed without caching (empty code_state_hash)")
 
         if hasattr(self._f, "_write_counter") and self._f._write_counter % 50 == 0:
             self._f._log_debug(self._ppr_cache.stats)
@@ -16827,7 +17024,7 @@ Output only the symbol name.
         self,
         query: str,
         project_id: str,
-        max_propagation_steps: int = 4,
+        max_propagation_steps: int = 0,
         messages: Optional[List[dict]] = None,
         inferred_seeds: Optional[Dict[str, float]] = None,
         persist: bool = True,
@@ -16838,13 +17035,12 @@ Output only the symbol name.
         Args:
             query: The user query string.
             project_id: Current project identifier.
-            max_propagation_steps: Steps for PPR propagation.
+            max_propagation_steps: PPR steps. 0 = read from valves.path_propagation_steps.
             messages: Recent conversation messages (for historical seeds).
-            inferred_seeds: Optional {qid: score} from LLM‑guided inference.
+            inferred_seeds: Optional {qid: score} from LLM-guided inference.
             persist: If False, activation scores are NOT written to
-                _last_activation_scores and do NOT affect pstate.
-                Used by MetacognitiveReasoningEngine.reason_per_focus()
-                for per-question volatile activation (FocalReasoning).
+                     _last_activation_scores. Used by FocalReasoning for
+                     per-question volatile activation.
 
         Returns:
             ActivationGraph with propagated scores.
@@ -16852,26 +17048,37 @@ Output only the symbol name.
         self._f._log_debug(
             f"[PPR] build_activation_graph: query='{query[:100]}', "
             f"project_id='{project_id}', "
-            f"max_steps={max_propagation_steps}, "
-            f"has_messages={bool(messages)}, "
             f"persist={persist}"
+        )
+
+        # ------------------------------------------------------------------
+        # Resolve effective propagation steps from valve when
+        # the caller did not provide an explicit non-zero override.
+        # ------------------------------------------------------------------
+        effective_steps = (
+            max_propagation_steps
+            if max_propagation_steps > 0
+            else self._f.valves.path_propagation_steps
         )
 
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
 
         # ------------------------------------------------------------------
-        # Step 1: Extract seeds from query, traceback, and history.
+        # Region: Extract seeds from query, traceback, and history
         # ------------------------------------------------------------------
         exact_seeds, partial_seeds, tb_seeds, history_boosts = (
             await self._prepare_seed_symbols(query, project_id, messages)
         )
 
         self._f._log_debug(
-            f"[PPR] Seeds extracted: exact={len(exact_seeds)} ({exact_seeds[:5] if exact_seeds else 'none'}), "
-            f"partial={len(partial_seeds)} ({partial_seeds[:5] if partial_seeds else 'none'}), "
+            f"[PPR] Seeds extracted: exact={len(exact_seeds)}, "
+            f"partial={len(partial_seeds)}, "
             f"tb={len(tb_seeds)}, history={len(history_boosts)}"
         )
 
+        # ------------------------------------------------------------------
+        # Region: Resolve qualified seed ids
+        # ------------------------------------------------------------------
         seed_qids: List[str] = []
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
 
@@ -16889,7 +17096,7 @@ Output only the symbol name.
         seed_qids = list(set(seed_qids) & set(all_qids))
 
         # ------------------------------------------------------------------
-        # Step 2: Get or compute PPR scores (with cache).
+        # Region: Get or compute PPR scores (with cache)
         # ------------------------------------------------------------------
         code_state_hash = self.compute_code_state_hash(project_id)
 
@@ -16898,13 +17105,13 @@ Output only the symbol name.
             project_id=project_id,
             code_state_hash=code_state_hash,
             edges_out=edges_out,
-            max_steps=max_propagation_steps,
+            max_steps=effective_steps,
             min_score=0.05,
             alpha=self._f.valves.ppr_alpha,
         )
 
         # ------------------------------------------------------------------
-        # Step 3: Build the activation graph (single or multi-seed).
+        # Region: Build the activation graph (single or multi-seed)
         # ------------------------------------------------------------------
         _inferred = inferred_seeds or {}
         if not self._f.valves.enable_multi_seed_activation:
@@ -16932,14 +17139,14 @@ Output only the symbol name.
                 cached_scores=cached_scores,
             )
 
-        # Persist activation scores only when not running in volatile mode.
-        # FocalReasoning uses persist=False to avoid contaminating the main
-        # activation state with per-question intermediate activations.
+        # ------------------------------------------------------------------
+        # Region: Persist activation scores (skipped in volatile mode)
+        # ------------------------------------------------------------------
         if persist:
             self._store_activation_scores(ag, project_id)
 
         # ------------------------------------------------------------------
-        # Step 4: Get activated nodes and normalize scores.
+        # Region: Normalize scores and log distribution
         # ------------------------------------------------------------------
         activated = ag.get_activated_nodes(
             threshold=self._f.valves.path_activation_threshold
@@ -16948,12 +17155,10 @@ Output only the symbol name.
 
         self._f._log_debug(
             f"[PPR] Activation complete: {len(activated)} nodes activated "
-            f"(threshold={self._f.valves.path_activation_threshold})"
+            f"(threshold={self._f.valves.path_activation_threshold}, "
+            f"steps={effective_steps})"
         )
 
-        # ------------------------------------------------------------------
-        # Step 5: Log score distribution for debugging (Point 6).
-        # ------------------------------------------------------------------
         if self._f.valves.debug and activated:
             sorted_scores = sorted(activated.values(), reverse=True)
             if sorted_scores:
@@ -16961,8 +17166,7 @@ Output only the symbol name.
                 self._f._log_debug(
                     f"[PPR] score dist: max={sorted_scores[0]:.3f}, "
                     f"p50={p50:.3f}, "
-                    f"min={sorted_scores[-1]:.3f}, "
-                    f"above={sum(1 for s in activated.values() if s >= self._f.valves.path_activation_threshold)}/{len(activated)}"
+                    f"min={sorted_scores[-1]:.3f}"
                 )
 
         return ag
@@ -19836,10 +20040,8 @@ Code context (recent symbols referenced):
         4. If CrossEncoder is confident, use its decision.
         5. If CrossEncoder is in the middle zone, fallback to the existing logic.
 
-        Compression is forced after `code_history_force_compress_after_turns`
+        Compression is forced after code_history_force_compress_after_turns
         regardless of the cascade.
-
-        Restores KV slot after any LLM call (via _build_code_commit_summary).
 
         Args:
             messages (list): The conversation messages to process.
@@ -19851,9 +20053,21 @@ Code context (recent symbols referenced):
         if not self._f.valves.enable_code_history_compression:
             return messages
 
-        # ── Patterns ──
+        # ------------------------------------------------------------------
+        # Region: Compiled patterns for message classification
+        # ------------------------------------------------------------------
         _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
-        _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
+
+        # Bug 67 fix: extend regex to also match the force-compressed marker
+        # produced by _build_legacy_commit_summary(force_no_expand=True):
+        #   [🗜️ CÓDIGO COMPRIMIDO — sin índice]
+        # The original regex only matched:
+        #   [🗜️ PARTE N/M... — COMPRIMIDO]
+        # Force-compressed stubs were re-identified as candidates and re-compressed.
+        _ALREADY_COMPRESSED = re.compile(
+            r"\[🗜️ (?:PARTE \d+/\d+(?:: .+?)? — COMPRIMIDO|CÓDIGO COMPRIMIDO — sin índice)\]"
+        )
+
         _PHASE_HEADER = re.compile(
             r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
             re.IGNORECASE,
@@ -19862,7 +20076,9 @@ Code context (recent symbols referenced):
         keep = self._f.valves.code_history_keep_last_n_parts
         force_after = self._f.valves.code_history_force_compress_after_turns
 
-        # ── Load persistent state ──
+        # ------------------------------------------------------------------
+        # Region: Load persistent state
+        # ------------------------------------------------------------------
         pstate = self._f._project_state_manager.get_pstate(project_id)
         state = self._f._conversation_state_manager.get(project_id)
         blocked_age = state.history_blocked_age
@@ -19870,7 +20086,9 @@ Code context (recent symbols referenced):
 
         dirty = False
 
-        # ── Collect indices of uncompressed code-part messages ──
+        # ------------------------------------------------------------------
+        # Region: Collect indices of uncompressed code-part messages
+        # ------------------------------------------------------------------
         code_part_indices: List[Tuple[int, int, int]] = []
         for i, msg in enumerate(messages):
             if msg.get("role") != "assistant":
@@ -19915,13 +20133,18 @@ Code context (recent symbols referenced):
         forced_no_expand = 0
         preserved_by_semantic = 0
 
-        # ── Get the current user query for semantic relevance ──
+        # ------------------------------------------------------------------
+        # Region: Get current user query for semantic relevance
+        # ------------------------------------------------------------------
         current_query = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 current_query = msg.get("content", "")
                 break
 
+        # ------------------------------------------------------------------
+        # Region: Process each compression candidate
+        # ------------------------------------------------------------------
         for msg_idx, part_num, total_parts in to_compress:
             msg = new_messages[msg_idx]
             content = msg.get("content", "")
@@ -19929,7 +20152,7 @@ Code context (recent symbols referenced):
                 :16
             ]
 
-            # ── Step 1: Semantic relevance via CrossEncoder ──
+            # ── Step 1: Semantic relevance via CrossEncoder ──────────────
             should_compress = None
             semantic_score = None
             if current_query and self._f._cross_encoder is not None:
@@ -19937,14 +20160,8 @@ Code context (recent symbols referenced):
                 scores = await self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None and len(scores) > 0:
                     semantic_score = 1.0 / (1.0 + math.exp(-scores[0]))
-                    # Use the cascade thresholds from valves
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.code_history_ce_threshold
                     LLM_FALLBACK_THRESHOLD = self._f.valves.code_history_llm_threshold
-                    # Since this is a binary decision, we compute diff as |score - 0.5|*2
-                    # For simplicity, we treat the score itself as the confidence
-                    # and use a threshold: if score < 0.3 → compress, if > 0.7 → preserve
-                    # The diff is not directly applicable here because it's a single score.
-                    # We'll use a simplified decision.
                     if semantic_score < 0.3:
                         should_compress = True
                     elif semantic_score > 0.7:
@@ -19954,20 +20171,17 @@ Code context (recent symbols referenced):
             else:
                 should_compress = None
 
-            # ── Step 2: Symbol index ratio (reinforcement / fallback) ──
+            # ── Step 2: Symbol index ratio (reinforcement / fallback) ────
             safe, ratio = self._verify_code_symbols_indexed(content, project_id)
 
-            # ── Step 3: Final decision ──
+            # ── Step 3: Final decision ────────────────────────────────────
             if should_compress is True:
-                # CE says compress → compress, regardless of ratio
                 force_no_expand = False
                 safe = True
             elif should_compress is False:
-                # CE says preserve → keep message
                 preserved_by_semantic += 1
                 continue
             else:
-                # CE uncertain or unavailable: use existing logic
                 if not safe:
                     blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
                     dirty = True
@@ -19984,7 +20198,7 @@ Code context (recent symbols referenced):
                 else:
                     force_no_expand = False
 
-            # ── Compression ──
+            # ── Step 4: Execute compression ───────────────────────────────
             summary = await self._build_code_commit_summary(
                 content,
                 project_id,
@@ -19992,32 +20206,31 @@ Code context (recent symbols referenced):
                 total_parts,
                 force_no_expand=force_no_expand,
             )
-            tokens_before = self._f._tokens.estimate_tokens(content)
-            tokens_after = self._f._tokens.estimate_tokens(summary)
             new_messages[msg_idx] = {**msg, "content": summary}
             compressed_n += 1
 
             if force_no_expand:
                 force_compressed_keys.add(msg_key)
                 dirty = True
+                forced_no_expand += 1
 
             if msg_key in blocked_age:
                 del blocked_age[msg_key]
                 dirty = True
 
             self._f._log_debug(
-                f"Code history: compressed Part {part_num}/{total_parts} — "
-                f"{tokens_before:,} → {tokens_after:,} tokens "
-                f"(ratio {ratio:.0%})"
-                + (" [FORCED NO-EXPAND]" if force_no_expand else "")
+                f"Code history: compressed Part {part_num}/{total_parts} "
                 + (
-                    f" [semantic_score={semantic_score:.2f}]"
+                    f"[semantic_score={semantic_score:.2f}]"
                     if semantic_score is not None
                     else ""
                 )
+                + (" [FORCED NO-EXPAND]" if force_no_expand else "")
             )
 
-        # ── Cleanup ──
+        # ------------------------------------------------------------------
+        # Region: Cleanup and persist state changes
+        # ------------------------------------------------------------------
         if len(force_compressed_keys) > 500:
             force_compressed_keys = set(list(force_compressed_keys)[-250:])
             dirty = True
@@ -20147,12 +20360,17 @@ Code context (recent symbols referenced):
         Returns:
             str: A rendered commit summary string.
         """
+        # ------------------------------------------------------------------
+        # Region: Fast path — force-compressed stubs skip the LLM entirely
+        # ------------------------------------------------------------------
         if force_no_expand:
             return self._build_legacy_commit_summary(
                 content, part_num, total_parts, force_no_expand=True
             )
 
-        # Extract top symbols to give the LLM structural context.
+        # ------------------------------------------------------------------
+        # Region: Extract top symbols for structural context
+        # ------------------------------------------------------------------
         classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
         methods = re.findall(
@@ -20160,11 +20378,17 @@ Code context (recent symbols referenced):
         )
         symbols = (classes + top_fns + methods)[:5]
 
+        # ------------------------------------------------------------------
+        # Region: Build LLM prompt
+        # ------------------------------------------------------------------
         prompt = self.COMMIT_SUMMARY_PROMPT.format(
             user_message=content[:2000],
             symbols_context=", ".join(symbols) if symbols else "none",
         )
 
+        # ------------------------------------------------------------------
+        # Region: Call LLM
+        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -20187,16 +20411,43 @@ Code context (recent symbols referenced):
         if self._f.valves.enable_slot_persistence:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
+        # ------------------------------------------------------------------
+        # Region: Handle no-response from LLM
+        # ------------------------------------------------------------------
         if not response:
+            self._f._log_debug(
+                f"_build_code_commit_summary: no LLM response, "
+                f"falling back to legacy for Part {part_num}/{total_parts}"
+            )
             return self._build_legacy_commit_summary(
                 content, part_num, total_parts, force_no_expand=False
             )
 
+        # ------------------------------------------------------------------
+        # Region: Parse response
+        # ------------------------------------------------------------------
         summary = self._parse_commit_summary_response(response)
+
+        # ------------------------------------------------------------------
+        # Fall back to legacy when JSON parse produced no action.
+        # _parse_commit_summary_response returns {"action": "", "rationale": "",
+        # "symbols": []} on any parse error. Previously the empty action was
+        # replaced by the generic string "code change", losing all structural
+        # information. The legacy builder extracts class names, function counts,
+        # and dependencies directly from the code — far more informative.
+        # ------------------------------------------------------------------
         if not summary.get("action"):
-            summary["action"] = "code change"
-        summary["part_num"] = part_num
-        summary["total_parts"] = total_parts
+            self._f._log_debug(
+                f"_build_code_commit_summary: parse returned empty action, "
+                f"falling back to legacy for Part {part_num}/{total_parts}"
+            )
+            return self._build_legacy_commit_summary(
+                content, part_num, total_parts, force_no_expand=False
+            )
+
+        # ------------------------------------------------------------------
+        # Region: Render and return the LLM-generated summary
+        # ------------------------------------------------------------------
         return self._render_commit_summary(summary, turn=part_num)
 
     def _build_legacy_commit_summary(
@@ -20934,24 +21185,64 @@ class EnrichmentTasks:
 
     def update_mentions_from_message(
         self,
-        state: dict,
+        state: "ConversationState",
         message_content: str,
         project_id: str,
     ) -> None:
         """
         Increment mention counts for symbols referenced in the message content,
         and mark the corresponding blocks as recently mentioned.
+
+        Args:
+            state: The current ConversationState for the project.
+            message_content: The raw message text to scan for symbol mentions.
+            project_id: Current project identifier.
         """
+        # ------------------------------------------------------------------
+        # Region: Early exit — prerequisites
+        # ------------------------------------------------------------------
         if not message_content:
             return
+
         all_symbol_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_symbol_names:
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Extract word set from message
+        # ------------------------------------------------------------------
         words = set(re.findall(r"\b[\w-]+\b", message_content))
-        mentioned_names = all_symbol_names.intersection(words)
+        if not words:
+            return
+
+        # ------------------------------------------------------------------
+        # Bug 113 fix: filter out symbol names shorter than MIN_MENTION_LENGTH
+        # before computing the intersection. Short symbols like 'id', 'db',
+        # 'get', 'set', 'run', 'app', 'log' are extremely common in natural
+        # language and would cause every message containing those words to
+        # falsely boost the importance of unrelated code blocks.
+        # A minimum of 4 characters eliminates the most common false positives
+        # while preserving genuine short symbols like 'http', 'json', 'csrf'.
+        # ------------------------------------------------------------------
+        MIN_MENTION_LENGTH = 4
+        qualified_symbols = {
+            name for name in all_symbol_names if len(name) >= MIN_MENTION_LENGTH
+        }
+
+        mentioned_names = qualified_symbols.intersection(words)
         if not mentioned_names:
             return
+
+        # ------------------------------------------------------------------
+        # Region: Find all blocks that contain the mentioned symbols
+        # ------------------------------------------------------------------
         affected_blocks: Set[str] = set()
         for name in mentioned_names:
             affected_blocks.update(self._f._symbol_index.find_blocks(name, project_id))
+
+        # ------------------------------------------------------------------
+        # Region: Update mention metadata on each affected block
+        # ------------------------------------------------------------------
         for block_hash in affected_blocks:
             block = state.active_blocks.get(block_hash)
             if block:
@@ -21291,17 +21582,25 @@ class EnrichmentTasks:
         Cache misses are generated in groups of lazy_docstring_batch_size.
 
         Args:
-            qids: List of qualified symbol ids to resolve.
+            qids: List of qualified symbol ids to resolve. May contain duplicates.
             project_id: Current project identifier.
-            background: If True, this is a background task — uses label
-                        'bg_docstring' (whitelisted during silent ingestion)
-                        and bypasses the per-turn lazy_docstring_max_per_turn
-                        budget. If False, uses label 'lazy_docstring_batch'
-                        and respects the per-turn budget.
+            background: If True, uses label 'bg_docstring' (whitelisted during
+                        silent ingestion) and bypasses the per-turn budget.
+                        If False, uses label 'lazy_docstring_batch' and respects
+                        the per-turn budget.
 
         Returns:
             Dict[str, str]: Mapping of qid to docstring for resolved symbols.
         """
+        # ------------------------------------------------------------------
+        # Deduplicate qids while preserving insertion order.
+        # Without this, a symbol appearing twice in qids generates two LLM
+        # calls and two SQLite writes, one of which is always redundant.
+        # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
+        # order (unlike set(), which does not).
+        # ------------------------------------------------------------------
+        qids = list(dict.fromkeys(qids))
+
         self._f._log_debug(
             f"ensure_docstrings_batch: starting with {len(qids)} qids "
             f"(background={background})"
@@ -21311,8 +21610,11 @@ class EnrichmentTasks:
         resolved: Dict[str, str] = {}
         pending: List[str] = []
 
-        # Build a qid → (sym, block) lookup index once to avoid O(N²) scans
-        # across the active_blocks dict during cache and batch phases.
+        # ------------------------------------------------------------------
+        # Region: Build qid → (sym, block) lookup index
+        # ------------------------------------------------------------------
+        # Built once to avoid O(N²) scans across active_blocks during cache
+        # and batch phases.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -21325,7 +21627,9 @@ class EnrichmentTasks:
         ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
             return _qid_index.get(qid, (None, None))
 
-        # ── Phase 1: resolve from in-memory symbol index then SQLite ─────────
+        # ------------------------------------------------------------------
+        # Region: Phase 1 — resolve from in-memory symbol index then SQLite
+        # ------------------------------------------------------------------
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
@@ -21363,7 +21667,9 @@ class EnrichmentTasks:
             )
             return resolved
 
-        # ── Phase 2: apply per-turn budget (foreground/lazy mode only) ────────
+        # ------------------------------------------------------------------
+        # Region: Phase 2 — apply per-turn budget (foreground/lazy mode only)
+        # ------------------------------------------------------------------
         if not background:
             budget = self._f.valves.lazy_docstring_max_per_turn
             if budget > 0:
@@ -21381,7 +21687,9 @@ class EnrichmentTasks:
                 "ensure_docstrings_batch: background mode — per-turn budget skipped"
             )
 
-        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────
+        # ------------------------------------------------------------------
+        # Region: Phase 3 — build (qid, signature, snippet) items for LLM
+        # ------------------------------------------------------------------
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
@@ -21406,7 +21714,9 @@ class EnrichmentTasks:
             f"batch_size={batch_size}, label={label!r}"
         )
 
-        # ── Phase 4: LLM batch loop ───────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Phase 4 — LLM batch loop
+        # ------------------------------------------------------------------
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
@@ -22200,29 +22510,47 @@ class ActiveCodeUpdater:
     async def process(
         self, message: dict, project_id: str, is_continuation: bool = False
     ) -> None:
-        """Orchestrate the full update pipeline for one message."""
+        """
+        Orchestrate the full update pipeline for one message.
+
+        Processes extracted code blocks through symbol extraction, deduplication,
+        indexing, conflict detection, and post-update maintenance tasks.
+
+        Args:
+            message: The conversation message dict (user or assistant).
+            project_id: Current project identifier.
+            is_continuation: True only for genuine AutoContinue turns.
+        """
         if not self._f.valves.enable_code_awareness:
             return
 
         content = message.get("content", "")
         role = message.get("role", "")
 
-        # 1. Extract new blocks and symbols
+        # ------------------------------------------------------------------
+        # Region: Extract new blocks and symbols
+        # ------------------------------------------------------------------
         new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
             await self._extract_and_prepare_new_blocks(content, role)
         )
 
-        # 2. Get project lock and current state
+        # ------------------------------------------------------------------
+        # Region: Get project lock and current state
+        # ------------------------------------------------------------------
         lock = await self._f._state_store.get_project_lock(project_id)
         state_before = self._f._conversation_state_manager.get(project_id)
 
-        # 3. Detect duplicates
+        # ------------------------------------------------------------------
+        # Region: Detect duplicates against existing blocks
+        # ------------------------------------------------------------------
         duplicate_info = self._detect_duplicates(new_blocks_pending, state_before)
 
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
 
-            # 4. Housekeeping
+            # ------------------------------------------------------------------
+            # Region: Housekeeping — update mention counts from message content
+            # ------------------------------------------------------------------
             self._f._enrichment.update_mentions_from_message(state, content, project_id)
             for block in state.active_blocks.values():
                 if (
@@ -22240,7 +22568,19 @@ class ActiveCodeUpdater:
             if not content and not new_blocks_pending:
                 return
 
-            # 5. Process each new block
+            # ------------------------------------------------------------------
+            # Bug 45 fix: capture pre-index qualified ids BEFORE the processing
+            # loop so that added_qids / deleted_qids are computed correctly.
+            # Previously there was no capture point, making the sets always empty
+            # and _detect_and_migrate_renames effectively a no-op.
+            # ------------------------------------------------------------------
+            pre_process_qids: Set[str] = set(
+                self._f._symbol_index.get_all_qualified_names(project_id)
+            )
+
+            # ------------------------------------------------------------------
+            # Region: Process each new block
+            # ------------------------------------------------------------------
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
                     syms = []
@@ -22267,21 +22607,41 @@ class ActiveCodeUpdater:
                 else:
                     await self._process_new_block(new_block, syms, state, project_id)
 
-            # 6. Update assistant base blocks
+            # ------------------------------------------------------------------
+            # Region: Update assistant base blocks
+            # ------------------------------------------------------------------
             if role == "assistant" and len(extracted_blocks) > 0:
                 await self._update_assistant_base_blocks(
                     extracted_blocks, content_to_syms, state, project_id
                 )
+            post_process_qids: Set[str] = set(
+                self._f._symbol_index.get_all_qualified_names(project_id)
+            )
+            added_qids: Set[str] = post_process_qids - pre_process_qids
+            deleted_qids: Set[str] = pre_process_qids - post_process_qids
 
-            # 7. Post-update tasks
+            if added_qids or deleted_qids:
+                try:
+                    await self._f._enrichment._detect_and_migrate_renames(
+                        deleted_qids, added_qids, project_id
+                    )
+                except Exception as _e:
+                    self._f._log_debug(
+                        f"_detect_and_migrate_renames: non-fatal error — {_e}"
+                    )
+
+            # ------------------------------------------------------------------
+            # Region: Post-update tasks
+            # ------------------------------------------------------------------
             await self._post_update_tasks(
                 state, project_id, new_blocks_pending, is_continuation
             )
 
             self._f._conversation_state_manager.set(project_id, state)
 
-        # ── Invalidate session classification cache whenever active blocks change ──
-        # (ensures that subsequent queries remain code sessions if code exists)
+        # ------------------------------------------------------------------
+        # Region: Invalidate session classification cache on new blocks
+        # ------------------------------------------------------------------
         if new_blocks_pending:
             self._f._session_classify_cache.clear()
 
@@ -22777,24 +23137,41 @@ class ActiveCodeUpdater:
 
     async def _post_update_tasks(
         self,
-        state: dict,
+        state: "ConversationState",
         project_id: str,
         new_blocks_pending: List["CodeBlock"],
         is_continuation: bool,
     ) -> None:
-        """Expiration, enrichment, oversized‑block summaries, path index, soft eviction."""
+        """
+        Run post-update maintenance: expiration, enrichment, oversized-block
+        summaries, path index invalidation, and soft eviction via ContextPager.
+
+        Args:
+            state: The current ConversationState for the project.
+            project_id: Current project identifier.
+            new_blocks_pending: New code blocks processed this turn.
+            is_continuation: True only for genuine AutoContinue turns.
+        """
+        # ------------------------------------------------------------------
+        # Region: Message count increment
+        # ------------------------------------------------------------------
         if not is_continuation:
             state.message_count += 1
+
+        # ------------------------------------------------------------------
+        # Region: Duplicate block removal
+        # ------------------------------------------------------------------
         if self._f.valves.auto_remove_duplicate_blocks:
             self._f._code_blocks.remove_duplicate_blocks(state, project_id)
 
-        # Inline block expiration
+        # ------------------------------------------------------------------
+        # Region: Time-based block expiration
+        # ------------------------------------------------------------------
         await self._f._enrichment.expire_blocks_by_time(project_id)
 
-        # Missing docstrings are now generated reactively in _process_new_block
-        # and _process_duplicate_block, right after a symbol is indexed.
-        # No batch loop is needed anymore.
-
+        # ------------------------------------------------------------------
+        # Region: Session summary (interval-based)
+        # ------------------------------------------------------------------
         if self._f.valves.enable_session_summary and not is_continuation:
             interval = self._f.valves.session_summary_interval_messages
             if (
@@ -22813,7 +23190,9 @@ class ActiveCodeUpdater:
                     self._f.valves.llm_model,
                 )
 
-        # Oversized block summaries (action="summarize")
+        # ------------------------------------------------------------------
+        # Region: Oversized block summaries (action="summarize")
+        # ------------------------------------------------------------------
         if (
             self._f.valves.max_code_block_tokens > 0
             and self._f.valves.code_block_overflow_action == "summarize"
@@ -22824,19 +23203,31 @@ class ActiveCodeUpdater:
                         block, project_id
                     )
 
+        # ------------------------------------------------------------------
+        # Region: Lightweight activation cache invalidation
+        # ------------------------------------------------------------------
         self._f._activation.invalidate_lightweight_cache(project_id)
 
-        # Path index invalidation
+        # ------------------------------------------------------------------
+        # Region: Path index invalidation
+        # ------------------------------------------------------------------
         if self._f.valves.enable_path_analysis:
+            # Bug 135 fix: collect QUALIFIED symbol ids using qualify_symbol(sym)
+            # instead of bare sym.name. PathIndex._symbol_to_views is keyed by
+            # project_id:qualified_id (populated from view.induced_nodes).
+            # Passing bare names (e.g. "__init__", "process") always returned
+            # an empty set from mark_stale_for_symbol → paths were never
+            # invalidated after code changes, causing stale CodePathViews to
+            # serve incorrect activation scores on the next turn.
             changed_symbols: Set[str] = set()
             for blk in new_blocks_pending:
                 for sym in blk.symbols:
-                    changed_symbols.add(sym.name)
+                    changed_symbols.add(qualify_symbol(sym))  # Bug 135 fix
 
             stale_path_ids: Set[str] = set()
-            for sym_name in changed_symbols:
+            for sym_qid in changed_symbols:
                 for pid in self._f._path_index.mark_stale_for_symbol(
-                    sym_name, project_id
+                    sym_qid, project_id
                 ):
                     stale_path_ids.add(pid)
 
@@ -22863,7 +23254,9 @@ class ActiveCodeUpdater:
                     f"due to changes in {len(changed_symbols)} symbol(s)"
                 )
 
-        # Soft eviction via ContextPager
+        # ------------------------------------------------------------------
+        # Region: Soft eviction via ContextPager
+        # ------------------------------------------------------------------
         if self._f.valves.enable_block_paging and self._f._pager is not None:
             candidates = self._f._pager.get_eviction_candidates(
                 state=state,
@@ -22889,8 +23282,7 @@ class ActiveCodeUpdater:
                         del state.active_blocks[hash_]
             if candidates:
                 self._f._log_debug(
-                    f"Soft-evicted {len(candidates)} block(s) via ContextPager "
-                    f"(active_blocks now {len(state['active_blocks'])})"
+                    f"Soft-evicted {len(candidates)} block(s) via ContextPager"
                 )
 
 
@@ -23621,25 +24013,19 @@ class SystemPromptBuilder:
         If current_messages is provided, fragments that overlap with the current
         conversation window are filtered out to avoid duplication.
 
-        Uses a cascade for deduplication:
-        1. Quick substring containment (fast, cheap).
-        2. CrossEncoder (semantic) to compare fragments against the window.
-        3. LLM (only when extremely uncertain, prob < 0.25).
-        4. Fuzzy matching (fallback) when CrossEncoder is uncertain but not extremely.
-
-        Restores KV slot after any LLM call.
-
         Args:
-            project_id (str): The current project identifier.
-            memories (list): List of memory fragments from LTM retrieval.
-            current_messages (list, optional): The current conversation messages
-                to deduplicate against. Defaults to None.
+            project_id: The current project identifier.
+            memories: List of memory fragments from LTM retrieval.
+            current_messages: The current conversation messages to deduplicate
+                              against. Defaults to None.
 
         Returns:
             str: The rendered LTM section, or an empty string if no memories
-            remain after deduplication or truncation.
+                 remain after deduplication or truncation.
         """
-        # ── REGION 1: Deduplicate against the current session ──
+        # ------------------------------------------------------------------
+        # Region: Deduplicate against the current session
+        # ------------------------------------------------------------------
         if current_messages:
             window_norms = [
                 self._normalize_for_dedup(m.get("content", ""))
@@ -23648,15 +24034,21 @@ class SystemPromptBuilder:
             ]
             filtered = []
 
-            # Use CrossEncoder for semantic duplicate detection if available
             if HAS_SENTENCE and HAS_CHROMA and self._f._cross_encoder is not None:
                 for m in memories:
-                    body = self._strip_ltm_prefix(m["doc"])
+                    doc_content = m.get("doc")
+                    if not doc_content or not isinstance(doc_content, str):
+                        self._f._log_debug(
+                            "LTM dedup: skipping memory with None/non-string doc"
+                        )
+                        continue
+
+                    body = self._strip_ltm_prefix(doc_content)
                     norm = self._normalize_for_dedup(body)
                     if not norm:
                         continue
 
-                    # ── Quick substring check (cheap) ──
+                    # ── Quick substring check (cheap) ──────────────────────
                     is_duplicate = False
                     for w in window_norms:
                         if not w:
@@ -23666,7 +24058,7 @@ class SystemPromptBuilder:
                             break
 
                     if not is_duplicate:
-                        # ── CrossEncoder with heuristic reinforcement ──
+                        # ── CrossEncoder with heuristic reinforcement ──────
                         best_prob = 0.0
                         for w in window_norms[:5]:
                             if not w:
@@ -23676,7 +24068,6 @@ class SystemPromptBuilder:
                             )
                             if scores is not None and len(scores) > 0:
                                 prob = 1.0 / (1.0 + math.exp(-scores[0]))
-                                # Heuristic reinforcement: common words boost duplicate probability
                                 common_words = set(norm.split()) & set(w.split())
                                 if common_words:
                                     prob = min(
@@ -23693,20 +24084,23 @@ class SystemPromptBuilder:
                         elif best_prob >= CE_CONFIDENCE_THRESHOLD:
                             is_duplicate = best_prob >= 0.5
                         elif best_prob < LLM_FALLBACK_THRESHOLD:
-                            # Extremely uncertain → LLM
                             is_duplicate = await self._ltm_dedup_with_llm(
                                 norm, window_norms[:3], best_prob, project_id
                             )
                         else:
-                            # Middle zone: keep (not duplicate) by default
                             is_duplicate = False
 
                     if not is_duplicate:
                         filtered.append(m)
             else:
-                # ── Fallback to substring + fuzzy matching ──
+                # ── Fallback to substring + fuzzy matching ─────────────────
                 for m in memories:
-                    body = self._strip_ltm_prefix(m["doc"])
+                    # Bug 61 fix: same guard for the fallback path.
+                    doc_content = m.get("doc")
+                    if not doc_content or not isinstance(doc_content, str):
+                        continue
+
+                    body = self._strip_ltm_prefix(doc_content)
                     norm = self._normalize_for_dedup(body)
                     if not norm:
                         continue
@@ -23723,16 +24117,21 @@ class SystemPromptBuilder:
         if not memories:
             return ""
 
-        # ── REGION 2: Sort and deduplicate ──
+        # ------------------------------------------------------------------
+        # Region: Sort and deduplicate by content
+        # ------------------------------------------------------------------
         memories.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
         seen = set()
         unique = []
         for m in memories:
-            if m["doc"] not in seen:
-                seen.add(m["doc"])
+            doc_val = m.get("doc", "")
+            if doc_val and doc_val not in seen:
+                seen.add(doc_val)
                 unique.append(m)
 
-        # ── REGION 3: Build header ──
+        # ------------------------------------------------------------------
+        # Region: Build header
+        # ------------------------------------------------------------------
         header = (
             "## Relevant Past Context (long-term memory)\n\n"
             "> The following fragments were retrieved from past conversations "
@@ -23740,7 +24139,9 @@ class SystemPromptBuilder:
             "They are NOT part of the current chat history.\n\n"
         )
 
-        # ── REGION 4: Render fragments with token budget ──
+        # ------------------------------------------------------------------
+        # Region: Render fragments with token budget
+        # ------------------------------------------------------------------
         parts = []
         max_tokens = self._f.valves.ltm_retrieval_max_tokens
         current_tokens = 0
@@ -23753,7 +24154,7 @@ class SystemPromptBuilder:
                 )
                 text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
-                text = f"[Past conversation — unknown date]\n{mem['doc']}"
+                text = f"[Past conversation — unknown date]\n{mem.get('doc', '')}"
 
             tok = self._f._tokens.estimate_code_tokens(text)
             if max_tokens > 0 and current_tokens + tok > max_tokens:
@@ -24565,11 +24966,15 @@ class WindowManager:
         v = self._f.valves
         old_hwm = state.summarized_turn_hwm
 
-        # ── Compute the new high-water mark from evicted turn numbers ─────────────
+        # ------------------------------------------------------------------
+        # Region: Compute new high-water mark from evicted turn numbers
+        # ------------------------------------------------------------------
         old_turn_nums = [t for m, t in zip(history, turns) if m in old_msgs]
         new_hwm = max(old_turn_nums) if old_turn_nums else old_hwm
 
-        # ── Build summary entry with unified metadata ──────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Build summary entry with unified metadata
+        # ------------------------------------------------------------------
         summary_entry = {
             "text": summary_text,
             "created_at": time.time(),
@@ -24579,16 +24984,30 @@ class WindowManager:
         }
         state.conversation_summaries.append(summary_entry)
 
-        # ── Apply L1 cap ──────────────────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Apply L1 cap
+        # ------------------------------------------------------------------
         max_l1 = v.max_conversation_summaries
         if max_l1 > 0:
             l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
             if len(l1) > max_l1:
-                keep_ids = {id(s) for s in l1[-max_l1:]}
+                # Bug 40 fix: use (covers_turns, created_at) as a stable
+                # content-based identity key instead of id(), which can be
+                # reused by the GC if an object is collected between the set
+                # comprehension and the list comprehension below.
+                keep_keys = {
+                    (tuple(s.get("covers_turns", [])), s.get("created_at", 0.0))
+                    for s in l1[-max_l1:]
+                }
                 state.conversation_summaries = [
                     s
                     for s in state.conversation_summaries
-                    if s.get("level", 1) != 1 or id(s) in keep_ids
+                    if s.get("level", 1) != 1
+                    or (
+                        tuple(s.get("covers_turns", [])),
+                        s.get("created_at", 0.0),
+                    )
+                    in keep_keys
                 ]
 
             l1_after = [
@@ -24599,10 +25018,14 @@ class WindowManager:
                 f"summaries retained"
             )
 
-        # ── Advance the high-water mark ────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Advance the high-water mark
+        # ------------------------------------------------------------------
         state.summarized_turn_hwm = new_hwm
 
-        # ── Update WindowManager instrumentation metrics ───────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Update WindowManager instrumentation metrics
+        # ------------------------------------------------------------------
         state.wm_fired = True
         state.wm_summary_ok = True
         state.wm_msgs_evicted = len(old_msgs)
@@ -24617,12 +25040,16 @@ class WindowManager:
             f"HWM {old_hwm} → {new_hwm}"
         )
 
-        # ── Persist summary to LTM ────────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Persist summary to LTM
+        # ------------------------------------------------------------------
         await self._f._message_assembler._persist_turn_summary_to_ltm(
             summary_text, project_id, old_hwm + 1, new_hwm
         )
 
-        # ── Consolidate L1 → L2 when enough summaries have accumulated ────────────
+        # ------------------------------------------------------------------
+        # Region: Consolidate L1 → L2 when enough summaries accumulated
+        # ------------------------------------------------------------------
         l1_count = sum(
             1 for s in state.conversation_summaries if s.get("level", 1) == 1
         )
@@ -24635,10 +25062,12 @@ class WindowManager:
                 state, project_id, slot_free
             )
 
-        # ── Bug 13 fix: pass project_id explicitly instead of reading from singleton
+        # ------------------------------------------------------------------
+        # Region: KV-freeze hook and state persistence
+        # ------------------------------------------------------------------
+        # Bug 13 fix: pass project_id explicitly instead of reading from singleton.
         self._on_frontier_advance(old_hwm, new_hwm, project_id)
 
-        # ── Persist conversation state ────────────────────────────────────────────
         self._f._conversation_state_manager.set(project_id, state)
 
         return f"[Summary of earlier conversation]\n{summary_text}"
@@ -24861,7 +25290,7 @@ class MessageAssembler:
         dynamic_injections: List[Tuple[str, str]],
         last_user_msg: Optional[dict],
         is_code_session: bool,
-        state: ConversationState,
+        state: "ConversationState",
         user_question: str,
         prelim_system: str,
         project_id: str,
@@ -24870,33 +25299,18 @@ class MessageAssembler:
         messages: List[dict],
     ) -> None:
         """
-        Detect CoT configuration and generate reasoning.
-        Modifies `dynamic_injections` in-place.
+        Detect CoT configuration and generate reasoning in-place.
 
-        Detection cascade (Fase 3 + new):
-        * STAGE 0 — SymbolGraph pre-scan: sync, free, before parallel gather.
-          Computes structural specificity of the user query.
-        * STAGE 1 — Heuristic: always runs, feeds stages 2 and 3.
-        * STAGE 2 — CrossEncoder: 6 pairs (level + scientific/linear).
-          Reinforced by stages 0 and 1.
-        * STAGE 3 — LLM: receives full cascaded context. Falls back to
-          stage 1 if unavailable.
+        Modifies dynamic_injections by appending the reasoning block when
+        CoT is triggered and generation succeeds. Returns without appending
+        anything when CoT is not needed, slot is busy, or generation fails.
 
-        Generation routing:
-        * use_scientific=True OR level==3 → generate_scientific_reasoning_L3
-        * use_scientific=False AND level==2 → generate_cot_reasoning (linear)
-        * Architecture path mirrors: sci/L3 → scientific_arch, else arch.
-
-        QueryDecomposition (Fase 3):
-          decompose_questions runs in Task 2 of the parallel gather.
-          Upgrades CoT level if ≥2 independent questions detected.
-
-        FocalReasoning (Fase 3):
-          per-question volatile activation + CoT synthesis.
-          Signal: enable_focal_reasoning + len(sub_questions)≥2 + level≥2
-                  + not arch mode. Falls back to unified if produces nothing.
+        Bug 156 fix: state.last_cot_level is now updated here, after the
+        reasoning is successfully generated and injected, instead of inside
+        detect_cot_configuration where it was set before generation even
+        started — causing stale sticky state when generation failed.
         """
-        # ── REGION 1: DETECT COT LEVEL ──
+        # ── Region: Detect CoT level — setup and short-circuits ──────────────
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT configuration")
         manual_cot_used = False
         cot_any_used = False
@@ -24909,7 +25323,7 @@ class MessageAssembler:
 
         self._last_cot_degraded = False
 
-        # ── enforce_scientific_method ─────────────────────────────────────
+        # -- enforce_scientific_method forces L3 scientific regardless --------
         if self._f.valves.enforce_scientific_method:
             self._f._log_debug(
                 "CoT: enforce_scientific_method=True → forcing L3 scientific"
@@ -24918,7 +25332,7 @@ class MessageAssembler:
             _use_scientific = True
             cot_any_used = True
 
-        # ── Manual /think command ─────────────────────────────────────────
+        # -- Manual /think command --------------------------------------------
         if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
             if (
                 last_user_msg
@@ -24941,9 +25355,7 @@ class MessageAssembler:
                             )
                         )
 
-        # ── STAGE 0: SymbolGraph pre-scan ─────────────────────────────────
-        # Synchronous, zero LLM cost. Computed before the parallel gather
-        # so it's available as reinforcement in Task 1.
+        # ── Region: STAGE 0 — SymbolGraph pre-scan (sync, free) ──────────────
         _signal_vector: Dict[str, int] = {
             "n_mentioned": 0,
             "n_found": 0,
@@ -24969,7 +25381,7 @@ class MessageAssembler:
                     f"found, {_signal_vector['structural_hits']} total hits"
                 )
 
-        # ── Parallel gather (slot_free, auto-detect path) ─────────────────
+        # ── Region: Parallel gather (slot_free, auto-detect path) ─────────────
         if (
             slot_free
             and not manual_cot_used
@@ -25006,8 +25418,7 @@ class MessageAssembler:
             else:
                 parallel_tasks.append(asyncio.sleep(0, result=True))
 
-            # Task 1: detect_cot_configuration (replaces detect_cot_level)
-            # Passes signal_vector from Stage 0 so it feeds CE reinforcement.
+            # Task 1: detect_cot_configuration
             if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
                 cot_detection_content = (
                     user_question
@@ -25037,7 +25448,7 @@ class MessageAssembler:
                     )
                 )
 
-            # Task 2: decompose_questions (QueryDecomposition)
+            # Task 2: decompose_questions
             if (
                 not _skip_intent_llm
                 and (
@@ -25054,15 +25465,38 @@ class MessageAssembler:
             else:
                 parallel_tasks.append(asyncio.sleep(0, result=[user_content]))
 
-            results = await asyncio.gather(*parallel_tasks)
+            # Bug 155 fix: return_exceptions=True so a timeout in Task 0 does not
+            # cancel Tasks 1 and 2.
+            results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
 
-            # Extract Task 0
-            self._f._user_intent_full_code = (
-                results[0] if not _skip_intent_llm else True
-            )
+            # -- Extract Task 0 (should_keep_full_code) -----------------------
+            _t0 = results[0]
+            if isinstance(_t0, Exception):
+                self._f._log_debug(
+                    f"CoT Task 0 (should_keep_full_code) failed: {_t0} — "
+                    "defaulting to keep_full=True"
+                )
+                self._f._user_intent_full_code = True
+            else:
+                self._f._user_intent_full_code = _t0 if not _skip_intent_llm else True
 
-            # Extract Task 1 — CoTConfig
-            cot_config = results[1]
+            # -- Extract Task 1 (detect_cot_configuration) --------------------
+            _t1 = results[1]
+            if isinstance(_t1, Exception):
+                self._f._log_debug(
+                    f"CoT Task 1 (detect_cot_configuration) failed: {_t1} — "
+                    "defaulting to level=0 (no CoT)"
+                )
+                cot_config = {
+                    "level": 0,
+                    "use_scientific": False,
+                    "decompose": False,
+                    "source": "exception",
+                    "rationale": str(_t1),
+                }
+            else:
+                cot_config = _t1
+
             if isinstance(cot_config, dict):
                 detected_level = cot_config.get("level", 0)
                 _use_scientific = cot_config.get("use_scientific", False)
@@ -25070,7 +25504,7 @@ class MessageAssembler:
                 _cot_source = cot_config.get("source", "?")
                 _cot_rationale = cot_config.get("rationale", "")
             else:
-                # Backward-compat fallback if result is an int
+                # Backward-compat: result is an int
                 detected_level = int(cot_config) if cot_config else 0
                 _use_scientific = False
                 _decompose_hint = False
@@ -25087,11 +25521,18 @@ class MessageAssembler:
                     f"rationale='{_cot_rationale}'"
                 )
 
-            # Extract Task 2 — QueryDecomposition
-            sub_questions = results[2] if len(results) > 2 else [user_content]
+            # -- Extract Task 2 (decompose_questions) -------------------------
+            _t2 = results[2] if len(results) > 2 else [user_content]
+            if isinstance(_t2, Exception):
+                self._f._log_debug(
+                    f"CoT Task 2 (decompose_questions) failed: {_t2} — "
+                    "treating as single question"
+                )
+                sub_questions = [user_content]
+            else:
+                sub_questions = _t2
 
-            # Upgrade CoT level if multiple independent questions detected.
-            # Gradual: L1→L2, L2→L3.
+            # Upgrade CoT level if multiple independent questions detected
             if (
                 cot_any_used
                 and not manual_cot_used
@@ -25111,7 +25552,7 @@ class MessageAssembler:
                 )
 
         else:
-            # Serial path (continuation, manual CoT already set, etc.)
+            # -- Serial path (continuation, manual CoT, enforce_scientific) ---
             self._f._user_intent_full_code = True
             if (
                 not manual_cot_used
@@ -25151,7 +25592,7 @@ class MessageAssembler:
             )
             return
 
-        # ── Multi-phase pre-check ─────────────────────────────────────────
+        # ── Region: Multi-phase pre-check — degrade CoT if budget is tight ───
         _mp_cot_degraded = False
         _available_mp_pre = self._f.valves.context_window_tokens
         if (
@@ -25185,10 +25626,9 @@ class MessageAssembler:
 
         self._last_cot_degraded = _mp_cot_degraded
 
-        # ── REGION 2: GENERATE REASONING ──
+        # ── Region: Generate reasoning — Level 1 terminal path ───────────────
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
 
-        # Level 1 — terminal lightweight path
         if cot_level == 1:
             if not manual_cot_used and not _mp_cot_degraded:
                 dynamic_injections.append(
@@ -25203,7 +25643,7 @@ class MessageAssembler:
             )
             return
 
-        # From here: levels 2 and 3 only
+        # ── Region: Generate reasoning — Levels 2 and 3 ──────────────────────
         _model_ctx = self._f.valves.active_context_max_tokens or 28000
         _cot_context_limit = _model_ctx // 3
 
@@ -25248,19 +25688,10 @@ class MessageAssembler:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-        # ── Generation routing ────────────────────────────────────────────
-        # use_scientific=True OR level==3 → compete_hypotheses (scientific)
-        # use_scientific=False AND level==2 → linear step-by-step CoT
-        # Architecture path mirrors this.
+        # -- Generation routing -----------------------------------------------
         _go_scientific = _use_scientific or cot_level >= 3
 
-        if _go_scientific and _use_scientific and cot_level < 3:
-            self._f._log_debug(
-                f"use_scientific=True with cot_level={cot_level}: "
-                f"routing to scientific generation (L3 compete_hypotheses)"
-            )
-
-        # ── FocalReasoning path ───────────────────────────────────────────
+        # -- FocalReasoning path ----------------------------------------------
         reasoning = None
         if (
             self._f.valves.enable_focal_reasoning
@@ -25286,7 +25717,7 @@ class MessageAssembler:
                     "🧠 FocalReasoning: no results — falling back to unified"
                 )
 
-        # ── Unified generation ────────────────────────────────────────────
+        # -- Unified generation -----------------------------------------------
         if not reasoning:
             question = cot_question if manual_cot_used else user_question
 
@@ -25318,12 +25749,11 @@ class MessageAssembler:
                     label="scientific_cot",
                 )
             else:
-                # cot_level == 2, use_scientific == False → linear step-by-step
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
                     question, prelim_for_cot
                 )
 
-        # ── L3 scientific fallback → linear L2 ───────────────────────────
+        # -- L3 scientific fallback → linear L2 -------------------------------
         _cot_error_msg = "Unable to generate reasoning."
         if (
             not manual_cot_used
@@ -25347,7 +25777,7 @@ class MessageAssembler:
             )
             return
 
-        # ── REGION 3: INJECT INTO SYSTEM PROMPT ──
+        # ── Region: Inject reasoning into system prompt ───────────────────────
         self._f._log_debug(
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
@@ -25373,6 +25803,12 @@ class MessageAssembler:
                 "Use them to enhance your answer, but always prioritise the actual user query.",
             )
         )
+
+        # Bug 156 fix: update last_cot_level only after successful generation.
+        # Previously this happened inside detect_cot_configuration (before generation
+        # even started), causing stale sticky state when generation ultimately failed.
+        if self._f.ENABLE_COT_STICKY:
+            state.last_cot_level = cot_level
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Code history compression & lean user code
@@ -25659,8 +26095,19 @@ class MessageAssembler:
         project_id: str,
     ) -> None:
         """
-        Inject multi‑phase protocol if the token budget is tight or a global‑scope
-        query demands it.
+        Inject multi-phase protocol instructions when the token budget is tight
+        or a global-scope query forces it.
+
+        The critical wrap-up hint (appended to the user message when budget is
+        critically low) is allowed even on continuation turns because it tells
+        the model to stop cleanly rather than overflow. All other multi-phase
+        instructions are skipped on continuation turns to prevent the model from
+        restarting the cycle (Fase 1 — Análisis, etc.) instead of continuing
+        from where it left off.
+
+        Bug 157 fix: added early return for continuation turns after the critical
+        wrap-up hint check, preventing the model from receiving full multi-phase
+        protocol instructions that would restart the task cycle.
         """
         if not (
             self._f.valves.enable_multi_phase_response
@@ -25677,7 +26124,9 @@ class MessageAssembler:
             0, self._f.valves.context_window_tokens - _prelim_tok - _hist_tok
         )
 
-        # --- Critical budget warning: append a wrap-up hint to the user message ---
+        # -- Critical budget warning: append a wrap-up hint to the user message -
+        # This is permitted even on continuation turns: if budget is critically
+        # low the model must be told to stop cleanly regardless of turn type.
         if _mp_available < self._f.valves.multi_phase_response_budget_warn:
             self._f._log_debug(
                 f"Multi-phase CRITICAL ({_mp_available} tokens): "
@@ -25686,10 +26135,21 @@ class MessageAssembler:
             self._f._multi_phase.append_critical_wrap_up_hint(messages)
             return
 
-        # --- Always evaluate the budget branch; force is an additive override ---
+        # Skip all multi-phase instructions on continuation turns.
+        # The model already has the continuation marker (▶ CONTINÚA:) and the
+        # full task history; injecting a new Fase 1-N protocol at this point
+        # causes the model to restart the cycle instead of continuing the plan.
+        if is_continuation:
+            self._f._log_debug(
+                "Multi-phase: skipped for continuation turn "
+                "(model uses existing history and continuation markers)"
+            )
+            return
+
+        # -- Always evaluate the budget branch; force is an additive override ---
         budget_tight = _mp_available < self._f.valves.multi_phase_response_threshold
 
-        # ── read the one‑shot global‑scope flag (MIGRADO) ──
+        # Read the one-shot global-scope flag set by prepare_call_graph_mode
         psm = self._f._project_state_manager
         force_global_scope = psm.pop_force_multi_phase_this_turn(project_id)
 
