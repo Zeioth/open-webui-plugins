@@ -8593,9 +8593,16 @@ class LongTermMemory:
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
-        """Initialize with a reference to the parent Filter."""
+        """
+        Initialize LongTermMemory with a reference to the parent Filter.
+
+        Args:
+            filter_ref: The parent Filter instance.
+        """
         self._f = filter_ref
+        # Reason string when LTM retrieval is disabled (e.g. embedding mismatch).
         self._retrieval_disabled_reason: Optional[str] = None
+        self._write_disabled_reason: Optional[str] = None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Initialization
@@ -9650,13 +9657,41 @@ class LongTermMemory:
         """
         Store user/assistant messages in the LTM ChromaDB collection.
 
-        If `wait` is False, the actual embedding and upsert run in a background
-        task and the method returns immediately.
+        Each message is embedded with contextual metadata (file paths, code
+        symbols, content type) and upserted into the collection.  If ``wait``
+        is False, embedding and upsert are offloaded to a background task and
+        this method returns immediately.
+
+        Args:
+            project_id: Current project identifier.
+            messages: List of message dicts with ``role`` and ``content`` keys.
+            wait: If True, block until all messages are stored.  If False,
+                schedule a background task and return immediately.
         """
+        # ------------------------------------------------------------------
+        # Region: Prerequisites check
+        # ------------------------------------------------------------------
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return
 
-        # ── Filter valid messages (skip partial multi-phase) ──────────
+        # ------------------------------------------------------------------
+        # Region: Write-disable guard (Bug D fix)
+        # Block writes when the collection was built with a different embedding
+        # model.  Without this guard, the collection would accumulate vectors
+        # from two incompatible spaces, making nearest-neighbour search
+        # semantically meaningless.
+        # ------------------------------------------------------------------
+        if self._write_disabled_reason:
+            self._f._log_debug(
+                f"LTM: store_messages blocked — embedding mismatch: "
+                f"{self._write_disabled_reason}"
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Filter valid messages
+        # Skip empty messages and partial multi-phase assistant responses (M2).
+        # ------------------------------------------------------------------
         valid = []
         for msg in messages:
             content = msg.get("content", "")
@@ -9664,14 +9699,14 @@ class LongTermMemory:
                 continue
 
             role = msg.get("role", "")
-            # M2: Skip partial multi-phase assistant responses
+            # M2: skip partial multi-phase assistant responses.
             if role == "assistant" and self._is_partial_multi_phase(content):
                 self._f._log_debug(
                     "ltm: skipping partial multi-phase response (not embedding)"
                 )
                 continue
 
-            # M1: Strip CoT scaffolding
+            # M1: strip CoT scaffolding before embedding.
             content = self._prepare_text_for_ltm(content, role)
             if not content:
                 continue
@@ -9681,12 +9716,16 @@ class LongTermMemory:
         if not valid:
             return
 
+        # ------------------------------------------------------------------
+        # Region: Async (fire-and-forget) path
+        # ------------------------------------------------------------------
         if not wait:
-            # Offload the heavy embedding to a background task
             asyncio.create_task(self._store_messages_async(project_id, valid))
             return
 
-        # ── Original synchronous path ──────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Synchronous embedding and upsert
+        # ------------------------------------------------------------------
         texts_for_embedding: List[str] = []
         documents_to_store: List[str] = []
         ids = []
@@ -9699,6 +9738,7 @@ class LongTermMemory:
             extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
             content_type = self._f._code_blocks.classify_content(content, extracted)
 
+            # Collect symbol names from the first three code blocks (cheap).
             ctx_symbols: List[str] = []
             for blk in extracted[:3]:
                 try:
@@ -9730,7 +9770,10 @@ class LongTermMemory:
             texts_for_embedding.append(contextual_doc)
             documents_to_store.append(contextual_doc)
 
-            msg_id = f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+            msg_id = (
+                f"{project_id}_{int(now)}_"
+                f"{hashlib.md5(content.encode()).hexdigest()[:8]}"
+            )
             ids.append(msg_id)
 
             expires_at = (
@@ -9739,6 +9782,7 @@ class LongTermMemory:
                 else None
             )
 
+            # Build symbol index string for metadata filtering.
             code_symbols_str = ""
             if self._f.valves.ltm_index_symbols_enabled:
                 all_syms = set()
@@ -9773,7 +9817,7 @@ class LongTermMemory:
                 }
             )
 
-        # Requires an embedder supporting 32768 context or more.
+        # Embed all texts at once (single batch call is faster than N calls).
         safe_texts = [
             self._f._tokens.truncate_text_to_tokens(t, 32768)
             for t in texts_for_embedding
@@ -9801,11 +9845,33 @@ class LongTermMemory:
                 self._f._log_debug(f"Async LTM store failed: {e}")
 
     async def _store_single_message(self, project_id: str, msg: dict) -> None:
-        """Embed and insert a single message into ChromaDB (used by async path)."""
+        """
+        Embed and insert a single message into ChromaDB (used by the async path).
+
+        Args:
+            project_id: Current project identifier.
+            msg: A dict with ``role`` and ``content`` keys.
+        """
+        # ------------------------------------------------------------------
+        # Region: Write-disable guard (Bug D fix)
+        # The async path (store_messages with wait=False → _store_messages_async
+        # → _store_single_message) must also respect the write-disable flag.
+        # ------------------------------------------------------------------
+        if self._write_disabled_reason:
+            self._f._log_debug(
+                f"LTM: _store_single_message blocked — embedding mismatch: "
+                f"{self._write_disabled_reason}"
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Extract content and metadata
+        # ------------------------------------------------------------------
         content = msg["content"]
         extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
         content_type = self._f._code_blocks.classify_content(content, extracted)
 
+        # Collect up to 10 symbol names from the first three code blocks.
         ctx_symbols: List[str] = []
         for blk in extracted[:3]:
             try:
@@ -9837,14 +9903,20 @@ class LongTermMemory:
         safe_text = self._f._tokens.truncate_text_to_tokens(contextual_doc, 32768)
         now = time.time()
 
-        # Use the shared ChromaDB semaphore
+        # ------------------------------------------------------------------
+        # Region: Embed using the shared ChromaDB semaphore
+        # ------------------------------------------------------------------
         async with self._f._chroma_semaphore:
             embedding = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(safe_text).tolist()
             )
 
+        # ------------------------------------------------------------------
+        # Region: Build message ID and expiry
+        # ------------------------------------------------------------------
         msg_id = (
-            f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+            f"{project_id}_{int(now)}_"
+            f"{hashlib.md5(content.encode()).hexdigest()[:8]}"
         )
         expires_at = (
             now + (self._f.valves.long_term_memory_expiration_days * 86400)
@@ -9852,6 +9924,7 @@ class LongTermMemory:
             else None
         )
 
+        # Build symbol index string for metadata filtering.
         code_symbols_str = ""
         if self._f.valves.ltm_index_symbols_enabled:
             all_syms = set()
@@ -9884,7 +9957,9 @@ class LongTermMemory:
             "memory_id": msg_id,
         }
 
-        # The upsert itself also needs the semaphore because it's a ChromaDB operation
+        # ------------------------------------------------------------------
+        # Region: Upsert into ChromaDB (also under the semaphore)
+        # ------------------------------------------------------------------
         async with self._f._chroma_semaphore:
             await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.upsert(
@@ -10117,30 +10192,41 @@ class LongTermMemory:
         """
         Validate that the current embedding model matches the stored fingerprint.
 
-        Reads/writes model metadata from the ChromaDB collection.
-        On the first run (no fingerprint stored yet), persists the current
-        model name and dimension. On subsequent runs, compares against the
-        stored fingerprint and disables LTM retrieval if they differ.
+        On the first run (no fingerprint stored), persists the current model
+        name and output dimension to the ChromaDB collection metadata.
 
-        Returns False and sets _retrieval_disabled_reason if a mismatch is
-        found. Returns True if the model matches or on the first run.
+        On subsequent runs, compares the stored fingerprint against the model
+        currently loaded.  If there is a **mismatch**, both retrieval *and*
+        writes are disabled via ``_retrieval_disabled_reason`` and
+        ``_write_disabled_reason``.  This prevents the collection from being
+        contaminated with vectors from two incompatible model spaces.  The
+        operator must delete or recreate the ChromaDB collection to resolve the
+        mismatch.
 
-        Bug fixed: the original check was `if stored_model is None` which
-        is always False because str() never returns None — so the first-run
-        fingerprint was never persisted. Changed to `if not stored_model`
-        to correctly detect an empty string (= no fingerprint yet).
+        Returns:
+            True if the model fingerprint matches (or on first run).
+            False when a mismatch is detected; both reads and writes are blocked.
         """
         try:
+            # ------------------------------------------------------------------
+            # Region: Determine current model fingerprint
+            # ------------------------------------------------------------------
             current_model: str = str(
                 getattr(self._f.valves, "embedding_model_name", "unknown")
             )
             current_dim: int = int(self._get_embedding_dimension() or 0)
 
+            # ------------------------------------------------------------------
+            # Region: Read stored fingerprint from ChromaDB collection metadata
+            # ------------------------------------------------------------------
             coll_meta: dict = self._f.memory_collection.metadata or {}
             stored_model: str = str(coll_meta.get("_codeaware_embedding_model", ""))
             stored_dim: int = int(coll_meta.get("_codeaware_embedding_dim", 0) or 0)
 
-            # Empty string means no fingerprint has been persisted yet (first run).
+            # ------------------------------------------------------------------
+            # Region: First run — persist fingerprint and clear any stale flags
+            # An empty string means no fingerprint has been stored yet.
+            # ------------------------------------------------------------------
             if not stored_model:
                 self._f.memory_collection.modify(
                     metadata={
@@ -10149,27 +10235,45 @@ class LongTermMemory:
                         "_codeaware_embedding_dim": current_dim,
                     }
                 )
+                # Clear any stale disable flags (e.g. after collection was
+                # recreated externally and the filter restarted).
+                self._retrieval_disabled_reason = None
+                self._write_disabled_reason = None
                 self._f._log_debug(
                     f"LTM: embedding fingerprint stored "
                     f"(model={current_model}, dim={current_dim})"
                 )
                 return True
 
+            # ------------------------------------------------------------------
+            # Region: Mismatch — disable both reads and writes
+            # ------------------------------------------------------------------
             if stored_model != current_model or stored_dim != current_dim:
                 reason = (
                     f"LTM embedding mismatch — collection built with "
                     f"'{stored_model}' (dim={stored_dim}), "
                     f"current model is '{current_model}' (dim={current_dim}). "
-                    f"LTM retrieval DISABLED. To fix: clear the ChromaDB collection."
+                    f"Both LTM retrieval and writes are DISABLED to prevent "
+                    f"contaminating the collection with incompatible vectors. "
+                    f"To fix: delete the ChromaDB collection directory at "
+                    f"'{self._f.valves.long_term_memory_dir}' and restart."
                 )
                 self._f._log_debug(reason)
                 self._retrieval_disabled_reason = reason
+                self._write_disabled_reason = reason
                 return False
 
+            # ------------------------------------------------------------------
+            # Region: Fingerprint matches — ensure disable flags are clear
+            # ------------------------------------------------------------------
+            self._retrieval_disabled_reason = None
+            self._write_disabled_reason = None
             return True
 
         except Exception as e:
-            # Fail open to avoid breaking existing installs that lack the metadata.
+            # Fail open on unexpected errors to avoid breaking existing installs
+            # that lack the metadata fields (e.g. collections created before this
+            # feature was added).
             self._f._log_debug(f"LTM: could not validate embedding model: {e}")
             return True
 
@@ -16125,31 +16229,33 @@ class ActivationEngine:
             self._misses += 1
             return None
 
-    def set(self, code_hash: str, seeds: frozenset, scores: Dict[str, float]) -> None:
-        """
-        Store PPR scores in the LRU cache.
+        def set(
+            self, code_hash: str, seeds: frozenset, scores: Dict[str, float]
+        ) -> None:
+            """
+            Store PPR scores in the LRU cache.
 
-        Args:
-            code_hash: Hash of the current code state (cache invalidation key).
-            seeds:     Frozenset of seed qualified ids used to produce the scores.
-            scores:    Dict mapping qualified ids to PPR scores.
-        """
-        key = (code_hash, seeds)
+            Args:
+                code_hash: Hash of the current code state (cache invalidation key).
+                seeds:     Frozenset of seed qualified ids used to produce the scores.
+                scores:    Dict mapping qualified ids to PPR scores.
+            """
+            key = (code_hash, seeds)
 
-        # ── Store a defensive copy to prevent caller mutations from corrupting the cache
-        self._cache[key] = dict(scores)
-        self._cache.move_to_end(key)
+            # ── Store a defensive copy to prevent caller mutations from corrupting the cache
+            self._cache[key] = dict(scores)
+            self._cache.move_to_end(key)
 
-        # ── Evict the oldest entry when the cache exceeds its capacity ────────────
-        if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
+            # ── Evict the oldest entry when the cache exceeds its capacity ────────────
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
 
-        @property
-        def stats(self) -> str:
-            """Return cache hit/miss statistics."""
-            total = self._hits + self._misses
-            rate = self._hits / total if total else 0
-            return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
+            @property
+            def stats(self) -> str:
+                """Return cache hit/miss statistics."""
+                total = self._hits + self._misses
+                rate = self._hits / total if total else 0
+                return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -16636,62 +16742,78 @@ Output only the symbol name.
         alpha: float = 0.85,
     ) -> Dict[str, float]:
         """
-        Compute PPR scores with LRU caching.
+        Compute Personalised PageRank scores with LRU caching.
 
         Args:
-            seed_qids: List of qualified symbol ids to seed.
+            seed_qids: Qualified symbol ids to use as PPR seeds.
             project_id: Current project identifier.
-            code_state_hash: Hash of the code state (cache invalidation key).
-                             Empty string disables caching.
-            edges_out: Call-graph outgoing edges for PPR propagation.
-            max_steps: PPR propagation steps (from valves.path_propagation_steps).
-            min_score: Minimum score to keep.
-            alpha: Damping factor.
+            code_state_hash: Hash of active-block content — used as fallback
+                cache key only when the structure hash is not yet set.
+            edges_out: Outgoing call-graph edges for PPR propagation.
+            max_steps: Maximum power-iteration steps.
+            min_score: Minimum score for a node to appear in results.
+            alpha: PPR damping factor (restart probability = 1 - alpha).
 
         Returns:
-            Dict[str, float]: qid → PPR score.
+            Dict mapping qualified symbol ids to PPR scores in [0, 1].
         """
-        seed_frozenset = frozenset(seed_qids)
+        # ------------------------------------------------------------------
+        # Region: Resolve cache key
+        # Use structure hash (signatures only) so page-out events — which
+        # modify active_blocks but not the SymbolIndex graph — do not
+        # invalidate the cache.  Fall back to code_state_hash on cold start.
+        # ------------------------------------------------------------------
+        psm = self._f._project_state_manager
+        structure_hash = psm.get_structure_hash_for_cache(project_id)
+        cache_key = structure_hash if structure_hash else code_state_hash
 
         # ------------------------------------------------------------------
-        # Bug 69 fix: skip cache on empty hash to prevent cross-project
-        # collisions between projects that have no indexed code.
+        # Region: Cache read
+        # Skip caching entirely when the key is empty to avoid cross-project
+        # collisions between sessions with no indexed code (Bug 69 fix).
         # ------------------------------------------------------------------
-        use_cache = bool(code_state_hash)
+        use_cache = bool(cache_key)
+        seed_frozen = frozenset(seed_qids)
 
         if use_cache:
-            cached = self._ppr_cache.get(code_state_hash, seed_frozenset)
+            cached = self._ppr_cache.get(cache_key, seed_frozen)
             if cached is not None:
-                self._f._log_debug(f"PPR: cache hit ({self._ppr_cache.stats})")
+                self._f._log_debug(
+                    f"PPR: cache hit (key={cache_key[:8]}, {self._ppr_cache.stats})"
+                )
                 return cached
 
         # ------------------------------------------------------------------
-        # Region: Build activation graph and propagate
+        # Region: Build activation graph and seed
+        # When no seed qids are available, fall back to high-centrality entry
+        # points so the graph is still populated for structural queries.
         # ------------------------------------------------------------------
         ag = ActivationGraph()
 
-        total_seed_score = len(seed_qids)
-        if total_seed_score == 0:
-            psm = self._f._project_state_manager
+        if not seed_qids:
             centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
                 self._f._symbol_index, project_id
             )
             if entry_points:
                 sorted_eps = sorted(
-                    entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
+                    entry_points,
+                    key=lambda ep: centrality.get(ep, 0.0),
+                    reverse=True,
                 )
                 for sym_name in sorted_eps[:3]:
                     cent_score = centrality.get(sym_name, 0.0)
                     seed_score = 0.2 + 0.2 * cent_score
-                    ag.seed([sym_name], initial_score=seed_score)
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=seed_score, depth=0, source="seed"
+                    )
         else:
-            init_score = 1.0 / total_seed_score
+            init_score = 1.0 / len(seed_qids)
             ag.seed(seed_qids, initial_score=init_score)
 
-        # max_steps comes from the caller (which reads the valve),
-        # not hardcoded. Previously the default was 20 here but callers passed
-        # 4 (hardcoded default in build_activation_graph, ignoring the valve).
+        # ------------------------------------------------------------------
+        # Region: PPR propagation
+        # ------------------------------------------------------------------
         ag.propagate(
             edges_out=edges_out,
             max_steps=max_steps,
@@ -16702,14 +16824,22 @@ Output only the symbol name.
         scores = ag.get_activated_nodes(threshold=min_score)
 
         # ------------------------------------------------------------------
-        # Region: Store in cache (only when hash is non-empty)
+        # Region: Cache write
+        # Store under the structure hash key so subsequent calls with the same
+        # graph topology (even after page-outs) get a cache hit.
         # ------------------------------------------------------------------
         if use_cache:
-            self._ppr_cache.set(code_state_hash, seed_frozenset, scores)
-            self._f._log_debug(f"PPR: computed and cached ({self._ppr_cache.stats})")
+            self._ppr_cache.set(cache_key, seed_frozen, scores)
+            self._f._log_debug(
+                f"PPR: computed and cached "
+                f"(key={cache_key[:8]}, {self._ppr_cache.stats})"
+            )
         else:
-            self._f._log_debug("PPR: computed without caching (empty code_state_hash)")
+            self._f._log_debug(
+                "PPR: computed without caching (empty cache key — cold start)"
+            )
 
+        # Periodic stats dump (avoid log spam).
         if hasattr(self._f, "_write_counter") and self._f._write_counter % 50 == 0:
             self._f._log_debug(self._ppr_cache.stats)
 
@@ -19943,7 +20073,7 @@ class MetacognitiveReasoningEngine:
                 f"{question[:60]}{'...' if len(question) > 60 else ''}"
             )
             try:
-                # -- save slot to isolate auxiliary calls from main state ----
+                # -- save slot to isolate auxiliary calls from open_webui.main state ----
                 if self._f.valves.enable_slot_persistence:
                     await self._f._project_state_manager.slot_save(project_id)
 
@@ -20392,25 +20522,76 @@ Code context (recent symbols referenced):
         self, content: str, project_id: str
     ) -> Tuple[bool, float]:
         """
-        Verify that code symbols in the content are indexed in the SymbolGraph.
-        Returns (is_indexed, ratio).
-        """
-        _TOP_LEVEL = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
-        expected = set(_TOP_LEVEL.findall(content))
-        if not expected:
-            _TOP_FN = re.compile(
-                r"^(?:async )?def\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
-            )
-            expected = set(_TOP_FN.findall(content))
-        if not expected:
-            return True, 1.0
+        Check whether the code symbols present in a message are indexed in the
+        SymbolGraph, to decide if it is safe to compress that message.
 
+        Returns a ``(safe_to_compress, ratio)`` tuple where *ratio* is the
+        fraction of detected symbols that are already in the SymbolIndex.
+
+        Args:
+            content: The message content to evaluate.
+            project_id: Current project identifier.
+
+        Returns:
+            Tuple of (is_safe_to_compress, symbol_coverage_ratio).
+        """
+        # ------------------------------------------------------------------
+        # Region: Attempt to extract Python top-level symbols via regex
+        # These patterns are intentionally restricted to Python so we don't
+        # risk false positives on other languages.
+        # ------------------------------------------------------------------
+        _CLASS_RE = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+        _FUNC_RE = re.compile(
+            r"^(?:async )?def\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+        )
+
+        expected = set(_CLASS_RE.findall(content))
+        if not expected:
+            expected = set(_FUNC_RE.findall(content))
+
+        # ------------------------------------------------------------------
+        # Region: Handle case where no Python symbols were detected (Bug H fix)
+        # ------------------------------------------------------------------
+        if not expected:
+            # Check whether the project has ANY indexed symbols at all.
+            # If the SymbolIndex is empty, there is nothing to protect and
+            # compression is safe regardless of content language.
+            try:
+                project_symbols = self._f._symbol_index.get_all_names(project_id)
+            except Exception as exc:
+                self._f._log_debug(
+                    f"_verify_code_symbols_indexed: SymbolIndex query failed: {exc}"
+                )
+                # Conservative: do not compress if we cannot verify.
+                return False, 0.0
+
+            if not project_symbols:
+                # No symbols indexed at all → safe to compress.
+                return True, 1.0
+
+            # The project has indexed symbols (from tree-sitter on non-Python
+            # code, or from a prior turn) but our Python regex found nothing.
+            # The content is likely non-Python code whose symbols ARE in the
+            # index — be conservative and refuse compression.
+            self._f._log_debug(
+                "_verify_code_symbols_indexed: no Python symbols found by regex "
+                f"but project has {len(project_symbols)} indexed symbols — "
+                "treating as unsafe to compress (non-Python code)"
+            )
+            return False, 0.0
+
+        # ------------------------------------------------------------------
+        # Region: Normal path — compute coverage ratio
+        # ------------------------------------------------------------------
         try:
             graph_symbols = self._f._symbol_index.get_all_names(project_id)
             ratio = len(expected & graph_symbols) / len(expected)
             return ratio >= self._f.valves.code_history_symbol_index_threshold, ratio
         except Exception as exc:
-            self._f._log_debug(f"Symbol index check failed: {exc}")
+            self._f._log_debug(
+                f"_verify_code_symbols_indexed: SymbolIndex check failed: {exc}"
+            )
+            # Conservative fallback: assume not yet indexed.
             return False, 0.0
 
     # ── Q4: Commit summary builder with rationale ──────────────────────────
@@ -21384,51 +21565,130 @@ class EnrichmentTasks:
                 block.last_mentioned_msg_idx = state.message_count
                 block._update_importance()
 
-    async def expire_blocks_by_time(self, project_id: str) -> None:
-        """Remove blocks that have not been mentioned recently, based on configured timeouts."""
+    async def expire_blocks_by_time(
+        self,
+        project_id: str,
+        state: Optional["ConversationState"] = None,
+    ) -> None:
+        """
+        Remove blocks that have not been mentioned recently, based on the
+        configured time-out valves.
+
+        Supports two call paths:
+
+        **In-lock path** (Bug G fix): when ``_post_update_tasks`` already holds
+        the project lock and has the current in-flight state, it passes ``state``
+        directly.  Using the provided object avoids re-reading a stale snapshot
+        from ``ConversationStateManager`` (which has not yet received the
+        in-flight mutations) and prevents the removed blocks from silently
+        reverting those mutations.  The caller is responsible for persisting the
+        modified state.
+
+        **Standalone path**: when ``state`` is None, this method acquires the
+        project lock, loads the state from the manager, applies expiration, and
+        persists the result before returning.
+
+        Args:
+            project_id: Current project identifier.
+            state: Optional pre-loaded ConversationState.  When provided, the
+                caller must hold the project lock and must call
+                ``ConversationStateManager.set()`` after this method returns.
+        """
+        # ------------------------------------------------------------------
+        # Region: In-lock fast path
+        # The caller (ActiveCodeUpdater._post_update_tasks) already holds the
+        # project lock and has applied in-flight mutations to `state`.
+        # Mutate the provided object directly; the caller will persist it.
+        # ------------------------------------------------------------------
+        if state is not None:
+            self._expire_blocks_on_state(state, project_id)
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Standalone path — acquire lock, load, expire, persist
+        # ------------------------------------------------------------------
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            state = self._f._conversation_state_manager.get(project_id)
-            if not state:
+            loaded = self._f._conversation_state_manager.get(project_id)
+            if not loaded:
                 return
-            now = time.time()
-            expiration_seconds = self._f.valves.block_expiration_hours * 3600
-            to_remove = []
-            for h, block in state.active_blocks.items():
-                if block.pinned or block.obsolete:
-                    continue
-                age = now - block.last_mentioned
-                if (
-                    block.content_type == ContentType.ERROR
-                    and self._f.valves.error_retention_turns > 0
+            changed = self._expire_blocks_on_state(loaded, project_id)
+            if changed:
+                self._f._conversation_state_manager.set(project_id, loaded)
+
+    def _expire_blocks_on_state(
+        self, state: "ConversationState", project_id: str
+    ) -> bool:
+        """
+        Apply time-based block expiration to a ConversationState object in place.
+
+        This is the core expiration logic shared by both ``expire_blocks_by_time``
+        call paths (standalone with lock, and in-lock via ``_post_update_tasks``).
+        It mutates *state* directly and returns True if any blocks were removed.
+
+        The caller is responsible for acquiring any necessary locks and for
+        persisting the modified state via ``ConversationStateManager.set()``.
+
+        Args:
+            state: The ConversationState to mutate.
+            project_id: Current project identifier (used for SymbolIndex cleanup
+                and lightweight-cache invalidation).
+
+        Returns:
+            True if at least one block was removed, False otherwise.
+        """
+        # ------------------------------------------------------------------
+        # Region: Collect hashes of expired blocks
+        # ------------------------------------------------------------------
+        now = time.time()
+        expiration_seconds = self._f.valves.block_expiration_hours * 3600
+        to_remove: List[str] = []
+
+        for h, block in state.active_blocks.items():
+            if block.pinned or block.obsolete:
+                continue
+            age = now - block.last_mentioned
+
+            if (
+                block.content_type == ContentType.ERROR
+                and self._f.valves.error_retention_turns > 0
+            ):
+                if age > max(
+                    self._f.valves.error_retention_turns * 300, expiration_seconds
                 ):
-                    if age > max(
-                        self._f.valves.error_retention_turns * 300, expiration_seconds
-                    ):
-                        to_remove.append(h)
-                elif (
-                    block.content_type == ContentType.PROPOSED_CHANGE
-                    and self._f.valves.proposed_change_retention_turns > 0
+                    to_remove.append(h)
+            elif (
+                block.content_type == ContentType.PROPOSED_CHANGE
+                and self._f.valves.proposed_change_retention_turns > 0
+            ):
+                if age > max(
+                    self._f.valves.proposed_change_retention_turns * 300,
+                    expiration_seconds,
                 ):
-                    if age > max(
-                        self._f.valves.proposed_change_retention_turns * 300,
-                        expiration_seconds,
-                    ):
-                        to_remove.append(h)
-            for h in to_remove:
-                if h in state.active_blocks:
-                    block = state.active_blocks[h]
-                    self._f._symbol_index.remove_all_for_block(
-                        block.hash, block.symbols, project_id
-                    )
-                del state.active_blocks[h]
-            if to_remove:
-                state.has_any_calls = any(
-                    any(s.calls for s in b.symbols)
-                    for b in state.active_blocks.values()
+                    to_remove.append(h)
+
+        # ------------------------------------------------------------------
+        # Region: Remove expired blocks and update derived state
+        # Use pop() instead of del to avoid KeyError when a block was removed
+        # concurrently by hard eviction in _process_new_block.
+        # ------------------------------------------------------------------
+        for h in to_remove:
+            block = state.active_blocks.pop(h, None)
+            if block:
+                self._f._symbol_index.remove_all_for_block(
+                    block.hash, block.symbols, project_id
                 )
-                self._f._activation.invalidate_lightweight_cache(project_id)
-                self._f._conversation_state_manager.set(project_id, state)
+
+        # ------------------------------------------------------------------
+        # Region: Update derived fields when blocks were removed
+        # ------------------------------------------------------------------
+        if to_remove:
+            state.has_any_calls = any(
+                any(s.calls for s in b.symbols) for b in state.active_blocks.values()
+            )
+            self._f._activation.invalidate_lightweight_cache(project_id)
+
+        return bool(to_remove)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. LOD adaptive adjustment
@@ -23276,11 +23536,21 @@ class ActiveCodeUpdater:
         is_continuation: bool,
     ) -> None:
         """
-        Run post-update maintenance: expiration, enrichment, oversized-block
-        summaries, path index invalidation, and soft eviction via ContextPager.
+        Run post-update maintenance tasks after new blocks have been indexed.
+
+        Called from ``process()`` while the project lock is held and ``state``
+        already contains all in-flight mutations for this turn.  Performs:
+          - Message-count increment
+          - Duplicate block removal
+          - Time-based block expiration (Bug G fix: passes ``state`` directly)
+          - Session summary (interval-based)
+          - Oversized-block summary scheduling
+          - Lightweight activation cache invalidation
+          - Path index invalidation for changed symbols
+          - Soft eviction via ContextPager
 
         Args:
-            state: The current ConversationState for the project.
+            state: The current, mutated ConversationState (held under lock).
             project_id: Current project identifier.
             new_blocks_pending: New code blocks processed this turn.
             is_continuation: True only for genuine AutoContinue turns.
@@ -23300,7 +23570,7 @@ class ActiveCodeUpdater:
         # ------------------------------------------------------------------
         # Region: Time-based block expiration
         # ------------------------------------------------------------------
-        await self._f._enrichment.expire_blocks_by_time(project_id)
+        await self._f._enrichment.expire_blocks_by_time(project_id, state=state)
 
         # ------------------------------------------------------------------
         # Region: Session summary (interval-based)
@@ -23342,20 +23612,13 @@ class ActiveCodeUpdater:
         self._f._activation.invalidate_lightweight_cache(project_id)
 
         # ------------------------------------------------------------------
-        # Region: Path index invalidation
+        # Region: Path index invalidation for changed symbols
         # ------------------------------------------------------------------
         if self._f.valves.enable_path_analysis:
-            # Bug 135 fix: collect QUALIFIED symbol ids using qualify_symbol(sym)
-            # instead of bare sym.name. PathIndex._symbol_to_views is keyed by
-            # project_id:qualified_id (populated from view.induced_nodes).
-            # Passing bare names (e.g. "__init__", "process") always returned
-            # an empty set from mark_stale_for_symbol → paths were never
-            # invalidated after code changes, causing stale CodePathViews to
-            # serve incorrect activation scores on the next turn.
             changed_symbols: Set[str] = set()
             for blk in new_blocks_pending:
                 for sym in blk.symbols:
-                    changed_symbols.add(qualify_symbol(sym))  # Bug 135 fix
+                    changed_symbols.add(qualify_symbol(sym))
 
             stale_path_ids: Set[str] = set()
             for sym_qid in changed_symbols:
