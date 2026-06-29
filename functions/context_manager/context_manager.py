@@ -866,59 +866,36 @@ class SymbolIndex:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def add_edge(self, edge: "Edge", project_id: str) -> None:
-        """
-        Register a directed edge in both the edges_out and edges_in indices.
-
-        Steps:
-            1.  Build the edge key (src, dst, type).
-            2.  Check edges_out for an existing entry with the same key.
-            3.  If absent, append to both edges_out and edges_in.
-        """
-        # -- Step 1: edge key --
-        edge_type = getattr(edge, "type", "calls")
-        key = (edge.src, edge.dst, edge_type)
-
-        # -- Step 2: check for existing edge --
-        existing_out = self._edges_out.setdefault(project_id, {}).setdefault(
-            edge.src, []
-        )
-        for existing in existing_out:
-            if (existing.src, existing.dst, getattr(existing, "type", "calls")) == key:
-                return  # duplicate — skip
-
-        # -- Step 3: append to both indices --
-        existing_out.append(edge)
-        self._edges_in.setdefault(project_id, {}).setdefault(edge.dst, []).append(edge)
+        """Register a typed edge.  `edge.src` is expected to be the
+        qualified id of the symbol whose body contains the call (the caller
+        must qualify it themselves with qualify_symbol_name() before
+        building the Edge — SymbolIndex has no way to know a symbol's
+        parent_symbol from a bare string alone).  `edge.dst` stays whatever
+        the extractor produced (best-effort, normally bare)."""
+        src_key = f"{project_id}:{edge.src}"
+        dst_key = f"{project_id}:{edge.dst}"
+        existing = self._edges_out.get(src_key, [])
+        for e in existing:
+            if e.dst == edge.dst and e.type == edge.type:
+                return
+        self._edges_out[src_key].append(edge)
+        self._edges_in[dst_key].append(edge)
 
     def remove_edges_for_symbol(self, symbol_id: str, project_id: str) -> None:
-        """
-        Remove all edges that originate FROM or point TO symbol_id.
-
-        Steps:
-            1.  Remove outgoing edges from edges_out; clean up edges_in for
-                each callee.
-            2.  Remove incoming edges to symbol_id from edges_in.
-            3.  Remove symbol_id from any source's edges_out list where it
-                appears as a destination.
-        """
-        proj_out = self._edges_out.get(project_id, {})
-        proj_in = self._edges_in.get(project_id, {})
-
-        # -- Step 1: outgoing edges --
-        removed_out = proj_out.pop(symbol_id, [])
-        for edge in removed_out:
-            callee_in = proj_in.get(edge.dst)
-            if callee_in is not None:
-                proj_in[edge.dst] = [e for e in callee_in if e.src != symbol_id]
-
-        # -- Step 2: incoming edges to symbol_id --
-        proj_in.pop(symbol_id, None)
-
-        # -- Step 3: clean symbol_id as destination in edges_out --
-        for src in list(proj_out.keys()):
-            filtered = [e for e in proj_out[src] if e.dst != symbol_id]
-            if len(filtered) != len(proj_out[src]):
-                proj_out[src] = filtered
+        """Remove edges where `symbol_id` (qualified id for a class‑scoped
+        symbol, bare name for a module‑level one) is source or destination."""
+        src_key = f"{project_id}:{symbol_id}"
+        for edge in self._edges_out.pop(src_key, []):
+            dst_key = f"{project_id}:{edge.dst}"
+            self._edges_in[dst_key] = [
+                e for e in self._edges_in.get(dst_key, []) if e.src != symbol_id
+            ]
+        dst_key = f"{project_id}:{symbol_id}"
+        for edge in self._edges_in.pop(dst_key, []):
+            src_key_in = f"{project_id}:{edge.src}"
+            self._edges_out[src_key_in] = [
+                e for e in self._edges_out.get(src_key_in, []) if e.dst != symbol_id
+            ]
 
     def get_edges_out(self, symbol_id: str, project_id: str) -> List["Edge"]:
         """Outgoing edges.  Pass a method's qualified id for precisely its
@@ -970,118 +947,74 @@ class SymbolIndex:
         max_steps: int = 30,
         tolerance: float = 1e-7,
     ) -> Dict[str, float]:
-        """
-        Compute Personalised PageRank centrality for all symbols in a project
-        and store the result for use by the LOD tier system and hub selection.
+        """PageRank over QUALIFIED symbol identities, so e.g. fifteen
+        __init__ with the same name are fifteen separate nodes instead of
+        one node whose edges were silently fused.
 
-        Uses the standard PageRank formulation with dangling node rank
-        redistribution. Without redistribution, symbols with no outgoing
-        edges (leaf functions, standalone classes) accumulate rank without
-        passing it on, causing 60-80% of the total rank to vanish in typical
-        codebases. Hub symbols that ARE well-connected then appear with
-        artificially low centrality, breaking all LOD tier decisions that
-        depend on them.
-
-        Convergence is checked via L∞ norm (max absolute per-node delta).
-        Exits early when delta < tolerance or after max_steps iterations.
-
-        Steps:
-            1.  Collect all nodes from the symbol index.
-            2.  Build adjacency map from SymbolIndex edges.
-            3.  Guard empty graph; return {} immediately.
-            4.  Initialise uniform scores.
-            5.  Iterate with dangling node redistribution until convergence
-                or max_steps.
-            6.  Store and return final scores.
-        """
-        # -- Step 1: collect nodes --
-        all_qids = list(self.get_all_qualified_names(project_id))
-
-        # Include dst nodes that appear in edges but are not indexed as src.
-        extra_dst: Set[str] = set()
-        raw_edges_out = self.get_all_edges_out(project_id)
-        for src_edges in raw_edges_out.values():
-            for edge in src_edges:
-                if edge.dst not in set(all_qids):
-                    extra_dst.add(edge.dst)
-
-        nodes: List[str] = all_qids + list(extra_dst)
-        N = len(nodes)
-
-        # -- Step 2: build adjacency map (qid → list[qid]) --
-        # Only include edges whose src is in our node set for clean iteration.
-        node_set = set(nodes)
-        edges_out_map: Dict[str, List[str]] = {n: [] for n in nodes}
-        for src, src_edges in raw_edges_out.items():
-            if src not in node_set:
-                continue
-            for edge in src_edges:
-                if edge.dst in node_set:
-                    edges_out_map[src].append(edge.dst)
-
-        # -- Step 3: empty graph guard --
-        if N == 0:
+        Each edge's destination (best-effort, normally bare) is resolved
+        against every qualified node sharing that bare name — if a name is
+        ambiguous (multiple classes with a method of that same name), the
+        contribution is split among all candidates instead of being silently
+        lost."""
+        names = list(self.get_all_qualified_names(project_id))
+        n = len(names)
+        if n == 0:
             return {}
+        if n == 1:
+            scores = {names[0]: 1.0}
+            self._store_centrality(project_id, scores)
+            return scores
 
-        # -- Step 4: initialise uniform scores --
-        scores: Dict[str, float] = {n: 1.0 / N for n in nodes}
+        idx = {name: i for i, name in enumerate(names)}
 
-        # Precompute which nodes are dangling (no outgoing edges).
-        # This set is static across iterations since the graph doesn't change.
-        dangling_nodes: Set[str] = {n for n in nodes if not edges_out_map.get(n)}
+        bare_to_indices: Dict[str, List[int]] = {}
+        for (pid, bare), qids in self._bare_index.items():
+            if pid != project_id:
+                continue
+            indices = [idx[q] for q in qids if q in idx]
+            if indices:
+                bare_to_indices[bare] = indices
 
-        # -- Step 5: iterate --
-        for step in range(max_steps):
-            dangling_sum = sum(scores[n] for n in dangling_nodes)
-            dangling_contribution = alpha * dangling_sum / N
+        out_links: list = [[] for _ in range(n)]
+        for name in names:
+            i = idx[name]
+            for edge in self._edges_out.get(f"{project_id}:{name}", []):
+                if edge.dst in idx:
+                    out_links[i].append(idx[edge.dst])
+                else:
+                    for j in bare_to_indices.get(edge.dst, []):
+                        out_links[i].append(j)
 
-            new_scores: Dict[str, float] = {
-                n: (1.0 - alpha) / N + dangling_contribution for n in nodes
-            }
+        rank = [1.0 / n] * n
+        base = (1.0 - alpha) / n
+        dangling_nodes = [i for i in range(n) if not out_links[i]]
 
-            for src in nodes:
-                outs = edges_out_map.get(src)
-                if not outs:
+        for _ in range(max_steps):
+            new_rank = [base] * n
+            dangling_sum = sum(rank[i] for i in dangling_nodes)
+            if dangling_sum:
+                share = alpha * dangling_sum / n
+                for k in range(n):
+                    new_rank[k] += share
+            for i in range(n):
+                links = out_links[i]
+                if not links:
                     continue
-                # Distribute src's rank proportionally by edge effective weight.
-                out_edges = raw_edges_out.get(src, [])
-                # Use effective_weight if available, else uniform split.
-                if out_edges and len(out_edges) == len(outs):
-                    total_weight = sum(e.effective_weight() for e in out_edges)
-                    if total_weight > 0:
-                        for edge in out_edges:
-                            if edge.dst in node_set:
-                                new_scores[edge.dst] += (
-                                    alpha
-                                    * scores[src]
-                                    * edge.effective_weight()
-                                    / total_weight
-                                )
-                        continue
-                # Fallback: uniform distribution
-                contrib = alpha * scores[src] / len(outs)
-                for dst in outs:
-                    new_scores[dst] += contrib
-
-            # -- Convergence check --
-            delta = max(abs(new_scores[n] - scores[n]) for n in nodes)
-            scores = new_scores
+                contrib = alpha * rank[i] / len(links)
+                for j in links:
+                    new_rank[j] += contrib
+            delta = sum(abs(new_rank[k] - rank[k]) for k in range(n))
+            rank = new_rank
             if delta < tolerance:
-                self._f._log_debug(
-                    f"precompute_centrality: converged after {step + 1} "
-                    f"steps (delta={delta:.2e}) for '{project_id}'"
-                )
                 break
 
-        # -- Step 6: store and return --
-        self._store_centrality(project_id, scores)
+        max_r = max(rank) if rank else 1.0
+        if max_r <= 0:
+            scores = {name: 0.0 for name in names}
+        else:
+            scores = {names[k]: rank[k] / max_r for k in range(n)}
 
-        top_3 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
-        self._f._log_debug(
-            f"precompute_centrality: {N} nodes, "
-            f"total_rank={sum(scores.values()):.4f}, "
-            f"top3={[(n.rsplit('.',1)[-1], f'{s:.3f}') for n,s in top_3]}"
-        )
+        self._store_centrality(project_id, scores)
         return scores
 
     def get_hub_symbols(
@@ -1422,15 +1355,6 @@ class ConversationStateManager:
     def _load_from_db(self, project_id: str) -> Optional[ConversationState]:
         """
         Load ConversationState from SQLite.
-
-        FIX Bug 6: los code_contents se cargan en una sola query batch en lugar
-        de una query por bloque (N+1). Con 50 bloques activos el original hacía
-        51 queries síncronas bloqueando el event loop; ahora son siempre 2.
-
-        FIX Regresión: hash_to_block_keys mapea cada hash a una LISTA de block
-        keys. El dict original (hash → un key) sobreescribía el primer bloque
-        cuando dos bloques compartían contenido idéntico, dejando uno sin
-        contenido restaurado.
         """
         try:
             with _db_global_lock:
@@ -1473,27 +1397,22 @@ class ConversationStateManager:
             )
             raw_active = {}
 
-        # ── FIX Bug 6: batch fetch de code_contents ─────────────────────────
-        # Recopilar hash → lista de block_keys que lo referencian.
-        # Un dict hash → un solo key sobreescribiría el primero cuando dos
-        # bloques tienen contenido idéntico (mismo hash); ambos quedarían sin
-        # contenido restaurado excepto el último que se procesara.
-        hash_to_block_keys: Dict[str, List[str]] = {}
+        hash_to_block_key: Dict[str, str] = {}
         for k, v in raw_active.items():
             content_field = v.get("content", "")
             if content_field.startswith("@@hash:"):
                 content_hash = content_field[7:]
-                hash_to_block_keys.setdefault(content_hash, []).append(k)
+                hash_to_block_key[content_hash] = k
 
         content_lookup: Dict[str, str] = {}
-        if hash_to_block_keys:
+        if hash_to_block_key:
             try:
-                placeholders = ",".join("?" * len(hash_to_block_keys))
+                placeholders = ",".join("?" * len(hash_to_block_key))
                 with _db_global_lock:
                     cur2 = self._f._db_conn.execute(
                         f"SELECT hash, content FROM code_contents "
                         f"WHERE hash IN ({placeholders})",
-                        list(hash_to_block_keys.keys()),
+                        list(hash_to_block_key.keys()),
                     )
                     rows2 = cur2.fetchall()
                 content_lookup = {r[0]: r[1] for r in rows2}
@@ -1503,15 +1422,12 @@ class ConversationStateManager:
                     f"batch content fetch failed: {e}"
                 )
 
-        # Aplicar el resultado del batch a todos los block_keys que referencian
-        # ese hash (puede ser más de uno si dos bloques tienen contenido idéntico).
-        for content_hash, block_keys in hash_to_block_keys.items():
-            resolved = content_lookup.get(
+        # Aplicar el resultado del batch al raw_active antes de construir bloques
+        for content_hash, block_key in hash_to_block_key.items():
+            raw_active[block_key]["content"] = content_lookup.get(
                 content_hash,
                 f"[Content not found for hash {content_hash}]",
             )
-            for block_key in block_keys:
-                raw_active[block_key]["content"] = resolved
 
         # ── Rebuild active_blocks ──────────────────────────────────────────
         active: Dict[str, CodeBlock] = {}
@@ -1568,7 +1484,7 @@ class ConversationStateManager:
             else:
                 blk._cached_token_count = len(blk.content) // 4
 
-        # ── Restore docstrings from symbol_docstrings table ───────────────
+        # ── Restore docstrings from symbol_docstrings table ──────────────
         try:
             with _db_global_lock:
                 cur = self._f._db_conn.execute(
@@ -1830,88 +1746,73 @@ class ActivationGraph:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. PPR propagation
     # ═══════════════════════════════════════════════════════════════════════════
+
     def propagate(
         self,
-        edges_out: Dict[str, List["Edge"]],
+        edges_out: Dict[str, List[Edge]],
         max_steps: int = 20,
         min_score: float = 0.05,
         alpha: float = 0.85,
         tolerance: float = 1e-6,
-    ) -> None:
+    ):
         """
-        Run Personalised PageRank from the seeded nodes, spreading activation
-        scores along the call graph edges.
+        Run the PPR power iteration until convergence or ``max_steps``.
 
-        Steps:
-            1.  Guard: return when no activations seeded.
-            2.  Clamp alpha to safe range.
-            3.  Iterative propagation with per-step pruning (safe).
-            4.  Convergence check; exit early when stable.
+        Seeds keep their original high score (they are not overwritten by the
+        converged PPR score). Propagated nodes receive the PPR score as usual.
         """
-        # -- Step 1: empty guard --
         if not self._activations:
             return
-
-        # -- Step 2: clamp alpha --
-        effective_alpha = max(0.5, min(0.99, alpha))
-        if effective_alpha != alpha:
-            pass  # silently clamp; caller may pass valves value directly
-
-        # -- Step 3: iterative propagation --
-        for step in range(max_steps):
-            new_scores: Dict[str, float] = {}
-
-            # Distribute score from each activated node along its out-edges
-            for node_id, state in self._activations.items():
-                out_edges = edges_out.get(node_id, [])
-                if not out_edges:
+        seed_total = sum(
+            s.score for s in self._activations.values() if s.source == "seed"
+        )
+        if seed_total == 0:
+            return
+        personalization: Dict[str, float] = {
+            nid: s.score / seed_total
+            for nid, s in self._activations.items()
+            if s.source == "seed"
+        }
+        out_weight_total: Dict[str, float] = {}
+        for src, edges in edges_out.items():
+            total_w = sum(e.effective_weight() for e in edges)
+            out_weight_total[src] = total_w if total_w > 0 else 1.0
+        r: Dict[str, float] = dict(personalization)
+        for iteration in range(max_steps):
+            r_new: Dict[str, float] = {}
+            for node, score in personalization.items():
+                r_new[node] = (1.0 - alpha) * score
+            for src, edges in edges_out.items():
+                src_score = r.get(src, 0.0)
+                if src_score < min_score:
                     continue
-
-                total_weight = sum(e.effective_weight() for e in out_edges)
-                if total_weight <= 0:
-                    continue
-
-                for edge in out_edges:
-                    dst = edge.dst
-                    contribution = (
-                        effective_alpha
-                        * state.score
-                        * edge.effective_weight()
-                        / total_weight
-                    )
-                    if contribution > 0:
-                        current = new_scores.get(dst, 0.0)
-                        new_scores[dst] = current + contribution
-
-            # Apply new scores, preserving seed depth/source metadata
-            max_delta = 0.0
-            for node_id, new_score in new_scores.items():
-                existing = self._activations.get(node_id)
-                if existing is not None:
-                    delta = abs(new_score - existing.score)
-                    max_delta = max(max_delta, delta)
-                    existing.score = min(1.0, new_score)
-                else:
-                    self._activations[node_id] = ActivationState(
-                        node_id=node_id,
-                        score=min(1.0, new_score),
-                        depth=step + 1,
-                        source="propagation",
-                    )
-                    max_delta = max(max_delta, new_score)
-
-            # -- Bug 136 fix: prune AFTER propagation body, not during --
-            to_prune = [
-                nid
-                for nid, s in self._activations.items()
-                if s.score < min_score and s.source != "seed"
-            ]
-            for nid in to_prune:
-                del self._activations[nid]
-
-            # -- Step 4: convergence check --
-            if max_delta < tolerance:
+                out_w = out_weight_total.get(src, 1.0)
+                for edge in edges:
+                    contribution = alpha * src_score * edge.effective_weight() / out_w
+                    r_new[edge.dst] = r_new.get(edge.dst, 0.0) + contribution
+            all_keys = set(r.keys()) | set(r_new.keys())
+            delta = sum(abs(r_new.get(k, 0.0) - r.get(k, 0.0)) for k in all_keys)
+            r = r_new
+            if delta < tolerance:
                 break
+
+        # Update activations: seeds keep their original score, propagated nodes get the PPR score
+        for node_id, score in r.items():
+            if score < min_score:
+                continue
+            existing = self._activations.get(node_id)
+            # Seeds keep their initial high score — PPR only lowers propagated neighbors
+            final_score = (
+                max(score, existing.score)
+                if (existing and existing.source == "seed")
+                else score
+            )
+            self._activations[node_id] = ActivationState(
+                node_id=node_id,
+                score=final_score,
+                depth=existing.depth if existing else 99,
+                source=existing.source if existing else "propagation",
+            )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Query methods
@@ -1963,19 +1864,7 @@ class SubgraphExtractor:
     # 1. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def __init__(
-        self,
-        activation_threshold: float = 0.1,
-        expand_hops: int = 1,
-    ) -> None:
-        """
-        Initialise the SubgraphExtractor.
-
-        activation_threshold : minimum activation score for a node to be
-            included as a seed before expansion.
-        expand_hops : number of hops to expand around each seed node in
-            both the forward (calls) and backward (callers) directions.
-        """
+    def __init__(self, activation_threshold: float = 0.1, expand_hops: int = 1):
         self.activation_threshold = activation_threshold
         self.expand_hops = expand_hops
 
@@ -1985,81 +1874,30 @@ class SubgraphExtractor:
 
     def extract(
         self,
-        activation: "ActivationGraph",
-        edges_out: Dict[str, List["Edge"]],
-        edges_in: Dict[str, List["Edge"]],
-    ) -> Tuple[Set[str], List["Edge"]]:
-        """
-        Extract the induced subgraph around the activated nodes.
-
-        Starting from all nodes whose activation score meets the threshold,
-        performs a BFS expansion of self.expand_hops hops in both the
-        forward direction (edges_out: callee neighbours) and the backward
-        direction (edges_in: caller neighbours). Returns the set of all
-        reachable nodes and the edges that are internal to that set.
-
-        Steps:
-            1.  Collect seed nodes from activation scores.
-            2.  BFS expand: for each hop, extend frontier using both
-                edges_out (forward) and edges_in (backward).
-            3.  Collect internal edges: all edges where both src and dst
-                are in all_nodes.
-            4.  Return (all_nodes, internal_edges).
-        """
-        # -- Step 1: seed nodes --
-        all_nodes: Set[str] = {
-            node_id
-            for node_id, state in activation._activations.items()
-            if state.score >= self.activation_threshold
-        }
-
-        if not all_nodes:
-            return set(), []
-
-        # -- Step 2: BFS expansion with visited set --
-        visited: Set[str] = set(all_nodes)
-
-        current_frontier: Set[str] = set(all_nodes)
-
-        for _hop in range(self.expand_hops):
-            if not current_frontier:
-                break
-            next_frontier: Set[str] = set()
-
-            for node in current_frontier:
-                # Forward expansion: nodes this node calls
-                for edge in edges_out.get(node, []):
-                    if edge.dst not in visited:
-                        visited.add(edge.dst)
-                        next_frontier.add(edge.dst)
-
-                # Backward expansion: nodes that call this node
-                for edge in edges_in.get(node, []):
-                    if edge.src not in visited:
-                        visited.add(edge.src)
-                        next_frontier.add(edge.src)
-
-            all_nodes |= next_frontier
-            current_frontier = next_frontier
-
-        # -- Step 3: collect internal edges --
-        internal_edges: List["Edge"] = []
-        seen_edge_keys: Set[Tuple[str, str, str]] = set()
-
-        for node in all_nodes:
-            for edge in edges_out.get(node, []):
-                if edge.dst not in all_nodes:
-                    continue
-                # Deduplicate: same (src, dst, type) pair can appear from
-                # multiple indexing passes
-                key = (edge.src, edge.dst, getattr(edge, "type", ""))
-                if key in seen_edge_keys:
-                    continue
-                seen_edge_keys.add(key)
-                internal_edges.append(edge)
-
-        # -- Step 4: return --
-        return all_nodes, internal_edges
+        activation: ActivationGraph,
+        edges_out: Dict[str, List[Edge]],
+        edges_in: Dict[str, List[Edge]],
+    ) -> Tuple[Set[str], List[Edge]]:
+        """Return (activated_nodes, edges_among_them) after optional expansion."""
+        activated = activation.get_activated_nodes(self.activation_threshold)
+        included_nodes: Set[str] = set(activated.keys())
+        if self.expand_hops > 0:
+            expansion_candidates = []
+            for node_id in list(included_nodes):
+                for edge in edges_out.get(node_id, []):
+                    if (
+                        edge.dst not in included_nodes
+                        and edge.effective_weight() >= 0.8
+                        and edge.type == "calls"
+                    ):
+                        expansion_candidates.append(edge.dst)
+            included_nodes.update(expansion_candidates)
+        included_edges: List[Edge] = []
+        for node_id in included_nodes:
+            for edge in edges_out.get(node_id, []):
+                if edge.dst in included_nodes:
+                    included_edges.append(edge)
+        return included_nodes, included_edges
 
 
 # ---------------------------------------------------------------------------
@@ -2226,50 +2064,10 @@ class PathIndex:
     # 4. Symbol-level queries
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def mark_stale_for_symbol(
-        self,
-        symbol_name: str,
-        project_id: str,
-    ) -> List[str]:
-        """
-        Mark all CodePathViews that contain symbol_name as stale so they are
-        rebuilt on the next build_activation_graph call.
-
-        The fix checks both the bare name and any qualified id ending with
-        '.' + bare_name, matching the semantics used throughout SymbolIndex.
-
-        Steps:
-            1.  Get all views for the project.
-            2.  For each view, check if symbol_name appears in induced_nodes
-                as either a bare name or a suffix of a qualified name.
-            3.  Collect and return stale path_ids.
-        """
-        views = self.get_all(project_id)
-        stale_ids: List[str] = []
-
-        bare = symbol_name.rsplit(".", 1)[-1]
-
-        for view in views:
-            induced = getattr(view, "induced_nodes", {}) or {}
-            matched = False
-
-            if symbol_name in induced:
-                matched = True
-            elif bare != symbol_name:
-                # symbol_name is already bare — only check bare
-                matched = bare in induced
-            else:
-                # Check as suffix of any qualified key
-                matched = any(
-                    k == symbol_name or k.endswith("." + symbol_name) for k in induced
-                )
-
-            if matched:
-                path_id = getattr(view, "path_id", None)
-                if path_id:
-                    stale_ids.append(path_id)
-
-        return stale_ids
+    def mark_stale_for_symbol(self, symbol_name: str, project_id: str) -> List[str]:
+        """Return path_ids that reference a given symbol (to invalidate them later)."""
+        key = f"{project_id}:{symbol_name}"
+        return list(self._symbol_to_views.get(key, set()))
 
     def find_entry_points(
         self, symbol_index: "SymbolIndex", project_id: str
@@ -2350,8 +2148,8 @@ class HubSymbolIndex:
         """True if *symbol_name* would appear in Block A for the given *top_n*."""
         return symbol_name in set(self.get_hub_names(centrality, top_n))
 
-    @staticmethod
     def build(
+        self,
         symbol_index: "SymbolIndex",
         centrality: dict,
         project_id: str,
@@ -2360,193 +2158,119 @@ class HubSymbolIndex:
         mode: str = "hubs_only",
     ) -> str:
         """
-        Build the hub-symbol section of Block A for the given project.
+        Build the full Block A symbol text: class outline (unchanged across
+        modes) + a call-graph section whose depth depends on *mode*:
 
-        Supported modes:
-            hubs_only      — compact list of hub signatures with callers/callees
-            expanded_hubs  — hub signatures plus inline body excerpts
-            full_graph     — all symbols in the project, no centrality filter
-            class_outline  — class hierarchy without method bodies
+          hubs_only      → existing behavior: top_n hubs by centrality only.
+          expanded_hubs  → top_n hubs + every direct caller/callee of each hub
+                           (depth 1, deduplicated, non-hub only).
+          full_graph     → every qualified symbol with its direct
+                           callers/callees, alphabetically sorted.
 
-        Returns "" when:
-            - The symbol index is empty.
-            - Centrality is not yet computed and mode requires it (hubs_only,
-              expanded_hubs). A log entry is emitted so operators know why
-              Block A is empty on the first turn.
-            - mode is unrecognised. A warning is logged so misconfigured valves
-              are immediately visible without tracing the full assembly pipeline.
-
-        FIX Bug 53: removed the automatic fallback from hubs_only/expanded_hubs
-        to class_outline when centrality is empty. That fallback was a behaviour
-        change: users on first session or with empty projects would see unexpected
-        content in Block A, and the block-A cache (keyed on structure hash, not
-        mode) could store a class_outline entry for a hubs_only key, producing
-        an inconsistent cache on the next turn when centrality becomes available.
-
-        Steps:
-            1.  Validate inputs; return "" on empty index.
-            2.  Check centrality availability for mode that requires it.
-            3.  Dispatch to the appropriate builder by mode.
-            4.  Log warning and return "" for unrecognised modes.
+        *mode* is resolved by the CALLER (ContextBuilder._resolve_call_graph_mode)
+        and passed in already-decided — this method does no query/intent logic,
+        it only renders. Deterministic while the code is unchanged (alphabetical /
+        centrality order), so llama.cpp's KV cache stays stable.
         """
-        # -- Step 1: validate inputs --
-        all_qids = symbol_index.get_all_qualified_names(project_id)
-        if not all_qids:
-            return ""
+        logger.debug(
+            f"HubSymbolIndex.build: rendering mode='{mode}' for project='{project_id}'"
+        )
 
-        # -- Step 2: centrality availability check --
-        if not centrality and mode in ("hubs_only", "expanded_hubs"):
-            import logging
+        sections = []
 
-            logging.getLogger(__name__).debug(
-                "HubSymbolIndex.build: centrality not yet computed for "
-                "'%s' (mode='%s'). Returning empty hub tier. "
-                "Will populate after first PPR pass.",
-                project_id,
-                mode,
-            )
-            return ""
-
-        # -- Step 3: dispatch --
-        if mode == "hubs_only":
-            hub_qids = HubSymbolIndex.get_hub_names(centrality, top_n)
-            if not hub_qids:
-                return ""
-            return HubSymbolIndex._build_hub_section(
-                hub_qids=hub_qids,
-                centrality=centrality,
-                symbol_index=symbol_index,
-                project_id=project_id,
-                enable_callees=True,
-            )
+        outline = self._build_class_outline(symbol_index, project_id, valves)
+        if outline:
+            sections.append(outline)
 
         if mode == "expanded_hubs":
-            return HubSymbolIndex._build_expanded_hubs_section(
-                symbol_index=symbol_index,
-                centrality=centrality,
-                project_id=project_id,
-                top_n=top_n,
-                valves=valves,
+            section = self._build_expanded_hubs_section(
+                symbol_index, centrality, project_id, top_n, valves
             )
+            if section:
+                sections.append(section)
+        elif mode == "full_graph":
+            section = self._build_full_graph_section(symbol_index, project_id, valves)
+            if section:
+                sections.append(section)
+        else:
+            # "hubs_only" and any unexpected value: render the stable hub
+            # section. Defensive fallback for an invalid valve never crashes
+            # and never renders nothing.
+            hub_qids = self.get_hub_names(centrality, top_n)
+            if hub_qids:
+                enable_callees = (
+                    getattr(valves, "enable_hub_callees", True) if valves else True
+                )
+                sections.append(
+                    self._build_hub_section(
+                        hub_qids, centrality, symbol_index, project_id, enable_callees
+                    )
+                )
 
-        if mode == "full_graph":
-            return HubSymbolIndex._build_full_graph_section(
-                symbol_index=symbol_index,
-                project_id=project_id,
-                valves=valves,
-            )
+        return "\n\n".join(s for s in sections if s.strip())
 
-        if mode == "class_outline":
-            return HubSymbolIndex._build_class_outline(
-                symbol_index=symbol_index,
-                project_id=project_id,
-                valves=valves,
-            )
-
-        # -- Step 4: unrecognised mode --
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "HubSymbolIndex.build: unrecognised mode '%s' for project '%s'. "
-            "Valid modes: hubs_only, expanded_hubs, full_graph, class_outline. "
-            "Returning empty hub tier.",
-            mode,
-            project_id,
-        )
-        return ""
-
-    @staticmethod
     def _build_expanded_hubs_section(
-        symbol_index: "SymbolIndex",
-        centrality: dict,
-        project_id: str,
-        top_n: int = 30,
-        valves=None,
+        self, symbol_index, centrality, project_id, top_n, valves=None
     ) -> str:
         """
-        Build an expanded hub section including a short body excerpt for
-        each top hub symbol.
+        Top-N hubs (rendered exactly as in hubs_only) PLUS a sub-section
+        listing every direct neighbor (caller or callee) of any hub that is
+        not itself a hub — one hop beyond the hub set without the full
+        O(all symbols) cost.
 
-        Steps:
-            1.  Resolve budget and per-hub cap from valves.
-            2.  Select top_n hub qids by centrality.
-            3.  For each hub: render signature, callers/callees, and
-                truncated body within per-hub cap.
-            4.  Accumulate into section respecting total budget.
-            5.  Return formatted section string.
+        Neighbors are a flat qid list grouped by hub (NOT full
+        _format_symbol_line entries — that would recursively pull in THEIR
+        neighbors and balloon token cost, blowing the ~2k-5k budget).
+        Truncated by expanded_hubs_max_tokens with an explicit notice.
         """
-        total_budget = HubSymbolIndex.valves_expanded_hubs_budget_chars(valves)
-        # Bug 132: guard zero budget
-        if not total_budget or total_budget <= 0:
-            total_budget = 8000  # safe default
-
-        per_hub_cap = (
-            getattr(valves, "expanded_hub_max_chars_per_hub", 500) if valves else 500
-        )
-        # Bug 131: ensure per_hub_cap is meaningful
-        if per_hub_cap <= 0:
-            per_hub_cap = 500
-
-        hub_qids = HubSymbolIndex.get_hub_names(centrality, top_n)
+        enable_callees = getattr(valves, "enable_hub_callees", True) if valves else True
+        hub_qids = self.get_hub_names(centrality, top_n)
         if not hub_qids:
+            logger.debug("Expanded hubs: no hubs found, returning empty.")
             return ""
 
-        parts: List[str] = []
-        total_chars = 0
+        hub_section = self._build_hub_section(
+            hub_qids, centrality, symbol_index, project_id, enable_callees
+        )
 
+        hub_set = set(hub_qids)
+        neighbor_lines = []
         for qid in hub_qids:
-            if total_chars >= total_budget:
+            callers = self._safe_callers(qid, project_id, symbol_index) - hub_set
+            callees = self._safe_callees(qid, project_id, symbol_index) - hub_set
+            extra = sorted(callers | callees)
+            if extra:
+                neighbor_lines.append(f"- `{qid}` neighbors: {', '.join(extra)}")
+
+        if not neighbor_lines:
+            logger.debug("Expanded hubs: no neighbor lines to add.")
+            return hub_section
+
+        budget_chars = self.valves_expanded_hubs_budget_chars(valves)
+        kept_lines = []
+        total = 0
+        omitted = 0
+        for idx, line in enumerate(neighbor_lines):
+            total += len(line)
+            if budget_chars and total > budget_chars:
+                omitted = len(neighbor_lines) - idx
+                kept_lines.append(
+                    f"_(Neighbor list truncated to fit budget — "
+                    f"{omitted} hub(s) omitted)_"
+                )
                 break
+            kept_lines.append(line)
 
-            # Signature line
-            sig = symbol_index.get_signature(qid, project_id) or qid.rsplit(".", 1)[-1]
-            cent = centrality.get(qid, 0.0)
-            file_path = HubSymbolIndex._file_for(qid, project_id, symbol_index)
-            loc = f" · `{file_path}`" if file_path else ""
+        logger.debug(
+            f"Expanded hubs: {len(hub_qids)} hubs, {len(neighbor_lines)} neighbor entries total, "
+            f"{len(kept_lines) - (1 if omitted else 0)} shown, {omitted} omitted due to budget."
+        )
 
-            callers = HubSymbolIndex._safe_callers(qid, project_id, symbol_index)
-            callees = HubSymbolIndex._safe_callees(qid, project_id, symbol_index)
-
-            caller_str = ""
-            if callers:
-                caller_sigs = [
-                    symbol_index.get_signature(c, project_id) or c.rsplit(".", 1)[-1]
-                    for c in sorted(callers)[:3]
-                ]
-                caller_str = f"\n  ← {', '.join(f'`{s}`' for s in caller_sigs)}"
-
-            callee_str = ""
-            if callees:
-                callee_sigs = [
-                    symbol_index.get_signature(c, project_id) or c.rsplit(".", 1)[-1]
-                    for c in sorted(callees)[:3]
-                ]
-                callee_str = f"\n  → {', '.join(f'`{s}`' for s in callee_sigs)}"
-
-            # Docstring
-            docstring = symbol_index.get_docstring(qid, project_id) or ""
-            doc_line = f"\n  _{docstring[:120]}_" if docstring else ""
-
-            hub_text = (
-                f"#### `{sig}` _(hub: {cent:.2f})_{loc}"
-                f"{doc_line}{caller_str}{callee_str}"
-            )
-
-            # Bug 131: per-hub cap on body
-            if len(hub_text) > per_hub_cap:
-                hub_text = hub_text[:per_hub_cap] + "…"
-
-            remaining = total_budget - total_chars
-            if len(hub_text) > remaining:
-                hub_text = hub_text[:remaining] + "…"
-
-            parts.append(hub_text)
-            total_chars += len(hub_text)
-
-        if not parts:
-            return ""
-
-        return "### Hub Symbols (expanded)\n\n" + "\n\n".join(parts)
+        neighbor_section = (
+            "### Direct neighbors of hub symbols (depth 1, non-hub only)\n"
+            + "\n".join(kept_lines)
+        )
+        return hub_section + "\n\n" + neighbor_section
 
     @staticmethod
     def valves_expanded_hubs_budget_chars(valves) -> int:
@@ -2830,73 +2554,30 @@ class HubSymbolIndex:
         except Exception:
             return set()
 
-    @staticmethod
     def _format_symbol_line(
-        qid: str,
-        centrality: dict,
-        symbol_index: "SymbolIndex",
-        project_id: str,
-        enable_callees: bool = True,
+        self, qid, centrality, symbol_index, project_id, enable_callees=True
     ) -> str:
         """
-        Format a single symbol line for the hub tier.
+        Format one hub-symbol line: ``- `qid` (centrality: score)``
+        optionally followed by ``← used by:`` (all callers) and
+        ``→ calls:`` (all callees, when *enable_callees* is True).
 
-        Renders: signature, centrality score, file location, and optionally
-        the top callers and callees.
-
-        When get_signature() returns None (stale index entry, dangling edge, or
-        symbol removed since last centrality computation), falls back to the
-        bare qualified id rather than producing the literal string "None" in the
-        hub section.
-
-        Steps:
-            1.  Resolve signature with bare-qid fallback.
-            2.  Format centrality score.
-            3.  Append file location if available.
-            4.  Append callers and callees when enabled.
+        All callers and callees are shown in full, without truncation.
         """
-        # -- Step 1: resolve signature --
-        signature = (
-            symbol_index.get_signature(qid, project_id)
-            or qid.rsplit(".", 1)[-1]  # bare name as last resort
-        )
+        score = centrality.get(qid, 0.0)
+        callers = self._safe_callers(qid, project_id, symbol_index)
 
-        cent_score = centrality.get(qid, 0.0)
+        parts = [f"- `{qid}` (centrality: {score:.2f})"]
 
-        # -- Step 2: format score --
-        line = f"- `{signature}` _(hub: {cent_score:.2f})_"
+        if callers:
+            parts.append(f"\n  ← used by: {', '.join(sorted(callers))}")
 
-        # -- Step 3: file location --
-        file_path = HubSymbolIndex._file_for(qid, project_id, symbol_index)
-        if file_path:
-            line += f" · `{file_path}`"
-
-        # -- Step 4: callers and callees --
         if enable_callees:
-            callers = HubSymbolIndex._safe_callers(qid, project_id, symbol_index)
-            callees = HubSymbolIndex._safe_callees(qid, project_id, symbol_index)
-
-            if callers:
-                caller_sigs = []
-                for c in sorted(callers)[:3]:
-                    sig = (
-                        symbol_index.get_signature(c, project_id)
-                        or c.rsplit(".", 1)[-1]
-                    )
-                    caller_sigs.append(f"`{sig}`")
-                line += f"\n  ← {', '.join(caller_sigs)}"
-
+            callees = self._safe_callees(qid, project_id, symbol_index)
             if callees:
-                callee_sigs = []
-                for c in sorted(callees)[:3]:
-                    sig = (
-                        symbol_index.get_signature(c, project_id)
-                        or c.rsplit(".", 1)[-1]
-                    )
-                    callee_sigs.append(f"`{sig}`")
-                line += f"\n  → {', '.join(callee_sigs)}"
+                parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
 
-        return line
+        return "".join(parts)
 
 
 class ContextPager:
@@ -3518,59 +3199,50 @@ class ContextPager:
         db_conn=None,
     ) -> "Optional[CodeBlock]":
         """
-        Retrieve a soft-evicted block from ChromaDB for use in the current turn only.
+        Retrieve a paged block for temporary use THIS TURN ONLY.
+
+        Reconstruction uses ChromaDB as the single authoritative source —
+        the full block content is stored there by _page_out_async.
+        The previous SQLite path was dead code: page_out_block never wrote
+        to code_contents, so reconstruction always fell back to a 2000-char
+        excerpt. Now the document field contains the complete content.
+
         Does NOT restore the block to active_blocks.
 
-        ChromaDB is always consulted when the block is absent from the in-memory
-        registry. This handles the post-restart case where _paged_hashes was reset
-        but the block persists in ChromaDB. When found via this fallback path, the
-        block_hash is re-registered in _paged_hashes so that subsequent is_paged()
-        calls return correctly for the remainder of the session.
+        Args:
+            block_hash: Hash of the block to page in.
+            project_id: Current project identifier.
+            chroma_collection: ChromaDB collection.
+            db_conn: Unused, kept for API compatibility.
 
-        db_conn is accepted for API compatibility but is unused; ChromaDB is the
-        single authoritative source for paged block content.
+        Returns:
+            The reconstructed CodeBlock, or None if not found.
         """
-        if chroma_collection is None:
+        if not self.is_paged(block_hash, project_id):
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
 
-        # -- Step 1: log registry miss for diagnostics --
-        # The absence from _paged_hashes does not abort the lookup; it may
-        # simply indicate a post-restart access.
-        if not self.is_paged(block_hash, project_id):
-            self._f._log_debug(
-                f"page_in_block: {block_hash[:8]} not in paged registry, "
-                f"attempting ChromaDB lookup (possible post-restart access)"
-            )
-
-        # -- Step 2: fetch full content and metadata from ChromaDB --
+        # ── Step 1: Retrieve full content and metadata from ChromaDB ──────────
         meta = None
         content = ""
-        try:
-            result = await anyio.to_thread.run_sync(
-                lambda: chroma_collection.get(
-                    ids=[entry_id], include=["metadatas", "documents"]
+        if chroma_collection is not None:
+            try:
+                result = await anyio.to_thread.run_sync(
+                    lambda: chroma_collection.get(
+                        ids=[entry_id], include=["metadatas", "documents"]
+                    )
                 )
-            )
-            if result and result.get("ids"):
-                meta = result["metadatas"][0]
-                content = result["documents"][0] if result.get("documents") else ""
-        except Exception as e:
-            self._f._log_debug(
-                f"page_in_block: ChromaDB fetch failed for {block_hash[:8]}: {e}"
-            )
-            return None
+                if result and result.get("ids"):
+                    meta = result["metadatas"][0]
+                    content = result["documents"][0] if result.get("documents") else ""
+            except Exception:
+                pass
 
         if not content:
             return None
 
-        # -- Step 3: re-register in paged_hashes --
-        # Ensures is_paged() returns True for the remainder of this session
-        # without requiring another ChromaDB round-trip.
-        self._paged_hashes.setdefault(project_id, set()).add(block_hash)
-
-        # -- Step 4: extract metadata fields with safe defaults --
+        # ── Step 2: Extract metadata fields with safe defaults ────────────────
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3584,14 +3256,14 @@ class ContextPager:
         except Exception:
             ctype = ContentType.GENERAL
 
-        # -- Step 5: re-extract symbols from the restored content --
+        # ── Step 3: Deterministic symbol re-extraction ────────────────────────
         symbols = []
         try:
             symbols = await SignatureExtractor.extract_async(content, file_path)
         except Exception:
             pass
 
-        # -- Step 6: reconstruct and return the CodeBlock --
+        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -3602,7 +3274,6 @@ class ContextPager:
         )
         for s in block.symbols:
             s.parent_block_hash = block_hash
-
         return block
 
 
@@ -3758,172 +3429,153 @@ class RaptorCodeIndex:
         stop_event: Optional[asyncio.Event] = None,
     ) -> int:
         """
-        Build one RAPTOR layer by clustering symbols (level 1) or prior-level
-        summaries (level > 1), generating a natural-language summary per cluster,
-        and storing the results in ChromaDB.
+        Build one RAPTOR level and store its cluster summaries.
 
-        Returns the number of clusters stored, or 0 when the layer is skipped
-        (empty project, insufficient items to cluster, stop_event set).
+        level == 1: cluster raw symbols (now using qualified ids).
+        level >= 2: cluster the previous level's summaries (read back from the
+                    store); graph features are not used at L2 (summaries have no
+                    direct call edges), so the augmented vector degrades to the
+                    plain semantic embedding.
 
-        n_clusters is capped to len(names) before clustering. Without this cap,
-        KMeans raises ValueError when the project has fewer symbols than the
-        configured cluster count, which kills the background RAPTOR task
-        permanently for that session.
+        If stop_event is provided and becomes set, the method returns early
+        without completing the level.
 
-        Steps:
-            1.  Collect names for this level (symbols at L1, summary texts at L>1).
-            2.  Cap n_clusters to len(names); exit when fewer than 2 items remain.
-            3.  Compute embeddings with stop_event checks between batches.
-            4.  Build graph-feature matrix from edge adjacency.
-            5.  Cluster with KMeans using combined embedding + graph distance.
-            6.  For each cluster: summarise members and store in ChromaDB.
-            7.  Prune stale clusters from prior builds at this level.
-            8.  Return cluster count.
+        Returns the number of clusters actually created.
         """
+        import numpy as np
+
+        # ── Step 0: Early exit if stop requested ──────────────────────────
         if stop_event and stop_event.is_set():
             return 0
 
-        # -- Step 1: collect names --
+        # ── Step 1: Gather items + embeddings for this level ──────────────
         if level == 1:
-            names: List[str] = list(symbol_index.get_all_qualified_names(project_id))
-            member_texts: List[str] = [
-                (symbol_index.get_signature(n, project_id) or n)
-                + (
-                    f": {symbol_index.get_docstring(n, project_id)}"
-                    if symbol_index.get_docstring(n, project_id)
-                    else ""
+            names = list(symbol_index.get_all_qualified_names(project_id))
+            texts = []
+            for n in names:
+                sig = self._safe(
+                    getattr(symbol_index, "get_signature", None),
+                    n,
+                    project_id,
+                    default=n,
                 )
-                for n in names
-            ]
+                doc = self._safe(
+                    getattr(symbol_index, "get_docstring", None),
+                    n,
+                    project_id,
+                    default="",
+                )
+                texts.append(f"{sig} — {doc}".strip(" —"))
+            item_ids = names
         else:
-            prev_summaries = await self._load_level_summaries(
+            prev = await self._load_level_summaries(
                 project_id, level - 1, chroma_collection
             )
-            if not prev_summaries:
+            if len(prev) < max(2 * n_clusters, 4):
                 return 0
-            names = [
-                s.get("id", f"L{level-1}_c{i}") for i, s in enumerate(prev_summaries)
-            ]
-            member_texts = [s.get("text", "") for s in prev_summaries]
+            item_ids = [p["id"] for p in prev]
+            texts = [p["text"] for p in prev]
+            names = item_ids
 
-        if not names:
-            self._f._log_debug(
-                f"RAPTOR build_layer: no items for project '{project_id}' "
-                f"level {level}, skipping"
-            )
+        if len(texts) < max(2 * n_clusters, 4):
             return 0
 
-        # -- Step 2: cap n_clusters --
-        original_n = n_clusters
-        n_clusters = min(n_clusters, len(names))
-        if n_clusters != original_n:
-            self._f._log_debug(
-                f"RAPTOR build_layer: capped n_clusters {original_n}→{n_clusters} "
-                f"(only {len(names)} item(s) available)"
-            )
-
-        if n_clusters < 2:
-            self._f._log_debug(
-                f"RAPTOR build_layer: {len(names)} item(s) — fewer than 2 required "
-                f"for clustering, skipping level {level}"
-            )
-            return 0
-
-        if stop_event and stop_event.is_set():
-            return 0
-
-        # -- Step 3: compute embeddings --
+        # ── Step 2: Semantic embeddings ────────────────────────────────────
         try:
-            embeddings = await anyio.to_thread.run_sync(
-                lambda: embedder.encode(member_texts, show_progress_bar=False)
+            sem = await anyio.to_thread.run_sync(
+                lambda: np.asarray(embedder.encode(texts), dtype=np.float32)
             )
-        except Exception as e:
-            self._f._log_debug(
-                f"RAPTOR build_layer: embedding failed for level {level}: {e}"
-            )
-            return 0
-
-        if stop_event and stop_event.is_set():
-            return 0
-
-        # -- Step 4: build graph features --
-        try:
-            graph_features = self._build_graph_features(names, edges_out)
         except Exception:
-            graph_features = None
-
-        # -- Step 5: cluster --
-        try:
-            import numpy as np
-            from sklearn.cluster import KMeans
-            from sklearn.preprocessing import normalize
-
-            emb_matrix = np.array(embeddings, dtype=np.float32)
-            emb_norm = normalize(emb_matrix)
-
-            if graph_features is not None and graph_weight > 0.0:
-                gf_norm = normalize(np.array(graph_features, dtype=np.float32))
-                combined = (1.0 - graph_weight) * emb_norm + graph_weight * gf_norm
-            else:
-                combined = emb_norm
-
-            km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-            labels = km.fit_predict(combined)
-
-        except Exception as e:
-            self._f._log_debug(
-                f"RAPTOR build_layer: clustering failed level {level}: "
-                f"{type(e).__name__}: {e}"
-            )
             return 0
 
-        # -- Step 6: summarise and store --
-        stored = 0
-        clusters: Dict[int, List[int]] = {}
-        for idx, label in enumerate(labels):
-            clusters.setdefault(int(label), []).append(idx)
+        # ── Step 3: Augmented features (semantic | graph) ─────────────────
+        if level == 1 and graph_weight > 0.0:
+            graph_feats = self._build_graph_features(names, edges_out)
+            sem_scaled = sem * (1.0 - graph_weight)
+            graph_scaled = graph_feats * graph_weight
+            features = np.hstack([sem_scaled, graph_scaled])
+        else:
+            features = sem
 
-        for cluster_id, member_indices in clusters.items():
+        # ── Step 4: KMeans fit ────────────────────────────────────────────
+        # Check stop before the potentially long KMeans operation.
+        if stop_event and stop_event.is_set():
+            return 0
+
+        k = min(n_clusters, len(texts))
+        try:
+            from sklearn.cluster import KMeans
+
+            labels = await anyio.to_thread.run_sync(
+                lambda: KMeans(n_clusters=k, n_init=4, random_state=42).fit_predict(
+                    features
+                )
+            )
+        except ImportError:
+            self._f._log_debug(
+                "RAPTOR clustering disabled: scikit-learn not installed."
+            )
+            return 0
+        except Exception as e:
+            err_str = str(e)
+            # Detect sklearn ABI mismatch — Cython extension compiled against
+            # a different sklearn version than currently installed.
+            # Symptom: "C function sklearn.utils._sorting.__pyx_fuse_N...
+            # has wrong signature" or similar _sorting import errors.
+            # Fix: pip install --force-reinstall scikit-learn==1.9.0
+            # Prevention: scikit-learn==1.9.0 is pinned in requirements.
+            if (
+                "wrong signature" in err_str
+                or "_sorting" in err_str
+                or "simultaneous_sort" in err_str
+            ):
+                logger.warning(
+                    "[CodeAware] RAPTOR clustering failed: sklearn ABI mismatch "
+                    f"(level={level}, k={k}, sklearn version may have been "
+                    "reinstalled without the correct .so files). "
+                    "Run: docker exec open-webui pip install --force-reinstall "
+                    "scikit-learn==1.9.0 --break-system-packages "
+                    "&& docker restart open-webui"
+                )
+            else:
+                logger.warning(
+                    f"[CodeAware] RAPTOR clustering failed "
+                    f"(level={level}, k={k}, n_items={len(texts)}): {e}"
+                )
+            return 0
+
+        # ── Step 5: Per-cluster summary + store ───────────────────────────
+        clusters: dict = {}
+        for idx, lab in enumerate(labels):
+            clusters.setdefault(int(lab), []).append(idx)
+
+        created = 0
+        for lab, member_idxs in clusters.items():
             if stop_event and stop_event.is_set():
                 break
 
-            cluster_texts = [member_texts[i] for i in member_indices]
-            cluster_names = [names[i] for i in member_indices]
+            member_texts = [texts[i] for i in member_idxs]
+            member_names = [item_ids[i] for i in member_idxs]
 
-            try:
-                summary = await self._summarise_cluster(
-                    cluster_texts, level, summary_model, summary_max_tokens, llm_caller
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"RAPTOR build_layer: summarise failed for cluster "
-                    f"{cluster_id} level {level}: {e}"
-                )
+            summary = await self._summarise_cluster(
+                member_texts, level, summary_model, summary_max_tokens, llm_caller
+            )
+            if not summary:
                 continue
 
-            ok = await self._store_summary(
-                project_id,
-                level,
-                cluster_id,
-                summary,
-                cluster_names,
-                chroma_collection,
-                embedder,
+            stored = await self._store_summary(
+                project_id=project_id,
+                level=level,
+                cluster_id=lab,
+                summary=summary,
+                member_names=member_names,
+                chroma_collection=chroma_collection,
+                embedder=embedder,
             )
-            if ok:
-                stored += 1
+            if stored:
+                created += 1
 
-        # -- Step 7: prune stale clusters --
-        if stored > 0:
-            await self._prune_stale_clusters(
-                project_id, level, stored, chroma_collection
-            )
-
-        self._f._log_debug(
-            f"RAPTOR build_layer: level {level} complete — "
-            f"{stored}/{n_clusters} cluster(s) stored for '{project_id}'"
-        )
-        return stored
+        return created
 
     async def retrieve(
         self,
@@ -3934,78 +3586,60 @@ class RaptorCodeIndex:
         chroma_collection,
     ) -> list:
         """
-        Retrieve the top_k most relevant RAPTOR cluster summaries for a query.
+        Return cluster summary texts most relevant to the query, highest level
+        first (L2 subsystems before L1 function groups).
 
-        Queries all built RAPTOR levels and merges results by distance before
-        returning the top_k summaries as plain strings. Returns [] on any
-        infrastructure error or when the index is empty.
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
+            top_k: Maximum number of summaries to return.
+            embedder: Embedder instance.
+            chroma_collection: ChromaDB collection.
 
-        ChromaDB query() returns nested lists even when empty:
-            {"documents": [[]], "distances": [[]]}
-        Accessing [0] on an empty inner list raises IndexError. Every result
-        field is therefore guarded with (field or [[]])[0] before use.
-
-        Steps:
-            1.  Embed the query; return [] on failure.
-            2.  For each RAPTOR level up to raptor_max_levels: query ChromaDB,
-                guard against empty/missing result fields, collect (doc, dist) pairs.
-            3.  Sort all collected results by distance and return the top_k docs.
+        Returns:
+            List of summary text strings.
         """
-        if not chroma_collection:
+        if chroma_collection is None:
             return []
 
-        # -- Step 1: embed query --
+        # ------------------------------------------------------------------
+        # Embed the query.
+        # ------------------------------------------------------------------
         try:
-            query_emb = await anyio.to_thread.run_sync(
-                lambda: embedder.encode([query], show_progress_bar=False)[0].tolist()
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: embedder.encode(query[:1000]).tolist()
             )
-        except Exception as e:
-            self._f._log_debug(f"RAPTOR retrieve: embedding failed: {e}")
+
+            # ------------------------------------------------------------------
+            # Query ChromaDB for RAPTOR summaries.
+            # ------------------------------------------------------------------
+            res = await anyio.to_thread.run_sync(
+                lambda: chroma_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=top_k,
+                    where={
+                        "$and": [
+                            {"project_id": project_id},
+                            {"is_raptor_summary": True},
+                        ]
+                    },
+                    include=["documents", "metadatas"],
+                )
+            )
+        except Exception:
             return []
 
-        # -- Step 2: query each level --
-        max_levels = getattr(self._f.valves, "raptor_max_levels", 3)
-        all_results: List[Tuple[str, float]] = []
-
-        for level in range(1, max_levels + 1):
-            try:
-                raw = await anyio.to_thread.run_sync(
-                    lambda lvl=level: chroma_collection.query(
-                        query_embeddings=[query_emb],
-                        n_results=top_k,
-                        where={
-                            "$and": [
-                                {"project_id": {"$eq": project_id}},
-                                {"raptor_level": {"$eq": lvl}},
-                            ]
-                        },
-                        include=["documents", "distances"],
-                    )
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"RAPTOR retrieve: ChromaDB query failed level {level}: "
-                    f"{type(e).__name__}: {e}"
-                )
-                continue
-
-            # Guard against empty/missing result fields before indexing.
-            docs = (raw.get("documents") or [[]])[0]
-            distances = (raw.get("distances") or [[]])[0]
-
-            if not docs:
-                continue
-
-            for doc, dist in zip(docs, distances):
-                if doc and isinstance(doc, str):
-                    all_results.append((doc, float(dist)))
-
-        if not all_results:
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        if not docs:
             return []
 
-        # -- Step 3: merge and return top_k --
-        all_results.sort(key=lambda x: x[1])
-        return [doc for doc, _ in all_results[:top_k]]
+        # ------------------------------------------------------------------
+        # Sort by raptor_level desc (subsystems first), keep original order otherwise.
+        # ------------------------------------------------------------------
+        paired = list(zip(docs, metas))
+        paired.sort(key=lambda dm: -int(dm[1].get("raptor_level", 1)))
+        return [d for d, _ in paired]
 
     # ------------------------------------------------------------------
     # Region: Graph & Distance Helpers (for clustering)
@@ -4825,7 +4459,7 @@ class ContextBuilder:
                 )
                 pstate["skeleton_tier_cache_key"] = structure_hash
                 pstate["skeleton_tier_cached"] = ""
-                psm.set_skeleton_tier_qids(project_id, [])  # FIX Bug 4
+                psm.set_skeleton_tier_qids(project_id, [])
                 return ""
 
         tier = (
@@ -4853,8 +4487,17 @@ class ContextBuilder:
 
     def _build_hub_bodies_tier(self, project_id: str) -> Tuple[str, str, List[str]]:
         """
-        Build the Hub‑Bodies Tier: full bodies of top‑N hubs by centrality,
+        Build the Hub-Bodies Tier: full bodies of top-N hubs by centrality,
         ordered by stability (last_modified_turn), truncated by budget.
+
+        Bug 10 fix: the previous tier_hash computation performed ``str + bytes``
+        (a ``TypeError``) because ``.encode()`` was applied only to the right-hand
+        side of the ``+`` operator.  The fix encloses the full concatenated string
+        in parentheses before calling ``.encode()``.
+
+        Returns:
+            Tuple of (tier_text, tier_hash, kept_qids).
+            tier_text is empty when the tier is disabled or no hubs qualify.
         """
         if not self._f.valves.enable_hub_bodies_tier:
             return "", "", []
@@ -4885,6 +4528,7 @@ class ContextBuilder:
         floor = self._f.valves.hub_bodies_tier_min_centrality
         candidates = [qid for qid, c in ranked if (floor <= 0 or c >= floor)]
 
+        # ── Resolve body text for each candidate ──────────────────────────────────
         resolved = {}
         for qid in candidates:
             body, lang = self._resolve_hub_body(qid, project_id, state)
@@ -4903,11 +4547,13 @@ class ContextBuilder:
         if not resolved:
             return "", "", []
 
+        # ── Compute per-hub query heat (exponential moving average) ──────────────
         alpha = 0.3
         for qid in candidates:
             was_seed = 1.0 if qid in prev_seeds else 0.0
             heat[qid] = alpha * was_seed + (1 - alpha) * heat.get(qid, 0.0)
 
+        # ── Order by stability: oldest-modified first, highest heat as tiebreaker ─
         ordered = sorted(
             resolved,
             key=lambda q: (
@@ -4917,13 +4563,14 @@ class ContextBuilder:
             ),
         )
 
+        # ── Apply token budget ─────────────────────────────────────────────────────
         budget = self._f.valves.hub_bodies_tier_max_tokens
         if (
             self._f.valves.enable_multi_phase_response
             or self._f.valves.force_multi_phase_response
         ):
             budget = min(budget, 6000)
-            self._f._log_debug(f"Hub tier: budget capped to 6000 (multi‑phase active)")
+            self._f._log_debug(f"Hub tier: budget capped to 6000 (multi-phase active)")
 
         lines = [
             "## Core Implementation (hub symbols — stable, cached)",
@@ -4942,7 +4589,7 @@ class ContextBuilder:
             doc_line = f"_{doc}_\n" if doc else ""
 
             kept_set = set(kept)
-            body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | set([qid]))
+            body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | {qid})
 
             chunk = f"### `{qid}`\n{doc_line}```{lang}\n{body_with_xrefs}\n```\n"
             tok = self._f._tokens.estimate_code_tokens(chunk)
@@ -4964,15 +4611,19 @@ class ContextBuilder:
 
         tier_text = "\n".join(lines)
 
+        # ── Bug 10 fix: encode the entire concatenated string, not just the rhs ───
+        # Previous code: f"{config_prefix}|" + "|".join(...).encode()
+        # → TypeError: can only concatenate str (not "bytes") to str
         config_prefix = (
             f"n={self._f.valves.hub_bodies_tier_top_n}|"
             f"floor={self._f.valves.hub_bodies_tier_min_centrality}"
         )
-        tier_hash = hashlib.md5(
-            f"{config_prefix}|"
-            + "|".join(f"{q}:{resolved[q][1]}" for q in kept).encode()
-        ).hexdigest()[:16]
+        _tier_key = f"{config_prefix}|" + "|".join(
+            f"{q}:{resolved[q][1]}" for q in kept
+        )
+        tier_hash = hashlib.md5(_tier_key.encode()).hexdigest()[:16]
 
+        # ── Clean up stale heat/body-hash entries ──────────────────────────────────
         live = set(candidates)
         for d in (last_mod, body_hashes, heat):
             for stale in [k for k in list(d.keys()) if k not in live]:
@@ -4981,6 +4632,7 @@ class ContextBuilder:
         state.hub_tier_qids_persisted = kept
         self._f._conversation_state_manager.set(project_id, state)
 
+        # ── Log KV-cache stability signal ─────────────────────────────────────────
         previous_tier_hash = psm.get_pstate(project_id).get("last_tier_hash")
         if previous_tier_hash and previous_tier_hash != tier_hash:
             self._f._log_debug(
@@ -5942,46 +5594,34 @@ Output only the option name.
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
 
-        Steps:
-            1.  Early exit when path analysis is disabled.
-            2.  Fast paths: empty state, skeleton-symbol intent, skeleton intent,
-                inventory queries.
-            3.  Use case classification and semantic seed inference.
-            4.  Build ActivationGraph via PPR; abort if no nodes activate.
-            5.  Adjust LOD thresholds by intent vector and use-case profile.
-            6.  Case D: pull direct callers into Block B at LOD-1.
-            7.  Resolve call-graph mode from pstate.
-            8.  Compute token budget for Block B assembly.
-            9.  LOD-2 hysteresis: build lod2_qids and lod3_qids from pre-bump
-                activation scores; persist lod2_active_qids_prev.
-            10. Retrieve skeleton tier qids to avoid signature duplication.
-            11. Define _lod_tier closure (captures lod2_qids/lod3_qids by name).
-                Sort activated nodes by descending tier then descending score.
-            12. Centrality LOD bump: adjust per-node activation scores, then
-                rebuild lod2_qids and lod3_qids from bumped scores preserving
-                LOD-2 hysteresis (Bug 12 fix), and re-sort.
-            13. Batch LOD-2 docstring pre-resolution.
-                lod3_qids excluded (Bug 14 fix): full-body nodes receive body
-                injection in Step 15, making a separate docstring pass redundant.
-            14. Batch LOD-2.5 CFG pre-resolution.
-                lod3_qids excluded (Bug 14 fix): same reason as Step 13.
-            15. Render each activated node at its effective LOD tier:
-                  LOD-1 → signature line
-                  LOD-2 → signature + docstring (+ optional CFG skeleton)
-                  LOD-3 → full code body with overflow / compression /
-                           semantic relevance filter
-            16. Prepend RAPTOR cluster summaries to the LOD-2 section.
-            17. SWA-aware assembly of rendered sections.
-            18. Append hub recency pointers.
-            19. Append use-case instruction tail.
-            20. Fallback to full active_code_context when nothing rendered.
-            21. Append summary line.
-            22. Record LOD-level map for adaptive threshold tuning.
-            23. Store injected qids for docstring prioritisation.
-        """
-        psm = self._f._project_state_manager
+        Constructs the per-query dynamic context injected alongside the static
+        Block A.  Uses PPR activation, LOD thresholds, semantic filtering, and
+        optional LLM-assisted relevance evaluation for LOD-3 blocks.
 
-        # ── Step 1: early exit ────────────────────────────────────────────────
+        Bug 12 fix: after the centrality LOD bump (Step 12), ``lod2_qids`` and
+        ``lod3_qids`` are rebuilt from the bumped scores so that ``_lod_tier()``
+        uses up-to-date sets.  Previously, nodes bumped above ``lod3_threshold``
+        were still rendered at LOD-2.
+
+        Bug 14 fix: ``lod2_candidates`` in Steps 13 and 14 now uses
+        ``lod2_qids - lod3_qids`` instead of plain ``lod2_qids``.  This avoids
+        generating docstrings and CFG skeletons for nodes that will already
+        receive their full body at LOD-3.
+
+        Args:
+            project_id: Current project identifier.
+            query: The user query.
+            messages: The conversation messages.
+            slot_free: Whether the LLM slot is free.
+            intent_vector: Intent classification results.
+            is_continuation: Whether this is a continuation turn.
+
+        Returns:
+            The rendered Block B, or an empty string if no context is needed.
+        """
+        # ------------------------------------------------------------------
+        # Step 1: Early exits.
+        # ------------------------------------------------------------------
         if not self._f.valves.enable_path_analysis:
             active_ctx = self._f._activation.get_active_code_context(project_id, query)
             return active_ctx if active_ctx else ""
@@ -5990,7 +5630,9 @@ Output only the option name.
         if not state or not state.active_blocks:
             return ""
 
-        # ── Step 2: fast paths ────────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 2: Fast paths for skeleton and inventory queries.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_skeleton_intent:
             _sym_match = self._SKELETON_SYMBOL_RE.search(query)
             if _sym_match:
@@ -6015,7 +5657,9 @@ Output only the option name.
             if all_qids:
                 return await self._format_full_symbol_inventory(all_qids, project_id)
 
-        # ── Step 3: use case classification and seed inference ────────────────
+        # ------------------------------------------------------------------
+        # Step 3: Use case classification and seed inference.
+        # ------------------------------------------------------------------
         active_use_case, use_case_profile, _ = await self.classify_use_case(
             query, intent_vector, project_id
         )
@@ -6030,7 +5674,9 @@ Output only the option name.
                 slot_free=slot_free,
             )
 
-        # ── Step 4: build ActivationGraph ────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 4: Build ActivationGraph and get activated nodes.
+        # ------------------------------------------------------------------
         ag = await self._f._activation.build_activation_graph(
             query,
             project_id,
@@ -6050,7 +5696,9 @@ Output only the option name.
             if self._f._write_counter % 50 == 0:
                 self._f._log_debug(self._f._activation._ppr_cache.stats)
 
-        # ── Step 5: adjust LOD thresholds by intent ───────────────────────────
+        # ------------------------------------------------------------------
+        # Step 5: Adjust LOD thresholds by intent.
+        # ------------------------------------------------------------------
         debug_weight = intent_vector.get("debug", 0.2)
         modify_weight = intent_vector.get("modify", 0.3)
         refactor_weight = intent_vector.get("refactor", 0.1)
@@ -6074,7 +5722,9 @@ Output only the option name.
             lod2 *= scale
             lod1 *= scale
 
-        # ── Step 6: Case D – pull in direct callers ───────────────────────────
+        # ------------------------------------------------------------------
+        # Step 6: Case D — pull in direct callers.
+        # ------------------------------------------------------------------
         if (
             self._f.valves.enable_lod_by_intent
             and active_use_case == "D"
@@ -6098,18 +5748,24 @@ Output only the option name.
                     break
             if pulled:
                 self._f._log_debug(
-                    f"Case D: pulled {pulled} direct caller(s) into Block B "
-                    f"at LOD-1 (impact analysis)"
+                    f"Case D: pulled {pulled} direct caller(s) of seed symbol(s) "
+                    f"into Block B at LOD-1 (impact analysis)."
                 )
 
-        # ── Step 7: resolve call-graph mode ──────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 7: Resolve call graph mode.
+        # ------------------------------------------------------------------
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
         resolved_graph_mode = psm.get_resolved_call_graph_mode(project_id)
         if resolved_graph_mode is None:
             resolved_graph_mode = await self.prepare_call_graph_mode(
                 project_id, query, intent_vector
             )
 
-        # ── Step 8: token budget ──────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 8: Build LOD tiers with token budget.
+        # ------------------------------------------------------------------
         total_tokens = 0
         budget = self._f.valves.active_context_max_tokens or 32000
 
@@ -6129,10 +5785,12 @@ Output only the option name.
             )
             budget = min(budget, max(8000, _available_for_context))
 
-        tier_qids: Set[str] = set(psm.get_hub_tier_qids(project_id))
+        tier_qids = set(psm.get_hub_tier_qids(project_id))
         injected_symbols: Set[str] = set(tier_qids)
 
-        # ── Step 9: LOD-2 hysteresis ──────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 9: LOD-2 hysteresis (entry/exit thresholds).
+        # ------------------------------------------------------------------
         lod2_entry = self._f.valves.lod2_threshold
         lod2_exit = lod2_entry * self._f.valves.lod2_exit_ratio
         currently_lod2: Set[str] = set(psm.get_lod2_active_qids_prev(project_id))
@@ -6141,52 +5799,55 @@ Output only the option name.
         lod3_qids: Set[str] = set()
 
         for qid, score in activated.items():
-            if score >= lod3:
-                lod3_qids.add(qid)
             if qid in currently_lod2:
                 if score >= lod2_exit:
                     lod2_qids.add(qid)
             else:
                 if score >= lod2_entry:
                     lod2_qids.add(qid)
+            if score >= lod3:
+                lod3_qids.add(qid)
 
         psm.set_lod2_active_qids_prev(project_id, list(lod2_qids))
 
-        # ── Step 10: retrieve skeleton tier qids ─────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 10: Retrieve skeleton tier qids to avoid duplicates.
+        # ------------------------------------------------------------------
         skeleton_qids: Set[str] = set(psm.get_skeleton_tier_qids(project_id))
 
-        # ── Step 11: closure + stable ordering ───────────────────────────────
-        # The closure captures lod2_qids and lod3_qids by name (not by value).
-        # Rebinding those names in Step 12 is automatically visible here
-        # without redefining the closure.
+        # ------------------------------------------------------------------
+        # Step 11: Stable ordering function using the pre-bump tier sets.
+        # ------------------------------------------------------------------
         def _lod_tier(qid: str) -> int:
+            """Return 3, 2, or 1 based on current tier membership sets."""
             if qid in lod3_qids:
                 return 3
             if qid in lod2_qids:
                 return 2
             return 1
 
-        sorted_nodes: List[str] = sorted(
+        sorted_nodes = sorted(
             activated.keys(),
-            key=lambda q: (-_lod_tier(q), -activated.get(q, 0.0), q),
+            key=lambda qid: (
+                -_lod_tier(qid),
+                -activated.get(qid, 0.0),
+                qid,
+            ),
         )
 
-        # ── Step 12: centrality LOD bump ──────────────────────────────────────
-        # After adjusting per-node scores, lod2_qids and lod3_qids are rebuilt
-        # from the bumped scores so that Steps 13-15 and the _lod_tier closure
-        # classify every node at its correct effective tier (Bug 12).
+        # ------------------------------------------------------------------
+        # Step 12: Centrality LOD bump.
         #
-        # FIX Bug 12 + Regresión: the rebuild preserves LOD-2 hysteresis by
-        # checking currently_lod2 and lod2_exit, exactly as Step 9 does.
-        # Without this, nodes retained via hysteresis (score between lod2_exit
-        # and lod2_entry, no centrality bump applied) were incorrectly expelled
-        # from lod2_qids after the rebuild, disappearing from the context
-        # silently even though their score hadn't changed.
-        activated_scores: Dict[str, float] = dict(activated)
+        # Bug 12 fix: after bumping the activation scores, rebuild lod2_qids
+        # and lod3_qids from the new scores and re-sort sorted_nodes.  Without
+        # this, _lod_tier() continues to use the pre-bump sets, so a node
+        # whose effective score crossed lod3_threshold is still rendered at
+        # LOD-2 instead of LOD-3.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_centrality_lod_bump:
             centrality = psm.get_node_centrality(project_id)
             threshold = self._f.valves.centrality_lod_bump_threshold
-            adjusted: List[Tuple[str, float]] = []
+            adjusted = []
             for qid in sorted_nodes:
                 cent = centrality.get(qid, 0.0)
                 if cent >= threshold:
@@ -6200,28 +5861,39 @@ Output only the option name.
                     adjusted.append((qid, activated.get(qid, 0.0)))
             activated_scores = dict(adjusted)
 
-            # Rebuild tier sets from bumped scores, preserving LOD-2 hysteresis.
+            # ── Bug 12 fix: rebuild tier sets from bumped scores ──────────────────
             lod2_qids = set()
             lod3_qids = set()
             for qid, score in activated_scores.items():
-                if score >= lod3:
-                    lod3_qids.add(qid)
                 if qid in currently_lod2:
                     if score >= lod2_exit:
                         lod2_qids.add(qid)
                 else:
                     if score >= lod2_entry:
                         lod2_qids.add(qid)
+                if score >= lod3:
+                    lod3_qids.add(qid)
 
+            # Re-sort with the updated tier sets and bumped scores
             sorted_nodes = sorted(
                 activated_scores.keys(),
-                key=lambda q: (-_lod_tier(q), -activated_scores.get(q, 0.0), q),
+                key=lambda qid: (
+                    -_lod_tier(qid),
+                    -activated_scores.get(qid, 0.0),
+                    qid,
+                ),
             )
+        else:
+            activated_scores = activated
 
-        # ── Step 13: batch LOD-2 docstring pre-resolution ─────────────────────
-        # FIX Bug 14: lod3_qids excluded. Full-body nodes receive body injection
-        # in Step 15, making a separate docstring LLM call redundant — the
-        # docstring would be generated and then immediately discarded.
+        # ------------------------------------------------------------------
+        # Step 13: Batched LOD-2 docstring pre-resolution.
+        #
+        # Bug 14 fix: use (lod2_qids - lod3_qids) so docstrings are only
+        # generated for symbols that will actually be rendered at LOD-2.
+        # LOD-3 symbols will have their full body injected; generating a
+        # docstring for them wastes an LLM call.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_auto_docstrings:
             lod2_only_candidates = [
                 qid
@@ -6229,7 +5901,7 @@ Output only the option name.
                 if not skeleton_qids or qid not in skeleton_qids
             ]
             if lod2_only_candidates:
-                missing: List[str] = []
+                missing = []
                 for qid in lod2_only_candidates:
                     has_doc = False
                     for bh in self._f._symbol_index.find_blocks(qid, project_id):
@@ -6248,8 +5920,13 @@ Output only the option name.
                         missing, project_id
                     )
 
-        # ── Step 14: batch LOD-2.5 CFG pre-resolution ────────────────────────
-        # FIX Bug 14: lod3_qids excluded for the same reason as Step 13.
+        # ------------------------------------------------------------------
+        # Step 14: Batched LOD-2.5 CFG pre-resolution.
+        #
+        # Bug 14 fix: use (lod2_qids - lod3_qids) so CFG skeletons are only
+        # generated for symbols rendered at LOD-2.  CFG at LOD-3 is redundant
+        # because the full body is already injected.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == "D"
             or intent_vector.get("debug", 0.0)
@@ -6274,7 +5951,10 @@ Output only the option name.
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
-        # ── Step 15: render LOD tiers ─────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 15: Iterate over sorted_nodes and build LOD tier output lists.
+        # ------------------------------------------------------------------
+        _lod0_parts: List[str] = []
         _lod1_parts: List[str] = []
         _lod2_parts: List[str] = []
         _lod3_parts: List[str] = []
@@ -6282,10 +5962,11 @@ Output only the option name.
         for qid in sorted_nodes:
             if total_tokens >= budget:
                 break
+
             if qid in injected_symbols:
                 continue
 
-            # -- Skeleton tier handling --
+            # ── Handle symbols already present in the skeleton tier ───────────────
             if qid in skeleton_qids:
                 if _lod_tier(qid) == 2:
                     self._f._log_debug(
@@ -6306,6 +5987,7 @@ Output only the option name.
             for bh in block_hashes:
                 block = state.active_blocks.get(bh)
 
+                # ── Page-in if the block was soft-evicted ─────────────────────────
                 if block is None and self._f._pager is not None:
                     if self._f._pager.is_paged(bh, project_id):
                         block = await self._f._pager.page_in_block(
@@ -6319,15 +6001,14 @@ Output only the option name.
                     continue
 
                 score = activated_scores.get(qid, 0.0)
-                tier = _lod_tier(qid)
 
-                # -- LOD-1: signature only --
-                if tier == 1:
+                # ── LOD-1: Signatures only ────────────────────────────────────────
+                if _lod_tier(qid) == 1:
                     sig = next(
                         (
-                            s.signature
-                            for s in block.symbols
-                            if qualify_symbol(s) == qid
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == qid
                         ),
                         qid,
                     )
@@ -6335,25 +6016,25 @@ Output only the option name.
                     if total_tokens + tok > budget:
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
-                    _lod1_parts.append(f"- `{sig}`{loc} _(score: {score:.2f})_")
+                    _lod1_parts.append(f"- '{sig}'{loc} _(score: {score:.2f})_")
                     total_tokens += tok
                     injected_symbols.add(qid)
 
-                # -- LOD-2: signature + docstring + optional CFG --
-                elif tier == 2:
+                # ── LOD-2: Signatures + docstrings (+ optional CFG) ───────────────
+                elif _lod_tier(qid) == 2:
                     sig = next(
                         (
-                            s.signature
-                            for s in block.symbols
-                            if qualify_symbol(s) == qid
+                            sym.signature
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == qid
                         ),
                         qid,
                     )
                     docstring = next(
                         (
-                            s.docstring
-                            for s in block.symbols
-                            if qualify_symbol(s) == qid and s.docstring
+                            sym.docstring
+                            for sym in block.symbols
+                            if qualify_symbol(sym) == qid and sym.docstring
                         ),
                         "",
                     )
@@ -6369,13 +6050,13 @@ Output only the option name.
                         )
 
                     if cfg_skeleton:
-                        self._f._log_debug(f"CFG injected for '{qid}' (LOD-2)")
-                        text = f"`{sig}`"
+                        self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
+                        text = f"'{sig}'"
                         if docstring:
                             text += f": {docstring}"
                         text += f"\n```python\n{cfg_skeleton}\n```"
                     else:
-                        text = f"- `{sig}`: {docstring}" if docstring else f"- `{sig}`"
+                        text = f"- '{sig}': {docstring}" if docstring else f"- '{sig}'"
 
                     tok = self._f._tokens.estimate_code_tokens(text)
                     if total_tokens + tok > budget:
@@ -6385,8 +6066,9 @@ Output only the option name.
                     total_tokens += tok
                     injected_symbols.add(qid)
 
-                # -- LOD-3: full body --
+                # ── LOD-3: Full code body ─────────────────────────────────────────
                 else:
+                    # Semantic relevance filter (LOD-3 only)
                     if self._f.valves.enable_semantic_lod3_filter and slot_free:
                         include_block = await self._evaluate_lod3_block_relevance(
                             block=block,
@@ -6396,8 +6078,8 @@ Output only the option name.
                         )
                         if not include_block:
                             self._f._log_debug(
-                                f"Block B: skipping LOD-3 for {qid} "
-                                f"(low semantic relevance)"
+                                f"Block B: skipping LOD-3 for {qid} due to low "
+                                f"semantic relevance"
                             )
                             continue
 
@@ -6422,8 +6104,7 @@ Output only the option name.
                     ):
                         if block.block_summary:
                             content_to_inject = (
-                                f"[Summary of {tok}-token block]\n"
-                                f"{block.block_summary}"
+                                f"[Summary of {tok}-token block]\n{block.block_summary}"
                             )
                         else:
                             content_to_inject = (
@@ -6439,12 +6120,12 @@ Output only the option name.
                         _is_oversized
                         and self._f.valves.code_block_overflow_action == "truncate"
                     ):
-                        content_to_inject = (
-                            self._f._tokens.truncate_text_to_tokens(
-                                content_to_inject,
-                                self._f.valves.max_code_block_tokens,
-                            )
-                            + "\n# ... [truncated — use /expand for full body]"
+                        content_to_inject = self._f._tokens.truncate_text_to_tokens(
+                            content_to_inject,
+                            self._f.valves.max_code_block_tokens,
+                        )
+                        content_to_inject += (
+                            "\n# ... [truncated — use /expand for full body]"
                         )
                         tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
@@ -6472,15 +6153,17 @@ Output only the option name.
                         break
                     loc = f" ({block.file_path})" if block.file_path else ""
                     _lod3_parts.append(
-                        f"### `{qid}`{loc} [activation: {score:.2f}]\n"
+                        f"### '{qid}'{loc} [activation: {score:.2f}]\n"
                         f"```\n{content_to_inject}\n```\n"
                     )
                     total_tokens += tok
                     injected_symbols.add(qid)
 
-                break  # one block per qid is sufficient
+                break  # Only process the first valid block for each qid
 
-        # ── Step 16: RAPTOR cluster summaries ────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 16: RAPTOR cluster summaries injected into LOD-2 tier.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_raptor and getattr(self._f, "_raptor", None):
             try:
                 raptor_hits = await self._f._raptor.retrieve(
@@ -6500,14 +6183,21 @@ Output only the option name.
                 )
                 _lod2_parts.insert(0, raptor_section)
 
-        # ── Step 17: SWA-aware assembly ───────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 17: SWA-aware assembly.
+        # ------------------------------------------------------------------
         suppress_sigs = (
             self._f.valves.skeleton_tier_suppresses_block_b_signatures
             and active_use_case != "D"
             and self._is_skeleton_tier_active(project_id)
         )
 
-        ordered: List[str] = ["## Code Context (activation-based LOD)\n"]
+        ordered = []
+        ordered.append("## Code Context (activation-based LOD)\n")
+        if _lod0_parts and not suppress_sigs:
+            ordered.append(
+                "**Known symbols** (minimal activation):\n" + ", ".join(_lod0_parts)
+            )
         if _lod1_parts and not suppress_sigs:
             ordered.append(
                 "\n**Signatures** (low activation):\n" + "\n".join(_lod1_parts)
@@ -6523,16 +6213,25 @@ Output only the option name.
                 + "\n".join(_lod3_parts)
             )
 
-        # ── Step 18: recency pointers ─────────────────────────────────────────
-        _ptr = self._build_hub_recency_pointers(project_id, set(injected_symbols))
+        # ------------------------------------------------------------------
+        # Step 18: Recency pointers for hub-tier seeds from the previous turn.
+        # ------------------------------------------------------------------
+        current_b_qids = set(injected_symbols)
+        _ptr = self._build_hub_recency_pointers(project_id, current_b_qids)
         if _ptr:
             ordered.append(_ptr)
 
-        # ── Step 19: instruction tail ─────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 19: Instruction tail adapted to the active use case.
+        # ------------------------------------------------------------------
         ordered.append(self._build_instruction_tail(active_use_case))
 
-        # ── Step 20: fallback to full context ────────────────────────────────
+        # ------------------------------------------------------------------
+        # Step 20: Handle empty context.
+        # ------------------------------------------------------------------
         if len(ordered) <= 1:
+            if self._f.valves.debug:
+                self._f._log_debug("build_block_b: no activated nodes or empty context")
             if suppress_sigs:
                 self._f._log_debug(
                     "build_block_b: skeleton tier active and suppress_sigs=True, "
@@ -6541,14 +6240,19 @@ Output only the option name.
                 return ""
             return self._f._activation.get_active_code_context(project_id, query)
 
-        # ── Step 21: summary line ─────────────────────────────────────────────
-        ordered.append(
+        # ------------------------------------------------------------------
+        # Step 21: Summary line.
+        # ------------------------------------------------------------------
+        summary_line = (
             f"\n_(Context: {len(injected_symbols)} symbols, "
             f"~{total_tokens} tokens, "
             f"{len(activated)} nodes activated)_\n"
         )
+        ordered.append(summary_line)
 
-        # ── Step 22: LOD tracking for adaptive threshold tuning ───────────────
+        # ------------------------------------------------------------------
+        # Step 22: LOD tracking for adaptive threshold feedback.
+        # ------------------------------------------------------------------
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
             for qid, score in activated.items():
@@ -6562,7 +6266,9 @@ Output only the option name.
                     lod_map[qid] = 3
             psm.set_last_lod_levels(project_id, lod_map)
 
-        # ── Step 23: store injected qids for docstring prioritisation ─────────
+        # ------------------------------------------------------------------
+        # Step 23: Store injected qids for docstring prioritisation next turn.
+        # ------------------------------------------------------------------
         psm.set_block_b_qids_this_turn(project_id, list(injected_symbols))
 
         return "\n".join(ordered)
@@ -6733,6 +6439,21 @@ Output only "YES" or "NO".
                     self._f._log_debug(f"Removed obsolete slot file: {fname}")
         except Exception as e:
             self._f._log_debug(f"Slot cleanup error: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 8. Internal helpers (LOD tier, etc.)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _lod_tier(qid: str) -> int:
+        """
+        Determine the LOD tier for a symbol based on its activation.
+
+        This is a static helper used during Block B assembly.
+        """
+        # This is a placeholder; the actual logic is in build_block_b
+        # where lod3_qids, lod2_qids, etc. are defined.
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -6928,97 +6649,176 @@ class SignatureExtractor:
 
     @staticmethod
     async def extract_async(
-        code: str,
-        file_path: Optional[str] = None,
-        language: Optional[str] = None,
+        code: str, file_path: Optional[str] = None, language: Optional[str] = None
     ) -> List["CodeSymbol"]:
         """
-        Extract CodeSymbol objects from source code using tree-sitter (preferred)
-        with an ast fallback for Python.
+        Extract symbols and call relationships from source code.
 
-        Results are cached by (code, file_path, language) hash. The cache always
-        returns a fresh shallow copy of the stored symbol list so that callers
-        mutating symbol fields (docstring, calls, cfg_skeleton) cannot corrupt
-        the cached entry. Without this copy, a second call with the same code
-        receives symbols that already have docstrings populated by a prior caller,
-        silencing the "missing docstring" detection in EnrichmentTasks.
+        Uses AST for Python (fast and precise) and tree-sitter for all other
+        languages via ``tree_sitter_language_pack.process()``.  The result is a
+        list of ``CodeSymbol`` objects with qualified names, line ranges, and
+        call lists.
 
-        Steps:
-            1.  Guard: code too large or empty → return [].
-            2.  Build cache key; return a shallow copy on cache hit.
-            3.  Guess language when not explicitly provided.
-            4.  Parse via tree-sitter; fall back to AST for Python.
-            5.  Enrich with parent info.
-            6.  Store a shallow copy in the cache; return a fresh copy to caller.
+        Results are cached with a 1-hour TTL to avoid re-parsing the same block.
+
+        Bug 11 fix: the write path previously stored the ``symbols`` list by
+        reference.  Any mutation by the caller (e.g. assigning
+        ``sym.parent_block_hash`` in ``ActiveCodeUpdater._process_new_block``)
+        silently corrupted the cached entry for subsequent callers.  Both the
+        stored list and its elements are now stored as copies.
+
+        Args:
+            code: The source code.
+            file_path: The file path (used for language detection).
+            language: Explicit language hint.
+
+        Returns:
+            List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
-        if not code or not code.strip():
+        if not CodeBlockManager._is_likely_code(code):
+            logger.debug("Skipping extraction: text does not appear to be code.")
             return []
 
-        if (
-            len(code.encode("utf-8", errors="replace"))
-            > SignatureExtractor.MAX_PARSE_SIZE_BYTES
-        ):
-            return []
-
-        # -- Step 2: cache lookup — return a fresh copy --
         cache_key = SignatureExtractor._cache_key(code, file_path, language)
-        cached = SignatureExtractor._extraction_cache.get(cache_key)
-        if cached is not None:
-            # Shallow copy each symbol so callers cannot mutate cached state.
-            return [sym.copy() for sym in cached]
 
-        # -- Step 3: resolve language --
+        # ── Cache read: return copies so caller mutations don't corrupt the cache ──
+        with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+            if cache_key in SignatureExtractor._extraction_cache:
+                cached_symbols, ts = SignatureExtractor._extraction_cache[cache_key]
+                if time.time() - ts < SignatureExtractor._EXTRACTION_CACHE_TTL:
+                    return [s.copy() for s in cached_symbols]
+                else:
+                    del SignatureExtractor._extraction_cache[cache_key]
+
+        if len(code.encode()) > SignatureExtractor.MAX_PARSE_SIZE_BYTES:
+            logger.warning(
+                f"Code block too large ({len(code.encode())} bytes) — "
+                "skipping symbol extraction to avoid memory issues."
+            )
+            return []
+
         lang = language or SignatureExtractor._guess_language(file_path, code)
 
-        # -- Step 4: parse --
-        symbols: List["CodeSymbol"] = []
-        try:
-            code_bytes = code.encode("utf-8", errors="replace")
-            tree, used_lang = await anyio.to_thread.run_sync(
-                lambda: SignatureExtractor._parse_sync(code_bytes, lang)
+        # Guard against empty string or "unknown" — neither can be parsed reliably
+        if not lang or lang == "unknown":
+            logger.warning(
+                "Could not detect language for code block — skipping symbol extraction."
             )
-            if tree is not None:
-                symbols = SignatureExtractor._extract_symbols_from_tree(
-                    tree, used_lang, code, file_path
-                )
-                if symbols:
-                    calls_map = SignatureExtractor._extract_calls_from_tree(
-                        tree, used_lang, code
-                    )
-                    for sym in symbols:
-                        sym.calls = calls_map.get(sym.name, [])
-        except Exception:
-            pass
+            return []
 
-        if not symbols and lang == "python":
+        # ── Python path: AST extraction ────────────────────────────────────────────
+        if lang == "python":
             try:
                 symbols = SignatureExtractor._extract_symbols_from_ast(code, file_path)
-                if symbols:
-                    calls_map = SignatureExtractor._extract_calls_from_ast(code)
-                    for sym in symbols:
-                        sym.calls = calls_map.get(sym.name, [])
-                    SignatureExtractor._extract_docstrings_python(code, symbols)
-            except Exception:
-                pass
+                call_map = SignatureExtractor._extract_calls_from_ast(code)
+                for sym in symbols:
+                    qid = qualify_symbol_name(
+                        sym.name, sym.parent_symbol, sym.file_path
+                    )
+                    calls = list(call_map.get(qid, []))
+                    if qid != sym.name:
+                        for c in call_map.get(sym.name, []):
+                            if c not in calls:
+                                calls.append(c)
+                    sym.calls = calls
 
-        # -- Step 5: enrich --
-        if symbols:
-            symbols = SignatureExtractor.enrich_symbols_with_parent_info(symbols, code)
-
-        # -- Step 6: store a copy in cache, return a fresh copy to caller --
-        if symbols:
-            stored = [sym.copy() for sym in symbols]
-            SignatureExtractor._extraction_cache[cache_key] = stored
-            # Enforce cache size limit
-            while (
-                len(SignatureExtractor._extraction_cache)
-                > SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
-            ):
-                SignatureExtractor._extraction_cache.pop(
-                    next(iter(SignatureExtractor._extraction_cache))
+                # ── Bug 11 fix: store copies in the cache ─────────────────────────
+                _cached_symbols = [s.copy() for s in symbols]
+                with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+                    if (
+                        len(SignatureExtractor._extraction_cache)
+                        >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
+                    ):
+                        oldest_key = min(
+                            SignatureExtractor._extraction_cache,
+                            key=lambda k: SignatureExtractor._extraction_cache[k][1],
+                        )
+                        del SignatureExtractor._extraction_cache[oldest_key]
+                    SignatureExtractor._extraction_cache[cache_key] = (
+                        _cached_symbols,
+                        time.time(),
+                    )
+                return symbols
+            except Exception as e:
+                logger.warning(
+                    f"AST extraction failed for Python: {e} — falling back to tree-sitter"
                 )
 
-        return [sym.copy() for sym in symbols]
+        # ── Non-Python path: tree-sitter via process() ────────────────────────────
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
+
+                config = ProcessConfig()
+                config.language = lang
+                config.extract_symbols = True
+                config.extract_calls = True
+                result = process(code, config)
+
+                symbols = []
+                if hasattr(result, "symbols"):
+                    for sym in result.symbols:
+                        code_sym = CodeSymbol(
+                            name=sym.name,
+                            kind=sym.kind,
+                            signature=sym.signature or sym.name,
+                            file_path=file_path,
+                            line_start=sym.line_start + 1,
+                            line_end=sym.line_end + 1,
+                            language=lang,
+                            parent_symbol=sym.parent or "",
+                        )
+                        symbols.append(code_sym)
+
+                call_map: Dict[str, List[str]] = {}
+                if hasattr(result, "calls"):
+                    from collections import defaultdict
+
+                    tmp = defaultdict(set)
+                    for call in result.calls:
+                        if call.caller:
+                            tmp[call.caller].add(call.callee)
+                    call_map = {k: list(v) for k, v in tmp.items()}
+
+                for sym in symbols:
+                    qid = qualify_symbol_name(
+                        sym.name, sym.parent_symbol, sym.file_path
+                    )
+                    calls = list(call_map.get(qid, []))
+                    if qid != sym.name:
+                        for c in call_map.get(sym.name, []):
+                            if c not in calls:
+                                calls.append(c)
+                    sym.calls = calls
+
+                # ── Bug 11 fix: store copies in the cache ─────────────────────────
+                _cached_symbols = [s.copy() for s in symbols]
+                with SignatureExtractor._EXTRACTION_CACHE_LOCK:
+                    if (
+                        len(SignatureExtractor._extraction_cache)
+                        >= SignatureExtractor._EXTRACTION_CACHE_MAXSIZE
+                    ):
+                        oldest_key = min(
+                            SignatureExtractor._extraction_cache,
+                            key=lambda k: SignatureExtractor._extraction_cache[k][1],
+                        )
+                        del SignatureExtractor._extraction_cache[oldest_key]
+                    SignatureExtractor._extraction_cache[cache_key] = (
+                        _cached_symbols,
+                        time.time(),
+                    )
+                return symbols
+
+            except Exception as e:
+                logger.warning(
+                    f"tree-sitter process() extraction failed for language '{lang}': {e}"
+                )
+
+        logger.warning(
+            "No extraction method available — returning empty symbol list. "
+            "Install tree-sitter-language-pack for non-Python languages."
+        )
+        return []
 
     @staticmethod
     def _extract_symbols_from_ast(
@@ -7167,70 +6967,38 @@ class SignatureExtractor:
         return {k: list(v) for k, v in call_map.items()}
 
     @staticmethod
-    def _parse_sync(
-        code_bytes: bytes,
-        lang: str,
-    ) -> Tuple[Optional[Any], str]:
+    def _parse_sync(code_bytes: bytes, lang: str):
         """
-        Parse source bytes with tree-sitter and return (tree, lang_used).
+        Parse source-code bytes synchronously with a fresh tree-sitter parser.
 
-        Parser instances are stored in thread-local storage so each worker
-        thread in the anyio thread pool has its own dedicated parser. Sharing
-        a single parser instance across threads is unsafe: tree-sitter's C
-        library modifies internal parser state during parse() and is not
-        re-entrant. Concurrent calls on the same instance produce corrupted
-        trees or segfaults under load.
+        Creates a new parser instance on every call. This avoids thread-safety
+        issues: tree-sitter Parser is not Send/Sync and cannot be shared across
+        threads [2†L11]. Creating a parser is cheap compared to parsing.
 
-        Returns (None, lang) when:
-            - the requested language is not in _LANG_MAP
-            - the tree-sitter language grammar cannot be loaded
-            - parsing raises an unexpected exception
+        Supports both old API (set_language) and new API (language in constructor).
+        See: https://tree-sitter.github.io/tree-sitter/ [3†L19-L22]
 
-        Steps:
-            1.  Resolve language string and look up grammar in _LANG_MAP.
-            2.  Get or create a per-thread parser for this language.
-            3.  Parse and return the tree.
+        Returns the root ``tree_sitter.Node`` of the concrete syntax tree.
         """
-        import threading
+        from tree_sitter import Parser as TSParser
+        from tree_sitter_language_pack import get_language
 
-        # -- Step 1: resolve language --
-        effective_lang = lang.lower().strip()
-        lang_grammar = SignatureExtractor._LANG_MAP.get(effective_lang)
-        if lang_grammar is None:
-            return None, effective_lang
+        lang_obj = get_language(lang)
 
-        # -- Step 2: get or create per-thread parser --
-        thread_local = getattr(SignatureExtractor, "_thread_local", None)
-        if thread_local is None:
-            # Lazy initialisation for environments that import the class before
-            # the attribute is declared (e.g. during module reload).
-            SignatureExtractor._thread_local = threading.local()
-            thread_local = SignatureExtractor._thread_local
-
-        if not hasattr(thread_local, "parsers"):
-            thread_local.parsers = {}
-
-        parser = thread_local.parsers.get(effective_lang)
-        if parser is None:
-            try:
-                from tree_sitter import Parser
-
-                p = Parser()
-                p.set_language(lang_grammar)
-                thread_local.parsers[effective_lang] = p
-                parser = p
-            except Exception as e:
-                return None, effective_lang
-
-        # -- Step 3: parse --
+        # New API (py-tree-sitter >= 0.23.0): language passed to constructor.
         try:
-            tree = parser.parse(code_bytes)
-            return tree, effective_lang
-        except Exception:
-            # Discard the potentially corrupt parser instance for this thread
-            # so the next call creates a fresh one.
-            thread_local.parsers.pop(effective_lang, None)
-            return None, effective_lang
+            parser = TSParser(lang_obj)
+        except TypeError:
+            # Old API (py-tree-sitter < 0.23.0): use set_language().
+            parser = TSParser()
+            if hasattr(parser, "set_language"):
+                parser.set_language(lang_obj)
+            else:
+                raise RuntimeError(
+                    f"Unsupported tree-sitter version: cannot set language '{lang}'"
+                )
+
+        return parser.parse(code_bytes)
 
     @staticmethod
     def enrich_symbols_with_parent_info(
@@ -7901,49 +7669,48 @@ class ControlFlowExtractor:
 
     @staticmethod
     def _inject_role_comments(
-        skeleton_text: str,
-        role_queue: List[Optional[str]],
+        skeleton_text: str, role_queue: List[Optional[str]]
     ) -> str:
         """
-        Replace cache-hit placeholder tokens in skeleton_text with role-label
-        comments drawn from role_queue.
+        ast.unparse() drops comments entirely (they aren't part of the AST).
+        This walks the unparsed text in order and, for each control-keyword
+        line, pops the next role from role_queue (collected during the same
+        pre-order walk that produced the text) and appends it as a comment.
 
-        role_queue is consumed left-to-right: each regex match pops one entry.
-        If skeleton_text contains more matches than role_queue has entries (e.g.
-        because ast.unparse produced a symbol name that incidentally matches the
-        pattern), the excess matches are replaced with an empty comment rather
-        than raising IndexError.
-
-        Steps:
-            1.  Build a mutable copy of role_queue so the original is not modified.
-            2.  Define a replacement callback that pops from the copy, or returns
-                an empty comment on underflow.
-            3.  Apply the substitution and return.
+        Safe because we never reorder statements — only truncate bodies —
+        so textual top-to-bottom order of control lines matches the
+        pre-order AST walk order exactly.
         """
-        if not skeleton_text:
-            return skeleton_text
+        lines = skeleton_text.split("\n")
+        queue = list(role_queue)
+        out_lines = []
+        roles_assigned = 0
 
-        # -- Step 1: mutable copy --
-        queue: List[Optional[str]] = list(role_queue)
+        logger.debug(
+            f"[CFG] _inject_role_comments: {len(lines)} lines, "
+            f"{len(queue)} roles in queue"
+        )
 
-        # -- Step 2: replacement callback with underflow guard --
-        def _replace(m: "re.Match") -> str:
-            if not queue:
-                # More matches than expected — inject a neutral placeholder
-                # rather than crashing.
-                return "# ..."
-            role = queue.pop(0)
-            if role:
-                return f"# [{role}]"
-            return "# ..."
+        for line in lines:
+            m = ControlFlowExtractor._CONTROL_LINE_RE.match(line)
+            if m and queue:
+                role = queue.pop(0)
+                if role:
+                    line = line.rstrip() + f"  # {role}"
+                    roles_assigned += 1
+                    logger.debug(
+                        f"[CFG] _inject_role_comments: assigned role '{role}' "
+                        f"to line: '{line[:60]}...'"
+                    )
+                else:
+                    logger.debug("[CFG] _inject_role_comments: skipped None role")
+            out_lines.append(line)
 
-        # -- Step 3: substitute --
-        try:
-            result = ControlFlowExtractor._CACHE_HIT_RE.sub(_replace, skeleton_text)
-        except Exception:
-            result = skeleton_text
-
-        return result
+        logger.debug(
+            f"[CFG] _inject_role_comments: injected {roles_assigned} role comment(s), "
+            f"{len(queue)} roles remaining (should be 0 if queue matched lines)"
+        )
+        return "\n".join(out_lines)
 
     @staticmethod
     def _classify_if_role(if_node: "ast.If") -> Optional[str]:
@@ -8009,15 +7776,11 @@ class ReentrantAsyncLock:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def __init__(self, default_timeout: float = 60.0) -> None:
-        """
-        Initialise the reentrant async lock.
-
-        The lock allows the same asyncio Task to acquire it multiple times
-        without deadlocking, using a per-task reentrancy counter.
-        """
+        """*default_timeout* applies to every ``acquire()`` call that doesn't
+        specify its own timeout."""
         self._lock = asyncio.Lock()
-        self._owner_task: Optional[asyncio.Task] = None
-        self._depth: int = 0
+        self._owner: Optional[asyncio.Task] = None
+        self._count = 0
         self._default_timeout = default_timeout
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -8025,76 +7788,42 @@ class ReentrantAsyncLock:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def acquire(self, timeout: Optional[float] = None) -> None:
-        """
-        Acquire the lock for the current asyncio Task.
-
-        If the current task already owns the lock (reentrant call), the
-        depth counter is incremented and the method returns immediately.
-
-        Steps:
-            1.  Check if current task already owns the lock (reentrant).
-            2.  Acquire the underlying lock with a finite timeout.
-            3.  Record ownership and set depth to 1.
-        """
-        current = asyncio.current_task()
-
-        # -- Step 1: reentrant fast path --
-        if self._owner_task is current and self._depth > 0:
-            self._depth += 1
+        """Acquire the lock, reentrantly if already held by the current task.
+        *timeout* overrides the instance default."""
+        task = asyncio.current_task()
+        if self._owner is task:
+            self._count += 1
             return
-
-        # -- Step 2: acquire with finite timeout --
         effective_timeout = timeout if timeout is not None else self._default_timeout
-        try:
-            await asyncio.wait_for(
-                self._lock.acquire(),
-                timeout=effective_timeout,
-            )
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(
-                f"ReentrantAsyncLock: timed out after {effective_timeout}s "
-                f"waiting for lock held by task "
-                f"'{getattr(self._owner_task, 'get_name', lambda: '?')()}'"
-            )
-
-        # -- Step 3: record ownership --
-        self._owner_task = current
-        self._depth = 1
+        if effective_timeout is not None:
+            await asyncio.wait_for(self._lock.acquire(), timeout=effective_timeout)
+        else:
+            await self._lock.acquire()
+        self._owner = task
+        self._count = 1
 
     def release(self) -> None:
-        """
-        Release one level of lock ownership.
-
-        Steps:
-            1.  Guard: no-op if not owned or depth already 0.
-            2.  Decrement depth.
-            3.  If depth reaches 0, release the underlying lock and clear owner.
-        """
-        # -- Step 1: guard --
-        current = asyncio.current_task()
-        if self._owner_task is not current or self._depth <= 0:
-            return
-
-        # -- Step 2: decrement --
-        self._depth -= 1
-
-        # -- Step 3: full release --
-        if self._depth == 0:
-            self._owner_task = None
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass  # already unlocked (defensive)
+        """Release the lock once.  Raises ``RuntimeError`` if the current
+        task does not own the lock."""
+        task = asyncio.current_task()
+        if self._owner is not task:
+            raise RuntimeError("Lock not owned by current task")
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+            self._lock.release()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Async context manager support
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def __aenter__(self) -> "ReentrantAsyncLock":
+    async def __aenter__(self):
+        """Async context manager entry."""
         await self.acquire()
         return self
 
     async def __aexit__(self, *args) -> None:
+        """Async context manager exit."""
         self.release()
 
 
@@ -8304,76 +8033,18 @@ class StateStore:
     # 2. Database write queue (serialised, non-blocking writes)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _db_enqueue(
-        self,
-        fn,
-        args: tuple = (),
-        kwargs: Optional[dict] = None,
-    ) -> None:
+    async def _db_enqueue(self, fn, args=(), kwargs=None) -> None:
         """
-        Enqueue a synchronous database write for the background DB worker.
+        Enqueue a database write operation to the worker queue.
 
-        Uses asyncio.wait_for around queue.put() to implement backpressure:
-        if the queue is full (DB worker can't keep up), callers block for up
-        to db_enqueue_timeout seconds before the write is dropped with a
-        warning. This prevents unbounded memory growth when SQLite is slow
-        (WAL checkpoint running, disk saturation) at the cost of occasionally
-        dropping non-critical writes.
-
-        Critical writes (e.g. from drain_writes paths) should use wait=True
-        with a longer timeout. Background writes (metrics, optional caches)
-        should tolerate occasional drops.
-
-        The queue must be initialised with a maxsize. If the queue was created
-        without one (pre-fix), this method re-creates it with the configured
-        maxsize on first call — a one-time migration compatible with existing
-        code that creates the queue in __init__.
-
-        Steps:
-            1.  Ensure the queue has a maxsize (migrate if necessary).
-            2.  Attempt to put with timeout.
-            3.  Log and drop on timeout rather than blocking indefinitely.
+        Args:
+            fn: Callable to execute.
+            args: Positional arguments.
+            kwargs: Keyword arguments (default: empty dict).
         """
         if kwargs is None:
             kwargs = {}
-
-        # -- Step 1: migrate unbounded queue if necessary --
-        current_queue = self._f._db_write_queue
-        if current_queue.maxsize == 0:
-            max_q = getattr(self._f.valves, "db_write_queue_maxsize", 500)
-            new_q: asyncio.Queue = asyncio.Queue(maxsize=max_q)
-            # Drain pending items from the old unbounded queue into the new one
-            while not current_queue.empty():
-                try:
-                    item = current_queue.get_nowait()
-                    try:
-                        new_q.put_nowait(item)
-                    except asyncio.QueueFull:
-                        break  # new queue already at capacity; drop oldest items
-                except asyncio.QueueEmpty:
-                    break
-            self._f._db_write_queue = new_q
-            current_queue = new_q
-            self._f._log_debug(
-                f"StateStore._db_enqueue: migrated to bounded queue "
-                f"(maxsize={max_q})"
-            )
-
-        # -- Step 2: attempt put with timeout --
-        timeout = getattr(self._f.valves, "db_enqueue_timeout", 10.0)
-        try:
-            await asyncio.wait_for(
-                current_queue.put((fn, args, kwargs)),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            # -- Step 3: log and drop --
-            qsize = current_queue.qsize()
-            self._f._log_debug(
-                f"StateStore._db_enqueue: queue full after {timeout}s "
-                f"(size={qsize}/{current_queue.maxsize}), dropping write. "
-                f"DB worker may be stalled. Check disk I/O and WAL size."
-            )
+        await self._f._db_write_queue.put((fn, args, kwargs))
 
     async def db_worker(self) -> None:
         """Database write worker with automatic restart on failure."""
@@ -8537,86 +8208,20 @@ class StateStore:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def run_db_checkpoints(self) -> None:
-        """
-        Periodically flush the SQLite WAL (Write-Ahead Log) to the main database
-        file to prevent unbounded WAL growth.
-
-        Uses PASSIVE checkpoint mode which frames checkpoint as best-effort:
-        it checkpoints as many WAL frames as possible without waiting for active
-        readers to finish. This is appropriate for a server process with
-        continuous concurrent reads.
-
-        FULL and TRUNCATE modes block until all readers complete, which in this
-        system means holding _db_global_lock for potentially seconds while LTM
-        retrieval, edge loading, and state reads are in progress — effectively
-        serialising all writes behind the checkpoint.
-
-        Checkpoints are skipped when the WAL is below wal_checkpoint_min_frames
-        to avoid unnecessary I/O on idle projects.
-
-        Steps:
-            1.  Check WAL size; skip if below threshold.
-            2.  Run PASSIVE checkpoint via the write thread.
-            3.  Log frames checkpointed and frames remaining.
-            4.  Sleep until next checkpoint interval.
-        """
-        interval = getattr(self._f.valves, "db_checkpoint_interval_seconds", 30.0)
-        min_frames = getattr(self._f.valves, "wal_checkpoint_min_frames", 100)
-
-        while True:
-            await asyncio.sleep(interval)
-
-            try:
-                # -- Step 1: check WAL frame count --
-                def _wal_size() -> int:
-                    with _db_global_lock:
-                        row = self._f._db_conn.execute(
-                            "PRAGMA wal_checkpoint(PASSIVE)"
-                        ).fetchone()
-                        # row: (busy, log, checkpointed)
-                        # Return log (total frames in WAL)
-                        return row[1] if row else 0
-
-                wal_frames = await anyio.to_thread.run_sync(_wal_size)
-
-                if wal_frames < min_frames:
-                    self._f._log_debug(
-                        f"run_db_checkpoints: WAL has {wal_frames} frames "
-                        f"(< {min_frames}), skipping"
-                    )
-                    continue
-
-                # -- Steps 2-3: PASSIVE checkpoint already ran above;
-                #    re-run for logging of result --
-                def _checkpoint() -> Tuple[int, int, int]:
-                    with _db_global_lock:
-                        row = self._f._db_conn.execute(
-                            "PRAGMA wal_checkpoint(PASSIVE)"
-                        ).fetchone()
-                        return tuple(row) if row else (0, 0, 0)
-
-                busy, log_frames, ckpt_frames = await anyio.to_thread.run_sync(
-                    _checkpoint
-                )
-
-                self._f._log_debug(
-                    f"run_db_checkpoints: PASSIVE checkpoint complete — "
-                    f"log={log_frames} frames, checkpointed={ckpt_frames}, "
-                    f"busy_readers={busy}"
-                )
-
-                if busy > 0:
-                    self._f._log_debug(
-                        f"run_db_checkpoints: {busy} active reader(s) prevented "
-                        f"full checkpoint; {log_frames - ckpt_frames} frames remain in WAL"
-                    )
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._f._log_debug(
-                    f"run_db_checkpoints: failed: {type(e).__name__}: {e}"
-                )
+        """Run SQLite WAL checkpoint and ChromaDB persist."""
+        try:
+            await anyio.to_thread.run_sync(
+                lambda: self._f._db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            )
+            self._f._log_debug("SQLite WAL checkpoint completed")
+        except Exception as e:
+            self._f._log_debug(f"SQLite checkpoint error: {e}")
+        try:
+            if self._f.chroma_client:
+                await anyio.to_thread.run_sync(lambda: self._f.chroma_client.persist())
+            self._f._log_debug("ChromaDB persist/checkpoint completed")
+        except Exception as e:
+            self._f._log_debug(f"ChromaDB checkpoint error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Edge persistence
@@ -8683,28 +8288,33 @@ class StateStore:
 
     async def load_symbol_edges_from_db(self, project_id: str) -> int:
         """
-        Restore typed edges from SQLite into the SymbolIndex.
+        Restore typed edges from SQLite.
 
-        Restoration is skipped only when the in-memory edge count already matches
-        the count recorded in symbol_edges_meta, indicating a complete set is
-        present. A partial in-memory set (e.g. only 'calls' edges rebuilt by
-        _rebuild_symbol_index on cold load) does not prevent restoration.
+        Only restores if the saved code_state_hash matches the current state.
+        Returns the number of edges restored (0 if stale, no data, or already
+        fully loaded).
 
-        add_edge is idempotent, so edges that already exist in memory are safely
-        re-added without creating duplicates.
+        Bug 9 fix: the previous guard ``if existing: return 0`` skipped the
+        restore whenever *any* edges were present in memory, even if the
+        in-memory count was lower than the persisted count (e.g., only ``calls``
+        edges loaded but ``data_flow`` / ``reads`` / ``writes`` still missing).
+        The new guard compares the actual in-memory edge count against the
+        persisted count and only skips when they are equal or higher.
 
-        Returns the number of edges restored, or 0 if restoration was skipped or
-        the saved metadata is stale relative to the current code state.
+        Args:
+            project_id: The current project identifier.
+
+        Returns:
+            int: Number of edges restored from SQLite.
         """
         if not self._f.valves.enable_edge_persistence:
             return 0
 
-        # -- Step 1: validate code state hash --
         current_code_hash = self._f._activation.compute_code_state_hash(project_id)
         if not current_code_hash:
-            return 0
+            return 0  # No active code — nothing to restore
 
-        # -- Step 2: read saved metadata --
+        # ── Read persisted metadata ────────────────────────────────────────────────
         meta_row = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT code_state_hash, edge_count FROM symbol_edges_meta "
@@ -8726,19 +8336,21 @@ class StateStore:
             )
             return 0
 
-        # -- Step 3: compare in-memory count against saved count --
-        # _rebuild_symbol_index populates only 'calls' edges on cold load,
-        # so in_memory_count < saved_count signals an incomplete restore.
-        existing = self._f._symbol_index.get_all_edges_out(project_id)
-        in_memory_count = sum(len(edges) for edges in existing.values())
+        # ── Bug 9 fix: compare counts, not just presence ───────────────────────────
+        # Only skip the restore if the number of in-memory edges already equals or
+        # exceeds the persisted count for this code state.  A lower in-memory count
+        # means some edge types (data_flow, reads, writes, inherits…) were not yet
+        # loaded and need to be restored.
+        existing_edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        in_memory_count = sum(len(edges) for edges in existing_edges_out.values())
         if in_memory_count >= saved_count:
             self._f._log_debug(
-                f"Edge persistence: in-memory count ({in_memory_count}) matches "
-                f"saved count ({saved_count}), skipping reload"
+                f"Edge persistence: in-memory edge count ({in_memory_count}) already "
+                f"matches or exceeds persisted count ({saved_count}) — skipping restore"
             )
             return 0
 
-        # -- Step 4: fetch and register all saved edges --
+        # ── Restore edges from SQLite ──────────────────────────────────────────────
         rows = await self._db_read(
             lambda: self._f._db_conn.execute(
                 "SELECT src, dst, type, weight, confidence "
@@ -8761,7 +8373,7 @@ class StateStore:
 
         self._f._log_debug(
             f"✓ Edge persistence: restored {count} edges "
-            f"(code_hash={current_code_hash})"
+            f"(code_hash={current_code_hash}, was {in_memory_count} in memory)"
         )
         return count
 
@@ -9030,256 +8642,189 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def find_cached_response(
-        self,
-        query: str,
-        context_hash: str,
-        state: dict,
+        self, query: str, context_hash: str, state: dict
     ) -> Optional[dict]:
+        """Search the response cache for a semantically similar query.
+
+        Returns a dict with ``response``, ``query``, and ``timestamp`` on a
+        hit, or ``None`` if no valid cached entry is found.  Stale entries
+        (code state changed or TTL expired) are deleted on the fly.
         """
-        Look up a previously cached response for this query and context.
-
-        Validates the cached entry against the current code_state_hash to
-        detect code changes since the response was stored. If the hash has
-        changed, the cached response is stale and must not be used.
-
-        Steps:
-            1.  Check feature flag; return None when caching is disabled.
-            2.  Retrieve candidate entry from ChromaDB by context_hash.
-            3.  Validate context_hash matches exactly.
-            4.  Validate code_state_hash:
-                  - if either side is empty, skip.
-                  - if hashes differ, the codebase changed; skip.
-            5.  Validate response text is non-empty.
-            6.  Return the cached response dict.
-        """
-        if not getattr(self._f.valves, "enable_response_cache", True):
+        # ── Early exit: cache disabled or collection missing ──────────
+        if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
+            return None
+        col = getattr(self._f, "_response_cache_collection", None)
+        if col is None:
             return None
 
-        if not context_hash or not self._f.memory_collection:
-            return None
-
-        project_id = self._f._inlet_orchestrator.get_project_id()
-
-        # -- Step 2: retrieve from ChromaDB --
-        try:
-            raw = await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.get(
-                    ids=[f"response_cache_{context_hash}"],
-                    include=["documents", "metadatas"],
-                )
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"find_cached_response: ChromaDB get failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
-
-        if not raw or not raw.get("ids") or not raw["ids"]:
-            return None
-
-        metas = (raw.get("metadatas") or [None])[0]
-        docs = (raw.get("documents") or [None])[0]
-
-        if not docs or not metas:
-            return None
-
-        # -- Step 3: context_hash exact match --
-        if metas.get("context_hash") != context_hash:
-            return None
-
-        # -- Step 4: code_state_hash validation --
-        stored_code_hash = metas.get("code_state_hash", "")
-        current_code_hash = self._f._activation.compute_code_state_hash(project_id)
-
-        # Empty hash → skip cache to prevent cross-project hits.
-        if not stored_code_hash or not current_code_hash:
-            self._f._log_debug(
-                f"find_cached_response: skipping cache — "
-                f"code_state_hash is empty "
-                f"(stored='{stored_code_hash}', current='{current_code_hash}')"
-            )
-            return None
-
-        if stored_code_hash != current_code_hash:
-            self._f._log_debug(
-                f"find_cached_response: stale cache entry — "
-                f"code changed since storage "
-                f"(stored={stored_code_hash[:8]}, "
-                f"current={current_code_hash[:8]})"
-            )
-            return None
-
-        # -- Step 5: validate response --
-        response_text = docs.strip()
-        if not response_text:
-            return None
-
-        # -- Step 6: return --
-        self._f._log_debug(
-            f"find_cached_response: HIT for context_hash={context_hash[:8]}"
+        # ── Embed query ───────────────────────────────────────────────
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
-        return {
-            "response": response_text,
-            "context_hash": context_hash,
-            "code_state_hash": stored_code_hash,
-            "cached_at": metas.get("cached_at", 0.0),
-        }
+
+        # ── Retrieve nearest neighbour ─────────────────────────────────
+        results = await anyio.to_thread.run_sync(
+            lambda: col.query(
+                query_embeddings=[query_vec],
+                n_results=1,
+                where={"project_id": self._f.valves.project_id},
+                include=["documents", "metadatas", "distances"],
+            )
+        )
+        if not results or not results["ids"] or not results["ids"][0]:
+            return None
+
+        # ── Validate similarity ────────────────────────────────────────
+        dist = results["distances"][0][0]
+        similarity = 1.0 - (dist / 2.0)
+        if similarity < self._f.valves.response_cache_similarity_threshold:
+            return None
+
+        # ── Check staleness: code state hash ───────────────────────────
+        meta = results["metadatas"][0][0]
+        stored_code_state = meta.get("code_state_hash", "")
+        if (
+            stored_code_state
+            and stored_code_state
+            != self._f._activation.compute_code_state_hash(self._f.valves.project_id)
+        ):
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        # ── Check staleness: TTL ───────────────────────────────────────
+        ttl = self._f.valves.response_cache_ttl_hours * 3600
+        ts = meta.get("timestamp", 0)
+        if ttl > 0 and time.time() - ts > ttl:
+            await anyio.to_thread.run_sync(
+                lambda: col.delete(ids=[results["ids"][0][0]])
+            )
+            return None
+
+        doc = results["documents"][0][0]
+        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
 
     async def find_duplicate_question(
-        self,
-        query: str,
-        project_id: str,
+        self, query: str, project_id: str
     ) -> Optional[dict]:
         """
-        Check whether the current query is semantically equivalent to a
-        question asked and answered earlier in this project's LTM.
+        Detect near‑duplicate user questions using a cascade.
 
-        Returns the prior Q&A dict if a duplicate is found, None otherwise.
+        Cascade:
+        1. Cosine similarity (fast, initial filtering).
+        2. CrossEncoder (semantic) scores the similarity.
+        3. If confident (diff >= CE_THRESHOLD), use CrossEncoder decision.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
+        5. Middle zone: fallback to cosine similarity only.
 
-        Bug 103 fix: all ChromaDB queries include a project_id filter.
-        Without it, a question asked in project B can match a question from
-        project A if they are semantically similar, and the answer for B
-        is injected as a response to A's context — producing a subtly
-        wrong or completely irrelevant answer with no visible error.
+        Restores KV slot after any LLM call.
 
-        Bug 104 fix: _find_duplicate_with_llm is wrapped in try/except.
-        On LLM failure (timeout, model unavailable), the function conservatively
-        returns None (not a duplicate) rather than propagating an exception.
-        A false negative (missing a real duplicate) is safer than a false
-        positive (treating unrelated questions as duplicates).
+        Args:
+            query (str): The user's current question.
+            project_id (str): Current project identifier.
 
-        Steps:
-            1.  Guard: return None when feature is disabled or query is empty.
-            2.  Embed the query.
-            3.  Query ChromaDB for semantically similar prior questions,
-                filtered by project_id.
-            4.  For each candidate above the high-confidence threshold,
-                return immediately.
-            5.  For borderline candidates, call _find_duplicate_with_llm
-                with exception guard (Bug 104).
-            6.  Return None when no duplicate found.
+        Returns:
+            Optional[dict]: {'sim': float, 'doc': str} if a duplicate is found, else None.
         """
-        if not getattr(self._f.valves, "enable_duplicate_detection", True):
+        # ── REGION 1: Prerequisites check ──
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return None
-        if not query.strip() or not self._f.memory_collection:
+        if not query or len(query.strip()) < 15:
             return None
 
-        # -- Step 2: embed --
-        if not self._f.embedder:
-            return None
         try:
-            max_embed = getattr(self._f.valves, "ltm_max_embedding_tokens", 400)
-            safe_q = self._f._tokens.truncate_text_to_tokens(query, max_embed)
-            query_emb = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode([safe_q], show_progress_bar=False)[
-                    0
-                ].tolist()
+            # ── REGION 2: Embed the query ──
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(query[:8000]).tolist()
             )
-        except Exception as e:
-            self._f._log_debug(
-                f"find_duplicate_question: embedding failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
+            now = time.time()
 
-        # -- Step 3: query ChromaDB with project_id filter --
-        top_k = getattr(self._f.valves, "duplicate_detection_top_k", 3)
-        try:
-            count = await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.count()
-            )
-            safe_n = max(1, min(top_k, count))
-
-            raw = await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.query(
-                    query_embeddings=[query_emb],
-                    n_results=safe_n,
-                    where={
-                        "$and": [
-                            {"project_id": {"$eq": project_id}},  # Bug 103
-                            {"type": {"$eq": "question"}},
-                        ]
+            # ── REGION 3: Build time‑filtered ChromaDB query ──
+            where = {
+                "$and": [
+                    {"project_id": {"$eq": project_id}},
+                    {"role": {"$eq": "user"}},
+                    {
+                        "timestamp": {
+                            "$gt": time.time()
+                            - self._f.valves.duplicate_question_lookback_hours * 3600
+                        }
                     },
-                    include=["documents", "metadatas", "distances", "ids"],
+                ]
+            }
+
+            # ── REGION 4: Query ChromaDB ──
+            results = await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=self._f.valves.duplicate_question_lookback,
+                    where=where,
+                    include=["documents", "metadatas", "distances"],
                 )
             )
+            if not results or not results["ids"] or not results["ids"][0]:
+                return None
+
+            # ── REGION 5: Evaluate candidates ──
+            best_candidate = None
+            best_sim = 0.0
+            for i, doc in enumerate(results["documents"][0]):
+                dist = results["distances"][0][i]
+                sim = 1.0 - (dist / 2.0)
+                if sim >= self._f.valves.duplicate_question_threshold and doc != query:
+                    # ── CrossEncoder for semantic similarity ──
+                    pairs = [(query[:500], doc[:500])]
+                    ce_scores = await self._f._commands._predict_cross_encoder(pairs)
+
+                    if ce_scores is None or len(ce_scores) < 1:
+                        # CE unavailable: use cosine similarity only
+                        best_candidate = (sim, doc, None)
+                        break
+
+                    ce_score = ce_scores[0]
+                    # Normalize to [0,1] roughly
+                    ce_prob = 1.0 / (1.0 + math.exp(-ce_score))
+
+                    CE_CONFIDENCE_THRESHOLD = self._f.valves.duplicate_ce_threshold
+                    LLM_FALLBACK_THRESHOLD = self._f.valves.duplicate_llm_threshold
+
+                    # ── Confidence check ──
+                    if ce_prob >= 0.85 and (ce_prob - 0.5) > CE_CONFIDENCE_THRESHOLD:
+                        # Confident duplicate
+                        best_candidate = (sim, doc, ce_score)
+                        break
+                    elif ce_prob < 0.6 and (0.5 - ce_prob) > CE_CONFIDENCE_THRESHOLD:
+                        # Confident not duplicate
+                        continue
+                    elif abs(ce_prob - 0.5) < LLM_FALLBACK_THRESHOLD:
+                        # ── Extremely uncertain → LLM ──
+                        is_duplicate = await self._find_duplicate_with_llm(
+                            query, doc, ce_score, project_id
+                        )
+                        if is_duplicate:
+                            best_candidate = (sim, doc, ce_score)
+                            break
+                        else:
+                            continue
+                    else:
+                        # ── Middle zone: use cosine similarity threshold ──
+                        if sim >= self._f.valves.duplicate_question_threshold:
+                            best_candidate = (sim, doc, None)
+                            break
+
+            # ── REGION 6: Return result ──
+            if best_candidate:
+                sim, doc, ce = best_candidate
+                log_msg = f"Duplicate question found (cosine={sim:.3f}"
+                if ce is not None:
+                    log_msg += f", crossencoder={ce:.3f}"
+                log_msg += ")"
+                self._f._log_debug(log_msg)
+                return {"sim": sim, "doc": doc}
+
         except Exception as e:
-            self._f._log_debug(
-                f"find_duplicate_question: ChromaDB query failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
-
-        docs = (raw.get("documents") or [[]])[0]
-        metas = (raw.get("metadatas") or [[]])[0]
-        distances = (raw.get("distances") or [[]])[0]
-        ids = (raw.get("ids") or [[]])[0]
-
-        if not docs:
-            return None
-
-        high_thresh = getattr(self._f.valves, "duplicate_high_threshold", 0.92)
-        llm_thresh = getattr(self._f.valves, "duplicate_llm_threshold", 0.80)
-
-        # -- Steps 4 and 5: evaluate candidates --
-        for doc, meta, dist, eid in zip(docs, metas, distances, ids):
-            if not doc or not meta:
-                continue
-
-            # Verify project_id match (belt-and-suspenders after where filter)
-            if meta.get("project_id") != project_id:
-                continue
-
-            response = meta.get("response", "")
-            if not response:
-                continue
-
-            score = max(0.0, 1.0 - float(dist))
-
-            # -- Step 4: high-confidence direct match --
-            if score >= high_thresh:
-                self._f._log_debug(
-                    f"find_duplicate_question: direct hit "
-                    f"(score={score:.3f}) for '{project_id}'"
-                )
-                return {
-                    "question": doc,
-                    "response": response,
-                    "score": score,
-                    "entry_id": eid,
-                }
-
-            # -- Step 5: borderline — confirm with LLM (Bug 104: guarded) --
-            if score >= llm_thresh:
-                try:
-                    is_dup = await self._find_duplicate_with_llm(
-                        query=query,
-                        candidate=doc,
-                        ce_score=score,
-                        project_id=project_id,
-                    )
-                except Exception as e:
-                    self._f._log_debug(
-                        f"find_duplicate_question: LLM confirmation failed "
-                        f"(defaulting to not-duplicate): "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    is_dup = False
-
-                if is_dup:
-                    self._f._log_debug(
-                        f"find_duplicate_question: LLM-confirmed duplicate "
-                        f"(score={score:.3f}) for '{project_id}'"
-                    )
-                    return {
-                        "question": doc,
-                        "response": response,
-                        "score": score,
-                        "entry_id": eid,
-                    }
-
-        # -- Step 6: no duplicate found --
+            self._f._log_debug(f"Error in duplicate question detection: {e}")
         return None
 
     async def _find_duplicate_with_llm(
@@ -9386,77 +8931,87 @@ class LongTermMemory:
         is_continuation: bool = False,
     ) -> List[str]:
         """
-        Generate semantically diverse rephrasings of the query to improve
-        LTM retrieval coverage.
+        Generate alternative search queries for LTM retrieval.
 
-        Returns a list starting with the ORIGINAL query, followed by up to
-        max_expansions rephrasings generated by the LLM. The original is
-        always included so retrieve_memories_unified has at least one query
-        even when expansion fails.
-
-        Steps:
-            1.  Skip expansion for continuation turns (context unchanged).
-            2.  Call LLM for semantic expansions.
-            3.  Parse response into a list of query strings.
-            4.  Prepend original query and deduplicate.
-            5.  Return capped list.
+        Modified (B1): strips <details> and filters reasoning lines.
+        Modified (AC-A): uses is_continuation to skip expansion.
         """
-        # -- Step 1: skip for continuation --
+        if not self._f.valves.enable_multi_query_retrieval:
+            return [query]
         if is_continuation:
             return [query]
-
-        max_exp = getattr(self._f.valves, "ltm_max_query_expansions", 2)
-        if max_exp <= 0:
+        if len(query.strip()) < 15:
             return [query]
 
-        # -- Step 2: call LLM --
         prompt = (
-            f"Rephrase the following question in {max_exp} different ways "
-            f"to maximise semantic search coverage. "
-            f"Context: {use_case_label}.\n\n"
-            f"Original: {query}\n\n"
-            f"Output one rephrasing per line. "
-            f"Do not number them or add any other text."
-        )
-        system = (
-            "You are a search query expansion engine. "
-            "Output only the rephrased queries, one per line."
+            f"User question: {query[:300]}\n\n"
+            f"Generate {self._f.valves.multi_query_variants} alternative search queries.\n"
+            "Output ONLY the queries, one per line, numbered 1 to N.\n"
+            "Do not include any other text.\n\n"
+            "1. "
         )
 
-        try:
-            raw = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=200,
-                temperature=0.5,
-                enable_thinking=False,
-                label="query_expansion",
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_expand_query_for_retrieval: LLM failed "
-                f"(returning original only): {type(e).__name__}: {e}"
-            )
-            return [query]  # Aways return at least the original
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a search query reformulator. Your ONLY task is to output search queries. "
+                "Never include analysis, reasoning, explanations, or meta-commentary. "
+                "Output must be in the exact format: numbered queries, one per line. "
+                "No other text is allowed."
+            ),
+            model_override=self._f.valves.llm_model,
+            max_tokens=0,
+            temperature=0.4,
+            label="multi_query_expand",
+        )
 
-        # -- Step 3: parse --
-        expansions: List[str] = []
-        if raw:
-            for line in raw.splitlines():
-                clean = line.strip().lstrip("-•*0123456789.) ")
-                if clean and len(clean) > 5:
-                    expansions.append(clean)
+        self._f._log_debug(f"Multi-query raw response: {response}")
 
-        # -- Step 4: prepend original and deduplicate --
-        seen: Set[str] = set()
-        result: List[str] = []
-        for q in [query] + expansions:
-            if q not in seen:
-                seen.add(q)
-                result.append(q)
+        # ── B1: strip <details> reasoning blocks ──────────────────────────
+        raw_response = re.sub(
+            r"<details[^>]*>.*?</details>",
+            "",
+            response or "",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
 
-        # -- Step 5: cap --
-        return result[: max_exp + 1]  # original + max_exp expansions
+        # ── B1: line-level filter ──────────────────────────────────────────
+        _REASONING_LINE_PREFIXES = (
+            "thinking process",
+            "let me ",
+            "i will ",
+            "to answer",
+            "step ",
+            "note:",
+            "reasoning:",
+            "my approach",
+            "first,",
+            "here are",
+            "i need to",
+            "the user",
+        )
+
+        queries = [query]
+        pattern = re.compile(r"^\s*(?:\d+\.\s*|[-*]\s*)?(.+)$")
+        for line in raw_response.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if not match:
+                continue
+            cleaned = match.group(1).strip()
+            if not cleaned:
+                continue
+            lower = cleaned.lower()
+            if any(lower.startswith(p) for p in _REASONING_LINE_PREFIXES):
+                continue
+            if len(cleaned) > 5:
+                queries.append(cleaned)
+
+        queries = queries[: self._f.valves.multi_query_variants + 1]
+        self._f._log_debug(f"Multi-query expansion: {len(queries)} queries")
+        return queries
 
     async def _rerank_results(
         self, query: str, documents: List[str], top_k: int
@@ -9616,378 +9171,300 @@ class LongTermMemory:
         is_continuation: bool = False,
     ) -> list:
         """
-        Retrieve relevant memories from LTM using multiple complementary paths,
-        then merge and deduplicate results.
-
-        Retrieval paths (all executed concurrently where possible):
-            A.  Symbol-based: extract named symbols from the query and fetch
-                entries that mention those symbols.
-            B.  Semantic: embed the (optionally expanded) query and perform
-                nearest-neighbour search in ChromaDB.
-            C.  Historical messages: retrieve recent conversation turns whose
-                content overlaps with the query.
-
-        Results from all paths are merged into a single ranked list.
-        Deduplication is performed on entry_id before ranking so that a memory
-        retrieved by both path A and path B counts only once.
-
-        ChromaDB raises InvalidArgumentException when n_results exceeds the
-        number of stored documents. All ChromaDB calls are wrapped in try/except
-        and use a safe_n_results helper that caps the request count to the actual
-        collection size.
-
-        Steps:
-            1.  Resolve effective retrieval parameters from valves.
-            2.  Parse forced-symbol override if present in query.
-            3.  Expand query for semantic retrieval.
-            4.  Run path A: symbol-based retrieval.
-            5.  Run path B: semantic retrieval with n_results cap.
-            6.  Run path C: historical message retrieval.
-            7.  Merge all results, deduplicate by entry_id, sort by score.
-            8.  Rerank with cross-encoder if available.
-            9.  Return top-k memories.
+        Retrieve relevant LTM entries, with multi‑query expansion and reranking.
         """
-        if not self._f.memory_collection:
+        # ── C4: early exit if retrieval disabled ──────────────────────────
+        if self._retrieval_disabled_reason:
+            self._f._log_debug(
+                f"LTM retrieval skipped: {self._retrieval_disabled_reason}"
+            )
             return []
 
-        top_k = getattr(self._f.valves, "ltm_top_k", 5)
-        max_memories = getattr(self._f.valves, "ltm_max_memories", 10)
-
-        # -- Step 1: resolve parameters --
-        enable_symbol = getattr(self._f.valves, "ltm_enable_symbol_retrieval", True)
-        enable_semantic = getattr(self._f.valves, "ltm_enable_semantic_retrieval", True)
-        enable_history = getattr(self._f.valves, "ltm_enable_history_retrieval", True)
-
-        # -- Step 2: forced-symbol override --
-        forced_symbol, clean_query = self._parse_forced_symbol_query(query)
-        effective_query = clean_query if clean_query.strip() else query
-
-        # -- Step 3: expand query for semantic retrieval --
-        expanded_queries: List[str] = [effective_query]
-        if enable_semantic and not is_continuation:
-            try:
-                expanded_queries = await self._expand_query_for_retrieval(
-                    effective_query,
-                    use_case_label=use_case_label,
-                    is_continuation=is_continuation,
-                ) or [effective_query]
-            except Exception as e:
-                self._f._log_debug(
-                    f"retrieve_memories_unified: query expansion failed: {e}"
-                )
-
-        # Helper: cap n_results to avoid ChromaDB InvalidArgumentException.
-        async def _safe_query_chroma(
-            query_texts: List[str],
-            where: dict,
-            n_results: int,
-            include: List[str],
-        ) -> Optional[dict]:
-            if not query_texts or not any(q.strip() for q in query_texts):
-                return None
-            try:
-                # Cap n_results to actual collection count for this filter.
-                count_result = await anyio.to_thread.run_sync(
-                    lambda: self._f.memory_collection.count()
-                )
-                safe_n = max(1, min(n_results, count_result))
-                return await anyio.to_thread.run_sync(
-                    lambda: self._f.memory_collection.query(
-                        query_texts=query_texts,
-                        where=where,
-                        n_results=safe_n,
-                        include=include,
-                    )
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"retrieve_memories_unified: ChromaDB query failed: "
-                    f"{type(e).__name__}: {e}"
-                )
-                return None
-
-        # Accumulate all hits keyed by entry_id to deduplicate across paths.
-        seen_ids: Set[str] = set()
-        all_hits: List[Dict[str, Any]] = []
-
-        def _add_hit(entry_id: str, doc: str, meta: dict, score: float) -> None:
-            if entry_id in seen_ids:
-                return
-            seen_ids.add(entry_id)
-            all_hits.append(
-                {
-                    "entry_id": entry_id,
-                    "content": doc,
-                    "metadata": meta,
-                    "score": score,
-                }
-            )
-
-        # -- Step 4: path A — symbol-based retrieval --
-        if enable_symbol:
-            symbols_to_fetch: Set[str] = set()
-            if forced_symbol:
-                symbols_to_fetch.add(forced_symbol)
-            else:
-                symbols_to_fetch = self._extract_query_symbols(
-                    effective_query, project_id
-                )
-
-            for sym in list(symbols_to_fetch)[:5]:
-                try:
-                    sym_hits = await self._retrieve_by_symbol(
-                        sym, effective_query, project_id
-                    )
-                    for hit in sym_hits:
-                        _add_hit(
-                            hit.get("entry_id", hit.get("id", sym)),
-                            hit.get("content", ""),
-                            hit.get("metadata", {}),
-                            hit.get("score", 0.7),
-                        )
-                except Exception as e:
-                    self._f._log_debug(
-                        f"retrieve_memories_unified: symbol path failed "
-                        f"for '{sym}': {e}"
-                    )
-
-        # -- Step 5: path B — semantic retrieval --
-        if enable_semantic:
-            where_filter = {
-                "$and": [
-                    {"project_id": {"$eq": project_id}},
-                    {"type": {"$ne": "raptor_summary"}},
-                ]
-            }
-            raw = await _safe_query_chroma(
-                query_texts=expanded_queries[:3],
-                where=where_filter,
-                n_results=top_k * 2,
-                include=["documents", "metadatas", "distances", "ids"],
-            )
-            if raw:
-                docs = (raw.get("documents") or [[]])[0]
-                metas = (raw.get("metadatas") or [[]])[0]
-                distances = (raw.get("distances") or [[]])[0]
-                ids = (raw.get("ids") or [[]])[0]
-                for doc, meta, dist, eid in zip(docs, metas, distances, ids):
-                    score = max(0.0, 1.0 - float(dist))
-                    _add_hit(eid, doc or "", meta or {}, score)
-
-        # -- Step 6: path C — historical message retrieval --
-        if enable_history:
-            try:
-                hist_limit = getattr(self._f.valves, "ltm_history_limit", 5)
-                hist_hits = await self.retrieve_historical_messages(
-                    query=effective_query,
-                    project_id=project_id,
-                    limit=hist_limit,
-                    is_continuation=is_continuation,
-                )
-                for hit in hist_hits:
-                    _add_hit(
-                        hit.get("entry_id", hit.get("id", "")),
-                        hit.get("content", ""),
-                        hit.get("metadata", {}),
-                        hit.get("score", 0.5),
-                    )
-            except Exception as e:
-                self._f._log_debug(
-                    f"retrieve_memories_unified: history path failed: {e}"
-                )
-
-        if not all_hits:
+        # ------------------------------------------------------------------
+        # REGION 1: Early exits
+        # ------------------------------------------------------------------
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
-        # -- Step 7: sort by score descending --
-        all_hits.sort(key=lambda h: h["score"], reverse=True)
-        candidates = all_hits[:max_memories]
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
+        if forced_symbol:
+            return await self._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
+            )
 
-        # -- Step 8: cross-encoder rerank if available --
-        if len(candidates) > 1:
-            try:
-                docs_for_rerank = [h["content"] for h in candidates]
-                reranked_docs = await self._rerank_results(
-                    effective_query, docs_for_rerank, top_k=len(candidates)
-                )
-                if reranked_docs:
-                    doc_to_hit = {h["content"]: h for h in candidates}
-                    reranked_hits = [
-                        doc_to_hit[d] for d in reranked_docs if d in doc_to_hit
-                    ]
-                    if reranked_hits:
-                        candidates = reranked_hits
-            except Exception as e:
-                self._f._log_debug(
-                    f"retrieve_memories_unified: rerank failed, "
-                    f"using score order: {e}"
-                )
-
-        # -- Step 9: return top-k --
-        result = candidates[:top_k]
-        self._f._log_debug(
-            f"retrieve_memories_unified: {len(all_hits)} raw hits → "
-            f"{len(result)} returned "
-            f"(sym={enable_symbol}, sem={enable_semantic}, "
-            f"hist={enable_history})"
+        # ------------------------------------------------------------------
+        # REGION 2: Build query variants (thematic expansion)
+        # ------------------------------------------------------------------
+        expanded = await self._expand_query_for_retrieval(
+            query, use_case_label=use_case_label, is_continuation=is_continuation
         )
-        return result
+
+        try:
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
+
+            # Expiration filter with OR for summaries
+            if self._f.valves.long_term_memory_expiration_days > 0:
+                where_filter["$and"].append(
+                    {
+                        "$or": [
+                            {"expires_at": {"$gt": now}},
+                            {"is_session_summary": {"$eq": True}},
+                            {"is_turn_summary": {"$eq": True}},
+                            {"is_raptor_summary": {"$eq": True}},
+                            {"is_hierarchical_summary": {"$eq": True}},
+                        ]
+                    }
+                )
+
+            # ── C2: deduplicate results by memory_id, keeping highest raw score ──
+            all_raw_results: Dict[str, Tuple[str, float, Any, Any]] = {}
+
+            # ------------------------------------------------------------------
+            # REGION 3: Retrieve for each variant
+            # ------------------------------------------------------------------
+            for variant_query in expanded:  # <-- antes 'query_variants', corregido
+                q_emb = await anyio.to_thread.run_sync(
+                    lambda q=variant_query: self._f.embedder.encode(
+                        self._f._tokens.truncate_text_to_tokens(q, 32768)
+                    ).tolist()
+                )
+                try:
+                    variant_results = await anyio.to_thread.run_sync(
+                        lambda emb=q_emb: self._f.memory_collection.query(
+                            query_embeddings=[emb],
+                            n_results=self._f.valves.long_term_memory_top_k * 2,
+                            where=where_filter,
+                            include=["documents", "metadatas", "distances"],
+                        )
+                    )
+                except Exception as e:
+                    self._f._log_debug(f"Multi-query retrieval failed for variant: {e}")
+                    continue
+
+                if not variant_results or not variant_results["documents"]:
+                    continue
+
+                for i, doc in enumerate(variant_results["documents"][0]):
+                    meta = variant_results["metadatas"][0][i]
+                    raw_sim = 1.0 - (variant_results["distances"][0][i] / 2.0)
+
+                    # ── C1: apply threshold on RAW similarity ──────────────────
+                    if raw_sim < self._f.valves.long_term_memory_similarity_threshold:
+                        continue
+
+                    ts = meta.get("timestamp")
+                    if ts is not None and ts < 1000000000:
+                        ts = None
+
+                    mem_id = meta.get(
+                        "memory_id",
+                        hashlib.md5(doc.encode()).hexdigest()[:16],
+                    )
+
+                    # ── C2: deduplicate, keep highest raw score ─────────────────
+                    if (
+                        mem_id not in all_raw_results
+                        or raw_sim > all_raw_results[mem_id][1]
+                    ):
+                        all_raw_results[mem_id] = (doc, raw_sim, ts, meta)
+
+            # ── C1: apply time decay for ranking (not for filtering) ──────────
+            docs_with_meta = []
+            for mem_id, (doc, raw_sim, ts, meta) in all_raw_results.items():
+                if self._f.valves.ltm_time_decay_hours > 0 and ts is not None:
+                    age_hours = (now - ts) / 3600
+                    effective_sim = raw_sim * (
+                        0.5 ** (age_hours / self._f.valves.ltm_time_decay_hours)
+                    )
+                else:
+                    effective_sim = raw_sim
+
+                if meta.get("is_raptor_summary"):
+                    raptor_level = meta.get("raptor_level", 1)
+                    effective_sim *= 1.0 + 0.1 * raptor_level
+
+                docs_with_meta.append((doc, effective_sim, ts, meta, raw_sim))
+
+            if self._f.valves.preserve_error_context:
+                new_docs = []
+                for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
+                    if meta.get("content_type") == ContentType.ERROR.value:
+                        eff_sim *= 1.1
+                    new_docs.append((doc, eff_sim, ts, meta, raw_sim))
+                docs_with_meta = new_docs
+
+            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+
+            if self._f.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._extract_query_symbols(query, project_id)
+                if query_symbols:
+                    new_docs = []
+                    for doc, eff_sim, ts, meta, raw_sim in docs_with_meta:
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if (
+                            meta_symbols_str
+                            and eff_sim
+                            >= self._f.valves.ltm_symbol_boost_min_similarity
+                        ):
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                eff_sim *= self._f.valves.ltm_symbol_boost_factor
+                        new_docs.append((doc, eff_sim, ts, meta, raw_sim))
+                    new_docs.sort(key=lambda x: x[1], reverse=True)
+                    docs_with_meta = new_docs
+
+            if (
+                self._f.valves.enable_reranking
+                and self._f._cross_encoder
+                and docs_with_meta
+            ):
+                rerank_k = min(
+                    (
+                        self._f.valves.reranker_top_k
+                        if self._f.valves.reranker_top_k > 0
+                        else self._f.valves.long_term_memory_top_k
+                    ),
+                    50,
+                )
+                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
+                reranked = await self._rerank_results(query, docs_only, rerank_k)
+                doc_to_meta = {
+                    d[0]: (d[1], d[2], d[3] if len(d) > 3 else {})
+                    for d in docs_with_meta
+                }
+                docs_with_meta = [
+                    (doc, *doc_to_meta.get(doc, (0.0, None, {}))) for doc in reranked
+                ]
+
+            docs_with_meta = docs_with_meta[: self._f.valves.long_term_memory_top_k]
+
+            # ------------------------------------------------------------------
+            # REGION 5: Normalize output
+            # ------------------------------------------------------------------
+            normalized = []
+            for entry in docs_with_meta:
+                if len(entry) == 5:
+                    doc, score, ts, meta_dict, _ = entry
+                elif len(entry) == 4:
+                    doc, score, ts, meta_dict = entry
+                elif len(entry) == 3:
+                    doc, score, ts = entry
+                    meta_dict = {}
+                else:
+                    doc, score, ts = entry[0], entry[1], entry[2]
+                    meta_dict = entry[3] if len(entry) > 3 else {}
+                normalized.append((doc, score, ts, meta_dict))
+
+            return [
+                {"doc": doc, "timestamp": ts, "meta": meta_dict}
+                for doc, _, ts, meta_dict in normalized
+            ]
+
+        except Exception as e:
+            logger.warning(f"Unified memory retrieval failed: {e}")
+            return []
 
     async def retrieve_historical_messages(
-        self,
-        query: str,
-        project_id: str,
-        limit: int,
-        is_continuation: bool = False,
+        self, query: str, project_id: str, limit: int, is_continuation: bool = False
     ) -> list:
-        """
-        Retrieve conversation messages from LTM that are semantically
-        relevant to the current query.
-
-        Bug 90 fix: messages stored within the last ltm_history_min_age_seconds
-        are excluded from results. Without this filter, messages from the
-        immediately preceding turn appear in historical retrieval (they were
-        just stored by outlet). The LLM then sees the same message in both
-        the current window and the LTM injection, wasting tokens.
-
-        The filter uses the 'timestamp' metadata field. A default min_age of
-        5 seconds gives outlet's store_messages call time to complete while
-        still being short enough to not block genuinely relevant recent content
-        for continuation turns where is_continuation=True (where min_age is
-        relaxed to 0 so the prior turn's assistant response IS retrievable).
-
-        Bug 91 fix: n_results is capped to the actual collection size before
-        the ChromaDB query, preventing InvalidArgumentException when the
-        collection has fewer entries than limit.
-
-        Steps:
-            1.  Guard: return [] when ChromaDB unavailable or query empty.
-            2.  Embed the query.
-            3.  Cap n_results to collection size.
-            4.  Query ChromaDB for similar historical messages.
-            5.  Filter by min_age and by role (exclude system messages).
-            6.  Deduplicate by entry_id.
-            7.  Return top-limit results sorted by relevance score.
-        """
-        if not self._f.memory_collection or not query.strip():
+        """Retrieve historically relevant messages from ChromaDB LTM."""
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return []
 
-        # -- Step 1: determine min_age --
-        # Continuation turns may legitimately want the prior assistant response,
-        # so we relax the filter for them.
-        if is_continuation:
-            min_age_seconds = 0.0
-        else:
-            min_age_seconds = getattr(
-                self._f.valves, "ltm_history_min_age_seconds", 5.0
+        forced_symbol, cleaned_query = self._parse_forced_symbol_query(query)
+        if forced_symbol:
+            memories = await self._retrieve_by_symbol(
+                forced_symbol, cleaned_query, project_id
             )
+            return [{"role": "user", "content": m["doc"]} for m in memories]
 
-        # -- Step 2: embed query --
-        if not self._f.embedder:
-            return []
         try:
-            max_embed = getattr(self._f.valves, "ltm_max_embedding_tokens", 400)
-            safe_query = self._f._tokens.truncate_text_to_tokens(query, max_embed)
-            query_emb = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode([safe_query], show_progress_bar=False)[
-                    0
-                ].tolist()
+            # Requires an embedder supporting 32768 context or more.
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(
+                    self._f._tokens.truncate_text_to_tokens(query, 32768)
+                ).tolist()
             )
-        except Exception as e:
-            self._f._log_debug(
-                f"retrieve_historical_messages: embedding failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return []
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
-        # -- Step 3: cap n_results to collection size --
-        try:
-            collection_count = await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.count()
-            )
-        except Exception:
-            collection_count = limit
+            # ── FIX 11: Expiration filter with OR for summaries ──
+            if self._f.valves.long_term_memory_expiration_days > 0:
+                where_filter["$and"].append(
+                    {
+                        "$or": [
+                            {"expires_at": {"$gt": now}},
+                            {"is_session_summary": {"$eq": True}},
+                            {"is_turn_summary": {"$eq": True}},
+                            {"is_raptor_summary": {"$eq": True}},
+                            {"is_hierarchical_summary": {"$eq": True}},
+                        ]
+                    }
+                )
 
-        safe_n = max(1, min(limit * 2, collection_count))
-
-        # -- Step 4: query ChromaDB --
-        cutoff_ts = time.time() - min_age_seconds
-        try:
-            where_filter: dict = {
-                "$and": [
-                    {"project_id": {"$eq": project_id}},
-                    {"type": {"$eq": "message"}},
-                ]
-            }
-            if min_age_seconds > 0:
-                where_filter["$and"].append({"timestamp": {"$lte": cutoff_ts}})
-
-            raw = await anyio.to_thread.run_sync(
+            results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
-                    query_embeddings=[query_emb],
-                    n_results=safe_n,
+                    query_embeddings=[q_emb],
+                    n_results=limit * 3,
                     where=where_filter,
-                    include=["documents", "metadatas", "distances", "ids"],
+                    include=["documents", "metadatas", "distances"],
                 )
             )
+
+            query_symbols = set()
+            if self._f.valves.ltm_symbol_boost_enabled and query:
+                query_symbols = self._extract_query_symbols(query, project_id)
+
+            scored_regular = []
+            scored_summaries = []
+            if results and results["documents"]:
+                for i, doc in enumerate(results["documents"][0]):
+                    meta = results["metadatas"][0][i]
+                    dist = results["distances"][0][i]
+                    sim = 1.0 - (dist / 2.0)
+                    if (
+                        query_symbols
+                        and sim >= self._f.valves.ltm_symbol_boost_min_similarity
+                    ):
+                        meta_symbols_str = meta.get("code_symbols", "")
+                        if meta_symbols_str:
+                            meta_symbols = set(meta_symbols_str.split(","))
+                            common = query_symbols.intersection(meta_symbols)
+                            if common:
+                                sim *= self._f.valves.ltm_symbol_boost_factor
+                    role = meta.get("role", "user")
+                    is_summary = meta.get("is_hierarchical_summary", False) or meta.get(
+                        "is_session_summary", False
+                    )
+                    entry = (sim, {"role": role, "content": doc})
+                    if is_summary:
+                        scored_summaries.append(entry)
+                    else:
+                        scored_regular.append(entry)
+
+            scored_summaries.sort(key=lambda x: x[0], reverse=True)
+            scored_regular.sort(key=lambda x: x[0], reverse=True)
+
+            messages = [msg for _, msg in scored_summaries] + [
+                msg for _, msg in scored_regular
+            ]
+
+            if (
+                self._f.valves.enable_reranking
+                and self._f._cross_encoder
+                and len(messages) > 1
+            ):
+                docs = [m["content"] for m in messages]
+                reranked = await self._rerank_results(query, docs, limit)
+                doc_to_msg = {m["content"]: m for m in messages}
+                messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
+
+            return messages[:limit]
         except Exception as e:
-            self._f._log_debug(
-                f"retrieve_historical_messages: ChromaDB query failed: "
-                f"{type(e).__name__}: {e}"
-            )
+            logger.warning(f"Historical message retrieval failed: {e}")
             return []
-
-        # -- Step 5: unpack and filter --
-        docs = (raw.get("documents") or [[]])[0]
-        metas = (raw.get("metadatas") or [[]])[0]
-        distances = (raw.get("distances") or [[]])[0]
-        ids = (raw.get("ids") or [[]])[0]
-
-        hits: List[dict] = []
-        seen_ids: set = set()
-
-        for doc, meta, dist, eid in zip(docs, metas, distances, ids):
-            if not doc or not isinstance(doc, str):
-                continue
-            if not meta:
-                meta = {}
-
-            # Exclude system messages from historical injection
-            role = meta.get("role", "user")
-            if role == "system":
-                continue
-
-            # Bug 90: exclude messages stored too recently
-            stored_ts = meta.get("timestamp", 0.0)
-            if min_age_seconds > 0 and stored_ts > cutoff_ts:
-                continue
-
-            # -- Step 6: deduplicate by entry_id --
-            if eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-
-            score = max(0.0, 1.0 - float(dist))
-            hits.append(
-                {
-                    "entry_id": eid,
-                    "content": doc,
-                    "metadata": meta,
-                    "score": score,
-                    "role": role,
-                }
-            )
-
-        # -- Step 7: sort by score and return top limit --
-        hits.sort(key=lambda h: h["score"], reverse=True)
-        result = hits[:limit]
-
-        self._f._log_debug(
-            f"retrieve_historical_messages: {len(result)}/{len(hits)} "
-            f"historical messages for '{project_id}' "
-            f"(min_age={min_age_seconds}s, n_results={safe_n})"
-        )
-        return result
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 5. Message storage
@@ -10020,78 +9497,152 @@ class LongTermMemory:
         )
 
     async def store_messages(
-        self,
-        project_id: str,
-        messages: list,
-        wait: bool = True,
+        self, project_id: str, messages: list, wait: bool = True
     ) -> None:
         """
-        Store a batch of conversation messages in LTM (ChromaDB + SQLite).
+        Store user/assistant messages in the LTM ChromaDB collection.
 
-        Filters out messages that are empty, role-less, or have non-string
-        content before dispatching to _store_messages_async.
-
-        When wait=False, the storage is dispatched as a background task.
-        The task is registered on the running event loop with a done-callback
-        that logs exceptions so failures are always visible in the debug log.
-        asyncio.ensure_future is wrapped in try/except to handle the case where
-        the event loop is closing during server shutdown.
-
-        Steps:
-            1.  Filter messages to valid candidates.
-            2.  Early exit when nothing to store.
-            3.  Dispatch: await directly when wait=True, background task otherwise.
+        If `wait` is False, the actual embedding and upsert run in a background
+        task and the method returns immediately.
         """
-        # -- Step 1: filter to valid messages --
-        valid: List[dict] = []
+        if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
+            return
+
+        # ── Filter valid messages (skip partial multi-phase) ──────────
+        valid = []
         for msg in messages:
+            content = msg.get("content", "")
+            if not content or len(content.strip()) < 15:
+                continue
+
             role = msg.get("role", "")
-            content = msg.get("content")
-            if role not in ("user", "assistant", "system"):
+            # M2: Skip partial multi-phase assistant responses
+            if role == "assistant" and self._is_partial_multi_phase(content):
+                self._f._log_debug(
+                    "ltm: skipping partial multi-phase response (not embedding)"
+                )
                 continue
-            if content is None or not isinstance(content, str):
+
+            # M1: Strip CoT scaffolding
+            content = self._prepare_text_for_ltm(content, role)
+            if not content:
                 continue
-            if not content.strip():
-                continue
+
             valid.append({"role": role, "content": content})
 
-        # -- Step 2: early exit --
         if not valid:
             return
 
-        # -- Step 3: dispatch --
-        if wait:
-            await self._store_messages_async(project_id, valid)
+        if not wait:
+            # Offload the heavy embedding to a background task
+            asyncio.create_task(self._store_messages_async(project_id, valid))
             return
 
-        # Fire-and-forget with exception surfacing.
-        try:
-            task = asyncio.ensure_future(self._store_messages_async(project_id, valid))
+        # ── Original synchronous path ──────────────────────────────────────
+        texts_for_embedding: List[str] = []
+        documents_to_store: List[str] = []
+        ids = []
+        metadatas = []
+        now = time.time()
 
-            def _on_done(t: asyncio.Task) -> None:
-                exc = t.exception()
-                if exc:
-                    self._f._log_debug(
-                        f"store_messages (background): failed for "
-                        f"'{project_id}': {type(exc).__name__}: {exc}"
+        for i, msg in enumerate(valid):
+            content = msg["content"]
+
+            extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
+            content_type = self._f._code_blocks.classify_content(content, extracted)
+
+            ctx_symbols: List[str] = []
+            for blk in extracted[:3]:
+                try:
+                    syms = await SignatureExtractor.extract_async(
+                        blk["code"], language=blk.get("language")
                     )
+                    for sym in syms:
+                        if self._is_symbol_indexable(sym):
+                            ctx_symbols.append(sym.name)
+                            if len(ctx_symbols) >= 10:
+                                break
+                except Exception:
+                    pass
 
-            task.add_done_callback(_on_done)
+            ctx_file_paths: List[str] = []
+            if self._f.valves.track_file_paths:
+                ctx_file_paths = self._f._code_blocks.extract_file_paths(content)[:3]
 
-        except RuntimeError as e:
-            # Event loop not running or closing — fall back to best-effort
-            # synchronous store so messages are not completely lost.
-            self._f._log_debug(
-                f"store_messages: ensure_future failed ({e}), "
-                f"attempting synchronous fallback for '{project_id}'"
+            context_prefix = await self._build_retrieval_context(
+                content=content,
+                project_id=project_id,
+                role=msg.get("role", "user"),
+                code_symbols=ctx_symbols[:6],
+                file_paths=ctx_file_paths,
+                content_type=content_type.value,
             )
-            try:
-                await self._store_messages_async(project_id, valid)
-            except Exception as e2:
-                self._f._log_debug(
-                    f"store_messages: synchronous fallback also failed: "
-                    f"{type(e2).__name__}: {e2}"
+
+            contextual_doc = context_prefix + content
+            texts_for_embedding.append(contextual_doc)
+            documents_to_store.append(contextual_doc)
+
+            msg_id = f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+            ids.append(msg_id)
+
+            expires_at = (
+                now + (self._f.valves.long_term_memory_expiration_days * 86400)
+                if self._f.valves.long_term_memory_expiration_days > 0
+                else None
+            )
+
+            code_symbols_str = ""
+            if self._f.valves.ltm_index_symbols_enabled:
+                all_syms = set()
+                for blk in extracted:
+                    try:
+                        syms = await SignatureExtractor.extract_async(
+                            blk["code"], language=blk.get("language")
+                        )
+                        for sym in syms:
+                            if self._is_symbol_indexable(sym):
+                                all_syms.add(sym.name)
+                                if (
+                                    len(all_syms)
+                                    >= self._f.valves.ltm_symbol_index_max_per_message
+                                ):
+                                    break
+                    except Exception:
+                        pass
+                if all_syms:
+                    code_symbols_str = "," + ",".join(sorted(all_syms)) + ","
+
+            metadatas.append(
+                {
+                    "role": msg.get("role"),
+                    "project_id": project_id,
+                    "timestamp": now,
+                    "expires_at": expires_at,
+                    "content_type": content_type.value,
+                    "has_code": len(extracted) > 0,
+                    "code_symbols": code_symbols_str,
+                    "memory_id": msg_id,
+                }
+            )
+
+        # Requires an embedder supporting 32768 context or more.
+        safe_texts = [
+            self._f._tokens.truncate_text_to_tokens(t, 32768)
+            for t in texts_for_embedding
+        ]
+        embeddings = await anyio.to_thread.run_sync(
+            lambda: self._f.embedder.encode(safe_texts, convert_to_numpy=True).tolist()
+        )
+
+        if ids:
+            await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=documents_to_store,
                 )
+            )
 
     async def _store_messages_async(self, project_id: str, valid: list) -> None:
         """Store each message one by one, offloading embedding to a thread."""
@@ -10101,103 +9652,99 @@ class LongTermMemory:
             except Exception as e:
                 self._f._log_debug(f"Async LTM store failed: {e}")
 
-    async def _store_single_message(
-        self,
-        project_id: str,
-        msg: dict,
-    ) -> None:
-        """
-        Embed and persist a single conversation message to ChromaDB and SQLite.
+    async def _store_single_message(self, project_id: str, msg: dict) -> None:
+        """Embed and insert a single message into ChromaDB (used by async path)."""
+        content = msg["content"]
+        extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
+        content_type = self._f._code_blocks.classify_content(content, extracted)
 
-        Content is truncated to ltm_max_embedding_tokens before embedding to
-        prevent silent truncation or errors from the embedding model's internal
-        token limit. Without this truncation, assistant messages containing
-        large code blocks produce degraded or failed embeddings that pollute
-        the retrieval index.
+        ctx_symbols: List[str] = []
+        for blk in extracted[:3]:
+            try:
+                syms = await SignatureExtractor.extract_async(
+                    blk["code"], language=blk.get("language")
+                )
+                for sym in syms:
+                    if self._is_symbol_indexable(sym):
+                        ctx_symbols.append(sym.name)
+                        if len(ctx_symbols) >= 10:
+                            break
+            except Exception:
+                pass
 
-        Steps:
-            1.  Prepare content and metadata.
-            2.  Truncate content to embedding model's safe token limit.
-            3.  Compute embedding; abort on failure.
-            4.  Build a stable entry_id from (project_id, role, content_hash).
-            5.  Upsert to ChromaDB.
-            6.  Persist raw content to SQLite for full-text retrieval.
-        """
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if not content.strip():
-            return
+        ctx_file_paths: List[str] = []
+        if self._f.valves.track_file_paths:
+            ctx_file_paths = self._f._code_blocks.extract_file_paths(content)[:3]
 
-        # -- Step 1: metadata --
-        content_hash = hashlib.md5(
-            content.encode("utf-8", errors="replace")
-        ).hexdigest()
-        timestamp = time.time()
-        metadata = {
-            "project_id": project_id,
-            "role": role,
-            "timestamp": timestamp,
-            "hash": content_hash,
-            "type": "message",
-        }
-
-        # -- Step 2: truncate before embedding --
-        max_embed_tokens = getattr(self._f.valves, "ltm_max_embedding_tokens", 400)
-        text_for_embedding = self._f._tokens.truncate_text_to_tokens(
-            content, max_embed_tokens
+        context_prefix = await self._build_retrieval_context(
+            content=content,
+            project_id=project_id,
+            role=msg.get("role", "user"),
+            code_symbols=ctx_symbols[:6],
+            file_paths=ctx_file_paths,
+            content_type=content_type.value,
         )
 
-        # -- Step 3: embed --
-        if not self._f.embedder or not self._f.memory_collection:
-            return
-        try:
+        contextual_doc = context_prefix + content
+        safe_text = self._f._tokens.truncate_text_to_tokens(contextual_doc, 32768)
+        now = time.time()
+
+        # Use the shared ChromaDB semaphore
+        async with self._f._chroma_semaphore:
             embedding = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode(
-                    [text_for_embedding], show_progress_bar=False
-                )[0].tolist()
+                lambda: self._f.embedder.encode(safe_text).tolist()
             )
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_single_message: embedding failed for "
-                f"'{project_id}' ({role}): {type(e).__name__}: {e}"
-            )
-            return
 
-        # -- Step 4: stable entry_id --
-        entry_id = f"{project_id}_msg_{role}_{content_hash}"
+        msg_id = (
+            f"{project_id}_{int(now)}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+        )
+        expires_at = (
+            now + (self._f.valves.long_term_memory_expiration_days * 86400)
+            if self._f.valves.long_term_memory_expiration_days > 0
+            else None
+        )
 
-        # -- Step 5: upsert to ChromaDB --
-        try:
+        code_symbols_str = ""
+        if self._f.valves.ltm_index_symbols_enabled:
+            all_syms = set()
+            for blk in extracted:
+                try:
+                    syms = await SignatureExtractor.extract_async(
+                        blk["code"], language=blk.get("language")
+                    )
+                    for sym in syms:
+                        if self._is_symbol_indexable(sym):
+                            all_syms.add(sym.name)
+                            if (
+                                len(all_syms)
+                                >= self._f.valves.ltm_symbol_index_max_per_message
+                            ):
+                                break
+                except Exception:
+                    pass
+            if all_syms:
+                code_symbols_str = "," + ",".join(sorted(all_syms)) + ","
+
+        metadata = {
+            "role": msg.get("role"),
+            "project_id": project_id,
+            "timestamp": now,
+            "expires_at": expires_at,
+            "content_type": content_type.value,
+            "has_code": len(extracted) > 0,
+            "code_symbols": code_symbols_str,
+            "memory_id": msg_id,
+        }
+
+        # The upsert itself also needs the semaphore because it's a ChromaDB operation
+        async with self._f._chroma_semaphore:
             await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.upsert(
-                    ids=[entry_id],
+                    ids=[msg_id],
                     embeddings=[embedding],
-                    documents=[content],
                     metadatas=[metadata],
+                    documents=[contextual_doc],
                 )
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_single_message: ChromaDB upsert failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-            return
-
-        # -- Step 6: persist raw content to SQLite --
-        try:
-            await self._f._state_store._db_enqueue(
-                self._f._db_conn.execute,
-                args=(
-                    "INSERT OR REPLACE INTO ltm_messages "
-                    "(entry_id, project_id, role, content, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (entry_id, project_id, role, content, timestamp),
-                ),
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_single_message: SQLite persist failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
             )
 
     async def store_response_in_cache(
@@ -10209,61 +9756,25 @@ class LongTermMemory:
         code_state_hash: str,
         wait: bool = True,
     ) -> None:
+        """Store a response in the ChromaDB response cache for future reuse.
+        If `wait` is False, the embedding and upsert are offloaded to a background task.
         """
-        Persist a query→response pair to the LTM response cache so that
-        identical queries with the same context can be answered without
-        calling the LLM.
-
-        Steps:
-            1.  Validate: skip if response is empty or caching is disabled.
-            2.  Dispatch synchronously (wait=True) or as a tracked background
-                task (wait=False).
-        """
-        # -- Step 1: validate --
-        if not response or not response.strip():
+        if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return
-        if not getattr(self._f.valves, "enable_response_cache", True):
+        if not query or not response:
             return
 
-        # -- Step 2: dispatch --
-        if wait:
-            await self._store_response_in_cache_async(
-                query, response, context_hash, state, code_state_hash
-            )
-            return
-
-        try:
-            task = asyncio.ensure_future(
+        if not wait:
+            asyncio.create_task(
                 self._store_response_in_cache_async(
                     query, response, context_hash, state, code_state_hash
                 )
             )
+            return
 
-            def _on_done(t: asyncio.Task) -> None:
-                exc = t.exception()
-                if exc:
-                    self._f._log_debug(
-                        f"store_response_in_cache (background): failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-            task.add_done_callback(_on_done)
-
-        except RuntimeError as e:
-            # Event loop closing — attempt synchronous fallback.
-            self._f._log_debug(
-                f"store_response_in_cache: ensure_future failed ({e}), "
-                f"attempting sync fallback"
-            )
-            try:
-                await self._store_response_in_cache_async(
-                    query, response, context_hash, state, code_state_hash
-                )
-            except Exception as e2:
-                self._f._log_debug(
-                    f"store_response_in_cache: sync fallback failed: "
-                    f"{type(e2).__name__}: {e2}"
-                )
+        await self._store_response_in_cache_sync(
+            query, response, context_hash, state, code_state_hash
+        )
 
     async def _store_response_in_cache_sync(
         self,
@@ -10378,269 +9889,36 @@ class LongTermMemory:
         state: dict,
         code_state_hash: str,
     ) -> None:
-        """
-        Persist a query-response pair to the LTM response cache.
-
-        Stores the response text in ChromaDB (with semantic embedding of the
-        query for future nearest-neighbour lookup) and a metadata entry in
-        SQLite for fast exact-hash retrieval.
-
-        Steps:
-            1.  Validate: skip when either hash is empty.
-            2.  Embed the QUERY (truncated), not the response.
-            3.  Build JSON-safe metadata from scalar state fields only.
-            4.  Upsert to ChromaDB (idempotent on same context_hash).
-            5.  Persist to SQLite for structured lookup.
-        """
-        # -- Step 1: validate --
-        if not context_hash or not code_state_hash:
-            self._f._log_debug(
-                "_store_response_in_cache_async: skipping — "
-                "empty context_hash or code_state_hash"
-            )
-            return
-        if not response or not response.strip():
-            return
-        if not self._f.memory_collection:
-            return
-
-        project_id = self._f._inlet_orchestrator.get_project_id()
-        entry_id = f"response_cache_{context_hash}"
-
-        # -- Step 2: embed the QUERY (truncated) --
-        if not self._f.embedder:
-            return
+        """Background wrapper for response cache storage."""
         try:
-            max_embed = getattr(self._f.valves, "ltm_max_embedding_tokens", 400)
-            safe_query = self._f._tokens.truncate_text_to_tokens(query, max_embed)
-            query_emb = await anyio.to_thread.run_sync(
-                lambda: self._f.embedder.encode([safe_query], show_progress_bar=False)[
-                    0
-                ].tolist()
+            await self._store_response_in_cache_sync(
+                query, response, context_hash, state, code_state_hash
             )
         except Exception as e:
-            self._f._log_debug(
-                f"_store_response_in_cache_async: embedding failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return
-
-        # -- Step 3: JSON-safe metadata (scalar primitives only) --
-        msg_count = 0
-        hwm = 0
-        if state is not None:
-            if isinstance(state, dict):
-                msg_count = int(state.get("message_count", 0))
-                hwm = int(state.get("summarized_turn_hwm", 0))
-            else:
-                msg_count = int(getattr(state, "message_count", 0))
-                hwm = int(getattr(state, "summarized_turn_hwm", 0))
-
-        metadata = {
-            "type": "response_cache",
-            "project_id": project_id,
-            "context_hash": context_hash,
-            "code_state_hash": code_state_hash,
-            "cached_at": float(time.time()),
-            "message_count": msg_count,
-            "hwm": hwm,
-            "query_preview": query[:200],
-            "response": response,
-        }
-
-        # -- Step 4: upsert to ChromaDB --
-        try:
-            await anyio.to_thread.run_sync(
-                lambda: self._f.memory_collection.upsert(
-                    ids=[entry_id],
-                    embeddings=[query_emb],
-                    documents=[response[:2000]],  # truncate document for storage
-                    metadatas=[metadata],
-                )
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_response_in_cache_async: ChromaDB upsert failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return
-
-        # -- Step 5: persist to SQLite --
-        try:
-            await self._f._state_store._db_enqueue(
-                self._f._db_conn.execute,
-                args=(
-                    "INSERT OR REPLACE INTO ltm_response_cache "
-                    "(entry_id, project_id, context_hash, code_state_hash, "
-                    " query, cached_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        entry_id,
-                        project_id,
-                        context_hash,
-                        code_state_hash,
-                        query[:500],
-                        time.time(),
-                    ),
-                ),
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_response_in_cache_async: SQLite insert failed: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        self._f._log_debug(
-            f"_store_response_in_cache_async: cached "
-            f"(context={context_hash[:8]}, code={code_state_hash[:8]}) "
-            f"for '{project_id}'"
-        )
+            self._f._log_debug(f"Async response cache store failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. Maintenance (purge expired memories)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def purge_expired_memories(self) -> None:
-        """
-        Delete LTM entries whose age exceeds the configured TTL from both
-        ChromaDB and SQLite.
-
-        Bug 80 fix: uses an asyncio.Lock (_purge_lock) to prevent concurrent
-        purge runs. Without the guard, two background callers (_bg_purge and
-        _lazy_purge) can execute simultaneously, both querying the same
-        expired entries and both trying to delete them. The second delete
-        raises a ChromaDB 404, leaving SQLite and ChromaDB inconsistent.
-
-        The lock is non-blocking on the second caller: if a purge is already
-        in progress, the new call returns immediately (skipped, not queued)
-        so callers don't pile up waiting.
-
-        Steps:
-            1.  Guard: skip if already running or feature is disabled.
-            2.  Dispatch _do_purge to the thread pool (sync I/O).
-            3.  Log result.
-        """
-        # -- Step 1: guard --
-        if not getattr(self._f.valves, "enable_ltm_purge", True):
+        """Remove memories whose expires_at timestamp is in the past."""
+        await asyncio.sleep(0)
+        if not HAS_CHROMA or self._f.memory_collection is None:
             return
-
-        if not hasattr(self, "_purge_lock"):
-            self._purge_lock = asyncio.Lock()
-
-        if self._purge_lock.locked():
-            self._f._log_debug("purge_expired_memories: already running, skipping")
+        if self._f.valves.long_term_memory_expiration_days <= 0:
             return
-
-        async with self._purge_lock:
-            # -- Step 2: dispatch to thread pool --
-            try:
-                deleted = await anyio.to_thread.run_sync(
-                    self._do_purge, cancellable=True
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"purge_expired_memories: failed: " f"{type(e).__name__}: {e}"
-                )
-                return
-
-            # -- Step 3: log --
-            if deleted:
-                self._f._log_debug(
-                    f"purge_expired_memories: deleted {deleted} expired "
-                    f"entr{'y' if deleted == 1 else 'ies'}"
-                )
-
-    def _do_purge(self) -> int:
-        """
-        Synchronous purge body executed in the thread pool.
-
-        Bug 81 fix: _db_global_lock is held ONLY during the initial SQLite
-        query and during each individual SQLite DELETE. It is released before
-        every ChromaDB HTTP call. The original held the lock for the entire
-        duration including network I/O, blocking all concurrent DB writers
-        (save_if_dirty, _db_enqueue) for the full purge duration.
-
-        Purge is best-effort per entry: a ChromaDB failure for one entry is
-        logged and skipped; the remaining entries are still processed. SQLite
-        cleanup for that entry is also skipped so the next purge can retry.
-
-        Steps:
-            1.  Compute expiry cutoff from TTL valve.
-            2.  Query expired entry_ids from SQLite (inside lock).
-            3.  For each entry_id: delete from ChromaDB (no lock), then
-                delete from SQLite (brief lock re-acquire).
-            4.  Return count of successfully purged entries.
-        """
-        ttl_seconds = getattr(self._f.valves, "ltm_ttl_seconds", 0)
-        if not ttl_seconds or ttl_seconds <= 0:
-            return 0
-
-        cutoff = time.time() - ttl_seconds
-
-        # -- Step 2: query inside lock --
         try:
-            with _db_global_lock:
-                rows = self._f._db_conn.execute(
-                    "SELECT entry_id FROM ltm_messages WHERE timestamp < ?",
-                    (cutoff,),
-                ).fetchall()
-                cache_rows = self._f._db_conn.execute(
-                    "SELECT entry_id FROM ltm_response_cache WHERE cached_at < ?",
-                    (cutoff,),
-                ).fetchall()
+            await anyio.to_thread.run_sync(self._do_purge)
         except Exception as e:
-            self._f._log_debug(
-                f"_do_purge: SQLite query failed: {type(e).__name__}: {e}"
-            )
-            return 0
+            logger.warning(f"Purge failed: {e}")
 
-        entry_ids = [r[0] for r in rows] + [r[0] for r in cache_rows]
-        if not entry_ids:
-            return 0
-
-        deleted = 0
-
-        # -- Step 3: delete per entry, lock released before HTTP --
-        for entry_id in entry_ids:
-            # ChromaDB delete (no lock — HTTP call)
-            chroma_ok = True
-            if self._f.memory_collection:
-                try:
-                    self._f.memory_collection.delete(ids=[entry_id])
-                except Exception as e:
-                    err = str(e).lower()
-                    if "not found" in err or "404" in err:
-                        pass  # already gone from ChromaDB, proceed with SQLite
-                    else:
-                        self._f._log_debug(
-                            f"_do_purge: ChromaDB delete failed for "
-                            f"{entry_id}: {type(e).__name__}: {e}"
-                        )
-                        chroma_ok = False
-
-            if not chroma_ok:
-                continue  # don't delete from SQLite if ChromaDB failed
-
-            # SQLite delete (brief lock re-acquire)
-            try:
-                with _db_global_lock:
-                    self._f._db_conn.execute(
-                        "DELETE FROM ltm_messages WHERE entry_id = ?",
-                        (entry_id,),
-                    )
-                    self._f._db_conn.execute(
-                        "DELETE FROM ltm_response_cache WHERE entry_id = ?",
-                        (entry_id,),
-                    )
-                    self._f._db_conn.commit()
-                deleted += 1
-            except Exception as e:
-                self._f._log_debug(
-                    f"_do_purge: SQLite delete failed for "
-                    f"{entry_id}: {type(e).__name__}: {e}"
-                )
-
-        return deleted
+    def _do_purge(self) -> None:
+        now = time.time()
+        expired = self._f.memory_collection.get(where={"expires_at": {"$lt": now}})
+        if expired and expired["ids"]:
+            self._f.memory_collection.delete(ids=expired["ids"])
+            self._f._log_debug(f"Purged {len(expired['ids'])} expired memories")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Project purge – NEW (C3)
@@ -11305,137 +10583,280 @@ class ReasoningEngine:
         project_id: str = "",
     ) -> Dict[str, Any]:
         """
-        Detect the full CoT configuration for the current turn.
+        Four-stage cascade CoT feature detector.
 
-        Returns a dict with the following guaranteed keys and types:
-            level                  : int   in [1, 3]
-            enable_scientific_cot  : bool
-            enable_architecture_mode: bool
-            cot_label              : str
-            use_multi_focus        : bool
-            focus_questions        : list
+        Returns a CoTConfig dict:
+            level          int  0-3   reasoning depth
+            use_scientific bool       activate compete_hypotheses
+            decompose      bool       advisory: per-question focal reasoning
+            source         str        "forced"|"heuristic"|"crossencoder"|
+                                      "llm"|"heuristic_fallback"
+            rationale      str        one line, logging only
 
-        All keys are normalized after LLM classification. Without normalization,
-        a partial LLM response (missing keys) causes KeyError in callers, and
-        truthy string values like "true" / "false" are not automatically cast
-        to bool, causing silent logic errors in conditions like
-        `if cot_config["enable_scientific_cot"]`.
+        STAGE 0 — SymbolGraph signal (pre-computed by caller, sync, free)
+            Measures structural specificity of the query.
+            Passed as signal_vector. If None, treated as empty (no signal).
 
-        Steps:
-            1.  Detect CoT level.
-            2.  Compute feature hints and signal vector.
-            3.  Call _classify_cot_config_with_llm.
-            4.  Normalize: ensure all canonical keys exist with correct types.
-            5.  Apply valve-based overrides.
-            6.  Return.
+        STAGE 1 — Heuristic (always, sync, free)
+            _detect_cot_level_heuristic → heuristic_level
+            _compute_feature_hints → ambiguity_score, traceback, multi_q,
+                                      heuristic_suggests_scientific
+            If enable_cot_llm_detection=False → returns here.
+
+        STAGE 2 — CrossEncoder (6 pairs)
+            [L0, L1, L2, L3] + [scientific, linear]
+            Reinforced by stage 0+1 via _reinforce_cot_scores.
+            If BOTH level AND scientific confident → CoTConfig, done.
+            If uncertain on ANY → stage 3.
+
+        STAGE 3 — LLM (summarization_model, cheap)
+            Full context: query + CE scores + signal_vector + hints.
+            Falls back to stage 1 estimate on failure.
+
+        Short-circuits:
+            enforce_scientific_method=True → {level:3, use_scientific:True}
+            is_continuation=True          → {level:0}
+            empty content                 → {level:0}
+            enable_cot_llm_detection=False → stage 1 only
         """
-        _DEFAULTS: Dict[str, Any] = {
-            "level": 1,
-            "enable_scientific_cot": False,
-            "enable_architecture_mode": False,
-            "cot_label": "General Programming",
-            "use_multi_focus": False,
-            "focus_questions": [],
+        _sv = signal_vector or {
+            "n_mentioned": 0,
+            "n_found": 0,
+            "n_relations": 0,
+            "structural_hits": 0,
         }
 
-        # -- Step 1: detect CoT level --
-        level = await self.detect_cot_level(
-            user_content, is_code_session, state, is_continuation
-        )
-
-        # -- Step 2: compute hints --
-        if signal_vector is None:
-            signal_vector = {}
-        hints = self._compute_feature_hints(
-            user_content, is_code_session, signal_vector, level
-        )
-
-        # -- Step 3: LLM config classification --
-        raw: Dict[str, Any] = {}
-        try:
-            level_scores = hints.get("level_scores")
-            sci_scores = hints.get("sci_scores")
-            raw = await self._classify_cot_config_with_llm(
-                user_content=user_content,
-                is_code_session=is_code_session,
-                level_scores=level_scores,
-                sci_scores=sci_scores,
-                hints=hints,
-                project_id=project_id,
-            )
-            if not isinstance(raw, dict):
-                raw = {}
-        except Exception as e:
+        # ── Short-circuits ─────────────────────────────────────────────────
+        if self._f.valves.enforce_scientific_method:
             self._f._log_debug(
-                f"detect_cot_configuration: LLM failed for '{project_id}': "
-                f"{type(e).__name__}: {e}"
+                "detect_cot_configuration: enforce_scientific_method → L3 scientific"
             )
+            return {
+                "level": 3,
+                "use_scientific": True,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "enforce_scientific_method=True",
+            }
 
-        # -- Step 4: normalize all keys to correct types --
-        config: Dict[str, Any] = dict(_DEFAULTS)
-        config["level"] = level  # always use the clamped value from Step 1
+        if is_continuation:
+            return {
+                "level": 0,
+                "use_scientific": False,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "continuation turn",
+            }
 
-        def _to_bool(val: Any, default: bool) -> bool:
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, int):
-                return bool(val)
-            if isinstance(val, str):
-                return val.strip().lower() in ("true", "1", "yes")
-            return default
+        if not user_content:
+            return {
+                "level": 0,
+                "use_scientific": False,
+                "decompose": False,
+                "source": "forced",
+                "rationale": "empty content",
+            }
 
-        def _to_int(val: Any, default: int, lo: int, hi: int) -> int:
-            try:
-                return max(lo, min(hi, int(float(str(val)))))
-            except (TypeError, ValueError):
-                return default
-
-        if "level" in raw:
-            config["level"] = _to_int(raw["level"], level, 1, 3)
-
-        if "enable_scientific_cot" in raw:
-            config["enable_scientific_cot"] = _to_bool(
-                raw["enable_scientific_cot"], False
-            )
-
-        if "enable_architecture_mode" in raw:
-            config["enable_architecture_mode"] = _to_bool(
-                raw["enable_architecture_mode"], False
-            )
-
-        if "cot_label" in raw:
-            label_raw = raw["cot_label"]
-            config["cot_label"] = (
-                str(label_raw).strip() if label_raw else _DEFAULTS["cot_label"]
-            )
-
-        if "use_multi_focus" in raw:
-            config["use_multi_focus"] = _to_bool(raw["use_multi_focus"], False)
-
-        if "focus_questions" in raw:
-            fq = raw["focus_questions"]
-            config["focus_questions"] = fq if isinstance(fq, list) else []
-
-        # -- Step 5: valve overrides --
-        if not self._f.valves.enable_scientific_cot:
-            config["enable_scientific_cot"] = False
-
-        if self.is_architecture_query(user_content):
-            config["enable_architecture_mode"] = True
-            config["level"] = 3
-
-        if not is_code_session:
-            config["enable_architecture_mode"] = False
+        # ── STAGE 1: Heuristic ─────────────────────────────────────────────
+        heuristic_level = self._detect_cot_level_heuristic(
+            user_content, is_code_session, state
+        )
+        hints = self._compute_feature_hints(
+            user_content, is_code_session, _sv, heuristic_level
+        )
 
         self._f._log_debug(
-            f"detect_cot_configuration: L{config['level']}, "
-            f"sci={config['enable_scientific_cot']}, "
-            f"arch={config['enable_architecture_mode']}, "
-            f"label='{config['cot_label']}' "
-            f"for '{project_id}'"
+            f"detect_cot_configuration stage1: "
+            f"heuristic_level={heuristic_level}, "
+            f"ambiguity={hints['ambiguity_score']}, "
+            f"traceback={hints['has_traceback']}, "
+            f"n_found={hints['n_found']}, "
+            f"suggests_sci={hints['heuristic_suggests_scientific']}"
         )
 
-        # -- Step 6: return --
+        # Heuristic-only mode
+        if not self._f.valves.enable_cot_llm_detection:
+            config = {
+                "level": heuristic_level,
+                "use_scientific": hints["heuristic_suggests_scientific"],
+                "decompose": hints["multi_question"],
+                "source": "heuristic",
+                "rationale": (
+                    f"heuristic-only: L{heuristic_level}, "
+                    f"ambiguity={hints['ambiguity_score']}"
+                ),
+            }
+            if self._f.ENABLE_COT_STICKY:
+                state.last_cot_level = heuristic_level
+            return config
+
+        # ── STAGE 2: CrossEncoder ──────────────────────────────────────────
+        # Build enriched query (same enrichment as existing _detect_cot_level_via_llm)
+        session_type = "code" if is_code_session else "general"
+        intent_hint = ""
+        if (
+            hasattr(self._f, "_user_intent_full_code")
+            and self._f._user_intent_full_code is not None
+        ):
+            intent_hint = (
+                "The user likely needs the full code."
+                if self._f._user_intent_full_code
+                else "The user likely needs only a summary."
+            )
+
+        context_parts = []
+        if "```" in user_content or any(
+            kw in user_content
+            for kw in ("def ", "class ", "import ", "from ", "function ")
+        ):
+            context_parts.append("[CODE]")
+        if hints["has_traceback"]:
+            context_parts.append("[TRACEBACK]")
+        if is_continuation:
+            context_parts.append("[CONTINUATION]")
+        context_prefix = " ".join(context_parts)
+        base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
+        query = (
+            f"{context_prefix} {base_query}".strip() if context_parts else base_query
+        )
+
+        # 6 CE pairs: 4 level + 2 scientific
+        ce_pairs = [
+            (
+                query,
+                "The user asks a trivial question about code: a simple fact, "
+                "definition, or direct command that does not require reasoning.",
+            ),
+            (
+                query,
+                "The user asks a moderately complex question about code that "
+                "requires some logical reasoning but the answer is straightforward.",
+            ),
+            (
+                query,
+                "The user asks a complex question about code with a clear "
+                "direction: step-by-step implementation, explanation of how "
+                "something works, or debugging with an obvious likely cause.",
+            ),
+            (
+                query,
+                "The user asks a deep, system-wide, or multi-component question "
+                "requiring exhaustive analysis, cascading impact evaluation, or "
+                "reasoning that spans many interconnected modules simultaneously.",
+            ),
+            (
+                query,
+                "The root cause or best solution is genuinely ambiguous — "
+                "several competing explanations are plausible, each involving "
+                "different parts of the codebase. The query names specific "
+                "functions, classes, or files that could be the root cause."
+                "The query mentions specific symbols or methods.",
+            ),
+            (
+                query,
+                "The direction is clear — one implementation, explanation, or "
+                "diagnosis needs to be produced in detail. There are no "
+                "competing structural alternatives to evaluate.",
+            ),
+        ]
+
+        all_scores = await self._f._commands._predict_cross_encoder(ce_pairs)
+
+        if all_scores is not None and len(all_scores) >= 6:
+            raw_level = list(all_scores[:4])
+            raw_sci = list(all_scores[4:6])
+
+            # Apply existing level reinforcement (backward compat)
+            if self._f.valves.enable_cot_heuristic_reinforcement:
+                level_scores = self._reinforce_cot_level_detection_with_heuristic(
+                    user_content, raw_level
+                )
+            else:
+                level_scores = raw_level
+
+            # Apply full reinforcement (level + scientific)
+            level_scores, sci_scores = self._reinforce_cot_scores(
+                level_scores, raw_sci, hints
+            )
+
+            # Confidence check on both dimensions
+            sorted_lv = sorted(level_scores, reverse=True)
+            level_diff = sorted_lv[0] - sorted_lv[1]
+            sci_diff = sci_scores[0] - sci_scores[1]  # + = scientific wins
+
+            level_confident = (
+                level_diff >= self._f.valves.cot_cascade_uncertainty_threshold
+            )
+            sci_confident = abs(sci_diff) >= self._f.valves.cot_scientific_ce_threshold
+
+            self._f._log_debug(
+                f"detect_cot_configuration stage2 CE: "
+                f"lv={[f'{s:.2f}' for s in level_scores]}, "
+                f"sci={[f'{s:.2f}' for s in sci_scores]}, "
+                f"lv_diff={level_diff:.2f}({'✅' if level_confident else '❌'}), "
+                f"sci_diff={sci_diff:.2f}({'✅' if sci_confident else '❌'})"
+            )
+
+            if not self._f.valves.enable_cot_cascade:
+                # Cascade disabled → skip CE decision, go straight to LLM
+                self._f._log_debug("detect_cot_configuration: cascade disabled → LLM")
+                config = await self._classify_cot_config_with_llm(
+                    user_content,
+                    is_code_session,
+                    level_scores,
+                    sci_scores,
+                    hints,
+                    project_id,
+                )
+            elif level_confident and sci_confident:
+                # Both dimensions confident → return from CE
+                best_level = int(np.argmax(level_scores))
+                use_scientific = sci_diff > 0 and best_level >= 2
+
+                if self._f.ENABLE_COT_STICKY:
+                    state.last_cot_level = best_level
+
+                config = {
+                    "level": best_level,
+                    "use_scientific": use_scientific,
+                    "decompose": hints["multi_question"],
+                    "source": "crossencoder",
+                    "rationale": (
+                        f"CE confident: L{best_level} (diff={level_diff:.2f}), "
+                        f"sci={use_scientific} (sci_diff={sci_diff:.2f})"
+                    ),
+                }
+                self._f._log_debug(
+                    f"detect_cot_configuration → CE: "
+                    f"level={best_level}, scientific={use_scientific}"
+                )
+                return config
+            else:
+                # Some dimension uncertain → LLM with CE context
+                self._f._log_debug("detect_cot_configuration: CE uncertain → LLM")
+                config = await self._classify_cot_config_with_llm(
+                    user_content,
+                    is_code_session,
+                    level_scores,
+                    sci_scores,
+                    hints,
+                    project_id,
+                )
+        else:
+            # CE unavailable → LLM with heuristics only
+            self._f._log_debug("detect_cot_configuration: CE unavailable → LLM")
+            config = await self._classify_cot_config_with_llm(
+                user_content,
+                is_code_session,
+                None,
+                None,
+                hints,
+                project_id,
+            )
+
+        if self._f.ENABLE_COT_STICKY:
+            state.last_cot_level = config["level"]
+
         return config
 
     async def _classify_cot_config_with_llm(
@@ -11772,96 +11193,21 @@ class ReasoningEngine:
         is_continuation: bool = False,
     ) -> int:
         """
-        Classify the required Chain-of-Thought depth for the current message.
+        Backward-compatible wrapper around detect_cot_configuration().
 
-        Returns an integer in [1, 3]:
-            1 — direct answer, minimal reasoning
-            2 — structured explanation, moderate reasoning
-            3 — scientific / architectural deep reasoning
-
-        The result is always clamped to [1, 3] after classification, regardless
-        of what the heuristic or LLM returns. Without the clamp, a malformed
-        LLM response of "0" or "4" propagates to callers that assume the value
-        is in the valid range, silently disabling or over-triggering CoT.
-
-        Steps:
-            1.  Heuristic fast path via _detect_cot_level_heuristic.
-            2.  Run cross-encoder against CoT-level exemplars.
-            3.  Call _classify_with_crossencoder_and_llm when heuristic is uncertain.
-            4.  Clamp final result to [1, 3] and return.
+        Returns the level int only. For full feature detection
+        (use_scientific, decompose), call detect_cot_configuration()
+        directly with a pre-computed signal_vector.
         """
-        # -- Step 1: heuristic --
-        heuristic_level = self._detect_cot_level_heuristic(
-            user_content, is_code_session, state
+        config = await self.detect_cot_configuration(
+            user_content=user_content,
+            is_code_session=is_code_session,
+            state=state,
+            signal_vector=None,
+            is_continuation=is_continuation,
+            project_id="",
         )
-
-        heuristic_threshold = getattr(
-            self._f.valves, "cot_heuristic_confidence_threshold", 0.85
-        )
-
-        # Architecture queries always get L3 regardless of heuristic confidence
-        if self.is_architecture_query(user_content):
-            self._f._log_debug("detect_cot_level: architecture query → L3")
-            return 3
-
-        # -- Step 2: cross-encoder --
-        exemplars = [
-            "simple quick question answer fact lookup",
-            "explain how implement step by step detailed",
-            "design architecture analyze system scientific hypothesis",
-        ]
-        pairs = [(user_content[:512], ex) for ex in exemplars]
-        raw_ce = await self._f._command_router._predict_cross_encoder(pairs)
-        ce_scores: List[float] = (
-            [self._f._command_router._normalize_cross_encoder_score(s) for s in raw_ce]
-            if raw_ce is not None
-            else []
-        )
-
-        if ce_scores and len(ce_scores) == 3:
-            ce_scores = self._reinforce_cot_level_detection_with_heuristic(
-                user_content, ce_scores
-            )
-            max_score = max(ce_scores)
-            ce_level = ce_scores.index(max_score) + 1
-
-            if max_score >= heuristic_threshold:
-                result = ce_level
-                self._f._log_debug(
-                    f"detect_cot_level: CE sufficient "
-                    f"(L{ce_level}, score={max_score:.2f})"
-                )
-                return max(1, min(3, result))
-
-        # -- Step 3: LLM classification --
-        try:
-            raw_level = await self._classify_with_crossencoder_and_llm(
-                user_content=user_content,
-                is_code_session=is_code_session,
-                crossencoder_scores=ce_scores or None,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"detect_cot_level: LLM failed, using heuristic "
-                f"L{heuristic_level}: {type(e).__name__}: {e}"
-            )
-            raw_level = heuristic_level
-
-        # -- Step 4: clamp to [1, 3] --
-        try:
-            level = int(float(str(raw_level).strip()))
-        except (ValueError, TypeError):
-            self._f._log_debug(
-                f"detect_cot_level: unparseable level '{raw_level}', "
-                f"falling back to heuristic L{heuristic_level}"
-            )
-            level = heuristic_level
-
-        clamped = max(1, min(3, level))
-        if clamped != level:
-            self._f._log_debug(f"detect_cot_level: clamped L{level} → L{clamped}")
-
-        return clamped
+        return config["level"]
 
     async def _classify_with_crossencoder_and_llm(
         self,
@@ -12583,130 +11929,37 @@ Output only the number (0, 1, 2, or 3):
         label: str = "",
     ) -> List[Tuple[str, float]]:
         """
-        Call the LLM to generate an initial pool of candidate hypotheses for
-        the scientific reasoning pipeline.
-
-        Returns a list of (hypothesis_text, confidence) tuples ready for
-        compete_hypotheses. Returns [] on LLM failure; the caller
-        (generate_scientific_reasoning_L3) falls back to L2 CoT.
-
-        Steps:
-            1.  Guard and clamp max_hypotheses.
-            2.  Optionally generate a step-back abstraction of the question.
-            3.  Build the hypothesis-generation prompt.
-            4.  Call LLM; return [] on failure.
-            5.  Parse response into (text, confidence) pairs.
-            6.  Clamp confidences, filter invalid entries.
-            7.  Return up to max_hypotheses pairs.
+        Generate the initial set of hypotheses for the scientific reasoning loop.
+        Extracted from generate_scientific_reasoning_L3 REGION 2.
+        Slot is restored after the LLM call.
         """
-        label_str = f" ({label})" if label else ""
-
-        # -- Step 1: clamp max_hypotheses --
-        safe_max = max(1, min(10, int(max_hypotheses) if max_hypotheses else 3))
-        if safe_max != max_hypotheses:
-            self._f._log_debug(
-                f"_generate_initial_hypotheses{label_str}: "
-                f"max_hypotheses clamped {max_hypotheses} → {safe_max}"
-            )
-
-        # -- Step 2: step-back abstraction (Bug 97: truncate first) --
-        step_back_q = question
-        if getattr(self._f.valves, "enable_step_back_reasoning", True):
-            try:
-                max_sb_tokens = getattr(
-                    self._f.valves, "max_stepback_context_tokens", 1500
-                )
-                safe_sb_context = self._f._tokens.truncate_text_to_tokens(
-                    context, max_sb_tokens
-                )
-                step_back_q = (
-                    await self._generate_step_back_context(
-                        question=question,
-                        code_context=safe_sb_context,
-                    )
-                    or question
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"_generate_initial_hypotheses{label_str}: "
-                    f"step-back failed (non-fatal): {type(e).__name__}: {e}"
-                )
-
-        # -- Step 3: build prompt --
         prompt = (
-            f"You are a senior software engineer performing root-cause analysis.\n\n"
-            f"Question: {step_back_q}\n\n"
-            f"Relevant code context:\n{context}\n\n"
-            f"Generate exactly {safe_max} distinct, falsifiable hypotheses that "
-            f"could explain or address the question. "
-            f"Order them from most to least likely.\n\n"
-            f"Format each hypothesis as:\n"
-            f"H1: <hypothesis text> [confidence: 0.X]\n"
-            f"H2: <hypothesis text> [confidence: 0.X]\n"
-            f"...\n\n"
-            f"Confidence is your estimate that the hypothesis is correct (0.0-1.0). "
-            f"Be specific and reference actual symbols or patterns from the code context."
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question}\n\n"
+            f"Propose {max_hypotheses} distinct hypotheses that could explain "
+            f"the issue or solve the problem. For each, state:\n"
+            f"Hypothesis: <one concise sentence>\n"
+            f"Confidence: <0.0-1.0>\n\n"
+            f"Be specific: mention function names, files, or data flows if possible."
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a scientific reasoning engine. Output exactly the "
+                "requested hypotheses with confidence scores. No extra commentary."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=0.4,
+            label=f"{label}_gen_hypotheses" if label else "sci_gen_hypotheses",
         )
 
-        system = (
-            "You are an expert software engineer performing scientific debugging. "
-            "Generate precise, falsifiable hypotheses grounded in the provided code. "
-            "Do not add commentary outside the requested format."
-        )
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # -- Step 4: call LLM --
-        try:
-            raw = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=getattr(
-                    self._f.valves, "hypothesis_generation_max_tokens", 800
-                ),
-                temperature=getattr(
-                    self._f.valves, "hypothesis_generation_temperature", 0.7
-                ),
-                enable_thinking=False,
-                label=f"generate_hypotheses{label_str}",
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_generate_initial_hypotheses{label_str}: "
-                f"LLM call failed: {type(e).__name__}: {e}"
-            )
+        if not response:
             return []
-
-        if not raw:
-            return []
-
-        # -- Step 5: parse response --
-        raw_pairs = self._f._metacognitive._parse_hypotheses_from_response(raw)
-
-        if not raw_pairs:
-            self._f._log_debug(
-                f"_generate_initial_hypotheses{label_str}: "
-                f"no hypotheses parsed from LLM response"
-            )
-            return []
-
-        # -- Step 6: clamp and filter --
-        result: List[Tuple[str, float]] = []
-        for text, conf in raw_pairs:
-            if not text or not isinstance(text, str) or not text.strip():
-                continue
-            try:
-                clamped_conf = max(0.0, min(1.0, float(conf)))
-            except (TypeError, ValueError):
-                clamped_conf = 0.5
-            result.append((text.strip(), clamped_conf))
-
-        # -- Step 7: return up to max --
-        final = result[:safe_max]
-        self._f._log_debug(
-            f"_generate_initial_hypotheses{label_str}: "
-            f"generated {len(final)}/{safe_max} hypotheses "
-            f"for '{project_id}'"
-        )
-        return final
+        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
 
     async def _generate_initial_arch_hypotheses(
         self,
@@ -12766,104 +12019,54 @@ Output only the number (0, 1, 2, or 3):
         label: str = "",
     ) -> str:
         """
-        Synthesise the final scientific reasoning text from the competition
-        winner, its evidence, and optionally a peer review verdict.
+        Synthesize final reasoning from winning hypothesis + evidence.
+        Extracted from generate_scientific_reasoning_L3 REGIONS 4-5.
 
-        Always returns a str (empty string on failure), never None.
-
-        Bug 129 fix: peer_review fields are accessed via getattr with safe
-        defaults so that None peer_review (reviewer unavailable, timed out,
-        or explicitly passed as None) does not raise AttributeError.
-
-        Bug 130 fix: returns "" instead of None on LLM failure so that the
-        caller (generate_scientific_reasoning_L3 Bug 82) can safely call
-        .strip() on the return value without a NoneType guard.
-
-        Steps:
-            1.  Format evidence summary from best_evidence fields.
-            2.  Format peer review section (None-safe via getattr).
-            3.  Build synthesis prompt.
-            4.  Call LLM; return "" on failure.
-            5.  Return cleaned reasoning string.
+        Receives peer_review to include verdict in the header (H6 dialectical
+        synthesis has already happened inside compete_hypotheses — best_hyp
+        may already be a scoped hypothesis).
         """
-        label_str = f" ({label})" if label else ""
-
-        # -- Step 1: format evidence summary --
-        symbols_found = getattr(best_evidence, "symbols_found", []) or []
-        relations_ok = getattr(best_evidence, "call_relations_valid", []) or []
-        obj_score = getattr(best_evidence, "objective_score", 0.0)
-
-        evidence_lines: List[str] = []
-        if symbols_found:
-            evidence_lines.append(
-                f"Supporting symbols: {', '.join(str(s) for s in symbols_found[:5])}"
-            )
-        if relations_ok:
-            evidence_lines.append(
-                f"Valid call relations: {', '.join(str(r) for r in relations_ok[:3])}"
-            )
-        evidence_lines.append(f"Objective evidence score: {obj_score:.2f}")
-        evidence_text = "\n".join(evidence_lines)
-
-        # -- Step 2: peer review section (Bug 129: None-safe) --
-        peer_section = ""
-        if peer_review is not None:
-            verdict = getattr(peer_review, "verdict", "")
-            critiques = getattr(peer_review, "critiques", []) or []
-            if verdict or critiques:
-                peer_section = f"\nPeer Review Verdict: {verdict}\n" + (
-                    "Critiques:\n" + "\n".join(f"- {c}" for c in critiques[:3])
-                    if critiques
-                    else ""
-                )
-
-        # -- Step 3: synthesis prompt --
-        confidence_desc = (
-            "high" if best_score >= 0.7 else "moderate" if best_score >= 0.4 else "low"
-        )
-
-        prompt = (
-            f"You are a senior software engineer synthesising a technical analysis.\n\n"
-            f"Question: {question}\n\n"
-            f"Winning hypothesis ({confidence_desc} confidence, score {best_score:.2f}):\n"
+        final_prompt = (
+            f"Context:\n{context[:3000]}\n\n"
+            f"Question:\n{question}\n\n"
+            f"The best validated hypothesis (score {best_score:.3f}):\n"
             f"{best_hyp}\n\n"
-            f"Supporting evidence:\n{evidence_text}"
-            f"{peer_section}\n\n"
-            f"Relevant code context:\n{context}\n\n"
-            f"Write a concise, actionable technical analysis (3-5 paragraphs) that:\n"
-            f"1. States the most likely explanation directly.\n"
-            f"2. References specific code evidence.\n"
-            f"3. Identifies what to verify or change.\n"
-            f"4. Notes any uncertainty honestly."
+            f"Structural evidence supporting it:\n"
+            f"- Symbols found: {best_evidence.symbols_found}\n"
+            f"- Call relations valid: {best_evidence.call_relations_valid}\n"
+            f"- Recent changes: {best_evidence.recent_changes}\n"
+            f"- Data flow upstream: {best_evidence.data_flow_upstream}\n\n"
+            f"Provide a step-by-step reasoning to answer the question, "
+            f"grounded in this evidence."
+        )
+        reasoning = await self._f._llm_orchestrator.call_llm(
+            prompt=final_prompt,
+            system_prompt=(
+                "You are a helpful assistant that reasons step by step "
+                "based on verified evidence."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=self._f.valves.cot_max_tokens,
+            temperature=0.3,
+            label=f"{label}_synthesize" if label else "sci_synthesize",
         )
 
-        system = (
-            "You are an expert software engineer performing root-cause analysis. "
-            "Be precise, reference actual code symbols, and distinguish "
-            "confirmed facts from hypotheses."
-        )
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        # -- Step 4: call LLM --
-        try:
-            raw = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=getattr(self._f.valves, "synthesis_max_tokens", 1000),
-                temperature=0.3,
-                enable_thinking=False,
-                label=f"synthesize_reasoning{label_str}",
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_synthesize_scientific_reasoning{label_str}: "
-                f"LLM failed: {type(e).__name__}: {e}"
-            )
-            return ""  # Bug 130: always str, never None
-
-        # -- Step 5: return cleaned string --
-        if not raw:
+        if not reasoning:
             return ""
-        return raw.strip()
+
+        peer_note = ""
+        if peer_review and peer_review.verdict != "APPROVE":
+            peer_note = f" | {peer_review.verdict} by {peer_review.reviewer_model}"
+
+        return (
+            f"## 🔬 Scientific Reasoning (Level 3)\n"
+            f"*Validated against code structure. "
+            f"Best hypothesis score: {best_score:.2f}{peer_note}*\n\n"
+            f"{reasoning}"
+        )
 
     async def _synthesize_scientific_architecture_reasoning(
         self,
@@ -12944,177 +12147,56 @@ Output only the number (0, 1, 2, or 3):
         )
 
     async def generate_scientific_reasoning_L3(
-        self,
-        question: str,
-        context: str,
-        project_id: str,
-        label: str = "",
+        self, question: str, context: str, project_id: str, label: str = ""
     ) -> str:
         """
-        Generate scientific-grade L3 Chain-of-Thought reasoning using
-        multi-hypothesis competition, peer review, and synthesis.
-
-        Falls back to standard L2 generate_cot_reasoning when:
-          - No hypotheses can be generated (LLM failure, empty codebase).
-          - The competition winner has score below the minimum threshold.
-          - Synthesis returns None or empty string.
-
-        Bug 82 fix: empty hypothesis list triggers immediate L2 fallback
-        rather than returning "" which would inject an empty CoT section.
-
-        Bug 83 fix: context is truncated to max_scientific_context_tokens
-        before being embedded in the hypothesis-generation prompt. Without
-        this, a 16k-token Block B payload causes the LLM to truncate mid-
-        response or return None, silently dropping the entire CoT.
-
-        Bug 84 fix: _synthesize_scientific_reasoning receives
-        peer_review=None gracefully; the synthesis prompt omits the peer
-        review section when no review is available rather than crashing on
-        peer_review.critiques.
-
-        Steps:
-            1.  Truncate context to safe token limit.
-            2.  Generate initial hypotheses.
-            3.  Fallback to L2 when hypotheses is empty.
-            4.  Run hypothesis competition.
-            5.  Fallback to L2 when winner score is too low.
-            6.  Run peer review (best-effort; None on failure is fine).
-            7.  Synthesise final reasoning.
-            8.  Fallback to L2 when synthesis returns empty.
+        Generate scientific Chain-of-Thought reasoning with structural validation.
+        Thin wrapper — delegates to MetacognitiveReasoningEngine.compete_hypotheses().
         """
-        label_str = f" ({label})" if label else ""
+        max_hypotheses = self._f.valves.scientific_hypotheses_count
+        threshold = self._f.valves.scientific_confidence_threshold
+        max_iters = self._f.valves.scientific_max_iterations
 
-        # -- Step 1: truncate context --
-        max_ctx_tokens = getattr(self._f.valves, "max_scientific_context_tokens", 3000)
-        safe_context = self._f._tokens.truncate_text_to_tokens(context, max_ctx_tokens)
-        if len(safe_context) < len(context):
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"context truncated from ~{len(context)//4} to "
-                f"~{max_ctx_tokens} tokens"
-            )
-
-        # -- Step 2: generate initial hypotheses --
-        try:
-            hypotheses = await self._generate_initial_hypotheses(
-                question=question,
-                context=safe_context,
-                max_hypotheses=getattr(self._f.valves, "max_hypotheses", 3),
-                project_id=project_id,
-                label=label,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"hypothesis generation failed: {type(e).__name__}: {e}"
-            )
-            hypotheses = []
-
-        # -- Step 3: fallback to L2 when no hypotheses --
-        if not hypotheses:
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"no hypotheses generated, falling back to L2 CoT"
-            )
-            return await self.generate_cot_reasoning(
-                question=question,
-                context=safe_context,
-                label=label,
-            )
-
-        # -- Step 4: hypothesis competition --
-        try:
-            winner_text, winner_score, evidence, peer_review = (
-                await self._f._metacognitive.compete_hypotheses(
-                    hypotheses=hypotheses,
-                    project_id=project_id,
-                    max_iters=getattr(self._f.valves, "max_competition_iters", 3),
-                    threshold=getattr(
-                        self._f.valves, "hypothesis_confidence_threshold", 0.75
-                    ),
-                    label=label,
-                )
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"competition failed: {type(e).__name__}: {e}"
-            )
-            return await self.generate_cot_reasoning(
-                question=question,
-                context=safe_context,
-                label=label,
-            )
-
-        # -- Step 5: fallback to L2 when winner is too weak --
-        min_score = getattr(self._f.valves, "scientific_reasoning_min_score", 0.2)
-        if not winner_text or winner_score < min_score:
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"winner score {winner_score:.2f} < {min_score}, "
-                f"falling back to L2 CoT"
-            )
-            return await self.generate_cot_reasoning(
-                question=question,
-                context=safe_context,
-                label=label,
-            )
-
-        # -- Step 6: peer review (best-effort) --
-        # peer_review=None is acceptable; synthesis handles it gracefully (Bug 84).
-        if peer_review is None:
-            try:
-                peer_review = await self._f._metacognitive.peer_review_hypothesis(
-                    hypothesis=winner_text,
-                    evidence=evidence,
-                    design=await self._f._metacognitive.design_critical_experiment(
-                        winner_text, project_id
-                    ),
-                    project_id=project_id,
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"generate_scientific_reasoning_L3{label_str}: "
-                    f"peer review failed (non-fatal): {type(e).__name__}: {e}"
-                )
-                peer_review = None
-
-        # -- Step 7: synthesise --
-        try:
-            reasoning = await self._synthesize_scientific_reasoning(
-                question=question,
-                context=safe_context,
-                best_hyp=winner_text,
-                best_score=winner_score,
-                best_evidence=evidence,
-                project_id=project_id,
-                peer_review=peer_review,  # None handled inside (Bug 84)
-                label=label,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"synthesis failed: {type(e).__name__}: {e}"
-            )
-            reasoning = None
-
-        # -- Step 8: fallback to L2 when synthesis is empty --
-        if not reasoning or not reasoning.strip():
-            self._f._log_debug(
-                f"generate_scientific_reasoning_L3{label_str}: "
-                f"synthesis returned empty, falling back to L2 CoT"
-            )
-            return await self.generate_cot_reasoning(
-                question=question,
-                context=safe_context,
-                label=label,
-            )
-
-        self._f._log_debug(
-            f"generate_scientific_reasoning_L3{label_str}: "
-            f"complete — winner_score={winner_score:.2f}, "
-            f"peer_review={'yes' if peer_review else 'no'}"
+        hypotheses = await self._generate_initial_hypotheses(
+            question, context, max_hypotheses, project_id, label
         )
+        if len(hypotheses) < 2:
+            self._f._log_debug(
+                "Scientific L3: insufficient hypotheses — falling back to L2 CoT"
+            )
+            return await self.generate_cot_reasoning(question, context, label)
+
+        best_hyp, best_score, best_evidence, peer_review = (
+            await self._f._meta_reasoning.compete_hypotheses(
+                hypotheses=hypotheses,
+                project_id=project_id,
+                max_iters=max_iters,
+                threshold=threshold,
+                label=label,
+                obj_weight=0.5,
+                llm_weight=0.5,
+            )
+        )
+
+        if not best_hyp or best_score == 0.0:
+            self._f._log_debug(
+                "Scientific L3: no valid hypothesis survived — falling back to L2 CoT"
+            )
+            return await self.generate_cot_reasoning(question, context, label)
+
+        reasoning = await self._synthesize_scientific_reasoning(
+            question,
+            context,
+            best_hyp,
+            best_score,
+            best_evidence,
+            project_id=project_id,
+            peer_review=peer_review,
+            label=label,
+        )
+
+        if not reasoning:
+            return "Unable to synthesize scientific reasoning."
         return reasoning
 
     async def generate_scientific_architecture_reasoning(
@@ -13217,161 +12299,157 @@ class MultiPhasePlanner:
         cot_degraded_to_l1: bool = False,
         is_continuation: bool = False,
     ) -> str:
-        """
-        Build the multi-phase response instructions injected into the final
-        user message before the model call.
+        """Build the multi‑phase protocol instructions injected into the system prompt."""
+        _CODE_SIGNALS = {
+            "refactor",
+            "refactoriza",
+            "implement",
+            "implementa",
+            "escribe",
+            "write",
+            "genera",
+            "generate",
+            "crea",
+            "create",
+            "código",
+            "code",
+            "clase",
+            "class",
+            "función",
+            "function",
+            "método",
+            "method",
+            "módulo",
+            "module",
+            "reescribe",
+            "rewrite",
+        }
+        is_code_task = any(sig in user_query.lower() for sig in _CODE_SIGNALS)
 
-        Guards against a zero or negative available_tokens budget. When the
-        context is nearly full, WindowManager may leave fewer tokens than the
-        minimum viable phase size; in that case the function falls back to a
-        single-phase instruction rather than producing directives like
-        "write Part 1 in 0 tokens" which confuse the model.
+        part_budget = min(
+            self._f.valves.multi_phase_effective_max_tokens,
+            max(500, available_tokens - 200),
+        )
 
-        When cot_degraded_to_l1=True the reasoning preamble phase is omitted
-        from the phase plan. Without this check the planner still schedules
-        a reasoning phase even though ReasoningEngine already downgraded CoT
-        to L1 (direct answer), wasting tokens on unwanted meta-commentary.
+        fase1_suffix = (
+            " *(razona paso a paso aquí — análisis de dependencias incluido)*"
+            if cot_degraded_to_l1
+            else ""
+        )
 
-        Steps:
-            1.  Guard: return single-phase fallback when budget is too small.
-            2.  Compute phase count and per-phase budget.
-            3.  Build phase descriptors; skip reasoning phase when cot_degraded.
-            4.  Format and return instruction string.
-        """
-        v = self._f.valves
-
-        min_phase_tokens = getattr(v, "multi_phase_min_tokens_per_phase", 200)
-        default_phases = getattr(v, "multi_phase_default_phases", 3)
-        tokens_per_phase = getattr(v, "multi_phase_tokens_per_phase", 0)
-
-        # -- Step 1: budget guard --
-        effective_budget = max(0, available_tokens)
-
-        if effective_budget < min_phase_tokens * 2:
-            # Not enough room for at least two meaningful phases.
-            fallback_tokens = effective_budget or getattr(
-                v, "multi_phase_effective_max_tokens", 2048
+        if is_continuation and is_code_task:
+            header = (
+                f"## 📋 CONTINUACIÓN MULTI-FASE — {part_budget} tokens por parte\n\n"
+                "Fases 1-4 completadas. Continúa con el siguiente bloque del Plan."
             )
-            return (
-                f"Respond completely in one part. "
-                f"Use at most ~{fallback_tokens} tokens. "
-                f"Be concise and prioritise the most important information."
-            )
+            phases = textwrap.dedent(f"""
+                    **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
+                    Escribe el siguiente bloque del plan. REGLAS CRÍTICAS:
+                      · Encabeza la parte: `## Código — Parte K/M: [nombre del bloque]`
+                      · NUNCA cortes dentro de una función, clase o método.
+                      · Antes de alcanzar el límite, cierra el bloque actual limpiamente
+                        y escribe el marcador obligatorio:
+                        `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
+                        `# Pendiente: [lista de lo que falta]`
+                      · Una clase puede partirse entre partes; un método, nunca.
 
-        # -- Step 2: compute phase count and per-phase budget --
-        if tokens_per_phase and tokens_per_phase > 0:
-            n_phases = max(1, effective_budget // tokens_per_phase)
-            per_phase = tokens_per_phase
+                    **FASE FINAL — Verificación** (~150 tokens)
+                    Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
+                """).strip()
+            return f"{header}\n\n{phases}"
+
+        if is_code_task:
+            header = (
+                f"## 📋 PROTOCOLO MULTI-FASE — {part_budget} tokens por parte\n\n"
+                "Tu tarea genera más código del que cabe en un mensaje. "
+                "Sigue **exactamente** este protocolo:"
+            )
+            phases = textwrap.dedent(f"""
+                    **FASE 1 — Análisis{fase1_suffix}** (~300-400 tokens)
+                    Qué existe, qué cambia, dependencias críticas. Sin código todavía.
+
+                    **FASE 2 — Arquitectura** (~400-600 tokens) *(solo si el diseño es complejo)*
+                    Decisiones de estructura: clases, inyección de dependencias, patrones.
+                    Omite esta fase si el Plan la cubre suficientemente.
+
+                    **FASE 3 — Contrato** (~300-500 tokens)
+                    Firmas completas de todas las clases y métodos públicos, sin cuerpo.
+                    Compromiso firme: no cambies estas firmas en fases posteriores.
+
+                    **FASE 4 — Plan de Acción** (~300-400 tokens)
+                    Lista numerada: bloque | tokens estimados | dependencias previas.
+                    Última línea obligatoria:
+                    "Total: ~X tokens → N partes de ≤ {part_budget} tokens c/u"
+
+                    **FASE 5...N — Código Parte K/M** (≤ {part_budget} tokens por parte)
+                    Escribe los bloques del plan en orden. REGLAS CRÍTICAS:
+                      · Encabeza cada parte: `## Código — Parte K/M: [nombre del bloque]`
+                      · NUNCA cortes dentro de una función, clase o método.
+                      · Antes de alcanzar el límite, cierra el bloque actual limpiamente
+                        y escribe el marcador obligatorio:
+                        `# ▶ CONTINÚA: Parte [K+1] — [nombre exacto del siguiente bloque]`
+                        `# Pendiente: [lista de lo que falta]`
+                      · Una clase puede partirse entre partes; un método, nunca.
+
+                    **FASE FINAL — Verificación** (~150 tokens)
+                    Lista los bloques del plan y marca: ✓ escrito | ✗ pendiente.
+                """).strip()
         else:
-            n_phases = default_phases
-            per_phase = effective_budget // n_phases
-
-        # Clamp to minimum useful size per phase
-        if per_phase < min_phase_tokens:
-            n_phases = max(1, effective_budget // min_phase_tokens)
-            per_phase = effective_budget // n_phases
-
-        n_phases = min(n_phases, getattr(v, "multi_phase_max_phases", 5))
-
-        # -- Step 3: build phase descriptors --
-        phases: List[str] = []
-        phase_num = 1
-
-        # Reasoning preamble — omitted when CoT was degraded to L1
-        if (
-            not cot_degraded_to_l1
-            and not is_continuation
-            and getattr(v, "multi_phase_include_reasoning_phase", True)
-            and n_phases >= 3
-        ):
-            reasoning_budget = max(min_phase_tokens, per_phase // 2)
-            phases.append(
-                f"**Part {phase_num}** (~{reasoning_budget} tokens): "
-                f"Think through the problem. Outline your approach. "
-                f"Do NOT write final code yet."
+            cot_note = (
+                "\nRazona paso a paso antes de continuar." if cot_degraded_to_l1 else ""
             )
-            phase_num += 1
-
-        # Middle parts — implementation / explanation
-        while phase_num < n_phases:
-            phases.append(
-                f"**Part {phase_num}** (~{per_phase} tokens): "
-                f"Continue the implementation or explanation. "
-                f"Signal readiness to continue with "
-                f"'[CONTINUE to Part {phase_num + 1}]' at the end."
+            header = (
+                f"## 📋 RESPUESTA LARGA — {available_tokens} tokens disponibles\n\n"
+                "Tu respuesta probablemente excede el espacio en un mensaje. "
+                "Divídela en partes lógicas:"
             )
-            phase_num += 1
+            phases = textwrap.dedent(f"""
+                    **Parte 1 — Resumen y plan** (~300 tokens)
+                    Enumera los puntos que vas a desarrollar.{cot_note}
 
-        # Final part
-        phases.append(
-            f"**Part {phase_num}** (~{per_phase} tokens): "
-            f"Complete your response. Summarise key points. "
-            f"Do NOT add a continuation signal."
-        )
+                    **Partes 2...N — Desarrollo** (≤ {part_budget} tokens por parte)
+                    Al final de cada parte que no sea la última escribe:
+                    `▶ CONTINÚA — [título de lo que sigue]`
 
-        # -- Step 4: format --
-        header = (
-            f"Your response must be split into {len(phases)} parts "
-            f"(~{per_phase} tokens each, {effective_budget} total available):\n\n"
-        )
-        return header + "\n\n".join(phases)
+                    **Parte Final — Conclusión** (~150 tokens)
+                    Verifica que cubriste todos los puntos del plan.
+                """).strip()
+
+        return f"{header}\n\n{phases}"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Wrap‑up hint (appended to user message when token window is critical)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def append_critical_wrap_up_hint(self, messages: list) -> list:
+    @staticmethod
+    def append_critical_wrap_up_hint(messages: list) -> list:
         """
-        Inject a wrap-up reminder into the last user message of the list.
+        Append a short (~25-token) wrap-up reminder to the last user message
+        when the response token budget is critically low.
 
-        The hint is appended to the CONTENT of the last user message rather
-        than added as a separate message. Adding a standalone user message
-        produces two consecutive user-role entries, which several LLM providers
-        reject with a 400 error, and which confuses models into treating the
-        second entry as a correction or clarification of the first.
-
-        Returns a new list with a shallow-copied last message so the caller's
-        original messages list and message dict are not modified in place.
-
-        Steps:
-            1.  Guard: return the original list unchanged if empty or no user
-                message is found.
-            2.  Make a shallow copy of the list.
-            3.  Copy the last user message dict and append the hint to its content.
-            4.  Replace the last entry in the copied list and return.
+        Appended to the user message (not system) so it is not deducted
+        from the model's generation budget.
         """
-        # -- Step 1: guard --
-        if not messages:
-            return messages
-
-        # Find the last user message index
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-
+        last_user_idx = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].get("role") == "user"
+            ),
+            None,
+        )
         if last_user_idx is None:
             return messages
 
-        hint_text = getattr(
-            self._f.valves,
-            "multi_phase_wrap_up_hint",
-            "\n\n[This is the final part. Complete your response now. "
-            "Do NOT add a continuation signal.]",
+        hint = (
+            "\n\n⚠️ Tokens críticos. Cierra el bloque actual sin cortarlo, "
+            "escribe el marcador de continuación y para."
         )
-
-        # -- Step 2: shallow copy of list --
-        new_messages = list(messages)
-
-        # -- Step 3: copy the message dict and append hint --
-        original_msg = messages[last_user_idx]
-        original_content = original_msg.get("content") or ""
-        new_msg = {**original_msg, "content": original_content + hint_text}
-
-        # -- Step 4: replace in copied list --
-        new_messages[last_user_idx] = new_msg
-        return new_messages
+        messages[last_user_idx] = {
+            **messages[last_user_idx],
+            "content": messages[last_user_idx].get("content", "") + hint,
+        }
+        return messages
 
 
 class CommandRouter:
@@ -13736,126 +12814,154 @@ class CommandRouter:
 
         return text
 
-    async def classify_intent(
-        self,
-        user_query: str,
-        project_id: str,
-    ) -> dict:
+    async def classify_intent(self, user_query: str, project_id: str) -> dict:
         """
-        Classify the user query into a weighted intent vector.
+        Classify the user's intent using a cascade: CrossEncoder → LLM.
 
-        Returns a dict with float weights in [0.0, 1.0] for each of the
-        canonical intent keys. Weights do not need to sum to 1.
+        1. CrossEncoder provides initial scores for explain/modify/debug/refactor.
+        2. Heuristic reinforcement adjusts scores based on keywords.
+        3. If confident (diff >= CE_THRESHOLD), use the reinforced CrossEncoder result.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), call the LLM with CE context.
+        5. If CrossEncoder unavailable, use LLM alone.
+        6. Middle zone: conservative heuristic distribution.
 
-        Canonical keys (all guaranteed present in the returned dict):
-            debug, modify, refactor, explain, generate, review, architecture
+        Restores KV slot after any LLM call.
 
-        Classification cascade:
-            1.  Strip noise from the raw query.
-            2.  Build cross-encoder pairs (query vs. intent label exemplars).
-            3.  Run cross-encoder. If the model is unavailable, ce_scores is None;
-                the LLM path receives an empty list rather than None so it can
-                still function without indexing errors.
-            4.  Apply heuristic boosting via _reinforce_cot_level_detection.
-            5.  If heuristic confidence is sufficient, return heuristic result.
-            6.  Otherwise call _classify_intent_with_llm.
-            7.  Normalize the returned dict to guarantee all canonical keys exist
-                with float values, preventing KeyError in callers that do not
-                use .get() with a default.
+        Args:
+            user_query (str): The user's query.
+            project_id (str): Current project identifier.
+
+        Returns:
+            dict: Probabilities for explain, modify, debug, refactor.
         """
-        _CANONICAL_KEYS = {
-            "debug": 0.0,
-            "modify": 0.0,
-            "refactor": 0.0,
-            "explain": 0.0,
-            "generate": 0.0,
-            "review": 0.0,
-            "architecture": 0.0,
-        }
-
-        # -- Step 1: strip noise --
-        stripped = self._strip_code_noise(user_query)
-        query_for_ce = stripped if stripped.strip() else user_query
-
-        # -- Step 2: build cross-encoder pairs --
-        intent_exemplars = {
-            "debug": "fix bug error traceback exception crash failing test",
-            "modify": "change update edit add remove implement feature",
-            "refactor": "refactor restructure clean up improve reorganize",
-            "explain": "explain how does what is describe walk me through",
-            "generate": "write create generate new code function class",
-            "review": "review check code quality is this correct best practice",
-            "architecture": "design architecture system structure high level overview",
-        }
-        pairs = [(query_for_ce, exemplar) for exemplar in intent_exemplars.values()]
-        intent_keys_ordered = list(intent_exemplars.keys())
-
-        # -- Step 3: run cross-encoder --
-        raw_ce_scores = await self._predict_cross_encoder(pairs)
-
-        # Normalise to list before any downstream use. None means the
-        # cross-encoder model is not loaded; an empty list is safe to pass
-        # to _classify_intent_with_llm and avoids TypeError on indexing.
-        ce_scores: List[float] = (
-            [self._normalize_cross_encoder_score(s) for s in raw_ce_scores]
-            if raw_ce_scores is not None
-            else []
-        )
-
-        # -- Step 4: build heuristic intent dict from ce_scores --
-        heuristic: Dict[str, float] = dict(_CANONICAL_KEYS)
-        if ce_scores and len(ce_scores) == len(intent_keys_ordered):
-            for key, score in zip(intent_keys_ordered, ce_scores):
-                heuristic[key] = float(score)
-
-        # -- Step 5: heuristic confidence gate --
-        max_score = max(heuristic.values()) if heuristic else 0.0
-        confidence_threshold = getattr(
-            self._f.valves, "intent_heuristic_confidence_threshold", 0.75
-        )
-        if max_score >= confidence_threshold and ce_scores:
-            self._f._log_debug(
-                f"classify_intent: heuristic sufficient "
-                f"(max={max_score:.2f} >= {confidence_threshold})"
-            )
-            return heuristic
-
-        # -- Step 6: LLM classification --
-        try:
-            llm_result = await self._classify_intent_with_llm(
-                user_query=user_query,
-                ce_scores=ce_scores,  # guaranteed list, never None
-                stripped_query=stripped,
-                project_id=project_id,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"classify_intent: LLM failed, falling back to heuristic: "
-                f"{type(e).__name__}: {e}"
-            )
-            return heuristic
-
-        if not llm_result or not isinstance(llm_result, dict):
-            return heuristic
-
-        # -- Step 7: normalize result --
-        # Guarantee all canonical keys exist with float values so callers
-        # that do intent_vector["debug"] rather than .get("debug", 0.0)
-        # do not raise KeyError.
-        normalized: Dict[str, float] = dict(_CANONICAL_KEYS)
-        for key in _CANONICAL_KEYS:
-            raw = llm_result.get(key)
-            if raw is not None:
-                try:
-                    normalized[key] = max(0.0, min(1.0, float(raw)))
-                except (TypeError, ValueError):
-                    pass  # keep default 0.0
+        classifier_input = self._extract_text_for_classification(user_query)
 
         self._f._log_debug(
-            f"classify_intent: {normalized} "
-            f"(ce_scores={'yes' if ce_scores else 'none'})"
+            f"classify_intent: input truncated from {len(user_query.split())} words "
+            f"to {len(classifier_input.split())} (code stripped)"
         )
-        return normalized
+
+        context_parts = []
+        if "```" in user_query or any(
+            kw in user_query
+            for kw in ("def ", "class ", "import ", "from ", "function ")
+        ):
+            context_parts.append("[CODE]")
+        if "traceback" in user_query.lower() or 'File "' in user_query:
+            context_parts.append("[TRACEBACK]")
+        context_prefix = " ".join(context_parts)
+        query = (
+            f"{context_prefix} {classifier_input}"
+            if context_parts
+            else classifier_input
+        )
+
+        pairs = [
+            (
+                query,
+                "The user wants to understand or explain code at a high level, without modifying it.",
+            ),
+            (
+                query,
+                "The user wants to modify, fix, or create code directly, requiring changes to the codebase.",
+            ),
+            (
+                query,
+                "The user is debugging an error, exception, or unexpected behavior in the code.",
+            ),
+            (
+                query,
+                "The user wants to refactor, restructure, or redesign code without changing its external behavior.",
+            ),
+        ]
+        raw = await self._predict_cross_encoder(pairs)
+
+        if raw is not None:
+            scores = list(raw)
+            content_lower = user_query.lower()
+            h_weight = self._f.valves.heuristic_reinforcement_weight
+
+            if any(
+                kw in content_lower
+                for kw in (
+                    "fix",
+                    "bug",
+                    "error",
+                    "traceback",
+                    "depura",
+                    "excepción",
+                    "falla",
+                )
+            ):
+                scores[2] += h_weight * 0.35
+            if any(
+                kw in content_lower
+                for kw in (
+                    "refactor",
+                    "restructur",
+                    "reorganiz",
+                    "mueve",
+                    "extrae",
+                    "divide",
+                )
+            ):
+                scores[3] += h_weight * 0.35
+            if any(
+                kw in content_lower
+                for kw in (
+                    "explica",
+                    "describe",
+                    "cómo funciona",
+                    "qué hace",
+                    "por qué",
+                )
+            ):
+                scores[0] += h_weight * 0.25
+            if not any(
+                kw in content_lower
+                for kw in ("fix", "bug", "refactor", "explica", "describe")
+            ):
+                scores[1] += h_weight * 0.25
+
+            max_score = max(scores)
+            second_max = sorted(scores, reverse=True)[1] if len(scores) > 1 else 0
+            diff = max_score - second_max
+
+            CE_CONFIDENCE_THRESHOLD = self._f.valves.intent_ce_threshold
+            LLM_FALLBACK_THRESHOLD = self._f.valves.intent_llm_threshold
+
+            if diff >= CE_CONFIDENCE_THRESHOLD:
+                exp_scores = [2.71828**s for s in scores]
+                total_exp = sum(exp_scores)
+                if total_exp > 0:
+                    result = {
+                        "explain": exp_scores[0] / total_exp,
+                        "modify": exp_scores[1] / total_exp,
+                        "debug": exp_scores[2] / total_exp,
+                        "refactor": exp_scores[3] / total_exp,
+                    }
+                    self._f._log_debug(
+                        f"Intent (CrossEncoder): {max(result, key=result.get)}={max(result.values()):.2f}"
+                    )
+                    return result
+                else:
+                    return {
+                        "explain": 0.25,
+                        "modify": 0.45,
+                        "debug": 0.2,
+                        "refactor": 0.1,
+                    }
+            elif diff < LLM_FALLBACK_THRESHOLD:
+                self._f._log_debug(
+                    f"Intent: CrossEncoder uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                    "using LLM with CrossEncoder context"
+                )
+                return await self._classify_intent_with_llm(
+                    user_query, scores, classifier_input, project_id
+                )
+
+        self._f._log_debug("Intent: using conservative heuristic distribution")
+        return {"explain": 0.2, "modify": 0.3, "debug": 0.3, "refactor": 0.2}
 
     async def _classify_intent_with_llm(
         self,
@@ -15554,208 +14660,183 @@ class CodeBlockManager:
         return False
 
     async def extract_code_blocks(
-        self,
-        content: str,
-        project_id: Optional[str] = None,
+        self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
         """
-        Extract all fenced code blocks from a message content string.
+        Extract code blocks from a message using tree-sitter Markdown detection.
 
-        Returns (blocks, spans) where blocks[i] corresponds to spans[i].
-        The two lists are ALWAYS the same length; _postprocess_blocks
-        preserves this invariant.
+        Uses tree-sitter process() as a Markdown block detector (without
+        extract_symbols=True), falling back to regex for fenced blocks and
+        indentation scanning for plain text code snippets.
 
-        Steps:
-            1.  Guard: return empty when content is empty or too short.
-            2.  Find all code fence positions (stateless per call).
-            3.  Extract block content and metadata for each matched pair.
-            4.  Run _postprocess_blocks to dedup and validate.
-            5.  Return (blocks, spans) with guaranteed equal lengths.
+        Args:
+            content: Raw message content.
+            project_id: Project identifier for state lookup.
+
+        Returns:
+            Tuple of (list of block dicts, list of byte spans).
         """
-        if not content or not isinstance(content, str):
+        if project_id is None:
+            project_id = self._f.valves.project_id
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        blocks = []
+        spans = []
+        if not self._f.valves.auto_detect_code_blocks:
+            return blocks, spans
+
+        # ── Section 1: Silent ingestion path (pre-extracted symbols) ──────
+        raw = pstate.get("raw_ingested_symbols")
+        if raw is not None:
+            pstate["raw_ingested_symbols"] = None
+            lang = pstate.get("ingested_lang", "python")
+            block = {
+                "language": lang,
+                "code": content,
+                "type": "indented",
+                "precomputed_symbols": raw,
+            }
+            block["file_path"] = self._guess_file_path(content)
+            if not self._is_filter_internal(block["file_path"]):
+                return [block], [(0, len(content))]
             return [], []
 
-        min_block_chars = getattr(self._f.valves, "min_code_block_chars", 10)
+        # ── Section 2: Tree-sitter Markdown block detection ───────────────
+        # Parse as markdown to locate fenced code block spans.
+        # ProcessConfig() without a language defaults to '' which triggers a
+        # grammar download attempt for an unknown language and always fails.
+        # "markdown" is the correct grammar: we want fence detection, not
+        # source-code parsing. extract_symbols is intentionally NOT set here.
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
 
-        # -- Step 2: find fence positions (stateless) --
-        # Use get_code_spans which returns matched (open, close) pairs only.
-        # Unmatched fences (odd number of ```) are discarded automatically
-        # since get_code_spans works on pairs. State does not persist.
-        try:
-            spans = await self.get_code_spans(content)
-        except Exception as e:
-            self._f._log_debug(
-                f"extract_code_blocks: span detection failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return [], []
-
-        if not spans:
-            return [], []
-
-        # -- Step 3: extract content and metadata --
-        raw_blocks: List[Dict[str, Any]] = []
-        valid_spans: List[Tuple[int, int]] = []
-
-        for span_start, span_end in spans:
-            raw_text = content[span_start:span_end]
-
-            # Parse fence header: ```<lang> or ```
-            lines = raw_text.split("\n")
-            if not lines:
-                continue
-            header = lines[0].strip().lstrip("`").strip()
-            body = "\n".join(lines[1:]).rstrip("`").rstrip()
-
-            if len(body) < min_block_chars:
-                continue
-
-            # Infer language
-            language: Optional[str] = None
-            if header:
-                language = header.split()[0].lower() if header.split() else None
-
-            if language is None:
-                try:
-                    language = await self._infer_code_language(body)
-                except Exception:
-                    language = None
-
-            if not self._is_likely_code(body, [language] if language else None):
-                continue
-
-            # Extract file path from surrounding context
-            file_path = self.extract_file_path_for_block(content, span_start)
-            if file_path is None:
-                file_path = self._guess_file_path(body)
-
-            # Skip filter-internal blocks
-            if self._is_filter_internal(file_path):
-                continue
-
-            # Extract symbols
-            symbols: List["CodeSymbol"] = []
-            if project_id:
-                try:
-                    symbols, _ = await self._extract_full_document_symbols(
-                        body, file_path, project_id
-                    )
-                except Exception as e:
+                config = ProcessConfig()
+                config.language = "markdown"
+                result = process(content, config)
+                if hasattr(result, "blocks"):
                     self._f._log_debug(
-                        f"extract_code_blocks: symbol extraction failed "
-                        f"for block at {span_start}: {type(e).__name__}: {e}"
+                        f"extract_code_blocks: process() found {len(result.blocks)} block(s)"
                     )
+                    for b in result.blocks:
+                        lang = getattr(b, "language", None) or "text"
+                        code = content[b.start_byte : b.end_byte].strip()
+                        blocks.append(
+                            {"language": lang, "code": code, "type": "fenced"}
+                        )
+                        spans.append((b.start_byte, b.end_byte))
+                    if blocks:
+                        self._f._log_debug(
+                            f"tree-sitter path extracted {len(blocks)} block(s)"
+                        )
+                        return self._postprocess_blocks(blocks, spans, content)
+            except Exception as e:
+                self._f._log_debug(
+                    f"tree-sitter failed ({e}), falling through to regex"
+                )
 
-            raw_blocks.append(
-                {
-                    "content": body,
-                    "language": language,
-                    "file_path": file_path,
-                    "symbols": symbols,
-                    "span": (span_start, span_end),
-                }
+        # ── Section 3: Regex fallback for fenced code blocks ──────────────
+        for match in self._f.code_pattern.finditer(content):
+            lang = match.group(1) or "text"
+            code = match.group(2).strip()
+            if len(code) > 200_000:
+                self._f._log_debug(
+                    f"Skipping oversized fenced block ({len(code)} chars)"
+                )
+                continue
+            blocks.append({"language": lang, "code": code, "type": "fenced"})
+            spans.append((match.start(), match.end()))
+
+        if blocks:
+            self._f._log_debug(f"regex found {len(blocks)} fenced block(s)")
+            return self._postprocess_blocks(blocks, spans, content)
+
+        # ── Section 4: Indented blocks (only if no fenced blocks) ─────────
+        lines = content.split("\n")
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line) + 1)
+
+        total_lines = len(lines)
+        i = 0
+        indented = []
+        while i < total_lines:
+            line = lines[i]
+            if line.startswith(("    ", "\t")):
+                indented.append(line.lstrip(" \t"))
+                i += 1
+            else:
+                if len(indented) >= 3:
+                    code = "\n".join(indented)
+                    if self._is_likely_code(code) and len(code) <= 200_000:
+                        lang = SignatureExtractor._guess_language(None, code) or "text"
+                        blocks.append(
+                            {"language": lang, "code": code, "type": "indented"}
+                        )
+                        start_offset = line_offsets[i - len(indented)]
+                        end_offset = line_offsets[i] - 1
+                        spans.append((start_offset, end_offset))
+                    indented = []
+                else:
+                    indented = []
+                i += 1
+
+        if len(indented) >= 3:
+            code = "\n".join(indented)
+            if self._is_likely_code(code) and len(code) <= 200_000:
+                lang = SignatureExtractor._guess_language(None, code) or "text"
+                blocks.append({"language": lang, "code": code, "type": "indented"})
+                start_offset = line_offsets[total_lines - len(indented)]
+                end_offset = line_offsets[total_lines] - 1
+                spans.append((start_offset, end_offset))
+
+        # ── Section 5: Entire small content as a single block ─────────────
+        if not blocks and len(content) <= 20_000 and self._is_likely_code(content):
+            lang = SignatureExtractor._guess_language(None, content) or "text"
+            blocks.append({"language": lang, "code": content, "type": "indented"})
+            spans.append((0, len(content)))
+            self._f._log_debug(
+                f"treating entire small message as code ({len(content)} chars)"
             )
-            valid_spans.append((span_start, span_end))
 
-        if not raw_blocks:
-            return [], []
-
-        # -- Step 4: postprocess (dedup, validate) --
-        # Passes both raw_blocks and valid_spans so they stay in sync.
-        processed_blocks, processed_spans = self._postprocess_blocks(
-            raw_blocks, valid_spans, content
-        )
-
-        # -- Step 5: guaranteed equal lengths --
-        assert len(processed_blocks) == len(processed_spans), (
-            f"_postprocess_blocks violated length invariant: "
-            f"blocks={len(processed_blocks)}, spans={len(processed_spans)}"
-        )
-
-        return processed_blocks, processed_spans
+        return self._postprocess_blocks(blocks, spans, content)
 
     def _postprocess_blocks(
-        self,
-        blocks: List[Dict[str, Any]],
-        spans: List[Tuple[int, int]],
-        content: str,
-    ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+        self, blocks: List[Dict], spans: List[Tuple[int, int]], content: str
+    ) -> Tuple[List[Dict], List[Tuple[int, int]]]:
         """
-        Deduplicate, validate, and filter extracted code blocks.
+        Attach file paths to blocks and filter out internal system paths.
 
-        Maintains strict 1:1 correspondence between the returned blocks and
-        spans lists. Every filter operation removes the entry from BOTH lists
-        at the same index.
+        Args:
+            blocks: List of extracted block dictionaries.
+            spans: List of corresponding byte spans.
+            content: Original message content for path extraction.
 
-        Deduplication rules:
-            - Exact duplicate content (same hash): keep last occurrence.
-            - Same file_path within this extraction run: keep last occurrence
-              (most recent version of the file in this message).
-            - Empty or whitespace-only body: discard.
-
-        Steps:
-            1.  Validate equal-length input invariant.
-            2.  Filter empty bodies — remove from both lists simultaneously.
-            3.  Deduplicate by content hash — keep last occurrence.
-            4.  Deduplicate by file_path — keep last occurrence per path.
-            5.  Return filtered blocks and spans with equal lengths.
+        Returns:
+            Filtered list of blocks and spans.
         """
-        # -- Step 1: invariant check --
-        if len(blocks) != len(spans):
-            self._f._log_debug(
-                f"_postprocess_blocks: length mismatch on entry: "
-                f"blocks={len(blocks)}, spans={len(spans)} — truncating to min"
-            )
-            n = min(len(blocks), len(spans))
-            blocks = blocks[:n]
-            spans = spans[:n]
+        processed_blocks = []
+        processed_spans = []
+        for idx, block in enumerate(blocks):
+            blk_file = None
+            if self._f.valves.track_file_paths and idx < len(spans):
+                blk_file = self.extract_file_path_for_block(content, spans[idx][0])
+            if not blk_file and len(blocks) == 1:
+                paths = self.extract_file_paths(content)
+                blk_file = paths[0] if paths else None
 
-        # Work with paired list to always keep blocks and spans in sync.
-        paired: List[Tuple[Dict[str, Any], Tuple[int, int]]] = list(zip(blocks, spans))
+            if self._f.valves.exclude_filter_internals and blk_file:
+                if (
+                    "/app/backend/data/functions/" in blk_file
+                    or "open-webui/functions/" in blk_file
+                ):
+                    continue
 
-        # -- Step 2: filter empty bodies --
-        paired = [(b, s) for b, s in paired if b.get("content", "").strip()]
+            block["file_path"] = blk_file
+            processed_blocks.append(block)
+            processed_spans.append(spans[idx] if idx < len(spans) else (0, 0))
 
-        # -- Step 3: deduplicate by content hash (keep last) --
-        seen_hashes: Dict[str, int] = {}  # hash → last index
-        for i, (b, _) in enumerate(paired):
-            content_hash = hashlib.md5(
-                b.get("content", "").encode("utf-8", errors="replace")
-            ).hexdigest()
-            seen_hashes[content_hash] = i
-
-        paired = [
-            (b, s)
-            for i, (b, s) in enumerate(paired)
-            if seen_hashes[
-                hashlib.md5(
-                    b.get("content", "").encode("utf-8", errors="replace")
-                ).hexdigest()
-            ]
-            == i
-        ]
-
-        # -- Step 4: deduplicate by file_path (keep last), skip None paths --
-        # Same-file blocks in one message: user pasted multiple revisions.
-        # Keep only the last (most recent) revision.
-        file_path_last: Dict[str, int] = {}
-        for i, (b, _) in enumerate(paired):
-            fp = b.get("file_path")
-            if fp:  # None file_path blocks are all independent
-                file_path_last[fp] = i
-
-        paired = [
-            (b, s)
-            for i, (b, s) in enumerate(paired)
-            if not b.get("file_path") or file_path_last.get(b["file_path"]) == i
-        ]
-
-        # -- Step 5: unzip and return --
-        if not paired:
-            return [], []
-
-        result_blocks, result_spans = zip(*paired)
-        return list(result_blocks), list(result_spans)
+        return processed_blocks, processed_spans
 
     @staticmethod
     def _is_likely_code(text: str) -> bool:
@@ -16238,250 +15319,229 @@ class CodeBlockManager:
 
         return result
 
-    def remove_duplicate_blocks(
-        self,
-        state: dict,
-        project_id: str,
-    ) -> None:
+    def remove_duplicate_blocks(self, state: dict, project_id: str) -> None:
         """
-        Remove redundant CodeBlock entries from state.active_blocks.
+        Remove duplicate or near-duplicate code blocks from the active set.
 
-        Two types of duplicates are handled:
-            A) Same file_path, different hashes: keep the block with the
-               highest timestamp (most recent version). Older blocks for
-               the same file are evicted.
-            B) Same content hash, different dict keys: keep the first-seen
-               entry (degenerate case from double-indexing the same block).
+        Uses three strategies:
+        1. Pairwise similarity comparison (AST or fuzzy matching).
+        2. Age-based: keep newer blocks if similarity threshold is met.
+        3. Per-file version limiting: keep only the most recent version.
 
-        Steps:
-            1.  Pass 1 (collect): scan all blocks; group by file_path and
-                by content hash; identify the survivors.
-            2.  Pass 2 (delete): for each non-surviving hash, clean up the
-                SymbolIndex then remove from active_blocks.
-            3.  Log summary.
+        Args:
+            state: The conversation state containing active_blocks.
+            project_id: The current project identifier.
         """
-        active_blocks = (
-            state.active_blocks
-            if not isinstance(state, dict)
-            else state.get("active_blocks", {})
-        )
-        if len(active_blocks) <= 1:
+        if not self._f.valves.auto_remove_duplicate_blocks:
             return
 
-        # -- Pass 1: collect survivors --
+        blocks = list(state.active_blocks.values())
+        to_remove = set()
 
-        # Group by file_path: keep newest (highest timestamp).
-        # None file_path blocks are all independent — never deduplicated.
-        newest_by_file: Dict[str, Tuple[str, float]] = {}
-        for bh, block in active_blocks.items():
-            fp = getattr(block, "file_path", None)
-            if not fp:
-                continue
-            ts = getattr(block, "timestamp", 0.0)
-            if fp not in newest_by_file or ts > newest_by_file[fp][1]:
-                newest_by_file[fp] = (bh, ts)
-
-        keep_by_file: Set[str] = {bh for bh, _ in newest_by_file.values()}
-
-        # Group by content hash: keep first occurrence.
-        seen_content_hashes: Set[str] = set()
-        keep_by_content: Set[str] = set()
-        for bh, block in active_blocks.items():
-            content_hash = getattr(block, "hash", bh)
-            if content_hash not in seen_content_hashes:
-                seen_content_hashes.add(content_hash)
-                keep_by_content.add(bh)
-
-        # A block is kept if it survives BOTH checks:
-        # - file_path check: it is the newest for its file (or has no file_path)
-        # - content hash check: it is the first occurrence of its content
-        to_delete: List[str] = []
-        for bh, block in active_blocks.items():
-            fp = getattr(block, "file_path", None)
-            is_file_survivor = (not fp) or (bh in keep_by_file)
-            is_content_survivor = bh in keep_by_content
-
-            if not is_file_survivor or not is_content_survivor:
-                to_delete.append(bh)
-
-        if not to_delete:
-            return
-
-        # -- Pass 2: clean up SymbolIndex, then delete from active_blocks --
-        deleted = 0
-        for bh in to_delete:
-            block = active_blocks.get(bh)
-            if block is None:
+        # ── 1. Pairwise similarity comparison ──────────────────────────────
+        for i, block in enumerate(blocks):
+            if block.hash in to_remove or block.pinned or block.obsolete:
                 continue
 
-            # Bug 120: clean up SymbolIndex before removing the block.
-            symbols = getattr(block, "symbols", [])
-            try:
-                if symbols:
-                    self._f._symbol_index.remove_all_for_block(bh, symbols, project_id)
-            except Exception as e:
-                self._f._log_debug(
-                    f"remove_duplicate_blocks: SymbolIndex cleanup failed "
-                    f"for {bh[:8]}: {type(e).__name__}: {e}"
+            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
+                if other.hash in to_remove or other.pinned or other.obsolete:
+                    continue
+
+                sim = self.calculate_code_similarity(block.content, other.content)
+                if sim >= self._f.valves.code_similarity_threshold:
+                    age_diff = abs(block.timestamp - other.timestamp) / 3600
+
+                    # ── 1a. If age difference is significant ──────────────
+                    if age_diff > self._f.valves.max_duplicate_age_hours:
+                        if (
+                            block.timestamp < other.timestamp
+                            and block.importance_score < 5.0
+                        ):
+                            to_remove.add(block.hash)
+                        elif (
+                            other.timestamp < block.timestamp
+                            and other.importance_score < 5.0
+                        ):
+                            to_remove.add(other.hash)
+                        continue
+
+                    # ── 1b. Compare by importance score ─────────────────────
+                    score_diff = abs(block.importance_score - other.importance_score)
+                    if score_diff < 1.0:
+                        # If scores are similar, keep the newer one.
+                        if block.timestamp >= other.timestamp:
+                            to_remove.add(other.hash)
+                        else:
+                            to_remove.add(block.hash)
+                    elif block.importance_score >= other.importance_score:
+                        to_remove.add(other.hash)
+                    else:
+                        to_remove.add(block.hash)
+
+        # ── 2. Per-file version limiting ────────────────────────────────────
+        blocks_by_file = defaultdict(list)
+        for b in blocks:
+            if b.file_path and not b.pinned:
+                blocks_by_file[b.file_path].append(b)
+
+        for file_path, blks in blocks_by_file.items():
+            if len(blks) > 1:
+                blks.sort(key=lambda b: b.timestamp, reverse=True)
+                for b in blks[1:]:
+                    to_remove.add(b.hash)
+
+        # ── 3. Apply removal ────────────────────────────────────────────────
+        for h in to_remove:
+            if h in state.active_blocks:
+                block = state.active_blocks[h]
+                self._f._symbol_index.remove_all_for_block(
+                    block.hash, block.symbols, project_id
                 )
+                del state.active_blocks[h]
 
-            # Now safe to delete from active_blocks
-            del active_blocks[bh]
-            deleted += 1
+        # ── 4. Clean up dependent lists ─────────────────────────────────────
+        state.recent_changes = [
+            b for b in state.recent_changes if b.hash not in to_remove
+        ]
+        state.committed_changes = [
+            b for b in state.committed_changes if b.hash not in to_remove
+        ]
 
-        if deleted:
-            self._f._log_debug(
-                f"remove_duplicate_blocks: removed {deleted} duplicate "
-                f"block(s) for '{project_id}' "
-                f"({len(active_blocks)} remaining)"
+        # ── 5. Update state and invalidate cache ───────────────────────────
+        if to_remove:
+            state.has_any_calls = any(
+                any(s.calls for s in b.symbols) for b in state.active_blocks.values()
             )
-            self._f._conversation_state_manager.mark_dirty(project_id)
+            self._f._activation.invalidate_lightweight_cache(project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Proposed changes & diffs
     # ═══════════════════════════════════════════════════════════════════════════
 
     def has_conflicting_proposed_changes(
-        self,
-        state: dict,
-        new_block: "CodeBlock",
+        self, state: dict, new_block: "CodeBlock"
     ) -> bool:
         """
-        Return True when an active assistant-generated block targets the same
-        file as new_block and was created more recently than new_block.
+        Check if a proposed change conflicts with an existing recent change.
 
-        A conflict indicates that a prior proposed change is still active and
-        has not been superseded. The caller uses this to decide whether to
-        update the existing block in place (dedup) or add a new one.
+        Conflict is detected when:
+        - Two proposed changes affect the same file, OR
+        - They have high content similarity (>80%).
 
-        file_path=None blocks are never considered conflicting with each other.
-        Anonymous code snippets (no file path) are independent regardless of
-        content: two code blocks without a file path are not targeting the same
-        file by definition. Without this guard, None == None evaluates to True
-        and every anonymous block in the session conflicts with every other,
-        causing all but the first to be silently rejected.
+        Args:
+            state: The conversation state containing recent_changes.
+            new_block: The proposed change block to check.
 
-        Steps:
-            1.  Return False when new_block has no file_path.
-            2.  Iterate active blocks: match file_path, assistant-generated,
-                non-obsolete, timestamp newer than new_block.
-            3.  Return True on first match, False when none found.
+        Returns:
+            True if there is a conflict with an existing proposed change.
         """
-        # -- Step 1: anonymous block guard --
-        if not new_block.file_path:
+        if new_block.content_type != ContentType.PROPOSED_CHANGE:
             return False
 
-        active_blocks = (
-            state.active_blocks
-            if isinstance(state, dict)
-            else getattr(state, "active_blocks", {})
-        )
+        for existing in state.recent_changes:
+            if existing.hash == new_block.hash:
+                continue
 
-        new_ts = new_block.timestamp
-
-        # -- Steps 2-3: scan active blocks --
-        for block in active_blocks.values():
-            if block.obsolete:
-                continue
-            if not block.generated_by_assistant:
-                continue
-            if not block.file_path:
-                continue
-            if block.file_path != new_block.file_path:
-                continue
-            if block.timestamp <= new_ts:
-                continue
-            self._f._log_debug(
-                f"has_conflicting_proposed_changes: conflict found for "
-                f"'{new_block.file_path}' "
-                f"(existing ts={block.timestamp:.3f} > new ts={new_ts:.3f})"
+            same_file = (
+                existing.file_path
+                and new_block.file_path
+                and existing.file_path == new_block.file_path
             )
-            return True
+
+            if (
+                same_file
+                or self.calculate_code_similarity(existing.content, new_block.content)
+                > 0.8
+            ):
+                return True
 
         return False
 
-    def _apply_unified_diff(
-        self,
-        original: str,
-        diff_text: str,
-    ) -> Optional[str]:
+    def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
         """
-        Apply a unified diff to original content and return the patched result.
+        Apply a unified diff patch to original text.
 
-        Normalises both the original content and the diff to LF line endings
-        before patching so that CR+LF originals (Windows editors, clipboard
-        paste) and LF diffs (standard diff output) do not cause a line-mismatch
-        failure. The result is returned with LF endings; callers that need to
-        preserve the original line-ending style must post-process.
+        Parses the diff hunks and applies them in reverse order (so line
+        numbers remain correct as earlier hunks are applied).
 
-        Returns None when:
-            - diff_text is empty or does not contain a valid unified diff header
-            - the patch library is unavailable
-            - patching fails after line-ending normalisation
+        Args:
+            original: The original source code.
+            diff_text: The unified diff content (from `git diff` or similar).
 
-        Steps:
-            1.  Validate inputs; return None on empty diff.
-            2.  Normalize line endings in both original and diff_text.
-            3.  Attempt to parse and apply the patch.
-            4.  Return patched string or None on failure.
+        Returns:
+            The patched source code, or None if the diff cannot be applied.
         """
-        # -- Step 1: validate inputs --
-        if not diff_text or not diff_text.strip():
+        if not self._f.valves.enable_diff_application:
             return None
-        if "---" not in diff_text or "+++" not in diff_text:
-            self._f._log_debug(
-                "_apply_unified_diff: diff_text does not contain a valid "
-                "unified diff header, skipping"
+
+        lines = original.splitlines(keepends=False)
+        result_lines = lines[:]
+        hunks = []
+
+        # ── 1. Parse diff hunks ─────────────────────────────────────────────
+        for match in re.finditer(
+            r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
+        ):
+            old_start = int(match.group(1))
+            old_count_str = match.group(2)
+            old_count = int(old_count_str) if old_count_str else 1
+            new_start = int(match.group(3))
+            new_count_str = match.group(4)
+            new_count = int(new_count_str) if new_count_str else 1
+            hunk_body = match.group(5).strip("\n")
+
+            old_lines, new_lines = [], []
+            for line in hunk_body.split("\n"):
+                if line.startswith("-"):
+                    old_lines.append(line[1:])
+                elif line.startswith("+"):
+                    new_lines.append(line[1:])
+                elif line.startswith(" "):
+                    old_lines.append(line[1:])
+                    new_lines.append(line[1:])
+
+            if old_count == 0:
+                old_start_idx = old_start
+            else:
+                old_start_idx = old_start - 1
+
+            if new_count == 0:
+                new_lines = []
+
+            hunks.append((old_start_idx, old_lines, new_lines))
+
+        # ── 2. Apply hunks in reverse order ─────────────────────────────────
+        applied_any = False
+        for old_start_idx, old_lines, new_lines in reversed(hunks):
+            # ── 2a. Bounds check ─────────────────────────────────────────────
+            if old_start_idx < 0 or old_start_idx + len(old_lines) > len(result_lines):
+                logger.warning(
+                    f"Unified diff hunk out of bounds (start={old_start_idx}, "
+                    f"lines={len(old_lines)}, total={len(result_lines)})"
+                )
+                continue
+
+            # ── 2b. Verify context matches ──────────────────────────────────
+            if (
+                result_lines[old_start_idx : old_start_idx + len(old_lines)]
+                != old_lines
+            ):
+                logger.warning(f"Unified diff hunk mismatch at line {old_start_idx}")
+                continue
+
+            # ── 2c. Apply hunk ──────────────────────────────────────────────
+            result_lines = (
+                result_lines[:old_start_idx]
+                + new_lines
+                + result_lines[old_start_idx + len(old_lines) :]
             )
+            applied_any = True
+
+        if not applied_any and hunks:
+            logger.warning("No hunks were applied from the unified diff")
             return None
 
-        # -- Step 2: normalize line endings --
-        original_lf = original.replace("\r\n", "\n").replace("\r", "\n")
-        diff_text_lf = diff_text.replace("\r\n", "\n").replace("\r", "\n")
-
-        # -- Step 3: apply patch --
-        try:
-            import patch as patch_lib  # python-patch
-
-            pset = patch_lib.fromstring(diff_text_lf.encode("utf-8"))
-            if not pset:
-                self._f._log_debug(
-                    "_apply_unified_diff: patch.fromstring returned empty patchset"
-                )
-                return None
-
-            # patch_lib.apply works on bytes; encode, apply, decode
-            patched_bytes = pset.apply(original_lf.encode("utf-8"), root=b"")
-            if patched_bytes is False or patched_bytes is None:
-                self._f._log_debug(
-                    "_apply_unified_diff: patch application failed "
-                    "(hunk mismatch after LF normalisation)"
-                )
-                return None
-
-            return patched_bytes.decode("utf-8", errors="replace")
-
-        except ImportError:
-            # Fallback: use difflib.restore if python-patch not available
-            try:
-                import difflib
-
-                original_lines = original_lf.splitlines(keepends=True)
-                diff_lines = diff_text_lf.splitlines(keepends=True)
-                result_lines = list(difflib.restore(diff_lines, which=2))
-                return "".join(result_lines)
-            except Exception as e:
-                self._f._log_debug(
-                    f"_apply_unified_diff: difflib fallback failed: "
-                    f"{type(e).__name__}: {e}"
-                )
-                return None
-
-        except Exception as e:
-            self._f._log_debug(
-                f"_apply_unified_diff: patch failed: {type(e).__name__}: {e}"
-            )
-            return None
+        return "\n".join(result_lines)
 
     async def apply_change_with_diff(
         self, base_block: "CodeBlock", proposed_block: "CodeBlock"
@@ -16751,93 +15811,57 @@ class ActivationEngine:
 
     # ── Q2: PPR cache (nested class) ──────────────────────────────────────────
     class _PPRCache:
+        """LRU cache for PPR results.
+
+        Key: (code_state_hash: str, seed_qids: frozenset[str])
+        Value: dict[str, float]  — qid → PPR score
+
+        Thread safety: not needed (single-threaded inlet/build_block_b flow).
+        Invalidation: automatic via code_state_hash — any code change produces
+        a new hash, naturally evicting all cached entries for that project.
         """
-        LRU cache for Personalized PageRank score vectors keyed by
-        (code_hash, frozenset_of_seed_qids).
 
-        Uses OrderedDict to maintain true LRU order: every get() moves the
-        accessed entry to the end; eviction always removes from the front.
-
-        Stores defensive copies of score dicts so that the caller mutating
-        their dict after set() cannot corrupt cached entries.
-        """
-
-        def __init__(self, maxsize: int = 20) -> None:
-            """
-            Initialise the cache with a fixed maximum number of entries.
-
-            maxsize: maximum number of (code_hash, seeds) vectors to retain.
-            Using an OrderedDict allows O(1) LRU tracking via move_to_end.
-            """
-            self._cache: "OrderedDict[Tuple[str, frozenset], Dict[str, float]]" = (
-                OrderedDict()
-            )
+        def __init__(self, maxsize: int = 20):
+            self._cache: OrderedDict[tuple, dict[str, float]] = OrderedDict()
             self._maxsize = maxsize
             self._hits = 0
             self._misses = 0
 
-        def get(self, code_hash: str, seeds: frozenset) -> "Optional[Dict[str, float]]":
-            """
-            Return the cached score vector for (code_hash, seeds), or None on miss.
-
-            Moves the entry to the end of the OrderedDict on every cache hit to
-            record it as the most recently used. Without this call, all entries
-            age at the same rate regardless of access frequency, making the cache
-            degrade from LRU to FIFO.
-            """
+        def get(self, code_hash: str, seeds: frozenset) -> Optional[Dict[str, float]]:
+            """Retrieve cached PPR scores if available."""
             key = (code_hash, seeds)
-            if key not in self._cache:
-                self._misses += 1
-                return None
-
-            # Move to end before returning to maintain LRU order
-            self._cache.move_to_end(key)
-            self._hits += 1
-            return self._cache[key]
-
-        def set(
-            self,
-            code_hash: str,
-            seeds: frozenset,
-            scores: "Dict[str, float]",
-        ) -> None:
-            """
-            Store a score vector, evicting the LRU entry if the cache is full.
-
-            Stores dict(scores) — a shallow copy — rather than the dict itself.
-            Without the copy, any in-place mutation of the caller's scores dict
-            after this call (e.g. normalisation in _normalize_ppr_scores, or
-            score adjustments in _build_multi_seed_graph) silently corrupts the
-            cached entry and causes stale or wrong scores on subsequent cache hits.
-
-            If the key already exists, its value is updated in place and it is
-            moved to the end (most recently used position).
-            """
-            key = (code_hash, seeds)
-
             if key in self._cache:
                 self._cache.move_to_end(key)
-                self._cache[key] = dict(scores)
-                return
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
 
-            if len(self._cache) >= self._maxsize:
-                # Evict least recently used entry (front of OrderedDict)
-                self._cache.popitem(last=False)
+    def set(self, code_hash: str, seeds: frozenset, scores: Dict[str, float]) -> None:
+        """
+        Store PPR scores in the LRU cache.
 
-            self._cache[key] = dict(scores)
+        Args:
+            code_hash: Hash of the current code state (cache invalidation key).
+            seeds:     Frozenset of seed qualified ids used to produce the scores.
+            scores:    Dict mapping qualified ids to PPR scores.
+        """
+        key = (code_hash, seeds)
+
+        # ── Store a defensive copy to prevent caller mutations from corrupting the cache
+        self._cache[key] = dict(scores)
+        self._cache.move_to_end(key)
+
+        # ── Evict the oldest entry when the cache exceeds its capacity ────────────
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
 
         @property
         def stats(self) -> str:
-            """
-            Human-readable hit/miss statistics for debug logging.
-            """
+            """Return cache hit/miss statistics."""
             total = self._hits + self._misses
-            hit_rate = self._hits / total if total > 0 else 0.0
-            return (
-                f"PPRCache: {len(self._cache)}/{self._maxsize} entries | "
-                f"{self._hits} hits / {self._misses} misses "
-                f"({hit_rate:.1%} hit rate)"
-            )
+            rate = self._hits / total if total else 0
+            return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -17059,152 +16083,81 @@ class ActivationEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _extract_query_seeds(
-        self,
-        query: str,
-        project_id: str,
+        self, query: str, project_id: str
     ) -> Tuple[List[str], List[str]]:
         """
-        Extract candidate seed symbol names from the query text.
+        Extract seed symbols from the query using exact match, CrossEncoder, and LLM.
 
-        Returns (exact_seeds, partial_seeds) where:
-            exact_seeds  : symbol names that appear verbatim in the query.
-            partial_seeds: symbol names inferred by the LLM as likely intended
-                           by the query even when not literally present.
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
 
-        Steps:
-            1.  Get all symbol names; return ([], []) if index is empty.
-            2.  Heuristic pass: find exact name matches in the query text.
-            3.  If exact matches found, return them without an LLM call.
-            4.  Quick heuristic: if query has no symbol indicators, skip LLM.
-            5.  Build capped candidates list sorted by centrality.
-            6.  Call _extract_seeds_with_llm for partial/inferred seeds.
-            7.  Return (exact_seeds, partial_seeds).
+        Returns:
+            A tuple of (exact_matches, partial_matches).
         """
-        # -- Step 1: empty index guard --
-        all_names: Set[str] = self._f._symbol_index.get_all_names(project_id)
-        if not all_names:
-            return [], []
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        query_words = set(re.findall(r"\b\w+\b", query))
 
-        query_lower = query.lower()
+        exact = list(all_names.intersection(query_words))
+        partial = []
 
-        # -- Step 2: heuristic exact match --
-        # Check both bare names and qualified names for case-insensitive match.
-        exact_seeds: List[str] = []
-        partial_seeds: List[str] = []
+        if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
+            candidates = set()
+            for word in query_words:
+                if len(word) < 3:
+                    continue
+                for name in all_names:
+                    if word.lower() in name.lower() and name not in exact:
+                        candidates.add(name)
+                        if len(candidates) >= 20:
+                            break
+                if len(candidates) >= 20:
+                    break
 
-        # Build a word-set for fast lookup
-        query_words: Set[str] = set(re.findall(r"\b[A-Za-z_]\w*\b", query))
+            if candidates:
+                pairs = [(query, name) for name in candidates]
+                scores = await self._f._commands._predict_cross_encoder(pairs)
+                if scores is not None:
+                    scored = sorted(
+                        zip(candidates, scores), key=lambda x: x[1], reverse=True
+                    )
+                    ce_threshold = 0.5
+                    best = [name for name, sc in scored if sc > ce_threshold]
+                    if best:
+                        partial = best[:5]
+                    else:
+                        if len(scored) >= 2:
+                            diff = scored[0][1] - scored[1][1]
+                            if diff < 0.10:
+                                llm_choice = await self._extract_seeds_with_llm(
+                                    query, scored[:5], project_id
+                                )
+                                if llm_choice:
+                                    partial = [llm_choice]
+                                else:
+                                    partial = [scored[0][0]]
+                            else:
+                                partial = [scored[0][0]]
+                        elif scored:
+                            partial = [scored[0][0]]
 
-        for name in all_names:
-            bare = name.rsplit(".", 1)[-1]
-            if bare in query_words or name in query_words:
-                exact_seeds.append(name)
-            elif bare.lower() in query_lower and len(bare) >= 4:
-                # Case-insensitive partial match for longer names
-                if re.search(r"\b" + re.escape(bare) + r"\b", query, re.IGNORECASE):
-                    exact_seeds.append(name)
+        if len(partial) < 3:
+            for word in query_words:
+                if len(word) < 4:
+                    continue
+                for name in all_names:
+                    if (
+                        word.lower() in name.lower()
+                        and name not in exact
+                        and name not in partial
+                    ):
+                        partial.append(name)
+                        if len(partial) >= 5:
+                            break
+                if len(partial) >= 5:
+                    break
 
-        # -- Step 3: return exact matches immediately --
-        if exact_seeds:
-            self._f._log_debug(
-                f"_extract_query_seeds: {len(exact_seeds)} exact seed(s) "
-                f"from heuristic for '{project_id}'"
-            )
-            return exact_seeds, []
-
-        # -- Step 4: skip LLM for purely conversational queries (Bug 122) --
-        def _has_symbol_indicators(q: str) -> bool:
-            if re.search(r"[a-z][A-Z]", q):
-                return True  # CamelCase
-            if re.search(r"\b[a-z]+_[a-z]+\b", q):
-                return True  # snake_case
-            if re.search(r"\b\w+\s*\(", q):
-                return True  # fn call
-            if re.search(r"`\w+`", q):
-                return True  # backtick
-            if re.search(r"\b\w+\.\w+\b", q):
-                return True  # dotted
-            if re.search(r"\b[A-Z_]{2,}\b", q):
-                return True  # CONSTANT
-            if any(len(w) > 8 and w.isalpha() for w in q.split()):
-                return True  # long identifier-like word
-            return False
-
-        if not _has_symbol_indicators(query):
-            self._f._log_debug(
-                f"_extract_query_seeds: no symbol indicators in query, "
-                f"skipping LLM for '{project_id}'"
-            )
-            return [], []
-
-        # -- Step 5: build capped candidates by centrality (Bug 121) --
-        max_candidates = getattr(self._f.valves, "seed_extraction_max_candidates", 80)
-        centrality = self._f._project_state_manager.get_node_centrality(project_id)
-
-        if centrality:
-            # Sort by centrality descending; high-centrality symbols are more
-            # likely to be referenced indirectly in queries
-            sorted_names = sorted(
-                all_names,
-                key=lambda n: centrality.get(n, 0.0),
-                reverse=True,
-            )
-        else:
-            sorted_names = sorted(all_names)
-
-        candidates = sorted_names[:max_candidates]
-
-        candidates_chars = sum(len(n) for n in candidates)
-        self._f._log_debug(
-            f"_extract_query_seeds: calling LLM with {len(candidates)} "
-            f"candidates (~{candidates_chars} chars) for '{project_id}'"
-        )
-
-        # -- Step 6: LLM extraction --
-        try:
-            raw_response = await self._extract_seeds_with_llm(
-                query=query,
-                candidates=candidates,
-                project_id=project_id,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_extract_query_seeds: LLM extraction failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return [], []
-
-        if not raw_response:
-            return [], []
-
-        # -- Step 7: parse response into partial seeds --
-        # _extract_seeds_with_llm returns a newline-delimited list of names
-        raw_lines = [
-            line.strip().strip(",-").strip()
-            for line in raw_response.splitlines()
-            if line.strip()
-        ]
-
-        for raw_name in raw_lines:
-            # Accept both bare names and qualified names
-            if raw_name in all_names:
-                partial_seeds.append(raw_name)
-            else:
-                # Try bare name lookup
-                matching = self._f._symbol_index.get_qualified_names_for(
-                    raw_name, project_id
-                )
-                partial_seeds.extend(matching)
-
-        # Deduplicate preserving order
-        seen: Set[str] = set()
-        partial_seeds = [n for n in partial_seeds if not (n in seen or seen.add(n))]
-
-        self._f._log_debug(
-            f"_extract_query_seeds: {len(partial_seeds)} partial seed(s) "
-            f"from LLM for '{project_id}'"
-        )
-        return [], partial_seeds
+        return exact, partial
 
     async def _extract_seeds_with_llm(
         self, query: str, candidates: list, project_id: str
@@ -17472,133 +16425,131 @@ Output only the symbol name.
         inferred_seeds: Optional[Dict[str, float]] = None,
         cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
-        """
-        Build an ActivationGraph by merging all seed vectors into a single
-        unified seed set and running one PPR propagation pass.
+        """Build activation graph when multi‑seed activation is disabled.
 
-        Used when the query produces a small, coherent seed set that does not
-        benefit from the three-graph weighting strategy of _build_multi_seed_graph.
+        Each bare‑name seed is split across its qualified id(s) before being
+        written into the graph, since edges_out is now keyed by qualified id.
 
-        When cached_scores is provided the method skips PPR propagation entirely.
-        The seed set is still resolved so that source annotation ('seed' vs
-        'propagation') is accurate in the returned graph.
-
-        Seed scoring rules:
-            exact_seeds     → 0.5 + 0.5 * specificity  (capped at 1.0)
-            partial_seeds   → 0.3 + 0.3 * specificity  (capped at 0.6)
-            tb_seeds        → original tb_score × 0.4 boost
-            inferred_seeds  → score as provided, merged with max()
-            history_boosts  → applied after propagation via speculative prefetch
-
-        Steps:
-            1.  Resolve unified seed set from all four seed sources.
-            2.  Early return from cache when cached_scores is provided.
-            3.  Propagate PPR from the unified seed set.
-            4.  Apply history boosts to propagated scores.
-            5.  Return the populated ActivationGraph.
+        Q2: If cached_scores is provided, skip propagation and load scores directly.
         """
         symbol_index = self._f._symbol_index
-
-        # -- Step 1: resolve unified seed set --
         ag = ActivationGraph()
-        seed_qids: Set[str] = set()
+        lexical_seed_qids: Set[str] = set()
 
-        for sym_name in exact_seeds:
-            specificity = self._compute_node_specificity(sym_name, project_id)
-            score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            seed_qids.update(qids)
-            share = score / len(qids) if qids else 0.0
-            for qid in qids:
-                ag._activations[qid] = ActivationState(
-                    node_id=qid, score=share, depth=0, source="seed"
-                )
-
-        for sym_name in partial_seeds:
-            specificity = self._compute_node_specificity(sym_name, project_id)
-            score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            seed_qids.update(qids)
-            share = score / len(qids) if qids else 0.0
-            for qid in qids:
-                existing = ag._activations.get(qid)
-                ag._activations[qid] = ActivationState(
-                    node_id=qid,
-                    score=max(existing.score if existing else 0.0, share),
-                    depth=0,
-                    source="seed",
-                )
-
+        if exact_seeds:
+            for sym_name in exact_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
+                share = score / len(qids) if qids else 0.0
+                for qid in qids:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
+        if partial_seeds:
+            for sym_name in partial_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
+                share = score / len(qids) if qids else 0.0
+                for qid in qids:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            seed_qids.update(qids)
+            lexical_seed_qids.update(qids)
             share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag._activations.get(qid)
+                if existing:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share * 0.4),
+                        depth=0,
+                        source="seed",
+                    )
+                else:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
+        for sym_name, boost in history_boosts.items():
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            lexical_seed_qids.update(qids)
+            share = boost / len(qids) if qids else 0.0
+            for qid in qids:
+                existing = ag._activations.get(qid)
+                if existing:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share),
+                        depth=0,
+                        source=existing.source,
+                    )
+                else:
+                    ag._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
+
+        for qid, inf_score in (inferred_seeds or {}).items():
+            lexical_seed_qids.add(qid)
+            existing = ag._activations.get(qid)
+            if existing:
                 ag._activations[qid] = ActivationState(
                     node_id=qid,
-                    score=min(1.0, (existing.score if existing else 0.0) + share * 0.4),
+                    score=min(1.0, max(existing.score, inf_score)),
+                    depth=0,
+                    source="seed",
+                )
+            else:
+                ag._activations[qid] = ActivationState(
+                    node_id=qid,
+                    score=inf_score,
                     depth=0,
                     source="seed",
                 )
 
-        for qid, inf_score in (inferred_seeds or {}).items():
-            seed_qids.add(qid)
-            existing = ag._activations.get(qid)
-            ag._activations[qid] = ActivationState(
-                node_id=qid,
-                score=min(1.0, max(existing.score if existing else 0.0, inf_score)),
-                depth=0,
-                source="seed",
-            )
-
-        # -- Step 2: early return from cache --
-        # Avoids the full PPR propagation pass (O(V·E·steps)) on cache hit.
         if cached_scores is not None:
-            ag_cached = ActivationGraph()
             for qid, score in cached_scores.items():
                 if score >= 0.01:
-                    source = "seed" if qid in seed_qids else "propagation"
-                    ag_cached._activations[qid] = ActivationState(
-                        node_id=qid, score=score, depth=0, source=source
-                    )
-            self._f._log_debug(
-                f"PPR single-seed: loaded {len(cached_scores)} scores from cache"
-            )
-            return ag_cached
-
-        if not ag._activations:
-            self._f._log_debug(
-                f"_build_single_seed_graph: no seeds resolved for '{project_id}'"
-            )
-            return ag
-
-        # -- Step 3: PPR propagation --
-        ag.propagate(
-            edges_out=edges_out,
-            max_steps=20,
-            min_score=0.03,
-            alpha=self._f.valves.ppr_alpha,
-        )
-
-        # -- Step 4: apply history boosts --
-        for sym_name, boost in (history_boosts or {}).items():
-            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            for qid in qids:
-                existing = ag._activations.get(qid)
-                if existing:
-                    existing.score = min(1.0, existing.score + boost * 0.2)
-                else:
+                    existing = ag._activations.get(qid)
+                    final_score = max(score, existing.score) if existing else score
                     ag._activations[qid] = ActivationState(
-                        node_id=qid, score=boost * 0.2, depth=3, source="propagation"
+                        node_id=qid,
+                        score=final_score,
+                        depth=0,
+                        source="seed" if qid in lexical_seed_qids else "propagation",
                     )
+            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
+        else:
+            if not ag._activations:
+                psm = self._f._project_state_manager
+                centrality = psm.get_node_centrality(project_id)
+                entry_points = self._f._path_index.find_entry_points(
+                    symbol_index, project_id
+                )
+                if entry_points:
+                    sorted_eps = sorted(
+                        entry_points,
+                        key=lambda ep: centrality.get(ep, 0.0),
+                        reverse=True,
+                    )
+                    for sym_name in sorted_eps[:3]:
+                        cent_score = centrality.get(sym_name, 0.0)
+                        seed_score = 0.2 + 0.2 * cent_score
+                        ag._activations[sym_name] = ActivationState(
+                            node_id=sym_name, score=seed_score, depth=0, source="seed"
+                        )
+                        lexical_seed_qids.add(sym_name)
 
-        # -- Step 5: return --
-        activated_count = len(ag.get_activated_nodes(threshold=0.05))
-        self._f._log_debug(
-            f"Single-seed ActivationGraph: {activated_count} nodes activated "
-            f"from {len(seed_qids)} seed qid(s)"
-        )
+            ag.propagate(
+                edges_out=edges_out,
+                max_steps=20,
+                min_score=0.05,
+                alpha=self._f.valves.ppr_alpha,
+            )
         return ag
 
     def _build_multi_seed_graph(
@@ -17612,63 +16563,57 @@ Output only the symbol name.
         inferred_seeds: Optional[Dict[str, float]] = None,
         cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
-        """
-        Build an ActivationGraph by combining three independent seed vectors
-        with configurable weights (lexical, structural, historical).
+        """Build activation graph combining lexical, structural and historical
+        seed vectors.
 
-        When cached_scores is provided, the method skips all three PPR propagation
-        passes. The seed set is still resolved so that the source annotation
-        ('seed' vs 'propagation') on each node is accurate in the returned graph.
-
-        Weight configuration valves:
-            multi_seed_weight_lexical    — query-term and inferred seeds
-            multi_seed_weight_structural — entry-point seeds from PathIndex views
-            multi_seed_weight_historical — mention-frequency seeds from history
+        Q2: If cached_scores is provided, use it directly instead of recomputing.
         """
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
         symbol_index = self._f._symbol_index
 
-        # -- Step 1: resolve lexical seed set (needed even on cache hit for
-        #            source annotation) --
         ag_lex = ActivationGraph()
         lexical_seed_qids: Set[str] = set()
-
-        for sym_name in exact_seeds:
-            specificity = self._compute_node_specificity(sym_name, project_id)
-            score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            lexical_seed_qids.update(qids)
-            share = score / len(qids) if qids else 0.0
-            for qid in qids:
-                ag_lex._activations[qid] = ActivationState(
-                    node_id=qid, score=share, depth=0, source="seed"
-                )
-
-        for sym_name in partial_seeds:
-            specificity = self._compute_node_specificity(sym_name, project_id)
-            score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-            lexical_seed_qids.update(qids)
-            share = score / len(qids) if qids else 0.0
-            for qid in qids:
-                ag_lex._activations[qid] = ActivationState(
-                    node_id=qid, score=share, depth=0, source="seed"
-                )
-
+        if exact_seeds:
+            for sym_name in exact_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
+                share = score / len(qids) if qids else 0.0
+                for qid in qids:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
+        if partial_seeds:
+            for sym_name in partial_seeds:
+                specificity = self._compute_node_specificity(sym_name, project_id)
+                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
+                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+                lexical_seed_qids.update(qids)
+                share = score / len(qids) if qids else 0.0
+                for qid in qids:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
             share = tb_score / len(qids) if qids else 0.0
             for qid in qids:
                 existing = ag_lex._activations.get(qid)
-                ag_lex._activations[qid] = ActivationState(
-                    node_id=qid,
-                    score=min(1.0, (existing.score if existing else 0.0) + share * 0.4),
-                    depth=0,
-                    source="seed",
-                )
+                if existing:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share * 0.4),
+                        depth=0,
+                        source="seed",
+                    )
+                else:
+                    ag_lex._activations[qid] = ActivationState(
+                        node_id=qid, score=share, depth=0, source="seed"
+                    )
 
         for qid, inf_score in (inferred_seeds or {}).items():
             lexical_seed_qids.add(qid)
@@ -17680,25 +16625,6 @@ Output only the symbol name.
                 source="seed",
             )
 
-        # -- Step 2: early return from cache --
-        # Avoids three PPR propagation passes (O(V·E·steps) each) on cache hit.
-        if cached_scores is not None:
-            ag_final = ActivationGraph()
-            for qid, score in cached_scores.items():
-                if score >= 0.01:
-                    source = "seed" if qid in lexical_seed_qids else "propagation"
-                    ag_final._activations[qid] = ActivationState(
-                        node_id=qid,
-                        score=score,
-                        depth=0,
-                        source=source,
-                    )
-            self._f._log_debug(
-                f"PPR multi-seed: loaded {len(cached_scores)} scores from cache"
-            )
-            return ag_final
-
-        # -- Step 3: propagate lexical graph --
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -17707,11 +16633,11 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # -- Step 4: build and propagate structural graph --
         ag_str = ActivationGraph()
+        seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
         for view in self._f._path_index.get_all(project_id):
-            for lex_seed in lexical_seed_qids:
+            for lex_seed in seed_qids_for_structural:
                 if lex_seed in view.induced_nodes:
                     structural_seeds.add(view.entry_point)
                     break
@@ -17732,7 +16658,6 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # -- Step 5: build and propagate historical graph --
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -17749,7 +16674,20 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # -- Step 6: combine the three graphs --
+        if cached_scores is not None:
+            ag_final = ActivationGraph()
+            for qid, score in cached_scores.items():
+                if score >= 0.01:
+                    source = "seed" if qid in lexical_seed_qids else "propagation"
+                    ag_final._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=score,
+                        depth=0,
+                        source=source,
+                    )
+            self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
+            return ag_final
+
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -17812,54 +16750,17 @@ Output only the symbol name.
             f"str={len(ag_str.get_activated_nodes(0.01))}, "
             f"his={len(ag_his.get_activated_nodes(0.01))})"
         )
+
         return ag_final
 
-    def _store_activation_scores(
-        self,
-        ag: "ActivationGraph",
-        project_id: str,
-    ) -> None:
-        """
-        Persist the current turn's activation scores to pstate for use by
-        speculative prefetch and the adaptive LOD threshold updater.
-
-        Guards against project state being cleared between the start of
-        build_activation_graph and this call (e.g. via /forget command or
-        LRU eviction). Without the guard, accessing pstate for a cleared
-        project raises KeyError, crashing the inlet silently.
-
-        Steps:
-            1.  Retrieve pstate; return early if unavailable.
-            2.  Extract activated nodes above a minimal threshold.
-            3.  Write scores to pstate under 'last_activation_scores'.
-            4.  Update the per-instance cache for speculative prefetch
-                access without going through pstate.
-        """
-        # -- Step 1: guard against cleared project state --
-        try:
-            psm = self._f._project_state_manager
-            pstate = psm.get_pstate(project_id)
-            if pstate is None:
-                return
-        except Exception as e:
-            self._f._log_debug(
-                f"_store_activation_scores: pstate unavailable for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-            return
-
-        # -- Step 2: extract activated nodes --
-        activated = ag.get_activated_nodes(threshold=0.05)
-        if not activated:
-            return
-
-        # -- Step 3: write to pstate --
-        pstate["last_activation_scores"] = activated
-
-        # -- Step 4: update per-instance cache for speculative prefetch --
-        if not hasattr(self, "_last_activation_scores"):
-            self._last_activation_scores = {}
-        self._last_activation_scores[project_id] = activated
+    def _store_activation_scores(self, ag: ActivationGraph, project_id: str) -> None:
+        """Save activation scores for speculative prefetch and LOD tracking."""
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
+        )
+        if not hasattr(self._f, "_last_activation_scores"):
+            self._f._last_activation_scores: Dict[str, Dict[str, float]] = {}
+        self._f._last_activation_scores[project_id] = activated
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 5. Main entry point: build_activation_graph
@@ -17875,146 +16776,138 @@ Output only the symbol name.
         persist: bool = True,
     ) -> "ActivationGraph":
         """
-        Build an ActivationGraph for the given query against the current
-        symbol index, using Personalised PageRank seeded from query terms,
-        traceback symbols, and conversation history.
+        Build an ActivationGraph combining up to three independent seed vectors.
 
-        Steps:
-            1.  Prepare seed symbol sets (exact, partial, traceback, history).
-            2.  Compute code_state_hash for PPR cache key.
-            3.  Retrieve graph edges from SymbolIndex.
-            4.  Decide between single-seed and multi-seed graph strategy.
-            5.  Try PPR cache; compute fresh graph on miss.
-            6.  Normalise activation scores.
-            7.  Store activation scores for speculative prefetch and LOD
-                adaptive feedback when persist=True.
-            8.  Return the populated ActivationGraph.
+        Args:
+            query: The user query string.
+            project_id: Current project identifier.
+            max_propagation_steps: Steps for PPR propagation.
+            messages: Recent conversation messages (for historical seeds).
+            inferred_seeds: Optional {qid: score} from LLM‑guided inference.
+            persist: If False, activation scores are NOT written to
+                _last_activation_scores and do NOT affect pstate.
+                Used by MetacognitiveReasoningEngine.reason_per_focus()
+                for per-question volatile activation (FocalReasoning).
 
-        Bug 69 fix: if code_state_hash is empty (no blocks indexed yet),
-        the PPR cache is bypassed entirely. An empty string key maps all
-        projects with no code to the same cache entry, causing project B
-        to receive project A's activation scores silently.
-
-        Bug 70 fix: max_propagation_steps is forwarded to the PPR
-        computation so callers can reduce steps for lightweight queries
-        (e.g. speculative prefetch) without hardcoding inside the builders.
+        Returns:
+            ActivationGraph with propagated scores.
         """
-        # -- Step 1: prepare seed symbols --
-        try:
-            (
+        self._f._log_debug(
+            f"[PPR] build_activation_graph: query='{query[:100]}', "
+            f"project_id='{project_id}', "
+            f"max_steps={max_propagation_steps}, "
+            f"has_messages={bool(messages)}, "
+            f"persist={persist}"
+        )
+
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+
+        # ------------------------------------------------------------------
+        # Step 1: Extract seeds from query, traceback, and history.
+        # ------------------------------------------------------------------
+        exact_seeds, partial_seeds, tb_seeds, history_boosts = (
+            await self._prepare_seed_symbols(query, project_id, messages)
+        )
+
+        self._f._log_debug(
+            f"[PPR] Seeds extracted: exact={len(exact_seeds)} ({exact_seeds[:5] if exact_seeds else 'none'}), "
+            f"partial={len(partial_seeds)} ({partial_seeds[:5] if partial_seeds else 'none'}), "
+            f"tb={len(tb_seeds)}, history={len(history_boosts)}"
+        )
+
+        seed_qids: List[str] = []
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
+        for sym in exact_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        for sym in partial_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        for sym, _ in tb_seeds:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            seed_qids.extend(qids)
+        if inferred_seeds:
+            seed_qids.extend(inferred_seeds.keys())
+        seed_qids = list(set(seed_qids) & set(all_qids))
+
+        # ------------------------------------------------------------------
+        # Step 2: Get or compute PPR scores (with cache).
+        # ------------------------------------------------------------------
+        code_state_hash = self.compute_code_state_hash(project_id)
+
+        cached_scores = self._get_or_compute_ppr_scores(
+            seed_qids=seed_qids,
+            project_id=project_id,
+            code_state_hash=code_state_hash,
+            edges_out=edges_out,
+            max_steps=max_propagation_steps,
+            min_score=0.05,
+            alpha=self._f.valves.ppr_alpha,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 3: Build the activation graph (single or multi-seed).
+        # ------------------------------------------------------------------
+        _inferred = inferred_seeds or {}
+        if not self._f.valves.enable_multi_seed_activation:
+            self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
+            ag = self._build_single_seed_graph(
                 exact_seeds,
                 partial_seeds,
                 tb_seeds,
                 history_boosts,
-            ) = await self._prepare_seed_symbols(query, project_id, messages)
-        except Exception as e:
-            self._f._log_debug(
-                f"build_activation_graph: seed preparation failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-            exact_seeds = []
-            partial_seeds = []
-            tb_seeds = []
-            history_boosts = {}
-
-        # -- Step 2: code state hash --
-        code_state_hash = self.compute_code_state_hash(project_id)
-
-        # -- Step 3: retrieve edges --
-        try:
-            edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-            edges_in = self._f._symbol_index.get_all_edges_in(project_id)
-        except Exception as e:
-            self._f._log_debug(
-                f"build_activation_graph: edge retrieval failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            edges_out = {}
-            edges_in = {}
-
-        # -- Step 4: choose graph strategy --
-        multi_seed = (
-            self._f.valves.enable_multi_seed_graph
-            and (len(exact_seeds) + len(partial_seeds)) > 1
-        )
-
-        # -- Step 5: cache lookup and PPR computation --
-        use_cache = bool(code_state_hash)
-
-        cached_scores: Optional[Dict[str, float]] = None
-        if use_cache:
-            seed_qids: List[str] = []
-            for sym in exact_seeds + partial_seeds:
-                seed_qids.extend(
-                    self._f._symbol_index.get_qualified_names_for(sym, project_id)
-                )
-            for sym, _ in tb_seeds:
-                seed_qids.extend(
-                    self._f._symbol_index.get_qualified_names_for(sym, project_id)
-                )
-            seed_frozenset = frozenset(seed_qids)
-
-            cached_scores = self._ppr_cache.get(code_state_hash, seed_frozenset)
-
-            if cached_scores is None and seed_qids:
-                computed = self._get_or_compute_ppr_scores(
-                    seed_qids=seed_qids,
-                    project_id=project_id,
-                    code_state_hash=code_state_hash,
-                    edges_out=edges_out,
-                    max_steps=max(max_propagation_steps, 4),
-                    min_score=0.03,
-                    alpha=self._f.valves.ppr_alpha,
-                )
-                if computed:
-                    self._ppr_cache.set(code_state_hash, seed_frozenset, computed)
-                    cached_scores = computed
-
-        if multi_seed:
-            ag = self._build_multi_seed_graph(
-                exact_seeds=exact_seeds,
-                partial_seeds=partial_seeds,
-                tb_seeds=tb_seeds,
-                history_boosts=history_boosts,
-                edges_out=edges_out,
-                project_id=project_id,
-                inferred_seeds=inferred_seeds,
+                edges_out,
+                project_id,
+                _inferred,
                 cached_scores=cached_scores,
             )
         else:
-            ag = self._build_single_seed_graph(
-                exact_seeds=exact_seeds,
-                partial_seeds=partial_seeds,
-                tb_seeds=tb_seeds,
-                history_boosts=history_boosts,
-                edges_out=edges_out,
-                project_id=project_id,
-                inferred_seeds=inferred_seeds,
+            self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
+            ag = self._build_multi_seed_graph(
+                exact_seeds,
+                partial_seeds,
+                tb_seeds,
+                history_boosts,
+                edges_out,
+                project_id,
+                _inferred,
                 cached_scores=cached_scores,
             )
 
-        # -- Step 6: normalise scores --
-        if ag._activations:
-            normalised = self._normalize_ppr_scores(
-                {qid: s.score for qid, s in ag._activations.items()}
-            )
-            for qid, score in normalised.items():
-                if qid in ag._activations:
-                    ag._activations[qid].score = score
-
-        # -- Step 7: store for prefetch and adaptive LOD --
+        # Persist activation scores only when not running in volatile mode.
+        # FocalReasoning uses persist=False to avoid contaminating the main
+        # activation state with per-question intermediate activations.
         if persist:
             self._store_activation_scores(ag, project_id)
 
-        # -- Step 8: return --
-        activated_count = len(ag.get_activated_nodes(threshold=0.05))
-        self._f._log_debug(
-            f"build_activation_graph: {activated_count} nodes activated "
-            f"for '{project_id}' "
-            f"(hash={'none' if not code_state_hash else code_state_hash[:8]}, "
-            f"cache={'hit' if cached_scores else 'miss'}, "
-            f"strategy={'multi' if multi_seed else 'single'})"
+        # ------------------------------------------------------------------
+        # Step 4: Get activated nodes and normalize scores.
+        # ------------------------------------------------------------------
+        activated = ag.get_activated_nodes(
+            threshold=self._f.valves.path_activation_threshold
         )
+        activated = self._normalize_ppr_scores(activated)
+
+        self._f._log_debug(
+            f"[PPR] Activation complete: {len(activated)} nodes activated "
+            f"(threshold={self._f.valves.path_activation_threshold})"
+        )
+
+        # ------------------------------------------------------------------
+        # Step 5: Log score distribution for debugging (Point 6).
+        # ------------------------------------------------------------------
+        if self._f.valves.debug and activated:
+            sorted_scores = sorted(activated.values(), reverse=True)
+            if sorted_scores:
+                p50 = sorted_scores[len(sorted_scores) // 2]
+                self._f._log_debug(
+                    f"[PPR] score dist: max={sorted_scores[0]:.3f}, "
+                    f"p50={p50:.3f}, "
+                    f"min={sorted_scores[-1]:.3f}, "
+                    f"above={sum(1 for s in activated.values() if s >= self._f.valves.path_activation_threshold)}/{len(activated)}"
+                )
+
         return ag
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -18119,149 +17012,37 @@ Output only the symbol name.
 
     async def resolve_dangling_edges(self, project_id: str) -> int:
         """
-        Attempt to resolve edges whose destination symbol is not present in
-        the SymbolIndex. Such 'dangling' edges arise when code references
-        symbols in files not yet pasted into the conversation, or external
-        library symbols that will never be indexed.
+        Resolve cross-chunk symbol references.
 
-        For each dangling edge, tries to find a matching symbol via:
-            1. Exact qualified-name match (symbol was added since last run).
-            2. Bare-name lookup via get_qualified_names_for.
-            3. Fuzzy match via _fuzzy_resolve.
+        A 'dangling edge' is an edge whose destination is referenced in the
+        call graph but has no code block yet. When a new chunk defines that
+        symbol, the edge confidence is raised from 0.3 (provisional) to 1.0.
 
-        Resolved edges are updated in the SymbolIndex to point to the
-        matched qualified id with a reduced confidence.
+        Conversely, edges pointing to symbols that are referenced but not
+        defined are marked with confidence 0.3.
 
-        Steps:
-            1.  Get all edges; return 0 when graph is empty.
-            2.  Load the "already attempted" set from pstate.
-            3.  Collect all currently indexed qualified ids.
-            4.  Iterate edges: skip already-attempted, skip non-dangling.
-            5.  Attempt resolution (exact → bare → fuzzy).
-            6.  Update edge on success; mark as attempted on any outcome.
-            7.  Persist the updated attempted set to pstate.
-            8.  Return count of newly resolved edges.
+        Returns the number of edges resolved.
         """
-        psm = self._f._project_state_manager
-        pstate = psm.get_pstate(project_id)
-
-        # -- Step 1: get edges --
-        try:
-            edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-        except Exception as e:
-            self._f._log_debug(
-                f"resolve_dangling_edges: edge fetch failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-            return 0
-
-        if not edges_out:
-            self._f._log_debug(
-                f"resolve_dangling_edges: no edges for '{project_id}', " f"skipping"
-            )
-            return 0
-
-        # -- Step 2: load attempted set --
-        raw_attempted: List[str] = pstate.get("dangling_edges_attempted", [])
-        attempted: Set[str] = set(raw_attempted)
-
-        # -- Step 3: get indexed symbols --
-        all_qids: Set[str] = set(
-            self._f._symbol_index.get_all_qualified_names(project_id)
-        )
-
-        if not all_qids:
-            return 0
-
-        # -- Steps 4-6: iterate and resolve --
+        all_names = self._f._symbol_index.get_all_names(project_id)
         resolved = 0
-        newly_attempted: List[str] = []
 
-        for src, src_edges in edges_out.items():
-            for edge in src_edges:
-                dst = edge.dst
-                attempt_key = f"{src}::{dst}"
-
-                # Skip already-attempted (Bug 107)
-                if attempt_key in attempted:
-                    continue
-
-                # Skip if dst is already indexed (not dangling)
-                if dst in all_qids:
-                    continue
-
-                # Mark as attempted regardless of outcome
-                newly_attempted.append(attempt_key)
-
-                # -- Attempt resolution --
-                resolved_qid: Optional[str] = None
-
-                # Strategy 1: bare name lookup
-                bare = dst.rsplit(".", 1)[-1]
-                candidates = self._f._symbol_index.get_qualified_names_for(
-                    bare, project_id
-                )
-                if len(candidates) == 1:
-                    resolved_qid = next(iter(candidates))
-                elif len(candidates) > 1:
-                    # Ambiguous: pick the one sharing the same parent if any
-                    parent = dst.rsplit(".", 1)[0] if "." in dst else ""
-                    if parent:
-                        matching = [q for q in candidates if q.startswith(parent + ".")]
-                        if len(matching) == 1:
-                            resolved_qid = matching[0]
-
-                # Strategy 2: fuzzy fallback
-                if resolved_qid is None and hasattr(self, "_fuzzy_resolve"):
-                    fuzzy = self._fuzzy_resolve(bare, project_id)
-                    if len(fuzzy) == 1:
-                        resolved_qid = fuzzy[0]
-
-                if resolved_qid and resolved_qid in all_qids:
-                    # Update edge destination in SymbolIndex
-                    try:
-                        updated_edge = Edge(
-                            src=edge.src,
-                            dst=resolved_qid,
-                            type=getattr(edge, "type", "calls"),
-                            weight=edge.weight * 0.8,  # reduced confidence
-                            confidence=getattr(edge, "confidence", 1.0) * 0.8,
-                        )
-                        self._f._symbol_index.remove_edges_for_symbol(src, project_id)
-                        # Re-add other edges for this src
-                        for other_edge in src_edges:
-                            if other_edge.dst != dst:
-                                self._f._symbol_index.add_edge(other_edge, project_id)
-                        self._f._symbol_index.add_edge(updated_edge, project_id)
-                        resolved += 1
-                        self._f._log_debug(
-                            f"resolve_dangling_edges: '{dst}' → "
-                            f"'{resolved_qid}' for '{project_id}'"
-                        )
-                    except Exception as e:
-                        self._f._log_debug(
-                            f"resolve_dangling_edges: update failed for "
-                            f"'{dst}': {type(e).__name__}: {e}"
-                        )
-
-        # -- Step 7: persist attempted set --
-        if newly_attempted:
-            updated_attempted = list(attempted | set(newly_attempted))
-            # Cap size to prevent pstate bloat
-            max_attempted = getattr(
-                self._f.valves, "dangling_edges_max_attempted", 5000
+        for sym_name in all_names:
+            has_definition = bool(
+                self._f._symbol_index.find_blocks(sym_name, project_id)
             )
-            if len(updated_attempted) > max_attempted:
-                updated_attempted = updated_attempted[-max_attempted:]
-            pstate["dangling_edges_attempted"] = updated_attempted
+            edges_in = self._f._symbol_index.get_edges_in(sym_name, project_id)
 
-        # -- Step 8: return --
-        if resolved or newly_attempted:
+            for edge in edges_in:
+                if has_definition and edge.confidence < 1.0:
+                    edge.confidence = 1.0
+                    resolved += 1
+                elif not has_definition and edge.confidence == 1.0:
+                    edge.confidence = 0.3
+
+        if resolved > 0:
             self._f._log_debug(
-                f"resolve_dangling_edges: resolved={resolved}, "
-                f"newly_attempted={len(newly_attempted)}, "
-                f"total_attempted={len(attempted) + len(newly_attempted)} "
-                f"for '{project_id}'"
+                f"Cross-chunk resolution: {resolved} edge(s) resolved "
+                f"(references confirmed with definitions)"
             )
         return resolved
 
@@ -18324,113 +17105,63 @@ Output only the symbol name.
         stop_event: asyncio.Event = None,
     ) -> None:
         """
-        Pre-warm the PPR cache for symbols likely to be activated on the next turn.
+        Background version of speculative_prefetch that accepts a stop_event.
+        Pre‑builds CodePathViews for symbols likely to be relevant in the next query.
 
-        For each hub-tier symbol that was highly activated this turn, computes
-        an activation graph as if that symbol were the sole entry point on the
-        next query, and stores the result in _PPRCache. This turns a cache miss
-        at the start of the next inlet into a cache hit.
-
-        Takes a defensive copy of last_activated immediately to avoid
-        RuntimeError when the main inlet path updates the same dict concurrently.
-
-        Checks stop_event between each PPR computation so the background task
-        can be cleanly cancelled during server shutdown or plugin reload without
-        waiting for the entire prefetch batch to finish.
-
-        Steps:
-            1.  Defensive copy of last_activated; early exit if empty.
-            2.  Identify prefetch candidates: top-N activated hub symbols.
-            3.  Compute code_state_hash once for cache key.
-            4.  For each candidate: check stop_event, compute PPR, cache result.
+        Args:
+            project_id (str): The current project identifier.
+            last_activated (dict): Activation scores from the previous turn.
+            stop_event (asyncio.Event, optional): Event to signal cancellation.
         """
-        # -- Step 1: defensive copy + stop check --
         if stop_event and stop_event.is_set():
             return
 
-        activated_snapshot: Dict[str, float] = dict(last_activated)
-        if not activated_snapshot:
+        if not self._f.valves.enable_speculative_prefetch:
+            return
+        if not last_activated:
             return
 
-        # -- Step 2: identify prefetch candidates --
-        psm = self._f._project_state_manager
-        centrality = psm.get_node_centrality(project_id)
-        hub_qids = set(psm.get_hub_tier_qids(project_id))
-        top_n = getattr(self._f.valves, "speculative_prefetch_top_n", 3)
-        min_score = getattr(self._f.valves, "speculative_prefetch_min_score", 0.3)
+        top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
 
-        candidates: List[Tuple[str, float]] = sorted(
-            [
-                (qid, score)
-                for qid, score in activated_snapshot.items()
-                if score >= min_score and qid in hub_qids
-            ],
-            key=lambda x: x[1],
-            reverse=True,
-        )[:top_n]
+        prefetch_candidates: Set[str] = set()
+        for sym in top_syms:
+            for edge in self._f._symbol_index.get_edges_out(sym, project_id):
+                if (
+                    edge.type == "calls"
+                    and edge.effective_weight() >= 0.7
+                    and edge.dst not in last_activated
+                ):
+                    prefetch_candidates.add(edge.dst)
 
-        if not candidates:
-            self._f._log_debug(
-                f"speculative_prefetch_background: no candidates for '{project_id}'"
-            )
+        if not prefetch_candidates:
             return
 
-        # -- Step 3: code state hash (stable across the batch) --
-        code_state_hash = self.compute_code_state_hash(project_id)
-        if not code_state_hash:
+        if stop_event and stop_event.is_set():
             return
 
-        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-
+        candidates = list(prefetch_candidates)[
+            : self._f.valves.speculative_prefetch_max
+        ]
         self._f._log_debug(
-            f"speculative_prefetch_background: prefetching {len(candidates)} "
-            f"candidate(s) for '{project_id}'"
+            f"Speculative prefetch: pre-building {len(candidates)} CodePathView(s) "
+            f"for next likely query"
         )
 
-        # -- Step 4: compute and cache PPR per candidate --
-        for qid, score in candidates:
-            # Check stop_event BEFORE each PPR computation, not just once at start.
+        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
+        for idx, sym_name in enumerate(candidates):
             if stop_event and stop_event.is_set():
                 self._f._log_debug(
-                    f"speculative_prefetch_background: stop_event set, "
-                    f"aborting remaining {len(candidates)} prefetch(es)"
+                    f"Speculative prefetch: stopped after {idx}/{len(candidates)} candidates"
                 )
-                return
+                break
 
-            existing = self._ppr_cache.get(code_state_hash, frozenset([qid]))
-            if existing is not None:
-                self._f._log_debug(
-                    f"speculative_prefetch_background: cache hit for {qid[:30]}, skipping"
-                )
+            if not self._f._symbol_index.find_blocks(sym_name, project_id):
                 continue
-
-            try:
-                ppr_scores = self._get_or_compute_ppr_scores(
-                    seed_qids=[qid],
-                    project_id=project_id,
-                    code_state_hash=code_state_hash,
-                    edges_out=edges_out,
-                    max_steps=15,
-                    min_score=0.05,
-                    alpha=self._f.valves.ppr_alpha,
-                )
-                if ppr_scores:
-                    self._ppr_cache.set(code_state_hash, frozenset([qid]), ppr_scores)
-                    self._f._log_debug(
-                        f"speculative_prefetch_background: cached PPR for "
-                        f"'{qid[:30]}' ({len(ppr_scores)} nodes)"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._f._log_debug(
-                    f"speculative_prefetch_background: PPR failed for "
-                    f"'{qid[:30]}': {type(e).__name__}: {e}"
-                )
-
-            # Yield to the event loop between PPR computations so other
-            # coroutines (inlet, docstring loop) are not starved.
-            await asyncio.sleep(0)
+            qids = self._f._symbol_index.get_qualified_names_for(sym_name, project_id)
+            ag = ActivationGraph()
+            ag.seed(list(qids), initial_score=1.0)
+            ag.propagate(edges_out, max_steps=2, min_score=0.1)
+            await self._build_view_from_activation(sym_name, ag, project_id)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Hash utilities
@@ -19381,31 +18112,22 @@ class MetacognitiveReasoningEngine:
         min_delta: float = 0.02,
     ) -> bool:
         """
-        Return True when the objective score has not improved meaningfully over
-        the last `window` iterations.
+        Detect stagnation in the OBJECTIVE score (SymbolGraph-based).
+        ITERATION LEVEL (H5 temporal hierarchy).
 
-        Requires at least window+1 data points to make a meaningful comparison.
-        Returns False (not stagnated) when history is too short, which is the
-        correct signal: on early iterations there is not enough data to declare
-        stagnation, so refinement should proceed normally.
+        Critical: uses obj_score_history, NOT combined score history.
+        llm_conf is self-reported by the LLM and unreliable as a
+        convergence signal. The SymbolGraph-derived obj_score is the
+        only trustworthy measure of progress.
 
-        Steps:
-            1.  Return False immediately when history has fewer than window+1
-                entries — avoids IndexError and gives early iterations the benefit
-                of the doubt.
-            2.  Compute the per-step deltas within the window.
-            3.  Return True if every delta is below min_delta (flat or regressing).
+        Returns True if obj_score hasn't improved by min_delta
+        in the last `window` iterations.
         """
-        # -- Step 1: minimum history guard --
         if len(obj_score_history) < window + 1:
             return False
-
-        # -- Step 2: compute deltas within window --
         recent = obj_score_history[-(window + 1) :]
-        deltas = [recent[i + 1] - recent[i] for i in range(len(recent) - 1)]
-
-        # -- Step 3: stagnation when all deltas below threshold --
-        return all(d < min_delta for d in deltas)
+        improvement = max(recent) - recent[0]
+        return improvement < min_delta
 
     def _build_refinement_constraints(
         self,
@@ -19605,281 +18327,435 @@ class MetacognitiveReasoningEngine:
         llm_weight: float = 0.5,
     ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
         """
-        Run multi-iteration hypothesis competition to find the strongest explanation.
+        Full scientific hypothesis competition loop.
 
-        Each iteration: evaluates all active (non-falsified) hypotheses against
-        static evidence and LLM confidence, falsifies weak ones, refines or
-        diversifies survivors, and checks for convergence.
+        Temporal hierarchy (H5):
+        ITERATION:     stagnation detection on obj_score_history (NOT combined —
+                       llm_conf excluded as self-reported signal),
+                       _build_refinement_constraints (PID output → LLM input),
+                       divergent thinking on stagnation escape
+        TURN:          design_critical_experiment, generate_predictions (iter 1),
+                       gather_evidence, Active Learning (H4),
+                       is_falsified (with coverage guard), compute_weighted_score,
+                       _compute_epistemic_uncertainty
+        CONVERSATION:  experimentum_crucis (tiebreaker when top-2 within threshold),
+                       devil's advocate (signal: score > 0.8, overconfidence risk),
+                       peer_review (antithesis, gated by uncertainty + valve),
+                       delimit_scope (synthesis, H6 dialectical order —
+                       always AFTER peer_review so critique informs synthesis)
+        PROJECT:       _debrief_competition → _performance_history (all iterations,
+                       including total-failure case — Bug B fix)
+                       → _get_adaptive_strategy (next call)
 
-        Returns the best surviving hypothesis, its score, its evidence, and an
-        optional peer review result.
+        H6 (Dialectical order): peer_review BEFORE delimit_scope.
+        The antithesis (critique) must be known before synthesis (scope).
 
-        Fallback when all hypotheses are falsified:
-            The least-bad entry in scored_list is returned with a low score rather
-            than crashing. This preserves a usable (if low-confidence) answer for
-            the caller rather than propagating StopIteration or IndexError.
+        obj_weight / llm_weight:
+            0.5/0.5 default — verification: evidence and LLM equally weighted
+            0.4/0.6 for architecture — proposing changes, design judgment > evidence
 
-        Steps:
-            1.  Guard: empty input returns a null hypothesis immediately.
-            2.  Initialise scored_list from input hypotheses.
-            3.  Competition loop (up to max_iters):
-                a.  Evaluate each active hypothesis.
-                b.  Falsify those below the falsification threshold.
-                c.  Find current best among survivors.
-                d.  Check early-exit on threshold or stagnation.
-                e.  Seek experimentum crucis between top-2 survivors.
-                f.  Refine or diversify based on stagnation signal.
-            4.  Select winner: best non-falsified entry; fallback to least-bad
-                if all are falsified.
-            5.  Run peer review on winner.
-            6.  Debrief competition for adaptive strategy update.
-            7.  Return (winner_text, score, evidence, peer_review).
+        Returns (best_hypothesis_text, best_score, best_evidence, peer_review).
         """
-        # -- Step 1: empty input guard --
-        if not hypotheses:
+        max_hypotheses = len(hypotheses)
+
+        # Null hypothesis baseline — always included as floor comparison
+        null_hyp = (
+            "The behavior follows the most direct structural path "
+            "without additional indirection or hidden dependencies.",
+            0.5,
+        )
+        if not any(h[0] == null_hyp[0] for h in hypotheses):
+            hypotheses = [null_hyp] + list(hypotheses)
+
+        # PROJECT LEVEL: adaptive strategy from history
+        strategy = self._get_adaptive_strategy(project_id)
+        if strategy.get("suggest_divergent_start"):
             self._f._log_debug(
-                f"compete_hypotheses: called with empty hypotheses list "
-                f"for '{project_id}' ({label}), returning null hypothesis"
+                "compete_hypotheses: adaptive strategy suggests divergent start "
+                "(high stagnation rate in project history)"
             )
-            null_evidence = self.gather_evidence("", project_id)
-            return "", 0.0, null_evidence, None
 
-        # -- Step 2: initialise scored_list --
-        scored_list: List[ScoredHypothesis] = []
-        for text, llm_conf in hypotheses:
-            evidence = self.gather_evidence(text, project_id)
-            design = await self.design_critical_experiment(text, project_id)
-            score, coverage, uncertainty = self.compute_weighted_score(
-                evidence,
-                design,
-                llm_conf,
-                obj_weight=obj_weight,
-                llm_weight=llm_weight,
+        best_scored: Optional["ScoredHypothesis"] = None
+        runner_up: Optional["ScoredHypothesis"] = None
+        obj_score_history: List[float] = []  # obj_score ONLY — no llm_conf
+        stagnated_this_run = False
+        valid_scored: List["ScoredHypothesis"] = []
+        all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
+        iteration = 0
+
+        while iteration < max_iters:
+            iteration += 1
+            current_scored: List["ScoredHypothesis"] = []
+
+            await self._f._emit_status(
+                f"🔬 Evaluating {len(hypotheses)} hypotheses "
+                f"(iteration {iteration}/{max_iters})..."
             )
-            scored_list.append(
-                ScoredHypothesis(
-                    text=text,
-                    score=score,
-                    llm_conf=llm_conf,
-                    obj_score=evidence.objective_score,
-                    evidence=evidence,
-                    design=design,
-                    falsified=False,
-                    falsification_reason=None,
-                    scope="",
-                    predictions_verified=0,
-                    predictions_total=0,
-                    coverage_score=coverage,
-                    epistemic_uncertainty=uncertainty,
+
+            # ITERATION LEVEL: PID constraints from previous iteration's results
+            _constraints = self._build_refinement_constraints(
+                coverage_score=best_scored.coverage_score if best_scored else 1.0,
+                strategy=strategy,
+                stagnated=stagnated_this_run,
+            )
+
+            # TURN LEVEL: evaluate each hypothesis
+            for hyp_text, llm_conf in hypotheses:
+
+                # ① Design experiment (cached after first occurrence)
+                design = await self.design_critical_experiment(hyp_text, project_id)
+
+                # ② Generate predictions (first iteration only — costly LLM call)
+                predictions: List[str] = []
+                if iteration == 1:
+                    predictions = await self.generate_predictions(hyp_text, project_id)
+
+                # ③ Gather primary evidence
+                evidence = self.gather_evidence(hyp_text, project_id)
+
+                # ④ Verify predictions via secondary evidence pass
+                pred_verified = 0
+                pred_total = 0
+                if predictions:
+                    pred_evidence = self.gather_evidence(
+                        " ".join(predictions), project_id
+                    )
+                    pred_verified = sum(
+                        1 for v in pred_evidence.symbols_found.values() if v
+                    ) + sum(1 for v in pred_evidence.call_relations_valid.values() if v)
+                    pred_total = len(pred_evidence.symbols_found) + len(
+                        pred_evidence.call_relations_valid
+                    )
+
+                # ⑤ Active Learning (H4) — reclassify unknown claims
+                # Signal: initial coverage below threshold AND unknown claims
+                # mention verifiable symbols
+                initial_coverage = self._compute_coverage_score(design)
+                if initial_coverage < self._f.valves.low_coverage_threshold:
+                    resolvable = self._identify_missing_information(design, project_id)
+                    if resolvable:
+                        design = self._resolve_unknown_claims(
+                            design, resolvable, project_id
+                        )
+                        # ⑥ Re-gather with improved design (more claims verifiable)
+                        evidence = self.gather_evidence(hyp_text, project_id)
+                        self._f._log_debug(
+                            f"active_learning: re-gathered after reclassification "
+                            f"(was coverage={initial_coverage:.2f})"
+                        )
+
+                # ⑦ Falsification with coverage guard
+                current_coverage = self._compute_coverage_score(design)
+                falsified, reason = self.is_falsified(
+                    evidence, design, coverage_score=current_coverage
                 )
-            )
 
-        obj_score_history: List[float] = []
-        peer_review: Optional[PeerReviewResult] = None
+                if falsified:
+                    self._f._log_debug(
+                        f"compete_hypotheses iter {iteration}: " f"FALSIFIED — {reason}"
+                    )
+                    current_scored.append(
+                        ScoredHypothesis(
+                            text=hyp_text,
+                            score=0.0,
+                            llm_conf=llm_conf,
+                            obj_score=0.0,
+                            evidence=evidence,
+                            design=design,
+                            falsified=True,
+                            falsification_reason=reason,
+                            coverage_score=current_coverage,
+                            epistemic_uncertainty=1.0,
+                        )
+                    )
+                    continue
 
-        # -- Step 3: competition loop --
-        for iteration in range(max_iters):
-            active = [h for h in scored_list if not h.falsified]
-            if not active:
-                self._f._log_debug(
-                    f"compete_hypotheses: all hypotheses falsified after "
-                    f"iteration {iteration} for '{project_id}'"
-                )
-                break
+                # Downgrade: reason returned but not killed (coverage guard active)
+                downgraded_reason = reason if (not falsified and reason) else None
 
-            # -- 3a: evaluate active hypotheses --
-            for h in active:
-                evidence = self.gather_evidence(h.text, project_id)
-                design = h.design
-                score, coverage, uncertainty = self.compute_weighted_score(
+                # ⑧ Weighted scoring with obj/llm balance
+                obj_score, combined, coverage_score = self.compute_weighted_score(
                     evidence,
                     design,
-                    h.llm_conf,
+                    llm_conf,
+                    pred_verified,
+                    pred_total,
+                    downgraded_reason=downgraded_reason,
                     obj_weight=obj_weight,
                     llm_weight=llm_weight,
                 )
-                h.score = score
-                h.obj_score = evidence.objective_score
-                h.evidence = evidence
-                h.coverage_score = coverage
-                h.epistemic_uncertainty = uncertainty
 
-            # -- 3b: falsify weak hypotheses --
-            active_scores = sorted([h.score for h in active], reverse=True)
-            falsification_floor = (
-                active_scores[0] * self._f.valves.hypothesis_falsification_ratio
-                if active_scores
-                and hasattr(self._f.valves, "hypothesis_falsification_ratio")
+                # ⑨ Epistemic uncertainty (H2 — Bayesian-inspired, deterministic)
+                epistemic_uncertainty = self._compute_epistemic_uncertainty(
+                    obj_score, coverage_score, pred_verified, pred_total
+                )
+
+                self._f._log_debug(
+                    f"compete_hypotheses iter {iteration}: "
+                    f"'{hyp_text[:60]}...' "
+                    f"score={combined:.3f} "
+                    f"(obj={obj_score:.3f}, llm_conf={llm_conf:.3f}, "
+                    f"coverage={coverage_score:.2f}, "
+                    f"uncertainty={epistemic_uncertainty:.2f}, "
+                    f"pred={pred_verified}/{pred_total})"
+                )
+
+                current_scored.append(
+                    ScoredHypothesis(
+                        text=hyp_text,
+                        score=combined,
+                        llm_conf=llm_conf,
+                        obj_score=obj_score,
+                        evidence=evidence,
+                        design=design,
+                        falsified=False,
+                        falsification_reason=downgraded_reason,
+                        predictions_verified=pred_verified,
+                        predictions_total=pred_total,
+                        coverage_score=coverage_score,
+                        epistemic_uncertainty=epistemic_uncertainty,
+                    )
+                )
+
+            # Bug 7: accumulate ALL iterations for project-level debriefing
+            all_scored.extend(current_scored)
+
+            # Sort: non-falsified by combined score descending
+            valid_scored = [s for s in current_scored if not s.falsified]
+            valid_scored.sort(key=lambda x: x.score, reverse=True)
+
+            if not valid_scored:
+                self._f._log_debug(
+                    f"compete_hypotheses iter {iteration}: all hypotheses falsified"
+                )
+                break
+
+            best_scored = valid_scored[0]
+            runner_up = valid_scored[1] if len(valid_scored) >= 2 else None
+
+            # ITERATION LEVEL: track obj_score ONLY (deterministic SymbolGraph signal)
+            # llm_conf excluded — self-reported by LLM, unreliable for convergence
+            obj_score_history.append(best_scored.obj_score)
+
+            if best_scored.score >= threshold or iteration >= max_iters:
+                break
+
+            # ITERATION LEVEL: stagnation detection → diverge or refine
+            # Note: requires len(obj_score_history) >= stagnation_window + 1.
+            # Only effective when scientific_max_iterations >= stagnation_window + 2.
+            # See _validate_valve_coherence for the coherence warning (Bug C).
+            if self._f.valves.enable_stagnation_detection and self._detect_stagnation(
+                obj_score_history,
+                window=self._f.valves.stagnation_window,
+                min_delta=self._f.valves.stagnation_min_delta,
+            ):
+                stagnated_this_run = True
+                self._f._log_debug(
+                    f"compete_hypotheses: stagnation detected "
+                    f"(obj_scores={obj_score_history[-3:]}) → divergent thinking"
+                )
+                await self._f._emit_status(
+                    "💡 Stagnation detected — exploring alternative hypotheses..."
+                )
+                refined = await self._generate_divergent_hypotheses(
+                    best_scored, max_hypotheses, project_id, label
+                )
+                if not refined:
+                    break
+                hypotheses = refined
+                obj_score_history = []  # reset — new direction, new baseline
+
+            else:
+                # Convergent refinement with deterministic PID constraints
+                refined = await self._refine_hypotheses(
+                    best_scored,
+                    max_hypotheses,
+                    project_id,
+                    label,
+                    constraints=_constraints,
+                )
+                if not refined:
+                    break
+                hypotheses = refined
+
+        # ── Post-loop guard ───────────────────────────────────────────────
+        if best_scored is None:
+            self._f._log_debug(
+                "compete_hypotheses: no valid hypothesis survived — "
+                "all falsified across all iterations"
+            )
+            # Bug B fix: record total-failure in performance history so
+            # _get_adaptive_strategy can learn from this failure mode.
+            # Without this, the project's persistent failure pattern
+            # (e.g., always falsified by call_relations) is invisible.
+            _avg_cov = (
+                sum(s.coverage_score for s in all_scored) / len(all_scored)
+                if all_scored
                 else 0.0
             )
-            for h in active:
-                falsified, reason = self.is_falsified(
-                    h.evidence, h.design, h.coverage_score
-                )
-                if falsified or h.score < falsification_floor:
-                    h.falsified = True
-                    h.falsification_reason = reason or "score below floor"
-
-            active = [h for h in scored_list if not h.falsified]
-            if not active:
-                break
-
-            # -- 3c: find current best --
-            best = max(active, key=lambda h: h.score)
-            obj_score_history.append(best.obj_score)
-
-            self._f._log_debug(
-                f"compete_hypotheses: iter {iteration+1}/{max_iters} — "
-                f"best score={best.score:.3f}, "
-                f"{len(active)} active / {len(scored_list)} total "
-                f"({label})"
-            )
-
-            # -- 3d: convergence check --
-            if best.score >= threshold:
-                self._f._log_debug(
-                    f"compete_hypotheses: threshold {threshold} reached "
-                    f"at iter {iteration+1}"
-                )
-                break
-
-            stagnated = self._detect_stagnation(obj_score_history)
-
-            # -- 3e: experimentum crucis for top-2 survivors --
-            if len(active) >= 2:
-                sorted_active = sorted(active, key=lambda h: h.score, reverse=True)
-                try:
-                    crucis = await self.find_experimentum_crucis(
-                        sorted_active[0].text, sorted_active[1].text, project_id
-                    )
-                    if crucis:
-                        self._f._log_debug(
-                            f"compete_hypotheses: experimentum crucis found"
-                        )
-                except Exception as e:
-                    self._f._log_debug(
-                        f"compete_hypotheses: experimentum crucis failed: {e}"
-                    )
-
-            # -- 3f: refine or diversify --
-            if iteration < max_iters - 1:
-                try:
-                    if stagnated:
-                        new_pairs = await self._generate_divergent_hypotheses(
-                            best,
-                            max_hypotheses=2,
-                            project_id=project_id,
-                            label=label,
-                        )
-                    else:
-                        constraints = self._build_refinement_constraints(
-                            best.coverage_score,
-                            self._get_adaptive_strategy(project_id),
-                            stagnated,
-                        )
-                        new_pairs = await self._refine_hypotheses(
-                            best,
-                            max_hypotheses=2,
-                            project_id=project_id,
-                            label=label,
-                            constraints=constraints,
-                        )
-
-                    for new_text, new_conf in new_pairs:
-                        if not new_text:
-                            continue
-                        new_evidence = self.gather_evidence(new_text, project_id)
-                        new_design = await self.design_critical_experiment(
-                            new_text, project_id
-                        )
-                        new_score, new_cov, new_unc = self.compute_weighted_score(
-                            new_evidence,
-                            new_design,
-                            new_conf,
-                            obj_weight=obj_weight,
-                            llm_weight=llm_weight,
-                        )
-                        scored_list.append(
-                            ScoredHypothesis(
-                                text=new_text,
-                                score=new_score,
-                                llm_conf=new_conf,
-                                obj_score=new_evidence.objective_score,
-                                evidence=new_evidence,
-                                design=new_design,
-                                falsified=False,
-                                falsification_reason=None,
-                                scope="",
-                                predictions_verified=0,
-                                predictions_total=0,
-                                coverage_score=new_cov,
-                                epistemic_uncertainty=new_unc,
-                            )
-                        )
-
-                except Exception as e:
-                    self._f._log_debug(
-                        f"compete_hypotheses: refinement failed at iter "
-                        f"{iteration+1}: {type(e).__name__}: {e}"
-                    )
-
-        # -- Step 4: select winner --
-        # Primary: best non-falsified hypothesis.
-        # Fallback: best by score among all entries (including falsified) so we
-        # never return an empty string when all hypotheses were falsified.
-        survivors = [h for h in scored_list if not h.falsified]
-        if survivors:
-            winner = max(survivors, key=lambda h: h.score)
-        else:
-            self._f._log_debug(
-                f"compete_hypotheses: all {len(scored_list)} hypotheses falsified "
-                f"for '{project_id}' ({label}) — using least-bad fallback"
-            )
-            winner = max(scored_list, key=lambda h: h.score)
-            winner.score = min(winner.score, 0.3)  # cap to signal low confidence
-
-        final_score = winner.score
-        final_evidence = winner.evidence
-        coverage = winner.coverage_score
-        score_trajectory = obj_score_history
-
-        # -- Step 5: peer review --
-        try:
-            peer_review = await self.peer_review_hypothesis(
-                hypothesis=winner.text,
-                evidence=final_evidence,
-                design=winner.design,
-                project_id=project_id,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"compete_hypotheses: peer review failed: {type(e).__name__}: {e}"
-            )
-            peer_review = None
-
-        # -- Step 6: debrief --
-        try:
             await self._debrief_competition(
-                scored_list,
-                final_score,
-                coverage,
-                score_trajectory,
-                stagnated=self._detect_stagnation(score_trajectory),
+                scored_list=all_scored,
+                final_score=0.0,
+                coverage_score=_avg_cov,
+                score_trajectory=obj_score_history,
+                stagnated=stagnated_this_run,
                 project_id=project_id,
             )
-        except Exception as e:
-            self._f._log_debug(
-                f"compete_hypotheses: debrief failed: {type(e).__name__}: {e}"
+            return (
+                "Unable to validate any hypothesis against the codebase structure.",
+                0.0,
+                StaticEvidence(
+                    symbols_found={},
+                    call_relations_valid={},
+                    recent_changes=[],
+                    entry_points_mentioned=[],
+                    path_memberships={},
+                    data_flow_upstream={},
+                    objective_score=0.0,
+                ),
+                None,
             )
 
-        # -- Step 7: return --
-        self._f._log_debug(
-            f"compete_hypotheses: winner score={final_score:.3f}, "
-            f"coverage={coverage:.2f}, "
-            f"peer_review={'yes' if peer_review else 'no'} "
-            f"({label})"
+        # CONVERSATION LEVEL: experimentum crucis
+        # Signal: top-2 hypotheses within crucis_threshold of each other
+        if (
+            self._f.valves.enable_experimentum_crucis
+            and runner_up is not None
+            and abs(best_scored.score - runner_up.score)
+            < self._f.valves.crucis_threshold
+        ):
+            await self._f._emit_status("⚖️ Running tiebreaker experiment...")
+            crucis_winner = await self.find_experimentum_crucis(
+                best_scored.text, runner_up.text, project_id
+            )
+            if crucis_winner and crucis_winner != best_scored.text:
+                self._f._log_debug(
+                    "compete_hypotheses: experimentum crucis promoted runner-up"
+                )
+                best_scored, runner_up = runner_up, best_scored
+
+        # CONVERSATION LEVEL: devil's advocate
+        # Signal: score > 0.8 (overconfidence risk) AND peer_review disabled.
+        # When enable_peer_review=True, challenge_hypothesis() runs internally
+        # inside the degraded peer review path — no duplication needed.
+        # Result stored as PeerReviewResult so delimit_scope (H6) can use
+        # the critique as antithesis material.
+        peer_review: Optional["PeerReviewResult"] = None
+
+        if (
+            self._f.valves.enable_devil_advocate
+            and not self._f.valves.enable_peer_review
+            and best_scored.score > 0.8
+        ):
+            self._f._log_debug(
+                f"compete_hypotheses: devil's advocate triggered "
+                f"(score={best_scored.score:.3f} > 0.8, overconfidence risk)"
+            )
+            await self._f._emit_status("😈 Running devil's advocate...")
+            critique = await self.challenge_hypothesis(
+                best_scored.text, best_scored.evidence, project_id
+            )
+            if critique:
+                peer_review = PeerReviewResult(
+                    verdict="QUALIFY",
+                    critiques=[critique],
+                    reviewer_model="internal_devil_advocate",
+                    is_external=False,
+                )
+                self._f._log_debug(
+                    "compete_hypotheses: devil's advocate found flaw — "
+                    "will inform dialectical scope delimitation"
+                )
+
+        # CONVERSATION LEVEL: peer review (antithesis — H6)
+        # Signal: enable_peer_review=True AND uncertainty >= threshold.
+        # Epistemic uncertainty gate:
+        #   score < 0.4 → uncertainty high but hypothesis already failed → noise
+        #   score > 0.85 → uncertainty low, hypothesis won clearly → wasteful
+        #   useful range [0.4, 0.85] maps to uncertainty >= threshold
+        # Bug 2 fix: only call when valve is enabled (avoids needless None returns)
+        if self._f.valves.enable_peer_review:
+            _uncertainty_justifies_review = (
+                best_scored.epistemic_uncertainty
+                >= self._f.valves.peer_review_uncertainty_threshold
+            )
+            if _uncertainty_justifies_review:
+                peer_review = await self.peer_review_hypothesis(
+                    best_scored.text,
+                    best_scored.evidence,
+                    best_scored.design,
+                    project_id,
+                )
+            else:
+                self._f._log_debug(
+                    f"compete_hypotheses: peer review skipped — "
+                    f"uncertainty={best_scored.epistemic_uncertainty:.2f} < "
+                    f"threshold={self._f.valves.peer_review_uncertainty_threshold:.2f} "
+                    f"(hypothesis result is clear enough)"
+                )
+
+        # Promote runner-up if peer review rejects winner
+        if (
+            peer_review is not None
+            and peer_review.verdict == "REJECT"
+            and runner_up is not None
+        ):
+            self._f._log_debug(
+                f"compete_hypotheses: winner REJECTED by peer review, "
+                f"promoting runner-up. "
+                f"Critiques (about demoted winner): {peer_review.critiques}"
+            )
+            best_scored = runner_up
+            # Bug 16 fix: peer_review critiques describe the DEMOTED winner,
+            # not the promoted runner-up. Passing them to delimit_scope would
+            # synthesize scope for the wrong hypothesis using irrelevant critiques.
+            # Clear peer_review — the runner-up has not been independently reviewed.
+            peer_review = PeerReviewResult(
+                verdict="APPROVE",
+                critiques=[],
+                reviewer_model="runner_up_promotion",
+                is_external=False,
+            )
+
+        # CONVERSATION LEVEL: delimit_scope (synthesis — H6)
+        # Receives peer_review AFTER antithesis is known.
+        # If peer_review is APPROVE (or runner-up was promoted), only
+        # negative structural evidence informs the scope.
+        final_text = best_scored.text
+        if self._f.valves.enable_scope_delimitation:
+            await self._f._emit_status("📐 Synthesizing scope and critique...")
+            scoped = await self.delimit_scope(
+                best_scored.text,
+                best_scored.evidence,
+                best_scored.design,
+                project_id,
+                peer_review=peer_review,  # H6: antithesis informs synthesis
+            )
+            if scoped:
+                final_text = scoped
+
+        # PROJECT LEVEL: debriefing with ALL iterations (Bug 7)
+        # all_scored includes hypotheses from every iteration — gives accurate
+        # picture of failure patterns across the full competition, not just
+        # the final iteration.
+        await self._debrief_competition(
+            scored_list=all_scored,
+            final_score=best_scored.score,
+            coverage_score=best_scored.coverage_score,
+            score_trajectory=obj_score_history,
+            stagnated=stagnated_this_run,
+            project_id=project_id,
         )
-        return winner.text, final_score, final_evidence, peer_review
+
+        self._f._log_debug(
+            f"compete_hypotheses: winner score={best_scored.score:.3f}, "
+            f"coverage={best_scored.coverage_score:.2f}, "
+            f"uncertainty={best_scored.epistemic_uncertainty:.2f}, "
+            f"stagnated={stagnated_this_run}, "
+            f"total_evaluated={len(all_scored)} across {iteration} iter(s)"
+        )
+
+        return final_text, best_scored.score, best_scored.evidence, peer_review
 
     # ═══════════════════════════════════════════════════════════════════════
     # 5. Post-competition tools
@@ -20885,112 +19761,229 @@ Code context (recent symbols referenced):
         # block.hash -> in-flight background summary task, to avoid firing
         # a second summary attempt for the same block while one is pending.
         self._pending_block_summaries: Set[str] = set()
-        self._summarizing_blocks: Set[str] = set()
 
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Code history compression (multi‑phase code parts → summaries)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def compress_code_history(
-        self,
-        messages: list,
-        project_id: str,
-    ) -> list:
+    async def compress_code_history(self, messages: list, project_id: str) -> list:
         """
-        Replace code-dump assistant messages with compact commit-summary stubs.
+        Replace old assistant code-part messages with compact commit summaries.
 
-        Only assistant messages that contain code indicators, meet the minimum
-        character threshold, and have their symbols already indexed are replaced.
-        All other messages pass through unchanged.
+        Uses a cascade for compression decisions:
+        1. CrossEncoder evaluates semantic relevance of the message to the
+           current conversation context (score 0-1).
+        2. Symbol index ratio (existing logic) reinforces the decision.
+        3. If CrossEncoder is extremely uncertain (diff < LLM_FALLBACK_THRESHOLD),
+           use a conservative default (preserve).
+        4. If CrossEncoder is confident, use its decision.
+        5. If CrossEncoder is in the middle zone, fallback to the existing logic.
 
-        Steps:
-            1.  Defensive copy — the caller's list is never modified in place.
-            2.  Early exits: compression disabled, state missing, no candidates.
-            3.  Count total code-bearing assistant turns for part numbering.
-            4.  Iterate messages: non-candidates pass through directly.
-            5.  For each candidate verify symbol coverage, then call
-                _build_code_commit_summary.
-            6.  On success replace with the summary dict; on failure keep original.
+        Compression is forced after `code_history_force_compress_after_turns`
+        regardless of the cascade.
+
+        Restores KV slot after any LLM call (via _build_code_commit_summary).
+
+        Args:
+            messages (list): The conversation messages to process.
+            project_id (str): The current project identifier.
+
+        Returns:
+            list: The updated message list with compressed assistant messages.
         """
-        # -- Step 1: defensive copy --
-        messages = list(messages)
-
-        # -- Step 2: early exits --
         if not self._f.valves.enable_code_history_compression:
             return messages
 
+        # ── Patterns ──
+        _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
+        _ALREADY_COMPRESSED = re.compile(r"\[🗜️ PARTE \d+/\d+")
+        _PHASE_HEADER = re.compile(
+            r"^(?:Fase|Parte|Phase|Step)\s*(\d+)\s*[:—\-]\s*(.+)$",
+            re.IGNORECASE,
+        )
+
+        keep = self._f.valves.code_history_keep_last_n_parts
+        force_after = self._f.valves.code_history_force_compress_after_turns
+
+        # ── Load persistent state ──
+        pstate = self._f._project_state_manager.get_pstate(project_id)
         state = self._f._conversation_state_manager.get(project_id)
-        if not state:
-            return messages
+        blocked_age = state.history_blocked_age
+        force_compressed_keys: Set[str] = set(pstate.get("force_compressed_keys", []))
 
-        min_chars = self._f.valves.compress_code_history_min_chars
+        dirty = False
 
-        # -- Step 3: count total code-bearing assistant turns --
-        total_parts = sum(
-            1
-            for m in messages
-            if m.get("role") == "assistant"
-            and self._f._code_blocks.has_code_indicators(m.get("content", ""))
-            and len(m.get("content", "")) >= min_chars
-        )
-        if total_parts == 0:
-            return messages
-
-        # -- Steps 4-6: iterate and replace --
-        result: List[dict] = []
-        part_num = 0
-
-        for msg in messages:
-            role = msg.get("role", "")
+        # ── Collect indices of uncompressed code-part messages ──
+        code_part_indices: List[Tuple[int, int, int]] = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "assistant":
+                continue
             content = msg.get("content", "")
-
-            is_candidate = (
-                role == "assistant"
-                and self._f._code_blocks.has_code_indicators(content)
-                and len(content) >= min_chars
-            )
-
-            if not is_candidate:
-                result.append(msg)
+            if _ALREADY_COMPRESSED.search(content):
                 continue
 
-            part_num += 1
-            is_indexed, coverage = self._verify_code_symbols_indexed(
-                content, project_id
-            )
-
-            if not is_indexed:
-                result.append(msg)
+            m = _PART_HEADER.search(content)
+            if m:
+                code_part_indices.append((i, int(m.group(1)), int(m.group(2))))
                 continue
 
-            force_no_expand = coverage < self._f.valves.compress_coverage_threshold
+            if _PHASE_HEADER.search(content):
+                est_tokens = self._f._tokens.estimate_code_tokens(content)
+                if est_tokens > 300:
+                    max_phase = 0
+                    for msg2 in messages:
+                        if msg2.get("role") != "assistant":
+                            continue
+                        m2 = _PHASE_HEADER.search(msg2.get("content", ""))
+                        if m2:
+                            max_phase = max(max_phase, int(m2.group(1)))
+                    m_phase = _PHASE_HEADER.search(content)
+                    if m_phase:
+                        part_num = int(m_phase.group(1))
+                        total_parts = max_phase if max_phase >= part_num else part_num
+                        code_part_indices.append((i, part_num, total_parts))
+                    else:
+                        code_part_indices.append((i, 1, 1))
 
-            try:
-                summary = await self._build_code_commit_summary(
-                    content,
-                    project_id,
-                    part_num,
-                    total_parts,
-                    force_no_expand=force_no_expand,
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"compress_code_history: summary failed for part "
-                    f"{part_num}/{total_parts}: {type(e).__name__}: {e}"
-                )
-                summary = None
+        if len(code_part_indices) <= keep:
+            if dirty:
+                self._f._conversation_state_manager.mark_dirty(project_id)
+                pstate["force_compressed_keys"] = list(force_compressed_keys)
+            return messages
 
-            if summary:
-                result.append({"role": "assistant", "content": summary})
+        to_compress = code_part_indices[:-keep]
+        new_messages = list(messages)
+        compressed_n = 0
+        blocked_by_ratio = 0
+        forced_no_expand = 0
+        preserved_by_semantic = 0
+
+        # ── Get the current user query for semantic relevance ──
+        current_query = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                current_query = msg.get("content", "")
+                break
+
+        for msg_idx, part_num, total_parts in to_compress:
+            msg = new_messages[msg_idx]
+            content = msg.get("content", "")
+            msg_key = hashlib.md5(f"{msg.get('role')}|{content}".encode()).hexdigest()[
+                :16
+            ]
+
+            # ── Step 1: Semantic relevance via CrossEncoder ──
+            should_compress = None
+            semantic_score = None
+            if current_query and self._f._cross_encoder is not None:
+                pairs = [(current_query[:500], content[:500])]
+                scores = await self._f._commands._predict_cross_encoder(pairs)
+                if scores is not None and len(scores) > 0:
+                    semantic_score = 1.0 / (1.0 + math.exp(-scores[0]))
+                    # Use the cascade thresholds from valves
+                    CE_CONFIDENCE_THRESHOLD = self._f.valves.code_history_ce_threshold
+                    LLM_FALLBACK_THRESHOLD = self._f.valves.code_history_llm_threshold
+                    # Since this is a binary decision, we compute diff as |score - 0.5|*2
+                    # For simplicity, we treat the score itself as the confidence
+                    # and use a threshold: if score < 0.3 → compress, if > 0.7 → preserve
+                    # The diff is not directly applicable here because it's a single score.
+                    # We'll use a simplified decision.
+                    if semantic_score < 0.3:
+                        should_compress = True
+                    elif semantic_score > 0.7:
+                        should_compress = False
+                    else:
+                        should_compress = None
             else:
-                result.append(msg)
+                should_compress = None
 
-        self._f._log_debug(
-            f"compress_code_history: {part_num} candidate(s) processed, "
-            f"{sum(1 for m in result if '[commit]' in m.get('content','').lower())} "
-            f"compressed"
-        )
-        return result
+            # ── Step 2: Symbol index ratio (reinforcement / fallback) ──
+            safe, ratio = self._verify_code_symbols_indexed(content, project_id)
+
+            # ── Step 3: Final decision ──
+            if should_compress is True:
+                # CE says compress → compress, regardless of ratio
+                force_no_expand = False
+                safe = True
+            elif should_compress is False:
+                # CE says preserve → keep message
+                preserved_by_semantic += 1
+                continue
+            else:
+                # CE uncertain or unavailable: use existing logic
+                if not safe:
+                    blocked_age[msg_key] = blocked_age.get(msg_key, 0) + 1
+                    dirty = True
+                    age = blocked_age[msg_key]
+
+                    if force_after > 0 and (
+                        age >= force_after or msg_key in force_compressed_keys
+                    ):
+                        force_no_expand = True
+                        safe = True
+                    else:
+                        blocked_by_ratio += 1
+                        continue
+                else:
+                    force_no_expand = False
+
+            # ── Compression ──
+            summary = await self._build_code_commit_summary(
+                content,
+                project_id,
+                part_num,
+                total_parts,
+                force_no_expand=force_no_expand,
+            )
+            tokens_before = self._f._tokens.estimate_tokens(content)
+            tokens_after = self._f._tokens.estimate_tokens(summary)
+            new_messages[msg_idx] = {**msg, "content": summary}
+            compressed_n += 1
+
+            if force_no_expand:
+                force_compressed_keys.add(msg_key)
+                dirty = True
+
+            if msg_key in blocked_age:
+                del blocked_age[msg_key]
+                dirty = True
+
+            self._f._log_debug(
+                f"Code history: compressed Part {part_num}/{total_parts} — "
+                f"{tokens_before:,} → {tokens_after:,} tokens "
+                f"(ratio {ratio:.0%})"
+                + (" [FORCED NO-EXPAND]" if force_no_expand else "")
+                + (
+                    f" [semantic_score={semantic_score:.2f}]"
+                    if semantic_score is not None
+                    else ""
+                )
+            )
+
+        # ── Cleanup ──
+        if len(force_compressed_keys) > 500:
+            force_compressed_keys = set(list(force_compressed_keys)[-250:])
+            dirty = True
+
+        if dirty:
+            self._f._conversation_state_manager.mark_dirty(project_id)
+            pstate["force_compressed_keys"] = list(force_compressed_keys)
+
+        if compressed_n:
+            self._f._log_debug(
+                f"Code history: {compressed_n} part(s) compressed, "
+                f"last {keep} kept in full. "
+                f"(blocked_by_ratio={blocked_by_ratio}, "
+                f"forced_no_expand={forced_no_expand}, "
+                f"preserved_by_semantic={preserved_by_semantic})"
+            )
+        elif blocked_by_ratio > 0:
+            self._f._log_debug(
+                f"Code history: {blocked_by_ratio} part(s) blocked by ratio, "
+                f"none compressed (force_after={force_after})."
+            )
+
+        return new_messages
 
     def _verify_code_symbols_indexed(
         self, content: str, project_id: str
@@ -21081,70 +20074,73 @@ Code context (recent symbols referenced):
         force_no_expand: bool = False,
     ) -> str:
         """
-        Generate a compact commit-summary stub for a code block that will
-        replace the full code in the compressed conversation history.
+        Generate a compact commit summary for a compressed code message.
 
-        Steps:
-            1.  Truncate content to safe token limit.
-            2.  Build prompt requesting a structured commit summary.
-            3.  Call LLM.
-            4.  Parse response; fallback to legacy on empty/malformed parse.
-            5.  Render and return the stub string.
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        to get a guaranteed clean JSON object with keys: action, rationale,
+        symbols. Falls back to _build_legacy_commit_summary on any failure.
+
+        Args:
+            content: The code message content (truncated to 2000 chars in prompt).
+            project_id: Current project identifier, used for slot restoration.
+            part_num: The part number within a multi-phase message.
+            total_parts: Total number of parts.
+            force_no_expand: If True, skip LLM and use legacy summary directly.
+
+        Returns:
+            str: A rendered commit summary string.
         """
-        # -- Step 1: truncate content (Bug 133) --
-        max_ctx_tokens = getattr(self._f.valves, "max_commit_context_tokens", 2000)
-        safe_content = self._f._tokens.truncate_text_to_tokens(content, max_ctx_tokens)
-        was_truncated = len(safe_content) < len(content)
-
-        # -- Step 2: build prompt --
-        expand_hint = (
-            ""
-            if force_no_expand
-            else " Include an /expand hint for the most important symbols."
-        )
-        prompt = (
-            f"Summarise the following code block as a git-style commit message. "
-            f"Be specific about what changed and why.{expand_hint}\n\n"
-            f"Part {part_num} of {total_parts}."
-            + (" [truncated for summary]" if was_truncated else "")
-            + f"\n\n```\n{safe_content}\n```"
-        )
-
-        system = (
-            "You are a senior engineer writing commit messages. "
-            "Be concise, specific, and mention key symbol names."
-        )
-
-        # -- Step 3: call LLM --
-        try:
-            raw = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=300,
-                temperature=0.2,
-                enable_thinking=False,
-                label="commit_summary",
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_build_code_commit_summary: LLM failed: " f"{type(e).__name__}: {e}"
-            )
-            raw = None
-
-        # -- Step 4: parse or fallback (Bug 134) --
-        if raw:
-            parsed = self._parse_commit_summary_response(raw)
-        else:
-            parsed = {}
-
-        if not parsed:
-            # Fallback: use legacy builder which always produces a string
+        if force_no_expand:
             return self._build_legacy_commit_summary(
-                content, part_num, total_parts, force_no_expand
+                content, part_num, total_parts, force_no_expand=True
             )
 
-        # -- Step 5: render --
-        return self._render_commit_summary(parsed, part_num)
+        # Extract top symbols to give the LLM structural context.
+        classes = re.findall(r"^class\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        top_fns = re.findall(r"^(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE)
+        methods = re.findall(
+            r"^\s{4,}(?:async )?def\s+([A-Za-z_]\w*)", content, re.MULTILINE
+        )
+        symbols = (classes + top_fns + methods)[:5]
+
+        prompt = self.COMMIT_SUMMARY_PROMPT.format(
+            user_message=content[:2000],
+            symbols_context=", ".join(symbols) if symbols else "none",
+        )
+
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a code summarization assistant. "
+                "Output ONLY a valid JSON object with exactly three keys: "
+                "'action' (string: one-line description of what changed), "
+                "'rationale' (string: why this change matters), "
+                "'symbols' (list of strings: affected symbol names). "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.summarization_model,
+            max_tokens=0,
+            temperature=0.2,
+            label="commit_summary",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+            log_raw_response=False,
+        )
+
+        if self._f.valves.enable_slot_persistence:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        if not response:
+            return self._build_legacy_commit_summary(
+                content, part_num, total_parts, force_no_expand=False
+            )
+
+        summary = self._parse_commit_summary_response(response)
+        if not summary.get("action"):
+            summary["action"] = "code change"
+        summary["part_num"] = part_num
+        summary["total_parts"] = total_parts
+        return self._render_commit_summary(summary, turn=part_num)
 
     def _build_legacy_commit_summary(
         self,
@@ -21249,111 +20245,70 @@ Code context (recent symbols referenced):
     def ensure_compressed_user_messages(
         self,
         messages: list,
-        state: "ConversationState",
+        state: ConversationState,
         project_id: str,
     ) -> list:
         """
-        Replace large user messages with compact stubs in the message list
-        to reduce history token usage before context assembly.
+        Replace long user messages with compressed stubs, using persistent state.
 
-        Returns a NEW list; the caller's list and message dicts are never
-        modified in place. Without this guarantee, two callers that hold
-        references to the same messages list (e.g. inlet and outlet) see
-        content replaced under them.
+        This method is called during message assembly (in MessageAssembler)
+        and ensures that any user message exceeding lean_user_code_min_tokens
+        is replaced by a compact stub. The stub is stored in ConversationState
+        under compressed_user_messages, keyed by MD5 hash of the original content.
 
-        Compression tracking uses MD5 hashes (stored in state.compressed_user_messages
-        as a set of hash strings) rather than full content strings. This is
-        O(1) per lookup instead of O(content_len) and survives state reload
-        because hashes are short and JSON-serialisable. Without hash-based
-        tracking, a state eviction from the LRU cache resets compressed_user_messages
-        to [] and all previously compressed messages are re-compressed on the
-        next turn, producing double-stubs ("Code uploaded. [Code uploaded.]").
+        If a stub already exists for a given message, it is reused. If not,
+        a new stub is generated, stored, and the state is marked dirty for
+        persistence in SQLite.
 
-        Steps:
-            1.  Resolve compression threshold from valves.
-            2.  Ensure compressed_user_messages is a set of hash strings
-                (migrate from list-of-content if needed).
-            3.  Iterate messages; build a new list with replacements where needed.
-            4.  Return the new list.
+        Args:
+            messages (list): The list of conversation messages (dicts).
+            state (ConversationState): The persistent state for the current project.
+            project_id (str): The current project identifier.
+
+        Returns:
+            list: The updated list of messages, with long user messages replaced by stubs.
         """
-        min_chars = getattr(self._f.valves, "compress_user_message_min_chars", 1500)
-
-        # -- Step 1: check if feature is enabled --
-        if not getattr(self._f.valves, "enable_compressed_user_messages", True):
+        if not self._f.valves.enable_lean_user_code:
             return messages
 
-        # -- Step 2: migrate / normalise compression tracker to set of hashes --
-        raw_tracker = getattr(state, "compressed_user_messages", None)
-        if raw_tracker is None:
-            compressed_hashes: set = set()
-            state.compressed_user_messages = []
-        elif isinstance(raw_tracker, list):
-            # Migrate: entries may be full content strings (old format) or hashes.
-            compressed_hashes = set()
-            for entry in raw_tracker:
-                if isinstance(entry, str) and len(entry) == 32:
-                    compressed_hashes.add(entry)  # already a hash
-                elif isinstance(entry, str):
-                    compressed_hashes.add(
-                        hashlib.md5(entry.encode("utf-8", errors="replace")).hexdigest()
-                    )
-            # Rewrite in normalised hash format
-            state.compressed_user_messages = list(compressed_hashes)
-        else:
-            compressed_hashes = set(raw_tracker)
+        min_tokens = self._f.valves.lean_user_code_min_tokens
 
-        # -- Step 3: build replacement list --
-        new_messages: List[dict] = []
-        dirty = False
+        # Avoid compressing when the symbol index is too sparse (stub would be misleading)
+        symbol_count = len(self._f._symbol_index.get_all_names(project_id))
+        if symbol_count < 20:
+            return messages
 
+        new_messages = []
         for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content") or ""
-
-            should_compress = (
-                role == "user"
-                and isinstance(content, str)
-                and len(content) >= min_chars
-                and self._f._code_blocks.has_code_indicators(content)
-            )
-
-            if should_compress:
-                content_hash = hashlib.md5(
-                    content.encode("utf-8", errors="replace")
-                ).hexdigest()
-
-                if content_hash not in compressed_hashes:
-                    # First time seeing this content — compress it
-                    symbol_count = len(
-                        [
-                            s
-                            for bh, blk in (
-                                self._f._conversation_state_manager.get(
-                                    project_id
-                                ).active_blocks.items()
-                                if self._f._conversation_state_manager.get(project_id)
-                                else {}
-                            ).items()
-                            for s in blk.symbols
-                        ]
-                    )
-                    stub = self._build_user_stub(symbol_count)
-                    new_messages.append({**msg, "content": stub})
-                    compressed_hashes.add(content_hash)
-                    dirty = True
-                else:
-                    # Already compressed in a prior turn — keep as stub
-                    symbol_count = 0
-                    new_messages.append(
-                        {**msg, "content": self._build_user_stub(symbol_count)}
-                    )
-            else:
+            if msg.get("role") != "user":
                 new_messages.append(msg)
+                continue
 
-        # -- Step 4: persist updated tracker if modified --
-        if dirty:
-            state.compressed_user_messages = list(compressed_hashes)
+            content = msg.get("content", "")
+
+            # Skip messages that are already short enough
+            if self._f._tokens.estimate_code_tokens(content) < min_tokens:
+                new_messages.append(msg)
+                continue
+
+            # Compute a stable hash of the original content
+            content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+
+            # Reuse existing stub if available
+            if content_hash in state.compressed_user_messages:
+                stub = state.compressed_user_messages[content_hash]
+                new_messages.append({**msg, "content": stub})
+                continue
+
+            # Generate new stub (no truncation needed – stub is naturally short)
+            stub = self._build_user_stub(symbol_count)
+
+            # Store in state and mark dirty for persistence
+            state.compressed_user_messages[content_hash] = stub
             self._f._conversation_state_manager.mark_dirty(project_id)
+
+            # Replace the message content with the stub
+            new_messages.append({**msg, "content": stub})
 
         return new_messages
 
@@ -21361,99 +20316,51 @@ Code context (recent symbols referenced):
     # 3. Refactor state injection
     # ═══════════════════════════════════════════════════════════════════════
 
-    def build_refactor_state_injection(
-        self,
-        messages: list,
-        project_id: Optional[str] = None,
-    ) -> str:
+    def build_refactor_state_injection(self, messages: list) -> str:
         """
-        Build a concise summary of recent code changes for injection into
-        the system prompt during refactor/edit workflows.
+        Build a compact "Estado del Refactor" block from compressed code parts
+        in conversation history.
 
-        Steps:
-            1.  Resolve project_id.
-            2.  Get ConversationState; return "" on miss.
-            3.  Return "" when recent_changes is empty.
-            4.  Build change summary lines, respecting per-block token budget.
-            5.  Cap total injection to max_tokens.
-            6.  Return formatted injection.
+        Injected into Block B when active multi-phase compression is detected.
+        Gives the model awareness of what has been written without reading full messages.
+
+        Returns empty string if no compressed parts found (no injection needed).
         """
-        # -- Step 1: resolve project_id --
-        if not project_id:
-            try:
-                project_id = self._f._inlet_orchestrator.get_project_id()
-            except Exception:
-                project_id = ""
+        _COMPRESSED = re.compile(r"\[🗜️ PARTE (\d+)/(\d+)(?:: (.+?))? — COMPRIMIDO\]")
 
-        if not project_id:
-            return ""
+        completed: List[Tuple[int, str]] = []
+        total_parts: Optional[int] = None
 
-        # -- Step 2: get state --
-        state = self._f._conversation_state_manager.get(project_id)
-        if state is None:
-            return ""
-
-        recent = getattr(state, "recent_changes", None) or []
-
-        # -- Step 3: empty guard --
-        # Bug 100: return "" so _assemble_prelim_system filters it out.
-        if not recent:
-            return ""
-
-        # -- Step 4: build summary lines --
-        max_tokens = getattr(self._f.valves, "refactor_injection_max_tokens", 1000)
-        max_per_entry = getattr(
-            self._f.valves, "refactor_injection_max_tokens_per_entry", 80
-        )
-        total_tokens = 0
-        lines: List[str] = []
-
-        # Show most-recent changes first
-        for block in reversed(recent):
-            if total_tokens >= max_tokens:
-                break
-
-            file_path = getattr(block, "file_path", None) or ""
-            summary = getattr(block, "block_summary", "") or ""
-
-            if not file_path and not summary:
+        for msg in messages:
+            if msg.get("role") != "assistant":
                 continue
+            m = _COMPRESSED.search(msg.get("content", ""))
+            if m:
+                num = int(m.group(1))
+                total = int(m.group(2))
+                label = m.group(3) or f"Parte {num}"
+                completed.append((num, label))
+                total_parts = total
 
-            if summary:
-                # Truncate long summaries per entry
-                entry_text = self._f._tokens.truncate_text_to_tokens(
-                    summary, max_per_entry
-                )
-                line = (
-                    f"- `{file_path}`: {entry_text}" if file_path else f"- {entry_text}"
-                )
-            else:
-                line = f"- `{file_path}` (modified)"
-
-            entry_tokens = self._f._tokens.estimate_code_tokens(line)
-            if total_tokens + entry_tokens > max_tokens:
-                break
-
-            lines.append(line)
-            total_tokens += entry_tokens
-
-        if not lines:
+        if not completed or not total_parts:
             return ""
 
-        # -- Step 5: cap total -- (belt-and-suspenders after per-entry budget)
-        header = f"_Recent changes ({len(recent)} block(s)):_\n"
-        body = "\n".join(lines)
-        full = header + body
+        done_nums = {n for n, _ in completed}
+        pending = [i for i in range(1, total_parts + 1) if i not in done_nums]
 
-        full = self._f._tokens.truncate_text_to_tokens(full, max_tokens)
-
-        # -- Step 6: return --
-        self._f._log_debug(
-            f"build_refactor_state_injection: "
-            f"{len(lines)}/{len(recent)} change(s) included "
-            f"(~{total_tokens} tokens) for '{project_id}'"
+        lines = ["## 📊 Estado del Refactor en Progreso"]
+        for num, label in sorted(completed):
+            lines.append(
+                f"  ✓ Parte {num}/{total_parts}: {label} [indexado en SymbolGraph]"
+            )
+        for num in pending:
+            lines.append(f"  ⏳ Parte {num}/{total_parts}: [pendiente]")
+        lines.append(
+            "Los símbolos de las partes completadas están disponibles via LOD "
+            "(firmas en este prompt) o /expand para implementación completa."
         )
-        return full
+
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. LLMLingua‑2 code block compression
@@ -21607,130 +20514,41 @@ Code context (recent symbols referenced):
     # ═══════════════════════════════════════════════════════════════════════
 
     async def summarize_messages(
-        self,
-        old_messages: list,
-        is_code_context: bool = False,
+        self, old_messages: list, is_code_context: bool = False
     ) -> Optional[str]:
         """
-        Generate a concise natural-language summary of a batch of conversation
-        messages, suitable for inclusion in conversation_summaries as an L1 entry.
+        Summarise a list of old conversation messages into a single paragraph.
 
-        Used by WindowManager when it evicts a batch of turns to free token budget.
-        The summary should preserve the semantic content of the batch so the LLM
-        can reason about earlier context without re-reading the full messages.
-
-        Steps:
-            1.  Guard empty or effectively-empty input — return None immediately
-                rather than sending a vacuous prompt to the LLM.
-            2.  Sanitize message content: replace None with empty string, strip
-                nulls and control characters.
-            3.  Build the conversation transcript, skipping empty messages.
-            4.  Guard: if the sanitized transcript is empty, return None.
-            5.  Build prompt with code-context hint if applicable.
-            6.  Call LLM with a tight token budget.
-            7.  Return cleaned summary or None on failure.
+        Input is capped at 4000 chars in the prompt; the model terminates
+        naturally so no max_tokens ceiling is needed. enable_thinking=False
+        avoids reasoning overhead on a straightforward summarization task.
         """
-        # -- Step 1: empty input guard --
         if not old_messages:
-            self._f._log_debug(
-                "summarize_messages: called with empty message list, returning None"
-            )
             return None
-
-        # -- Step 2: sanitize content --
-        sanitized: List[dict] = []
-        for msg in old_messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content")
-            if content is None:
-                content = ""
-            elif not isinstance(content, str):
-                try:
-                    content = str(content)
-                except Exception:
-                    content = ""
-            content = content.strip()
-            sanitized.append({"role": role, "content": content})
-
-        # -- Step 3: build transcript, skipping empty messages --
-        lines: List[str] = []
-        for msg in sanitized:
-            content = msg["content"]
-            if not content:
-                continue
-            role_label = msg["role"].upper()
-
-            max_msg_tokens = getattr(
-                self._f.valves, "summarize_max_tokens_per_message", 800
-            )
-            if max_msg_tokens > 0:
-                content = self._f._tokens.truncate_text_to_tokens(
-                    content, max_msg_tokens
-                )
-            lines.append(f"{role_label}: {content}")
-
-        # -- Step 4: guard empty transcript after sanitization --
-        if not lines:
-            self._f._log_debug(
-                "summarize_messages: all messages empty after sanitization, "
-                "returning None"
-            )
-            return None
-
-        transcript = "\n\n".join(lines)
-
-        # -- Step 5: build prompt --
-        code_hint = (
-            " Pay special attention to code changes, function signatures, "
-            "and architectural decisions discussed."
-            if is_code_context
-            else ""
+        combined = "\n".join(
+            [m.get("content", "") for m in old_messages if m.get("content")]
         )
-
+        if not combined.strip():
+            return None
         prompt = (
-            f"Summarize the following conversation excerpt concisely, "
-            f"preserving all key decisions, code changes, and action items.{code_hint} "
-            f"Write 2-4 sentences. Do not add commentary or meta-text.\n\n"
-            f"---\n{transcript}\n---"
+            f"Summarize the following conversation segment, preserving key "
+            f"decisions and code changes:\n\n{combined[:4000]}"
         )
-
-        system = (
-            "You are a technical writer summarising a developer conversation. "
-            "Be precise and factual. Never invent information not present in "
-            "the transcript."
+        system_prompt = (
+            "You produce concise summaries of technical conversations."
+            if is_code_context
+            else "You produce concise summaries."
         )
-
-        # -- Step 6: LLM call --
-        max_out = getattr(self._f.valves, "summarize_max_output_tokens", 256)
-        try:
-            raw = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=max_out,
-                temperature=0.2,
-                enable_thinking=False,
-                label="summarize_messages",
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"summarize_messages: LLM failed: {type(e).__name__}: {e}"
-            )
-            return None
-
-        # -- Step 7: clean and return --
-        if not raw:
-            return None
-
-        summary = raw.strip()
-        if not summary:
-            return None
-
-        self._f._log_debug(
-            f"summarize_messages: generated {len(summary)} char summary "
-            f"from {len(old_messages)} message(s) "
-            f"(code_context={is_code_context})"
+        summary = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model_override=self._f.valves.summarization_model,
+            max_tokens=0,
+            temperature=0.3,
+            label="summarize_messages",
+            enable_thinking=False,
         )
-        return summary
+        return summary.strip() if summary else None
 
     # ═══════════════════════════════════════════════════════════════════════
     # 6. Proactive summarization suggestion
@@ -21742,204 +20560,88 @@ Code context (recent symbols referenced):
         total_tokens: int,
         max_tokens: int,
     ) -> Optional[str]:
-        """
-        Check if the conversation history is approaching the token limit and
-        return a suggestion string when the user should consider summarizing.
-
-        Returns None when:
-            - The token ratio is below the configured threshold.
-            - The cooldown period since the last suggestion has not elapsed.
-            - The conversation is too short to benefit from summarization.
-            - max_tokens is zero or negative (unconfigured valve).
-
-        Steps:
-            1.  Guard: max_tokens invalid → return None.
-            2.  Guard: conversation too short → return None.
-            3.  Guard: token ratio below threshold → return None.
-            4.  Guard: cooldown not elapsed → return None.
-            5.  Update last_suggestion_timestamp.
-            6.  Return suggestion string.
-        """
-        # -- Step 1: max_tokens guard --
-        if not max_tokens or max_tokens <= 0:
+        """Return a proactive suggestion when the conversation is using a high ratio of the token window."""
+        if max_tokens <= 0:
             return None
-
-        # -- Step 2: minimum message count guard --
-        state = self._f._conversation_state_manager.get(project_id)
-        if state is None:
-            return None
-
-        min_msgs = getattr(self._f.valves, "suggestion_min_message_count", 8)
-        if state.message_count < min_msgs:
-            return None
-
-        # -- Step 3: token ratio threshold --
-        threshold = getattr(self._f.valves, "suggestion_token_threshold", 0.80)
         ratio = total_tokens / max_tokens
-        if ratio < threshold:
-            return None
-
-        # -- Step 4: cooldown --
-        cooldown = getattr(self._f.valves, "suggestion_cooldown_seconds", 300.0)
-        now = time.time()
-
-        # Use a sentinel: only enforce cooldown if ts > 0.
-        last_ts = getattr(state, "last_suggestion_timestamp", 0.0)
-        if last_ts > 0.0 and (now - last_ts) < cooldown:
-            self._f._log_debug(
-                f"check_and_suggest_summarization: cooldown active "
-                f"({now - last_ts:.0f}s / {cooldown:.0f}s) for '{project_id}'"
+        if ratio > self._f.valves.proactive_summary_threshold:
+            return (
+                f"[CodeAware] The conversation is using {total_tokens}/{max_tokens} tokens "
+                f"(≈{int(ratio*100)}%). Consider using `/forget` or asking me to summarize "
+                f"older parts."
             )
-            return None
-
-        # -- Step 5: update timestamp --
-        state.last_suggestion_timestamp = now
-        self._f._conversation_state_manager.mark_dirty(project_id)
-
-        # -- Step 6: build suggestion --
-        pct = int(ratio * 100)
-        suggestion = (
-            f"_💡 Context usage at **{pct}%** "
-            f"({total_tokens:,} / {max_tokens:,} tokens). "
-            f"Consider using `/compress` to summarise older messages "
-            f"and free context budget._"
-        )
-
-        self._f._log_debug(
-            f"check_and_suggest_summarization: suggesting compression at "
-            f"{pct}% usage for '{project_id}' "
-            f"(msg_count={state.message_count})"
-        )
-        return suggestion
+        return None
 
     # ═══════════════════════════════════════════════════════════════════════
     # 7. Oversized block summary generation (fire-and-forget)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def schedule_block_summary(
-        self,
-        block: "CodeBlock",
-        project_id: str,
-    ) -> None:
+    async def schedule_block_summary(self, block: "CodeBlock", project_id: str) -> None:
         """
-        Gate before maybe_generate_block_summary.
+        Fire-and-forget oversized-block summary generation.
 
-        Skips blocks that already have a summary, are below the minimum size,
-        are obsolete, or are already being summarized by a concurrent task.
-        Passes project_id via block._project_id_hint so maybe_generate_block_summary
-        can mark the state dirty without a separate project_id parameter.
-
-        Steps:
-            1.  Fast exits: existing summary, below threshold, obsolete.
-            2.  Stash project_id on the block for use in maybe_generate.
-            3.  Delegate to maybe_generate_block_summary.
+        Returns immediately. Does nothing if the block already has a summary,
+        is under the size threshold, or a background attempt is already
+        in flight for this exact block hash.
         """
-        # -- Step 1: fast exits --
-        if block.block_summary:
+        if block.block_summary or block.hash in self._pending_block_summaries:
             return
-        if block.obsolete:
-            return
-        min_chars = getattr(self._f.valves, "block_summary_min_chars", 1000)
-        if len(block.content) < min_chars:
+        tok = block._cached_token_count or (len(block.content) // 4)
+        if (
+            self._f.valves.max_code_block_tokens <= 0
+            or tok <= self._f.valves.max_code_block_tokens
+        ):
             return
 
-        # -- Step 2: stash project context --
-        block._project_id_hint = project_id  # type: ignore[attr-defined]
+        self._pending_block_summaries.add(block.hash)
 
-        # -- Step 3: delegate --
-        await self.maybe_generate_block_summary(block)
+        async def _run() -> None:
+            try:
+                await self.maybe_generate_block_summary(block)
+                if block.block_summary:
+                    # Mark state dirty so the next save_state_if_dirty() persists it.
+                    self._f._conversation_state_manager.mark_dirty(project_id)
+            except Exception as exc:
+                self._f._log_debug(f"Background block summary failed: {exc}")
+            finally:
+                self._pending_block_summaries.discard(block.hash)
+
+        asyncio.create_task(_run())
 
     async def maybe_generate_block_summary(self, block: "CodeBlock") -> None:
-        """
-        Generate and store a natural-language summary for an oversized code block.
-
-        Uses _summarizing_blocks to ensure at most one LLM call is in-flight per
-        block hash at any time. Without this guard, concurrent calls from two rapid
-        inlet passes both observe block.block_summary == "" and launch duplicate
-        LLM requests; the second overwrites the first and wastes tokens.
-
-        Project context is read from block._project_id_hint, set by
-        schedule_block_summary. Falls back to valves.project_id when absent.
-
-        Steps:
-            1.  Skip if block already has a summary.
-            2.  Skip and return if generation is already in-progress for this hash.
-            3.  Register hash in _summarizing_blocks.
-            4.  Build a compact prompt from the block's content and symbols.
-            5.  Call LLM; on success write to block.block_summary and mark dirty.
-            6.  Always deregister the hash in a finally block.
-        """
-        # -- Step 1: already summarized --
+        """Generate a summary for an oversized code block when overflow action is 'summarize'."""
+        if not (
+            self._f.valves.max_code_block_tokens > 0
+            and self._f.valves.code_block_overflow_action == "summarize"
+        ):
+            return
+        tok = block._cached_token_count or (len(block.content) // 4)
+        if tok <= self._f.valves.max_code_block_tokens:
+            return
         if block.block_summary:
             return
 
-        # -- Step 2: in-progress guard --
-        if block.hash in self._summarizing_blocks:
-            self._f._log_debug(
-                f"maybe_generate_block_summary: in-progress for {block.hash[:8]}, "
-                f"skipping duplicate"
-            )
-            return
-
-        # -- Step 3: register --
-        self._summarizing_blocks.add(block.hash)
-
-        project_id: str = (
-            getattr(block, "_project_id_hint", None) or self._f.valves.project_id or ""
+        sig = block.symbols[0].signature if block.symbols else ""
+        prompt = (
+            f"Summarize the following code block in 3-5 sentences. "
+            f"Cover: main purpose, key classes/functions, and important dependencies.\n\n"
+            f"{'Signature: ' + sig + chr(10) if sig else ''}"
+            f"```\n{block.content[:self._f.valves.summary_code_max_chars]}\n```"
         )
-
-        try:
-            # -- Step 4: build prompt --
-            sym_names = [s.name for s in block.symbols[:10]] if block.symbols else []
-            sym_hint = f"Key symbols: {', '.join(sym_names)}. " if sym_names else ""
-            file_hint = f"File: {block.file_path}. " if block.file_path else ""
-
-            truncated = self._f._tokens.truncate_text_to_tokens(
-                block.content,
-                getattr(self._f.valves, "block_summary_context_tokens", 2000),
-            )
-
-            prompt = (
-                f"Write a one-paragraph technical summary of the following code block. "
-                f"{file_hint}{sym_hint}"
-                f"Focus on what the code does and its main responsibilities.\n\n"
-                f"```\n{truncated}\n```"
-            )
-
-            system = (
-                "You are a senior software engineer. "
-                "Reply with a single concise paragraph. No bullet points."
-            )
-
-            # -- Step 5: call LLM and store --
-            result = await self._f._llm.call_llm(
-                prompt=prompt,
-                system_prompt=system,
-                max_tokens=200,
-                temperature=0.2,
-                enable_thinking=False,
-                label="block_summary",
-            )
-
-            if result:
-                block.block_summary = result.strip()
-                if project_id:
-                    self._f._conversation_state_manager.mark_dirty(project_id)
-                self._f._log_debug(
-                    f"maybe_generate_block_summary: generated for {block.hash[:8]} "
-                    f"(~{len(block.block_summary)} chars)"
-                )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
+        summary = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt="You are a code summarization assistant. Be concise and technical.",
+            model_override=self._f.valves.code_block_summary_model,
+            max_tokens=self._f.valves.oversized_summary_max_tokens,
+            temperature=0.2,
+            label="block_summary",
+        )
+        if summary:
+            block.block_summary = summary.strip()
             self._f._log_debug(
-                f"maybe_generate_block_summary: LLM failed for "
-                f"{block.hash[:8]}: {type(e).__name__}: {e}"
+                f"Block {block.hash[:8]}: summary generated "
+                f"({tok} tokens > {self._f.valves.max_code_block_tokens} limit)"
             )
-        finally:
-            # -- Step 6: always deregister --
-            self._summarizing_blocks.discard(block.hash)
 
 
 class TokenUtils:
@@ -22180,97 +20882,26 @@ class EnrichmentTasks:
         project_id: str,
     ) -> None:
         """
-        Update mention_count, last_mentioned, and last_mentioned_msg_idx
-        on CodeBlock objects when the user message references their symbols.
-
-        Steps:
-            1.  Guard: return when content is empty.
-            2.  Extract word set from message (O(len(message))).
-            3.  Get current message index from state.
-            4.  Iterate active blocks; for each block's symbols check if
-                bare name is in the word set.
-            5.  Update mention fields on matching blocks.
-            6.  Call mark_dirty() if any block was updated.
+        Increment mention counts for symbols referenced in the message content,
+        and mark the corresponding blocks as recently mentioned.
         """
-        # -- Step 1: guard --
         if not message_content:
             return
-        if not isinstance(message_content, str):
+        all_symbol_names = self._f._symbol_index.get_all_names(project_id)
+        words = set(re.findall(r"\b[\w-]+\b", message_content))
+        mentioned_names = all_symbol_names.intersection(words)
+        if not mentioned_names:
             return
-        if not message_content.strip():
-            return
-
-        active_blocks = (
-            state.active_blocks
-            if not isinstance(state, dict)
-            else state.get("active_blocks", {})
-        )
-        if not active_blocks:
-            return
-
-        # -- Step 2: extract word set from message --
-        min_length: int = getattr(self._f.valves, "min_mention_length", 4)
-        msg_words: Set[str] = set(re.findall(r"\b[A-Za-z_]\w+\b", message_content))
-        # Keep only words above min_length (case-sensitive; symbol names
-        # are usually CamelCase or snake_case so case matters for precision)
-        msg_words_lower: Set[str] = {
-            w.lower() for w in msg_words if len(w) >= min_length
-        }
-
-        if not msg_words_lower:
-            return
-
-        # -- Step 3: current message index --
-        msg_idx: int = (
-            getattr(state, "message_count", 0)
-            if not isinstance(state, dict)
-            else state.get("message_count", 0)
-        )
-        now = time.time()
-
-        # -- Step 4: iterate blocks --
-        updated = False
-
-        for block in active_blocks.values():
-            if block.obsolete:
-                continue
-            if not block.symbols:
-                continue
-
-            block_mentioned = False
-            for sym in block.symbols:
-                bare = sym.name
-                if len(bare) < min_length:
-                    continue
-                if bare.lower() not in msg_words_lower:
-                    continue
-
-                # Verify with word-boundary to avoid partial matches.
-                # e.g. "process" should not match "preprocessor"
-                if not re.search(
-                    r"\b" + re.escape(bare) + r"\b",
-                    message_content,
-                    re.IGNORECASE,
-                ):
-                    continue
-
-                block_mentioned = True
-                break
-
-            if block_mentioned:
-                block.mention_count = getattr(block, "mention_count", 0) + 1
-                block.last_mentioned = now
-                block.last_mentioned_msg_idx = msg_idx
+        affected_blocks: Set[str] = set()
+        for name in mentioned_names:
+            affected_blocks.update(self._f._symbol_index.find_blocks(name, project_id))
+        for block_hash in affected_blocks:
+            block = state.active_blocks.get(block_hash)
+            if block:
+                block.mention_count += 1
+                block.last_mentioned = time.time()
+                block.last_mentioned_msg_idx = state.message_count
                 block._update_importance()
-                updated = True
-
-        # -- Step 5 & 6: persist if changed --
-        if updated:
-            self._f._conversation_state_manager.mark_dirty(project_id)
-            self._f._log_debug(
-                f"update_mentions_from_message: updated mention counts "
-                f"for '{project_id}' (msg_idx={msg_idx})"
-            )
 
     async def expire_blocks_by_time(self, project_id: str) -> None:
         """Remove blocks that have not been mentioned recently, based on configured timeouts."""
@@ -22431,88 +21062,45 @@ class EnrichmentTasks:
         skip_duplicate: bool = False,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
         """
-        Run contradiction detection, response cache lookup, and duplicate
-        question detection concurrently.
-
-        Each check is independent: a failure in one must never suppress the
-        results of the others. asyncio.gather with return_exceptions=True
-        captures exceptions per-task as result values rather than re-raising.
-
-        Returns:
-            contradiction_warning : Optional[str]  — inline warning or None
-            cached_response       : Optional[dict] — cached LLM response or None
-            duplicate_result      : Optional[dict] — prior Q&A or None
-
-        Steps:
-            1.  Build per-check coroutines respecting the skip_* flags and
-                Bug 99 guard on empty context_hash.
-            2.  Dispatch with return_exceptions=True.
-            3.  Unwrap results: exceptions → None with debug log.
+        Run contradiction detection, response cache lookup, and duplicate question
+        detection in parallel. Returns (contradiction_warning, cached_response,
+        duplicate_match). All three can be None.
         """
-        contradiction_timeout = getattr(self._f.valves, "contradiction_timeout", 8.0)
-        cache_timeout = getattr(self._f.valves, "response_cache_timeout", 5.0)
-        duplicate_timeout = getattr(self._f.valves, "duplicate_detection_timeout", 5.0)
-
-        # -- Step 1: build coroutines --
-        async def _safe_contradiction() -> Optional[str]:
-            if skip_contradiction:
-                return None
-            return await asyncio.wait_for(
-                self._f._command_router._detect_contradictions(messages, project_id),
-                timeout=contradiction_timeout,
-            )
-
-        async def _safe_cache() -> Optional[dict]:
-            # Bug 99: skip immediately if hash is empty
-            if skip_cache or not context_hash:
-                return None
-            return await asyncio.wait_for(
-                self._f._ltm.find_cached_response(query, context_hash, state),
-                timeout=cache_timeout,
-            )
-
-        async def _safe_duplicate() -> Optional[dict]:
-            if skip_duplicate:
-                return None
-            return await asyncio.wait_for(
-                self._f._ltm.find_duplicate_question(query, project_id),
-                timeout=duplicate_timeout,
-            )
-
-        # -- Step 2: gather with per-task exception capture --
-        results = await asyncio.gather(
-            _safe_contradiction(),
-            _safe_cache(),
-            _safe_duplicate(),
-            return_exceptions=True,
-        )
-
-        # -- Step 3: unwrap --
-        def _unwrap(result: Any, label: str) -> Any:
-            if isinstance(result, BaseException):
-                self._f._log_debug(
-                    f"parallel_context_checks: '{label}' failed: "
-                    f"{type(result).__name__}: {result}"
+        tasks = [
+            (
+                self._f._commands._detect_contradictions(
+                    messages, project_id
+                )  # <-- project_id added
+                if (
+                    self._f.valves.enable_contradiction_detection
+                    and not skip_contradiction
                 )
-                return None
-            return result
-
-        contradiction_warning = _unwrap(results[0], "contradiction")
-        cached_response = _unwrap(results[1], "cache")
-        duplicate_result = _unwrap(results[2], "duplicate")
-
-        if any(
-            r is not None
-            for r in (contradiction_warning, cached_response, duplicate_result)
-        ):
-            self._f._log_debug(
-                f"parallel_context_checks: "
-                f"contradiction={'yes' if contradiction_warning else 'no'}, "
-                f"cache={'hit' if cached_response else 'miss'}, "
-                f"duplicate={'yes' if duplicate_result else 'no'}"
-            )
-
-        return contradiction_warning, cached_response, duplicate_result
+                else asyncio.sleep(0, result=None)
+            ),
+            (
+                self._f._ltm.find_cached_response(query, context_hash, state)
+                if (
+                    self._f.valves.enable_response_cache
+                    and HAS_SENTENCE
+                    and not skip_cache
+                )
+                else asyncio.sleep(0, result=None)
+            ),
+            (
+                self._f._ltm.find_duplicate_question(query, project_id)
+                if (
+                    self._f.valves.duplicate_question_threshold
+                    and HAS_SENTENCE
+                    and not skip_duplicate
+                )
+                else asyncio.sleep(0, result=None)
+            ),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        contradiction = results[0] if not isinstance(results[0], Exception) else None
+        cached = results[1] if not isinstance(results[1], Exception) else None
+        duplicate = results[2] if not isinstance(results[2], Exception) else None
+        return contradiction, cached, duplicate
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. Docstring generation (batch and background)
@@ -22627,237 +21215,225 @@ class EnrichmentTasks:
             )
             return {}
 
-
-async def ensure_docstrings_batch(
-    self,
-    qids: List[str],
-    project_id: str,
-    background: bool = False,
-) -> Dict[str, str]:
-    """
-    Ensure docstrings exist for all requested qualified ids, generating
-    them via LLM for any that are missing.
-
-    Uses the batch LLM path (_build_docstring_batch_prompt) when the
-    missing set is above the batch threshold, and falls back to
-    individual _background_docstring calls for single symbols.
-
-    Bug 105 fix: qids are deduplicated before processing. Without dedup,
-    the same symbol can appear multiple times in lod2_candidates (if its
-    block is found via multiple lookup paths), causing redundant LLM calls
-    whose results overwrite each other in a non-deterministic order.
-
-    Bug 106 fix: when background=True, the coroutine is dispatched via
-    asyncio.ensure_future with add_done_callback for exception logging,
-    matching the pattern established in Bug 54 (store_messages) and
-    Bug 74 (store_response_in_cache). Without this, LLM failures and
-    ChromaDB errors during background docstring generation are silently
-    discarded.
-
-    Returns a dict mapping qid → generated docstring for synchronous
-    callers. Background callers receive {} immediately; side effects
-    appear in the SymbolIndex asynchronously.
-
-    Steps:
-        1.  Deduplicate qids preserving order.
-        2.  Identify which qids are actually missing docstrings.
-        3.  Dispatch: background=True → tracked fire-and-forget;
-                      background=False → synchronous batch generation.
-        4.  For synchronous path: use batch LLM when above threshold,
-            individual calls otherwise.
-        5.  Update SymbolIndex and return results.
-    """
-    if not qids:
-        return {}
-
-    # -- Step 1: deduplicate preserving order --
-    unique_qids: List[str] = list(dict.fromkeys(qids))
-
-    # -- Step 2: identify missing --
-    missing: List[str] = []
-    for qid in unique_qids:
-        existing = self._f._symbol_index.get_docstring(qid, project_id)
-        if not existing or not existing.strip():
-            missing.append(qid)
-
-    if not missing:
-        return {}
-
-    self._f._log_debug(
-        f"ensure_docstrings_batch: {len(missing)}/{len(unique_qids)} "
-        f"missing docstrings for '{project_id}' "
-        f"(background={background})"
-    )
-
-    # -- Step 3: background dispatch --
-    if background:
-
-        async def _bg_generate() -> None:
-            await self._docstring_generation_for_qids(missing, project_id)
-
-        try:
-            task = asyncio.ensure_future(_bg_generate())
-
-            def _on_done(t: asyncio.Task) -> None:
-                exc = t.exception()
-                if exc:
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch (background): failed "
-                        f"for '{project_id}': "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-            task.add_done_callback(_on_done)
-        except RuntimeError as e:
-            self._f._log_debug(
-                f"ensure_docstrings_batch: ensure_future failed ({e}), "
-                f"running synchronously"
-            )
-            await self._docstring_generation_for_qids(missing, project_id)
-
-        return {}
-
-    # -- Steps 4-5: synchronous batch generation --
-    return await self._docstring_generation_for_qids(missing, project_id)
-
-    async def _docstring_generation_for_qids(
+    async def ensure_docstrings_batch(
         self,
         qids: List[str],
         project_id: str,
+        background: bool = False,
     ) -> Dict[str, str]:
         """
-        Internal: generate docstrings for a list of qids that are confirmed
-        missing from the SymbolIndex.
+        Resolve docstrings for many symbols at once, identified by their
+        QUALIFIED id (e.g. "ContextBuilder.__init__") — never by bare name.
 
-        Uses the batch LLM path when len(qids) >= docstring_batch_threshold
-        and falls back to individual calls for small batches. This avoids
-        the O(N) serial LLM call overhead for large batches while keeping
-        individual call quality for single symbols.
+        Uses response_format={"type": "json_object"} and enable_thinking=False
+        to force clean JSON output from the server with no reasoning preamble.
+        The server-side GBNF grammar guarantees valid JSON, so the parser
+        calls json.loads directly with no artifact stripping.
 
-        Steps:
-            1.  Prioritise targets (hub symbols and recently active first).
-            2.  If batch size >= threshold: call batch LLM endpoint.
-            3.  Otherwise: individual _background_docstring per symbol.
-            4.  Collect and return {qid: docstring} results.
+        Cache hits (already in memory or SQLite) are resolved for free.
+        Cache misses are generated in groups of lazy_docstring_batch_size.
+
+        Args:
+            qids: List of qualified symbol ids to resolve.
+            project_id: Current project identifier.
+            background: If True, this is a background task — uses label
+                        'bg_docstring' (whitelisted during silent ingestion)
+                        and bypasses the per-turn lazy_docstring_max_per_turn
+                        budget. If False, uses label 'lazy_docstring_batch'
+                        and respects the per-turn budget.
+
+        Returns:
+            Dict[str, str]: Mapping of qid to docstring for resolved symbols.
         """
-        if not qids:
-            return {}
+        self._f._log_debug(
+            f"ensure_docstrings_batch: starting with {len(qids)} qids "
+            f"(background={background})"
+        )
 
-        results: Dict[str, str] = {}
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-
-        # -- Step 1: prioritise --
-        ordered = self._prioritize_docstring_targets(qids, project_id, pstate)
-
-        batch_threshold = getattr(self._f.valves, "docstring_batch_threshold", 3)
         state = self._f._conversation_state_manager.get(project_id)
+        resolved: Dict[str, str] = {}
+        pending: List[str] = []
 
-        if len(ordered) >= batch_threshold:
-            # -- Step 2: batch LLM path --
-            try:
-                batch_items: List[Tuple[str, str, str]] = []
-                for qid in ordered:
-                    sig = self._f._symbol_index.get_signature(qid, project_id) or qid
-                    block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
-                    snippet = ""
-                    for bh in block_hashes:
-                        blk = state.active_blocks.get(bh) if state else None
-                        if blk:
-                            snippet = (
-                                self._get_optimal_snippet(
-                                    next(
-                                        (
-                                            s
-                                            for s in blk.symbols
-                                            if qualify_symbol_name(
-                                                s.name, s.parent_symbol, s.file_path
-                                            )
-                                            == qid
-                                        ),
-                                        blk.symbols[0] if blk.symbols else None,
-                                    ),
-                                    blk,
-                                    project_id,
-                                )
-                                if blk.symbols
-                                else ""
-                            )
-                            break
-                    batch_items.append((qid, sig, snippet))
+        # Build a qid → (sym, block) lookup index once to avoid O(N²) scans
+        # across the active_blocks dict during cache and batch phases.
+        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+        for _block in state.active_blocks.values():
+            for _sym in _block.symbols:
+                _q = qualify_symbol_name(_sym.name, _sym.parent_symbol)
+                if _q not in _qid_index:
+                    _qid_index[_q] = (_sym, _block)
 
-                if batch_items:
-                    prompt = self._build_docstring_batch_prompt(batch_items)
-                    raw = await self._f._llm.call_llm(
-                        prompt=prompt,
-                        system_prompt=(
-                            "You are a technical documentation writer. "
-                            "Generate concise, accurate docstrings. "
-                            "Reply only with the requested JSON."
-                        ),
-                        max_tokens=min(150 * len(batch_items), 2000),
-                        temperature=0.2,
-                        response_format={"type": "json_object"},
-                        enable_thinking=False,
-                        label="docstring_batch",
+        def _find_symbol(
+            qid: str,
+        ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
+            return _qid_index.get(qid, (None, None))
+
+        # ── Phase 1: resolve from in-memory symbol index then SQLite ─────────
+        for qid in qids:
+            sym, _ = _find_symbol(qid)
+            found = sym.docstring if sym and sym.docstring else ""
+
+            if not found:
+                try:
+                    row = await self._f._state_store._db_read(
+                        lambda: self._f._db_conn.execute(
+                            "SELECT docstring FROM symbol_docstrings "
+                            "WHERE project_id=? AND symbol_name=?",
+                            (project_id, qid),
+                        ).fetchone()
                     )
-                    if raw:
-                        expected = {qid.rsplit(".", 1)[-1] for qid in ordered}
-                        parsed = self._parse_docstring_batch_response(raw, expected)
-                        for qid in ordered:
-                            bare = qid.rsplit(".", 1)[-1]
-                            doc = parsed.get(qid) or parsed.get(bare)
-                            if doc:
-                                cleaned = self._clean_single_docstring(doc, bare)
-                                if cleaned:
-                                    self._f._symbol_index.update_docstring(
-                                        qid, project_id, cleaned
-                                    )
-                                    results[qid] = cleaned
-            except Exception as e:
-                self._f._log_debug(
-                    f"_docstring_generation_for_qids: batch failed: "
-                    f"{type(e).__name__}: {e} — falling back to individual"
-                )
+                except Exception:
+                    row = None
 
-        # -- Step 3: individual fallback for symbols not covered by batch --
-        remaining = [q for q in ordered if q not in results]
-        for qid in remaining:
-            try:
-                block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
-                for bh in block_hashes:
-                    blk = state.active_blocks.get(bh) if state else None
-                    if not blk:
-                        continue
-                    sym = next(
-                        (
-                            s
-                            for s in blk.symbols
-                            if qualify_symbol_name(s.name, s.parent_symbol, s.file_path)
-                            == qid
-                        ),
-                        None,
-                    )
-                    if sym:
-                        await self._background_docstring(sym, blk, project_id)
-                        doc = self._f._symbol_index.get_docstring(qid, project_id)
-                        if doc:
-                            results[qid] = doc
-                        break
-            except Exception as e:
-                self._f._log_debug(
-                    f"_docstring_generation_for_qids: individual failed "
-                    f"for '{qid}': {type(e).__name__}: {e}"
-                )
+                if row and row[0]:
+                    found = row[0]
+                    if sym is not None:
+                        sym.docstring = found
+                    self._f._symbol_index.update_docstring(qid, project_id, found)
 
-        # -- Step 4: mark dirty --
-        if results:
-            self._f._conversation_state_manager.mark_dirty(project_id)
+            if found:
+                resolved[qid] = found
+            else:
+                pending.append(qid)
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(pending)} pending after cache check"
+        )
+
+        if not pending:
             self._f._log_debug(
-                f"_docstring_generation_for_qids: generated "
-                f"{len(results)}/{len(qids)} docstrings for '{project_id}'"
+                "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
+            )
+            return resolved
+
+        # ── Phase 2: apply per-turn budget (foreground/lazy mode only) ────────
+        if not background:
+            budget = self._f.valves.lazy_docstring_max_per_turn
+            if budget > 0:
+                remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
+                pending = pending[:remaining]
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: {len(pending)} remaining after "
+                    f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
+                    f"limit={budget})"
+                )
+            if not pending:
+                return resolved
+        else:
+            self._f._log_debug(
+                "ensure_docstrings_batch: background mode — per-turn budget skipped"
             )
 
-        return results
+        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────
+        items: List[Tuple[str, str, str]] = []
+        for qid in pending:
+            sym, block = _find_symbol(qid)
+            if sym is not None and block is not None:
+                signature = sym.signature
+                if sym.line_start:
+                    lines = block.content.split("\n")
+                    start_idx = max(0, sym.line_start - 1)
+                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
+                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
+                else:
+                    snippet = block.content[:500]
+            else:
+                signature, snippet = qid, ""
+            items.append((qid, signature, snippet))
+
+        batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
+        label = "bg_docstring" if background else "lazy_docstring_batch"
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(items)} items to generate, "
+            f"batch_size={batch_size}, label={label!r}"
+        )
+
+        # ── Phase 4: LLM batch loop ───────────────────────────────────────────
+        for i in range(0, len(items), batch_size):
+            batch = items[i : i + batch_size]
+            expected = {q for q, _, _ in batch}
+            prompt = self._build_docstring_batch_prompt(batch)
+
+            batch_num = i // batch_size + 1
+            total_batches = (len(items) + batch_size - 1) // batch_size
+            prompt_tokens = (
+                len(self._f.tokenizer.encode(prompt))
+                if self._f.tokenizer
+                else len(prompt) // 4
+            )
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
+                f"{len(batch)} symbols, ~{prompt_tokens} prompt tokens, "
+                f"label={label!r}"
+            )
+
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a code documentation assistant. "
+                    "Output ONLY a valid JSON object. "
+                    "Your entire response must start with { and end with }. "
+                    "No text before { and no text after }."
+                ),
+                model_override=self._f.valves.llm_model,
+                max_tokens=0,
+                temperature=0.0,
+                label=label,
+                response_format={"type": "json_object"},
+                log_raw_response=False,
+                enable_thinking=False,
+            )
+
+            if not background:
+                self._lazy_docstrings_generated_this_turn += len(batch)
+
+            if response is None:
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
+                )
+                continue
+
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num} — "
+                f"received {len(response)}-char response"
+            )
+
+            parsed = self._parse_docstring_batch_response(response, expected)
+
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num} — "
+                f"parsed {len(parsed)} docstrings"
+            )
+
+            for qid, docstring in parsed.items():
+                resolved[qid] = docstring
+                sym, _ = _find_symbol(qid)
+                if sym is not None:
+                    sym.docstring = docstring
+                self._f._symbol_index.update_docstring(qid, project_id, docstring)
+
+            if parsed:
+                rows = [
+                    (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
+                ]
+
+                def _write_batch(rows: list = rows) -> None:
+                    self._f._db_conn.executemany(
+                        "INSERT OR REPLACE INTO symbol_docstrings "
+                        "(project_id, symbol_name, docstring, updated_at) "
+                        "VALUES (?,?,?,?)",
+                        rows,
+                    )
+                    self._f._db_conn.commit()
+
+                await self._f._state_store._db_enqueue(_write_batch)
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: done — "
+            f"resolved {len(resolved)} / {len(qids)} total"
+        )
+        return resolved
 
     async def ensure_cfg_batch(
         self, qids: List[str], project_id: str
@@ -22987,164 +21563,117 @@ async def ensure_docstrings_batch(
         stop_event: Optional[asyncio.Event] = None,
     ) -> None:
         """
-        Background loop that generates docstrings for symbols that lack them.
+        Background loop that generates docstrings for all pending symbols
+        (functions, methods, and classes) that lack one.
 
-        Runs indefinitely until stop_event is set or the task is cancelled.
-        Errors at the per-symbol level are caught and logged with continue so
-        one bad symbol cannot abort processing for the rest. Errors at the
-        outer level (e.g. state cleared mid-loop, ChromaDB unavailable) are
-        caught, logged, and followed by a longer sleep before retrying, so the
-        loop survives transient infrastructure failures.
+        Takes a snapshot of all symbols without docstrings at the start,
+        then prioritizes them using `_prioritize_docstring_targets` so that
+        skeleton-tier symbols are documented first.
 
-        Only CancelledError and stop_event propagate out of the loop.
+        Uses `background=True` so that the calls to `ensure_docstrings_batch`
+        use the `bg_docstring` label, which is whitelisted during silent
+        ingestion. This allows docstring generation to proceed even if the
+        system is in the middle of a silent ingestion operation.
 
-        Steps (per iteration):
-            1.  Check stop_event.
-            2.  Collect and prioritize qids that need docstrings.
-            3.  For each target: find block, find symbol, call _background_docstring.
-                Per-symbol exceptions continue to next target.
-            4.  Sleep between full passes.
-            Outer exception handler: log + extended sleep + continue (not break).
+        Args:
+            project_id: The current project identifier.
+            stop_event: If set, stops the loop gracefully after the current batch.
         """
-        base_sleep = max(
-            1.0, getattr(self._f.valves, "docstring_loop_interval_seconds", 5.0)
-        )
-        error_sleep = base_sleep * 4
-        symbol_yield = 0.05
+        if stop_event is None:
+            stop_event = asyncio.Event()
 
-        while True:
-            # -- Step 1: stop check --
-            if stop_event and stop_event.is_set():
-                self._f._log_debug(
-                    f"Docstring loop: stop_event set for '{project_id}', exiting"
-                )
-                return
+        # ── 1. Snapshot: collect all symbols without docstrings ──────────
+        state = self._f._conversation_state_manager.get(project_id)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
 
-            try:
-                # -- Step 2: collect targets --
-                all_qids = list(
-                    self._f._symbol_index.get_all_qualified_names(project_id)
-                )
-                if not all_qids:
-                    await asyncio.sleep(base_sleep)
-                    continue
-
-                state = self._f._conversation_state_manager.get(project_id)
-                pstate = self._f._project_state_manager.get_pstate(project_id)
-
-                targets = self._prioritize_docstring_targets(
-                    all_qids, project_id, pstate
-                )
-
-                # -- Step 3: process each target --
-                processed = 0
-                for qid in targets:
-                    if stop_event and stop_event.is_set():
-                        return
-
-                    existing = self._f._symbol_index.get_docstring(qid, project_id)
-                    if existing:
-                        continue
-
-                    try:
-                        block_hashes = self._f._symbol_index.find_blocks(
-                            qid, project_id
-                        )
-                        if not block_hashes:
-                            continue
-
-                        bh = next(iter(block_hashes))
-                        block = state.active_blocks.get(bh) if state else None
-                        if not block or block.obsolete:
-                            continue
-
-                        sym = next(
-                            (
-                                s
-                                for s in block.symbols
-                                if qualify_symbol_name(
-                                    s.name, s.parent_symbol, s.file_path
-                                )
-                                == qid
-                            ),
-                            None,
-                        )
-                        if not sym:
-                            continue
-
-                        await self._background_docstring(sym, block, project_id)
-                        processed += 1
-                        await asyncio.sleep(symbol_yield)
-
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        # Per-symbol error: log and continue to next symbol.
-                        self._f._log_debug(
-                            f"Docstring loop: failed for '{qid}': "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        continue
-
-                if processed:
-                    self._f._log_debug(
-                        f"Docstring loop: generated {processed} docstring(s) "
-                        f"for '{project_id}'"
-                    )
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Outer error: infrastructure or state issue.
-                # Log and sleep — do NOT break, the loop must survive.
-                self._f._log_debug(
-                    f"Docstring loop: outer error for '{project_id}': "
-                    f"{type(e).__name__}: {e} — sleeping {error_sleep}s before retry"
-                )
-                await asyncio.sleep(error_sleep)
+        pending_qids: List[str] = []
+        for block in state.active_blocks.values():
+            if block.obsolete:
                 continue
+            for sym in block.symbols:
+                if sym.kind in ("function", "method", "class") and not sym.docstring:
+                    qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                    pending_qids.append(qid)
 
-            # -- Step 4: sleep between passes --
-            await asyncio.sleep(base_sleep)
-
-    def start_docstring_loop(self, project_id: str) -> None:
-        """
-        Start the background docstring generation loop for this project if it is
-        not already running.
-
-        Called from TaskRegistry._lazy_docstrings on every turn, so the is_running
-        guard is load-bearing: without it each turn spawns an additional concurrent
-        loop, resulting in N×LLM calls per symbol after N turns.
-
-        Uses BackgroundTaskManager.is_running() to check whether a loop task with
-        the canonical name is already active before creating a new one.
-
-        Steps:
-            1.  Check whether the loop is already running for this project.
-            2.  Schedule via BackgroundTaskManager so the loop is tracked and
-                can be cancelled by cancel_docstring_tasks().
-        """
-        loop_name = f"docstring_loop_{project_id}"
-
-        # -- Step 1: deduplicate --
-        if self._f._bg_manager.is_running(loop_name):
-            self._f._log_debug(
-                f"start_docstring_loop: already running for '{project_id}', skipping"
-            )
+        if not pending_qids:
+            self._f._log_debug("Background docstring loop: no pending symbols")
             return
 
-        # -- Step 2: schedule via BackgroundTaskManager --
-        self._f._log_debug(f"start_docstring_loop: starting loop for '{project_id}'")
+        self._f._log_debug(
+            f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
+        )
 
-        async def _start() -> None:
-            await self._f._bg_manager.start(
-                loop_name,
-                self._docstring_generation_loop,
-                project_id,
-                project_id,
+        # ── Q5: Prioritize symbols ──
+        prioritized_qids = self._prioritize_docstring_targets(
+            pending_qids, project_id, pstate
+        )
+
+        self._f._log_debug(
+            f"bg_docstring: prioritized {len(prioritized_qids)} symbols, "
+            "skeleton-tier first"
+        )
+
+        # ── 2. Batch configuration ──────────────────────────────────────────
+        batch_size = getattr(self._f.valves, "docstring_bg_batch_size", 5)
+        batches = [
+            prioritized_qids[i : i + batch_size]
+            for i in range(0, len(prioritized_qids), batch_size)
+        ]
+
+        self._f._log_debug(
+            f"bg_docstring: {len(prioritized_qids)} symbols → "
+            f"{len(batches)} batches (batch_size={batch_size})"
+        )
+
+        # ── 3. Process each batch with stop_event check ─────────────────────
+        total_docstrings = 0
+        for batch_idx, batch in enumerate(batches):
+            if stop_event.is_set():
+                self._f._log_debug(
+                    f"bg_docstring: stop signal received, exiting after "
+                    f"{batch_idx}/{len(batches)} batches"
+                )
+                break
+
+            try:
+                results: Dict[str, str] = await self.ensure_docstrings_batch(
+                    batch,
+                    project_id,
+                    background=True,  # <-- background mode
+                )
+                for qid, docstring in results.items():
+                    if docstring:
+                        self._f._symbol_index.update_docstring(
+                            qid, project_id, docstring
+                        )
+                        total_docstrings += 1
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1}/{len(batches)}: "
+                    f"got {len(results)} docstrings"
+                )
+            except Exception as e:
+                self._f._log_debug(
+                    f"bg_docstring batch {batch_idx + 1} failed: {e} — "
+                    "continuing with remaining batches"
+                )
+
+        # ── Log performance metrics if enabled ──────────────────────────────
+        if self._f.valves.bg_task_measure_performance:
+            self._f._log_debug(
+                f"bg_docstring: processed {len(batches)} batches, "
+                f"generated {total_docstrings} docstrings"
             )
 
-        asyncio.ensure_future(_start())
+        self._f._log_debug("bg_docstring: finished (no slot restore)")
+
+    def start_docstring_loop(self, project_id: str) -> None:
+        """Launch the background docstring generation loop (if not already running)."""
+        if self._active_bg_task is not None and not self._active_bg_task.done():
+            return
+
+        self._active_bg_task = asyncio.create_task(
+            self._docstring_generation_loop(project_id)
+        )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Helper methods for background docstring (unchanged)
@@ -23612,101 +22141,92 @@ class ActiveCodeUpdater:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def process(
-        self,
-        message: dict,
-        project_id: str,
-        is_continuation: bool = False,
+        self, message: dict, project_id: str, is_continuation: bool = False
     ) -> None:
-        """
-        Index all code blocks found in a single conversation message.
-
-        Captures a snapshot of qualified ids present in the symbol index
-        BEFORE processing new blocks. This pre-index snapshot is passed to
-        _post_update_tasks so that _detect_and_migrate_renames can compute
-        accurate deleted/added sets. Without the snapshot, _post_update_tasks
-        runs after indexing and sees the post-indexing state for both sides
-        of the comparison, making deleted_qids and added_qids always empty.
-
-        Steps:
-            1.  Capture pre-index qid snapshot.
-            2.  Extract and prepare new blocks from message content.
-            3.  Detect duplicates against existing active blocks.
-            4.  Process each block (new or duplicate).
-            5.  Run post-update tasks with pre-index snapshot.
-        """
-        state = self._f._conversation_state_manager.get(project_id)
-        if state is None:
+        """Orchestrate the full update pipeline for one message."""
+        if not self._f.valves.enable_code_awareness:
             return
 
-        content = message.get("content")
-        if not content or not isinstance(content, str):
-            return
+        content = message.get("content", "")
+        role = message.get("role", "")
 
-        # -- Step 1: pre-index snapshot --
-        pre_index_qids: Optional[Set[str]] = None
-        try:
-            pre_index_qids = set(
-                self._f._symbol_index.get_all_qualified_names(project_id)
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"ActiveCodeUpdater.process: pre-index snapshot failed: {e}"
-            )
+        # 1. Extract new blocks and symbols
+        new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
+            await self._extract_and_prepare_new_blocks(content, role)
+        )
 
-        # -- Step 2: extract and prepare blocks --
-        try:
-            new_blocks, symbol_lists, content_to_syms = (
-                await self._extract_and_prepare_new_blocks(
-                    content, message.get("role", "user")
+        # 2. Get project lock and current state
+        lock = await self._f._state_store.get_project_lock(project_id)
+        state_before = self._f._conversation_state_manager.get(project_id)
+
+        # 3. Detect duplicates
+        duplicate_info = self._detect_duplicates(new_blocks_pending, state_before)
+
+        async with lock:
+            state = self._f._conversation_state_manager.get(project_id)
+
+            # 4. Housekeeping
+            self._f._enrichment.update_mentions_from_message(state, content, project_id)
+            for block in state.active_blocks.values():
+                if (
+                    block.content
+                    and self._f._code_blocks.calculate_code_similarity(
+                        block.content[:200], content[:200]
+                    )
+                    > 0.7
+                ):
+                    block.mention_count += 1
+                    block.last_mentioned = time.time()
+                    block.last_mentioned_msg_idx = state.message_count
+                    block._update_importance()
+
+            if not content and not new_blocks_pending:
+                return
+
+            # 5. Process each new block
+            for new_block, syms in zip(new_blocks_pending, symbols_list):
+                if isinstance(syms, Exception):
+                    syms = []
+
+                new_block.content = CodeBlockManager.sanitize_text(new_block.content)
+                if self._f.tokenizer:
+                    new_block._cached_token_count = len(
+                        self._f.tokenizer.encode(new_block.content)
+                    )
+                else:
+                    new_block._cached_token_count = len(new_block.content) // 4
+
+                is_dup, existing_hash = duplicate_info.get(
+                    new_block.hash, (False, None)
                 )
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"ActiveCodeUpdater.process: extraction failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-            return
+                existing = (
+                    state.active_blocks.get(existing_hash) if existing_hash else None
+                )
 
-        if not new_blocks:
-            return
-
-        # -- Step 3: detect duplicates --
-        duplicate_map = self._detect_duplicates(new_blocks, state)
-
-        # -- Step 4: process each block --
-        new_blocks_pending: List["CodeBlock"] = []
-        for new_block, syms in zip(new_blocks, symbol_lists):
-            is_dup, existing_hash = duplicate_map.get(new_block.hash, (False, None))
-            try:
-                if is_dup and existing_hash:
-                    existing = state.active_blocks.get(existing_hash)
-                    if existing:
-                        await self._process_duplicate_block(
-                            existing, new_block, syms, state, project_id
-                        )
+                if is_dup and existing:
+                    await self._process_duplicate_block(
+                        existing, new_block, syms, state, project_id
+                    )
                 else:
                     await self._process_new_block(new_block, syms, state, project_id)
-                    new_blocks_pending.append(new_block)
-            except Exception as e:
-                self._f._log_debug(
-                    f"ActiveCodeUpdater.process: block processing failed "
-                    f"({new_block.hash[:8]}): {type(e).__name__}: {e}"
-                )
 
-        if message.get("role") == "assistant":
-            try:
+            # 6. Update assistant base blocks
+            if role == "assistant" and len(extracted_blocks) > 0:
                 await self._update_assistant_base_blocks(
-                    [], content_to_syms, state, project_id
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"ActiveCodeUpdater.process: assistant base update failed: {e}"
+                    extracted_blocks, content_to_syms, state, project_id
                 )
 
-        # -- Step 5: post-update tasks with pre-index snapshot --
-        await self._post_update_tasks(
-            state, project_id, new_blocks_pending, is_continuation, pre_index_qids
-        )
+            # 7. Post-update tasks
+            await self._post_update_tasks(
+                state, project_id, new_blocks_pending, is_continuation
+            )
+
+            self._f._conversation_state_manager.set(project_id, state)
+
+        # ── Invalidate session classification cache whenever active blocks change ──
+        # (ensures that subsequent queries remain code sessions if code exists)
+        if new_blocks_pending:
+            self._f._session_classify_cache.clear()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Extraction & preparation of new blocks
@@ -24200,65 +22720,24 @@ class ActiveCodeUpdater:
 
     async def _post_update_tasks(
         self,
-        state: "ConversationState",
+        state: dict,
         project_id: str,
         new_blocks_pending: List["CodeBlock"],
         is_continuation: bool,
-        pre_index_qids: Optional[Set[str]] = None,
     ) -> None:
-        """
-        Run all post-processing tasks after a new message has been indexed.
-
-        Receives pre_index_qids: the set of qualified ids that were present in
-        the symbol index BEFORE the new blocks were processed. Comparing this
-        against the post-indexing state gives accurate deleted/added sets for
-        rename detection. Computing both sets inside this function (after
-        indexing) always produces empty sets because the symbol index already
-        reflects the new state.
-
-        Steps:
-            1.  Increment message counter unless this is a continuation turn.
-            2.  Remove duplicate blocks from the active set.
-            3.  Expire blocks that have exceeded their TTL.
-            4.  Detect symbol renames and migrate docstrings using pre/post
-                index snapshots.
-            5.  Generate periodic session summary.
-            6.  Schedule background summaries for oversized code blocks.
-            7.  Invalidate lightweight activation cache.
-            8.  Invalidate stale CodePathViews.
-            9.  Soft-evict cold blocks via ContextPager.
-        """
-        # -- Step 1: message counter --
+        """Expiration, enrichment, oversized‑block summaries, path index, soft eviction."""
         if not is_continuation:
             state.message_count += 1
-
-        # -- Step 2: deduplicate blocks --
         if self._f.valves.auto_remove_duplicate_blocks:
             self._f._code_blocks.remove_duplicate_blocks(state, project_id)
 
-        # -- Step 3: expire old blocks --
+        # Inline block expiration
         await self._f._enrichment.expire_blocks_by_time(project_id)
 
-        # -- Step 4: docstring rename migration --
-        if new_blocks_pending and pre_index_qids is not None:
-            try:
-                post_index_qids: Set[str] = set(
-                    self._f._symbol_index.get_all_qualified_names(project_id)
-                )
-                deleted_qids = pre_index_qids - post_index_qids
-                added_qids = post_index_qids - pre_index_qids
+        # Missing docstrings are now generated reactively in _process_new_block
+        # and _process_duplicate_block, right after a symbol is indexed.
+        # No batch loop is needed anymore.
 
-                if deleted_qids and added_qids:
-                    await self._f._enrichment._detect_and_migrate_renames(
-                        deleted_qids, added_qids, project_id
-                    )
-            except Exception as e:
-                self._f._log_debug(
-                    f"_post_update_tasks: rename migration failed: "
-                    f"{type(e).__name__}: {e}"
-                )
-
-        # -- Step 5: periodic session summary --
         if self._f.valves.enable_session_summary and not is_continuation:
             interval = self._f.valves.session_summary_interval_messages
             if (
@@ -24277,7 +22756,7 @@ class ActiveCodeUpdater:
                     self._f.valves.llm_model,
                 )
 
-        # -- Step 6: oversized block summaries --
+        # Oversized block summaries (action="summarize")
         if (
             self._f.valves.max_code_block_tokens > 0
             and self._f.valves.code_block_overflow_action == "summarize"
@@ -24288,10 +22767,9 @@ class ActiveCodeUpdater:
                         block, project_id
                     )
 
-        # -- Step 7: invalidate lightweight cache --
         self._f._activation.invalidate_lightweight_cache(project_id)
 
-        # -- Step 8: invalidate stale CodePathViews --
+        # Path index invalidation
         if self._f.valves.enable_path_analysis:
             changed_symbols: Set[str] = set()
             for blk in new_blocks_pending:
@@ -24328,7 +22806,7 @@ class ActiveCodeUpdater:
                     f"due to changes in {len(changed_symbols)} symbol(s)"
                 )
 
-        # -- Step 9: soft eviction via ContextPager --
+        # Soft eviction via ContextPager
         if self._f.valves.enable_block_paging and self._f._pager is not None:
             candidates = self._f._pager.get_eviction_candidates(
                 state=state,
@@ -24355,7 +22833,7 @@ class ActiveCodeUpdater:
             if candidates:
                 self._f._log_debug(
                     f"Soft-evicted {len(candidates)} block(s) via ContextPager "
-                    f"(active_blocks now {len(state.active_blocks)})"
+                    f"(active_blocks now {len(state['active_blocks'])})"
                 )
 
 
@@ -24399,72 +22877,45 @@ class InletOrchestrator:
     # 2. Preprocessing (project switch, cache load, slot restore)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def inlet_preprocess(
-        self,
-        body: dict,
-        project_id: str,
-    ) -> list:
-        """
-        Normalize and validate the incoming request body, returning a
-        working copy of the messages list.
+    async def inlet_preprocess(self, body: dict, project_id: str) -> list:
+        """Handle project switching, symbol cache loading, and KV slot restore."""
+        messages = body.get("messages", [])
 
-        Bug 88 fix: returns a shallow copy (list of copied dicts) rather
-        than a direct reference to body["messages"]. Without the copy, every
-        subsequent modification during inlet processing (CoT injection,
-        multi-phase hints, system prompt assembly) writes back into the
-        original body. Open-WebUI then sees partially assembled content as
-        if it were real conversation history, corrupting the stored thread.
+        if self._f._last_project_id and self._f._last_project_id != project_id:
+            self._f._log_debug(
+                f"Project changed from {self._f._last_project_id} to {project_id}"
+            )
+            self._f._conversation_state_manager.clear_project(self._f._last_project_id)
+            self._f._symbol_index.clear_project(self._f._last_project_id)
+            self._f._project_state_manager.clear_project(self._f._last_project_id)
+            self._f._block_change_summaries.clear()
 
-        Normalisation applied to each message:
-            - Non-dict entries are dropped.
-            - 'role' missing or invalid → dropped.
-            - 'content' None → replaced with "".
-            - Leading/trailing whitespace stripped from content.
+        self._f._last_project_id = project_id
 
-        Steps:
-            1.  Extract raw messages list from body with safe default.
-            2.  Shallow-copy and normalise each message.
-            3.  Ensure the last message is from a user role.
-            4.  Return the normalised working copy.
-        """
-        VALID_ROLES = {"user", "assistant", "system", "tool"}
+        # ── load persisted CodePathViews if index is empty ──
+        if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
+            existing_views = self._f._path_index.get_all(project_id)
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            if all_names and not existing_views:
+                self._f._log_debug(
+                    "PathIndex empty but symbols exist — loading from DB"
+                )
+                db_views = await self._f._state_store.load_path_views_from_db(
+                    project_id
+                )
+                for view in db_views:
+                    self._f._path_index.add(view, project_id)
 
-        # -- Step 1: extract raw messages --
-        raw = body.get("messages")
-        if not raw or not isinstance(raw, list):
-            return []
+        # ── restore typed edges from DB ─────────
+        if self._f.valves.enable_edge_persistence:
+            restored = await self._f._state_store.load_symbol_edges_from_db(project_id)
+            if restored > 0:
+                self._f._log_debug(
+                    f"Cross-session: {restored} symbol edges restored from DB. "
+                    f"No need to re-paste code."
+                )
 
-        # -- Step 2: copy and normalise --
-        working: List[dict] = []
-        for msg in raw:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role", "")
-            if role not in VALID_ROLES:
-                continue
-
-            # Shallow copy preserves all fields (images, tool_calls, etc.)
-            normalised = dict(msg)
-
-            # Sanitise content: None → "", strip whitespace
-            content = normalised.get("content")
-            if content is None:
-                normalised["content"] = ""
-            elif isinstance(content, str):
-                normalised["content"] = content.strip()
-            # Non-string content (e.g. list for vision models) kept as-is
-
-            working.append(normalised)
-
-        # -- Step 3: ensure last message is user --
-        working = self.ensure_last_message_is_user(working)
-
-        # -- Step 4: return working copy --
-        self._f._log_debug(
-            f"inlet_preprocess: {len(working)} messages normalised "
-            f"for '{project_id}'"
-        )
-        return working
+        return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. User info extraction (last message, query, commands)
@@ -24474,91 +22925,60 @@ class InletOrchestrator:
         self,
         messages: list,
     ) -> Tuple[Optional[dict], str, str, bool, bool]:
-        """
-        Extract the last user message and derived metadata from the
-        normalised messages list.
-
-        Returns:
-            last_user_msg   : the last message with role='user', or None
-            user_query      : full content of last_user_msg
-            user_question   : query with code blocks stripped for classifiers
-            has_code_blocks : True when last_user_msg contains fenced code
-            is_explicit_command : True when message starts with a / command
-
-        Bug 89 fix: guards against empty messages list and against
-        last_user_msg having None or non-string content. Without the guard,
-        calling content.strip() on None raises AttributeError, and
-        has_code_indicators() on None raises TypeError — both silent
-        failures that abort the entire inlet silently.
-
-        Steps:
-            1.  Find the last user message; return null tuple if absent.
-            2.  Sanitise content to string.
-            3.  Derive user_question by stripping code spans.
-            4.  Detect code blocks and explicit commands.
-            5.  Return the tuple.
-        """
-        # -- Step 1: find last user message --
-        last_user_msg: Optional[dict] = next(
-            (m for m in reversed(messages) if m.get("role") == "user"),
-            None,
+        """Extract last user message, query, and detect explicit commands."""
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
         )
-        if last_user_msg is None:
-            self._f._log_debug("inlet_extract_user_info: no user message in history")
-            return None, "", "", False, False
+        user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
-        # -- Step 2: sanitise content --
-        raw_content = last_user_msg.get("content")
-        if raw_content is None:
-            user_query = ""
-        elif isinstance(raw_content, str):
-            user_query = raw_content.strip()
-        elif isinstance(raw_content, list):
-            # Vision / multi-modal: concatenate text parts
-            user_query = " ".join(
-                part.get("text", "")
-                for part in raw_content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ).strip()
-        else:
-            user_query = str(raw_content).strip()
-
-        if not user_query:
-            self._f._log_debug(
-                "inlet_extract_user_info: last user message has empty content"
-            )
-            return last_user_msg, "", "", False, False
-
-        # -- Step 3: strip code spans for classifiers --
-        try:
-            user_question = self._f._code_blocks.sanitize_text(
-                self._f._code_blocks.remove_code_spans(
-                    user_query,
-                    await self._f._code_blocks.get_code_spans(user_query),
+        has_code_blocks = False
+        user_question = user_query
+        if last_user_msg and user_query:
+            try:
+                spans = await self._f._code_blocks.get_code_spans(user_query)
+                if spans:
+                    user_question = CodeBlockManager.remove_code_spans(
+                        user_query, spans
+                    ).strip()
+                if "```" in user_query:
+                    has_code_blocks = True
+                if spans:
+                    has_code_blocks = True
+            except Exception:
+                spans = None
+            if not user_question or len(user_question) < 10:
+                cleaned = re.sub(r"```.*?```", "", user_query, flags=re.DOTALL)
+                cleaned = re.sub(r"`[^`]+`", "", cleaned)
+                cleaned = re.sub(
+                    r"\b(def |class |import |from |function |const |let |var )",
+                    "",
+                    cleaned,
                 )
-            ).strip()
-        except Exception:
-            user_question = user_query
+                cleaned = cleaned.strip()
+                user_question = (
+                    cleaned if (cleaned and len(cleaned) >= 10) else user_query
+                )
 
-        if not user_question:
-            user_question = user_query
+        is_explicit_command = last_user_msg and last_user_msg.get(
+            "content", ""
+        ).startswith("/")
 
-        # -- Step 4: detect code blocks and explicit commands --
-        has_code_blocks = self._f._code_blocks.has_code_indicators(user_query)
-
-        is_explicit_command = (
-            user_query.startswith("/")
-            and len(user_query) > 1
-            and not user_query.startswith("//")
+        # Capture every system message now, joined in order, before any
+        # downstream compression/trim step can touch them.
+        system_msgs_now = [m for m in messages if m.get("role") == "system"]
+        original_system_prompt = "\n\n".join(
+            m.get("content", "")
+            for m in system_msgs_now
+            if m.get("content", "").strip()
         )
+        self._f._original_system_prompt = original_system_prompt
 
-        # -- Step 5: return --
         return (
             last_user_msg,
             user_query,
             user_question,
-            has_code_blocks,
             is_explicit_command,
+            has_code_blocks,
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -24612,108 +23032,117 @@ class InletOrchestrator:
     # 5. Session classification (cached CrossEncoder or heuristic)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def classify_session(
-        self,
-        messages: list,
-        project_id: str,
-    ) -> bool:
+    async def classify_session(self, messages: list, project_id: str) -> bool:
         """
-        Classify whether the current conversation is a code session.
+        Determine whether the current session is a coding session.
 
-        A code session enables Block A/B context injection, symbol indexing,
-        and the full activation pipeline. Non-code sessions skip all of that
-        for lower latency and token usage.
+        Uses a cascade:
+        1. Heuristic reinforcement (code indicators → boost)
+        2. CrossEncoder (primary decision)
+        3. LLM (only when CrossEncoder is extremely uncertain, diff < 0.15)
+        4. Heuristic fallback (when 0.15 ≤ diff < 0.25)
 
-        The cache key includes project_id so that two projects with identical
-        last-user-message content do not share a cached classification result.
-        Without this, a code session in project A would cause project B (a
-        documentation-only project with the same greeting) to receive full code
-        context injection incorrectly.
-
-        Classification cascade:
-            1.  Extract the last user message; return False if absent or empty.
-            2.  Build cache key from (project_id, query_hash); check cache.
-            3.  Run cross-encoder against code-session exemplars.
-            4.  Heuristic: if code indicators are present, return True immediately.
-            5.  If cross-encoder confidence is sufficient, return heuristic result.
-            6.  Otherwise call _classify_session_with_llm.
-            7.  Store result in cache and return.
+        After any LLM call, the KV slot is restored to avoid cache pollution.
         """
-        # -- Step 1: extract last user message --
         last_user = next(
-            (m for m in reversed(messages) if m.get("role") == "user"),
-            None,
+            (m for m in reversed(messages) if m.get("role") == "user"), None
         )
-        if not last_user:
-            return False
-
-        query = (last_user.get("content") or "").strip()
-        if not query:
-            return False
-
-        # -- Step 2: cache lookup -- project_id scoped key --
-        query_hash = hashlib.md5(query.encode()).hexdigest()
-        cache_key = f"{project_id}:{query_hash}"
-
-        if hasattr(self, "_session_cache") and cache_key in self._session_cache:
-            self._f._log_debug(
-                f"classify_session: cache hit for '{project_id}' "
-                f"(result={self._session_cache[cache_key]})"
+        cache_key = None
+        if last_user:
+            content_key = last_user.get("content", "")[:200]
+            cache_key = (
+                f"{project_id}:{hashlib.md5(content_key.encode()).hexdigest()[:12]}"
             )
-            return self._session_cache[cache_key]
+            cached = self._f._session_classify_cache.get(cache_key)
+            if cached is not None:
+                result, ts = cached
+                if time.time() - ts < self._f._session_classify_ttl:
+                    return result
+                del self._f._session_classify_cache[cache_key]
 
-        # -- Step 3: cross-encoder against code-session exemplars --
-        exemplars = [
-            "write python function class method code implementation",
-            "fix bug error traceback exception refactor",
-            "explain code review architecture design pattern",
-            "what is the meaning of life philosophy history",
-        ]
-        pairs = [(query, ex) for ex in exemplars]
-        raw_ce = await self._predict_cross_encoder(pairs)
-        ce_scores: List[float] = (
-            [self._normalize_cross_encoder_score(s) for s in raw_ce]
-            if raw_ce is not None
-            else []
-        )
-
-        # -- Step 4: code-indicator fast path --
-        if self._f._code_blocks.has_code_indicators(query):
+        # ── Fast path: explicit code indicators ──
+        state = self._f._conversation_state_manager.get(project_id)
+        if state and state.active_blocks:
             self._cache_session_result(cache_key, True)
             return True
 
-        # -- Step 5: heuristic from cross-encoder --
-        if ce_scores and len(ce_scores) >= 3:
-            code_signal = max(ce_scores[:3])
-            prose_signal = ce_scores[3] if len(ce_scores) > 3 else 0.0
-            confidence_threshold = getattr(
-                self._f.valves, "session_classifier_ce_threshold", 0.65
-            )
-            if code_signal >= confidence_threshold:
-                result = code_signal > prose_signal
+        # ── CrossEncoder primary ──
+        if last_user and len(last_user.get("content", "")) >= 20:
+            user_text = last_user.get("content", "")[:500]
+
+            # Enrich query with context tags
+            context_parts = []
+            if "```" in user_text or any(
+                kw in user_text
+                for kw in ("def ", "class ", "import ", "from ", "function ")
+            ):
+                context_parts.append("[CODE]")
+            if "traceback" in user_text.lower() or 'File "' in user_text:
+                context_parts.append("[TRACEBACK]")
+            context_prefix = " ".join(context_parts)
+            query = f"{context_prefix} {user_text}" if context_parts else user_text
+
+            pairs = [
+                (
+                    query,
+                    "The user is asking about programming, code, or software development.",
+                ),
+                (
+                    query,
+                    "The user is asking about something else, not related to programming.",
+                ),
+            ]
+            scores = await self._f._commands._predict_cross_encoder(pairs)
+
+            if scores is not None and len(scores) >= 2:
+                # Heuristic reinforcement
+                scores_reinforced = list(scores)
+                if "```" in user_text or any(
+                    kw in user_text
+                    for kw in ("def ", "class ", "import ", "from ", "function ")
+                ):
+                    scores_reinforced[0] += 0.2
+                if len(user_text.split()) < 5:
+                    scores_reinforced[1] += 0.1
+
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                CE_CONFIDENCE_THRESHOLD = 0.25
+                LLM_FALLBACK_THRESHOLD = 0.15
+
+                if diff >= CE_CONFIDENCE_THRESHOLD:
+                    result = scores_reinforced[0] > scores_reinforced[1]
+                    self._cache_session_result(cache_key, result)
+                    return result
+                elif diff < LLM_FALLBACK_THRESHOLD:
+                    # Extremely uncertain → LLM
+                    result = await self._classify_session_with_llm(
+                        query, scores_reinforced, project_id
+                    )
+                    self._cache_session_result(cache_key, result)
+                    return result
+                # else: middle zone → fall through to heuristic
+
+        # ── Heuristic fallback (middle zone or no CE) ──
+        if last_user:
+            content = last_user.get("content", "").lower()
+            if any(
+                kw in content
+                for kw in (
+                    "code",
+                    "function",
+                    "def",
+                    "class",
+                    "error",
+                    "bug",
+                    "traceback",
+                )
+            ):
+                result = True
                 self._cache_session_result(cache_key, result)
                 return result
 
-        # -- Step 6: LLM classification --
-        try:
-            result = await self._classify_session_with_llm(
-                query=query,
-                ce_scores=ce_scores,
-                project_id=project_id,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"classify_session: LLM failed for '{project_id}', "
-                f"defaulting to False: {type(e).__name__}: {e}"
-            )
-            result = False
-
-        # -- Step 7: cache and return --
+        result = False
         self._cache_session_result(cache_key, result)
-        self._f._log_debug(
-            f"classify_session: result={result} for '{project_id}' "
-            f"(ce={'yes' if ce_scores else 'none'})"
-        )
         return result
 
     async def _classify_session_with_llm(
@@ -24803,39 +23232,23 @@ class InletOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def ensure_last_message_is_user(self, messages: list) -> list:
-        """
-        Guarantee that the final message in the list has role='user'.
-
-        Required by the Anthropic messages API which mandates that conversations
-        end on a user turn. When the pipeline processes outlet responses the
-        final message may temporarily be from the assistant.
-
-        Returns the original list unmodified when it already ends on a user
-        message. Appends a minimal user sentinel otherwise.
-
-        Steps:
-            1.  Guard empty list — nothing to check or fix.
-            2.  Check role of last message.
-            3.  Append sentinel user message only when needed.
-        """
-        # -- Step 1: empty list guard --
+        """Ensure the last message in the list is from the user."""
         if not messages:
-            self._f._log_debug(
-                "ensure_last_message_is_user: received empty message list, "
-                "returning as-is"
-            )
+            messages.append({"role": "user", "content": "continue"})
             return messages
-
-        # -- Step 2: check last message role --
-        if messages[-1].get("role") == "user":
-            return messages
-
-        # -- Step 3: append sentinel --
-        self._f._log_debug(
-            f"ensure_last_message_is_user: last role is "
-            f"'{messages[-1].get('role')}', appending user sentinel"
-        )
-        return messages + [{"role": "user", "content": ""}]
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx == -1:
+            while messages and messages[-1].get("role") != "user":
+                messages.pop()
+            messages.append({"role": "user", "content": "continue"})
+        else:
+            if last_user_idx + 1 < len(messages):
+                messages = messages[: last_user_idx + 1]
+        return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Intent classification with continuation inheritance – NEW (E2)
@@ -25073,182 +23486,232 @@ class SystemPromptBuilder:
         current_messages: list = None,
     ) -> Optional[str]:
         """
-        Retrieve relevant memories from LTM and render them as an injectable
-        context section.
+        Retrieve and format relevant LTM entries for the current query.
 
-        Enforces a hard token cap (ltm_injection_max_tokens) on the rendered
-        section before returning. Without this cap, a large retrieval result
-        (10 code-heavy memories × 800 tokens each) consumes 8 000+ tokens
-        before Block A/B have been assembled, leaving insufficient budget for
-        the actual code context and CoT reasoning.
+        Uses RAPTOR refinement (if enabled) to improve the query before retrieval,
+        then calls retrieve_memories_unified and renders the results.
 
-        Returns None when no memories are found or the rendered section is
-        empty, signalling to the caller that no LTM block should be injected.
+        Args:
+            project_id (str): The current project identifier.
+            user_question (str): The cleaned user question.
+            user_query (str): The raw user query.
+            is_code_session (bool): Whether the session is code-aware.
+            slot_free (bool): Whether the LLM slot is free.
+            use_case_label (str): The use case label for retrieval.
+            is_continuation (bool): Whether this is a continuation turn.
+            current_messages (list, optional): The current conversation messages
+                for deduplication. Defaults to None.
 
-        Steps:
-            1.  Skip when LTM injection is disabled or slot is busy.
-            2.  Retrieve memories via retrieve_memories_unified.
-            3.  Deduplicate against current window content.
-            4.  Render the LTM section.
-            5.  Enforce token budget; truncate if over limit.
-            6.  Return section string or None.
+        Returns:
+            Optional[str]: The rendered LTM section, or None if no memories
+            are retrieved or the section is empty.
         """
-        # -- Step 1: feature flags --
-        if not getattr(self._f.valves, "enable_ltm_injection", True):
-            return None
-        if not slot_free and not getattr(
-            self._f.valves, "ltm_inject_when_slot_busy", False
+        # ── REGION 1: Early exits ──
+        if not (
+            self._f.valves.enable_code_awareness
+            and is_code_session
+            and HAS_SENTENCE
+            and HAS_CHROMA
         ):
             return None
 
-        # -- Step 2: retrieve --
-        try:
-            memories = await self._f._ltm.retrieve_memories_unified(
-                query=user_question or user_query,
-                project_id=project_id,
-                use_case_label=use_case_label,
-                slot_free=slot_free,
-                is_continuation=is_continuation,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_build_ltm_injection: retrieval failed for '{project_id}': "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
+        _ltm_query = user_question if user_question else user_query
 
-        if not memories:
-            return None
-
-        # -- Step 3: deduplicate against current window --
-        if current_messages:
-            window_texts = [
-                m.get("content", "") for m in current_messages[-6:] if m.get("content")
-            ]
-            window_norms = [self._normalize_for_dedup(t) for t in window_texts]
-            unique_memories = []
-            for mem in memories:
-                norm = self._normalize_for_dedup(mem.get("content", ""))
-                if not self._overlaps_window(norm, window_norms):
-                    unique_memories.append(mem)
-            memories = unique_memories
-
-        if not memories:
-            return None
-
-        # -- Step 4: render --
-        try:
-            section = await self._render_ltm_section(
-                project_id=project_id,
-                memories=memories,
-                current_messages=current_messages or [],
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_build_ltm_injection: render failed for '{project_id}': "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
-
-        if not section or not section.strip():
-            return None
-
-        # -- Step 5: enforce token budget --
-        max_ltm_tokens = getattr(self._f.valves, "ltm_injection_max_tokens", 1500)
-        if max_ltm_tokens > 0:
-            actual_tokens = self._f._tokens.estimate_code_tokens(section)
-            if actual_tokens > max_ltm_tokens:
-                section = self._f._tokens.truncate_text_to_tokens(
-                    section, max_ltm_tokens
+        # ── REGION 2: RAPTOR refinement ──
+        refined_query = _ltm_query
+        if (
+            self._f.valves.enable_raptor
+            and getattr(self._f, "_raptor", None)
+            and self._f.memory_collection is not None
+        ):
+            try:
+                raptor_summaries = await self._f._raptor.retrieve(
+                    query=_ltm_query,
+                    project_id=project_id,
+                    top_k=2,
+                    embedder=self._f.embedder,
+                    chroma_collection=self._f.memory_collection,
                 )
-                section += "\n_[LTM section truncated to fit context budget]_"
-                self._f._log_debug(
-                    f"_build_ltm_injection: truncated LTM section from "
-                    f"~{actual_tokens} to {max_ltm_tokens} tokens for '{project_id}'"
-                )
+                if raptor_summaries:
+                    refined_query = _ltm_query + "\n" + "\n".join(raptor_summaries[:2])
+            except Exception:
+                pass
 
-        # -- Step 6: return --
-        self._f._log_debug(
-            f"_build_ltm_injection: injecting {len(memories)} memories "
-            f"(~{self._f._tokens.estimate_code_tokens(section)} tokens) "
-            f"for '{project_id}'"
+        # ── REGION 3: Retrieve memories ──
+        all_meta = await self._f._ltm.retrieve_memories_unified(
+            refined_query,
+            project_id,
+            use_case_label=use_case_label,
+            slot_free=slot_free,
+            is_continuation=is_continuation,
         )
-        return section
+
+        if not all_meta:
+            self._f._log_debug("LTM: no memories retrieved")
+            return None
+
+        # ── REGION 4: Render with deduplication ──
+        return await self._render_ltm_section(
+            project_id, all_meta, current_messages=current_messages
+        )
 
     async def _render_ltm_section(
-        self,
-        project_id: str,
-        memories: list,
-        current_messages: list = None,
+        self, project_id: str, memories: list, current_messages: list = None
     ) -> str:
         """
-        Format retrieved memories into a structured LTM context section.
+        Render the LTM section with a clear header and per-fragment labels.
 
-        Each memory entry is individually truncated to ltm_max_tokens_per_entry
-        before being added to the section. Without per-entry truncation, a
-        single code-heavy memory can fill the entire LTM budget, pushing out
-        all other memories and causing _build_ltm_injection to truncate the
-        section mid-entry (e.g., mid-function body), which confuses the model.
+        If current_messages is provided, fragments that overlap with the current
+        conversation window are filtered out to avoid duplication.
 
-        Steps:
-            1.  Resolve per-entry token limit from valves.
-            2.  For each memory: extract content, truncate, format, append.
-            3.  Prepend section header and return.
+        Uses a cascade for deduplication:
+        1. Quick substring containment (fast, cheap).
+        2. CrossEncoder (semantic) to compare fragments against the window.
+        3. LLM (only when extremely uncertain, prob < 0.25).
+        4. Fuzzy matching (fallback) when CrossEncoder is uncertain but not extremely.
+
+        Restores KV slot after any LLM call.
+
+        Args:
+            project_id (str): The current project identifier.
+            memories (list): List of memory fragments from LTM retrieval.
+            current_messages (list, optional): The current conversation messages
+                to deduplicate against. Defaults to None.
+
+        Returns:
+            str: The rendered LTM section, or an empty string if no memories
+            remain after deduplication or truncation.
         """
+        # ── REGION 1: Deduplicate against the current session ──
+        if current_messages:
+            window_norms = [
+                self._normalize_for_dedup(m.get("content", ""))
+                for m in current_messages
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+            filtered = []
+
+            # Use CrossEncoder for semantic duplicate detection if available
+            if HAS_SENTENCE and HAS_CHROMA and self._f._cross_encoder is not None:
+                for m in memories:
+                    body = self._strip_ltm_prefix(m["doc"])
+                    norm = self._normalize_for_dedup(body)
+                    if not norm:
+                        continue
+
+                    # ── Quick substring check (cheap) ──
+                    is_duplicate = False
+                    for w in window_norms:
+                        if not w:
+                            continue
+                        if norm in w or w in norm:
+                            is_duplicate = True
+                            break
+
+                    if not is_duplicate:
+                        # ── CrossEncoder with heuristic reinforcement ──
+                        best_prob = 0.0
+                        for w in window_norms[:5]:
+                            if not w:
+                                continue
+                            scores = await self._f._commands._predict_cross_encoder(
+                                [(norm[:500], w[:500])]
+                            )
+                            if scores is not None and len(scores) > 0:
+                                prob = 1.0 / (1.0 + math.exp(-scores[0]))
+                                # Heuristic reinforcement: common words boost duplicate probability
+                                common_words = set(norm.split()) & set(w.split())
+                                if common_words:
+                                    prob = min(
+                                        1.0, prob + 0.1 * min(len(common_words), 3)
+                                    )
+                                if prob > best_prob:
+                                    best_prob = prob
+
+                        CE_CONFIDENCE_THRESHOLD = 0.40
+                        LLM_FALLBACK_THRESHOLD = 0.25
+
+                        if best_prob >= 0.5:
+                            is_duplicate = True
+                        elif best_prob >= CE_CONFIDENCE_THRESHOLD:
+                            is_duplicate = best_prob >= 0.5
+                        elif best_prob < LLM_FALLBACK_THRESHOLD:
+                            # Extremely uncertain → LLM
+                            is_duplicate = await self._ltm_dedup_with_llm(
+                                norm, window_norms[:3], best_prob, project_id
+                            )
+                        else:
+                            # Middle zone: keep (not duplicate) by default
+                            is_duplicate = False
+
+                    if not is_duplicate:
+                        filtered.append(m)
+            else:
+                # ── Fallback to substring + fuzzy matching ──
+                for m in memories:
+                    body = self._strip_ltm_prefix(m["doc"])
+                    norm = self._normalize_for_dedup(body)
+                    if not norm:
+                        continue
+                    if not self._overlaps_window(norm, window_norms):
+                        filtered.append(m)
+
+            dropped = len(memories) - len(filtered)
+            if dropped:
+                self._f._log_debug(
+                    f"LTM: filtered {dropped} fragment(s) from current session"
+                )
+            memories = filtered
+
         if not memories:
             return ""
 
-        # -- Step 1: per-entry limit --
-        max_per_entry = getattr(self._f.valves, "ltm_max_tokens_per_entry", 300)
+        # ── REGION 2: Sort and deduplicate ──
+        memories.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+        seen = set()
+        unique = []
+        for m in memories:
+            if m["doc"] not in seen:
+                seen.add(m["doc"])
+                unique.append(m)
 
-        # -- Step 2: render each entry --
-        parts: List[str] = []
-        for mem in memories:
-            content = mem.get("content", "").strip()
-            metadata = mem.get("metadata", {})
-            score = mem.get("score", 0.0)
+        # ── REGION 3: Build header ──
+        header = (
+            "## Relevant Past Context (long-term memory)\n\n"
+            "> The following fragments were retrieved from past conversations "
+            "(different sessions) and are provided as additional context. "
+            "They are NOT part of the current chat history.\n\n"
+        )
 
-            if not content:
-                continue
+        # ── REGION 4: Render fragments with token budget ──
+        parts = []
+        max_tokens = self._f.valves.ltm_retrieval_max_tokens
+        current_tokens = 0
 
-            # Per-entry truncation before assembly
-            if max_per_entry > 0:
-                entry_tokens = self._f._tokens.estimate_code_tokens(content)
-                if entry_tokens > max_per_entry:
-                    content = self._f._tokens.truncate_text_to_tokens(
-                        content, max_per_entry
-                    )
-                    content += " …"
-
-            # Strip any existing LTM prefix to avoid double-labelling
-            content = self._strip_ltm_prefix(content)
-
-            # Role label and file hint
-            role = metadata.get("role", "")
-            file_path = metadata.get("file_path", "")
-            label_parts = []
-            if role:
-                label_parts.append(role)
-            if file_path:
-                label_parts.append(file_path)
-            label = " · ".join(label_parts)
-
-            if label:
-                entry = f"[{label}] {content}"
+        for mem in unique:
+            ts = mem.get("timestamp")
+            if ts and ts > 1_000_000_000:
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
+                )
+                text = f"[Past conversation — {time_str}]\n{mem['doc']}"
             else:
-                entry = content
+                text = f"[Past conversation — unknown date]\n{mem['doc']}"
 
-            if self._f.valves.debug:
-                entry += f" _(ltm score: {score:.2f})_"
-
-            parts.append(f"- {entry}")
+            tok = self._f._tokens.estimate_code_tokens(text)
+            if max_tokens > 0 and current_tokens + tok > max_tokens:
+                break
+            parts.append(text)
+            current_tokens += tok
 
         if not parts:
             return ""
 
-        # -- Step 3: prepend header --
-        header = "_Relevant context from earlier in this session or past sessions:_"
-        return f"{header}\n" + "\n".join(parts)
+        full_text = header + "\n---\n".join(parts)
+        self._f._log_debug(
+            f"LTM section rendered ({len(parts)} fragments, ~{current_tokens} tokens)"
+        )
+        return full_text
 
     async def _ltm_dedup_with_llm(
         self, norm: str, window_excerpts: list, ce_score: float, project_id: str
@@ -25336,80 +23799,23 @@ class SystemPromptBuilder:
         state: dict,
         slot_free: bool,
     ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
-        """
-        Run contradiction detection, response cache lookup, and duplicate
-        question detection concurrently to minimise wall-clock latency.
+        """Run contradiction detection, response cache lookup, and duplicate question detection."""
+        if not messages:
+            return None, None, None
 
-        Each task is independent: a failure in one must not discard results
-        from the others. asyncio.gather with return_exceptions=True is used
-        so that an exception from any single task is captured as a result
-        value rather than re-raised, allowing the caller to receive whatever
-        partial results are available.
-
-        Returns:
-            contradiction_warning : Optional[str]   — inline warning text or None
-            cached_response       : Optional[dict]  — cached LLM response or None
-            duplicate_result      : Optional[dict]  — prior duplicate Q&A or None
-
-        Steps:
-            1.  Build context hash for cache lookup.
-            2.  Schedule all three tasks concurrently with individual timeouts.
-            3.  Await with return_exceptions=True.
-            4.  Unpack results, converting exceptions to None with debug logging.
-        """
-        # -- Step 1: build context hash --
         context_hash = self._f._activation.compute_context_hash(messages)
-
-        contradiction_timeout = getattr(self._f.valves, "contradiction_timeout", 8.0)
-        cache_timeout = getattr(self._f.valves, "response_cache_timeout", 5.0)
-        duplicate_timeout = getattr(self._f.valves, "duplicate_detection_timeout", 5.0)
-
-        # -- Step 2: schedule all tasks --
-        async def _safe_contradiction() -> Optional[str]:
-            return await asyncio.wait_for(
-                self._f._command_router._detect_contradictions(messages, project_id),
-                timeout=contradiction_timeout,
+        contradiction_warning, cached_response, duplicate_match = (
+            await self._f._enrichment.parallel_context_checks(
+                messages,
+                user_query,
+                context_hash,
+                project_id,
+                state,
+                skip_contradiction=not slot_free,
+                skip_cache=not slot_free,
             )
-
-        async def _safe_cache() -> Optional[dict]:
-            if not slot_free:
-                return None
-            return await asyncio.wait_for(
-                self._f._ltm.find_cached_response(user_query, context_hash, state),
-                timeout=cache_timeout,
-            )
-
-        async def _safe_duplicate() -> Optional[dict]:
-            if not slot_free:
-                return None
-            return await asyncio.wait_for(
-                self._f._ltm.find_duplicate_question(user_query, project_id),
-                timeout=duplicate_timeout,
-            )
-
-        # -- Step 3: await with per-task exception capture --
-        results = await asyncio.gather(
-            _safe_contradiction(),
-            _safe_cache(),
-            _safe_duplicate(),
-            return_exceptions=True,
         )
-
-        # -- Step 4: unpack, log, and sanitise exceptions --
-        def _unwrap(result: Any, label: str) -> Any:
-            if isinstance(result, BaseException):
-                self._f._log_debug(
-                    f"_build_parallel_checks: {label} failed: "
-                    f"{type(result).__name__}: {result}"
-                )
-                return None
-            return result
-
-        contradiction_warning = _unwrap(results[0], "contradiction")
-        cached_response = _unwrap(results[1], "cache")
-        duplicate_result = _unwrap(results[2], "duplicate")
-
-        return contradiction_warning, cached_response, duplicate_result
+        return contradiction_warning, cached_response, duplicate_match
 
     @staticmethod
     def _strip_ltm_prefix(doc: str) -> str:
@@ -25614,53 +24020,71 @@ class SystemPromptBuilder:
         messages: List[dict],
     ) -> str:
         """
-        Concatenate static block, hub tier, and dynamic injections into the
-        preliminary system prompt sent to the model.
+        Assemble the preliminary system prompt with token budget constraints.
 
-        Filters out injection entries whose content is None, empty, or
-        whitespace-only before assembly. Without this filter, callers that
-        append (label, None) or (label, "") produce literal "None" or empty
-        section headers in the system prompt, wasting tokens and potentially
-        confusing the model.
+        The order is:
+            1. static_block (Block A)
+            2. hub_tier (stable full bodies of top hubs)
+            3. dynamic_block (Block B: LOD, pointers, LTM, suggestions, etc.)
+            4. user's original system prompt (captured separately)
 
-        Steps:
-            1.  Start with the static block (always present).
-            2.  Append hub tier if non-empty.
-            3.  Filter dynamic injections: skip entries with falsy content.
-            4.  Append each valid injection as a labelled section.
-            5.  Return the assembled system prompt.
+        This order ensures that the stable prefix (A + tier) is KV-cacheable
+        across turns, while the dynamic tail re-prefills as needed.
         """
-        parts: List[str] = []
+        budget = self._f.valves.global_injection_token_budget
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-        # -- Step 1: static block --
-        if static_block and static_block.strip():
-            parts.append(static_block.strip())
-
-        # -- Step 2: hub tier --
-        if hub_tier and hub_tier.strip():
-            parts.append(hub_tier.strip())
-
-        # -- Step 3 + 4: filter and append dynamic injections --
-        for label, content in dynamic_injections:
-            if not content:
-                continue
-            if not isinstance(content, str):
-                self._f._log_debug(
-                    f"_assemble_prelim_system: skipping injection "
-                    f"'{label}' with non-string content "
-                    f"({type(content).__name__})"
+        if budget > 0 and self._f.tokenizer:
+            dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            selected: List[str] = []
+            used = 0
+            static_tokens = (
+                len(self._f.tokenizer.encode(static_block)) if static_block else 0
+            )
+            hub_tier_tokens = len(self._f.tokenizer.encode(hub_tier)) if hub_tier else 0
+            # User system prompt is never truncated
+            user_prompt_tokens = (
+                len(
+                    self._f.tokenizer.encode(
+                        getattr(self._f, "_original_system_prompt", "") or ""
+                    )
                 )
-                continue
-            content_stripped = content.strip()
-            if not content_stripped:
-                continue
-            if label and label.strip():
-                parts.append(f"### {label.strip()}\n{content_stripped}")
-            else:
-                parts.append(content_stripped)
+                if getattr(self._f, "_original_system_prompt", "")
+                else 0
+            )
+            dyn_budget = max(
+                0, budget - static_tokens - hub_tier_tokens - user_prompt_tokens
+            )
 
-        # -- Step 5: assemble --
-        return "\n\n".join(parts)
+            for prio, text in dynamic_injections:
+                if not text:
+                    continue
+                tok = len(self._f.tokenizer.encode(text))
+                if used + tok <= dyn_budget:
+                    selected.append(text)
+                    used += tok
+                elif prio in ("critical", "high"):
+                    avail = dyn_budget - used
+                    if avail > 20:
+                        selected.append(text[: avail * 4] + "\n[truncated]")
+                        break
+            dynamic_block = "\n\n".join(selected)
+        else:
+            dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
+
+        # ── Assemble with tier between static and dynamic ──
+        separator = "\n\n---\n\n"
+        parts = [p for p in [static_block, hub_tier, dynamic_block] if p.strip()]
+        prelim_system = separator.join(parts)
+
+        # Append user's original system prompt if present (captured once per turn)
+        base_content = getattr(self._f, "_original_system_prompt", "") or ""
+        if base_content.strip():
+            prelim_system = (
+                prelim_system + separator + "## User instructions\n" + base_content
+            )
+
+        return prelim_system
 
 
 class WindowManager:
@@ -25927,86 +24351,68 @@ class WindowManager:
         budget: int,
     ) -> Tuple[List[dict], List[dict], int]:
         """
-        Find the earliest index in history such that all messages from that
-        index onward fit within the token budget. Returns (kept, evicted, new_hwm).
+        Compute the window frontier, ensuring the current user turn is never evicted.
 
-        The frontier is always snapped forward to the next complete turn boundary.
-        Without this snap, the backward token scan can split a turn pair, keeping
-        an assistant reply without its preceding user message (or vice versa),
-        producing a malformed conversation that the LLM cannot correctly attend to.
+        Iterates backwards from the most recent message, accumulating tokens.
+        If the current user turn alone exceeds the budget, it is force-included
+        and older turns are cut instead.
 
-        new_hwm is the turn number of the last evicted message, used to advance
-        summarized_turn_hwm. Returns 0 when nothing is evicted.
+        Args:
+            history: List of messages (user/assistant/tool).
+            turns: Turn number for each message (1-based).
+            budget: Token budget for the history window.
 
-        Steps:
-            1.  Backward scan: accumulate tokens newest-first until budget is
-                exceeded; record the split index.
-            2.  Turn-boundary snap: if the split index falls inside a turn,
-                advance it past the end of that turn so the evicted set contains
-                only complete turn pairs.
-            3.  Safety floor: if snapping consumed every message, preserve the
-                single most-recent complete turn regardless of budget.
-            4.  Split history and compute new_hwm from the turn list.
+        Returns:
+            Tuple of (kept_messages, evicted_messages, cut_turn).
+            cut_turn == 0 means everything fits.
         """
-        if not history:
-            return [], [], 0
+        accumulated = 0
+        cut_turn = 0
+        token_counts = [self._token_count(m.get("content", "")) for m in history]
 
-        # -- Step 1: backward token scan --
-        total_kept = 0
-        frontier_idx = 0  # default: everything fits, nothing evicted
+        # The current turn (highest turn number) MUST always be kept.
+        max_turn = max(turns) if turns else 0
 
+        # ------------------------------------------------------------------
+        # Walk backwards from the most recent message.
+        # ------------------------------------------------------------------
         for i in range(len(history) - 1, -1, -1):
-            tok = self._token_count(history[i].get("content", ""))
-            if total_kept + tok > budget:
-                frontier_idx = i + 1
+            tok = token_counts[i]
+            if accumulated + tok > budget:
+                if turns[i] == max_turn:
+                    # Force-include current turn regardless of size.
+                    # Continue cutting older turns to make room.
+                    accumulated += tok
+                    continue
+                cut_turn = turns[i]
                 break
-            total_kept += tok
+            accumulated += tok
 
-        if frontier_idx == 0:
+        # ------------------------------------------------------------------
+        # Everything fits.
+        # ------------------------------------------------------------------
+        if cut_turn == 0:
+            self._f._log_debug(
+                f"WindowManager: all {len(history)} msg(s) fit ({accumulated} tokens)"
+            )
             return history, [], 0
 
-        # -- Step 2: snap forward to the next complete turn boundary --
-        # If frontier_idx lands inside a turn, advance past the entire turn
-        # so that the kept slice starts at a clean user-message boundary.
-        if frontier_idx < len(history):
-            current_turn = turns[frontier_idx]
+        # ------------------------------------------------------------------
+        # Split history at the frontier.
+        # ------------------------------------------------------------------
+        kept = [m for m, t in zip(history, turns) if t > cut_turn]
+        old_msgs = [m for m, t in zip(history, turns) if t <= cut_turn]
 
-            # Find where the turn at frontier_idx actually starts
-            turn_start = frontier_idx
-            while turn_start > 0 and turns[turn_start - 1] == current_turn:
-                turn_start -= 1
-
-            if turn_start != frontier_idx:
-                # frontier_idx is mid-turn — advance past its end
-                while (
-                    frontier_idx < len(history) and turns[frontier_idx] == current_turn
-                ):
-                    frontier_idx += 1
-
-        # -- Step 3: safety floor — always keep at least one complete turn --
-        if frontier_idx >= len(history):
-            last_turn_num = turns[-1] if turns else 0
-            last_turn_start = len(history) - 1
-            while last_turn_start > 0 and turns[last_turn_start - 1] == last_turn_num:
-                last_turn_start -= 1
-            frontier_idx = last_turn_start
-            self._f._log_debug(
-                "WindowManager._compute_frontier: snap consumed all history, "
-                f"preserving last turn (turn {last_turn_num})"
-            )
-
-        # -- Step 4: split and compute HWM --
-        kept = history[frontier_idx:]
-        old_msgs = history[:frontier_idx]
-        new_hwm = turns[frontier_idx - 1] if old_msgs else 0
-
+        # ------------------------------------------------------------------
+        # Log C: frontier result.
+        # ------------------------------------------------------------------
         self._f._log_debug(
-            f"WindowManager._compute_frontier: evicting {len(old_msgs)} msg(s), "
-            f"keeping {len(kept)}, new_hwm={new_hwm}, "
-            f"~{total_kept} tokens retained"
+            f"WindowManager: frontier at turn {cut_turn} — "
+            f"keeping {len(kept)} msg(s), evicting {len(old_msgs)} msg(s), "
+            f"accumulated={accumulated} tokens"
         )
 
-        return kept, old_msgs, new_hwm
+        return kept, old_msgs, cut_turn
 
     def _apply_emergency_cap(
         self,
@@ -26079,35 +24485,34 @@ class WindowManager:
         old_msgs: List[dict],
         turns: List[int],
         history: List[dict],
-        state: "ConversationState",
+        state: ConversationState,
         project_id: str,
         slot_free: bool,
     ) -> str:
         """
         Persist the generated summary and update WindowManager metrics.
 
-        Steps:
-            1.  Derive the new high-water mark from the evicted turn numbers.
-            2.  Build a summary entry with full metadata and append it to
-                conversation_summaries.
-            3.  Apply the L1 cap, keeping only the most recent
-                max_conversation_summaries entries at level 1.
-            4.  Advance summarized_turn_hwm.
-            5.  Update all WindowManager instrumentation flags and token-freed counter.
-            6.  Persist the summary to LTM.
-            7.  Attempt L1→L2 consolidation when enough L1 summaries accumulate.
-            8.  Emit the Phase 2 KV-freeze signal via _on_frontier_advance,
-                passing project_id explicitly to avoid the singleton-valve bug.
-            9.  Persist the updated ConversationState.
+        Args:
+            summary_text: The summary text to store.
+            old_msgs: Messages that were evicted from the window.
+            turns: Turn numbers for every message in ``history``.
+            history: Full history list (system messages excluded).
+            state: ConversationState to update.
+            project_id: Current project identifier.
+            slot_free: Whether the LLM slot is free (governs consolidation).
+
+        Returns:
+            The formatted ``pending_summary`` string for injection into the
+            reassembled message list.
         """
         v = self._f.valves
         old_hwm = state.summarized_turn_hwm
 
-        # -- Step 1: derive new high-water mark --
+        # ── Compute the new high-water mark from evicted turn numbers ─────────────
         old_turn_nums = [t for m, t in zip(history, turns) if m in old_msgs]
         new_hwm = max(old_turn_nums) if old_turn_nums else old_hwm
 
-        # -- Step 2: build and append summary entry --
+        # ── Build summary entry with unified metadata ──────────────────────────────
         summary_entry = {
             "text": summary_text,
             "created_at": time.time(),
@@ -26117,7 +24522,7 @@ class WindowManager:
         }
         state.conversation_summaries.append(summary_entry)
 
-        # -- Step 3: apply L1 cap --
+        # ── Apply L1 cap ──────────────────────────────────────────────────────────
         max_l1 = v.max_conversation_summaries
         if max_l1 > 0:
             l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
@@ -26128,6 +24533,7 @@ class WindowManager:
                     for s in state.conversation_summaries
                     if s.get("level", 1) != 1 or id(s) in keep_ids
                 ]
+
             l1_after = [
                 s for s in state.conversation_summaries if s.get("level", 1) == 1
             ]
@@ -26136,29 +24542,30 @@ class WindowManager:
                 f"summaries retained"
             )
 
-        # -- Step 4: advance HWM --
+        # ── Advance the high-water mark ────────────────────────────────────────────
         state.summarized_turn_hwm = new_hwm
 
-        # -- Step 5: update WindowManager metrics --
+        # ── Update WindowManager instrumentation metrics ───────────────────────────
         state.wm_fired = True
         state.wm_summary_ok = True
         state.wm_msgs_evicted = len(old_msgs)
         state.wm_tokens_freed = sum(
             self._token_count(m.get("content", "")) for m in old_msgs
         )
+
         self._f._log_debug(
             f"WindowManager: summary stored — "
             f"{len(old_msgs)} msg(s) evicted, "
             f"~{state.wm_tokens_freed} tokens freed, "
-            f"HWM {old_hwm}→{new_hwm}"
+            f"HWM {old_hwm} → {new_hwm}"
         )
 
-        # -- Step 6: persist to LTM --
+        # ── Persist summary to LTM ────────────────────────────────────────────────
         await self._f._message_assembler._persist_turn_summary_to_ltm(
             summary_text, project_id, old_hwm + 1, new_hwm
         )
 
-        # -- Step 7: L1→L2 consolidation --
+        # ── Consolidate L1 → L2 when enough summaries have accumulated ────────────
         l1_count = sum(
             1 for s in state.conversation_summaries if s.get("level", 1) == 1
         )
@@ -26171,10 +24578,10 @@ class WindowManager:
                 state, project_id, slot_free
             )
 
-        # -- Step 8: Phase 2 KV-freeze --
+        # ── Bug 13 fix: pass project_id explicitly instead of reading from singleton
         self._on_frontier_advance(old_hwm, new_hwm, project_id)
 
-        # -- Step 9: persist state --
+        # ── Persist conversation state ────────────────────────────────────────────
         self._f._conversation_state_manager.set(project_id, state)
 
         return f"[Summary of earlier conversation]\n{summary_text}"
@@ -26183,36 +24590,36 @@ class WindowManager:
     # 4. Seams and static helpers
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _on_frontier_advance(
-        self,
-        old_hwm: int,
-        new_hwm: int,
-        project_id: str,
-    ) -> None:
+    def _on_frontier_advance(self, old_hwm: int, new_hwm: int, project_id: str) -> None:
         """
-        Phase 2 KV-freeze: save the KV slot immediately after history eviction.
-
-        When WindowManager evicts turns and generates a summary, the pre-frontier
-        history tokens disappear from context. Saving the slot at this point
-        captures the KV state with the new stabilised prefix (Block A + summary)
-        so the next request can restore from that checkpoint instead of
+        Phase-2 KV-freeze hook: save the slot immediately after history eviction
+        so the next request restores from the new stabilized prefix rather than
         re-prefilling from scratch.
 
-        force=True bypasses the static-hash guard: the history changed but Block A
-        did not, so the structure hash is unchanged and without force the slot would
-        be silently skipped.
+        Called from ``_persist`` after a successful summary is generated and the
+        frontier HWM is advanced.  ``force=True`` bypasses the static-hash guard
+        because the history changed even though Block A did not.
 
-        Receives project_id explicitly. The original code read valves.project_id
-        inside this method, which captures the wrong project when multiple projects
-        are served concurrently.
+        Bug 13 fix: the previous implementation called ``get_project_id()`` which
+        returns ``valves.project_id`` (a singleton).  In multi-project scenarios
+        this caused the slot to be saved for the wrong project.  The correct
+        ``project_id`` is now received as an explicit parameter from ``_persist``.
+
+        Args:
+            old_hwm: Summarized-turn high-water mark before this advance.
+            new_hwm: New summarized-turn high-water mark after this advance.
+            project_id: The project whose KV slot should be saved.
         """
         if old_hwm >= new_hwm:
-            return
+            return  # No real advance — nothing to freeze
 
         self._f._log_debug(
-            f"Phase 2 KV-freeze: frontier advanced hwm {old_hwm}→{new_hwm} "
-            f"for project '{project_id}', scheduling slot_save(force=True)"
+            f"Phase-2 KV-freeze: frontier advanced hwm {old_hwm}→{new_hwm}, "
+            "scheduling slot_save(force=True)"
         )
+
+        # asyncio.create_task is safe here because _on_frontier_advance is always
+        # called from _persist(), which is a coroutine running inside the event loop.
         asyncio.create_task(
             self._f._project_state_manager.slot_save(project_id, force=True)
         )
@@ -26281,7 +24688,7 @@ class MessageAssembler:
         prelim_system: str,
         last_user_msg: Optional[dict],
         is_code_session: bool,
-        state: "ConversationState",
+        state: ConversationState,
         __user__: Optional[dict],
         user_question: str,
         has_code_blocks: bool,
@@ -26289,146 +24696,104 @@ class MessageAssembler:
         is_continuation: bool = False,
     ) -> List[dict]:
         """
-        Assemble the final message list sent to the LLM, injecting system
-        context, CoT reasoning, multi-phase instructions, and history
-        compression stubs.
+        Orchestrate CoT, multi-phase, trimming, and final assembly.
 
-        dynamic_injections is mutated in place by _detect_and_generate_cot
-        and _inject_multi_phase_instructions (both append to it). This is
-        intentional and documented: the caller (ContextAssembler) does not
-        use dynamic_injections after this call returns.
+        Args:
+            messages: Current list of conversation messages.
+            project_id: Project identifier.
+            static_block: Rendered Block A (static, KV-cacheable).
+            dynamic_injections: List of (priority, text) dynamic content.
+            prelim_system: Preliminary system prompt (Block A + Block B).
+            last_user_msg: Last user message, if any.
+            is_code_session: Whether the session is code-aware.
+            state: ConversationState for the project.
+            __user__: User context from OpenWebUI.
+            user_question: Extracted question from the user message.
+            has_code_blocks: Whether the user message contained code fences.
+            slot_busy: Whether the LLM slot is busy.
+            is_continuation: True only for genuine AutoContinue.
 
-        Steps:
-            1.  Apply code history compression and LLMlingua.
-            2.  Re-resolve last_user_msg from the compressed messages list.
-            3.  Detect and generate CoT; skip injection when reasoning empty.
-            4.  Inject multi-phase instructions (guarded against None
-                last_user_msg).
-            5.  Assemble final system prompt and return.
+        Returns:
+            Final list of messages ready for the LLM.
         """
+        self._f._log_debug(
+            "Assembling final messages (CoT, trimming, system prompt injection)"
+        )
+
         slot_free = not slot_busy
 
-        # -- Step 1: history compression --
-        try:
-            messages = await self._compress_code_history_and_lean(
-                messages=messages,
-                project_id=project_id,
-                dynamic_injections=dynamic_injections,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"MessageAssembler.assemble: compression failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
-
-        if (
-            slot_free
-            and self._f.valves.enable_llmlingua
-            and getattr(self._f, "_llmlingua_compressor", None)
-        ):
-            try:
-                messages = await self._apply_history_llmlingua(
-                    messages=messages,
-                    project_id=project_id,
-                    user_question=user_question,
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"MessageAssembler.assemble: llmlingua failed for "
-                    f"'{project_id}': {type(e).__name__}: {e}"
-                )
-
-        # -- Step 2: re-resolve last_user_msg after compression --
-        effective_last_user = next(
-            (m for m in reversed(messages) if m.get("role") == "user"),
-            None,
+        # ------------------------------------------------------------------
+        # Step 1: CoT detection and generation.
+        # ------------------------------------------------------------------
+        await self._detect_and_generate_cot(
+            dynamic_injections,
+            last_user_msg,
+            is_code_session,
+            state,
+            user_question,
+            prelim_system,
+            project_id,
+            is_continuation,
+            slot_free,
+            messages,
         )
-        if effective_last_user is None and last_user_msg is not None:
-            # All user messages were compressed away — append a recovery stub
-            # so the LLM always receives a user turn.
+
+        # ------------------------------------------------------------------
+        # Step 2: Code history compression + lean user code.
+        # ------------------------------------------------------------------
+        messages = await self._compress_code_history_and_lean(
+            messages, project_id, dynamic_injections
+        )
+
+        # ------------------------------------------------------------------
+        # Step 3: History LLMLingua compression.
+        # ------------------------------------------------------------------
+        messages = await self._apply_history_llmlingua(
+            messages, project_id, user_question
+        )
+
+        # ------------------------------------------------------------------
+        # Step 4: WindowManager – unified history window policy.
+        # ------------------------------------------------------------------
+        messages, pending_summary = await self._window_manager.apply(
+            messages, state, project_id, slot_free
+        )
+
+        # ------------------------------------------------------------------
+        # Step 4b: Inject pending_summary if present (Bug 16).
+        # ------------------------------------------------------------------
+        if pending_summary:
             self._f._log_debug(
-                f"MessageAssembler.assemble: all user messages compressed "
-                f"for '{project_id}', re-appending last user message"
+                f"WindowManager: injecting {len(pending_summary)} char summary "
+                f"into message history"
             )
-            stub = {
-                "role": "user",
-                "content": last_user_msg.get("content", user_question) or user_question,
-            }
-            messages.append(stub)
-            effective_last_user = stub
+            # Inject the summary as a system message at the front of the history.
+            # This ensures the model sees it before the current conversation.
+            messages.insert(0, {"role": "system", "content": pending_summary})
+        elif pending_summary is not None:
+            self._f._log_debug("WindowManager: pending_summary empty, not injecting")
 
-        # -- Step 3: CoT detection and generation --
-        try:
-            await self._detect_and_generate_cot(
-                dynamic_injections=dynamic_injections,
-                last_user_msg=effective_last_user,
-                is_code_session=is_code_session,
-                state=state,
-                user_question=user_question,
-                prelim_system=prelim_system,
-                project_id=project_id,
-                is_continuation=is_continuation,
-                slot_free=slot_free,
-                messages=messages,
-            )
-            # Filter empty CoT injections (Bug 86)
-            dynamic_injections[:] = [
-                (label, content)
-                for label, content in dynamic_injections
-                if content and content.strip()
-            ]
-        except Exception as e:
-            self._f._log_debug(
-                f"MessageAssembler.assemble: CoT generation failed for "
-                f"'{project_id}': {type(e).__name__}: {e}"
-            )
+        # ------------------------------------------------------------------
+        # Step 5: Multi-phase instructions injection.
+        # ------------------------------------------------------------------
+        await self._inject_multi_phase_instructions(
+            dynamic_injections,
+            prelim_system,
+            messages,
+            user_question,
+            slot_free,
+            is_continuation,
+            project_id,
+        )
 
-        # -- Step 4: multi-phase instructions --
-        if effective_last_user is not None:
-            try:
-                await self._inject_multi_phase_instructions(
-                    dynamic_injections=dynamic_injections,
-                    prelim_system=prelim_system,
-                    messages=messages,
-                    user_question=user_question,
-                    slot_free=slot_free,
-                    is_continuation=is_continuation,
-                    project_id=project_id,
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"MessageAssembler.assemble: multi-phase injection failed "
-                    f"for '{project_id}': {type(e).__name__}: {e}"
-                )
-        else:
-            self._f._log_debug(
-                f"MessageAssembler.assemble: skipping multi-phase injection "
-                f"— no user message in compressed history for '{project_id}'"
-            )
+        # ------------------------------------------------------------------
+        # Step 6: Assemble final system message and inject.
+        # ------------------------------------------------------------------
+        messages = self._assemble_final_system_and_log(
+            static_block, dynamic_injections, messages, project_id, ""
+        )
 
-        # -- Step 5: assemble final system and return --
-        pending_summary = ""
-        summaries = getattr(state, "conversation_summaries", [])
-        if summaries:
-            latest = max(summaries, key=lambda s: s.get("covers_turns", [0, 0])[0])
-            pending_summary = latest.get("text", "")
-
-        try:
-            final_messages = self._assemble_final_system_and_log(
-                static_block=static_block,
-                dynamic_injections=dynamic_injections,
-                messages=messages,
-                project_id=project_id,
-                pending_summary=pending_summary,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"MessageAssembler.assemble: final assembly failed for "
-                f"'{project_id}': {type(e).__name__}: {e} — returning as-is"
-            )
-            final_messages = messages
-
-        return final_messages
+        return messages
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Chain‑of‑Thought (CoT) detection and generation
@@ -26963,82 +25328,36 @@ class MessageAssembler:
         dynamic_injections: List[Tuple[str, str]],
     ) -> List[dict]:
         """
-        Replace code-dump assistant messages with commit-summary stubs and
-        optionally apply LLMlingua token reduction on the resulting history.
-
-        The compression-applied note is only added to dynamic_injections when
-        at least one message was actually replaced by a commit stub. Injecting
-        the note before confirming success would cause the model to reason as
-        if history were compressed when it is not.
-
-        Steps:
-            1.  Run compress_code_history; count how many messages changed.
-            2.  Add compression note to dynamic_injections only on confirmed change.
-            3.  If llmlingua is available and slot is free, apply token reduction.
-            4.  Return the (possibly compressed) messages list.
+        Apply code history compression and lean user code if enabled.
         """
-        # -- Step 1: run commit-summary compression --
-        try:
-            compressed = await self._f._history_compressor.compress_code_history(
-                messages=messages,
-                project_id=project_id,
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"_compress_code_history_and_lean: compress_code_history failed "
-                f"for '{project_id}': {type(e).__name__}: {e}"
-            )
-            compressed = messages
-
-        # Count actual replacements by comparing content hashes
-        original_contents = {id(m): m.get("content", "") for m in messages}
-        compressed_count = sum(
-            1
-            for orig, comp in zip(messages, compressed)
-            if comp.get("content", "") != original_contents.get(id(orig), "")
-        )
-
-        # -- Step 2: inject note only on confirmed change --
-        if compressed_count > 0:
-            dynamic_injections.append(
-                (
-                    "History",
-                    f"_{compressed_count} earlier code block(s) have been "
-                    f"replaced with commit summaries to save context. "
-                    f"Request /expand <name> to see any symbol in full._",
-                )
-            )
-            self._f._log_debug(
-                f"_compress_code_history_and_lean: {compressed_count} "
-                f"message(s) compressed for '{project_id}'"
-            )
-        else:
-            self._f._log_debug(
-                f"_compress_code_history_and_lean: no messages eligible "
-                f"for compression in '{project_id}'"
-            )
-
-        result = compressed
-
-        # -- Step 3: optional llmlingua pass --
-        if (
-            getattr(self._f.valves, "enable_llmlingua", False)
-            and getattr(self._f, "_llmlingua_compressor", None) is not None
+        if not (
+            self._f.valves.enable_code_history_compression
+            or self._f.valves.enable_lean_user_code
         ):
-            try:
-                result = await self._apply_history_llmlingua(
-                    messages=result,
-                    project_id=project_id,
-                    user_question="",
-                )
-            except Exception as e:
-                self._f._log_debug(
-                    f"_compress_code_history_and_lean: llmlingua failed "
-                    f"for '{project_id}': {type(e).__name__}: {e} — using commit-compressed"
-                )
+            return messages
 
-        # -- Step 4: return --
-        return result
+        if self._f.valves.enable_code_history_compression:
+            messages = await self._f._history_compressor.compress_code_history(
+                messages, project_id
+            )
+
+        if self._f.valves.enable_lean_user_code:
+            state = self._f._conversation_state_manager.get(project_id)
+            messages = self._f._history_compressor.ensure_compressed_user_messages(
+                messages, state, project_id
+            )
+
+        _refactor_state = self._f._history_compressor.build_refactor_state_injection(
+            messages
+        )
+        if _refactor_state:
+            dynamic_injections.append(("medium", _refactor_state))
+            self._f._log_debug(
+                "Code history: injected refactor state into Block B "
+                f"({self._f._tokens.estimate_code_tokens(_refactor_state)} tokens)."
+            )
+
+        return messages
 
     async def _apply_history_llmlingua(
         self,
@@ -27214,81 +25533,59 @@ class MessageAssembler:
 
     async def _consolidate_summaries(
         self,
-        state: "ConversationState",
+        state: ConversationState,
         project_id: str,
         slot_free: bool,
     ) -> None:
         """
-        Merge accumulated L1 summaries into L2 (hierarchical compression).
-
-        Called from _persist after WindowManager evicts a batch of messages,
-        when the number of L1 summaries reaches hierarchical_summary_group_size.
-
-        Atomic replacement guarantee: a batch of L1 summaries is removed from
-        conversation_summaries only when _merge_summaries returns a non-None
-        merged L2 entry. If the LLM call fails, the L1 summaries are preserved
-        unchanged so no conversation context is silently lost.
-
-        Only one batch is consolidated per call. Repeated calls (one per
-        WindowManager eviction) drain the L1 queue incrementally.
-
-        Steps:
-            1.  Collect all L1 summaries; exit when below group_size threshold.
-            2.  Select the oldest batch up to group_size.
-            3.  Attempt merge; return immediately on failure without modifying state.
-            4.  Atomic swap: remove batch entries, append merged L2 entry.
-            5.  Mark state dirty and log.
+        Consolidate L1 summaries into L2 and apply level-aware cap.
         """
-        v = self._f.valves
-        group_size = v.hierarchical_summary_group_size
-
-        # -- Step 1: collect L1 summaries --
-        l1_entries = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
-        if len(l1_entries) < group_size:
+        summaries = state.conversation_summaries
+        if not summaries:
             return
 
-        # -- Step 2: select oldest batch --
-        batch = sorted(
-            l1_entries,
-            key=lambda s: s.get("covers_turns", [0, 0])[0],
-        )[:group_size]
-
-        self._f._log_debug(
-            f"_consolidate_summaries: merging {len(batch)} L1 → L2 "
-            f"for '{project_id}'"
-        )
-
-        # -- Step 3: attempt merge -- CRITICAL: do not touch state on failure --
-        try:
-            merged = await self._merge_summaries(batch)
-        except Exception as e:
-            self._f._log_debug(
-                f"_consolidate_summaries: _merge_summaries raised for "
-                f"'{project_id}': {type(e).__name__}: {e} — L1 entries preserved"
+        if slot_free and self._f.valves.enable_hierarchical_summaries:
+            group = self._f.valves.hierarchical_summary_group_size
+            l1 = sorted(
+                (s for s in summaries if s.get("level", 1) == 1),
+                key=WindowManager._summary_sort_key,
             )
-            return
+            l2plus = [s for s in summaries if s.get("level", 1) >= 2]
+            if len(l1) >= group:
+                oldest = l1[:group]
+                merged = await self._merge_summaries(oldest)
+                if merged:
+                    summaries = l2plus + [merged] + l1[group:]
+                    self._f._log_debug(
+                        f"Hierarchical: folded {group} L1 summaries into one L2 "
+                        f"covering turns {merged['covers_turns'][0]}–"
+                        f"{merged['covers_turns'][1]}."
+                    )
+                else:
+                    self._f._log_debug(
+                        "Hierarchical: L2 merge failed; L1 summaries kept "
+                        "(no-degradation guard)."
+                    )
 
-        if merged is None:
-            self._f._log_debug(
-                f"_consolidate_summaries: _merge_summaries returned None for "
-                f"'{project_id}' — L1 entries preserved, will retry next eviction"
-            )
-            return
-
-        # -- Step 4: atomic swap --
-        batch_ids = {id(s) for s in batch}
-        state.conversation_summaries = [
-            s for s in state.conversation_summaries if id(s) not in batch_ids
-        ]
-        state.conversation_summaries.append(merged)
-
-        # -- Step 5: mark dirty and log --
-        self._f._conversation_state_manager.mark_dirty(project_id)
-        self._f._log_debug(
-            f"_consolidate_summaries: L1→L2 merge OK for '{project_id}' "
-            f"(removed {len(batch)} L1, added 1 L2, "
-            f"total={len(state.conversation_summaries)} summaries remaining)"
+        max_l1 = self._f.valves.max_conversation_summaries
+        max_l2 = self._f.valves.max_hierarchical_summaries
+        l1 = sorted(
+            (s for s in summaries if s.get("level", 1) == 1),
+            key=WindowManager._summary_sort_key,
         )
+        l2 = sorted(
+            (s for s in summaries if s.get("level", 1) >= 2),
+            key=WindowManager._summary_sort_key,
+        )
+        if max_l1 > 0:
+            l1 = l1[-max_l1:]
+        if max_l2 > 0:
+            l2 = l2[-max_l2:]
+        state.conversation_summaries = sorted(
+            l2 + l1,
+            key=WindowManager._summary_sort_key,
+        )
+        self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 5. Multi‑phase instructions injection (MIGRADO)
@@ -27591,89 +25888,59 @@ class ContextAssembler:
         intent_vector: Optional[dict] = None,
     ) -> Tuple[List[dict], Optional[dict]]:
         """
-        Top-level context assembly coordinator for a single turn.
+        Execute the full context assembly pipeline for one turn.
 
-        Delegates to SystemPromptBuilder, WindowManager, and MessageAssembler
-        in sequence. Returns (assembled_messages, cached_response_or_None).
+        Phase 1: Build Block A + Block B injections via SystemPromptBuilder.
+        Phase 2: Assemble the final message list via MessageAssembler.
 
-        slot_busy is re-evaluated after slot_restore_for_continuity to capture
-        any restore that completed between when inlet computed the flag and when
-        assembly starts. Using the stale flag from inlet causes the current turn
-        to run all expensive operations (CoT, semantic filters, compressor) even
-        though the KV cache is now warm, wasting latency.
+        Args:
+            messages: Current conversation message list.
+            project_id: Current project identifier.
+            user_query: Raw user query string.
+            user_question: Cleaned user question (code spans removed).
+            is_code_session: Whether the session involves code.
+            last_user_msg: The last user message dict, if any.
+            state: The persistent ConversationState for this project.
+            __user__: OpenWebUI user context.
+            has_code_blocks: Whether the user message contained code fences.
+            slot_busy: True if the KV slot is occupied (cold-start or
+                background tasks active).
+            is_continuation: True only for genuine AutoContinue turns
+                (the 'triangle CONTINUA:' marker was present in the last
+                assistant message).
+            intent_vector: Intent classification probabilities dict.
 
-        On cache hit, ConversationState is persisted before returning so that
-        symbol indexing done in _update_active_code is not lost if the process
-        crashes before the next non-cached turn triggers a save.
-
-        Steps:
-            1.  Re-evaluate slot_busy after any in-progress restore completes.
-            2.  Build static (Block A) and dynamic context via SystemPromptBuilder.
-            3.  On cache hit: persist state and return early.
-            4.  Apply WindowManager to enforce token budget.
-            5.  Assemble final message list via MessageAssembler.
-            6.  Return (assembled_messages, None).
+        Returns:
+            Tuple of (final_messages, cached_response).
+            If cached_response is not None, the caller should short-circuit
+            and return the cached response without calling the LLM.
         """
-        psm = self._f._project_state_manager
-
-        # -- Step 1: re-evaluate slot_busy --
-        # slot_restore_for_continuity may have completed between inlet's call and
-        # now. Re-read the flag to get the accurate post-restore value.
-        slot_busy = psm.get_slot_restored(project_id)
-        slot_free = not slot_busy
-
-        # -- Step 2: build system prompt and dynamic context --
-        (
-            static_block,
-            dynamic_injections,
-            cached_response,
-            use_case_label,
-        ) = await self._f._system_prompt_builder.build(
-            messages=messages,
-            project_id=project_id,
-            user_query=user_query,
-            user_question=user_question,
-            is_code_session=is_code_session,
-            last_user_msg=last_user_msg,
-            state=state,
-            slot_busy=slot_busy,
-            is_continuation=is_continuation,
-            intent_vector=intent_vector,
+        # -- Phase 1: Build system injections (Block A + Block B) ----------
+        static_block, dynamic_injections, cached_response, prelim_system = (
+            await self._f._system_prompt_builder.build(
+                messages=messages,
+                project_id=project_id,
+                user_query=user_query,
+                user_question=user_question,
+                is_code_session=is_code_session,
+                last_user_msg=last_user_msg,
+                state=state,
+                slot_busy=slot_busy,
+                is_continuation=is_continuation,
+                intent_vector=intent_vector,
+            )
         )
 
-        # -- Step 3: cache hit fast path --
         if cached_response:
-            # Persist dirty state so symbol indexing from _update_active_code
-            # is not lost if the process crashes before the next non-cached turn.
-            try:
-                await self._f._conversation_state_manager.save_if_dirty(project_id)
-            except Exception as e:
-                self._f._log_debug(
-                    f"assemble_for_turn: save_if_dirty failed on cache hit "
-                    f"for '{project_id}': {e}"
-                )
-            self._f._log_debug(
-                f"assemble_for_turn: cache hit for '{project_id}', " f"returning early"
-            )
             return messages, cached_response
 
-        # -- Step 4: WindowManager --
-        windowed_messages, pending_summary = await self._f._window_manager.apply(
+        # -- Phase 2: Assemble final messages (CoT, compression, trimming) -
+        final_messages = await self._f._message_assembler.assemble(
             messages=messages,
-            state=state,
-            project_id=project_id,
-            slot_free=slot_free,
-        )
-
-        # -- Step 5: MessageAssembler --
-        assembled, metadata = await self._f._message_assembler.assemble(
-            messages=windowed_messages,
             project_id=project_id,
             static_block=static_block,
             dynamic_injections=dynamic_injections,
-            prelim_system=self._f._system_prompt_builder._assemble_prelim_system(
-                static_block, "", dynamic_injections, windowed_messages
-            ),
+            prelim_system=prelim_system,
             last_user_msg=last_user_msg,
             is_code_session=is_code_session,
             state=state,
@@ -27684,8 +25951,21 @@ class ContextAssembler:
             is_continuation=is_continuation,
         )
 
-        # -- Step 6: return --
-        return assembled, None
+        # -- Validate active_blocks integrity after assembly ---------------
+        # ConversationState.active_blocks must always be a dict. If corrupted
+        # during assembly (e.g. failed DB load), reset it here so the inlet
+        # never returns an invalid state to the LLM.
+        _state = self._f._conversation_state_manager.get(project_id)
+        if not isinstance(_state.active_blocks, dict):
+            self._f._log_debug(
+                "CRITICAL: active_blocks corrupted after assembly; "
+                "resetting to empty. Delete %s if this recurs."
+                % self._f.valves.state_db_path
+            )
+            _state.active_blocks = {}
+            self._f._conversation_state_manager.set(project_id, _state)
+
+        return final_messages, None
 
 
 # ---------------------------------------------------------------------------
@@ -27732,6 +26012,7 @@ class ContextDumper:
 
     def schedule_inlet_snapshot(
         self,
+        *,
         project_id: str,
         static_block: str,
         dynamic_block: str,
@@ -27739,56 +26020,37 @@ class ContextDumper:
         messages: List[dict],
     ) -> None:
         """
-        Schedule an async dump of the assembled context payload for debugging.
+        Capture the snapshot payload now and offload the write to a task.
 
-        Fire-and-forget: the dump must never block the inlet/outlet path or
-        propagate exceptions that abort the user-visible response.
+        Called from a synchronous context inside the async inlet, so a running
+        loop exists; if it does not (unexpected), fall back to a blocking write.
 
-        RuntimeError from asyncio.ensure_future (event loop not running or
-        closed during server shutdown/reload) is caught and logged at debug
-        level. All other exceptions are caught for the same reason.
-
-        Steps:
-            1.  Capture the payload synchronously before returning to the caller.
-            2.  Schedule _write_async; handle event-loop errors gracefully.
+        Args:
+            project_id: The project identifier.
+            static_block: The rendered Block A (static, KV-cacheable).
+            dynamic_block: The rendered Block B (dynamic, per-query).
+            final_system: The fully assembled system prompt.
+            messages: The final message list sent to the LLM.
         """
-        if not getattr(self._f.valves, "enable_context_dump", False):
+        if not self._f.valves.enable_context_dump:
             return
 
-        # -- Step 1: capture payload --
-        try:
-            payload = self._capture_payload(
-                project_id, static_block, dynamic_block, final_system, messages
-            )
-        except Exception as e:
-            self._f._log_debug(
-                f"ContextDumper.schedule_inlet_snapshot: capture failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return
+        self._f._log_debug(f"📸 Scheduling context dump for project '{project_id}'")
 
-        # -- Step 2: schedule write --
+        payload = self._capture_payload(
+            project_id, static_block, dynamic_block, final_system, messages
+        )
         try:
-            asyncio.ensure_future(self._write_async(payload))
-        except RuntimeError as e:
-            # Event loop not running or already closed (e.g. server reload).
-            # Fall back to synchronous write so the dump is not lost entirely.
-            self._f._log_debug(
-                f"ContextDumper.schedule_inlet_snapshot: ensure_future failed "
-                f"({e}), falling back to sync write"
-            )
+            task = asyncio.create_task(self._write_async(payload))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except RuntimeError:
+            # No running event loop — write inline (best effort).
+            self._f._log_debug("No event loop, writing context dump inline")
             try:
                 self._write_sync(payload)
-            except Exception as e2:
-                self._f._log_debug(
-                    f"ContextDumper.schedule_inlet_snapshot: sync write also "
-                    f"failed: {type(e2).__name__}: {e2}"
-                )
-        except Exception as e:
-            self._f._log_debug(
-                f"ContextDumper.schedule_inlet_snapshot: unexpected error: "
-                f"{type(e).__name__}: {e}"
-            )
+            except Exception as exc:
+                self._f._log_debug(f"Context dump inline write failed: {exc}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Payload capture (sync, cheap, mutation‑safe) – MODIFIED (M7)
@@ -28165,60 +26427,29 @@ class ContextDumper:
 
     def _prune(self, project_dir: str) -> None:
         """
-        Remove dump files beyond the configured retention limit to prevent
-        unbounded disk growth.
+        Prune old snapshots, keeping only the most recent ones.
 
-        Silently returns when the project directory does not yet exist (first
-        request for this project) or when retention is unlimited (max_dumps <= 0).
-
-        Steps:
-            1.  Resolve retention limit from valves; skip when unlimited.
-            2.  Guard: return if directory does not exist.
-            3.  Collect all .md dump files sorted by modification time (oldest first).
-            4.  Remove files beyond the retention limit.
+        Args:
+            project_dir: The project directory containing snapshots.
         """
-        # -- Step 1: retention limit --
-        max_dumps = getattr(self._f.valves, "context_dump_max_files", 20)
-        if max_dumps <= 0:
+        keep = self._f.valves.context_dump_max_files_per_project
+        if keep <= 0:
             return
-
-        # -- Step 2: directory existence guard --
-        if not os.path.isdir(project_dir):
-            return
-
-        # -- Step 3: collect files sorted oldest-first --
         try:
-            entries = [
-                os.path.join(project_dir, fn)
-                for fn in os.listdir(project_dir)
-                if fn.endswith(".md")
-            ]
-        except OSError as e:
-            self._f._log_debug(f"ContextDumper._prune: listing failed: {e}")
-            return
-
-        if len(entries) <= max_dumps:
-            return
-
-        entries.sort(key=lambda p: os.path.getmtime(p))
-        to_remove = entries[: len(entries) - max_dumps]
-
-        # -- Step 4: remove stale files --
-        removed = 0
-        for path in to_remove:
-            try:
-                os.unlink(path)
-                removed += 1
-            except OSError as e:
-                self._f._log_debug(
-                    f"ContextDumper._prune: could not remove {path}: {e}"
-                )
-
-        if removed:
-            self._f._log_debug(
-                f"ContextDumper._prune: removed {removed} old dump(s) "
-                f"from {project_dir}"
+            # Find all snapshots with the new format: XXXX_turn_...md
+            snapshots = sorted(
+                f
+                for f in os.listdir(project_dir)
+                if re.match(r"^\d{4}_turn_\d+\.md$", f)
             )
+        except Exception:
+            return
+        excess = len(snapshots) - keep
+        for fname in snapshots[: max(0, excess)]:
+            try:
+                os.remove(os.path.join(project_dir, fname))
+            except Exception:
+                pass
 
 
 class TaskRegistry:
@@ -28425,72 +26656,48 @@ class TaskRegistry:
     # Region: Lazy Task Execution (inlet)
     # ------------------------------------------------------------------
 
-    async def run_lazy_tasks(
-        self,
-        project_id: str,
-        pstate: dict,
-    ) -> None:
+    async def run_lazy_tasks(self, project_id: str, pstate: dict) -> None:
         """
-        Execute all pending lazy tasks for the current turn in priority order.
+        Execute lazy versions of all tasks that are not completed and
+        have their lazy valve enabled.
 
-        Lazy tasks are best-effort: a failure in one must never prevent
-        subsequent tasks from running. Each task is wrapped in an independent
-        try/except so that an exception from, for example, _lazy_raptor
-        (ChromaDB unavailable, embedding model not loaded) does not silently
-        drop docstring generation, LOD updates, or purge runs for that turn.
+        This is called at the beginning of the inlet, after background tasks
+        have been stopped.
 
-        Tasks that raise are marked not-completed so they will be retried
-        on the next turn rather than being silently skipped forever.
-
-        Steps:
-            1.  Collect tasks ordered by effective priority; skip completed ones.
-            2.  For each task: mark in-progress, execute, mark completed or
-                not-completed on exception.
-            3.  Log a summary of what ran and what failed.
+        Args:
+            project_id: The current project identifier.
+            pstate: The per-project volatile state.
         """
-        # -- Step 1: collect pending tasks sorted by priority --
-        pending = [
-            t
-            for t in self.get_background_tasks()
-            if not t.should_skip_lazy(pstate, project_id)
-        ]
+        for task in self._bg_tasks:
+            # ------------------------------------------------------------------
+            # Step 1: Skip if no lazy function.
+            # ------------------------------------------------------------------
+            if task.lazy_func is None:
+                continue
 
-        if not pending:
-            return
+            # ------------------------------------------------------------------
+            # Step 2: Check lazy valve.
+            # ------------------------------------------------------------------
+            valve_name = task.valve_lazy
+            if valve_name and not getattr(self._f.valves, valve_name, True):
+                continue
 
-        self._f._log_debug(
-            f"run_lazy_tasks: {len(pending)} pending task(s) for '{project_id}': "
-            f"{[t.name for t in pending]}"
-        )
+            # ------------------------------------------------------------------
+            # Step 3: Skip if completed and allowed.
+            # ------------------------------------------------------------------
+            if task.should_skip_lazy(pstate, project_id):
+                continue
 
-        completed_names: List[str] = []
-        failed_names: List[str] = []
-
-        # -- Steps 2-3: run each task independently --
-        for task in pending:
-            task.mark_in_progress(pstate)
+            # ------------------------------------------------------------------
+            # Step 4: Execute the lazy function.
+            # ------------------------------------------------------------------
             try:
                 await task.lazy_func(project_id)
                 task.mark_completed(pstate, project_id)
-                completed_names.append(task.name)
-            except asyncio.CancelledError:
-                # Propagate cancellation — do not swallow it.
-                task.mark_not_completed(pstate)
-                raise
+                self._f._log_debug(f"lazy task '{task.name}': completed")
             except Exception as e:
-                # Log and continue — never let one task kill the rest.
+                self._f._log_debug(f"lazy task '{task.name}': FAILED — {e}")
                 task.mark_not_completed(pstate)
-                failed_names.append(task.name)
-                self._f._log_debug(
-                    f"run_lazy_tasks: task '{task.name}' failed for "
-                    f"'{project_id}': {type(e).__name__}: {e}"
-                )
-
-        if completed_names or failed_names:
-            self._f._log_debug(
-                f"run_lazy_tasks: done for '{project_id}' — "
-                f"ok={completed_names}, failed={failed_names}"
-            )
 
     # ------------------------------------------------------------------
     # Region: Background Task Wrappers (Bugs 8 and 13)
@@ -29050,12 +27257,6 @@ class ProjectStateManager:
         """
         self.get_pstate(project_id)["skeleton_tier_qids"] = qids
 
-    def set_skeleton_tier_qids(self, project_id: str, qids: List[str]) -> None:
-        """
-        Store the qualified ids rendered in the skeleton tier.
-        """
-        self.get_pstate(project_id)["skeleton_tier_qids"] = qids
-
     def get_block_b_qids_this_turn(self, project_id: str) -> List[str]:
         """
         Return the qualified ids injected into Block B this turn.
@@ -29209,376 +27410,260 @@ class ProjectStateManager:
 
     async def slot_save(self, project_id: str, force: bool = False) -> bool:
         """
-        Persist Block A cache, ConversationState, and graph metadata to a slot
-        file for KV-cache warmup on the next request or session.
+        Save the KV slot after a turn.
 
-        The write is fully atomic: payload is written to a .tmp file, then
-        renamed over the target path with os.replace(). A process killed mid-write
-        leaves the .tmp file (cleaned up on next save) and the previously valid
-        slot file untouched. slot_restore therefore never reads a partial write.
+        force=True ignores the static-hash guard (used after monotonic
+        compaction, when the history prefix changed but Block A did not).
+        The token-threshold guard (P5) is always respected.
 
-        force=True bypasses the structure-hash equality guard. Used by
-        _on_frontier_advance after WindowManager evicts history without changing
-        Block A structure (hash unchanged, but KV prefix changed).
+        Uses the structural hash (signatures only) for the filename so
+        docstring population does not cause slot file proliferation.
 
-        Steps:
-            1.  Compute static_hash from current Block A structure.
-            2.  Skip if hash is unchanged and neither force nor pending_slot_resave.
-            3.  Build the serialisable slot payload.
-            4.  Atomic write: serialize to .tmp, then os.replace() to final path.
-            5.  Update last_saved_slot_hash and clear pending_slot_resave.
-            6.  Clean up slot files from previous hashes.
+        Args:
+            project_id: The project identifier.
+            force: Whether to force save even if the hash hasn't changed.
+
+        Returns:
+            bool: True if the slot was saved successfully.
         """
-        pstate = self.get_pstate(project_id)
-
-        # -- Step 1: compute static hash --
-        static_hash = self.get_structure_hash_for_cache(
-            project_id
-        ) or self._f._symbol_index.compute_structure_hash(project_id)
-        if not static_hash:
-            self._f._log_debug(
-                f"slot_save: skipping '{project_id}' — no structure hash yet"
-            )
+        if not self._f.valves.enable_slot_persistence:
             return False
 
-        # -- Step 2: redundant-save guard --
-        state = self._f._conversation_state_manager.get(project_id)
-        pending_resave = state.pending_slot_resave if state is not None else False
+        # --- 1. Resolve per-project state ---
+        pstate = self.get_pstate(project_id)
 
-        if not force and not pending_resave:
-            if self.get_last_saved_slot_hash(project_id) == static_hash:
+        # --- 2. Token threshold guard (skip oversized KV writes) ---
+        _max_ctx = self._f.valves.slot_save_max_context_tokens
+        if _max_ctx > 0:
+            _ctx_tok = self.get_last_total_context_tokens(project_id)
+            if _ctx_tok > _max_ctx:
                 self._f._log_debug(
-                    f"slot_save: skipping '{project_id}' — "
-                    f"hash unchanged ({static_hash[:8]})"
+                    f"Slot save skipped: context {_ctx_tok} tokens > threshold "
+                    f"{_max_ctx} (avoids large KV write under mutex)"
                 )
                 return False
 
-        # -- Step 3: build payload --
-        try:
-            slot_payload: Dict[str, Any] = {
-                "project_id": project_id,
-                "static_hash": static_hash,
-                "saved_at": time.time(),
-                "filter_version": getattr(self._f, "__version__", "unknown"),
-            }
+        # --- 3. Get the structural hash from pstate (set by build_block_a) ---
+        static_hash = self.get_structure_hash_for_cache(project_id)
+        if not static_hash:
+            cached = self.get_block_a_cached(project_id)
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                return False
 
-            if state is not None:
-                state_dict = state.dict()
-                # Inline content so slot file has no @@hash: references
-                raw_active: Dict[str, Any] = {}
-                for bh, blk in state.active_blocks.items():
-                    bd = blk.dict()
-                    bd["content"] = blk.content
-                    raw_active[bh] = bd
-                state_dict["active_blocks"] = raw_active
-                slot_payload["state"] = state_dict
-
-            slot_payload["block_a_cached"] = self.get_block_a_cached(project_id)
-            slot_payload["block_a_cache_key"] = self.get_block_a_cache_key(project_id)
-            slot_payload["skeleton_tier_cached"] = pstate.get("skeleton_tier_cached")
-            slot_payload["skeleton_tier_cache_key"] = pstate.get(
-                "skeleton_tier_cache_key"
-            )
-            slot_payload["skeleton_tier_qids"] = pstate.get("skeleton_tier_qids", [])
-            slot_payload["hub_tier_qids"] = self.get_hub_tier_qids(project_id)
-            slot_payload["node_centrality"] = self.get_node_centrality(project_id)
-
-        except Exception as e:
-            self._f._log_debug(
-                f"slot_save: serialisation error for '{project_id}': {e}"
-            )
+        # --- 4. Skip if already saved and not forced ---
+        if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
             return False
 
-        # -- Step 4: atomic write --
-        slot_path = self._slot_filename(project_id, static_hash)
-        tmp_path = slot_path + ".tmp"
+        # --- 5. Build filename and call llama.cpp API ---
+        filename = self._slot_filename(project_id, static_hash)
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
         try:
-            os.makedirs(os.path.dirname(slot_path), exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(slot_payload, fh, default=str)
-            os.replace(tmp_path, slot_path)
+            from shared_resources import get_http_session as _shared_get_http_session
+
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
+            )
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "save"},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
+            ) as resp:
+                if resp.status == 200:
+                    self.set_last_saved_slot_hash(project_id, static_hash)
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ Slot saved → {filename} "
+                        f"({data.get('n_saved', '?')} tokens, "
+                        f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
+                    )
+                    await self._cleanup_old_slot_files(project_id, filename)
+                    return True
+                else:
+                    body = await resp.text()
+                    self._f._log_debug(f"Slot save failed: HTTP {resp.status} — {body}")
+                    return False
         except Exception as e:
-            self._f._log_debug(f"slot_save: write failed for '{project_id}': {e}")
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._f._log_debug(f"Slot save error: {e}")
             return False
-
-        # -- Step 5: update tracking state --
-        self.set_last_saved_slot_hash(project_id, static_hash)
-        if state is not None and state.pending_slot_resave:
-            state.pending_slot_resave = False
-            self._f._conversation_state_manager.set(project_id, state)
-
-        self._f._log_debug(
-            f"slot_save: OK for '{project_id}' "
-            f"(hash={static_hash[:8]}, force={force})"
-        )
-
-        # -- Step 6: clean up stale slot files --
-        await self._cleanup_old_slot_files(project_id, keep=static_hash)
-
-        return True
 
     async def slot_restore(self, project_id: str) -> bool:
         """
-        Load the most recent valid slot file for this project and restore
-        ConversationState, SymbolIndex, and Block A / hub tier caches.
+        Restore the KV slot at session start.
 
-        The slot_restore_attempted flag is set before any awaitable operation.
-        This prevents a second concurrent inlet call from also entering restore
-        after reading the flag as False: since CPython's event loop is
-        single-threaded, setting the flag synchronously before the first await
-        guarantees the second coroutine sees True when it checks.
+        Uses the structural hash (signatures only) to locate the correct
+        slot file, ensuring that docstring population does not cause a miss.
 
-        When last_saved_slot_hash is empty (e.g. after a server restart that
-        cleared pstate), the method falls back to scanning the slot directory
-        for the newest matching file rather than silently returning False.
+        Args:
+            project_id: The project identifier.
 
-        Steps:
-            1.  Synchronously set slot_restore_attempted before first await.
-            2.  Resolve slot file path: use saved hash if available and the file
-                exists; otherwise scan the slot directory for the newest match.
-            3.  Read and validate the JSON payload.
-            4.  Restore ConversationState (active blocks, summaries, WM metrics).
-            5.  Rebuild SymbolIndex from restored symbols.
-            6.  Restore Block A and skeleton tier caches into pstate.
-            7.  Restore hub tier qids and node centrality.
-            8.  Mark slot as restored and update last_saved_slot_hash.
+        Returns:
+            bool: True if the slot was restored successfully.
         """
-        # -- Step 1: atomic gate — set flag before first await --
-        if self.get_slot_restore_attempted(project_id):
-            self._f._log_debug(
-                f"slot_restore: already attempted for '{project_id}', skipping"
-            )
-            return False
-        # Set synchronously here; no await between check and set.
-        self.set_slot_restore_attempted(project_id, True)
-
-        # -- Step 2: locate slot file --
-        slot_path: Optional[str] = None
-        saved_hash = self.get_last_saved_slot_hash(project_id)
-
-        if saved_hash:
-            candidate = self._slot_filename(project_id, saved_hash)
-            if os.path.isfile(candidate):
-                slot_path = candidate
-            else:
-                self._f._log_debug(
-                    f"slot_restore: saved hash {saved_hash[:8]} has no file, "
-                    f"falling back to directory scan"
-                )
-
-        if slot_path is None:
-            # Fallback: scan directory for newest slot file for this project
-            placeholder = self._slot_filename(project_id, "placeholder")
-            slot_dir = os.path.dirname(placeholder)
-            try:
-                if os.path.isdir(slot_dir):
-                    prefix = f"slot_{project_id}_"
-                    candidates = [
-                        os.path.join(slot_dir, fn)
-                        for fn in os.listdir(slot_dir)
-                        if fn.startswith(prefix)
-                        and fn.endswith(".json")
-                        and not fn.endswith(".tmp")
-                    ]
-                    if candidates:
-                        slot_path = max(candidates, key=os.path.getmtime)
-                        self._f._log_debug(
-                            f"slot_restore: found via scan: "
-                            f"{os.path.basename(slot_path)}"
-                        )
-            except OSError as e:
-                self._f._log_debug(
-                    f"slot_restore: directory scan failed for '{project_id}': {e}"
-                )
-
-        if slot_path is None:
-            self._f._log_debug(f"slot_restore: no slot file found for '{project_id}'")
+        if not self._f.valves.enable_slot_persistence:
             return False
 
-        # -- Step 3: read and validate --
-        try:
-            with open(slot_path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError) as e:
-            self._f._log_debug(
-                f"slot_restore: failed to read {os.path.basename(slot_path)}: {e}"
-            )
-            return False
-
-        if payload.get("project_id") != project_id:
-            self._f._log_debug(
-                f"slot_restore: project_id mismatch in "
-                f"{os.path.basename(slot_path)}, skipping"
-            )
-            return False
-
-        restored_hash = payload.get("static_hash", "")
-
-        # -- Step 4: restore ConversationState --
-        raw_state = payload.get("state")
-        if raw_state:
-            try:
-                raw_active = raw_state.get("active_blocks", {})
-                active: Dict[str, "CodeBlock"] = {}
-                for bh, bd in raw_active.items():
-                    try:
-                        bd["content_type"] = (
-                            ContentType(bd["content_type"])
-                            if "content_type" in bd
-                            else ContentType.GENERAL
-                        )
-                        blk = CodeBlock(**bd)
-                        if self._f.tokenizer:
-                            blk._cached_token_count = len(
-                                self._f.tokenizer.encode(blk.content)
-                            )
-                        active[bh] = blk
-                    except Exception:
-                        self._f._log_debug(f"slot_restore: skipping corrupt block {bh}")
-
-                recent: List["CodeBlock"] = []
-                for bd in raw_state.get("recent_changes", []):
-                    try:
-                        bd["content_type"] = (
-                            ContentType(bd["content_type"])
-                            if "content_type" in bd
-                            else ContentType.GENERAL
-                        )
-                        recent.append(CodeBlock(**bd))
-                    except Exception:
-                        pass
-
-                state = ConversationState(
-                    active_blocks=active,
-                    recent_changes=recent,
-                    committed_changes=[],
-                    message_count=raw_state.get("message_count", 0),
-                    last_cot_level=raw_state.get("last_cot_level", 0),
-                    conversation_summaries=raw_state.get("conversation_summaries", []),
-                    summarized_turn_hwm=raw_state.get("summarized_turn_hwm", 0),
-                    has_any_calls=raw_state.get("has_any_calls", False),
-                    wm_fired=raw_state.get("wm_fired", False),
-                    wm_msgs_evicted=raw_state.get("wm_msgs_evicted", 0),
-                    wm_turns_evicted=raw_state.get("wm_turns_evicted", 0),
-                    wm_summary_ok=raw_state.get("wm_summary_ok", False),
-                    hub_tier_last_modified=raw_state.get("hub_tier_last_modified", {}),
-                    hub_tier_body_hashes=raw_state.get("hub_tier_body_hashes", {}),
-                    hub_tier_query_heat=raw_state.get("hub_tier_query_heat", {}),
-                    hub_tier_qids_persisted=raw_state.get(
-                        "hub_tier_qids_persisted", []
-                    ),
-                )
-                self._f._conversation_state_manager.set(project_id, state)
-
-            except Exception as e:
-                self._f._log_debug(
-                    f"slot_restore: ConversationState rebuild failed "
-                    f"for '{project_id}': {e}"
-                )
-
-        # -- Step 5: rebuild SymbolIndex --
-        restored_state = self._f._conversation_state_manager.get(project_id)
-        if restored_state:
-            try:
-                self._f._conversation_state_manager._rebuild_symbol_index(
-                    restored_state, project_id
-                )
-            except Exception as e:
-                self._f._log_debug(f"slot_restore: SymbolIndex rebuild failed: {e}")
-
-        # -- Step 6: restore Block A and skeleton tier caches --
+        # --- 1. Resolve per-project state ---
         pstate = self.get_pstate(project_id)
 
-        block_a_cached = payload.get("block_a_cached")
-        if block_a_cached:
-            self.set_block_a_cached(project_id, block_a_cached)
-            cache_key = payload.get("block_a_cache_key") or restored_hash
-            self.set_block_a_cache_key(project_id, cache_key)
-            self._f._log_debug(
-                f"slot_restore: Block A cache restored "
-                f"(~{len(block_a_cached)//4} tokens)"
+        # --- 2. Skip if already attempted ---
+        if self.get_slot_restore_attempted(project_id):
+            return self.get_slot_restored(project_id)
+
+        self.set_slot_restore_attempted(project_id, True)
+
+        # --- 3. Get the structural hash from pstate ---
+        static_hash = self.get_structure_hash_for_cache(project_id)
+        if not static_hash:
+            cached = self.get_block_a_cached(project_id)
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                return False
+
+        filename = self._slot_filename(project_id, static_hash)
+
+        # --- 4. Check if file exists ---
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        if not os.path.exists(os.path.join(slot_dir, filename)):
+            self._f._log_debug(f"Slot restore: no file found for {filename}")
+            return False
+
+        # --- 5. Call llama.cpp API to restore ---
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            from shared_resources import get_http_session as _shared_get_http_session
+
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
             )
-
-        skeleton_cached = payload.get("skeleton_tier_cached")
-        if skeleton_cached:
-            pstate["skeleton_tier_cached"] = skeleton_cached
-            pstate["skeleton_tier_cache_key"] = payload.get(
-                "skeleton_tier_cache_key", restored_hash
-            )
-
-        skeleton_tier_qids = payload.get("skeleton_tier_qids")
-        if skeleton_tier_qids:
-            pstate["skeleton_tier_qids"] = skeleton_tier_qids
-
-        # -- Step 7: restore hub tier and centrality --
-        hub_tier_qids = payload.get("hub_tier_qids")
-        if hub_tier_qids:
-            self.set_hub_tier_qids(project_id, hub_tier_qids)
-
-        node_centrality = payload.get("node_centrality")
-        if node_centrality:
-            self.set_node_centrality(project_id, node_centrality)
-
-        # -- Step 8: mark as restored --
-        self.set_slot_restored(project_id, True)
-        self.set_last_saved_slot_hash(project_id, restored_hash)
-        if restored_hash:
-            self.set_structure_hash_for_cache(project_id, restored_hash)
-
-        self._f._log_debug(
-            f"slot_restore: OK for '{project_id}' "
-            f"(hash={restored_hash[:8] if restored_hash else '?'}, "
-            f"file={os.path.basename(slot_path)})"
-        )
-        return True
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "restore"},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
+            ) as resp:
+                if resp.status == 200:
+                    self.set_slot_restored(project_id, True)
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ Slot restored ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
+                    )
+                    return True
+                else:
+                    body = await resp.text()
+                    self._f._log_debug(
+                        f"Slot restore failed: HTTP {resp.status} — {body}"
+                    )
+                    return False
+        except Exception as e:
+            self._f._log_debug(f"Slot restore error: {e}")
+            return False
 
     async def slot_restore_for_continuity(self, project_id: str) -> bool:
         """
-        Attempt slot restore at the start of a continuation turn.
+        Restore KV cache after auxiliary LLM calls (CoT, contradiction) have
+        dirtied the slot due to SWA architecture. Called at the end of every
+        inlet when slot_free=True.
 
-        Continuation turns share the KV prefix with the preceding turn, so a
-        successful restore means the model can attend to Block A without a full
-        re-prefill. This method is called before context assembly on every turn
-        where is_continuation is True.
+        Uses the structural hash for consistency with the slot filename.
 
-        Returns False immediately when either:
-          - slot_restored is True  → already succeeded this session, no-op.
-          - slot_restore_attempted is True → a prior attempt was made (whether
-            it succeeded or failed). Without checking this flag, every
-            continuation turn independently retries a failed restore, causing
-            redundant file-system I/O (directory scan + JSON read attempt) on
-            each turn for projects that genuinely have no slot file.
+        Args:
+            project_id: The project identifier.
 
-        Steps:
-            1.  Return False if slot was already successfully restored.
-            2.  Return False if any restore attempt has already been made,
-                including failed ones.
-            3.  Delegate to slot_restore for the full restore logic.
+        Returns:
+            bool: True if the slot was restored successfully.
         """
-        # -- Step 1: already succeeded this session --
-        if self.get_slot_restored(project_id):
+        if not self._f.valves.enable_slot_persistence:
             self._f._log_debug(
-                f"slot_restore_for_continuity: already restored '{project_id}'"
+                "slot_restore_for_continuity: disabled (enable_slot_persistence=False)"
             )
             return False
 
-        # -- Step 2: a prior attempt was made (may have failed) --
-        if self.get_slot_restore_attempted(project_id):
-            self._f._log_debug(
-                f"slot_restore_for_continuity: prior attempt recorded for "
-                f"'{project_id}', skipping retry"
-            )
-            return False
+        # --- 1. Resolve per-project state ---
+        pstate = self.get_pstate(project_id)
 
-        # -- Step 3: delegate --
+        # --- 2. Get the structural hash ---
+        static_hash = self.get_structure_hash_for_cache(project_id)
+        if not static_hash:
+            cached = self.get_block_a_cached(project_id)
+            if cached:
+                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
+            else:
+                self._f._log_debug(
+                    "slot_restore_for_continuity: no static hash available, skipping"
+                )
+                return False
+
+        filename = self._slot_filename(project_id, static_hash)
+
+        # --- 3. Check if file exists ---
+        slot_dir = self._f.valves.slot_save_path.rstrip("/")
+        file_path = os.path.join(slot_dir, filename)
         self._f._log_debug(
-            f"slot_restore_for_continuity: attempting for '{project_id}'"
+            f"slot_restore_for_continuity: looking for {file_path} (hash={static_hash})"
         )
-        return await self.slot_restore(project_id)
+        if not os.path.exists(file_path):
+            self._f._log_debug(
+                f"slot_restore_for_continuity: file not found: {file_path}, skipping"
+            )
+            return False
+
+        # --- 4. Call llama.cpp API to restore ---
+        base = self._f.valves.LLM_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        self._f._log_debug(
+            f"slot_restore_for_continuity: attempting restore for '{project_id}' "
+            f"with hash {static_hash} -> {filename}"
+        )
+
+        try:
+            from shared_resources import get_http_session as _shared_get_http_session
+
+            session = await _shared_get_http_session(
+                timeout_seconds=self._f.valves.llm_per_call_timeout
+            )
+            async with session.post(
+                f"{base}/slots/{self._f.valves.slot_id}",
+                params={"action": "restore"},
+                json={
+                    "filename": filename,
+                    "model": get_model_name(self._f.valves.llm_model),
+                },
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._f._log_debug(
+                        f"✓ KV cache restored post-aux ← {filename} "
+                        f"({data.get('n_restored', '?')} tokens)"
+                    )
+                    return True
+
+                body = await resp.text()
+                self._f._log_debug(
+                    f"slot_restore_for_continuity: restore failed: "
+                    f"HTTP {resp.status} — {body}"
+                )
+                return False
+
+        except Exception as e:
+            self._f._log_debug(f"slot_restore_for_continuity: error: {e}")
+            return False
 
     def _slot_filename(self, project_id: str, static_hash: str) -> str:
         """
@@ -29791,154 +27876,136 @@ class BackgroundTaskManager:
         **kwargs,
     ) -> None:
         """
-        Start a named background task if one is not already running.
+        Start a background task if it is not already running and if not paused.
 
-        Uses a semaphore to cap concurrent background tasks at max_concurrent.
-        If the semaphore is full, the start is deferred and the task is
-        dropped with a log entry rather than blocking the caller.
-
-        Steps:
-            1.  Reject if paused or task already running.
-            2.  Acquire semaphore (non-blocking); drop on full.
-            3.  Create and register asyncio Task.
-            4.  Attach done-callback for registry cleanup.
+        Args:
+            name: Unique identifier for the task.
+            coro: Coroutine to execute (must accept stop_event kwarg).
+            project_id: Current project identifier.
+            *args, **kwargs: Additional arguments passed to the coroutine.
         """
-        # -- Step 1: gate checks --
-        if self._paused:
-            self._f._log_debug(
-                f"BackgroundTaskManager.start: paused, skipping '{name}'"
+        if not self._f.valves.enable_background_tasks:
+            return
+
+        async with self._lock:
+            # ------------------------------------------------------------------
+            # Avoid duplicate running tasks.
+            # ------------------------------------------------------------------
+            if name in self._tasks and not self._tasks[name].done():
+                self._f._log_debug(
+                    f"bg_manager: task '{name}' already running, skipped"
+                )
+                return
+
+            # ------------------------------------------------------------------
+            # Do not start if paused (inlet active).
+            # ------------------------------------------------------------------
+            if self._paused:
+                self._f._log_debug(f"bg_manager: task '{name}' not started (paused)")
+                return
+
+            # ------------------------------------------------------------------
+            # Check concurrency limit using max_concurrent (not semaphore._value).
+            # ------------------------------------------------------------------
+            if len(self._tasks) >= self._max_concurrent:
+                if self._f.valves.bg_task_log_detailed:
+                    self._f._log_debug(
+                        f"bg_manager: task '{name}' skipped — max concurrency "
+                        f"reached ({len(self._tasks)}/{self._max_concurrent})"
+                    )
+                return
+
+            # ------------------------------------------------------------------
+            # Create stop event and mark task as in_progress in pstate.
+            # ------------------------------------------------------------------
+            stop_event = asyncio.Event()
+            self._stop_events[name] = stop_event
+
+            task_def = self._f._task_registry.get_task_definition(name)
+            if task_def:
+                pstate = self._f._project_state_manager.get_pstate(project_id)
+                task_def.mark_in_progress(pstate)
+
+            # ------------------------------------------------------------------
+            # Create and store the task.
+            # ------------------------------------------------------------------
+            task = asyncio.create_task(
+                self._run_task(name, coro, stop_event, project_id, *args, **kwargs)
             )
-            return
-        if self.is_running(name):
-            self._f._log_debug(f"BackgroundTaskManager.start: already running '{name}'")
-            return
+            self._tasks[name] = task
 
-        # -- Step 2: semaphore (non-blocking) --
-        if not self._semaphore._value:  # full without blocking
-            self._f._log_debug(
-                f"BackgroundTaskManager.start: semaphore full, " f"deferring '{name}'"
-            )
-            return
-        await self._semaphore.acquire()
-
-        # -- Step 3: create stop_event and task --
-        stop_event = asyncio.Event()
-        task = asyncio.create_task(
-            self._run_task(name, coro, stop_event, project_id, *args, **kwargs)
-        )
-        self._running[name] = (task, stop_event)
-
-        # -- Step 4: done-callback for cleanup --
-        def _on_done(t: asyncio.Task) -> None:
-            # Cleanup happens in _run_task's finally block.
-            # The semaphore is released here so the next task can start.
-            try:
-                self._semaphore.release()
-            except Exception:
-                pass
-
-        task.add_done_callback(_on_done)
-
-        self._f._log_debug(
-            f"BackgroundTaskManager: started '{name}' for '{project_id}'"
-        )
+            if self._f.valves.bg_task_log_detailed:
+                self._f._log_debug(
+                    f"bg_manager: scheduling '{name}' "
+                    f"({len(self._tasks)}/{self._max_concurrent} concurrent)"
+                )
 
     async def stop_all(self, timeout: float = None) -> None:
         """
-        Signal all running tasks to stop and wait for them to finish.
+        Gracefully stop all running background tasks without deadlock.
 
-        Bug 77 fix: after setting all stop_events, tasks that do not
-        respond (e.g. they are blocked in an LLM call without checking
-        stop_event) are explicitly cancelled after the timeout. Without
-        explicit cancellation, stop_all blocks indefinitely even with a
-        finite timeout when a task is stuck in a long await.
+        Signals tasks and releases the lock before waiting for them.
+        This avoids the deadlock where stop_all holds the lock while tasks
+        need it to clean up.
 
-        Steps:
-            1.  Set stop_event for every running task.
-            2.  Wait for all tasks with the configured timeout.
-            3.  Cancel any tasks that did not finish within the timeout.
-            4.  Await cancelled tasks to allow their finally blocks to run.
+        Args:
+            timeout: Maximum seconds to wait for graceful shutdown.
+                     If None, uses valve bg_task_stop_timeout.
         """
-        if not self._running:
-            return
+        if timeout is None:
+            timeout = self._f.valves.bg_task_stop_timeout
 
-        snapshot = dict(self._running)
-        self._f._log_debug(
-            f"BackgroundTaskManager.stop_all: stopping "
-            f"{len(snapshot)} task(s): {list(snapshot.keys())}"
-        )
+        # ------------------------------------------------------------------
+        # Signal and snapshot under lock, then release BEFORE waiting.
+        # ------------------------------------------------------------------
+        async with self._lock:
+            if not self._tasks:
+                return
 
-        # -- Step 1: set all stop events --
-        for name, (task, stop_event) in snapshot.items():
-            stop_event.set()
+            running_names = list(self._tasks.keys())
 
-        tasks = [task for task, _ in snapshot.values()]
+            for name, ev in self._stop_events.items():
+                ev.set()
+                if self._f.valves.bg_task_log_detailed:
+                    self._f._log_debug(f"bg_manager: stop signal → '{name}'")
 
-        # -- Step 2: wait with timeout --
-        effective_timeout = timeout or getattr(
-            self._f.valves, "bg_task_stop_timeout", 10.0
-        )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=effective_timeout,
+            tasks_to_wait = [t for t in self._tasks.values() if not t.done()]
+
+        # ------------------------------------------------------------------
+        # Lock is released here — tasks can now acquire it in their finally blocks.
+        # ------------------------------------------------------------------
+        if tasks_to_wait:
+            self._f._log_debug(
+                f"bg_manager: waiting for {len(tasks_to_wait)} task(s) "
+                f"to finish (timeout={timeout}s): {running_names}"
             )
-        except asyncio.TimeoutError:
-            # -- Step 3: cancel tasks that didn't respond to stop_event --
-            still_running = [t for t in tasks if not t.done()]
-            if still_running:
-                self._f._log_debug(
-                    f"BackgroundTaskManager.stop_all: timeout after "
-                    f"{effective_timeout}s, cancelling "
-                    f"{len(still_running)} task(s)"
-                )
-                for task in still_running:
+
+            done, still_pending = await asyncio.wait(tasks_to_wait, timeout=timeout)
+
+            self._f._log_debug(
+                f"bg_manager: {len(done)} task(s) finished gracefully, "
+                f"{len(still_pending)} cancelled"
+            )
+
+            for task in still_pending:
+                if not task.done():
                     task.cancel()
 
-                # -- Step 4: await cancellations --
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*still_running, return_exceptions=True),
-                        timeout=2.0,
-                    )
-                except asyncio.TimeoutError:
-                    self._f._log_debug(
-                        "BackgroundTaskManager.stop_all: "
-                        "some tasks did not respond to cancellation"
-                    )
-
-        self._f._log_debug("BackgroundTaskManager.stop_all: complete")
+        # ------------------------------------------------------------------
+        # Final cleanup: tasks self-clean via finally, but clear any remnants.
+        # ------------------------------------------------------------------
+        async with self._lock:
+            self._tasks.clear()
+            self._stop_events.clear()
 
     def set_paused(self, paused: bool) -> None:
-        """
-        Pause or resume task creation.
-
-        When paused, start() rejects new tasks. Already-running tasks
-        are not affected; use stop_all() to stop them explicitly.
-        """
+        """Set the paused state. When paused, start() will not launch new tasks."""
         self._paused = paused
-        self._f._log_debug(
-            f"BackgroundTaskManager: {'paused' if paused else 'resumed'}"
-        )
+        self._f._log_debug(f"Background tasks {'paused' if paused else 'resumed'}")
 
     def is_running(self, name: str) -> bool:
-        """
-        Return True when a task with the given name is registered and
-        its asyncio.Task has not yet completed.
-
-        Cleans up stale entries where the Task is done but was not removed
-        from the registry (e.g. due to a done-callback failure). This makes
-        is_running() self-healing without requiring a separate cleanup pass.
-        """
-        entry = self._running.get(name)
-        if entry is None:
-            return False
-        task, _ = entry
-        if task.done():
-            # Stale entry: task finished but registry was not cleaned up.
-            self._running.pop(name, None)
-            return False
-        return True
+        """Check if a specific background task is currently running."""
+        return name in self._tasks and not self._tasks[name].done()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Internal methods
@@ -29954,41 +28021,83 @@ class BackgroundTaskManager:
         **kwargs,
     ) -> None:
         """
-        Execute a background coroutine and ensure the task registry is
-        cleaned up on every exit path.
+        Execute a background task with proper project_id forwarding and race-safe cleanup.
 
-        Bug 76 fix: the registry entry is removed in a finally block.
-        Without this, a task that raises an exception stays registered:
-        is_running(name) returns True after the crash, preventing start()
-        from restarting the task. The subsystem (RAPTOR, docstrings) then
-        stays dead for the entire session with no visible error.
-
-        Steps:
-            1.  Run the coroutine, passing stop_event as the first kwarg
-                if the coroutine accepts it.
-            2.  Log exceptions (except CancelledError, which is re-raised).
-            3.  Always remove from registry in finally.
+        Args:
+            name: Task identifier.
+            coro: Coroutine to execute.
+            stop_event: Event to signal cancellation.
+            project_id: Current project identifier.
+            *args, **kwargs: Additional arguments for the coroutine.
         """
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        task_def = self._f._task_registry.get_task_definition(name)
+        start_time = time.monotonic()
+
+        self._f._log_debug(
+            f"bg_manager: task '{name}' starting "
+            f"(project={project_id}, args={len(args)} extra arg(s))"
+        )
+
         try:
-            if args or kwargs:
-                await coro(*args, stop_event=stop_event, **kwargs)
+            # ------------------------------------------------------------------
+            # Acquire semaphore for concurrency control.
+            # ------------------------------------------------------------------
+            async with self._semaphore:
+                # ------------------------------------------------------------------
+                # CRITICAL: Forward project_id as the first argument.
+                # ------------------------------------------------------------------
+                await coro(project_id, *args, stop_event=stop_event, **kwargs)
+
+            # ------------------------------------------------------------------
+            # Mark as completed if not cancelled.
+            # ------------------------------------------------------------------
+            if task_def and not stop_event.is_set():
+                task_def.mark_completed(pstate, project_id)
+            elif task_def and stop_event.is_set():
+                task_def.mark_not_completed(pstate)
+
+            duration = time.monotonic() - start_time
+            if not stop_event.is_set():
+                self._f._log_debug(
+                    f"bg_manager: task '{name}' completed OK in {duration:.2f}s"
+                )
             else:
-                await coro(stop_event=stop_event)
+                self._f._log_debug(
+                    f"bg_manager: task '{name}' stopped by signal after {duration:.2f}s"
+                )
+
         except asyncio.CancelledError:
+            if task_def:
+                task_def.mark_not_completed(pstate)
+            duration = time.monotonic() - start_time
             self._f._log_debug(
-                f"BackgroundTaskManager: '{name}' cancelled for '{project_id}'"
+                f"bg_manager: task '{name}' was cancelled after {duration:.2f}s"
             )
             raise
+
         except Exception as e:
+            import traceback as _tb
+
+            duration = time.monotonic() - start_time
             self._f._log_debug(
-                f"BackgroundTaskManager: '{name}' failed for '{project_id}': "
-                f"{type(e).__name__}: {e}"
+                f"bg_manager: task '{name}' FAILED after {duration:.2f}s: {e}\n"
+                f"{_tb.format_exc()}"
             )
+            if task_def:
+                task_def.mark_not_completed(pstate)
+
         finally:
-            self._running.pop(name, None)
-            self._f._log_debug(
-                f"BackgroundTaskManager: '{name}' deregistered for '{project_id}'"
-            )
+            # ------------------------------------------------------------------
+            # Race-safe cleanup: only remove if we are still the registered task.
+            # This prevents the ABA race where a new task replaces us and we
+            # accidentally delete it.
+            # ------------------------------------------------------------------
+            _me = asyncio.current_task()
+            async with self._lock:
+                if self._tasks.get(name) is _me:
+                    self._tasks.pop(name, None)
+                    self._stop_events.pop(name, None)
 
 
 class SemanticSeedInferencer:
@@ -30273,20 +28382,26 @@ class SemanticSeedInferencer:
             )
             return True
 
-    # ------------------------------------------------------------------
-    # Region: Fuzzy Resolution Fallback
-    # ------------------------------------------------------------------
-
     def _fuzzy_resolve(self, token: str, project_id: str) -> List[str]:
         """
         Match a token against indexed qualified names using fuzzy string comparison.
 
-        Compares the token against the bare name of each qualified id (the part
-        after the last dot) using rapidfuzz token_set_ratio. Returns qualified ids
-        whose bare name meets or exceeds seed_inference_fuzzy_threshold.
+        Compares the token against both the full qualified id and the bare name
+        (part after the last dot) using rapidfuzz token_set_ratio, keeping the
+        higher of the two scores.  Returns qualified ids sorted by descending
+        score, capped at 5 entries to avoid flooding the seed set with noise.
 
         Returns an empty list when rapidfuzz is unavailable or no match clears
-        the threshold.
+        seed_inference_fuzzy_threshold.
+
+        Args:
+            token:      Symbol token to match — may be hallucinated or
+                        slightly mis-spelled.
+            project_id: Current project identifier used to look up the SymbolIndex.
+
+        Returns:
+            List of matching qualified ids sorted by descending similarity score,
+            capped at 5 entries.
         """
         if not HAS_FUZZ:
             return []
@@ -30294,15 +28409,21 @@ class SemanticSeedInferencer:
         threshold = self._f.valves.seed_inference_fuzzy_threshold
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
         token_lower = token.lower()
-        matches: List[str] = []
+        scored: List[Tuple[float, str]] = []
 
         for qid in all_qids:
             bare = qid.rsplit(".", 1)[-1].lower()
-            ratio = fuzz.token_set_ratio(token_lower, bare) / 100.0
+            # Score against both bare name and full qualified id; keep the higher
+            ratio = max(
+                fuzz.token_set_ratio(token_lower, bare) / 100.0,
+                fuzz.token_set_ratio(token_lower, qid.lower()) / 100.0,
+            )
             if ratio >= threshold:
-                matches.append(qid)
+                scored.append((ratio, qid))
 
-        return matches
+        # ── Sort descending, cap at 5 to avoid noise ──────────────────────────────
+        scored.sort(key=lambda t: -t[0])
+        return [qid for _, qid in scored[:5]]
 
     # ------------------------------------------------------------------
     # Region: Main Seed Inference Entry Point
@@ -30447,45 +28568,46 @@ class SemanticSeedInferencer:
         self, tokens: List[str], project_id: str
     ) -> Dict[str, float]:
         """
-        Resolve raw symbol token strings returned by the LLM planner to actual
-        qualified ids present in the SymbolIndex.
+        Resolve a list of symbol tokens to actual qualified ids.
 
-        Resolution cascade applied per token (first match wins):
-          1. Exact qualified id match.
-          2. Dotted decomposition: split on the last dot into (parent, member),
-             construct the qualified id, then fall back to bare member lookup.
-          3. Bare name lookup via get_qualified_names_for.
-          4. Fuzzy matching against bare names when rapidfuzz is available.
+        Receives a pre-parsed list of strings extracted from the JSON response
+        instead of raw LLM text. The resolution logic is unchanged:
+        exact match → dotted decomposition → bare name → fuzzy fallback.
 
-        Tokens that match nothing after all four stages are silently dropped.
-        Scores for fuzzy matches are penalised by seed_inference_fuzzy_penalty.
-        The result is capped at seed_inference_max_symbols entries.
+        Args:
+            tokens: List of identifier strings from the LLM JSON response.
+            project_id: Current project identifier.
+
+        Returns:
+            Dictionary mapping qualified symbol ids to seed scores.
         """
         score = self._f.valves.seed_inference_score
         max_syms = self._f.valves.seed_inference_max_symbols
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
         seeds: Dict[str, float] = {}
 
         for token in tokens:
-            # -- Guard: cap and sanitize --
             if len(seeds) >= max_syms:
                 break
+
             token = str(token).strip()
             if not token:
                 continue
 
-            # -- Stage 1: exact qualified id match --
+            # Exact match.
             if token in all_qids:
                 seeds[token] = max(seeds.get(token, 0.0), score)
                 continue
 
-            # -- Stage 2: dotted-name decomposition --
+            # Dotted-name decomposition (e.g. "ClassName.method").
             if "." in token:
                 parent_name, method_part = token.rsplit(".", 1)
                 constructed_qid = qualify_symbol_name(method_part, parent_name)
                 if constructed_qid in all_qids:
                     seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
                     continue
+                # Fallback: bare method name lookup.
                 by_method = self._f._symbol_index.get_qualified_names_for(
                     method_part, project_id
                 )
@@ -30496,7 +28618,7 @@ class SemanticSeedInferencer:
                             seeds[q] = max(seeds.get(q, 0.0), share)
                     continue
 
-            # -- Stage 3: bare name lookup --
+            # Bare name resolution.
             qids = {
                 q
                 for q in self._f._symbol_index.get_qualified_names_for(
@@ -30510,7 +28632,7 @@ class SemanticSeedInferencer:
                     seeds[q] = max(seeds.get(q, 0.0), share)
                 continue
 
-            # -- Stage 4: fuzzy fallback --
+            # Fuzzy matching fallback.
             fuzzy_matches = self._fuzzy_resolve(token, project_id)
             if fuzzy_matches:
                 fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
@@ -32556,47 +30678,32 @@ def _log_section(self, title: str, duration: float = None):
     line = f"{'=' * left}{title_text}{'=' * right}"
     print(f"[CodeAware] {line}")
 
-    async def _emit_status(
-        self,
-        description: str,
-        done: bool = False,
-    ) -> None:
-        """
-        Emit a status event to the Open-WebUI event stream.
 
-        No-ops when __event_emitter__ is None or not callable. This covers:
-          - CLI / headless use of the filter
-          - Unit tests that do not provide an emitter
-          - Programmatic calls from other pipeline stages
+async def _emit_status(self, description: str, done: bool = False) -> None:
+    """
+    Emit a real-time status update to the UI via __event_emitter__.
 
-        Exceptions from the emitter are caught and logged so a UI glitch
-        cannot abort inlet/outlet processing.
+    Gated by enable_status_updates valve — no-op when disabled.
+    No-op if event emitter is not available (non-streaming context).
+    Never raises — pipeline must never be interrupted by UI errors.
 
-        Steps:
-            1.  Guard: skip when emitter is absent or not callable.
-            2.  Build and emit the status payload.
-        """
-        # -- Step 1: guard --
-        emitter = getattr(self, "__event_emitter__", None)
-        if emitter is None or not callable(emitter):
-            return
-
-        # -- Step 2: emit --
-        try:
-            await emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
-        except Exception as e:
-            self._log_debug(
-                f"_emit_status: emitter raised for '{description}': "
-                f"{type(e).__name__}: {e}"
-            )
+    Args:
+        description: Status message shown to the user in the UI.
+        done: True signals the final status update for this request.
+    """
+    if not self.valves.enable_status_updates:
+        return
+    if not self._event_emitter:
+        return
+    try:
+        await self._event_emitter(
+            {
+                "type": "status",
+                "data": {"description": description, "done": done},
+            }
+        )
+    except Exception as e:
+        self._log_debug(f"_emit_status failed (non-fatal): {e}")
 
 
 def _validate_valve_coherence(self) -> None:
@@ -32797,62 +30904,10 @@ def _validate_valve_coherence(self) -> None:
 
 
 async def _update_active_code(
-    self,
-    message: dict,
-    project_id: str,
-    is_continuation: bool = False,
+    self, message: dict, project_id: str, is_continuation: bool = False
 ) -> None:
-    """
-    Index symbols, edges, and metadata from a single conversation message.
-
-    Guards against None or non-string content before dispatching to
-    ActiveCodeUpdater. Without this guard, interrupted assistant messages
-    (content=None) and system messages with missing content fields cause
-    a TypeError deep inside CodeBlockManager.extract_code_blocks, which
-    propagates up through inlet and appears to the user as a pipeline error.
-
-    All exceptions from ActiveCodeUpdater are caught and logged: a failure
-    to index symbols from one message must never abort the full inlet turn.
-    The model still receives the user's message; it just runs with a
-    temporarily stale symbol index.
-
-    Steps:
-        1.  Validate content; skip empty or non-string messages.
-        2.  Skip roles that never contain indexable code.
-        3.  Dispatch to ActiveCodeUpdater.process with exception isolation.
-    """
-    # -- Step 1: content guard --
-    content = message.get("content")
-    if content is None:
-        return
-    if not isinstance(content, str):
-        try:
-            content = str(content)
-        except Exception:
-            return
-    if not content.strip():
-        return
-
-    # -- Step 2: role filter --
-    role = message.get("role", "")
-    if role not in ("user", "assistant"):
-        return
-
-    # -- Step 3: dispatch with isolation --
-    try:
-        await self._active_code_updater.process(
-            message={"role": role, "content": content},
-            project_id=project_id,
-            is_continuation=is_continuation,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        self._log_debug(
-            f"_update_active_code: indexing failed for '{project_id}' "
-            f"({role}, {len(content)} chars): "
-            f"{type(e).__name__}: {e}"
-        )
+    """Update active blocks and SymbolIndex from a new message."""
+    await self._active_code_updater.process(message, project_id, is_continuation)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -32879,337 +30934,699 @@ def _detect_genuine_continuation(self, messages: list) -> bool:
             return any(marker in content for marker in self._MULTI_PHASE_MARKERS)
     return False
 
-    # ==========================================================================
-    # INLET – orchestrated entry point
-    # ==========================================================================
-    # Value categories (see project documentation):
-    #   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
-    #   ⚡ COMMAND HANDLING    – User‑initiated context control commands
-    #   🧠 ENRICHMENT          – Features that add information to the system prompt
-    #   📦 COMPRESSION         – Features that reduce context size to fit the window
-    #   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
-    # ==========================================================================
-    async def inlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __event_emitter__=None,
-    ) -> dict:
-        """
-        Main pipeline entry point. Preprocesses each incoming request, builds
-        context, and injects it into the message list before the model call.
 
-        The per-project lock is acquired via 'async with' so it is guaranteed
-        to be released on any exit path — normal return, exception, or
-        CancelledError. Acquiring with 'await lock.acquire()' followed by a
-        manual 'lock.release()' at the end of the function fails to release
-        when any intermediate await raises, deadlocking all subsequent requests
-        for that project until the server restarts.
+# ==========================================================================
+# INLET – orchestrated entry point
+# ==========================================================================
+# Value categories (see project documentation):
+#   🔥 STATE MANAGEMENT    – Critical steps that maintain conversation state
+#   ⚡ COMMAND HANDLING    – User‑initiated context control commands
+#   🧠 ENRICHMENT          – Features that add information to the system prompt
+#   📦 COMPRESSION         – Features that reduce context size to fit the window
+#   🚀 RESOURCE OPTIMISATION – Features that improve speed / avoid conflicts
+# ==========================================================================
+async def inlet(
+    self,
+    body: dict,
+    __user__: Optional[dict] = None,
+    __event_emitter__=None,  # ← NEW
+) -> dict:
+    """
+    Pre‑process the request before the LLM sees it.
 
-        Steps (categorised):
-            1. 🔥 Validate body and resolve project_id.
-            2. 🔥 Emit "processing" status.
-            3. 🔥 Acquire project lock for the duration of inlet processing.
-            4. 🔥 Preprocess body: normalise messages, extract last user message.
-            5. 🔥 Classify session (code vs prose).
-            6. 🔥 Restore slot for continuation turns.
-            7. 🔥 Update active code index for new messages.
-            8. 🧠📦 Assemble context (Block A, Block B, CoT, WindowManager).
-            9. ⚡ Handle explicit commands and natural intents.
-            10. 🔥 Emit "done" status and return assembled body.
-        """
-        t_start = time.monotonic()
+    Orchestrates seven sequential steps:
+    1. Project‑switch detection, cache loading, and KV‑slot restore.
+    2. User‑info extraction (last message, question, explicit commands).
+    3. Explicit command dispatch (/forget, /status, /clean, /expand).
+    4. Natural‑language intent dispatch (forget, remember, obsolete).
+    5. Silent ingestion when the message is a large code‑only paste.
+    6. Session classification and active‑code update.
+    7. System‑prompt assembly (Block A + Block B) with CoT, compression,
+       multi‑phase, and adaptive trimming.
 
-        # ==========================================================================
-        # 🔥 STATE MANAGEMENT – Validation, status, and lock acquisition
-        # ==========================================================================
-        # -- Step 1: validate body --
-        if not isinstance(body, dict):
-            return body
-        self.__event_emitter__ = __event_emitter__
+    Returns the modified body with the final message list ready for the LLM.
+    """
+    # Bind event emitter for this request. Always cleared in finally
+    # so a stale emitter can never leak into the next request.
+    self._event_emitter = __event_emitter__
+    try:
+        self._log_debug("inlet called")
+        inlet_start = time.monotonic()
+        self._log_section("CONTEXT MANAGER - INLET START")
 
-        # -- Step 2: status emit --
-        await self._emit_status("Processing…")
+        # -- Stop background tasks gracefully --------------------------------
+        await self._bg_manager.stop_all()
+        self._bg_manager.set_paused(True)
+        # ------------------------------------------------------------------
 
-        # -- Step 3: resolve project_id --
-        project_id = self._inlet_orchestrator.get_project_id()
+        def _inlet_timing(step_name: str, start: float, end: float = None):
+            if end is None:
+                end = time.monotonic()
+            self._log_timing(step_name, start - inlet_start, end - start)
 
-        # Acquire the per-project lock as a context manager so it is
-        # always released regardless of which step raises.
-        lock = await self._state_store.get_project_lock(project_id)
-        async with lock:
-            try:
-                # ==========================================================================
-                # 🔥 STATE MANAGEMENT – Preprocess, extract, classify, restore, update
-                # ==========================================================================
-                # -- Step 4: preprocess --
-                messages = await self._inlet_orchestrator.inlet_preprocess(
-                    body, project_id
+        project_id = self._inlet_orch.get_project_id()
+
+        # -- Get state early to decide slot_busy and is_continuation --
+        state = self._conversation_state_manager.get(project_id)
+        state.reset_wm_metrics()
+        psm = self._project_state_manager
+        pstate = psm.get_pstate(project_id)
+
+        # -- AC-A: separate slot_busy from is_continuation ---------------
+        slot_busy = False
+        if self._last_used_model is None and state.message_count <= 1:
+            slot_busy = True
+            self._log_debug("inlet: cold-start slot_busy=True")
+
+        is_continuation = psm.get_is_continuation(project_id)
+
+        # -- AC-A-WD: Watchdog for stuck continuations -------------------
+        if is_continuation:
+            turns = psm.get_continuation_turns(project_id)
+            max_turns = self.valves.max_autocontinue_turns
+            if turns > max_turns:
+                self._log_debug(
+                    f"AutoContinue watchdog: is_continuation has been True for "
+                    f"{turns} consecutive turns (max={max_turns}) "
+                    f"-- forcing reset. Check if 'triangle CONTINUA:' marker is "
+                    f"being generated correctly."
                 )
-                (
-                    last_user_msg,
-                    user_query,
-                    user_question,
-                    has_code_blocks,
-                    is_explicit_command,
-                ) = await self._inlet_orchestrator.inlet_extract_user_info(messages)
+                psm.set_is_continuation(project_id, False)
+                is_continuation = False
+                if self.valves.enable_slot_persistence:
+                    await psm.slot_restore_for_continuity(project_id)
 
-                if not last_user_msg:
-                    return body
+        await self._enrichment.cancel_docstring_tasks()
+        self._enrichment._lazy_docstrings_generated_this_turn = 0
+
+        # -- Phase A: Write barrier --------------------------------------
+        await self._state_store.drain_writes(timeout=5.0)
+
+        # 🔥 STATE MANAGEMENT
+        #   1. Preprocess (project switch, cache load)
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        messages = await self._inlet_orch.inlet_preprocess(body, project_id)
+        _inlet_timing("Step 1/6: Preprocess (project switch, cache load)", step_start)
+        if not messages:
+            return body
+
+        # 🔥 STATE MANAGEMENT
+        #   2. Extract user info
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        (
+            last_user_msg,
+            user_query,
+            user_question,
+            is_explicit_command,
+            has_code_blocks,
+        ) = await self._inlet_orch.inlet_extract_user_info(messages)
+        _inlet_timing("Step 2/6: Extract user info", step_start)
+
+        # -- C6: Wait for previous LTM store to complete ----------------
+        if not self._ltm_store_complete.is_set():
+            self._log_debug("LTM: store pending from previous turn -- waiting up to 3s")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._ltm_store_complete.wait()),
+                    timeout=3.0,
+                )
+                self._log_debug("LTM: store completed -- proceeding with retrieval")
+            except asyncio.TimeoutError:
+                self._log_debug(
+                    "LTM: store timeout (>3s) -- retrieval may miss previous turn"
+                )
+
+        # -- Detect AutoContinue continuation ----------------------------
+        _last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"), None
+        )
+        _hint = ""
+        if _last_assistant and not is_continuation:
+            _ac = _last_assistant.get("content", "")
+            for _marker in self._MULTI_PHASE_MARKERS:
+                if _marker in _ac:
+                    is_continuation = True
+                    _idx = _ac.find(_marker)
+                    _hint_line = _ac[_idx:].split("\n")[0]
+                    _hint = re.sub(
+                        r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
+                        "",
+                        _hint_line,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    if _hint:
+                        user_question = _hint
+                        self._log_debug(
+                            f"AutoContinue detected -- LOD query: '{user_question}'"
+                        )
+                    break
+
+        # ⚡ COMMAND HANDLING
+        #   3. Explicit commands (/forget, /status, /clean, /expand)
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        handled, handled_messages = await self._commands.handle_explicit_commands(
+            messages, project_id, is_explicit_command, last_user_msg, __user__
+        )
+        _inlet_timing("Step 3/6: Handle explicit commands", step_start)
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END",
+                duration=time.monotonic() - inlet_start,
+            )
+            return body
+
+        # ⚡ COMMAND HANDLING
+        #   4. Natural language intents (forget, remember, obsolete)
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        handled, handled_messages = await self._commands.handle_natural_intents(
+            messages,
+            project_id,
+            is_explicit_command,
+            last_user_msg,
+            slot_free=not slot_busy,
+        )
+        _inlet_timing("Step 4/6: Handle natural language intents", step_start)
+        if handled:
+            body["messages"] = handled_messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END",
+                duration=time.monotonic() - inlet_start,
+            )
+            return body
+
+        # -- Silent Ingestion (Modo B: chunked paste) -------------------
+        if (
+            self.valves.enable_silent_ingestion
+            and last_user_msg is not None
+            and not is_explicit_command
+        ):
+            if await self._commands.is_code_only_message(user_query, project_id):
+                self._log_section("SILENT INGESTION MODE")
+
+                pstate_local = self._project_state_manager.get_pstate(project_id)
+
+                _guessed_lang = SignatureExtractor._guess_language(None, user_query)
+                _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                pstate_local["ingested_lang"] = _lang
+
+                raw_symbols = []
+                if HAS_TREE_SITTER:
+                    try:
+                        raw_symbols = await SignatureExtractor.extract_async(
+                            user_query, None, language=_lang
+                        )
+                    except Exception:
+                        raw_symbols = []
+
+                if raw_symbols:
+                    raw_symbols = SignatureExtractor.enrich_symbols_with_parent_info(
+                        raw_symbols, user_query
+                    )
+
+                pstate_local["raw_ingested_symbols"] = raw_symbols
+
+                _msg_to_index = last_user_msg
+
+                self._is_silent_ingestion = True
+                try:
+                    await self._update_active_code(_msg_to_index, project_id)
+                finally:
+                    pass
+
+                await self._activation.resolve_dangling_edges(project_id)
+
+                if self.valves.enable_path_analysis:
+                    await self._activation.rebuild_path_index(project_id)
+
+                self._ctx_builder.invalidate_block_a_cache(
+                    project_id, "new chunk ingested", recompute_centrality=True
+                )
+
+                try:
+                    static_block = await self._ctx_builder.build_block_a(
+                        project_id, is_code_session=True, is_continuation=False
+                    )
+                    self._log_debug(
+                        "Block A scaffold (hub symbols + skeleton tier) "
+                        "pre-built after silent ingestion"
+                    )
+                except Exception as _scaffold_err:
+                    static_block = ""
+                    self._log_debug(
+                        f"Eager Block A scaffold build failed (non-fatal): "
+                        f"{_scaffold_err}"
+                    )
+
+                if (
+                    self.valves.enable_hub_bodies_tier
+                    and self.valves.hub_bodies_tier_warmup_on_ingestion
+                ):
+                    tier_text, tier_hash, tier_qids = (
+                        self._ctx_builder._build_hub_bodies_tier(project_id)
+                    )
+                    pstate_local["hub_tier_text"] = tier_text
+                    pstate_local["hub_tier_hash"] = tier_hash
+                    psm.set_hub_tier_qids(project_id, tier_qids)
+                    state.hub_tier_qids_persisted = tier_qids
+                    self._conversation_state_manager.set(project_id, state)
+
+                    asyncio.create_task(
+                        self._ctx_builder._warmup_tier_prefill(project_id)
+                    )
+
+                self._conversation_state_manager.mark_dirty(project_id)
+                await self._conversation_state_manager.save_if_dirty(project_id)
 
                 state = self._conversation_state_manager.get(project_id)
+                num_blocks = len(state.active_blocks)
+                num_symbols = len(self._symbol_index.get_all_names(project_id))
+                num_classes = len(self._symbol_index.get_classes(project_id))
 
-                # -- Step 5: classify session --
-                is_code_session = await self._inlet_orchestrator.classify_session(
-                    messages, project_id
+                stub = self._history_compressor._build_user_stub(num_symbols)
+
+                content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
+                state.compressed_user_messages[content_hash] = stub
+                self._conversation_state_manager.mark_dirty(project_id)
+
+                messages[-1] = {**messages[-1], "content": stub}
+
+                response = (
+                    f"✅ {num_symbols} symbols in {num_classes} classes "
+                    f"({num_blocks} active blocks). Code is in the SymbolGraph. "
+                    f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
+                    f"implementations."
                 )
+                messages.append({"role": "assistant", "content": response})
 
-                # -- Step 6: slot restore for continuation --
-                is_continuation = self._detect_genuine_continuation(messages)
-                self._project_state_manager.set_is_continuation(
-                    project_id, is_continuation
-                )
-                if is_continuation:
-                    await self._project_state_manager.slot_restore_for_continuity(
-                        project_id
-                    )
-
-                # -- Step 7: update active code index --
-                await self._update_active_code(
-                    last_user_msg, project_id, is_continuation
-                )
-
-                # ==========================================================================
-                # 🧠📦 ENRICHMENT & COMPRESSION – Context assembly
-                # ==========================================================================
-                # -- Step 8: context assembly --
-                is_code_session, use_case_label = (
-                    await self._inlet_orchestrator.inlet_prepare_code_session(
-                        messages, project_id, user_query, is_continuation
-                    )
-                )
-
-                (
-                    assembled_messages,
-                    cached_response,
-                ) = await self._context_assembler.assemble_for_turn(
-                    messages=messages,
-                    project_id=project_id,
-                    user_query=user_query,
-                    user_question=user_question,
-                    is_code_session=is_code_session,
-                    last_user_msg=last_user_msg,
-                    state=state,
-                    __user__=__user__,
-                    has_code_blocks=has_code_blocks,
-                    slot_busy=self._project_state_manager.get_slot_restored(project_id),
-                    is_continuation=is_continuation,
-                )
-
-                # ==========================================================================
-                # ⚡ COMMAND HANDLING – Explicit commands and natural intents
-                # ==========================================================================
-                # -- Step 9: commands --
-                handled, cmd_messages = (
-                    await self._command_router.handle_explicit_commands(
-                        assembled_messages,
-                        project_id,
-                        is_explicit_command,
-                        last_user_msg,
-                        __user__,
-                    )
-                )
-                if handled and cmd_messages is not None:
-                    body["messages"] = cmd_messages
-                    await self._emit_status("Done", done=True)
-                    return body
-
-                if not handled:
-                    _, natural_messages = (
-                        await self._command_router.handle_natural_intents(
-                            assembled_messages,
-                            project_id,
-                            is_explicit_command,
-                            last_user_msg,
+                if self.valves.enable_context_dump:
+                    try:
+                        self._context_dumper.schedule_inlet_snapshot(
+                            project_id=project_id,
+                            static_block=static_block,
+                            dynamic_block="",
+                            final_system=static_block,
+                            messages=messages,
                         )
-                    )
-                    if natural_messages:
-                        assembled_messages = natural_messages
+                    except Exception as _dump_err:
+                        self._log_debug(
+                            f"Context dump scheduling failed (silent ingestion): "
+                            f"{_dump_err}"
+                        )
 
-                body["messages"] = assembled_messages
-
-                self._log_timing(
-                    "inlet_total",
-                    time.monotonic() - t_start,
-                    time.monotonic() - t_start,
+                body["messages"] = messages
+                _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                self._log_section(
+                    "CONTEXT MANAGER - INLET END",
+                    duration=time.monotonic() - inlet_start,
                 )
-
-            except Exception as e:
-                self._log_debug(
-                    f"inlet: unhandled exception for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-                # Return original body on error rather than crashing Open-WebUI.
-                # The lock is released by the 'async with' even here.
-
-        # ==========================================================================
-        # 🔥 STATE MANAGEMENT – Final status emission
-        # ==========================================================================
-        # -- Step 10: done --
-        await self._emit_status("Done", done=True)
-        return body
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # OUTLET – Post‑response processing
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Value categories (see project documentation):
-    #   🔥 STATE MANAGEMENT    – Update code state, persist ConversationState,
-    #                            response metrics, index new symbols
-    #   ⚡ COMMAND HANDLING    – Intercept /expand command references in output
-    #   🚀 RESOURCE OPTIMISATION – Schedule background tasks (slot save,
-    #                            lazy tasks) and context dump snapshots
-    # ═══════════════════════════════════════════════════════════════════════════
-    async def outlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-    ) -> dict:
-        """
-        Post-process the model's response: index new symbols, schedule
-        background enrichment, persist state, and optionally dump context.
-
-        Any exception inside outlet must never propagate to Open-WebUI, as
-        the framework interprets outlet exceptions as pipeline failures and
-        replaces the model's successfully-generated response with an error
-        message. All processing is wrapped in try/except; the original body
-        is always returned.
-
-        Steps:
-            1. 🔥 Extract project_id and locate the assistant message.
-            2. 🔥 Index new symbols from the assistant response.
-            3. 🔥 Update response metrics in ProjectStateManager.
-            4. 🔥 Persist ConversationState if dirty.
-            5. ⚡ Intercept /expand command references in the response text.
-            6. 🚀 Schedule background tasks (docstrings, LOD, slot save).
-            7. 🚀 Schedule context dump snapshot.
-            8. 🔥 Return body unconditionally.
-        """
-        try:
-            # ==========================================================================
-            # 🔥 STATE MANAGEMENT – Project resolution and message extraction
-            # ==========================================================================
-            # -- Step 1: extract project_id and assistant message --
-            project_id = self._inlet_orchestrator.get_project_id()
-            messages = body.get("messages", [])
-
-            if not messages:
                 return body
 
-            assistant_msg = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"),
-                None,
+        # 🔥 STATE MANAGEMENT
+        #   5. Prepare code session (classify, update code blocks)
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        is_code_session, user_question = (
+            await self._inlet_orch.inlet_prepare_code_session(
+                messages,
+                project_id,
+                user_query,
+                is_continuation=is_continuation,
             )
+        )
+        _inlet_timing("Step 5/6: Prepare code session", step_start)
 
-            # ==========================================================================
-            # 🔥 STATE MANAGEMENT – Indexing and metrics update
-            # ==========================================================================
-            # -- Step 2: index assistant response --
-            if assistant_msg:
-                await self._update_active_code(
-                    message=assistant_msg,
-                    project_id=project_id,
-                    is_continuation=self._project_state_manager.get_is_continuation(
-                        project_id
-                    ),
-                )
+        # 🧠 ENRICHMENT – Resolve call‑graph mode BEFORE Block A is built
+        # ----------------------------------------------------------------
+        intent_vector = await self._commands.classify_intent(user_query, project_id)
 
-            # -- Step 3: update response metrics --
-            try:
-                response_text = (assistant_msg or {}).get("content", "")
-                self._project_state_manager.set_last_assistant_response(
-                    project_id, response_text
-                )
-                self._project_state_manager.set_last_response_timestamp(
-                    project_id, time.time()
-                )
-                await self._enrichment.update_lod_thresholds_from_response(
-                    project_id, response_text
-                )
-            except Exception as e:
-                self._log_debug(
-                    f"outlet: metrics update failed for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            # -- Step 4: persist state --
-            try:
-                await self._conversation_state_manager.save_if_dirty(project_id)
-            except Exception as e:
-                self._log_debug(
-                    f"outlet: save_if_dirty failed for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            # ==========================================================================
-            # ⚡ COMMAND HANDLING – Intercept /expand references
-            # ==========================================================================
-            # -- Step 5: intercept /expand references --
-            try:
-                if assistant_msg and assistant_msg.get("content"):
-                    new_content, was_expanded = (
-                        await self._command_router.outlet_intercept_expand(
-                            assistant_msg["content"], project_id
-                        )
-                    )
-                    if was_expanded:
-                        assistant_msg["content"] = new_content
-            except Exception as e:
-                self._log_debug(
-                    f"outlet: expand intercept failed for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            # ==========================================================================
-            # 🚀 RESOURCE OPTIMISATION – Background tasks and context dump
-            # ==========================================================================
-            # -- Step 6: background tasks --
-            try:
-                state = self._conversation_state_manager.get(project_id)
-                pstate = self._project_state_manager.get_pstate(project_id)
-                await self._task_registry.run_lazy_tasks(project_id, pstate)
-                asyncio.ensure_future(self._project_state_manager.slot_save(project_id))
-            except Exception as e:
-                self._log_debug(
-                    f"outlet: background tasks failed for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            # -- Step 7: context dump --
-            try:
-                if self.valves.enable_context_dump:
-                    self._context_dumper.schedule_inlet_snapshot(
-                        project_id=project_id,
-                        static_block="",
-                        dynamic_block="",
-                        final_system="",
-                        messages=messages,
-                    )
-            except Exception as e:
-                self._log_debug(
-                    f"outlet: context dump failed for '{project_id}': "
-                    f"{type(e).__name__}: {e}"
-                )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log_debug(
-                f"outlet: unexpected top-level error for project: "
-                f"{type(e).__name__}: {e}"
+        use_case_key, use_case_profile, use_case_label = (
+            await self._inlet_orch.classify_intent_with_continuation(
+                user_query, project_id, intent_vector, is_continuation
             )
+        )
 
-        # ==========================================================================
-        # 🔥 STATE MANAGEMENT – Always return original body
-        # ==========================================================================
-        # -- Step 8: always return body --
+        psm.set_last_user_query(project_id, user_query)
+
+        await self._task_registry.run_lazy_tasks(project_id, pstate)
+
+        await self._ctx_builder.prepare_call_graph_mode(
+            project_id, user_query, intent_vector
+        )
+
+        # 🧠📦 ENRICHMENT + COMPRESSION + ASSEMBLY
+        #   6. Assemble context and final messages
+        # ----------------------------------------------------------------
+        step_start = time.monotonic()
+        state = self._conversation_state_manager.get(project_id)
+
+        messages, cached_response = await self._context_assembler.assemble_for_turn(
+            messages=messages,
+            project_id=project_id,
+            user_query=user_query,
+            user_question=user_question,
+            is_code_session=is_code_session,
+            last_user_msg=last_user_msg,
+            state=state,
+            __user__=__user__,
+            has_code_blocks=has_code_blocks,
+            slot_busy=slot_busy,
+            is_continuation=is_continuation,
+            intent_vector=intent_vector,
+        )
+        _inlet_timing("Step 6/6: Assemble context and final messages", step_start)
+
+        if cached_response:
+            messages.pop()
+            messages.append(
+                {"role": "assistant", "content": cached_response["response"]}
+            )
+            messages = self._inlet_orch.ensure_last_message_is_user(messages)
+            body["messages"] = messages
+            _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._log_section(
+                "CONTEXT MANAGER - INLET END",
+                duration=time.monotonic() - inlet_start,
+            )
+            return body
+
+        body["messages"] = messages
+
+        # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
+        # ----------------------------------------------------------------
+        if not slot_busy and self.valves.enable_slot_persistence:
+            await self._project_state_manager.slot_restore_for_continuity(project_id)
+
+        _inlet_timing("total_inlet (end-to-end)", inlet_start)
+        self._log_section(
+            "CONTEXT MANAGER - INLET END",
+            duration=time.monotonic() - inlet_start,
+        )
         return body
+
+    finally:
+        # Always clear the event emitter to prevent leaking into the next
+        # request, regardless of which return path was taken or whether
+        # an exception was raised.
+        self._event_emitter = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTLET – Post‑response processing
+# ═══════════════════════════════════════════════════════════════════════════
+# Value categories (same as inlet):
+#   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
+#   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
+# ═══════════════════════════════════════════════════════════════════════════
+async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    """
+    Post‑process the response after the LLM has generated it.
+
+    Returns the (possibly modified) body unchanged.
+
+    Modified (Doc 18 AC-B): uses response hash instead of message index
+    to avoid skipping _update_active_code in every turn.
+    """
+    self._log_debug("outlet called")
+    start_time = time.monotonic()
+    self._log_section("CONTEXT MANAGER - OUTLET START")
+
+    if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
+        self._log_debug("outlet: prerequisites not met, returning body unchanged")
+        return body
+
+    # -- Log body structure once for debugging --------------------------
+    if not getattr(self, "_outlet_body_structure_logged", False):
+        self._log_debug(
+            f"outlet body structure (first call): "
+            f"keys={list(body.keys())}, "
+            f"messages_count={len(body.get('messages', []))}, "
+            f"last_role={body.get('messages', [{}])[-1].get('role', 'N/A')}"
+        )
+        self._outlet_body_structure_logged = True
+
+    try:
+        project_id = self._inlet_orch.get_project_id()
+        state = self._conversation_state_manager.get(project_id)
+        psm = self._project_state_manager
+        pstate = psm.get_pstate(project_id)
+        messages = body.get("messages", [])
+        is_code_session = await self._inlet_orch.classify_session(messages, project_id)
+
+        # -- Step 1: detect assistant response --------------------------
+        # In this OpenWebUI build, the assistant response may not be in messages.
+        assistant_content = ""
+        assistant_source = ""
+
+        # First, check if messages already has an assistant message at the end
+        if messages and messages[-1].get("role") == "assistant":
+            assistant_content = messages[-1].get("content", "")
+            assistant_source = "messages[-1]"
+
+        # If not, try common body fields
+        if not assistant_content:
+            for field in ("content", "output", "response", "assistant"):
+                val = body.get(field)
+                if isinstance(val, str) and val.strip():
+                    assistant_content = val
+                    assistant_source = f"body['{field}']"
+                    break
+                if isinstance(val, dict):
+                    val = val.get("content", "")
+                    if val:
+                        assistant_content = val
+                        assistant_source = f"body['{field}']['content']"
+                        break
+
+        if not assistant_content:
+            self._log_debug(
+                "outlet: no assistant response found in body -- "
+                "_update_active_code skipped. "
+                f"(keys={list(body.keys())})"
+            )
+            # Still run other outlet tasks (slot save, etc.)
+            return body
+
+        # -- Step 2: deduplicate by content hash ------------------------
+        response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
+        if pstate.get("last_outlet_response_hash") == response_hash:
+            self._log_debug(
+                f"outlet: response already processed (hash={response_hash}), skipping"
+            )
+            return body
+
+        pstate["last_outlet_response_hash"] = response_hash
+        self._log_debug(
+            f"outlet: processing assistant response "
+            f"(source={assistant_source}, hash={response_hash}, "
+            f"{len(assistant_content.split())} words)"
+        )
+
+        # -- Step 3: process the assistant message ----------------------
+        await self._llm_orchestrator.wait_for_llm_tasks()
+
+        # Intercept /expand commands in the assistant content
+        if is_code_session and "/expand" in assistant_content:
+            modified_content, did_expand = await self._commands.outlet_intercept_expand(
+                assistant_content, project_id
+            )
+            if did_expand:
+                # Update the message in body if it exists
+                if assistant_source == "messages[-1]":
+                    messages[-1]["content"] = modified_content
+                # Otherwise, we can't update the body directly; log it.
+                assistant_content = modified_content
+                self._log_debug(
+                    "outlet: /expand intercepted and expanded in assistant content"
+                )
+
+        # Store in LTM and update active blocks
+        assistant_msg = {"role": "assistant", "content": assistant_content}
+        if is_code_session:
+            self._log_debug(
+                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
+            )
+            await self._update_active_code(assistant_msg, project_id)
+
+            # -- C6: wrap store_messages with signal --------------------
+            self._ltm_store_complete.clear()
+
+            async def _store_and_signal():
+                try:
+                    await self._ltm.store_messages(
+                        project_id, [assistant_msg], wait=False
+                    )
+                except Exception as e:
+                    self._log_debug(f"LTM: store_messages failed: {e}")
+                finally:
+                    self._ltm_store_complete.set()
+
+            asyncio.create_task(_store_and_signal())
+        else:
+            if not self.valves.ltm_store_only_code_sessions:
+                self._log_debug(
+                    "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
+                )
+                self._ltm_store_complete.clear()
+
+                async def _store_and_signal_noncode():
+                    try:
+                        await self._ltm.store_messages(
+                            project_id, [assistant_msg], wait=False
+                        )
+                    except Exception as e:
+                        self._log_debug(f"LTM: store_messages failed: {e}")
+                    finally:
+                        self._ltm_store_complete.set()
+
+                asyncio.create_task(_store_and_signal_noncode())
+
+        # 🚀 RESOURCE OPTIMISATION – Save slot NOW (stable state, before long tasks)
+        # ----------------------------------------------------------------
+        if self.valves.enable_slot_persistence:
+            try:
+                psm.set_last_total_context_tokens(
+                    project_id, self._tokens.estimate_tokens(messages)
+                )
+            except Exception as e:
+                self._log_debug(f"outlet: token estimation failed: {e}")
+            await psm.slot_save(project_id)
+
+        # -- Save last response for LOD adaptive lazy -------------------
+        psm.set_last_assistant_response(project_id, assistant_content)
+        psm.set_last_response_timestamp(project_id, time.time())
+
+        # -- Response cache (use assistant_content for cache) -----------
+        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+            last_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user:
+                # Use the potentially modified assistant_content
+                _is_partial_mp = self.valves.enable_multi_phase_response and any(
+                    marker in assistant_content for marker in self._MULTI_PHASE_MARKERS
+                )
+                if not _is_partial_mp:
+                    context_hash = self._activation.compute_context_hash(messages)
+                    code_state_hash = self._activation.compute_code_state_hash(
+                        project_id
+                    )
+                    await self._ltm.store_response_in_cache(
+                        last_user.get("content", ""),
+                        assistant_content,
+                        context_hash,
+                        state,
+                        code_state_hash,
+                        wait=False,
+                    )
+
+        # 🚀 RESOURCE OPTIMISATION – Purge expired memories
+        # ----------------------------------------------------------------
+        await self._ltm.purge_expired_memories()
+
+        if not hasattr(self, "_write_counter"):
+            self._write_counter = 0
+        self._write_counter += 1
+
+        interval = self.valves.purge_orphaned_data_interval
+        if interval > 0 and self._write_counter % interval == 0:
+            await self._state_store.purge_orphaned_data(project_id)
+
+        # 🚀 RESOURCE OPTIMISATION – DB checkpoints
+        # ----------------------------------------------------------------
+        if self._write_counter % 100 == 0:
+            await self._state_store.run_db_checkpoints()
+
+        # 🚀 RESOURCE OPTIMISATION – Save edges
+        # ----------------------------------------------------------------
+        if self.valves.enable_edge_persistence:
+            await self._state_store.save_symbol_edges_to_db(project_id)
+
+        # 🚀 RESOURCE OPTIMISATION – Save path views
+        # ----------------------------------------------------------------
+        if self.valves.enable_path_analysis:
+            await self._state_store.save_path_views_to_db(
+                project_id, self._path_index.get_all(project_id)
+            )
+
+        # 🔥 STATE MANAGEMENT – Save state if dirty
+        # ----------------------------------------------------------------
+        await self._conversation_state_manager.save_if_dirty(project_id)
+
+        # 🔥 STATE MANAGEMENT – Detect and persist continuation marker
+        # ----------------------------------------------------------------
+        genuine = self._detect_genuine_continuation(messages)
+        if genuine:
+            turns = psm.increment_continuation_turns(project_id)
+            psm.set_is_continuation(project_id, True)
+            self._log_debug(
+                f"AutoContinue: genuine marker detected "
+                f"(turn {turns} of continuation)"
+            )
+        else:
+            psm.set_is_continuation(project_id, False)
+
+        # -- Continuation turns reset is handled inside set_is_continuation
+        # when set to False. No need to manually reset here.
+
+    except Exception as e:
+        self._log_debug(f"❌ outlet error: {e}")
+        import traceback
+
+        self._log_debug(traceback.format_exc())
+
+    finally:
+        if getattr(self, "_is_silent_ingestion", False):
+            self._is_silent_ingestion = False
+
+        self._log_debug("outlet: waiting for background LLM tasks to complete")
+        await self._llm_orchestrator.wait_for_llm_tasks()
+
+    # 🚀 BACKGROUND TASKS - Resume after critical work is done
+    # ----------------------------------------------------------------
+    # Now that the user's turn is fully processed and the KV slot is saved,
+    # we can resume background tasks to prepare for the next turn.
+    # We unpause the manager first, then launch tasks in priority order.
+    # ----------------------------------------------------------------
+    # First, drain SQLite writes to reduce lock contention
+    await self._state_store.drain_writes(timeout=2.0)
+
+    # Get last_activated for prefetch
+    last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
+
+    self._bg_manager.set_paused(False)
+
+    for task in self._task_registry.get_background_tasks():
+        if task.bg_func is None:
+            continue
+        valve_name = task.valve_bg
+        if valve_name and not getattr(self.valves, valve_name, True):
+            continue
+        # For LOD adaptive, pass the current response as an argument
+        if task.name == "lod_adaptive":
+            await self._bg_manager.start(
+                task.name,
+                task.bg_func,
+                project_id,
+                assistant_content,  # response_text
+            )
+        elif task.name == "prefetch":
+            await self._bg_manager.start(
+                task.name,
+                task.bg_func,
+                project_id,
+                last_activated,  # last_activated
+            )
+        else:
+            await self._bg_manager.start(task.name, task.bg_func, project_id)
+
+    self._log_section(
+        "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
+    )
+    return body
