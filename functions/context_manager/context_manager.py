@@ -2717,48 +2717,62 @@ class ContextPager:
         embedder,
     ) -> bool:
         """
-        Soft-evict a code block to ChromaDB with semantic relevance filtering.
+        Soft-evict a code block to ChromaDB using a semantic relevance cascade.
 
-        Uses a cascade: heuristic reinforcement, CrossEncoder, and LLM fallback.
-        The full block content (up to 32768 tokens) is stored in ChromaDB as
-        the authoritative source for page_in_block reconstruction.
+        The decision cascade is:
+        1. Heuristic reinforcement — importance score and pinned flag.
+        2. CrossEncoder — scores "keep" vs "page out" against the current query.
+        3. LLM fallback — only when CrossEncoder diff < ``paging_llm_threshold``.
+        4. Middle zone — importance heuristic (no LLM cost).
+
+        The block content (up to 32 768 tokens) is stored in ChromaDB as the
+        authoritative source for ``page_in_block`` reconstruction.
 
         Args:
-            block: The block to page out.
+            block: The block to consider for eviction.
             project_id: Current project identifier.
-            state: Conversation state.
+            state: Conversation state (unused directly; kept for API compat).
             symbol_index: SymbolIndex instance.
-            chroma_collection: ChromaDB collection for cold storage.
-            embedder: Embedder instance.
+            chroma_collection: Target ChromaDB collection.
+            embedder: Sentence-transformer embedder instance.
 
         Returns:
-            True if the block was paged out, False if kept.
+            True if the block was scheduled for page-out, False if it was kept.
         """
         if chroma_collection is None or embedder is None:
             return False
 
+        # ------------------------------------------------------------------
+        # Region: Resolve current query for semantic evaluation
+        # ------------------------------------------------------------------
         current_query = self._f._project_state_manager.get_last_user_query(project_id)
-
         should_page_out = True
         h_weight = self._f.valves.heuristic_reinforcement_weight
 
-        # ── Step 1: Heuristic reinforcement — boost keep for important blocks ──
-        if block.importance_score > 5.0 or block.pinned:
-            keep_boost = 0.2 * h_weight
-        else:
-            keep_boost = 0.0
+        # ------------------------------------------------------------------
+        # Region: Heuristic reinforcement
+        # Pinned or high-importance blocks receive a keep-score boost that
+        # makes the CrossEncoder less likely to recommend paging them out.
+        # ------------------------------------------------------------------
+        keep_boost = (
+            0.2 * h_weight if (block.importance_score > 5.0 or block.pinned) else 0.0
+        )
 
-        # ── Step 2: CrossEncoder evaluation ───────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: CrossEncoder evaluation
+        # ------------------------------------------------------------------
         if current_query and self._f._cross_encoder is not None:
             content_snippet = block.content[:1500]
             pairs = [
                 (
                     current_query[:500],
-                    f"This code block is relevant to the current query and should be kept:\n{content_snippet}",
+                    f"This code block is relevant to the current query and should "
+                    f"be kept:\n{content_snippet}",
                 ),
                 (
                     current_query[:500],
-                    f"This code block is not relevant to the current query and can be paged out:\n{content_snippet}",
+                    f"This code block is not relevant to the current query and can "
+                    f"be paged out:\n{content_snippet}",
                 ),
             ]
             scores = await self._f._commands._predict_cross_encoder(pairs)
@@ -2768,70 +2782,83 @@ class ContextPager:
                 scores_reinforced[0] += keep_boost
 
                 diff = scores_reinforced[0] - scores_reinforced[1]
-                CE_CONFIDENCE_THRESHOLD = self._f.valves.paging_ce_threshold
-                LLM_FALLBACK_THRESHOLD = self._f.valves.paging_llm_threshold
+                ce_threshold = self._f.valves.paging_ce_threshold
+                llm_threshold = self._f.valves.paging_llm_threshold
 
-                if diff >= CE_CONFIDENCE_THRESHOLD:
+                if diff >= ce_threshold:
+                    # CE is confident — use its decision.
                     should_page_out = scores_reinforced[1] > scores_reinforced[0]
                     self._f._log_debug(
                         f"page_out_block: CE confident (diff={diff:.2f}) → "
-                        f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
+                        f"{'page out' if should_page_out else 'keep'} "
+                        f"block {block.hash[:8]}"
                     )
-                elif diff < LLM_FALLBACK_THRESHOLD:
+                elif diff < llm_threshold:
+                    # CE is uncertain — fall back to LLM.
                     self._f._log_debug(
-                        f"page_out_block: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                        f"using LLM for {block.hash[:8]}"
+                        f"page_out_block: CE uncertain (diff={diff:.2f} < "
+                        f"{llm_threshold:.2f}), using LLM for block {block.hash[:8]}"
                     )
                     should_page_out = await self._page_out_block_with_llm(
                         block, current_query, scores_reinforced, project_id
                     )
                 else:
+                    # Middle zone — importance heuristic.
                     should_page_out = not (block.importance_score > 5.0 or block.pinned)
                     self._f._log_debug(
-                        f"page_out_block: middle zone, heuristic: "
-                        f"{'page out' if should_page_out else 'keep'} for {block.hash[:8]}"
+                        f"page_out_block: middle zone, heuristic → "
+                        f"{'page out' if should_page_out else 'keep'} "
+                        f"block {block.hash[:8]}"
                     )
 
-        # ── Step 3: Execute page-out if decided ───────────────────────────────
-        if should_page_out:
-            entry_id = f"{project_id}_paged_{block.hash}"
-            symbol_names = ",".join(s.name for s in block.symbols)
+        # ------------------------------------------------------------------
+        # Region: Execute page-out
+        # ------------------------------------------------------------------
+        if not should_page_out:
+            return False
 
-            # Truncate to embedder token limit — this is stored as the
-            # authoritative document in ChromaDB for lossless page_in.
-            safe_text = block.content
-            if hasattr(self._f, "_tokens"):
-                safe_text = self._f._tokens.truncate_text_to_tokens(
-                    block.content, 32768
-                )
+        entry_id = f"{project_id}_paged_{block.hash}"
+        symbol_names = ",".join(s.name for s in block.symbols)
 
-            metadata = {
-                "project_id": project_id,
-                "is_paged_block": True,
-                "block_hash": block.hash,
-                "file_path": block.file_path or "",
-                "content_type": block.content_type.value,
-                "importance_score": block.importance_score,
-                "paged_at": time.time(),
-                "symbol_names": symbol_names,
-            }
+        # Truncate to embedder token limit — this is the authoritative document
+        # stored in ChromaDB; page_in_block uses it to reconstruct the block
+        # without loss (previous design stored only a 2 000-char excerpt).
+        safe_text = block.content
+        if hasattr(self._f, "_tokens"):
+            safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
 
-            # Offload embedding + upsert to background — safe_text is the
-            # document (not a 2000-char excerpt) so page_in can reconstruct fully.
-            asyncio.create_task(
-                self._page_out_async(
-                    entry_id=entry_id,
-                    safe_text=safe_text,
-                    metadata=metadata,
-                    embedder=embedder,
-                    chroma_collection=chroma_collection,
-                )
+        metadata = {
+            "project_id": project_id,
+            "is_paged_block": True,
+            "block_hash": block.hash,
+            "file_path": block.file_path or "",
+            "content_type": block.content_type.value,
+            "importance_score": block.importance_score,
+            "paged_at": time.time(),
+            "symbol_names": symbol_names,
+        }
+
+        # Register the block as paged BEFORE launching the background task.
+        # If the task fails, _page_out_async will discard the hash from the
+        # registry (Issue 3.1 fix) so stale lookups are avoided.
+        self._paged_hashes.setdefault(project_id, set()).add(block.hash)
+
+        # Launch embedding + upsert in a background task.
+        # Issue 3.1 fix: pass project_id and block_hash so the task can
+        # remove the stale registry entry if the ChromaDB write fails.
+        asyncio.create_task(
+            self._page_out_async(
+                entry_id=entry_id,
+                safe_text=safe_text,
+                metadata=metadata,
+                embedder=embedder,
+                chroma_collection=chroma_collection,
+                project_id=project_id,
+                block_hash=block.hash,
             )
+        )
 
-            self._paged_hashes.setdefault(project_id, set()).add(block.hash)
-            return True
-
-        return False
+        return True
 
     async def _page_out_async(
         self,
@@ -2840,39 +2867,76 @@ class ContextPager:
         metadata: dict,
         embedder,
         chroma_collection,
+        project_id: str = "",
+        block_hash: str = "",
     ) -> None:
         """
-        Background task for embedding and upserting a paged block.
+        Background task: embed a paged block and upsert it into ChromaDB.
 
-        safe_text is stored as both the embedding source and the ChromaDB
-        document, making it the authoritative source for page_in_block
-        reconstruction. The previous design stored only a 2000-char excerpt
-        as the document, making lossless reconstruction impossible.
+        This method is intentionally fire-and-forget — it is launched via
+        ``asyncio.create_task`` from ``page_out_block`` so that the embedding
+        work does not block the request path.
+
+        ``safe_text`` is stored as the ChromaDB *document*, not a truncated
+        excerpt, so that ``page_in_block`` can fully reconstruct the original
+        block content.
 
         Args:
-            entry_id: Unique ID for the ChromaDB entry.
+            entry_id: Unique ChromaDB document ID for this block.
             safe_text: Full block content (truncated to embedder token limit).
-            metadata: Metadata to store with the embedding.
-            embedder: Embedder instance.
-            chroma_collection: ChromaDB collection.
+            metadata: Metadata dict to store alongside the embedding.
+            embedder: Sentence-transformer embedder instance.
+            chroma_collection: Target ChromaDB collection.
+            project_id: Project identifier — used to clean up ``_paged_hashes``
+                on failure.  Empty string disables cleanup (backward compat).
+            block_hash: Content hash of the block — used alongside
+                ``project_id`` to remove the stale registry entry on failure.
         """
         async with self._f._chroma_semaphore:
             try:
+                # ----------------------------------------------------------
+                # Region: Embed the block content
+                # ----------------------------------------------------------
                 embedding = await anyio.to_thread.run_sync(
                     lambda: embedder.encode(safe_text).tolist()
                 )
+
+                # ----------------------------------------------------------
+                # Region: Upsert into ChromaDB
+                # safe_text is the full document, not a 2000-char excerpt,
+                # so page_in_block can reconstruct the block without loss.
+                # ----------------------------------------------------------
                 await anyio.to_thread.run_sync(
                     lambda: chroma_collection.upsert(
                         ids=[entry_id],
                         embeddings=[embedding],
-                        documents=[safe_text],  # full content — was excerpt[:2000]
+                        documents=[safe_text],
                         metadatas=[metadata],
                     )
                 )
-            except Exception:
-                # Best effort; paged_hashes already tracks the eviction.
-                # If this fails, page_in_block will return None for this block.
-                pass
+
+            except Exception as exc:
+                # ----------------------------------------------------------
+                # Region: Failure handling (Issue 3.1 fix)
+                # The block has already been removed from active_blocks by the
+                # caller.  If we leave the hash in _paged_hashes, future calls
+                # to is_paged() will return True, leading page_in_block to
+                # query ChromaDB and find nothing — a silent context gap.
+                # Remove the entry so the hash is correctly reported as "not
+                # available" and any downstream context builder falls back
+                # gracefully (e.g. by skipping this symbol in the LOD tier).
+                # ----------------------------------------------------------
+                self._f._log_debug(
+                    f"_page_out_async: embedding/upsert FAILED for "
+                    f"entry '{entry_id}' (block {block_hash[:8] if block_hash else '?'}): "
+                    f"{exc}. "
+                    f"Block is NOT in ChromaDB — removing from _paged_hashes "
+                    f"to prevent stale lookups."
+                )
+                if project_id and block_hash:
+                    paged_set = self._paged_hashes.get(project_id)
+                    if paged_set is not None:
+                        paged_set.discard(block_hash)
 
     # ------------------------------------------------------------------
     # Region: LLM Fallback for Paging Decision
@@ -2960,7 +3024,7 @@ class ContextPager:
     async def purge_old_versions(
         self,
         project_id: str,
-        state: dict,
+        state: "ConversationState",
         symbol_index: "SymbolIndex",
         chroma_collection,
         embedder,
@@ -2970,31 +3034,42 @@ class ContextPager:
         """
         Move code versions beyond the N most recent per file to cold storage.
 
-        Uses the same cascade as page_out_block for each old version.
+        For each file with more than ``max_versions_per_file`` active blocks,
+        the oldest versions are evaluated for purging using the same
+        Heuristic → CrossEncoder → LLM cascade as ``page_out_block``.
+
+        1. Logs a clear WARNING explaining that content would be permanently lost.
+        2. Gates the hard delete on the new ``purge_allow_hard_delete`` valve
+           (default False), so the safe behaviour is to retain the block.
+        3. Operators who want aggressive cleanup under constrained storage can
+           opt in explicitly by setting the valve to True.
 
         Args:
             project_id: Current project identifier.
-            state: Conversation state.
+            state: Conversation state containing active_blocks.
             symbol_index: SymbolIndex instance.
             chroma_collection: ChromaDB collection for cold storage.
             embedder: Embedder instance.
             max_versions_per_file: Number of recent versions per file to keep.
-            stop_event: If set, stops processing gracefully.
+            stop_event: If set, stops processing gracefully between files.
 
         Returns:
-            int: The number of blocks purged.
+            int: The number of blocks purged (paged or hard-deleted).
         """
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
-            from collections import defaultdict
 
+            # ------------------------------------------------------------------
+            # Region: Early stop check
+            # ------------------------------------------------------------------
             if stop_event and stop_event.is_set():
                 return 0
 
             # ------------------------------------------------------------------
-            # Step 1: Group blocks by file path.
+            # Region: Group active blocks by file path
+            # Only unpinned, non-obsolete blocks with a known path are eligible.
             # ------------------------------------------------------------------
-            by_file = defaultdict(list)
+            by_file: dict = defaultdict(list)
             for h, block in state.active_blocks.items():
                 if block.file_path and not block.pinned and not block.obsolete:
                     by_file[block.file_path].append((h, block))
@@ -3006,42 +3081,48 @@ class ContextPager:
             h_weight = self._f.valves.heuristic_reinforcement_weight
 
             # ------------------------------------------------------------------
-            # Step 2: Process each file's versions.
+            # Region: Process each file's version list
             # ------------------------------------------------------------------
             for file_path, versions in by_file.items():
                 if stop_event and stop_event.is_set():
                     self._f._log_debug(
-                        f"purge_old_versions: stopped after {purged} purged blocks"
+                        f"purge_old_versions: stop signal received — "
+                        f"halting after {purged} block(s) purged"
                     )
                     break
 
                 if len(versions) <= max_versions_per_file:
                     continue
 
+                # Sort newest-first; everything beyond the keep window is a candidate.
                 versions.sort(key=lambda x: x[1].timestamp, reverse=True)
                 to_purge = versions[max_versions_per_file:]
 
                 for h, block in to_purge:
                     should_purge = True
 
-                    # ------------------------------------------------------------------
-                    # Heuristic reinforcement: keep if important.
-                    # ------------------------------------------------------------------
+                    # ----------------------------------------------------------
+                    # Region: Heuristic reinforcement
+                    # Important blocks receive a boost that lowers the chance of
+                    # being classified as purgeable by the CrossEncoder.
+                    # ----------------------------------------------------------
                     keep_boost = 0.2 * h_weight if block.importance_score > 5.0 else 0.0
 
-                    # ------------------------------------------------------------------
-                    # CrossEncoder evaluation.
-                    # ------------------------------------------------------------------
+                    # ----------------------------------------------------------
+                    # Region: CrossEncoder evaluation
+                    # ----------------------------------------------------------
                     if current_query and self._f._cross_encoder is not None:
                         content_snippet = block.content[:1500]
                         pairs = [
                             (
                                 current_query[:500],
-                                f"This old version is still relevant and should be kept:\n{content_snippet}",
+                                f"This old version is still relevant and should be kept:\n"
+                                f"{content_snippet}",
                             ),
                             (
                                 current_query[:500],
-                                f"This old version is obsolete and can be purged:\n{content_snippet}",
+                                f"This old version is obsolete and can be purged:\n"
+                                f"{content_snippet}",
                             ),
                         ]
                         scores = await self._f._commands._predict_cross_encoder(pairs)
@@ -3051,63 +3132,100 @@ class ContextPager:
                             scores_reinforced[0] += keep_boost
 
                             diff = scores_reinforced[0] - scores_reinforced[1]
-                            CE_CONFIDENCE_THRESHOLD = self._f.valves.purge_ce_threshold
-                            LLM_FALLBACK_THRESHOLD = self._f.valves.purge_llm_threshold
+                            ce_threshold = self._f.valves.purge_ce_threshold
+                            llm_threshold = self._f.valves.purge_llm_threshold
 
-                            if diff >= CE_CONFIDENCE_THRESHOLD:
+                            if diff >= ce_threshold:
+                                # CE is confident — use its decision.
                                 should_purge = (
                                     scores_reinforced[1] > scores_reinforced[0]
                                 )
                                 self._f._log_debug(
-                                    f"purge_old_versions: CE confident (diff={diff:.2f}) → "
-                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                    f"purge_old_versions: CE confident "
+                                    f"(diff={diff:.2f}) → "
+                                    f"{'purge' if should_purge else 'keep'} "
+                                    f"block {block.hash[:8]}"
                                 )
-                            elif diff < LLM_FALLBACK_THRESHOLD:
+                            elif diff < llm_threshold:
+                                # CE is uncertain — fall back to LLM.
                                 self._f._log_debug(
-                                    f"purge_old_versions: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                                    f"using LLM for {block.hash[:8]}"
+                                    f"purge_old_versions: CE uncertain "
+                                    f"(diff={diff:.2f} < {llm_threshold:.2f}), "
+                                    f"using LLM for block {block.hash[:8]}"
                                 )
                                 should_purge = await self._purge_old_version_with_llm(
                                     block, current_query, scores_reinforced, project_id
                                 )
                             else:
+                                # Middle zone — fall back to importance heuristic.
                                 should_purge = not (
                                     block.importance_score > 5.0 or block.pinned
                                 )
                                 self._f._log_debug(
-                                    f"purge_old_versions: middle zone, heuristic: "
-                                    f"{'purge' if should_purge else 'keep'} for {block.hash[:8]}"
+                                    f"purge_old_versions: middle zone, heuristic → "
+                                    f"{'purge' if should_purge else 'keep'} "
+                                    f"block {block.hash[:8]}"
                                 )
 
-                    # ------------------------------------------------------------------
-                    # Execute purge if decided.
-                    # ------------------------------------------------------------------
-                    if should_purge:
-                        if (
-                            self._f.valves.enable_block_paging
-                            and chroma_collection is not None
-                        ):
-                            paged = await self.page_out_block(
-                                block=block,
-                                project_id=project_id,
-                                state=state,
-                                symbol_index=symbol_index,
-                                chroma_collection=chroma_collection,
-                                embedder=embedder,
-                            )
-                            if paged:
-                                del state.active_blocks[h]
-                                purged += 1
-                                continue
+                    # ----------------------------------------------------------
+                    # Region: Execute purge decision
+                    # ----------------------------------------------------------
+                    if not should_purge:
+                        continue
 
-                        # Fallback: remove from active blocks without paging.
+                    # Primary path: soft-evict to ChromaDB.
+                    if (
+                        self._f.valves.enable_block_paging
+                        and chroma_collection is not None
+                    ):
+                        paged = await self.page_out_block(
+                            block=block,
+                            project_id=project_id,
+                            state=state,
+                            symbol_index=symbol_index,
+                            chroma_collection=chroma_collection,
+                            embedder=embedder,
+                        )
+                        if paged:
+                            del state.active_blocks[h]
+                            purged += 1
+                            continue
+
+                    # ----------------------------------------------------------
+                    # Fallback: paging is unavailable (ChromaDB down or disabled).
+                    #
+                    # Bug J fix: original code deleted unconditionally, silently
+                    # destroying content with no log and no operator override.
+                    # Now we warn explicitly and require purge_allow_hard_delete=True
+                    # for the block to be removed.  The default (False) keeps the
+                    # block so no content is lost without operator consent.
+                    # ----------------------------------------------------------
+                    if self._f.valves.purge_allow_hard_delete:
+                        self._f._log_debug(
+                            f"purge_old_versions: WARNING — hard-deleting block "
+                            f"{block.hash[:8]} from '{file_path}'. "
+                            f"Content will be PERMANENTLY LOST "
+                            f"(paging unavailable, purge_allow_hard_delete=True)."
+                        )
                         if h in state.active_blocks:
                             del state.active_blocks[h]
                             purged += 1
+                    else:
+                        self._f._log_debug(
+                            f"purge_old_versions: skipping hard delete of block "
+                            f"{block.hash[:8]} from '{file_path}' — "
+                            f"paging failed and purge_allow_hard_delete=False. "
+                            f"Block retained to prevent permanent data loss. "
+                            f"Set purge_allow_hard_delete=True to enable hard deletes."
+                        )
 
+            # ------------------------------------------------------------------
+            # Region: Summary log
+            # ------------------------------------------------------------------
             if purged > 0:
                 self._f._log_debug(
-                    f"Purged {purged} old code version(s) across {len(by_file)} file(s)"
+                    f"purge_old_versions: purged {purged} old version(s) "
+                    f"across {len(by_file)} file(s)"
                 )
             return purged
 
@@ -8582,27 +8700,115 @@ class LongTermMemory:
     * Duplicate question detection using cosine similarity and optional
       CrossEncoder reranking.
     * Time‑bounded expiration of old memories.
-
-    Docs 10–13 backported:
-        M1 – strip <details> reasoning before embedding.
-        M2 – skip partial multi‑phase assistant responses.
-        C1 – apply similarity threshold on raw score, not decayed.
-        C2 – deduplicate fragments by document ID.
-        C3 – purge_project.
-        C4 – validate embedding model dimension on startup.
     """
 
-    def __init__(self, filter_ref: "Filter") -> None:
+    def init(self) -> None:
         """
-        Initialize LongTermMemory with a reference to the parent Filter.
+        Initialise ChromaDB, the sentence-transformer embedder, and the
+        response-cache collection.
 
-        Args:
-            filter_ref: The parent Filter instance.
+        Call order during Filter startup:
+            1. ``LongTermMemory.__init__`` sets ``_retrieval_disabled_reason``
+               and ``_write_disabled_reason`` to None.
+            2. ``Filter.__init__`` calls this method, which sets up the
+               ChromaDB client, embedder, and both collections.
+            3. ``_validate_embedding_model`` is called last; it either
+               persists a first-run fingerprint or detects a mismatch and
+               sets both disable flags.
         """
-        self._f = filter_ref
-        # Reason string when LTM retrieval is disabled (e.g. embedding mismatch).
-        self._retrieval_disabled_reason: Optional[str] = None
-        self._write_disabled_reason: Optional[str] = None
+        # ------------------------------------------------------------------
+        # Region: Defensive reset of disable flags
+        # Cleared here so that a second call to init() (reconnect scenario)
+        # starts from a known-good state rather than inheriting stale flags
+        # from a previous failed or mismatched initialisation.
+        # ------------------------------------------------------------------
+        self._retrieval_disabled_reason = None
+        self._write_disabled_reason = None
+
+        # ------------------------------------------------------------------
+        # Region: Filesystem setup and shared embedder
+        # ------------------------------------------------------------------
+        os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
+        self._f.embedder = _shared_get_embedder()
+        self._f._log_debug("Embedder: using Qwen/Qwen3-Embedding-0.6B")
+
+        # ------------------------------------------------------------------
+        # Region: Shared ChromaDB client
+        # ------------------------------------------------------------------
+        self._f.chroma_client = _shared_get_chroma_client(
+            self._f.valves.long_term_memory_dir
+        )
+        self._f._log_debug("ChromaDB: using shared singleton")
+
+        if self._f.chroma_client is None:
+            self._f._log_debug("ChromaDB not available")
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Main memory collection
+        # ------------------------------------------------------------------
+        self._f.memory_collection = self._f.chroma_client.get_or_create_collection(
+            name="conversation_memory",
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._f._log_debug(
+            f"LTM collection ready – vector size = "
+            f"{self._f.memory_collection.metadata.get('dimension', '?')}"
+        )
+
+        # ------------------------------------------------------------------
+        # Region: Response cache collection (with automatic recovery)
+        # A corrupted collection is deleted and recreated rather than
+        # leaving init() in a partial state.
+        # ------------------------------------------------------------------
+        cache_name = f"response_cache_{self._f.valves.project_id or 'default'}"
+        try:
+            self._f._response_cache_collection = (
+                self._f.chroma_client.get_or_create_collection(
+                    name=cache_name,
+                    metadata={"hnsw:space": "cosine"},
+                )
+            )
+            self._f._log_debug(f"Response cache collection '{cache_name}' ready")
+        except Exception as e:
+            self._f._log_debug(
+                f"Failed to get/create cache collection '{cache_name}': {e}"
+            )
+            try:
+                self._f.chroma_client.delete_collection(cache_name)
+                self._f._log_debug(f"Deleted corrupted collection '{cache_name}'")
+            except Exception:
+                pass
+            try:
+                self._f._response_cache_collection = (
+                    self._f.chroma_client.create_collection(
+                        name=cache_name,
+                        metadata={"hnsw:space": "cosine"},
+                    )
+                )
+                self._f._log_debug(f"Recreated cache collection '{cache_name}'")
+            except Exception as e2:
+                self._f._log_debug(f"Could not recreate cache collection: {e2}")
+                self._f._response_cache_collection = None
+
+        # ------------------------------------------------------------------
+        # Region: Embedding model fingerprint validation (Bug D)
+        # _validate_embedding_model sets _retrieval_disabled_reason and
+        # _write_disabled_reason on mismatch, or persists the first-run
+        # fingerprint when no stored model is found.  Must run after
+        # memory_collection is ready.
+        # ------------------------------------------------------------------
+        if self._f.memory_collection is not None:
+            matched = self._validate_embedding_model()
+            if not matched:
+                self._f._log_debug(
+                    "LTM: both retrieval and writes are DISABLED — "
+                    "see _validate_embedding_model for details. "
+                    f"To fix: delete '{self._f.valves.long_term_memory_dir}' "
+                    "and restart."
+                )
+
+        self._f._log_debug("LTM ready")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Initialization
@@ -9837,12 +10043,55 @@ class LongTermMemory:
             )
 
     async def _store_messages_async(self, project_id: str, valid: list) -> None:
-        """Store each message one by one, offloading embedding to a thread."""
+        """
+        Store each pre-validated message one by one, offloading the embedding
+        to a thread.  Used by the fire-and-forget path in ``store_messages``
+        (``wait=False``).
+
+        Args:
+            project_id: Current project identifier.
+            valid: Pre-filtered list of message dicts with ``role`` and
+                   ``content`` keys.  Empty messages and partial multi-phase
+                   responses have already been removed by the caller.
+        """
+        # ------------------------------------------------------------------
+        # Region: Write-disable guard
+        # Check at the start of the task, not just at creation time.  The
+        # flag could be set between when the task was created (in
+        # store_messages) and when the event loop actually runs this coro.
+        # ------------------------------------------------------------------
+        if self._write_disabled_reason:
+            self._f._log_debug(
+                f"LTM: _store_messages_async blocked — embedding mismatch: "
+                f"{self._write_disabled_reason}"
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Per-message store with independent error isolation
+        # Each message is stored individually so a failure on one does not
+        # prevent the remaining messages from being written.
+        # ------------------------------------------------------------------
         for msg in valid:
+            # Re-check the flag before every message: _validate_embedding_model
+            # could theoretically run and set it mid-loop (e.g. another request
+            # triggers init() while this task is yielding at an await point).
+            if self._write_disabled_reason:
+                self._f._log_debug(
+                    "LTM: _store_messages_async: write-disable flag set mid-loop — "
+                    f"aborting after {valid.index(msg)} message(s) stored."
+                )
+                return
+
             try:
                 await self._store_single_message(project_id, msg)
             except Exception as e:
-                self._f._log_debug(f"Async LTM store failed: {e}")
+                # Log but continue — failure on one message must not drop the rest.
+                self._f._log_debug(
+                    f"LTM: _store_messages_async: failed to store message "
+                    f"(role={msg.get('role', '?')}, "
+                    f"content_len={len(msg.get('content', ''))}): {e}"
+                )
 
     async def _store_single_message(self, project_id: str, msg: dict) -> None:
         """
@@ -9853,7 +10102,7 @@ class LongTermMemory:
             msg: A dict with ``role`` and ``content`` keys.
         """
         # ------------------------------------------------------------------
-        # Region: Write-disable guard (Bug D fix)
+        # Region: Write-disable guard
         # The async path (store_messages with wait=False → _store_messages_async
         # → _store_single_message) must also respect the write-disable flag.
         # ------------------------------------------------------------------
@@ -31369,6 +31618,16 @@ class Valves(BaseModel):
         ge=1,
         le=20,
         description="Number of recent code versions per file to keep in active context.",
+    )
+    purge_allow_hard_delete: bool = Field(
+        default=False,
+        description=(
+            "Allow purge_old_versions to permanently delete old code versions from "
+            "active_blocks when block paging is unavailable (ChromaDB down or "
+            "enable_block_paging=False). "
+            "When False (default), the block is kept to prevent silent data loss. "
+            "When True, the block is deleted and its content is unrecoverable."
+        ),
     )
 
     # ── 12.5 Maintenance ──────────────────────────────────────────────────
