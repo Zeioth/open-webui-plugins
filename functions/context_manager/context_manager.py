@@ -2720,21 +2720,23 @@ class ContextPager:
         Soft-evict a code block to ChromaDB using a semantic relevance cascade.
 
         The decision cascade is:
-        1. Heuristic reinforcement — importance score and pinned flag.
-        2. CrossEncoder — scores "keep" vs "page out" against the current query.
-        3. LLM fallback — only when CrossEncoder diff < ``paging_llm_threshold``.
-        4. Middle zone — importance heuristic (no LLM cost).
+            1. Heuristic reinforcement — importance score and pinned flag.
+            2. CrossEncoder — scores "keep" vs "page out" against the current query.
+            3. LLM fallback — only when CrossEncoder diff < ``paging_llm_threshold``.
+            4. Middle zone — importance heuristic (no LLM cost).
 
-        The block content (up to 32 768 tokens) is stored in ChromaDB as the
-        authoritative source for ``page_in_block`` reconstruction.
+        The block content (up to 32 768 tokens) and its detected language are
+        stored in ChromaDB so that ``page_in_block`` can reconstruct the block
+        and re-extract symbols with the same language, preventing a mismatch
+        that would produce an empty symbol list on page-in.
 
         Args:
-            block: The block to consider for eviction.
-            project_id: Current project identifier.
-            state: Conversation state (unused directly; kept for API compat).
-            symbol_index: SymbolIndex instance.
+            block:            The block to consider for eviction.
+            project_id:       Current project identifier.
+            state:            Conversation state (kept for API compatibility).
+            symbol_index:     SymbolIndex instance.
             chroma_collection: Target ChromaDB collection.
-            embedder: Sentence-transformer embedder instance.
+            embedder:         Sentence-transformer embedder instance.
 
         Returns:
             True if the block was scheduled for page-out, False if it was kept.
@@ -2803,7 +2805,7 @@ class ContextPager:
                         block, current_query, scores_reinforced, project_id
                     )
                 else:
-                    # Middle zone — importance heuristic.
+                    # Middle zone — fall back to importance heuristic.
                     should_page_out = not (block.importance_score > 5.0 or block.pinned)
                     self._f._log_debug(
                         f"page_out_block: middle zone, heuristic → "
@@ -2812,17 +2814,28 @@ class ContextPager:
                     )
 
         # ------------------------------------------------------------------
-        # Region: Execute page-out
+        # Region: Early return when the block should be kept
         # ------------------------------------------------------------------
         if not should_page_out:
             return False
 
+        # ------------------------------------------------------------------
+        # Region: Resolve the block's detected language
+        # Stored in metadata so page_in_block can pass it to extract_async,
+        # ensuring the same language is used on reconstruction and preventing
+        # an empty symbol list caused by a language-detection mismatch.
+        # ------------------------------------------------------------------
+        block_language = block.symbols[0].language if block.symbols else ""
+
+        # ------------------------------------------------------------------
+        # Region: Build ChromaDB entry
+        # ------------------------------------------------------------------
         entry_id = f"{project_id}_paged_{block.hash}"
         symbol_names = ",".join(s.name for s in block.symbols)
 
-        # Truncate to embedder token limit — this is the authoritative document
-        # stored in ChromaDB; page_in_block uses it to reconstruct the block
-        # without loss (previous design stored only a 2 000-char excerpt).
+        # Truncate to the embedder token limit — this is the authoritative
+        # document stored in ChromaDB; page_in_block uses it to reconstruct
+        # the block without loss.
         safe_text = block.content
         if hasattr(self._f, "_tokens"):
             safe_text = self._f._tokens.truncate_text_to_tokens(block.content, 32768)
@@ -2836,16 +2849,17 @@ class ContextPager:
             "importance_score": block.importance_score,
             "paged_at": time.time(),
             "symbol_names": symbol_names,
+            "language": block_language,
         }
 
-        # Register the block as paged BEFORE launching the background task.
-        # If the task fails, _page_out_async will discard the hash from the
-        # registry (Issue 3.1 fix) so stale lookups are avoided.
+        # ------------------------------------------------------------------
+        # Region: Register and dispatch background page-out task
+        # The block is registered as paged BEFORE launching the task.
+        # If the task fails, _page_out_async removes the hash from the
+        # registry to prevent stale is_paged() lookups.
+        # ------------------------------------------------------------------
         self._paged_hashes.setdefault(project_id, set()).add(block.hash)
 
-        # Launch embedding + upsert in a background task.
-        # Issue 3.1 fix: pass project_id and block_hash so the task can
-        # remove the stale registry entry if the ChromaDB write fails.
         asyncio.create_task(
             self._page_out_async(
                 entry_id=entry_id,
@@ -3319,36 +3333,41 @@ class ContextPager:
         """
         Retrieve a paged block for temporary use THIS TURN ONLY.
 
-        Reconstruction uses ChromaDB as the single authoritative source.
-        Does NOT restore the block to active_blocks.
+        Reconstruction uses ChromaDB as the single authoritative source and
+        re-extracts symbols using the language stored in the metadata at
+        page-out time.  Passing the original language to ``extract_async``
+        prevents a mismatch where language auto-detection would return
+        ``"unknown"`` for small or ambiguous snippets, which would produce an
+        empty symbol list and make the block invisible to LOD lookups.
 
-        Bug 31 fix: the previous implementation returned None immediately when
-        ``block_hash`` was not in ``_paged_hashes``.  Since ``_paged_hashes``
-        is an in-memory dict reset on every process restart, blocks paged out
-        in a previous session existed in ChromaDB but were unreachable.
+        Does NOT restore the block to ``active_blocks``.
 
-        The fix attempts a ChromaDB lookup regardless of ``_paged_hashes``
-        state.  If the entry is found in ChromaDB, the block is re-registered
-        in ``_paged_hashes`` so subsequent calls within the same session use
-        the fast registry path.
+        Cold-restart resilience: ``_paged_hashes`` is an in-memory dict reset
+        on every process restart.  Blocks paged in a previous session exist
+        in ChromaDB but are unreachable via ``is_paged()``.  This method
+        therefore attempts a ChromaDB lookup regardless of ``_paged_hashes``
+        state and re-registers the hash on a successful cold lookup so
+        subsequent calls within the same session use the fast registry path.
 
         Args:
-            block_hash: Hash of the block to page in.
-            project_id: Current project identifier.
-            chroma_collection: ChromaDB collection.
-            db_conn: Unused, kept for API compatibility.
+            block_hash:       Hash of the block to page in.
+            project_id:       Current project identifier.
+            chroma_collection: ChromaDB collection to query.
+            db_conn:          Unused; kept for API compatibility.
 
         Returns:
-            The reconstructed CodeBlock, or None if not found.
+            The reconstructed ``CodeBlock``, or ``None`` if not found.
         """
         if chroma_collection is None:
             return None
 
         entry_id = f"{project_id}_paged_{block_hash}"
 
-        # ── Step 1: Retrieve from ChromaDB (authoritative source) ─────────────────
-        # Attempt lookup regardless of _paged_hashes state so that blocks paged
-        # out in a previous session (before a process restart) can still be found.
+        # ------------------------------------------------------------------
+        # Region: Retrieve from ChromaDB (authoritative source)
+        # Attempt lookup regardless of _paged_hashes state so that blocks
+        # paged in a previous session can still be found after a restart.
+        # ------------------------------------------------------------------
         meta = None
         content = ""
         try:
@@ -3366,8 +3385,11 @@ class ContextPager:
         if not content:
             return None
 
-        # ── Bug 31 fix: re-register in _paged_hashes if found via cold lookup ─────
-        # Ensures fast-path is used for subsequent calls within the same session.
+        # ------------------------------------------------------------------
+        # Region: Re-register in _paged_hashes on a cold-restart lookup
+        # Ensures the fast registry path is used for subsequent calls in
+        # the same session.
+        # ------------------------------------------------------------------
         if not self.is_paged(block_hash, project_id):
             self._paged_hashes.setdefault(project_id, set()).add(block_hash)
             self._f._log_debug(
@@ -3375,7 +3397,9 @@ class ContextPager:
                 f"_paged_hashes (found in ChromaDB after cold restart)"
             )
 
-        # ── Step 2: Extract metadata fields with safe defaults ────────────────────
+        # ------------------------------------------------------------------
+        # Region: Extract metadata fields with safe defaults
+        # ------------------------------------------------------------------
         file_path = meta.get("file_path") if meta else None
         ctype_str = (
             meta.get("content_type", ContentType.GENERAL.value)
@@ -3384,19 +3408,32 @@ class ContextPager:
         )
         importance = meta.get("importance_score", 1.0) if meta else 1.0
 
+        # Retrieve the language persisted at page-out time.  Passing it to
+        # extract_async avoids a language-detection mismatch for small or
+        # ambiguous snippets where auto-detection would return "unknown".
+        stored_language: Optional[str] = meta.get("language") or None if meta else None
+
         try:
             ctype = ContentType(ctype_str)
         except Exception:
             ctype = ContentType.GENERAL
 
-        # ── Step 3: Deterministic symbol re-extraction ────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Deterministic symbol re-extraction
+        # Uses the language stored at page-out time to guarantee the same
+        # extractor is used, preventing an empty symbol list on reconstruction.
+        # ------------------------------------------------------------------
         symbols = []
         try:
-            symbols = await SignatureExtractor.extract_async(content, file_path)
+            symbols = await SignatureExtractor.extract_async(
+                content, file_path, language=stored_language
+            )
         except Exception:
             pass
 
-        # ── Step 4: Reconstruct the CodeBlock ─────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Reconstruct the CodeBlock
+        # ------------------------------------------------------------------
         block = CodeBlock(
             content=content,
             content_type=ctype,
@@ -3407,6 +3444,7 @@ class ContextPager:
         )
         for s in block.symbols:
             s.parent_block_hash = block_hash
+
         return block
 
 
@@ -5981,13 +6019,7 @@ Output only the option name.
         )
 
         # ------------------------------------------------------------------
-        # Step 12: Centrality LOD bump.
-        #
-        # Bug 12 fix: after bumping the activation scores, rebuild lod2_qids
-        # and lod3_qids from the new scores and re-sort sorted_nodes.  Without
-        # this, _lod_tier() continues to use the pre-bump sets, so a node
-        # whose effective score crossed lod3_threshold is still rendered at
-        # LOD-2 instead of LOD-3.
+        # Step 12: Centrality LOD bump
         # ------------------------------------------------------------------
         if self._f.valves.enable_centrality_lod_bump:
             centrality = psm.get_node_centrality(project_id)
@@ -6006,7 +6038,7 @@ Output only the option name.
                     adjusted.append((qid, activated.get(qid, 0.0)))
             activated_scores = dict(adjusted)
 
-            # ── Bug 12 fix: rebuild tier sets from bumped scores ──────────────────
+            # Rebuild tier sets from bumped scores.
             lod2_qids = set()
             lod3_qids = set()
             for qid, score in activated_scores.items():
@@ -6019,7 +6051,7 @@ Output only the option name.
                 if score >= lod3:
                     lod3_qids.add(qid)
 
-            # Re-sort with the updated tier sets and bumped scores
+            # Re-sort with updated tier sets and bumped scores.
             sorted_nodes = sorted(
                 activated_scores.keys(),
                 key=lambda qid: (
@@ -6028,16 +6060,17 @@ Output only the option name.
                     qid,
                 ),
             )
+
+            # Update hysteresis tracking to reflect the post-bump tier assignments.
+            # Step 9 saved the pre-bump lod2_qids; this corrects it so the next
+            # turn inherits the actual tier membership used for rendering.
+            psm.set_lod2_active_qids_prev(project_id, list(lod2_qids))
+
         else:
             activated_scores = activated
 
         # ------------------------------------------------------------------
         # Step 13: Batched LOD-2 docstring pre-resolution.
-        #
-        # Bug 14 fix: use (lod2_qids - lod3_qids) so docstrings are only
-        # generated for symbols that will actually be rendered at LOD-2.
-        # LOD-3 symbols will have their full body injected; generating a
-        # docstring for them wastes an LLM call.
         # ------------------------------------------------------------------
         if self._f.valves.enable_auto_docstrings:
             lod2_only_candidates = [
@@ -8292,31 +8325,42 @@ class StateStore:
             finally:
                 self._f._db_write_queue.task_done()
 
-    def _db_conn_write_sync(self, project_id: str, state: ConversationState) -> None:
+    def _db_conn_write_sync(self, project_id: str, state: "ConversationState") -> None:
         """
-        Synchronous write of ConversationState to SQLite (used by LRU eviction).
+        Synchronous write of ConversationState to SQLite, used by LRU eviction.
 
-        This method bypasses the async queue and writes directly to the DB.
-        It is only intended for emergency flushes during eviction to avoid data loss.
+        Called from ConversationStateManager._evict_lru via a ThreadPoolExecutor,
+        so it runs on a worker thread, not the asyncio event loop.  The async DB
+        worker (_db_worker_loop) also accesses _db_conn under _db_global_lock.
 
         Args:
-            project_id: The project identifier.
-            state: The ConversationState to persist.
+            project_id: Identifier of the project being persisted.
+            state: The ConversationState to serialize and write.
         """
-        # Serialize the state (logic mirrored from _save_to_db)
-        active_blocks_meta = {}
+        # ------------------------------------------------------------------
+        # Region: Serialize active blocks — externalize large content
+        # Content is stored in code_contents keyed by hash; the state JSON
+        # stores only a @@hash: reference to keep the state table small.
+        # ------------------------------------------------------------------
+        active_blocks_meta: dict = {}
         for k, v in state.active_blocks.items():
             d = v.dict()
             d["content_type"] = v.content_type.value
             content_hash = v.hash
-            # Insert content if not present (synchronous)
-            self._f._db_conn.execute(
-                "INSERT OR IGNORE INTO code_contents (hash, content, created_at) VALUES (?, ?, ?)",
-                (content_hash, v.content, time.time()),
-            )
+            # Write the content blob first (INSERT OR IGNORE is idempotent).
+            with _db_global_lock:
+                self._f._db_conn.execute(
+                    "INSERT OR IGNORE INTO code_contents "
+                    "(hash, content, created_at) VALUES (?, ?, ?)",
+                    (content_hash, v.content, time.time()),
+                )
+                self._f._db_conn.commit()
             d["content"] = f"@@hash:{content_hash}"
             active_blocks_meta[k] = d
 
+        # ------------------------------------------------------------------
+        # Region: Build serializable state dict
+        # ------------------------------------------------------------------
         serializable = {
             "active_blocks": active_blocks_meta,
             "recent_changes": [b.dict() for b in state.recent_changes],
@@ -8340,13 +8384,25 @@ class StateStore:
             "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
             "pending_slot_resave": state.pending_slot_resave,
+            "hub_tier_last_modified": state.hub_tier_last_modified,
+            "hub_tier_body_hashes": state.hub_tier_body_hashes,
+            "hub_tier_query_heat": state.hub_tier_query_heat,
+            "hub_tier_qids_persisted": state.hub_tier_qids_persisted,
         }
 
-        self._f._db_conn.execute(
-            "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
-            (project_id, json.dumps(serializable), time.time()),
-        )
-        self._f._db_conn.commit()
+        # ------------------------------------------------------------------
+        # Region: Write state JSON under _db_global_lock (Bug K fix)
+        # Acquire the same threading.Lock used by the async DB worker so that
+        # this thread and the event-loop worker never touch _db_conn at the
+        # same time.
+        # ------------------------------------------------------------------
+        with _db_global_lock:
+            self._f._db_conn.execute(
+                "REPLACE INTO conversation_state "
+                "(project_id, state_json, updated_at) VALUES (?, ?, ?)",
+                (project_id, json.dumps(serializable), time.time()),
+            )
+            self._f._db_conn.commit()
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Maintenance (checkpoints)
@@ -8702,28 +8758,70 @@ class LongTermMemory:
     * Time‑bounded expiration of old memories.
     """
 
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Initialise the LongTermMemory subsystem with a reference to the parent Filter.
+
+        Sets disable flags to None so that the first call to ``init()`` always
+        performs a fresh validation.  The actual ChromaDB connection, embedder,
+        and collection setup are deferred to ``init()`` to keep construction
+        side-effect-free.
+
+        Args:
+            filter_ref: The parent Filter instance (provides valves, logger, etc.).
+        """
+        # ------------------------------------------------------------------
+        # Region: Store reference to parent filter
+        # ------------------------------------------------------------------
+        self._f = filter_ref
+
+        # ------------------------------------------------------------------
+        # Region: Initialise retrieval and write disable flags
+        # Both are None until _validate_embedding_model() runs inside init().
+        # A non-None value means the corresponding operation is blocked and
+        # must carry the human-readable reason string.
+        # ------------------------------------------------------------------
+        self._retrieval_disabled_reason: Optional[str] = None
+        self._write_disabled_reason: Optional[str] = None
+
+        # ------------------------------------------------------------------
+        # Region: Purge lock placeholder
+        # Initialised lazily in purge_expired_memories() to avoid creating
+        # an asyncio.Lock() outside an event loop during Filter construction.
+        # ------------------------------------------------------------------
+        self._purge_lock: Optional[asyncio.Lock] = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def init(self) -> None:
         """
         Initialise ChromaDB, the sentence-transformer embedder, and the
         response-cache collection.
 
+        Resetting the disable flags at the top of this method makes it safe
+        to call more than once (e.g. on reconnect): a previous mismatch flag
+        is cleared and a fresh validation is performed against the current
+        embedder.
+
         Call order during Filter startup:
-            1. ``LongTermMemory.__init__`` sets ``_retrieval_disabled_reason``
-               and ``_write_disabled_reason`` to None.
-            2. ``Filter.__init__`` calls this method, which sets up the
-               ChromaDB client, embedder, and both collections.
+            1. ``LongTermMemory.__init__`` is not defined; the object is
+               created bare.
+            2. ``Filter.__init__`` calls this method, which sets up
+               ChromaDB, the embedder, and both collections.
             3. ``_validate_embedding_model`` is called last; it either
                persists a first-run fingerprint or detects a mismatch and
                sets both disable flags.
         """
         # ------------------------------------------------------------------
-        # Region: Defensive reset of disable flags
+        # Region: Reset disable flags
         # Cleared here so that a second call to init() (reconnect scenario)
         # starts from a known-good state rather than inheriting stale flags
         # from a previous failed or mismatched initialisation.
         # ------------------------------------------------------------------
-        self._retrieval_disabled_reason = None
-        self._write_disabled_reason = None
+        self._retrieval_disabled_reason: Optional[str] = None
+        self._write_disabled_reason: Optional[str] = None
 
         # ------------------------------------------------------------------
         # Region: Filesystem setup and shared embedder
@@ -8792,10 +8890,10 @@ class LongTermMemory:
                 self._f._response_cache_collection = None
 
         # ------------------------------------------------------------------
-        # Region: Embedding model fingerprint validation (Bug D)
+        # Region: Embedding model fingerprint validation
         # _validate_embedding_model sets _retrieval_disabled_reason and
         # _write_disabled_reason on mismatch, or persists the first-run
-        # fingerprint when no stored model is found.  Must run after
+        # fingerprint when no stored model is found. Must run after
         # memory_collection is ready.
         # ------------------------------------------------------------------
         if self._f.memory_collection is not None:
@@ -8807,73 +8905,6 @@ class LongTermMemory:
                     f"To fix: delete '{self._f.valves.long_term_memory_dir}' "
                     "and restart."
                 )
-
-        self._f._log_debug("LTM ready")
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 1. Initialization
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def init(self) -> None:
-        """Initialise ChromaDB, embedder, and response cache collection."""
-        os.makedirs(self._f.valves.long_term_memory_dir, exist_ok=True)
-        self._f.embedder = _shared_get_embedder()
-        self._f._log_debug("Embedder: using Qwen/Qwen3-Embedding-0.6B")
-
-        self._f.chroma_client = _shared_get_chroma_client(
-            self._f.valves.long_term_memory_dir
-        )
-        self._f._log_debug("ChromaDB: using shared singleton")
-
-        if self._f.chroma_client is None:
-            self._f._log_debug("ChromaDB not available")
-            return
-
-        # --- Memory collection (LTM) ---
-        self._f.memory_collection = self._f.chroma_client.get_or_create_collection(
-            name="conversation_memory", metadata={"hnsw:space": "cosine"}
-        )
-        self._f._log_debug(
-            f"LTM collection ready – vector size = "
-            f"{self._f.memory_collection.metadata.get('dimension', '?')}"
-        )
-
-        # --- Response cache collection with recovery ---
-        cache_name = f"response_cache_{self._f.valves.project_id or 'default'}"
-        try:
-            self._f._response_cache_collection = (
-                self._f.chroma_client.get_or_create_collection(
-                    name=cache_name,
-                    metadata={"hnsw:space": "cosine"},
-                )
-            )
-            self._f._log_debug(f"Response cache collection '{cache_name}' ready")
-        except Exception as e:
-            self._f._log_debug(
-                f"Failed to get/create cache collection '{cache_name}': {e}"
-            )
-            try:
-                self._f.chroma_client.delete_collection(cache_name)
-                self._f._log_debug(f"Deleted corrupted collection '{cache_name}'")
-            except Exception:
-                pass
-            try:
-                self._f._response_cache_collection = (
-                    self._f.chroma_client.create_collection(
-                        name=cache_name,
-                        metadata={"hnsw:space": "cosine"},
-                    )
-                )
-                self._f._log_debug(f"Recreated cache collection '{cache_name}'")
-            except Exception as e2:
-                self._f._log_debug(f"Could not recreate cache collection: {e2}")
-                self._f._response_cache_collection = None
-
-        # Validate embedding model fingerprint against stored collection metadata.
-        # Must run after memory_collection is ready. Disables LTM retrieval if
-        # the stored model fingerprint doesn't match the current embedder.
-        if self._f.memory_collection is not None:
-            self._validate_embedding_model()
 
         self._f._log_debug("LTM ready")
 
@@ -8943,11 +8974,6 @@ class LongTermMemory:
             self._f.valves.project_id
         )
 
-        # Bug 75 fix: compare unconditionally. The original code used
-        # ``if stored_code_state and stored_code_state != current``, which
-        # skipped the check when stored_code_state was '' (codeless session),
-        # allowing stale cross-state hits. Now any mismatch (including '' vs
-        # non-empty or vice versa) triggers invalidation.
         if stored_code_state != current_code_state:
             await anyio.to_thread.run_sync(
                 lambda: col.delete(ids=[results["ids"][0][0]])
@@ -8990,20 +9016,26 @@ class LongTermMemory:
         Returns:
             Optional[dict]: {'sim': float, 'doc': str} if a duplicate is found, else None.
         """
-        # ── REGION 1: Prerequisites check ──
+        # ------------------------------------------------------------------
+        # Region: Prerequisites check
+        # ------------------------------------------------------------------
         if not HAS_SENTENCE or not HAS_CHROMA or self._f.memory_collection is None:
             return None
         if not query or len(query.strip()) < 15:
             return None
 
         try:
-            # ── REGION 2: Embed the query ──
+            # ------------------------------------------------------------------
+            # Region: Embed the query
+            # ------------------------------------------------------------------
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(query[:8000]).tolist()
             )
             now = time.time()
 
-            # ── REGION 3: Build time‑filtered ChromaDB query ──
+            # ------------------------------------------------------------------
+            # Region: Build time‑filtered ChromaDB query
+            # ------------------------------------------------------------------
             where = {
                 "$and": [
                     {"project_id": {"$eq": project_id}},
@@ -9017,7 +9049,9 @@ class LongTermMemory:
                 ]
             }
 
-            # ── REGION 4: Query ChromaDB ──
+            # ------------------------------------------------------------------
+            # Region: Query ChromaDB
+            # ------------------------------------------------------------------
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
                     query_embeddings=[q_emb],
@@ -9029,39 +9063,34 @@ class LongTermMemory:
             if not results or not results["ids"] or not results["ids"][0]:
                 return None
 
-            # ── REGION 5: Evaluate candidates ──
+            # ------------------------------------------------------------------
+            # Region: Evaluate candidates
+            # ------------------------------------------------------------------
             best_candidate = None
             best_sim = 0.0
             for i, doc in enumerate(results["documents"][0]):
                 dist = results["distances"][0][i]
                 sim = 1.0 - (dist / 2.0)
                 if sim >= self._f.valves.duplicate_question_threshold and doc != query:
-                    # ── CrossEncoder for semantic similarity ──
                     pairs = [(query[:500], doc[:500])]
                     ce_scores = await self._f._commands._predict_cross_encoder(pairs)
 
                     if ce_scores is None or len(ce_scores) < 1:
-                        # CE unavailable: use cosine similarity only
                         best_candidate = (sim, doc, None)
                         break
 
                     ce_score = ce_scores[0]
-                    # Normalize to [0,1] roughly
                     ce_prob = 1.0 / (1.0 + math.exp(-ce_score))
 
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.duplicate_ce_threshold
                     LLM_FALLBACK_THRESHOLD = self._f.valves.duplicate_llm_threshold
 
-                    # ── Confidence check ──
                     if ce_prob >= 0.85 and (ce_prob - 0.5) > CE_CONFIDENCE_THRESHOLD:
-                        # Confident duplicate
                         best_candidate = (sim, doc, ce_score)
                         break
                     elif ce_prob < 0.6 and (0.5 - ce_prob) > CE_CONFIDENCE_THRESHOLD:
-                        # Confident not duplicate
                         continue
                     elif abs(ce_prob - 0.5) < LLM_FALLBACK_THRESHOLD:
-                        # ── Extremely uncertain → LLM ──
                         is_duplicate = await self._find_duplicate_with_llm(
                             query, doc, ce_score, project_id
                         )
@@ -9071,12 +9100,13 @@ class LongTermMemory:
                         else:
                             continue
                     else:
-                        # ── Middle zone: use cosine similarity threshold ──
                         if sim >= self._f.valves.duplicate_question_threshold:
                             best_candidate = (sim, doc, None)
                             break
 
-            # ── REGION 6: Return result ──
+            # ------------------------------------------------------------------
+            # Region: Return result
+            # ------------------------------------------------------------------
             if best_candidate:
                 sim, doc, ce = best_candidate
                 log_msg = f"Duplicate question found (cosine={sim:.3f}"
@@ -9230,7 +9260,9 @@ class LongTermMemory:
 
         self._f._log_debug(f"Multi-query raw response: {response}")
 
-        # ── B1: strip <details> reasoning blocks ──────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Strip reasoning blocks and filter lines
+        # ------------------------------------------------------------------
         raw_response = re.sub(
             r"<details[^>]*>.*?</details>",
             "",
@@ -9238,7 +9270,6 @@ class LongTermMemory:
             flags=re.DOTALL | re.IGNORECASE,
         )
 
-        # ── B1: line-level filter ──────────────────────────────────────────
         _REASONING_LINE_PREFIXES = (
             "thinking process",
             "let me ",
@@ -9302,22 +9333,25 @@ class LongTermMemory:
         file_paths: List[str],
         content_type: str,
     ) -> str:
-        """Build a short prefix that enriches a ChromaDB document for better
-        retrieval.  Two modes are supported via ``contextual_retrieval_mode``:
+        """
+        Build a short prefix that enriches a ChromaDB document for better retrieval.
 
-        * ``"metadata"`` — fast, concatenates structured fields (project,
-          files, symbols, type, excerpt).
-        * ``"llm"`` — asks the LLM for a one‑sentence description of the
-          content (slower, but captures nuance better).
+        Two modes are supported via ``contextual_retrieval_mode``:
+        * ``"metadata"`` — fast, concatenates structured fields.
+        * ``"llm"`` — asks the LLM for a one‑sentence description.
         """
         if not self._f.valves.enable_contextual_retrieval:
             return ""
 
-        # ── LLM mode ────────────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: LLM mode
+        # ------------------------------------------------------------------
         if self._f.valves.contextual_retrieval_mode == "llm":
             return await self._build_retrieval_context_llm(content, project_id)
 
-        # ── Metadata mode ───────────────────────────────────────────────
+        # ------------------------------------------------------------------
+        # Region: Metadata mode
+        # ------------------------------------------------------------------
         parts: List[str] = [f"Project: {project_id}"]
         if file_paths:
             parts.append(f"Files: {', '.join(file_paths[:3])}")
@@ -9337,11 +9371,7 @@ class LongTermMemory:
     async def _build_retrieval_context_llm(self, content: str, project_id: str) -> str:
         """
         Use the LLM to generate a one-sentence contextual description of
-        *content* for improved long-term memory retrieval.
-
-        The prompt constrains output to 10-20 words, so no max_tokens ceiling
-        is needed — the model terminates naturally. enable_thinking=False avoids
-        reasoning overhead on a deterministic single-sentence task.
+        content for improved long-term memory retrieval.
         """
         prompt = (
             "In one sentence (10-20 words), describe what the following "
@@ -9376,8 +9406,6 @@ class LongTermMemory:
             ]
         }
 
-        # ── FIX 11: Expiration filter with OR for summaries ──
-        # Apply the same OR logic here so that summaries are not excluded.
         if self._f.valves.long_term_memory_expiration_days > 0:
             where["$and"].append(
                 {
@@ -9478,7 +9506,6 @@ class LongTermMemory:
             now = time.time()
             where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
 
-            # Expiration filter with OR for summaries.
             if self._f.valves.long_term_memory_expiration_days > 0:
                 where_filter["$and"].append(
                     {
@@ -9493,11 +9520,7 @@ class LongTermMemory:
                 )
 
             # ------------------------------------------------------------------
-            # Bug 46 fix: get collection count ONCE before the variant loop
-            # to avoid InvalidArgumentException when n_results > collection size.
-            # This can happen on fresh projects or after purges, and throws in
-            # ChromaDB < 0.4. A single count() call is cheaper than catching
-            # the exception inside the loop.
+            # Region: Guard n_results against collection size
             # ------------------------------------------------------------------
             try:
                 _coll_count = await anyio.to_thread.run_sync(
@@ -9535,7 +9558,7 @@ class LongTermMemory:
                     variant_results = await anyio.to_thread.run_sync(
                         lambda emb=q_emb: self._f.memory_collection.query(
                             query_embeddings=[emb],
-                            n_results=_safe_n,  # ← Bug 46 fix: use safe_n
+                            n_results=_safe_n,
                             where=where_filter,
                             include=["documents", "metadatas", "distances"],
                         )
@@ -9551,7 +9574,6 @@ class LongTermMemory:
                     meta = variant_results["metadatas"][0][i]
                     raw_sim = 1.0 - (variant_results["distances"][0][i] / 2.0)
 
-                    # Apply threshold on RAW similarity.
                     if raw_sim < self._f.valves.long_term_memory_similarity_threshold:
                         continue
 
@@ -9564,7 +9586,6 @@ class LongTermMemory:
                         hashlib.md5(doc.encode()).hexdigest()[:16],
                     )
 
-                    # Deduplicate, keep highest raw score.
                     if (
                         mem_id not in all_raw_results
                         or raw_sim > all_raw_results[mem_id][1]
@@ -9572,7 +9593,7 @@ class LongTermMemory:
                         all_raw_results[mem_id] = (doc, raw_sim, ts, meta)
 
             # ------------------------------------------------------------------
-            # Region: Apply time decay for ranking (not for filtering)
+            # Region: Apply time decay for ranking
             # ------------------------------------------------------------------
             docs_with_meta = []
             for mem_id, (doc, raw_sim, ts, meta) in all_raw_results.items():
@@ -9686,8 +9707,7 @@ class LongTermMemory:
             query: The user query used for semantic similarity search.
             project_id: Current project identifier.
             limit: Maximum number of messages to return.
-            is_continuation: Whether this is a continuation turn (unused here,
-                             kept for API compatibility).
+            is_continuation: Whether this is a continuation turn (kept for API compatibility).
 
         Returns:
             list: List of message dicts with role and content keys.
@@ -9712,7 +9732,6 @@ class LongTermMemory:
             # ------------------------------------------------------------------
             # Region: Embed query
             # ------------------------------------------------------------------
-            # Requires an embedder supporting 32768 context or more.
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(
                     self._f._tokens.truncate_text_to_tokens(query, 32768)
@@ -9738,10 +9757,7 @@ class LongTermMemory:
                 )
 
             # ------------------------------------------------------------------
-            # Bug 91 fix: guard n_results against collection size.
-            # ChromaDB raises InvalidArgumentException when n_results > count().
-            # This happens on fresh projects or after bulk purges. A single
-            # count() call is cheaper than catching the exception inside the loop.
+            # Region: Guard n_results against collection size
             # ------------------------------------------------------------------
             try:
                 _coll_count = await anyio.to_thread.run_sync(
@@ -9761,7 +9777,7 @@ class LongTermMemory:
             results = await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.query(
                     query_embeddings=[q_emb],
-                    n_results=_safe_n,  # Bug 91 fix: use safe_n
+                    n_results=_safe_n,
                     where=where_filter,
                     include=["documents", "metadatas", "distances"],
                 )
@@ -9831,7 +9847,6 @@ class LongTermMemory:
     # 5. Message storage
     # ═══════════════════════════════════════════════════════════════════════════
 
-    # ── M1: strip CoT scaffolding ──────────────────────────────────────────
     _LTM_STRIP_RE = re.compile(
         r"<details[^>]*>.*?</details>",
         re.DOTALL | re.IGNORECASE,
@@ -9839,20 +9854,19 @@ class LongTermMemory:
 
     def _prepare_text_for_ltm(self, text: str, role: str) -> str:
         """Strip model CoT scaffolding before embedding into ChromaDB.
-        Only applied to assistant messages. The original message content
-        shown to the user is NOT modified."""
+        Only applied to assistant messages."""
         if role != "assistant":
             return text
         stripped = self._LTM_STRIP_RE.sub("", text).strip()
         return stripped
 
-    # ── M2: skip partial multi‑phase responses ─────────────────────────────
     _MULTI_PHASE_CONTINUATION_MARKER = "▶ CONTINÚA:"
     _MULTI_PHASE_PART_RE = re.compile(
         r"##\s+C[oó]digo\s*[—–-]\s*Parte\s+\d+/\d+", re.IGNORECASE
     )
 
     def _is_partial_multi_phase(self, text: str) -> bool:
+        """Return True if the text looks like a partial multi-phase assistant response."""
         return self._MULTI_PHASE_CONTINUATION_MARKER in text or bool(
             self._MULTI_PHASE_PART_RE.search(text)
         )
@@ -9863,15 +9877,10 @@ class LongTermMemory:
         """
         Store user/assistant messages in the LTM ChromaDB collection.
 
-        Each message is embedded with contextual metadata (file paths, code
-        symbols, content type) and upserted into the collection.  If ``wait``
-        is False, embedding and upsert are offloaded to a background task and
-        this method returns immediately.
-
         Args:
             project_id: Current project identifier.
             messages: List of message dicts with ``role`` and ``content`` keys.
-            wait: If True, block until all messages are stored.  If False,
+            wait: If True, block until all messages are stored. If False,
                 schedule a background task and return immediately.
         """
         # ------------------------------------------------------------------
@@ -9881,11 +9890,7 @@ class LongTermMemory:
             return
 
         # ------------------------------------------------------------------
-        # Region: Write-disable guard (Bug D fix)
-        # Block writes when the collection was built with a different embedding
-        # model.  Without this guard, the collection would accumulate vectors
-        # from two incompatible spaces, making nearest-neighbour search
-        # semantically meaningless.
+        # Region: Write-disable guard
         # ------------------------------------------------------------------
         if self._write_disabled_reason:
             self._f._log_debug(
@@ -9896,7 +9901,6 @@ class LongTermMemory:
 
         # ------------------------------------------------------------------
         # Region: Filter valid messages
-        # Skip empty messages and partial multi-phase assistant responses (M2).
         # ------------------------------------------------------------------
         valid = []
         for msg in messages:
@@ -9905,14 +9909,12 @@ class LongTermMemory:
                 continue
 
             role = msg.get("role", "")
-            # M2: skip partial multi-phase assistant responses.
             if role == "assistant" and self._is_partial_multi_phase(content):
                 self._f._log_debug(
                     "ltm: skipping partial multi-phase response (not embedding)"
                 )
                 continue
 
-            # M1: strip CoT scaffolding before embedding.
             content = self._prepare_text_for_ltm(content, role)
             if not content:
                 continue
@@ -9944,7 +9946,6 @@ class LongTermMemory:
             extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
             content_type = self._f._code_blocks.classify_content(content, extracted)
 
-            # Collect symbol names from the first three code blocks (cheap).
             ctx_symbols: List[str] = []
             for blk in extracted[:3]:
                 try:
@@ -9988,7 +9989,6 @@ class LongTermMemory:
                 else None
             )
 
-            # Build symbol index string for metadata filtering.
             code_symbols_str = ""
             if self._f.valves.ltm_index_symbols_enabled:
                 all_syms = set()
@@ -10023,7 +10023,6 @@ class LongTermMemory:
                 }
             )
 
-        # Embed all texts at once (single batch call is faster than N calls).
         safe_texts = [
             self._f._tokens.truncate_text_to_tokens(t, 32768)
             for t in texts_for_embedding
@@ -10051,14 +10050,10 @@ class LongTermMemory:
         Args:
             project_id: Current project identifier.
             valid: Pre-filtered list of message dicts with ``role`` and
-                   ``content`` keys.  Empty messages and partial multi-phase
-                   responses have already been removed by the caller.
+                   ``content`` keys.
         """
         # ------------------------------------------------------------------
         # Region: Write-disable guard
-        # Check at the start of the task, not just at creation time.  The
-        # flag could be set between when the task was created (in
-        # store_messages) and when the event loop actually runs this coro.
         # ------------------------------------------------------------------
         if self._write_disabled_reason:
             self._f._log_debug(
@@ -10069,13 +10064,8 @@ class LongTermMemory:
 
         # ------------------------------------------------------------------
         # Region: Per-message store with independent error isolation
-        # Each message is stored individually so a failure on one does not
-        # prevent the remaining messages from being written.
         # ------------------------------------------------------------------
         for msg in valid:
-            # Re-check the flag before every message: _validate_embedding_model
-            # could theoretically run and set it mid-loop (e.g. another request
-            # triggers init() while this task is yielding at an await point).
             if self._write_disabled_reason:
                 self._f._log_debug(
                     "LTM: _store_messages_async: write-disable flag set mid-loop — "
@@ -10086,7 +10076,6 @@ class LongTermMemory:
             try:
                 await self._store_single_message(project_id, msg)
             except Exception as e:
-                # Log but continue — failure on one message must not drop the rest.
                 self._f._log_debug(
                     f"LTM: _store_messages_async: failed to store message "
                     f"(role={msg.get('role', '?')}, "
@@ -10103,8 +10092,6 @@ class LongTermMemory:
         """
         # ------------------------------------------------------------------
         # Region: Write-disable guard
-        # The async path (store_messages with wait=False → _store_messages_async
-        # → _store_single_message) must also respect the write-disable flag.
         # ------------------------------------------------------------------
         if self._write_disabled_reason:
             self._f._log_debug(
@@ -10120,7 +10107,6 @@ class LongTermMemory:
         extracted, _ = await self._f._code_blocks.extract_code_blocks(content)
         content_type = self._f._code_blocks.classify_content(content, extracted)
 
-        # Collect up to 10 symbol names from the first three code blocks.
         ctx_symbols: List[str] = []
         for blk in extracted[:3]:
             try:
@@ -10173,7 +10159,6 @@ class LongTermMemory:
             else None
         )
 
-        # Build symbol index string for metadata filtering.
         code_symbols_str = ""
         if self._f.valves.ltm_index_symbols_enabled:
             all_syms = set()
@@ -10228,9 +10213,7 @@ class LongTermMemory:
         code_state_hash: str,
         wait: bool = True,
     ) -> None:
-        """Store a response in the ChromaDB response cache for future reuse.
-        If `wait` is False, the embedding and upsert are offloaded to a background task.
-        """
+        """Store a response in the ChromaDB response cache for future reuse."""
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return
         if not query or not response:
@@ -10259,24 +10242,16 @@ class LongTermMemory:
         """
         Synchronously store a response in the ChromaDB response cache.
 
-        This method embeds the query, stores the response document, and
-        updates metadata including the code_state_hash for staleness detection.
-        The query is truncated to 500 characters in metadata to keep the field
-        compact and human-readable; this does not affect the embedding or
-        retrieval quality.
-
-        If the cache collection is missing or corrupted, this method attempts
-        to recreate it automatically, preventing the common
-        "Error getting collection: Failed to get segments" error.
-
         Args:
-            query (str): The user query that generated the response.
-            response (str): The assistant's response.
-            context_hash (str): Hash of the context (unused, kept for API compatibility).
-            state (dict): The conversation state (unused, kept for API compatibility).
-            code_state_hash (str): Hash of the code state for staleness detection.
+            query: The user query that generated the response.
+            response: The assistant's response.
+            context_hash: Hash of the context (kept for API compatibility).
+            state: The conversation state (kept for API compatibility).
+            code_state_hash: Hash of the code state for staleness detection.
         """
-        # --- Get the cache collection, recreating it if necessary ---
+        # ------------------------------------------------------------------
+        # Region: Get or recreate the cache collection
+        # ------------------------------------------------------------------
         col = getattr(self._f, "_response_cache_collection", None)
 
         if col is None:
@@ -10295,11 +10270,12 @@ class LongTermMemory:
                 self._f._log_debug(f"Could not recreate cache collection: {e}")
                 return
 
-        # --- Prepare the entry ---
+        # ------------------------------------------------------------------
+        # Region: Prepare the entry
+        # ------------------------------------------------------------------
         project = self._f.valves.project_id
         entry_id = hashlib.md5(f"{project}|{query}".encode()).hexdigest()[:32]
 
-        # Embed the query
         embedding = await anyio.to_thread.run_sync(
             lambda: self._f.embedder.encode([query], convert_to_numpy=True)[0].tolist()
         )
@@ -10308,7 +10284,9 @@ class LongTermMemory:
         pstate = self._f._project_state_manager.get_pstate(project)
         current_size = pstate.get("response_cache_count", 0)
 
-        # Enforce cache size limit (LRU eviction)
+        # ------------------------------------------------------------------
+        # Region: LRU eviction when at capacity
+        # ------------------------------------------------------------------
         if current_size >= max_entries:
             to_delete_count = max(1, max_entries // 10)
             try:
@@ -10329,7 +10307,9 @@ class LongTermMemory:
             except Exception as e:
                 self._f._log_debug(f"Failed to evict old cache entries: {e}")
 
-        # Upsert the new entry
+        # ------------------------------------------------------------------
+        # Region: Upsert the new entry
+        # ------------------------------------------------------------------
         try:
             await anyio.to_thread.run_sync(
                 lambda: col.upsert(
@@ -10340,7 +10320,7 @@ class LongTermMemory:
                         {
                             "query": query[:500],
                             "project_id": project,
-                            "context_hash": "",  # Kept for compatibility
+                            "context_hash": "",
                             "code_state_hash": code_state_hash,
                             "timestamp": time.time(),
                         }
@@ -10350,7 +10330,6 @@ class LongTermMemory:
             pstate["response_cache_count"] = pstate.get("response_cache_count", 0) + 1
         except Exception as e:
             self._f._log_debug(f"Failed to store response in cache: {e}")
-            # If the operation fails, mark the collection as invalid so it gets recreated next time
             self._f._response_cache_collection = None
 
     async def _store_response_in_cache_async(
@@ -10387,9 +10366,7 @@ class LongTermMemory:
             return
 
         # ------------------------------------------------------------------
-        # lazy-initialize a per-instance lock to serialise purge
-        # calls. Two concurrent outlet() invocations can both reach here; the
-        # lock ensures only one runs _do_purge at a time.
+        # Region: Lazy-initialise purge lock
         # ------------------------------------------------------------------
         if not hasattr(self, "_purge_lock"):
             self._purge_lock = asyncio.Lock()
@@ -10404,12 +10381,65 @@ class LongTermMemory:
             except Exception as e:
                 logger.warning(f"Purge failed: {e}")
 
+    def _do_purge(self) -> None:
+        """
+        Delete expired memory entries from the ChromaDB collection.
+
+        Runs synchronously inside ``anyio.to_thread.run_sync`` so that the
+        blocking ChromaDB I/O does not stall the event loop.
+
+        Summary entries (session, turn, RAPTOR, hierarchical) are exempt from
+        expiration regardless of their ``expires_at`` value, consistent with
+        the exemption applied in ``retrieve_memories_unified``.
+        """
+        # ------------------------------------------------------------------
+        # Region: Compute expiration cutoff
+        # ------------------------------------------------------------------
+        now = time.time()
+
+        # ------------------------------------------------------------------
+        # Region: Query ChromaDB for expired non-summary entries
+        # ------------------------------------------------------------------
+        try:
+            results = self._f.memory_collection.get(
+                where={
+                    "$and": [
+                        {"expires_at": {"$gt": 0}},
+                        {"expires_at": {"$lt": now}},
+                        {"is_session_summary": {"$ne": True}},
+                        {"is_turn_summary": {"$ne": True}},
+                        {"is_raptor_summary": {"$ne": True}},
+                        {"is_hierarchical_summary": {"$ne": True}},
+                    ]
+                },
+                include=[],
+            )
+        except Exception as e:
+            self._f._log_debug(f"LTM _do_purge: ChromaDB query failed: {e}")
+            return
+
+        # ------------------------------------------------------------------
+        # Region: Delete expired entries
+        # ------------------------------------------------------------------
+        ids_to_delete: List[str] = results.get("ids", []) if results else []
+        if not ids_to_delete:
+            return
+
+        try:
+            self._f.memory_collection.delete(ids=ids_to_delete)
+            self._f._log_debug(
+                f"LTM purge: deleted {len(ids_to_delete)} expired entries"
+            )
+        except Exception as e:
+            self._f._log_debug(f"LTM _do_purge: ChromaDB delete failed: {e}")
+
     # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Project purge – NEW (C3)
+    # 7. Project purge
     # ═══════════════════════════════════════════════════════════════════════════
 
     def purge_project(self, project_id: str) -> int:
-        """Delete all ChromaDB documents for a project.
+        """
+        Delete all ChromaDB documents for a project.
 
         Returns the number of documents deleted.
         """
@@ -10429,7 +10459,7 @@ class LongTermMemory:
             return 0
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 8. Embedding model validation – NEW (C4)
+    # 8. Embedding model validation
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _get_embedding_dimension(self) -> int:
@@ -10445,12 +10475,8 @@ class LongTermMemory:
         name and output dimension to the ChromaDB collection metadata.
 
         On subsequent runs, compares the stored fingerprint against the model
-        currently loaded.  If there is a **mismatch**, both retrieval *and*
-        writes are disabled via ``_retrieval_disabled_reason`` and
-        ``_write_disabled_reason``.  This prevents the collection from being
-        contaminated with vectors from two incompatible model spaces.  The
-        operator must delete or recreate the ChromaDB collection to resolve the
-        mismatch.
+        currently loaded. If there is a mismatch, both retrieval and writes are
+        disabled via ``_retrieval_disabled_reason`` and ``_write_disabled_reason``.
 
         Returns:
             True if the model fingerprint matches (or on first run).
@@ -10474,7 +10500,6 @@ class LongTermMemory:
 
             # ------------------------------------------------------------------
             # Region: First run — persist fingerprint and clear any stale flags
-            # An empty string means no fingerprint has been stored yet.
             # ------------------------------------------------------------------
             if not stored_model:
                 self._f.memory_collection.modify(
@@ -10484,8 +10509,6 @@ class LongTermMemory:
                         "_codeaware_embedding_dim": current_dim,
                     }
                 )
-                # Clear any stale disable flags (e.g. after collection was
-                # recreated externally and the filter restarted).
                 self._retrieval_disabled_reason = None
                 self._write_disabled_reason = None
                 self._f._log_debug(
@@ -10520,9 +10543,6 @@ class LongTermMemory:
             return True
 
         except Exception as e:
-            # Fail open on unexpected errors to avoid breaking existing installs
-            # that lack the metadata fields (e.g. collections created before this
-            # feature was added).
             self._f._log_debug(f"LTM: could not validate embedding model: {e}")
             return True
 
@@ -12329,50 +12349,57 @@ class ReasoningEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def generate_cot_reasoning(
-        self, question: str, context: str, label: str = ""
+        self,
+        question: str,
+        context: str,
+        label: str = "",
+        project_id: str = "",
     ) -> str:
         """
-        Generate a Chain‑of‑Thought reasoning chain for the given question.
+        Generate a Chain-of-Thought reasoning chain for the given question.
 
-        This method is used for CoT levels 2 and 3 (moderately complex to
-        deep reasoning). It takes the user's question and a context
-        (typically the system prompt or skeleton) and asks the LLM to
-        produce a step‑by‑step reasoning chain.
-
-        The context is truncated to a token limit derived from the active
-        context max tokens divided by 3. This balances providing enough
-        context for reasoning while keeping the prompt size manageable
-        and avoiding excessive latency.
+        After the LLM call the KV slot is restored so that auxiliary inference
+        does not leave a dirty slot that causes a cache miss when the main
+        inference runs immediately after.
 
         Args:
-            question (str): The user's question to reason about.
-            context (str): The context (system prompt, code, etc.) to reason on.
-            label (str): Optional label for LLM call logging.
+            question:   The user's question to reason about.
+            context:    Code or system context to reason on (truncated internally
+                        to fit the model's effective attention window).
+            label:      Optional label for LLM call logging.
+            project_id: Current project identifier used for KV slot restoration
+                        after the auxiliary LLM call.  Pass an empty string to
+                        skip restoration (e.g. when called outside an inlet).
 
         Returns:
-            str: A formatted reasoning chain with a header indicating the
-            CoT level and model used, or "Unable to generate reasoning." on failure.
+            A formatted reasoning chain with a header, or
+            ``"Unable to generate reasoning."`` on failure.
         """
-        # ── REGION 1: Configure token limits ──
+        # ------------------------------------------------------------------
+        # Region: Configure token limits
+        # ------------------------------------------------------------------
         effective_max_tokens = (
             self._f.valves.cot_max_tokens if self._f.valves.cot_max_tokens > 0 else None
         )
 
-        # ── REGION 2: Optionally generate step‑back context ──
+        # ------------------------------------------------------------------
+        # Region: Optionally generate step-back architectural context
+        # ------------------------------------------------------------------
         step_back = await self._generate_step_back_context(question, context)
         enriched_context = step_back + context if step_back else context
 
-        # ── REGION 3: Build the reasoning prompt ──
-        # The question is passed in full (no truncation). The context is
-        # truncated to a token limit that is a fraction of the model's
-        # context window to keep the prompt manageable.
+        # ------------------------------------------------------------------
+        # Region: Build the reasoning prompt
+        # ------------------------------------------------------------------
         prompt = (
             f"Context:\n{enriched_context}\n\n"
             f"Question:\n{question}\n\n"
             "Think step by step and provide your reasoning:"
         )
 
-        # ── REGION 4: Call the LLM ──
+        # ------------------------------------------------------------------
+        # Region: Call the LLM
+        # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -12384,7 +12411,18 @@ class ReasoningEngine:
             label=label,
         )
 
-        # ── REGION 5: Format and return ──
+        # ------------------------------------------------------------------
+        # Region: Restore KV slot after auxiliary LLM call
+        # Every auxiliary LLM call dirties the slot under the SWA architecture.
+        # Restoring here keeps the slot aligned with the stable prefix so the
+        # main inference does not suffer a KV cache miss.
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        # ------------------------------------------------------------------
+        # Region: Format and return
+        # ------------------------------------------------------------------
         if response:
             prefix = (
                 "## 🔎 Automated Chain-of-Thought Reasoning (Level 2)\n"
@@ -12393,6 +12431,7 @@ class ReasoningEngine:
             if step_back:
                 prefix += " *Includes step-back architectural context.*"
             return f"{prefix}\n\n{response}"
+
         return "Unable to generate reasoning."
 
     async def generate_architecture_reasoning(
@@ -16452,59 +16491,103 @@ class ActivationEngine:
 
     # ── Q2: PPR cache (nested class) ──────────────────────────────────────────
     class _PPRCache:
-        """LRU cache for PPR results.
+        """
+        LRU cache for Personalised PageRank computation results.
 
-        Key: (code_state_hash: str, seed_qids: frozenset[str])
-        Value: dict[str, float]  — qid → PPR score
+        Key:   (code_state_hash: str, seed_qids: frozenset[str])
+        Value: dict[str, float] — qid → PPR score
 
-        Thread safety: not needed (single-threaded inlet/build_block_b flow).
-        Invalidation: automatic via code_state_hash — any code change produces
-        a new hash, naturally evicting all cached entries for that project.
+        Invalidation is automatic via code_state_hash: any code change produces
+        a new hash, naturally evicting stale entries for that project without
+        requiring an explicit flush.
         """
 
-        def __init__(self, maxsize: int = 20):
+        def __init__(self, maxsize: int = 20) -> None:
+            """
+            Initialise the cache with a fixed capacity.
+
+            Args:
+                maxsize: Maximum number of (code_hash, seeds) entries to retain.
+                         Oldest entries are evicted first when the limit is reached.
+            """
             self._cache: OrderedDict[tuple, dict[str, float]] = OrderedDict()
             self._maxsize = maxsize
             self._hits = 0
             self._misses = 0
 
+        # ------------------------------------------------------------------
+        # Region: Cache reads
+        # ------------------------------------------------------------------
+
         def get(self, code_hash: str, seeds: frozenset) -> Optional[Dict[str, float]]:
-            """Retrieve cached PPR scores if available."""
+            """
+            Retrieve cached PPR scores for a (code_hash, seeds) pair.
+
+            On a hit, the entry is promoted to most-recently-used so it is
+            the last to be evicted under LRU policy.
+
+            Args:
+                code_hash: Hash of the current code state.
+                seeds:     Frozenset of seed qualified ids used in the PPR run.
+
+            Returns:
+                The cached score dict on a hit, or None on a miss.
+            """
             key = (code_hash, seeds)
             if key in self._cache:
                 self._cache.move_to_end(key)
                 self._hits += 1
                 return self._cache[key]
+
             self._misses += 1
             return None
+
+        # ------------------------------------------------------------------
+        # Region: Cache writes
+        # ------------------------------------------------------------------
 
         def set(
             self, code_hash: str, seeds: frozenset, scores: Dict[str, float]
         ) -> None:
             """
-            Store PPR scores in the LRU cache.
+            Store PPR scores in the cache under a (code_hash, seeds) key.
+
+            A defensive copy of the scores dict is stored so that subsequent
+            caller mutations cannot corrupt the cached entry.  The entry is
+            promoted to most-recently-used, and the oldest entry is evicted
+            if the capacity limit is exceeded.
 
             Args:
-                code_hash: Hash of the current code state (cache invalidation key).
-                seeds:     Frozenset of seed qualified ids used to produce the scores.
-                scores:    Dict mapping qualified ids to PPR scores.
+                code_hash: Hash of the current code state (invalidation key).
+                seeds:     Frozenset of seed qualified ids used to produce scores.
+                scores:    Dict mapping qualified ids to PPR activation scores.
             """
             key = (code_hash, seeds)
 
-            # ── Store a defensive copy to prevent caller mutations from corrupting the cache
+            # -- Store a defensive copy to prevent caller mutations from
+            # corrupting the cached entry.
             self._cache[key] = dict(scores)
             self._cache.move_to_end(key)
 
-            # ── Evict the oldest entry when the cache exceeds its capacity ────────────
+            # -- Evict the oldest entry when the cache exceeds its capacity.
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
-            @property
-            def stats(self) -> str:
-                """Return cache hit/miss statistics."""
-                total = self._hits + self._misses
-                rate = self._hits / total if total else 0
-                return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
+        # ------------------------------------------------------------------
+        # Region: Diagnostics
+        # ------------------------------------------------------------------
+
+        @property
+        def stats(self) -> str:
+            """
+            Return a human-readable cache hit/miss statistics string.
+
+            Exposed as a property so callers can embed it directly in
+            f-strings without an explicit method call.
+            """
+            total = self._hits + self._misses
+            rate = self._hits / total if total else 0
+            return f"PPR cache: {self._hits}/{total} hits ({rate:.0%})"
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -21385,22 +21468,45 @@ Code context (recent symbols referenced):
     # ═══════════════════════════════════════════════════════════════════════
 
     async def summarize_messages(
-        self, old_messages: list, is_code_context: bool = False
+        self,
+        old_messages: list,
+        is_code_context: bool = False,
+        project_id: str = "",
     ) -> Optional[str]:
         """
         Summarise a list of old conversation messages into a single paragraph.
 
-        Input is capped at 4000 chars in the prompt; the model terminates
-        naturally so no max_tokens ceiling is needed. enable_thinking=False
-        avoids reasoning overhead on a straightforward summarization task.
+        After the LLM call the KV slot is restored so that the auxiliary
+        inference does not leave a dirty slot that would cause a cache miss
+        when the main inference runs immediately after.
+
+        Args:
+            old_messages:    Messages to be summarised (user and assistant roles).
+            is_code_context: True when the conversation involves source code;
+                             selects a more technical system prompt.
+            project_id:      Current project identifier used for KV slot
+                             restoration.  Pass an empty string to skip
+                             restoration (e.g. when called outside an inlet).
+
+        Returns:
+            A single-paragraph summary string, or None when the input is empty
+            or the LLM call fails.
         """
         if not old_messages:
             return None
+
+        # ------------------------------------------------------------------
+        # Region: Build input text from message contents
+        # ------------------------------------------------------------------
         combined = "\n".join(
             [m.get("content", "") for m in old_messages if m.get("content")]
         )
         if not combined.strip():
             return None
+
+        # ------------------------------------------------------------------
+        # Region: Call the LLM to produce the summary
+        # ------------------------------------------------------------------
         prompt = (
             f"Summarize the following conversation segment, preserving key "
             f"decisions and code changes:\n\n{combined[:4000]}"
@@ -21419,6 +21525,15 @@ Code context (recent symbols referenced):
             label="summarize_messages",
             enable_thinking=False,
         )
+
+        # ------------------------------------------------------------------
+        # Region: Restore KV slot after auxiliary LLM call
+        # Every auxiliary LLM call dirties the slot.  Restoring here keeps
+        # the slot aligned with the stable prefix before the main inference.
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         return summary.strip() if summary else None
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -23153,15 +23268,18 @@ class ActiveCodeUpdater:
         self, message: dict, project_id: str, is_continuation: bool = False
     ) -> None:
         """
-        Orchestrate the full update pipeline for one message.
+        Orchestrate the full update pipeline for one conversation message.
 
-        Processes extracted code blocks through symbol extraction, deduplication,
-        indexing, conflict detection, and post-update maintenance tasks.
+        Extracts code blocks and symbols, detects near-duplicates against the
+        active block set, registers or updates blocks in the SymbolIndex, and
+        runs post-update maintenance tasks (mention tracking, expiration, paging,
+        path-index invalidation).
 
         Args:
-            message: The conversation message dict (user or assistant).
-            project_id: Current project identifier.
-            is_continuation: True only for genuine AutoContinue turns.
+            message:         The conversation message dict (user or assistant role).
+            project_id:      Current project identifier.
+            is_continuation: True only for genuine AutoContinue turns; suppresses
+                             the message-count increment.
         """
         if not self._f.valves.enable_code_awareness:
             return
@@ -23170,20 +23288,22 @@ class ActiveCodeUpdater:
         role = message.get("role", "")
 
         # ------------------------------------------------------------------
-        # Region: Extract new blocks and symbols
+        # Region: Extract code blocks and build CodeBlock objects
         # ------------------------------------------------------------------
         new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
             await self._extract_and_prepare_new_blocks(content, role)
         )
 
         # ------------------------------------------------------------------
-        # Region: Get project lock and current state
+        # Region: Acquire the project lock and load current state
         # ------------------------------------------------------------------
         lock = await self._f._state_store.get_project_lock(project_id)
         state_before = self._f._conversation_state_manager.get(project_id)
 
         # ------------------------------------------------------------------
-        # Region: Detect duplicates against existing blocks
+        # Region: Detect near-duplicates before entering the lock
+        # Detection runs on state_before; existing_hash values remain valid
+        # inside the lock assuming no concurrent project mutations.
         # ------------------------------------------------------------------
         duplicate_info = self._detect_duplicates(new_blocks_pending, state_before)
 
@@ -23191,7 +23311,7 @@ class ActiveCodeUpdater:
             state = self._f._conversation_state_manager.get(project_id)
 
             # ------------------------------------------------------------------
-            # Region: Housekeeping — update mention counts from message content
+            # Region: Housekeeping — update mention counts from raw message text
             # ------------------------------------------------------------------
             self._f._enrichment.update_mentions_from_message(state, content, project_id)
             for block in state.active_blocks.values():
@@ -23211,17 +23331,16 @@ class ActiveCodeUpdater:
                 return
 
             # ------------------------------------------------------------------
-            # Bug 45 fix: capture pre-index qualified ids BEFORE the processing
-            # loop so that added_qids / deleted_qids are computed correctly.
-            # Previously there was no capture point, making the sets always empty
-            # and _detect_and_migrate_renames effectively a no-op.
+            # Region: Capture pre-processing qualified ids for rename detection
+            # Snapshot taken before the loop so added_qids / deleted_qids can be
+            # computed accurately after all blocks have been processed.
             # ------------------------------------------------------------------
             pre_process_qids: Set[str] = set(
                 self._f._symbol_index.get_all_qualified_names(project_id)
             )
 
             # ------------------------------------------------------------------
-            # Region: Process each new block
+            # Region: Process each extracted block
             # ------------------------------------------------------------------
             for new_block, syms in zip(new_blocks_pending, symbols_list):
                 if isinstance(syms, Exception):
@@ -23243,19 +23362,26 @@ class ActiveCodeUpdater:
                 )
 
                 if is_dup and existing:
+                    # Pass existing_hash explicitly so _process_duplicate_block
+                    # can synchronise the active_blocks dict key when the block
+                    # hash changes after a content update.
                     await self._process_duplicate_block(
-                        existing, new_block, syms, state, project_id
+                        existing, new_block, syms, state, project_id, existing_hash
                     )
                 else:
                     await self._process_new_block(new_block, syms, state, project_id)
 
             # ------------------------------------------------------------------
-            # Region: Update assistant base blocks
+            # Region: Merge assistant-generated code into matching base blocks
             # ------------------------------------------------------------------
             if role == "assistant" and len(extracted_blocks) > 0:
                 await self._update_assistant_base_blocks(
                     extracted_blocks, content_to_syms, state, project_id
                 )
+
+            # ------------------------------------------------------------------
+            # Region: Detect and migrate symbol renames
+            # ------------------------------------------------------------------
             post_process_qids: Set[str] = set(
                 self._f._symbol_index.get_all_qualified_names(project_id)
             )
@@ -23273,7 +23399,7 @@ class ActiveCodeUpdater:
                     )
 
             # ------------------------------------------------------------------
-            # Region: Post-update tasks
+            # Region: Post-update maintenance tasks
             # ------------------------------------------------------------------
             await self._post_update_tasks(
                 state, project_id, new_blocks_pending, is_continuation
@@ -23282,7 +23408,7 @@ class ActiveCodeUpdater:
             self._f._conversation_state_manager.set(project_id, state)
 
         # ------------------------------------------------------------------
-        # Region: Invalidate session classification cache on new blocks
+        # Region: Invalidate session classification cache on new content
         # ------------------------------------------------------------------
         if new_blocks_pending:
             self._f._session_classify_cache.clear()
@@ -23401,20 +23527,51 @@ class ActiveCodeUpdater:
         syms: List["CodeSymbol"],
         state: dict,
         project_id: str,
+        existing_hash: str,
     ) -> None:
         """
-        Update an existing block with new content when a duplicate is detected.
-        Handles both pinned/raw blocks (forced update) and prioritised recent code.
-        Re‑indexes symbols and edges after the update.
+        Update an existing block when an incoming block is detected as a
+        near-duplicate (similarity >= code_similarity_threshold).
+
+        The ``active_blocks`` dictionary is keyed by block hash.  When the
+        content changes, the hash changes, so the dict key must be updated
+        atomically alongside the attribute — otherwise the block remains in
+        the dict under the stale key while the SymbolIndex records the new
+        hash, making the block invisible to all LOD lookups.
+
+        Args:
+            existing:      The block already present in ``active_blocks``.
+            new_block:     The incoming block with potentially updated content.
+            syms:          Pre-extracted symbols for ``new_block``.
+            state:         Current ConversationState (mutated in-place).
+            project_id:    Current project identifier.
+            existing_hash: The dict key under which ``existing`` is stored.
+                           Must be passed explicitly because ``existing.hash``
+                           changes during this method, making the original key
+                           impossible to recover afterwards.
         """
+        # ------------------------------------------------------------------
+        # Region: Pinned / raw-override path — force content replacement
+        # ------------------------------------------------------------------
         if existing.pinned or new_block.is_raw:
-            # Pinned or raw block: force update, keep pinned status
+
+            # Remove the old symbols from the index before changing content.
             self._f._symbol_index.remove_all_for_block(
                 existing.hash, existing.symbols, project_id
             )
+
             prev_content = existing.content
+            new_hash = new_block.hash
+
+            # Synchronise the active_blocks dict key with the new hash before
+            # updating the attribute, so the block is never unreachable.
+            if existing_hash != new_hash:
+                state.active_blocks.pop(existing_hash, None)
+                state.active_blocks[new_hash] = existing
+
             existing.content = new_block.content
-            existing.hash = new_block.hash
+            existing.hash = new_hash
+
             if new_block.file_path:
                 existing.file_path = new_block.file_path
             existing.line_range = new_block.line_range
@@ -23427,7 +23584,6 @@ class ActiveCodeUpdater:
             existing.importance_score = 10.0
             existing.symbols = syms
 
-            # Re-index with background docstrings
             await self._reindex_block_symbols_with_docstrings(existing, project_id)
 
             if prev_content != new_block.content:
@@ -23436,14 +23592,28 @@ class ActiveCodeUpdater:
                 )
             return
 
+        # ------------------------------------------------------------------
+        # Region: Prioritise-recent-code path — replace with newest version
+        # ------------------------------------------------------------------
         if self._f.valves.prioritize_recent_code:
-            # Prioritise recent code: replace content with newest version
+
+            # Remove the old symbols from the index before changing content.
             self._f._symbol_index.remove_all_for_block(
                 existing.hash, existing.symbols, project_id
             )
+
             prev_content = existing.content
+            new_hash = new_block.hash
+
+            # Synchronise the active_blocks dict key with the new hash before
+            # updating the attribute, so the block is never unreachable.
+            if existing_hash != new_hash:
+                state.active_blocks.pop(existing_hash, None)
+                state.active_blocks[new_hash] = existing
+
             existing.content = new_block.content
-            existing.hash = new_block.hash
+            existing.hash = new_hash
+
             if new_block.file_path:
                 existing.file_path = new_block.file_path
             existing.line_range = new_block.line_range
@@ -23453,7 +23623,6 @@ class ActiveCodeUpdater:
             existing.last_mentioned_msg_idx = state.message_count
             existing.symbols = syms
 
-            # Re-index with background docstrings
             await self._reindex_block_symbols_with_docstrings(existing, project_id)
 
             if prev_content != new_block.content:
@@ -25601,14 +25770,20 @@ class WindowManager:
         """
         Persist the generated summary and update WindowManager metrics.
 
+        Stores the summary entry in ``state.conversation_summaries``, updates
+        the summarized-turn high-water mark, emits LTM persistence, triggers
+        L1→L2 consolidation when enough entries have accumulated, and saves
+        the KV slot with ``force=True`` so that the next inlet restores from
+        the post-eviction prefix rather than the pre-eviction state.
+
         Args:
             summary_text: The summary text to store.
-            old_msgs: Messages that were evicted from the window.
-            turns: Turn numbers for every message in ``history``.
-            history: Full history list (system messages excluded).
-            state: ConversationState to update.
-            project_id: Current project identifier.
-            slot_free: Whether the LLM slot is free (governs consolidation).
+            old_msgs:     Messages that were evicted from the window.
+            turns:        Turn numbers for every message in ``history``.
+            history:      Full history list (system messages excluded).
+            state:        ConversationState to update.
+            project_id:   Current project identifier.
+            slot_free:    Whether the LLM slot is free (governs consolidation).
 
         Returns:
             The formatted ``pending_summary`` string for injection into the
@@ -25642,10 +25817,6 @@ class WindowManager:
         if max_l1 > 0:
             l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
             if len(l1) > max_l1:
-                # Bug 40 fix: use (covers_turns, created_at) as a stable
-                # content-based identity key instead of id(), which can be
-                # reused by the GC if an object is collected between the set
-                # comprehension and the list comprehension below.
                 keep_keys = {
                     (tuple(s.get("covers_turns", [])), s.get("created_at", 0.0))
                     for s in l1[-max_l1:]
@@ -25699,7 +25870,7 @@ class WindowManager:
         )
 
         # ------------------------------------------------------------------
-        # Region: Consolidate L1 → L2 when enough summaries accumulated
+        # Region: Consolidate L1 → L2 when enough summaries have accumulated
         # ------------------------------------------------------------------
         l1_count = sum(
             1 for s in state.conversation_summaries if s.get("level", 1) == 1
@@ -25714,11 +25885,17 @@ class WindowManager:
             )
 
         # ------------------------------------------------------------------
-        # Region: KV-freeze hook and state persistence
+        # Region: KV-freeze hook — save slot after history eviction
+        # Uses force=True because the structure hash (signatures) may not
+        # have changed even though the history prefix changed: the standard
+        # last_saved_slot_hash guard in slot_save would skip the write
+        # without the force flag, leaving the slot file stale.
         # ------------------------------------------------------------------
-        # Bug 13 fix: pass project_id explicitly instead of reading from singleton.
-        self._on_frontier_advance(old_hwm, new_hwm, project_id)
+        await self._on_frontier_advance(old_hwm, new_hwm, project_id)
 
+        # ------------------------------------------------------------------
+        # Region: Persist state and return the injection string
+        # ------------------------------------------------------------------
         self._f._conversation_state_manager.set(project_id, state)
 
         return f"[Summary of earlier conversation]\n{summary_text}"
@@ -26692,12 +26869,30 @@ class MessageAssembler:
         except Exception as e:
             self._f._log_debug(f"Turn summary LTM persist failed: {e}")
 
-    async def _merge_summaries(self, group_summaries: List[dict]) -> Optional[dict]:
-        """Fuse several L1 turn-range summaries into one L2 summary via the LLM."""
+    async def _merge_summaries(
+        self,
+        group_summaries: List[dict],
+        project_id: str = "",
+    ) -> Optional[dict]:
+        """
+        Fuse several L1 turn-range summaries into one L2 summary via the LLM.
+
+        Args:
+            group_summaries: List of L1 summary dicts to consolidate.
+            project_id:      Current project identifier used for KV slot
+                             restoration after the auxiliary LLM call.
+
+        Returns:
+            A single L2 summary dict, or None when merging fails.
+        """
+        # ------------------------------------------------------------------
+        # Region: Collect and validate input texts
+        # ------------------------------------------------------------------
         texts: List[str] = []
         starts: List[int] = []
         ends: List[int] = []
         total_msgs = 0
+
         for s in group_summaries:
             t = s.get("text", "")
             if t:
@@ -26707,9 +26902,14 @@ class MessageAssembler:
                 starts.append(ct[0])
                 ends.append(ct[1])
             total_msgs += s.get("covers_msgs", 0)
+
         combined = "\n\n".join(f"- {t}" for t in texts)
         if not combined.strip():
             return None
+
+        # ------------------------------------------------------------------
+        # Region: Call the LLM to produce the consolidated summary
+        # ------------------------------------------------------------------
         prompt = (
             "Consolidate these conversation summaries into ONE higher-level "
             "summary (3-5 sentences). Preserve key decisions, files modified, and "
@@ -26728,8 +26928,19 @@ class MessageAssembler:
             label="hierarchical_summary",
             enable_thinking=False,
         )
+
+        # ------------------------------------------------------------------
+        # Region: Restore KV slot after auxiliary LLM call
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
         if not merged or not merged.strip():
             return None
+
+        # ------------------------------------------------------------------
+        # Region: Build and return the L2 summary entry
+        # ------------------------------------------------------------------
         return {
             "text": merged.strip(),
             "created_at": time.time(),
@@ -26745,12 +26956,26 @@ class MessageAssembler:
         slot_free: bool,
     ) -> None:
         """
-        Consolidate L1 summaries into L2 and apply level-aware cap.
+        Consolidate L1 summaries into L2 and apply level-aware caps.
+
+        Folds the oldest ``hierarchical_summary_group_size`` L1 entries into a
+        single L2 entry when enough L1 summaries have accumulated, then trims
+        both levels to their configured maximums.
+
+        Args:
+            state:      ConversationState mutated in-place.
+            project_id: Current project identifier, threaded through to
+                        ``_merge_summaries`` for KV slot restoration.
+            slot_free:  False suppresses the LLM consolidation call so the
+                        method degrades gracefully when the slot is busy.
         """
         summaries = state.conversation_summaries
         if not summaries:
             return
 
+        # ------------------------------------------------------------------
+        # Region: Fold oldest L1 group into one L2 entry (hierarchical)
+        # ------------------------------------------------------------------
         if slot_free and self._f.valves.enable_hierarchical_summaries:
             group = self._f.valves.hierarchical_summary_group_size
             l1 = sorted(
@@ -26758,9 +26983,12 @@ class MessageAssembler:
                 key=WindowManager._summary_sort_key,
             )
             l2plus = [s for s in summaries if s.get("level", 1) >= 2]
+
             if len(l1) >= group:
                 oldest = l1[:group]
-                merged = await self._merge_summaries(oldest)
+                # Pass project_id so _merge_summaries can restore the slot
+                # after its auxiliary LLM call.
+                merged = await self._merge_summaries(oldest, project_id=project_id)
                 if merged:
                     summaries = l2plus + [merged] + l1[group:]
                     self._f._log_debug(
@@ -26774,8 +27002,12 @@ class MessageAssembler:
                         "(no-degradation guard)."
                     )
 
+        # ------------------------------------------------------------------
+        # Region: Apply per-level caps to bound memory consumption
+        # ------------------------------------------------------------------
         max_l1 = self._f.valves.max_conversation_summaries
         max_l2 = self._f.valves.max_hierarchical_summaries
+
         l1 = sorted(
             (s for s in summaries if s.get("level", 1) == 1),
             key=WindowManager._summary_sort_key,
@@ -26784,10 +27016,15 @@ class MessageAssembler:
             (s for s in summaries if s.get("level", 1) >= 2),
             key=WindowManager._summary_sort_key,
         )
+
         if max_l1 > 0:
             l1 = l1[-max_l1:]
         if max_l2 > 0:
             l2 = l2[-max_l2:]
+
+        # ------------------------------------------------------------------
+        # Region: Persist trimmed summary list and notify state manager
+        # ------------------------------------------------------------------
         state.conversation_summaries = sorted(
             l2 + l1,
             key=WindowManager._summary_sort_key,
