@@ -6373,8 +6373,14 @@ Output only the option name.
             if qid in injected_symbols:
                 continue
 
-            # ── Handle symbols already present in the skeleton tier ───────────────
+            # Region: skip symbols already rendered in the stable skeleton tier
+            # All three LOD tiers must continue here to prevent the signature or
+            # body from being re-emitted into the dynamic Block B sections.
             if qid in skeleton_qids:
+                if _lod_tier(qid) == 1:
+                    # Signature is already present in the skeleton tier;
+                    # adding it again to _lod1_parts would duplicate it.
+                    continue
                 if _lod_tier(qid) == 2:
                     self._f._log_debug(
                         f"Block B: skipping LOD-2 for {qid} (in skeleton tier)"
@@ -6846,21 +6852,6 @@ Output only "YES" or "NO".
                     self._f._log_debug(f"Removed obsolete slot file: {fname}")
         except Exception as e:
             self._f._log_debug(f"Slot cleanup error: {e}")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 8. Internal helpers (LOD tier, etc.)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _lod_tier(qid: str) -> int:
-        """
-        Determine the LOD tier for a symbol based on its activation.
-
-        This is a static helper used during Block B assembly.
-        """
-        # This is a placeholder; the actual logic is in build_block_b
-        # where lod3_qids, lod2_qids, etc. are defined.
-        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -23042,13 +23033,12 @@ class EnrichmentTasks:
         (functions, methods, and classes) that lack one.
 
         Takes a snapshot of all symbols without docstrings at the start,
-        then prioritizes them using `_prioritize_docstring_targets` so that
+        then prioritizes them using _prioritize_docstring_targets so that
         skeleton-tier symbols are documented first.
 
-        Uses `background=True` so that the calls to `ensure_docstrings_batch`
-        use the `bg_docstring` label, which is whitelisted during silent
-        ingestion. This allows docstring generation to proceed even if the
-        system is in the middle of a silent ingestion operation.
+        Uses background=True so that calls to ensure_docstrings_batch use the
+        bg_docstring LLM label, which is whitelisted during silent ingestion,
+        allowing docstring generation to proceed concurrently.
 
         Args:
             project_id: The current project identifier.
@@ -23057,7 +23047,7 @@ class EnrichmentTasks:
         if stop_event is None:
             stop_event = asyncio.Event()
 
-        # ── 1. Snapshot: collect all symbols without docstrings ──────────
+        # Region: snapshot all symbols without docstrings from active blocks
         state = self._f._conversation_state_manager.get(project_id)
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
@@ -23067,7 +23057,11 @@ class EnrichmentTasks:
                 continue
             for sym in block.symbols:
                 if sym.kind in ("function", "method", "class") and not sym.docstring:
-                    qid = qualify_symbol_name(sym.name, sym.parent_symbol)
+                    # qualify_symbol includes file_path so that module-level
+                    # functions resolve to "module.func" rather than bare "func",
+                    # matching the qualified ids used by the SymbolIndex and by
+                    # ensure_docstrings_batch.
+                    qid = qualify_symbol(sym)
                     pending_qids.append(qid)
 
         if not pending_qids:
@@ -23078,7 +23072,7 @@ class EnrichmentTasks:
             f"Background docstring loop: {len(pending_qids)} symbol(s) to process"
         )
 
-        # ── Q5: Prioritize symbols ──
+        # Region: sort by visibility priority — skeleton-tier and LOD-2 first
         prioritized_qids = self._prioritize_docstring_targets(
             pending_qids, project_id, pstate
         )
@@ -23088,7 +23082,7 @@ class EnrichmentTasks:
             "skeleton-tier first"
         )
 
-        # ── 2. Batch configuration ──────────────────────────────────────────
+        # Region: split the prioritized list into fixed-size batches
         batch_size = getattr(self._f.valves, "docstring_bg_batch_size", 5)
         batches = [
             prioritized_qids[i : i + batch_size]
@@ -23100,7 +23094,7 @@ class EnrichmentTasks:
             f"{len(batches)} batches (batch_size={batch_size})"
         )
 
-        # ── 3. Process each batch with stop_event check ─────────────────────
+        # Region: process batches with cooperative cancellation via stop_event
         total_docstrings = 0
         for batch_idx, batch in enumerate(batches):
             if stop_event.is_set():
@@ -23114,7 +23108,7 @@ class EnrichmentTasks:
                 results: Dict[str, str] = await self.ensure_docstrings_batch(
                     batch,
                     project_id,
-                    background=True,  # <-- background mode
+                    background=True,
                 )
                 for qid, docstring in results.items():
                     if docstring:
@@ -23132,14 +23126,14 @@ class EnrichmentTasks:
                     "continuing with remaining batches"
                 )
 
-        # ── Log performance metrics if enabled ──────────────────────────────
+        # Region: optional performance summary
         if self._f.valves.bg_task_measure_performance:
             self._f._log_debug(
                 f"bg_docstring: processed {len(batches)} batches, "
                 f"generated {total_docstrings} docstrings"
             )
 
-        self._f._log_debug("bg_docstring: finished (no slot restore)")
+        self._f._log_debug("bg_docstring: finished")
 
     def start_docstring_loop(self, project_id: str) -> None:
         """Launch the background docstring generation loop (if not already running)."""
@@ -23260,41 +23254,34 @@ class EnrichmentTasks:
         """
         Generate a one-line docstring for a symbol in the background.
 
-        This method is called from the background docstring loop and runs
-        asynchronously without blocking the main request flow. It extracts
-        a code snippet for the symbol, calls the LLM to generate a concise
-        docstring, and persists the result both in the SymbolIndex and in
-        SQLite.
-
-        Since this runs in the background, it uses the maximum context (4000
-        characters) for all symbols to ensure the highest quality docstrings.
-        The cost is paid once per symbol, and the benefit is permanent.
+        Extracts a code snippet for the symbol, calls the LLM to generate a
+        concise docstring, and persists the result both in the SymbolIndex and
+        in SQLite. Uses 4000 characters of context for every symbol because the
+        cost is paid once and the quality benefit is permanent.
 
         Args:
-            sym (CodeSymbol): The symbol to document.
-            block (CodeBlock): The code block containing the symbol.
-            project_id (str): The current project identifier.
+            sym:        The symbol to document.
+            block:      The code block that contains the symbol.
+            project_id: The current project identifier.
         """
-        # ── REGION 1: Extract symbol metadata ──
+        # Region: capture symbol identity before any async suspension point
         name = sym.name
         kind = sym.kind
         signature = sym.signature
         line_start = sym.line_start
-        line_end = sym.line_end
         block_hash = block.hash
 
-        # ── REGION 2: Verify the block still exists ──
+        # Region: verify the block still exists in active state
         state = self._f._conversation_state_manager.get(project_id)
         target_block = state.active_blocks.get(block_hash)
         if target_block is None:
             self._f._log_debug(
-                f"Background docstring: block {block_hash} not found, skipping '{name}'"
+                f"Background docstring: block {block_hash} not found, "
+                f"skipping '{name}'"
             )
             return
 
-        # ── REGION 3: Build the snippet with maximum context ──
-        # In background, it does not block the user, so we use 4000 chars always.
-        # This ensures the highest quality docstrings for all symbols.
+        # Region: extract a high-quality code snippet for the LLM prompt
         snippet = self._get_optimal_snippet(
             sym=sym,
             block=target_block,
@@ -23303,11 +23290,12 @@ class EnrichmentTasks:
             context_lines=5,
         )
 
-        # ── REGION 4: Build the LLM prompt ──
+        # Region: build a kind-specific prompt for higher accuracy
         if kind == "class":
             prompt = (
-                f"In one sentence, describe the single responsibility of this class "
-                f"based on its method names and structure:\n\n```\n{snippet}\n```"
+                f"In one sentence, describe the single responsibility of this "
+                f"class based on its method names and structure:\n\n"
+                f"```\n{snippet}\n```"
             )
         else:
             prompt = (
@@ -23315,10 +23303,13 @@ class EnrichmentTasks:
                 f"```\n{signature}\n{snippet}\n```"
             )
 
-        # ── REGION 5: Call the LLM ──
+        # Region: call the LLM to generate the docstring
         docstring_text = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt="You are a code summarization assistant. Output only one concise sentence.",
+            system_prompt=(
+                "You are a code summarization assistant. "
+                "Output only one concise sentence."
+            ),
             model_override=self._f.valves.llm_model,
             max_tokens=500,
             temperature=0.1,
@@ -23328,7 +23319,7 @@ class EnrichmentTasks:
         if not docstring_text or not docstring_text.strip():
             return
 
-        # ── REGION 6: Parse and validate the docstring ──
+        # Region: clean and validate the raw LLM output
         docstring = self._clean_single_docstring(docstring_text, name)
         if not docstring:
             self._f._log_debug(
@@ -23336,7 +23327,7 @@ class EnrichmentTasks:
             )
             return
 
-        # ── REGION 7: Persist the docstring ──
+        # Region: persist the docstring under the project lock
         lock = await self._f._state_store.get_project_lock(project_id)
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
@@ -23345,23 +23336,29 @@ class EnrichmentTasks:
                 for s in block.symbols:
                     if s.name == name and s.line_start == line_start:
                         s.docstring = docstring
-                        qid = qualify_symbol_name(s.name, s.parent_symbol)
+                        # qualify_symbol includes file_path so that module-level
+                        # functions resolve to "module.func" rather than bare
+                        # "func", matching the qualified ids used by the SymbolIndex.
+                        qid = qualify_symbol(s)
                         self._f._symbol_index.update_docstring(
                             qid, project_id, docstring
                         )
                         await self._f._state_store._db_enqueue(
-                            lambda q=qid, d=docstring, pid=project_id: self._f._db_conn.execute(
-                                "INSERT OR REPLACE INTO symbol_docstrings "
-                                "(project_id, symbol_name, docstring, updated_at) "
-                                "VALUES (?,?,?,?)",
-                                (pid, q, d, time.time()),
+                            lambda q=qid, d=docstring, pid=project_id: (
+                                self._f._db_conn.execute(
+                                    "INSERT OR REPLACE INTO symbol_docstrings "
+                                    "(project_id, symbol_name, docstring, updated_at) "
+                                    "VALUES (?,?,?,?)",
+                                    (pid, q, d, time.time()),
+                                )
                             )
                         )
                         break
                 self._f._conversation_state_manager.set(project_id, state)
             else:
                 self._f._log_debug(
-                    f"Background docstring: block {block_hash} disappeared, skipping '{name}'"
+                    f"Background docstring: block {block_hash} disappeared, "
+                    f"skipping '{name}'"
                 )
 
     def _clean_single_docstring(
@@ -25756,6 +25753,72 @@ class WindowManager:
     # Region: Main Entry Point
     # ------------------------------------------------------------------
 
+
+# WindowManager
+
+
+def _compute_frontier(
+    self,
+    history: List[dict],
+    turns: List[int],
+    budget: int,
+) -> Tuple[List[dict], List[dict], int, int]:
+    """
+    Compute the window frontier, ensuring the current user turn is never evicted.
+
+    Iterates backwards from the most recent message, accumulating tokens.
+    When the current turn alone exceeds the budget it is force-included;
+    older turns are cut instead. The accumulated token count is returned
+    alongside the split so the caller can distinguish a genuine fit from
+    an overflow where no older turns exist to evict.
+
+    Args:
+        history: List of messages (user/assistant/tool).
+        turns:   Turn number for each message (1-based, shared across a turn).
+        budget:  Token budget for the history window.
+
+    Returns:
+        Tuple of (kept_messages, evicted_messages, cut_turn, accumulated_tokens).
+        cut_turn == 0 means no older turn was evicted.
+        When accumulated_tokens > budget and cut_turn == 0, the current turn
+        alone fills the window; the caller must not log "history fits".
+    """
+    accumulated = 0
+    cut_turn = 0
+    token_counts = [self._token_count(m.get("content", "")) for m in history]
+
+    # The current turn (highest turn number) must always be kept.
+    max_turn = max(turns) if turns else 0
+
+    # Region: walk backwards, accumulating tokens until the budget is exceeded
+    for i in range(len(history) - 1, -1, -1):
+        tok = token_counts[i]
+        if accumulated + tok > budget:
+            if turns[i] == max_turn:
+                # Force-include every message that belongs to the current turn.
+                # The emergency cap in apply() handles the overflow case.
+                accumulated += tok
+                continue
+            cut_turn = turns[i]
+            break
+        accumulated += tok
+
+    # Region: no older turns were evicted — return with accumulated count
+    if cut_turn == 0:
+        return history, [], 0, accumulated
+
+    # Region: split history at the frontier
+    kept = [m for m, t in zip(history, turns) if t > cut_turn]
+    old_msgs = [m for m, t in zip(history, turns) if t <= cut_turn]
+
+    self._f._log_debug(
+        f"WindowManager: frontier at turn {cut_turn} — "
+        f"keeping {len(kept)} msg(s), evicting {len(old_msgs)} msg(s), "
+        f"accumulated={accumulated} tokens"
+    )
+
+    return kept, old_msgs, cut_turn, accumulated
+
     async def apply(
         self,
         messages: List[dict],
@@ -25772,10 +25835,10 @@ class WindowManager:
         injection.
 
         Args:
-            messages: Full list (system + history).
-            state: ConversationState for the project.
+            messages:   Full list (system + history).
+            state:      ConversationState for the project.
             project_id: Current project identifier.
-            slot_free: If False, no summaries are generated (no LLM calls).
+            slot_free:  If False, no summaries are generated (no LLM calls).
 
         Returns:
             Tuple of (messages_final, pending_summary).
@@ -25784,9 +25847,7 @@ class WindowManager:
         """
         v = self._f.valves
 
-        # ------------------------------------------------------------------
-        # Region: clean orphan tool calls at the front of the history
-        # ------------------------------------------------------------------
+        # Region: strip orphan tool calls at the front of the history
         if v.preserve_tool_calls:
             while messages and messages[0].get("role") == "tool":
                 messages = messages[1:]
@@ -25804,9 +25865,7 @@ class WindowManager:
                 if not tool_call_ids.issubset(tool_response_ids):
                     messages = messages[1:]
 
-        # ------------------------------------------------------------------
-        # Region: AutoContinue deferral — do not compact mid-stream
-        # ------------------------------------------------------------------
+        # Region: defer compaction while an AutoContinue session is mid-stream
         if v.compaction_defer_during_autocontinue and self._is_autocontinue_active(
             messages
         ):
@@ -25815,51 +25874,51 @@ class WindowManager:
             )
             return messages, ""
 
-        # ------------------------------------------------------------------
         # Region: separate system messages from history
-        # ------------------------------------------------------------------
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         history = [m for m in messages if m.get("role") != "system"]
         if not history:
             return messages, ""
 
-        # ------------------------------------------------------------------
         # Region: compute effective token budget
-        # ------------------------------------------------------------------
         budget = self._effective_budget(project_id)
 
-        # ------------------------------------------------------------------
         # Region: assign turn numbers to every history message
-        # ------------------------------------------------------------------
         turns, _total_turns = self._index_turns(history)
 
-        # ------------------------------------------------------------------
         # Region: compute the window frontier
-        # ------------------------------------------------------------------
-        kept, old_msgs, cut_turn = self._compute_frontier(history, turns, budget)
+        # accumulated is returned alongside the split so we can detect when the
+        # current turn alone exceeds the budget without any older turns to evict.
+        kept, old_msgs, cut_turn, accumulated = self._compute_frontier(
+            history, turns, budget
+        )
 
-        # ------------------------------------------------------------------
-        # Region: Log B — early return when everything fits
-        # ------------------------------------------------------------------
+        # Region: early return when history genuinely fits within the budget
+        # Do NOT early-return when accumulated > budget even if old_msgs is empty:
+        # that condition means the current turn alone overflows the window, and
+        # returning here would incorrectly emit "history fits" to the log.
         if not old_msgs:
+            if accumulated <= budget:
+                self._f._log_debug(
+                    f"WindowManager: history fits — {len(history)} msg(s), "
+                    f"no compaction needed"
+                )
+                return sys_msgs + kept, ""
+            # Current turn alone exceeds the budget; fall through so the emergency
+            # cap produces the correct diagnostic trace.
             self._f._log_debug(
-                f"WindowManager: history fits — {len(history)} msg(s), "
-                f"no compaction needed"
+                f"WindowManager: current turn alone exceeds budget "
+                f"({accumulated} > {budget} tokens) — attempting emergency cap"
             )
-            return sys_msgs + kept, ""
 
-        # ------------------------------------------------------------------
-        # Region: emergency cap for giant turns
-        # ------------------------------------------------------------------
+        # Region: emergency cap for giant individual turns
         kept, old_msgs = self._apply_emergency_cap(
             history, turns, kept, old_msgs, budget
         )
         if not old_msgs:
-            return sys_msgs + kept, ""
+            return sys_msgs + history, ""
 
-        # ------------------------------------------------------------------
-        # Region: minimum batch guard — skip if too few turns to summarise
-        # ------------------------------------------------------------------
+        # Region: minimum batch guard — skip when too few turns to summarise
         old_turn_nums = {t for m, t in zip(history, turns) if m in old_msgs}
         if len(old_turn_nums) < v.summarize_batch_turns:
             self._f._log_debug(
@@ -25869,9 +25928,7 @@ class WindowManager:
             )
             return sys_msgs + history, ""
 
-        # ------------------------------------------------------------------
-        # Region: summarise evicted turns (no-degradation guard)
-        # ------------------------------------------------------------------
+        # Region: generate summary (no-degradation guard)
         if not slot_free:
             self._f._log_debug("WindowManager: no free slot, keeping raw history")
             return sys_msgs + history, ""
@@ -25890,9 +25947,7 @@ class WindowManager:
             )
             return sys_msgs + history, ""
 
-        # ------------------------------------------------------------------
         # Region: persist summary and update metrics
-        # ------------------------------------------------------------------
         pending = await self._persist(
             summary_text=summary_text,
             old_msgs=old_msgs,
@@ -25978,70 +26033,62 @@ class WindowManager:
         history: List[dict],
         turns: List[int],
         budget: int,
-    ) -> Tuple[List[dict], List[dict], int]:
+    ) -> Tuple[List[dict], List[dict], int, int]:
         """
         Compute the window frontier, ensuring the current user turn is never evicted.
 
         Iterates backwards from the most recent message, accumulating tokens.
-        If the current user turn alone exceeds the budget, it is force-included
-        and older turns are cut instead.
+        When the current turn alone exceeds the budget it is force-included;
+        older turns are cut instead. The accumulated token count is returned
+        alongside the split so the caller can distinguish a genuine fit from
+        an overflow where no older turns exist to evict.
 
         Args:
             history: List of messages (user/assistant/tool).
-            turns: Turn number for each message (1-based).
-            budget: Token budget for the history window.
+            turns:   Turn number for each message (1-based, shared across a turn).
+            budget:  Token budget for the history window.
 
         Returns:
-            Tuple of (kept_messages, evicted_messages, cut_turn).
-            cut_turn == 0 means everything fits.
+            Tuple of (kept_messages, evicted_messages, cut_turn, accumulated_tokens).
+            cut_turn == 0 means no older turn was evicted.
+            When accumulated_tokens > budget and cut_turn == 0, the current turn
+            alone fills the window; the caller must not log "history fits".
         """
         accumulated = 0
         cut_turn = 0
         token_counts = [self._token_count(m.get("content", "")) for m in history]
 
-        # The current turn (highest turn number) MUST always be kept.
+        # The current turn (highest turn number) must always be kept.
         max_turn = max(turns) if turns else 0
 
-        # ------------------------------------------------------------------
-        # Walk backwards from the most recent message.
-        # ------------------------------------------------------------------
+        # Region: walk backwards, accumulating tokens until the budget is exceeded
         for i in range(len(history) - 1, -1, -1):
             tok = token_counts[i]
             if accumulated + tok > budget:
                 if turns[i] == max_turn:
-                    # Force-include current turn regardless of size.
-                    # Continue cutting older turns to make room.
+                    # Force-include every message that belongs to the current turn.
+                    # The emergency cap in apply() handles the overflow case.
                     accumulated += tok
                     continue
                 cut_turn = turns[i]
                 break
             accumulated += tok
 
-        # ------------------------------------------------------------------
-        # Everything fits.
-        # ------------------------------------------------------------------
+        # Region: no older turns were evicted — return with accumulated count
         if cut_turn == 0:
-            self._f._log_debug(
-                f"WindowManager: all {len(history)} msg(s) fit ({accumulated} tokens)"
-            )
-            return history, [], 0
+            return history, [], 0, accumulated
 
-        # ------------------------------------------------------------------
-        # Split history at the frontier.
-        # ------------------------------------------------------------------
+        # Region: split history at the frontier
         kept = [m for m, t in zip(history, turns) if t > cut_turn]
         old_msgs = [m for m, t in zip(history, turns) if t <= cut_turn]
 
-        # ------------------------------------------------------------------
-        # Log C: frontier result.
-        # ------------------------------------------------------------------
         self._f._log_debug(
             f"WindowManager: frontier at turn {cut_turn} — "
             f"keeping {len(kept)} msg(s), evicting {len(old_msgs)} msg(s), "
             f"accumulated={accumulated} tokens"
         )
 
-        return kept, old_msgs, cut_turn
+        return kept, old_msgs, cut_turn, accumulated
 
     def _apply_emergency_cap(
         self,
@@ -28420,15 +28467,13 @@ class TaskRegistry:
 
     def _validate_and_order(self) -> None:
         """
-        Validate the background_priority valve and order tasks by priority.
+        Validate the background_priority valve and sort tasks in execution order.
 
-        - Warns about unknown task names in the valve.
-        - Applies effective priority from the valve (or uses default).
-        - Sorts tasks in descending priority order (higher first).
+        Priority convention: lower number = higher urgency = runs first.
+        Tasks absent from background_priority retain their built-in default value.
+        Unknown names in background_priority are logged as warnings.
         """
-        # ------------------------------------------------------------------
-        # Step 1: Validate keys in background_priority valve.
-        # ------------------------------------------------------------------
+        # Region: warn about unrecognised task names in the valve
         valid_names = {t.name for t in self._bg_tasks}
         for name in self._f.valves.background_priority:
             if name not in valid_names:
@@ -28436,18 +28481,14 @@ class TaskRegistry:
                     f"WARNING: background_priority contains unknown task '{name}'"
                 )
 
-        # ------------------------------------------------------------------
-        # Step 2: Apply effective priority from valve or default.
-        # ------------------------------------------------------------------
+        # Region: apply effective priority from the valve or fall back to the default
         for task in self._bg_tasks:
             task._effective_priority = self._f.valves.background_priority.get(
                 task.name, task.priority
             )
 
-        # ------------------------------------------------------------------
-        # Step 3: Sort by effective priority (higher first).
-        # ------------------------------------------------------------------
-        self._bg_tasks.sort(key=lambda t: -t._effective_priority)
+        # Region: sort ascending so the lowest-numbered task (highest urgency) runs first
+        self._bg_tasks.sort(key=lambda t: t._effective_priority)
 
     # ------------------------------------------------------------------
     # Region: Public API for Filter
@@ -28647,43 +28688,38 @@ class TaskRegistry:
 
     async def _lazy_docstrings(self, project_id: str) -> None:
         """
-        Generate docstrings on demand for symbols that will be visible in the
-        current turn's Block B or skeleton tier, before the context is assembled.
+        Generate docstrings on demand for symbols about to appear in the
+        current turn's Block B (LOD-2) or skeleton tier, before context assembly.
 
-        Targets only symbols about to appear in LOD-2 or in the skeleton tier
-        so the per-turn budget is spent where it has immediate impact on the
-        quality of what the model actually sees this turn.
-
-        Uses ``background=False`` to respect the per-turn budget valve and to
-        use the ``lazy_docstring_batch`` LLM label, which is correct here because
-        this method never runs during silent ingestion.
+        Targets only symbols that will be immediately visible to the model so
+        the per-turn budget valve (lazy_docstring_max_per_turn) is spent where
+        it has direct quality impact. Uses background=False to respect that
+        valve and to use the lazy_docstring_batch LLM label, which is correct
+        here because this method never runs during silent ingestion.
 
         Args:
             project_id: Current project identifier.
         """
         psm = self._f._project_state_manager
 
-        # ── Load current conversation state ──────────────────────────────────────
+        # Region: load current conversation state
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return
 
-        # ── Determine which symbols need docstrings this turn ─────────────────────
-        # Only symbols about to appear in LOD-2 or the skeleton tier are targeted.
-        # Generating docstrings for symbols that will not be shown wastes the
-        # per-turn budget without any immediate benefit to the model's context.
+        # Region: determine which symbol tiers are visible this turn
         skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
         lod2_qids = set(psm.get_lod2_active_qids_prev(project_id))
 
+        # Region: collect qids that lack docstrings and will appear in context
         qids_needed: Set[str] = set()
         for block in state.active_blocks.values():
             if block.obsolete:
                 continue
             for sym in block.symbols:
-                # qualify_symbol() includes file_path so that module-level
-                # functions produce "module.func" rather than bare "func",
-                # matching the qualified ids stored in skeleton_qids and lod2_qids
-                # which were built by the SymbolIndex using the same convention.
+                # qualify_symbol includes file_path so that module-level functions
+                # resolve to "module.func" rather than bare "func", matching the
+                # qualified ids stored in skeleton_qids and lod2_qids.
                 qid = qualify_symbol(sym)
                 if (qid in skeleton_qids or qid in lod2_qids) and not sym.docstring:
                     qids_needed.add(qid)
@@ -28691,10 +28727,7 @@ class TaskRegistry:
         if not qids_needed:
             return
 
-        # ── Generate missing docstrings via EnrichmentTasks ───────────────────────
-        # ensure_docstrings_batch lives on self._f._enrichment (EnrichmentTasks),
-        # not on self (TaskRegistry). Calling self.ensure_docstrings_batch would
-        # raise AttributeError at runtime.
+        # Region: generate missing docstrings via the shared batch helper
         results = await self._f._enrichment.ensure_docstrings_batch(
             list(qids_needed),
             project_id,
@@ -30511,16 +30544,23 @@ class SemanticSeedInferencer:
         """
         Resolve a list of symbol tokens to actual qualified ids.
 
-        Receives a pre-parsed list of strings extracted from the JSON response
-        instead of raw LLM text. The resolution logic is unchanged:
-        exact match → dotted decomposition → bare name → fuzzy fallback.
+        Resolution strategies applied in priority order:
+          1. Exact qualified-id match against the SymbolIndex.
+          2. Dotted-name decomposition (e.g. "ClassName.method").
+          3. Bare-name lookup via the SymbolIndex reverse index.
+          4. Fuzzy matching via rapidfuzz (requires HAS_FUZZ).
+
+        The max_syms cap (seed_inference_max_symbols) is enforced both at
+        the outer token loop and inside each multi-qid inner loop so that no
+        single token can push the seed count beyond the configured limit.
 
         Args:
-            tokens: List of identifier strings from the LLM JSON response.
+            tokens:     Identifier strings parsed from the LLM JSON response.
             project_id: Current project identifier.
 
         Returns:
-            Dictionary mapping qualified symbol ids to seed scores.
+            Dictionary mapping qualified symbol ids to seed scores,
+            capped at seed_inference_max_symbols entries.
         """
         score = self._f.valves.seed_inference_score
         max_syms = self._f.valves.seed_inference_max_symbols
@@ -30529,6 +30569,7 @@ class SemanticSeedInferencer:
         seeds: Dict[str, float] = {}
 
         for token in tokens:
+            # Region: enforce the cap at the start of each token iteration
             if len(seeds) >= max_syms:
                 break
 
@@ -30536,19 +30577,19 @@ class SemanticSeedInferencer:
             if not token:
                 continue
 
-            # Exact match.
+            # Region: exact qualified-id match (fastest path)
             if token in all_qids:
                 seeds[token] = max(seeds.get(token, 0.0), score)
                 continue
 
-            # Dotted-name decomposition (e.g. "ClassName.method").
+            # Region: dotted-name decomposition (e.g. "ClassName.method")
             if "." in token:
                 parent_name, method_part = token.rsplit(".", 1)
                 constructed_qid = qualify_symbol_name(method_part, parent_name)
                 if constructed_qid in all_qids:
                     seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
                     continue
-                # Fallback: bare method name lookup.
+                # Fallback: bare method-name lookup across all classes
                 by_method = self._f._symbol_index.get_qualified_names_for(
                     method_part, project_id
                 )
@@ -30557,9 +30598,11 @@ class SemanticSeedInferencer:
                     for q in by_method:
                         if q in all_qids:
                             seeds[q] = max(seeds.get(q, 0.0), share)
+                            if len(seeds) >= max_syms:
+                                break
                     continue
 
-            # Bare name resolution.
+            # Region: bare-name resolution via the SymbolIndex reverse index
             qids = {
                 q
                 for q in self._f._symbol_index.get_qualified_names_for(
@@ -30571,14 +30614,18 @@ class SemanticSeedInferencer:
                 share = score / len(qids)
                 for q in qids:
                     seeds[q] = max(seeds.get(q, 0.0), share)
+                    if len(seeds) >= max_syms:
+                        break
                 continue
 
-            # Fuzzy matching fallback.
+            # Region: fuzzy matching fallback (requires rapidfuzz)
             fuzzy_matches = self._fuzzy_resolve(token, project_id)
             if fuzzy_matches:
                 fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
                 for q in fuzzy_matches:
                     seeds[q] = max(seeds.get(q, 0.0), fuzzy_score)
+                    if len(seeds) >= max_syms:
+                        break
 
         return seeds
 
@@ -32403,14 +32450,17 @@ class Valves(BaseModel):
     # ── 15.4 Priority & performance ───────────────────────────────────────
     background_priority: Dict[str, int] = Field(
         default_factory=lambda: {
-            "session_summary": 1,  # Controla el tamaño de la ventana — impacto directo
-            "docstrings": 2,  # LOD-2 calidad — beneficio inmediato cada turno
-            "prefetch": 3,  # CPU-only, no compite por LLM semaphore
-            "raptor": 4,  # Clustering — beneficio diferido
-            "lod_adaptive": 5,  # Ajuste fino — baja urgencia
-            "purge": 6,  # Mantenimiento — puede esperar
+            "session_summary": 1,  # Controls window size — direct impact every turn
+            "docstrings": 2,  # LOD-2 quality — benefit visible in Block B immediately
+            "prefetch": 3,  # CPU-only, does not compete for the LLM semaphore
+            "raptor": 4,  # Clustering — benefit is deferred
+            "lod_adaptive": 5,  # Fine-tuning — low urgency
+            "purge": 6,  # Maintenance — can always wait
         },
-        description="Override default priority for background tasks. Higher number = higher priority.",
+        description=(
+            "Task execution order: lower number runs first (1 = highest urgency). "
+            "Tasks absent from this mapping use their built-in default value."
+        ),
     )
     bg_task_stop_timeout: float = Field(
         default=5.0,
@@ -33360,10 +33410,13 @@ async def inlet(
         return body
 
     finally:
-        # ------------------------------------------------------------------
-        # Region: always clear the event emitter to prevent cross-request leaks
-        # ------------------------------------------------------------------
+        # Region: per-request teardown — always execute regardless of exit path
+        # Clear the event emitter to prevent cross-request leaks.
         self._event_emitter = None
+        # Reset the silent-ingestion guard unconditionally so that a request
+        # that raised an exception after setting the flag cannot suppress LLM
+        # calls in subsequent requests.
+        self._is_silent_ingestion = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
