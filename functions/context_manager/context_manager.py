@@ -11409,28 +11409,30 @@ class ReasoningEngine:
         user_content: str,
         is_code_session: bool,
         crossencoder_scores: Optional[List[float]] = None,
+        project_id: str = "",
     ) -> int:
         """
         Use the LLM to classify the CoT level, optionally informed by CrossEncoder scores.
 
-        If crossencoder_scores is provided, they are included in the prompt as context.
-        If None, the LLM classifies without CrossEncoder context (pure LLM mode).
-
-        If the LLM returns an invalid response, default to level 2 (complex), which
-        is the safest assumption for code-related questions.
+        Called when the CrossEncoder is unavailable or when its top-two scores
+        are within the uncertainty band.  Returns the reasoning depth (0–3) as
+        an integer.
 
         Args:
-            user_content (str): The user's message content.
-            is_code_session (bool): Whether the session is code-aware.
-            crossencoder_scores (Optional[List[float]]): The 4 scores from the CrossEncoder,
-                or None if not available.
+            user_content: The user's message content.
+            is_code_session: Whether the current session is code-aware.
+            crossencoder_scores: Optional list of four CE scores [L0,L1,L2,L3],
+                or None when the CE is unavailable.
+            project_id: Current project identifier for slot restoration.
 
         Returns:
-            int: 0-3 (same as detect_cot_level).
+            int: Reasoning depth — 0 (no CoT), 1 (simple), 2 (complex), 3 (deep).
+            Defaults to 2 on LLM failure (safest assumption for code queries).
         """
-        # ── Build the prompt ──
+        # ------------------------------------------------------------------
+        # Region: build prompt — with CE context when available
+        # ------------------------------------------------------------------
         if crossencoder_scores is not None:
-            # ── With CrossEncoder context ──
             max_score = max(crossencoder_scores)
             best_level = int(np.argmax(crossencoder_scores))
             second_max = (
@@ -11441,47 +11443,54 @@ class ReasoningEngine:
             diff = max_score - second_max
             confidence = "high" if diff > 0.5 else "medium" if diff > 0.3 else "low"
 
-            ce_summary = f"""
-The CrossEncoder has analyzed the question and provides the following scores:
-- Level 0 (Trivial): {crossencoder_scores[0]:.2f}
-- Level 1 (Moderate): {crossencoder_scores[1]:.2f}
-- Level 2 (Complex): {crossencoder_scores[2]:.2f}
-- Level 3 (Deep): {crossencoder_scores[3]:.2f}
+            ce_summary = (
+                f"The CrossEncoder has analyzed the question and provides the "
+                f"following scores:\n"
+                f"- Level 0 (Trivial): {crossencoder_scores[0]:.2f}\n"
+                f"- Level 1 (Moderate): {crossencoder_scores[1]:.2f}\n"
+                f"- Level 2 (Complex): {crossencoder_scores[2]:.2f}\n"
+                f"- Level 3 (Deep): {crossencoder_scores[3]:.2f}\n\n"
+                f"The highest score is Level {best_level} "
+                f"(score: {max_score:.2f}), with {confidence} confidence."
+            )
 
-The highest score is Level {best_level} (score: {max_score:.2f}), with {confidence} confidence.
-"""
-
-            prompt = f"""
-{ce_summary}
-
-Now, independently analyze the user's question and determine the appropriate reasoning level.
-
-User question:
-{user_content[:500]}
-
-Level definitions:
-- Level 0: Simple fact, definition, or direct command. No reasoning needed.
-- Level 1: Requires some logical reasoning but the answer is straightforward.
-- Level 2: Requires step-by-step reasoning, analysis of multiple steps or dependencies.
-- Level 3: Requires deep, open-ended, or system-wide analysis, scientific reasoning, or impact evaluation.
-
-Output only the number (0, 1, 2, or 3) that best represents the reasoning complexity required.
-"""
+            prompt = (
+                f"{ce_summary}\n\n"
+                "Now, independently analyze the user's question and determine "
+                "the appropriate reasoning level.\n\n"
+                f"User question:\n{user_content[:500]}\n\n"
+                "Level definitions:\n"
+                "- Level 0: Simple fact, definition, or direct command. "
+                "No reasoning needed.\n"
+                "- Level 1: Requires some logical reasoning but the answer "
+                "is straightforward.\n"
+                "- Level 2: Requires step-by-step reasoning, analysis of "
+                "multiple steps or dependencies.\n"
+                "- Level 3: Requires deep, open-ended, or system-wide analysis, "
+                "scientific reasoning, or impact evaluation.\n\n"
+                "Output only the number (0, 1, 2, or 3) that best represents "
+                "the reasoning complexity required."
+            )
         else:
-            # ── Without CrossEncoder context (pure LLM) ──
-            prompt = f"""
-Classify the following user question into one of four levels of reasoning complexity:
+            prompt = (
+                "Classify the following user question into one of four levels "
+                "of reasoning complexity:\n\n"
+                "Level 0: Simple fact, definition, or direct command. "
+                "No reasoning needed.\n"
+                "Level 1: Requires some logical reasoning but the answer "
+                "is straightforward.\n"
+                "Level 2: Requires step-by-step reasoning, analysis of multiple "
+                "steps or dependencies.\n"
+                "Level 3: Requires deep, open-ended, or system-wide analysis, "
+                "scientific reasoning, or impact evaluation.\n\n"
+                f"User question:\n{user_content[:500]}\n\n"
+                "Output only the number (0, 1, 2, or 3):"
+            )
 
-Level 0: Simple fact, definition, or direct command. No reasoning needed.
-Level 1: Requires some logical reasoning but the answer is straightforward.
-Level 2: Requires step-by-step reasoning, analysis of multiple steps or dependencies.
-Level 3: Requires deep, open-ended, or system-wide analysis, scientific reasoning, or impact evaluation.
-
-User question:
-{user_content[:500]}
-
-Output only the number (0, 1, 2, or 3):
-"""
+        # ------------------------------------------------------------------
+        # Region: call LLM
+        # ------------------------------------------------------------------
+        label = "cot_llm_with_ce" if crossencoder_scores is not None else "cot_llm_pure"
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
@@ -11489,16 +11498,24 @@ Output only the number (0, 1, 2, or 3):
             model_override=self._f.valves.summarization_model,
             max_tokens=5,
             temperature=0.0,
-            label="cot_llm_with_ce" if crossencoder_scores else "cot_llm_pure",
+            label=label,
         )
 
+        # ------------------------------------------------------------------
+        # Region: KV-2 fix — restore slot after auxiliary LLM call
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+
+        # ------------------------------------------------------------------
+        # Region: parse response and return level
+        # ------------------------------------------------------------------
         if response and response.strip().isdigit():
             level = int(response.strip())
             if 0 <= level <= 3:
                 return level
 
-        # ── If LLM fails, default to level 2 (complex) ──
-        # Level 2 is the safest assumption for code-related questions.
+        # -- default: level 2 (complex) is the safest fallback for code queries
         self._f._log_debug(
             "CoT detection: LLM returned invalid response, defaulting to level 2."
         )
@@ -12346,21 +12363,47 @@ Output only the number (0, 1, 2, or 3):
     ) -> str:
         """
         Generate scientific Chain-of-Thought reasoning with structural validation.
-        Thin wrapper — delegates to MetacognitiveReasoningEngine.compete_hypotheses().
+
+        Thin wrapper that generates N initial hypotheses, delegates the full
+        competition loop to MetacognitiveReasoningEngine.compete_hypotheses(),
+        and synthesises the winner into a final reasoning chain.
+
+        Args:
+            question: The user's question or debugging target.
+            context: The current code context (system prompt or skeleton).
+            project_id: Current project identifier for slot restoration.
+            label: Optional label for LLM call logging.
+
+        Returns:
+            Formatted scientific reasoning string, or a Level-2 CoT chain when
+            hypothesis generation or competition fails.
         """
+        # ------------------------------------------------------------------
+        # Region: configure competition parameters from valves
+        # ------------------------------------------------------------------
         max_hypotheses = self._f.valves.scientific_hypotheses_count
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
+        # ------------------------------------------------------------------
+        # Region: generate initial hypotheses
+        # ------------------------------------------------------------------
         hypotheses = await self._generate_initial_hypotheses(
             question, context, max_hypotheses, project_id, label
         )
+
         if len(hypotheses) < 2:
             self._f._log_debug(
                 "Scientific L3: insufficient hypotheses — falling back to L2 CoT"
             )
-            return await self.generate_cot_reasoning(question, context, label)
+            # KV-2 fix: pass project_id so the fallback call restores the slot
+            return await self.generate_cot_reasoning(
+                question, context, label, project_id=project_id
+            )
 
+        # ------------------------------------------------------------------
+        # Region: run hypothesis competition
+        # ------------------------------------------------------------------
         best_hyp, best_score, best_evidence, peer_review = (
             await self._f._meta_reasoning.compete_hypotheses(
                 hypotheses=hypotheses,
@@ -12373,12 +12416,21 @@ Output only the number (0, 1, 2, or 3):
             )
         )
 
+        # ------------------------------------------------------------------
+        # Region: fallback to L2 when no hypothesis survived
+        # ------------------------------------------------------------------
         if not best_hyp or best_score == 0.0:
             self._f._log_debug(
                 "Scientific L3: no valid hypothesis survived — falling back to L2 CoT"
             )
-            return await self.generate_cot_reasoning(question, context, label)
+            # KV-2 fix: pass project_id so the fallback call restores the slot
+            return await self.generate_cot_reasoning(
+                question, context, label, project_id=project_id
+            )
 
+        # ------------------------------------------------------------------
+        # Region: synthesise final reasoning from winning hypothesis
+        # ------------------------------------------------------------------
         reasoning = await self._synthesize_scientific_reasoning(
             question,
             context,
@@ -12391,7 +12443,7 @@ Output only the number (0, 1, 2, or 3):
         )
 
         if not reasoning:
-            return "Unable to synthesize scientific reasoning."
+            return "Unable to synthesise scientific reasoning."
         return reasoning
 
     async def generate_scientific_architecture_reasoning(
@@ -12403,21 +12455,53 @@ Output only the number (0, 1, 2, or 3):
     ) -> str:
         """
         Scientific-method architecture reasoning on skeleton contracts.
-        Thin wrapper — delegates to MetacognitiveReasoningEngine.compete_hypotheses().
-        obj_weight=0.4 / llm_weight=0.6: proposing changes, LLM judgment weighted higher.
+
+        Thin wrapper that generates N competing design options, delegates the
+        competition to MetacognitiveReasoningEngine.compete_hypotheses(), and
+        synthesises the winner into a concrete architecture proposal with
+        skeleton signatures and /expand hints.
+
+        Uses obj_weight=0.4 / llm_weight=0.6 because in design mode the LLM's
+        architectural judgment is more valuable than structural verification
+        of a proposed (not yet existing) interface.
+
+        KV-2 fix: the generate_architecture_reasoning() fallback already received
+            project_id in the original code, so no new change is needed on the
+            fallback path.  This docstring documents the invariant explicitly so
+            future refactors do not regress it.
+
+        Args:
+            question: The user's architecture or design question.
+            skeleton_context: The project skeleton (signatures only).
+            project_id: Current project identifier for slot restoration.
+            label: Optional label for LLM call logging.
+
+        Returns:
+            Formatted scientific architecture reasoning string, or a standard
+            architecture reasoning chain when competition fails.
         """
+        # ------------------------------------------------------------------
+        # Region: fallback to standard arch CoT when no skeleton is available
+        # ------------------------------------------------------------------
         if not skeleton_context.strip():
             return await self.generate_architecture_reasoning(
                 question, skeleton_context, project_id, label=label
             )
 
+        # ------------------------------------------------------------------
+        # Region: configure competition parameters from valves
+        # ------------------------------------------------------------------
         max_hypotheses = self._f.valves.scientific_hypotheses_count
         threshold = self._f.valves.scientific_confidence_threshold
         max_iters = self._f.valves.scientific_max_iterations
 
+        # ------------------------------------------------------------------
+        # Region: generate initial design-option hypotheses
+        # ------------------------------------------------------------------
         hypotheses = await self._generate_initial_arch_hypotheses(
             question, skeleton_context, max_hypotheses, project_id, label
         )
+
         if len(hypotheses) < 2:
             self._f._log_debug(
                 "Scientific arch: insufficient hypotheses — falling back to L2 arch"
@@ -12426,6 +12510,9 @@ Output only the number (0, 1, 2, or 3):
                 question, skeleton_context, project_id, label=label
             )
 
+        # ------------------------------------------------------------------
+        # Region: run hypothesis competition (LLM-weighted: design judgment)
+        # ------------------------------------------------------------------
         best_hyp, best_score, best_evidence, peer_review = (
             await self._f._meta_reasoning.compete_hypotheses(
                 hypotheses=hypotheses,
@@ -12438,6 +12525,9 @@ Output only the number (0, 1, 2, or 3):
             )
         )
 
+        # ------------------------------------------------------------------
+        # Region: fallback to standard arch CoT when no option survived
+        # ------------------------------------------------------------------
         if not best_hyp or best_score == 0.0:
             self._f._log_debug(
                 "Scientific arch: no valid option survived — falling back to L2 arch"
@@ -12446,6 +12536,9 @@ Output only the number (0, 1, 2, or 3):
                 question, skeleton_context, project_id, label=label
             )
 
+        # ------------------------------------------------------------------
+        # Region: synthesise final architecture proposal from winning option
+        # ------------------------------------------------------------------
         synthesis = await self._synthesize_scientific_architecture_reasoning(
             question,
             skeleton_context,
@@ -19796,45 +19889,79 @@ class MetacognitiveReasoningEngine:
         prelim_system: str,
     ) -> List[Tuple[str, str]]:
         """
-        FocalReasoning: separate volatile activation + CoT per question.
-        CONVERSATION LEVEL (H5). Gated by enable_focal_reasoning valve.
+        FocalReasoning: separate volatile activation + CoT per detected question.
 
-        Each iteration:
-            slot_save()                              — isolate from open_webui.main state
-            build_activation_graph(persist=False)   — volatile, no side effects
-            _build_volatile_context()               — read-only, no side effects
-            generate_cot_reasoning()                — LLM call
-            slot_restore_for_continuity()           — restore main state
+        For each independent question in the decomposed query:
+            1. Save the KV slot to isolate from the main inference state.
+            2. Build a volatile activation graph (no side effects on pstate).
+            3. Extract a focused context from the activated symbols.
+            4. Restore the slot for continuity.
+            5. Generate a CoT reasoning chain for that specific question.
 
-        If a question fails, it is skipped (not fatal).
-        "Unable to generate reasoning." is treated as failure (not added to results).
+        Results are collected and returned; any single-question failure is
+        non-fatal and that question is simply skipped.
+
+        CONVERSATION LEVEL (H5 temporal hierarchy).
+        Gated by enable_focal_reasoning valve.
+
+        KV-2 fix: project_id is now passed to generate_cot_reasoning() so that
+            the slot is restored after each per-question LLM call.  Without this,
+            the slot accumulates the state of every CoT call in the loop, causing
+            a KV-cache miss for the main inference that follows.
+
+        Args:
+            questions: List of independent questions from QueryDecomposition.
+            project_id: Current project identifier.
+            cot_level: The CoT depth to apply per question.
+            prelim_system: The preliminary system prompt (Block A + B) used as
+                fallback context when no symbols are activated for a question.
+
+        Returns:
+            List of (question, reasoning) tuples for questions that were
+            successfully reasoned about.  Empty list when focal reasoning
+            is disabled or no question produces valid output.
         """
+        # ------------------------------------------------------------------
+        # Region: early exit when feature is disabled
+        # ------------------------------------------------------------------
         if not self._f.valves.enable_focal_reasoning:
             return []
 
+        # ------------------------------------------------------------------
+        # Region: configure per-question CoT level (hard cap at 2)
+        # ------------------------------------------------------------------
         _COT_ERROR = "Unable to generate reasoning."
         per_q_level = min(cot_level, self._f.valves.focal_reasoning_max_level)
         results: List[Tuple[str, str]] = []
 
+        # ------------------------------------------------------------------
+        # Region: process each question independently
+        # ------------------------------------------------------------------
         for i, question in enumerate(questions):
             await self._f._emit_status(
                 f"🔍 Analyzing question {i + 1}/{len(questions)}: "
                 f"{question[:60]}{'...' if len(question) > 60 else ''}"
             )
             try:
+                # -- save slot to isolate auxiliary calls from main state ----
                 if self._f.valves.enable_slot_persistence:
                     await self._f._project_state_manager.slot_save(project_id)
 
+                # -- volatile activation graph (no pstate side effects) ------
                 ag = await self._f._activation.build_activation_graph(
                     question, project_id, persist=False
                 )
+
+                # -- extract focused context from activated symbols ----------
                 context = self._build_volatile_context(ag, project_id, prelim_system)
 
+                # -- restore slot before generating CoT ---------------------
                 if self._f.valves.enable_slot_persistence:
                     await self._f._project_state_manager.slot_restore_for_continuity(
                         project_id
                     )
 
+                # -- skip level-1 (inline prompt only, no chain to generate) -
                 if per_q_level < 2:
                     continue
 
@@ -19842,11 +19969,14 @@ class MetacognitiveReasoningEngine:
                     f"💭 Reasoning about question {i + 1}/{len(questions)}..."
                 )
 
+                # KV-2 fix: pass project_id so generate_cot_reasoning() restores
+                # the slot after its LLM call, keeping it clean for the next
+                # question's activation graph and for the main inference.
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
-                    question, context
+                    question, context, project_id=project_id
                 )
 
-                # Guard: error string is truthy but not valid reasoning
+                # -- filter out error sentinel strings ----------------------
                 if reasoning and reasoning != _COT_ERROR:
                     results.append((question, reasoning))
                     self._f._log_debug(
@@ -19871,6 +20001,9 @@ class MetacognitiveReasoningEngine:
                         pass
                 continue
 
+        # ------------------------------------------------------------------
+        # Region: log completion metrics
+        # ------------------------------------------------------------------
         self._f._log_debug(
             f"reason_per_focus: {len(results)}/{len(questions)} questions reasoned"
         )
@@ -24599,21 +24732,28 @@ class WindowManager:
         slot_free: bool,
     ) -> Tuple[List[dict], str]:
         """
-        Apply the history window policy.
+        Apply the history window policy to the current message list.
+
+        Separates system messages from history, computes a token-aware frontier,
+        applies an emergency cap for giant turns, generates a summary for evicted
+        messages, and returns the trimmed list plus a pending summary string for
+        injection.
 
         Args:
             messages: Full list (system + history).
             state: ConversationState for the project.
-            project_id: Project identifier.
-            slot_free: If False, no summaries are generated.
+            project_id: Current project identifier.
+            slot_free: If False, no summaries are generated (no LLM calls).
 
         Returns:
-            (messages_final, pending_summary).
+            Tuple of (messages_final, pending_summary).
+            pending_summary is non-empty only when a summary was generated;
+            the caller is responsible for injecting it into the message list.
         """
         v = self._f.valves
 
         # ------------------------------------------------------------------
-        # Clean orphan tool calls at front.
+        # Region: clean orphan tool calls at the front of the history
         # ------------------------------------------------------------------
         if v.preserve_tool_calls:
             while messages and messages[0].get("role") == "tool":
@@ -24633,7 +24773,7 @@ class WindowManager:
                     messages = messages[1:]
 
         # ------------------------------------------------------------------
-        # AutoContinue deferral.
+        # Region: AutoContinue deferral — do not compact mid-stream
         # ------------------------------------------------------------------
         if v.compaction_defer_during_autocontinue and self._is_autocontinue_active(
             messages
@@ -24644,7 +24784,7 @@ class WindowManager:
             return messages, ""
 
         # ------------------------------------------------------------------
-        # Separate system / history.
+        # Region: separate system messages from history
         # ------------------------------------------------------------------
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         history = [m for m in messages if m.get("role") != "system"]
@@ -24652,22 +24792,22 @@ class WindowManager:
             return messages, ""
 
         # ------------------------------------------------------------------
-        # Effective budget.
+        # Region: compute effective token budget
         # ------------------------------------------------------------------
         budget = self._effective_budget(project_id)
 
         # ------------------------------------------------------------------
-        # Turn indexing.
+        # Region: assign turn numbers to every history message
         # ------------------------------------------------------------------
         turns, _total_turns = self._index_turns(history)
 
         # ------------------------------------------------------------------
-        # Compute frontier.
+        # Region: compute the window frontier
         # ------------------------------------------------------------------
         kept, old_msgs, cut_turn = self._compute_frontier(history, turns, budget)
 
         # ------------------------------------------------------------------
-        # Log B: history fits early return.
+        # Region: Log B — early return when everything fits
         # ------------------------------------------------------------------
         if not old_msgs:
             self._f._log_debug(
@@ -24677,7 +24817,7 @@ class WindowManager:
             return sys_msgs + kept, ""
 
         # ------------------------------------------------------------------
-        # Emergency cap.
+        # Region: emergency cap for giant turns
         # ------------------------------------------------------------------
         kept, old_msgs = self._apply_emergency_cap(
             history, turns, kept, old_msgs, budget
@@ -24686,7 +24826,7 @@ class WindowManager:
             return sys_msgs + kept, ""
 
         # ------------------------------------------------------------------
-        # Minimum batch.
+        # Region: minimum batch guard — skip if too few turns to summarise
         # ------------------------------------------------------------------
         old_turn_nums = {t for m, t in zip(history, turns) if m in old_msgs}
         if len(old_turn_nums) < v.summarize_batch_turns:
@@ -24698,7 +24838,7 @@ class WindowManager:
             return sys_msgs + history, ""
 
         # ------------------------------------------------------------------
-        # Summarize batch.
+        # Region: summarise evicted turns (no-degradation guard)
         # ------------------------------------------------------------------
         if not slot_free:
             self._f._log_debug("WindowManager: no free slot, keeping raw history")
@@ -24706,7 +24846,9 @@ class WindowManager:
 
         has_code = any("```" in m.get("content", "") for m in old_msgs)
         summary_text = await self._f._history_compressor.summarize_messages(
-            old_msgs, is_code_context=has_code
+            old_msgs,
+            is_code_context=has_code,
+            project_id=project_id,
         )
 
         if not summary_text or not summary_text.strip():
@@ -24717,7 +24859,7 @@ class WindowManager:
             return sys_msgs + history, ""
 
         # ------------------------------------------------------------------
-        # Persist summary and update metrics.
+        # Region: persist summary and update metrics
         # ------------------------------------------------------------------
         pending = await self._persist(
             summary_text=summary_text,
@@ -24729,9 +24871,6 @@ class WindowManager:
             slot_free=slot_free,
         )
 
-        # ------------------------------------------------------------------
-        # Return trimmed history.
-        # ------------------------------------------------------------------
         return sys_msgs + kept, pending
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -25076,39 +25215,40 @@ class WindowManager:
     # 4. Seams and static helpers
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _on_frontier_advance(self, old_hwm: int, new_hwm: int, project_id: str) -> None:
+    async def _on_frontier_advance(
+        self, old_hwm: int, new_hwm: int, project_id: str
+    ) -> None:
         """
-        Phase-2 KV-freeze hook: save the slot immediately after history eviction
-        so the next request restores from the new stabilized prefix rather than
-        re-prefilling from scratch.
+        Phase-2 KV-freeze hook: save the slot synchronously after history eviction.
 
-        Called from ``_persist`` after a successful summary is generated and the
-        frontier HWM is advanced.  ``force=True`` bypasses the static-hash guard
-        because the history changed even though Block A did not.
-
-        Bug 13 fix: the previous implementation called ``get_project_id()`` which
-        returns ``valves.project_id`` (a singleton).  In multi-project scenarios
-        this caused the slot to be saved for the wrong project.  The correct
-        ``project_id`` is now received as an explicit parameter from ``_persist``.
+        Called from _persist() after a successful summary is generated and the
+        frontier HWM advances.  Saving here ensures the next inlet restores from
+        the new stabilised prefix rather than re-prefilling from scratch.
 
         Args:
             old_hwm: Summarized-turn high-water mark before this advance.
-            new_hwm: New summarized-turn high-water mark after this advance.
-            project_id: The project whose KV slot should be saved.
+            new_hwm: Summarized-turn high-water mark after this advance.
+            project_id: Project whose KV slot should be saved.
         """
+        # ------------------------------------------------------------------
+        # Region: guard — skip if no real advance occurred
+        # ------------------------------------------------------------------
         if old_hwm >= new_hwm:
-            return  # No real advance — nothing to freeze
+            return
 
+        # ------------------------------------------------------------------
+        # Region: save slot synchronously
+        #
+        # force=True bypasses the static-hash guard because the history prefix
+        # changed (new summary evicted old turns) even though Block A did not.
+        # Without force=True, slot_save() would skip because the structure hash
+        # looks unchanged.
+        # ------------------------------------------------------------------
         self._f._log_debug(
-            f"Phase-2 KV-freeze: frontier advanced hwm {old_hwm}→{new_hwm}, "
-            "scheduling slot_save(force=True)"
+            f"KV-3: frontier advanced hwm {old_hwm}→{new_hwm} — "
+            "saving slot synchronously before inlet returns"
         )
-
-        # asyncio.create_task is safe here because _on_frontier_advance is always
-        # called from _persist(), which is a coroutine running inside the event loop.
-        asyncio.create_task(
-            self._f._project_state_manager.slot_save(project_id, force=True)
-        )
+        await self._f._project_state_manager.slot_save(project_id, force=True)
 
     @staticmethod
     def _is_autocontinue_active(messages: List[dict]) -> bool:
@@ -25301,17 +25441,36 @@ class MessageAssembler:
         """
         Detect CoT configuration and generate reasoning in-place.
 
-        Modifies dynamic_injections by appending the reasoning block when
-        CoT is triggered and generation succeeds. Returns without appending
-        anything when CoT is not needed, slot is busy, or generation fails.
+        Modifies dynamic_injections by appending the reasoning block when CoT
+        is triggered and generation succeeds.  Returns without appending when
+        CoT is not needed, the slot is busy, or generation fails.
 
-        Bug 156 fix: state.last_cot_level is now updated here, after the
-        reasoning is successfully generated and injected, instead of inside
-        detect_cot_configuration where it was set before generation even
-        started — causing stale sticky state when generation failed.
+        Detection cascade:
+            Stage 0 — SymbolGraph pre-scan (sync, free): structural specificity
+                signal used to reinforce CE scores.
+            Stage 1 — Heuristic (always, sync, free): fast keyword-based level
+                estimate + feature hints.
+            Stage 2 — CrossEncoder (6 pairs: [L0,L1,L2,L3] + [scientific,linear]):
+                reinforced by stages 0 and 1.  If both dimensions are confident,
+                returns immediately without an LLM call.
+            Stage 3 — LLM: full context (query + CE scores + signal_vector + hints).
+                Falls back to the stage-1 estimate on failure.
+
+        Args:
+            dynamic_injections: List to append (priority, text) tuples to.
+            last_user_msg: The last user message dict.
+            is_code_session: Whether the session is code-aware.
+            state: Persistent ConversationState for the project.
+            user_question: Cleaned user question (code spans removed).
+            prelim_system: Preliminary system prompt (Block A + B assembled so far).
+            project_id: Current project identifier for slot restoration.
+            is_continuation: True for genuine AutoContinue continuation turns.
+            slot_free: False when the LLM slot is busy; suppresses generation.
+            messages: Full conversation message list (used for token estimation).
         """
-        # ── Region: Detect CoT level — setup and short-circuits ──────────────
-        self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: Detect CoT configuration")
+        # ------------------------------------------------------------------
+        # Region: initialise state flags
+        # ------------------------------------------------------------------
         manual_cot_used = False
         cot_any_used = False
         cot_level = 2
@@ -25323,7 +25482,9 @@ class MessageAssembler:
 
         self._last_cot_degraded = False
 
-        # -- enforce_scientific_method forces L3 scientific regardless --------
+        # ------------------------------------------------------------------
+        # Region: short-circuit 1 — enforce_scientific_method forces L3
+        # ------------------------------------------------------------------
         if self._f.valves.enforce_scientific_method:
             self._f._log_debug(
                 "CoT: enforce_scientific_method=True → forcing L3 scientific"
@@ -25332,7 +25493,9 @@ class MessageAssembler:
             _use_scientific = True
             cot_any_used = True
 
-        # -- Manual /think command --------------------------------------------
+        # ------------------------------------------------------------------
+        # Region: short-circuit 2 — manual /think command
+        # ------------------------------------------------------------------
         if self._f.valves.enable_cot_on_demand or self._f.valves.auto_cot_enabled:
             if (
                 last_user_msg
@@ -25355,7 +25518,9 @@ class MessageAssembler:
                             )
                         )
 
-        # ── Region: STAGE 0 — SymbolGraph pre-scan (sync, free) ──────────────
+        # ------------------------------------------------------------------
+        # Region: Stage 0 — SymbolGraph pre-scan (sync, free, no LLM)
+        # ------------------------------------------------------------------
         _signal_vector: Dict[str, int] = {
             "n_mentioned": 0,
             "n_found": 0,
@@ -25381,14 +25546,16 @@ class MessageAssembler:
                     f"found, {_signal_vector['structural_hits']} total hits"
                 )
 
-        # ── Region: Parallel gather (slot_free, auto-detect path) ─────────────
+        # ------------------------------------------------------------------
+        # Region: parallel gather — CoT detection + intent + decomposition
+        # ------------------------------------------------------------------
         if (
             slot_free
             and not manual_cot_used
             and not self._f.valves.enforce_scientific_method
             and not is_continuation
         ):
-            parallel_tasks = []
+            # -- compute available tokens for multi-phase pre-check ----------
             _available_mp_pre = self._f.valves.context_window_tokens
             if (
                 self._f.valves.enable_multi_phase_response
@@ -25407,6 +25574,8 @@ class MessageAssembler:
                 self._f.valves.enable_multi_phase_response
                 and _available_mp_pre < self._f.valves.multi_phase_response_threshold
             )
+
+            parallel_tasks = []
 
             # Task 0: should_keep_full_code
             if not _skip_intent_llm:
@@ -25465,11 +25634,11 @@ class MessageAssembler:
             else:
                 parallel_tasks.append(asyncio.sleep(0, result=[user_content]))
 
-            # Bug 155 fix: return_exceptions=True so a timeout in Task 0 does not
-            # cancel Tasks 1 and 2.
+            # return_exceptions=True prevents a Task 0 timeout
+            # from cancelling Tasks 1 and 2.
             results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
 
-            # -- Extract Task 0 (should_keep_full_code) -----------------------
+            # -- extract Task 0 (should_keep_full_code) ----------------------
             _t0 = results[0]
             if isinstance(_t0, Exception):
                 self._f._log_debug(
@@ -25480,7 +25649,7 @@ class MessageAssembler:
             else:
                 self._f._user_intent_full_code = _t0 if not _skip_intent_llm else True
 
-            # -- Extract Task 1 (detect_cot_configuration) --------------------
+            # -- extract Task 1 (detect_cot_configuration) ------------------
             _t1 = results[1]
             if isinstance(_t1, Exception):
                 self._f._log_debug(
@@ -25504,7 +25673,6 @@ class MessageAssembler:
                 _cot_source = cot_config.get("source", "?")
                 _cot_rationale = cot_config.get("rationale", "")
             else:
-                # Backward-compat: result is an int
                 detected_level = int(cot_config) if cot_config else 0
                 _use_scientific = False
                 _decompose_hint = False
@@ -25521,7 +25689,7 @@ class MessageAssembler:
                     f"rationale='{_cot_rationale}'"
                 )
 
-            # -- Extract Task 2 (decompose_questions) -------------------------
+            # -- extract Task 2 (decompose_questions) -----------------------
             _t2 = results[2] if len(results) > 2 else [user_content]
             if isinstance(_t2, Exception):
                 self._f._log_debug(
@@ -25532,7 +25700,7 @@ class MessageAssembler:
             else:
                 sub_questions = _t2
 
-            # Upgrade CoT level if multiple independent questions detected
+            # -- upgrade CoT level for multiple independent questions --------
             if (
                 cot_any_used
                 and not manual_cot_used
@@ -25552,7 +25720,9 @@ class MessageAssembler:
                 )
 
         else:
-            # -- Serial path (continuation, manual CoT, enforce_scientific) ---
+            # ------------------------------------------------------------------
+            # Region: serial path — continuation, manual CoT, enforce_scientific
+            # ------------------------------------------------------------------
             self._f._user_intent_full_code = True
             if (
                 not manual_cot_used
@@ -25583,6 +25753,9 @@ class MessageAssembler:
                         f"scientific={_use_scientific}"
                     )
 
+        # ------------------------------------------------------------------
+        # Region: early returns — no CoT needed or slot not free
+        # ------------------------------------------------------------------
         if not cot_any_used:
             self._f._log_debug("🧠 ENRICHMENT – CoT Step 1/3: No CoT needed")
             return
@@ -25592,7 +25765,9 @@ class MessageAssembler:
             )
             return
 
-        # ── Region: Multi-phase pre-check — degrade CoT if budget is tight ───
+        # ------------------------------------------------------------------
+        # Region: multi-phase pre-check — degrade CoT if budget is tight
+        # ------------------------------------------------------------------
         _mp_cot_degraded = False
         _available_mp_pre = self._f.valves.context_window_tokens
         if (
@@ -25626,7 +25801,9 @@ class MessageAssembler:
 
         self._last_cot_degraded = _mp_cot_degraded
 
-        # ── Region: Generate reasoning — Level 1 terminal path ───────────────
+        # ------------------------------------------------------------------
+        # Region: Level 1 terminal path — inline prompt, no chain generated
+        # ------------------------------------------------------------------
         self._f._log_debug("🧠 ENRICHMENT – CoT Step 2/3: Generate reasoning")
 
         if cot_level == 1:
@@ -25643,11 +25820,13 @@ class MessageAssembler:
             )
             return
 
-        # ── Region: Generate reasoning — Levels 2 and 3 ──────────────────────
+        # ------------------------------------------------------------------
+        # Region: prepare context for levels 2 and 3
+        # ------------------------------------------------------------------
         _model_ctx = self._f.valves.active_context_max_tokens or 28000
         _cot_context_limit = _model_ctx // 3
 
-        # Architecture-mode: replace full system prompt with skeleton
+        # -- architecture mode: replace full system prompt with skeleton -----
         _is_arch = (
             self._f.valves.enable_skeleton_cot
             and self._f._reasoning.is_architecture_query(user_question)
@@ -25688,11 +25867,12 @@ class MessageAssembler:
             else:
                 prelim_for_cot = prelim_system[: _cot_context_limit * 4]
 
-        # -- Generation routing -----------------------------------------------
+        # ------------------------------------------------------------------
+        # Region: FocalReasoning path — separate reasoning per question
+        # ------------------------------------------------------------------
         _go_scientific = _use_scientific or cot_level >= 3
-
-        # -- FocalReasoning path ----------------------------------------------
         reasoning = None
+
         if (
             self._f.valves.enable_focal_reasoning
             and not _is_arch
@@ -25709,7 +25889,7 @@ class MessageAssembler:
             if per_q:
                 reasoning = self._f._meta_reasoning.synthesize_focal_reasoning(per_q)
                 self._f._log_debug(
-                    f"🧠 FocalReasoning: synthesized {len(per_q)}/"
+                    f"🧠 FocalReasoning: synthesised {len(per_q)}/"
                     f"{len(sub_questions)} questions ({len(reasoning)} chars)"
                 )
             else:
@@ -25717,7 +25897,9 @@ class MessageAssembler:
                     "🧠 FocalReasoning: no results — falling back to unified"
                 )
 
-        # -- Unified generation -----------------------------------------------
+        # ------------------------------------------------------------------
+        # Region: unified generation path (non-focal or focal fallback)
+        # ------------------------------------------------------------------
         if not reasoning:
             question = cot_question if manual_cot_used else user_question
 
@@ -25733,11 +25915,13 @@ class MessageAssembler:
                         label="sci_arch_cot",
                     )
                 else:
+                    # generate_architecture_reasoning already has project_id
                     reasoning = (
                         await self._f._reasoning.generate_architecture_reasoning(
                             question, prelim_for_cot, project_id, label="arch_cot"
                         )
                     )
+
             elif _go_scientific:
                 await self._f._emit_status(
                     "🔬 Scientific reasoning — evaluating hypotheses..."
@@ -25748,12 +25932,17 @@ class MessageAssembler:
                     project_id,
                     label="scientific_cot",
                 )
+
             else:
+                # KV-2 fix: pass project_id so generate_cot_reasoning() restores
+                # the slot after its internal LLM call.
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
-                    question, prelim_for_cot
+                    question, prelim_for_cot, project_id=project_id
                 )
 
-        # -- L3 scientific fallback → linear L2 -------------------------------
+        # ------------------------------------------------------------------
+        # Region: L3 scientific fallback → linear L2
+        # ------------------------------------------------------------------
         _cot_error_msg = "Unable to generate reasoning."
         if (
             not manual_cot_used
@@ -25763,10 +25952,14 @@ class MessageAssembler:
             self._f._log_debug(
                 "🧠 Scientific reasoning failed — falling back to linear L2"
             )
+            # KV-2 fix: pass project_id for slot restoration in the fallback call
             reasoning = await self._f._reasoning.generate_cot_reasoning(
-                user_question, prelim_for_cot
+                user_question, prelim_for_cot, project_id=project_id
             )
 
+        # ------------------------------------------------------------------
+        # Region: check final reasoning result
+        # ------------------------------------------------------------------
         if reasoning and reasoning != _cot_error_msg:
             self._f._log_debug(
                 "🧠 ENRICHMENT – CoT Step 2/3: Reasoning generated successfully"
@@ -25777,12 +25970,13 @@ class MessageAssembler:
             )
             return
 
-        # ── Region: Inject reasoning into system prompt ───────────────────────
+        # ------------------------------------------------------------------
+        # Region: auto-resolve /expand hints from architecture CoT
+        # ------------------------------------------------------------------
         self._f._log_debug(
             "🧠 ENRICHMENT – CoT Step 3/3: Inject reasoning into system prompt"
         )
 
-        # Auto-resolve /expand hints from architecture CoT
         if _is_arch:
             try:
                 reasoning = await self._f._ctx_builder._resolve_cot_expands(
@@ -25793,6 +25987,9 @@ class MessageAssembler:
                     f"CoT expand resolution failed (non-fatal): {_exp_err}"
                 )
 
+        # ------------------------------------------------------------------
+        # Region: inject reasoning and note into dynamic_injections
+        # ------------------------------------------------------------------
         dynamic_injections.append(("high", reasoning))
         dynamic_injections.append(
             (
@@ -25804,9 +26001,14 @@ class MessageAssembler:
             )
         )
 
-        # Bug 156 fix: update last_cot_level only after successful generation.
-        # Previously this happened inside detect_cot_configuration (before generation
-        # even started), causing stale sticky state when generation ultimately failed.
+        # ------------------------------------------------------------------
+        # Update last_cot_level AFTER successful generation
+        #
+        # Previously this happened inside detect_cot_configuration (before
+        # generation even started), causing stale sticky state when generation
+        # ultimately failed.  Updating here guarantees the level reflects actual
+        # reasoning that was injected into the prompt.
+        # ------------------------------------------------------------------
         if self._f.ENABLE_COT_STICKY:
             state.last_cot_level = cot_level
 
@@ -31574,77 +31776,127 @@ async def inlet(
     self,
     body: dict,
     __user__: Optional[dict] = None,
-    __event_emitter__=None,  # ← NEW
+    __event_emitter__=None,
 ) -> dict:
     """
-    Pre‑process the request before the LLM sees it.
+    Pre-process the incoming request before the LLM sees it.
 
     Orchestrates seven sequential steps:
-    1. Project‑switch detection, cache loading, and KV‑slot restore.
-    2. User‑info extraction (last message, question, explicit commands).
-    3. Explicit command dispatch (/forget, /status, /clean, /expand).
-    4. Natural‑language intent dispatch (forget, remember, obsolete).
-    5. Silent ingestion when the message is a large code‑only paste.
-    6. Session classification and active‑code update.
-    7. System‑prompt assembly (Block A + Block B) with CoT, compression,
-       multi‑phase, and adaptive trimming.
+        1.  Project-switch detection, cache loading.
+        2.  User-info extraction (last message, question, explicit commands).
+        3.  Explicit command dispatch (/forget, /status, /clean, /expand).
+        4.  Natural-language intent dispatch (forget, remember, obsolete).
+        5.  Silent ingestion when the message is a large code-only paste.
+        6.  Session classification and active-code update.
+        7.  System-prompt assembly (Block A + Block B) with CoT, compression,
+            multi-phase, and adaptive trimming.
 
-    Returns the modified body with the final message list ready for the LLM.
+    KV-1 fix: _slot_cont_attempted_{filename} / _slot_cont_succeeded_{filename}
+        guards are stored in pstate, which survives across turns.  Without
+        clearing them, the guard set on the first auxiliary LLM call of turn N
+        blocks ALL slot restores in turns N+1, N+2, … indefinitely, causing
+        a permanent KV-cache miss after the very first turn.
+
+    KV-4 fix: slot_restore_attempted / slot_restored are reset so that the
+        explicit slot_restore() call issued after preprocessing undoes the
+        background-task dirt that accumulated after the previous outlet's
+        slot_save.  Without this reset, slot_restore() is a no-op on every
+        turn after the first (the once-per-session guard stays True).
     """
-    # Bind event emitter for this request. Always cleared in finally
-    # so a stale emitter can never leak into the next request.
+    # ------------------------------------------------------------------
+    # Region: bind event emitter — always cleared in finally
+    # ------------------------------------------------------------------
     self._event_emitter = __event_emitter__
     try:
         self._log_debug("inlet called")
         inlet_start = time.monotonic()
         self._log_section("CONTEXT MANAGER - INLET START")
 
-        # -- Stop background tasks gracefully --------------------------------
+        # ------------------------------------------------------------------
+        # Region: stop background tasks gracefully before any inlet work
+        # ------------------------------------------------------------------
         await self._bg_manager.stop_all()
         self._bg_manager.set_paused(True)
-        # ------------------------------------------------------------------
 
         def _inlet_timing(step_name: str, start: float, end: float = None):
             if end is None:
                 end = time.monotonic()
             self._log_timing(step_name, start - inlet_start, end - start)
 
+        # ------------------------------------------------------------------
+        # Region: resolve project and per-project volatile state
+        # ------------------------------------------------------------------
         project_id = self._inlet_orch.get_project_id()
-
-        # -- Get state early to decide slot_busy and is_continuation --
         state = self._conversation_state_manager.get(project_id)
         state.reset_wm_metrics()
         psm = self._project_state_manager
         pstate = psm.get_pstate(project_id)
 
-        # -- AC-A: separate slot_busy from is_continuation ---------------
+        # ------------------------------------------------------------------
+        # Region: KV-1 fix — clear per-turn slot-restore guards
+        #
+        # These keys accumulate across turns because pstate is an in-memory
+        # dict that is never wiped between requests.  The guard pattern inside
+        # slot_restore_for_continuity() is correct within a single turn (avoid
+        # double-restores), but wrong across turns (blocks every restore after
+        # the first).  Clearing here restores the intended semantics: at most
+        # one slot restore per auxiliary call TYPE per TURN.
+        # ------------------------------------------------------------------
+        _guards_cleared = [
+            k for k in list(pstate.keys()) if k.startswith("_slot_cont_")
+        ]
+        for _key in _guards_cleared:
+            del pstate[_key]
+        if _guards_cleared:
+            self._log_debug(
+                f"KV-1: cleared {len(_guards_cleared)} stale slot-restore "
+                f"guard(s) from previous turn"
+            )
+
+        # ------------------------------------------------------------------
+        # Reset once-per-session slot lifecycle flags
+        #
+        # slot_restore() guards itself with slot_restore_attempted to run only
+        # once per session.  We reset that flag each inlet so the explicit
+        # post-preprocessing restore below can undo background-task dirt that
+        # accumulated AFTER the previous outlet's slot_save.
+        # ------------------------------------------------------------------
+        psm.set_slot_restore_attempted(project_id, False)
+        psm.set_slot_restored(project_id, False)
+
+        # ------------------------------------------------------------------
+        # Region: determine slot_busy and is_continuation
+        # ------------------------------------------------------------------
         slot_busy = False
         if self._last_used_model is None and state.message_count <= 1:
             slot_busy = True
-            self._log_debug("inlet: cold-start slot_busy=True")
+            self._log_debug("inlet: cold-start — slot_busy=True")
 
         is_continuation = psm.get_is_continuation(project_id)
 
-        # -- AC-A-WD: Watchdog for stuck continuations -------------------
+        # -- AC-A-WD: watchdog for stuck AutoContinue loops ---------------
         if is_continuation:
             turns = psm.get_continuation_turns(project_id)
             max_turns = self.valves.max_autocontinue_turns
             if turns > max_turns:
                 self._log_debug(
-                    f"AutoContinue watchdog: is_continuation has been True for "
-                    f"{turns} consecutive turns (max={max_turns}) "
-                    f"-- forcing reset. Check if 'triangle CONTINUA:' marker is "
-                    f"being generated correctly."
+                    f"AutoContinue watchdog: is_continuation held for "
+                    f"{turns} consecutive turns (max={max_turns}) — forcing reset"
                 )
                 psm.set_is_continuation(project_id, False)
                 is_continuation = False
                 if self.valves.enable_slot_persistence:
                     await psm.slot_restore_for_continuity(project_id)
 
+        # ------------------------------------------------------------------
+        # Region: cancel background enrichment tasks from previous turn
+        # ------------------------------------------------------------------
         await self._enrichment.cancel_docstring_tasks()
         self._enrichment._lazy_docstrings_generated_this_turn = 0
 
-        # -- Phase A: Write barrier --------------------------------------
+        # ------------------------------------------------------------------
+        # Region: write barrier — flush pending SQLite writes before reads
+        # ------------------------------------------------------------------
         await self._state_store.drain_writes(timeout=5.0)
 
         # 🔥 STATE MANAGEMENT
@@ -31655,6 +31907,23 @@ async def inlet(
         _inlet_timing("Step 1/6: Preprocess (project switch, cache load)", step_start)
         if not messages:
             return body
+
+        # 🚀 RESOURCE OPTIMISATION
+        #   Explicit slot restore after preprocessing completes
+        #
+        #   Background tasks (docstrings, RAPTOR, prefetch) run in the outlet
+        #   AFTER slot_save, leaving the slot in a dirty state.  Restoring
+        #   here — before any auxiliary LLM work — guarantees the slot reflects
+        #   the clean post-outlet-save state for the entire inlet.
+        #   slot_restore() is a no-op when no slot file exists (cold start),
+        #   so this is safe for first-turn requests.
+        # ----------------------------------------------------------------
+        if self.valves.enable_slot_persistence and not slot_busy:
+            _restored = await psm.slot_restore(project_id)
+            self._log_debug(
+                f"KV-4: initial slot restore → "
+                f"{'OK' if _restored else 'skipped / no slot file'}"
+            )
 
         # 🔥 STATE MANAGEMENT
         #   2. Extract user info
@@ -31669,21 +31938,21 @@ async def inlet(
         ) = await self._inlet_orch.inlet_extract_user_info(messages)
         _inlet_timing("Step 2/6: Extract user info", step_start)
 
-        # -- C6: Wait for previous LTM store to complete ----------------
+        # -- wait for previous turn's LTM store to complete -----------
         if not self._ltm_store_complete.is_set():
-            self._log_debug("LTM: store pending from previous turn -- waiting up to 3s")
+            self._log_debug("LTM: store pending from previous turn — waiting up to 3 s")
             try:
                 await asyncio.wait_for(
                     asyncio.shield(self._ltm_store_complete.wait()),
                     timeout=3.0,
                 )
-                self._log_debug("LTM: store completed -- proceeding with retrieval")
+                self._log_debug("LTM: store completed — proceeding with retrieval")
             except asyncio.TimeoutError:
                 self._log_debug(
-                    "LTM: store timeout (>3s) -- retrieval may miss previous turn"
+                    "LTM: store timeout (>3 s) — retrieval may miss previous turn"
                 )
 
-        # -- Detect AutoContinue continuation ----------------------------
+        # -- detect AutoContinue continuation from last assistant message ---
         _last_assistant = next(
             (m for m in reversed(messages) if m.get("role") == "assistant"), None
         )
@@ -31704,7 +31973,7 @@ async def inlet(
                     if _hint:
                         user_question = _hint
                         self._log_debug(
-                            f"AutoContinue detected -- LOD query: '{user_question}'"
+                            f"AutoContinue detected — LOD query: '{user_question}'"
                         )
                     break
 
@@ -31746,7 +32015,9 @@ async def inlet(
             )
             return body
 
-        # -- Silent Ingestion (Modo B: chunked paste) -------------------
+        # 🔥 STATE MANAGEMENT
+        #   Silent ingestion (Modo B: large code-only paste)
+        # ----------------------------------------------------------------
         if (
             self.valves.enable_silent_ingestion
             and last_user_msg is not None
@@ -31757,6 +32028,7 @@ async def inlet(
 
                 pstate_local = self._project_state_manager.get_pstate(project_id)
 
+                # -- detect language and pre-extract symbols ---------------
                 _guessed_lang = SignatureExtractor._guess_language(None, user_query)
                 _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
                 pstate_local["ingested_lang"] = _lang
@@ -31777,23 +32049,23 @@ async def inlet(
 
                 pstate_local["raw_ingested_symbols"] = raw_symbols
 
+                # -- index the pasted code --------------------------------
                 _msg_to_index = last_user_msg
-
                 self._is_silent_ingestion = True
                 try:
                     await self._update_active_code(_msg_to_index, project_id)
                 finally:
                     pass
 
+                # -- rebuild graph and path index --------------------------
                 await self._activation.resolve_dangling_edges(project_id)
-
                 if self.valves.enable_path_analysis:
                     await self._activation.rebuild_path_index(project_id)
 
+                # -- invalidate and rebuild Block A eagerly ----------------
                 self._ctx_builder.invalidate_block_a_cache(
                     project_id, "new chunk ingested", recompute_centrality=True
                 )
-
                 try:
                     static_block = await self._ctx_builder.build_block_a(
                         project_id, is_code_session=True, is_continuation=False
@@ -31809,6 +32081,7 @@ async def inlet(
                         f"{_scaffold_err}"
                     )
 
+                # -- optional hub-bodies tier warmup ----------------------
                 if (
                     self.valves.enable_hub_bodies_tier
                     and self.valves.hub_bodies_tier_warmup_on_ingestion
@@ -31821,27 +32094,26 @@ async def inlet(
                     psm.set_hub_tier_qids(project_id, tier_qids)
                     state.hub_tier_qids_persisted = tier_qids
                     self._conversation_state_manager.set(project_id, state)
-
                     asyncio.create_task(
                         self._ctx_builder._warmup_tier_prefill(project_id)
                     )
 
+                # -- persist state ----------------------------------------
                 self._conversation_state_manager.mark_dirty(project_id)
                 await self._conversation_state_manager.save_if_dirty(project_id)
 
+                # -- build user-facing stub and acknowledgement -----------
                 state = self._conversation_state_manager.get(project_id)
                 num_blocks = len(state.active_blocks)
                 num_symbols = len(self._symbol_index.get_all_names(project_id))
                 num_classes = len(self._symbol_index.get_classes(project_id))
 
                 stub = self._history_compressor._build_user_stub(num_symbols)
-
                 content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
                 state.compressed_user_messages[content_hash] = stub
                 self._conversation_state_manager.mark_dirty(project_id)
 
                 messages[-1] = {**messages[-1], "content": stub}
-
                 response = (
                     f"✅ {num_symbols} symbols in {num_classes} classes "
                     f"({num_blocks} active blocks). Code is in the SymbolGraph. "
@@ -31850,6 +32122,7 @@ async def inlet(
                 )
                 messages.append({"role": "assistant", "content": response})
 
+                # -- optional context dump --------------------------------
                 if self.valves.enable_context_dump:
                     try:
                         self._context_dumper.schedule_inlet_snapshot(
@@ -31874,7 +32147,7 @@ async def inlet(
                 return body
 
         # 🔥 STATE MANAGEMENT
-        #   5. Prepare code session (classify, update code blocks)
+        #   5. Prepare code session (classify, update active code blocks)
         # ----------------------------------------------------------------
         step_start = time.monotonic()
         is_code_session, user_question = (
@@ -31887,7 +32160,8 @@ async def inlet(
         )
         _inlet_timing("Step 5/6: Prepare code session", step_start)
 
-        # 🧠 ENRICHMENT – Resolve call‑graph mode BEFORE Block A is built
+        # 🧠 ENRICHMENT
+        #   Classify intent and use case; run lazy tasks; resolve call-graph mode
         # ----------------------------------------------------------------
         intent_vector = await self._commands.classify_intent(user_query, project_id)
 
@@ -31943,10 +32217,16 @@ async def inlet(
 
         body["messages"] = messages
 
-        # 🚀 KV CACHE FIX – Restore stable prefix AFTER all auxiliaries
+        # 🚀 RESOURCE OPTIMISATION
+        #   KV cache — restore stable prefix after all auxiliary LLM work
+        #
+        #   Each auxiliary LLM call (CoT, contradiction, use-case, etc.) dirties
+        #   the slot.  slot_restore_for_continuity() is called at the end of
+        #   every such call (KV-2 fix), so the slot is already clean here.
+        #   This final call acts as a safety net in case any path skipped it.
         # ----------------------------------------------------------------
         if not slot_busy and self.valves.enable_slot_persistence:
-            await self._project_state_manager.slot_restore_for_continuity(project_id)
+            await psm.slot_restore_for_continuity(project_id)
 
         _inlet_timing("total_inlet (end-to-end)", inlet_start)
         self._log_section(
@@ -31956,9 +32236,9 @@ async def inlet(
         return body
 
     finally:
-        # Always clear the event emitter to prevent leaking into the next
-        # request, regardless of which return path was taken or whether
-        # an exception was raised.
+        # ------------------------------------------------------------------
+        # Region: always clear the event emitter to prevent cross-request leaks
+        # ------------------------------------------------------------------
         self._event_emitter = None
 
 
@@ -31971,12 +32251,11 @@ async def inlet(
 # ═══════════════════════════════════════════════════════════════════════════
 async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
     """
-    Post‑process the response after the LLM has generated it.
+    Post-process the response after the LLM has generated it.
 
-    Returns the (possibly modified) body unchanged.
-
-    Modified (Doc 18 AC-B): uses response hash instead of message index
-    to avoid skipping _update_active_code in every turn.
+    Stores the assistant message in LTM, updates the code SymbolGraph, saves
+    the KV slot, refreshes the response cache, runs maintenance tasks, and
+    queues background enrichment work for the next turn.
     """
     self._log_debug("outlet called")
     start_time = time.monotonic()
@@ -31986,7 +32265,9 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("outlet: prerequisites not met, returning body unchanged")
         return body
 
-    # -- Log body structure once for debugging --------------------------
+    # ------------------------------------------------------------------
+    # Region: log body structure once for easier debugging
+    # ------------------------------------------------------------------
     if not getattr(self, "_outlet_body_structure_logged", False):
         self._log_debug(
             f"outlet body structure (first call): "
@@ -31997,6 +32278,9 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._outlet_body_structure_logged = True
 
     try:
+        # ------------------------------------------------------------------
+        # Region: resolve project and per-project state
+        # ------------------------------------------------------------------
         project_id = self._inlet_orch.get_project_id()
         state = self._conversation_state_manager.get(project_id)
         psm = self._project_state_manager
@@ -32004,17 +32288,18 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         messages = body.get("messages", [])
         is_code_session = await self._inlet_orch.classify_session(messages, project_id)
 
-        # -- Step 1: detect assistant response --------------------------
-        # In this OpenWebUI build, the assistant response may not be in messages.
+        # 🔥 STATE MANAGEMENT
+        #   Detect assistant response from body
+        # ----------------------------------------------------------------
         assistant_content = ""
         assistant_source = ""
 
-        # First, check if messages already has an assistant message at the end
+        # -- check last message in the history first ----------------------
         if messages and messages[-1].get("role") == "assistant":
             assistant_content = messages[-1].get("content", "")
             assistant_source = "messages[-1]"
 
-        # If not, try common body fields
+        # -- fall back to top-level body fields ---------------------------
         if not assistant_content:
             for field in ("content", "output", "response", "assistant"):
                 val = body.get(field)
@@ -32031,14 +32316,15 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
 
         if not assistant_content:
             self._log_debug(
-                "outlet: no assistant response found in body -- "
+                "outlet: no assistant response found in body — "
                 "_update_active_code skipped. "
                 f"(keys={list(body.keys())})"
             )
-            # Still run other outlet tasks (slot save, etc.)
             return body
 
-        # -- Step 2: deduplicate by content hash ------------------------
+        # 🔥 STATE MANAGEMENT
+        #   Deduplicate by content hash — skip if already processed
+        # ----------------------------------------------------------------
         response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
         if pstate.get("last_outlet_response_hash") == response_hash:
             self._log_debug(
@@ -32053,87 +32339,104 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
             f"{len(assistant_content.split())} words)"
         )
 
-        # -- Step 3: process the assistant message ----------------------
+        # ------------------------------------------------------------------
+        # Region: wait for all in-flight LLM tasks before mutating state
+        # ------------------------------------------------------------------
         await self._llm_orchestrator.wait_for_llm_tasks()
 
-        # Intercept /expand commands in the assistant content
+        # 🔥 STATE MANAGEMENT
+        #   Intercept /expand commands in the assistant content
+        # ----------------------------------------------------------------
         if is_code_session and "/expand" in assistant_content:
             modified_content, did_expand = await self._commands.outlet_intercept_expand(
                 assistant_content, project_id
             )
             if did_expand:
-                # Update the message in body if it exists
                 if assistant_source == "messages[-1]":
                     messages[-1]["content"] = modified_content
-                # Otherwise, we can't update the body directly; log it.
                 assistant_content = modified_content
                 self._log_debug(
                     "outlet: /expand intercepted and expanded in assistant content"
                 )
 
-        # Store in LTM and update active blocks
+        # 🔥 STATE MANAGEMENT
+        #   Update active code blocks and store message in LTM
+        # ----------------------------------------------------------------
         assistant_msg = {"role": "assistant", "content": assistant_content}
+
         if is_code_session:
             self._log_debug(
-                "🔥 STATE MANAGEMENT – Updating active code blocks and storing in LTM (assistant code detected)"
+                "🔥 STATE MANAGEMENT – Updating active code blocks "
+                "and storing in LTM (assistant code detected)"
             )
             await self._update_active_code(assistant_msg, project_id)
 
-            # -- C6: wrap store_messages with signal --------------------
+            # -- LTM-1 fix: wait=True so _ltm_store_complete signals only
+            #   after the ChromaDB upsert finishes, not after the task is
+            #   merely enqueued.  The event drives inlet's wait() check; if
+            #   it fires too early, the next turn's retrieval misses this
+            #   message entirely.
             self._ltm_store_complete.clear()
 
             async def _store_and_signal():
                 try:
                     await self._ltm.store_messages(
-                        project_id, [assistant_msg], wait=False
+                        project_id, [assistant_msg], wait=True
                     )
-                except Exception as e:
-                    self._log_debug(f"LTM: store_messages failed: {e}")
+                except Exception as _ltm_err:
+                    self._log_debug(f"LTM: store_messages failed: {_ltm_err}")
                 finally:
                     self._ltm_store_complete.set()
 
             asyncio.create_task(_store_and_signal())
+
         else:
             if not self.valves.ltm_store_only_code_sessions:
                 self._log_debug(
-                    "🔥 STATE MANAGEMENT – Storing non‑code session message in LTM"
+                    "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
                 )
                 self._ltm_store_complete.clear()
 
                 async def _store_and_signal_noncode():
                     try:
                         await self._ltm.store_messages(
-                            project_id, [assistant_msg], wait=False
+                            project_id, [assistant_msg], wait=True
                         )
-                    except Exception as e:
-                        self._log_debug(f"LTM: store_messages failed: {e}")
+                    except Exception as _ltm_err:
+                        self._log_debug(
+                            f"LTM: store_messages (non-code) failed: {_ltm_err}"
+                        )
                     finally:
                         self._ltm_store_complete.set()
 
                 asyncio.create_task(_store_and_signal_noncode())
 
-        # 🚀 RESOURCE OPTIMISATION – Save slot NOW (stable state, before long tasks)
+        # 🚀 RESOURCE OPTIMISATION
+        #   Save KV slot NOW — stable state, before long maintenance tasks
         # ----------------------------------------------------------------
         if self.valves.enable_slot_persistence:
             try:
                 psm.set_last_total_context_tokens(
                     project_id, self._tokens.estimate_tokens(messages)
                 )
-            except Exception as e:
-                self._log_debug(f"outlet: token estimation failed: {e}")
+            except Exception as _tok_err:
+                self._log_debug(f"outlet: token estimation failed: {_tok_err}")
             await psm.slot_save(project_id)
 
-        # -- Save last response for LOD adaptive lazy -------------------
+        # 🔥 STATE MANAGEMENT
+        #   Persist last response for lazy LOD adaptive adjustment
+        # ----------------------------------------------------------------
         psm.set_last_assistant_response(project_id, assistant_content)
         psm.set_last_response_timestamp(project_id, time.time())
 
-        # -- Response cache (use assistant_content for cache) -----------
+        # 🔥 STATE MANAGEMENT
+        #   Response cache — skip partial multi-phase responses
+        # ----------------------------------------------------------------
         if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
             last_user = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
             )
             if last_user:
-                # Use the potentially modified assistant_content
                 _is_partial_mp = self.valves.enable_multi_phase_response and any(
                     marker in assistant_content for marker in self._MULTI_PHASE_MARKERS
                 )
@@ -32151,7 +32454,8 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
                         wait=False,
                     )
 
-        # 🚀 RESOURCE OPTIMISATION – Purge expired memories
+        # 🚀 RESOURCE OPTIMISATION
+        #   Purge expired memories and maintain counters
         # ----------------------------------------------------------------
         await self._ltm.purge_expired_memories()
 
@@ -32163,28 +32467,30 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         if interval > 0 and self._write_counter % interval == 0:
             await self._state_store.purge_orphaned_data(project_id)
 
-        # 🚀 RESOURCE OPTIMISATION – DB checkpoints
+        # 🚀 RESOURCE OPTIMISATION
+        #   SQLite WAL checkpoint (every 100 turns)
         # ----------------------------------------------------------------
         if self._write_counter % 100 == 0:
             await self._state_store.run_db_checkpoints()
 
-        # 🚀 RESOURCE OPTIMISATION – Save edges
+        # 🚀 RESOURCE OPTIMISATION
+        #   Persist typed edges and path views for cross-session restoration
         # ----------------------------------------------------------------
         if self.valves.enable_edge_persistence:
             await self._state_store.save_symbol_edges_to_db(project_id)
 
-        # 🚀 RESOURCE OPTIMISATION – Save path views
-        # ----------------------------------------------------------------
         if self.valves.enable_path_analysis:
             await self._state_store.save_path_views_to_db(
                 project_id, self._path_index.get_all(project_id)
             )
 
-        # 🔥 STATE MANAGEMENT – Save state if dirty
+        # 🔥 STATE MANAGEMENT
+        #   Flush dirty conversation state to SQLite
         # ----------------------------------------------------------------
         await self._conversation_state_manager.save_if_dirty(project_id)
 
-        # 🔥 STATE MANAGEMENT – Detect and persist continuation marker
+        # 🔥 STATE MANAGEMENT
+        #   Detect and persist AutoContinue continuation marker
         # ----------------------------------------------------------------
         genuine = self._detect_genuine_continuation(messages)
         if genuine:
@@ -32197,32 +32503,31 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         else:
             psm.set_is_continuation(project_id, False)
 
-        # -- Continuation turns reset is handled inside set_is_continuation
-        # when set to False. No need to manually reset here.
-
-    except Exception as e:
-        self._log_debug(f"❌ outlet error: {e}")
+    except Exception as _outlet_err:
+        self._log_debug(f"❌ outlet error: {_outlet_err}")
         import traceback
 
         self._log_debug(traceback.format_exc())
 
     finally:
-        if getattr(self, "_is_silent_ingestion", False):
-            self._is_silent_ingestion = False
-
+        # ------------------------------------------------------------------
+        # Region: wait for all background LLM tasks before launching new ones
+        # ------------------------------------------------------------------
         self._log_debug("outlet: waiting for background LLM tasks to complete")
         await self._llm_orchestrator.wait_for_llm_tasks()
 
-    # 🚀 BACKGROUND TASKS - Resume after critical work is done
+        # ------------------------------------------------------------------
+        # Region: clear silent-ingestion flag if it leaked into outlet
+        # ------------------------------------------------------------------
+        if getattr(self, "_is_silent_ingestion", False):
+            self._is_silent_ingestion = False
+
+    # 🚀 BACKGROUND TASKS
+    #   Resume after all critical outlet work is done.
+    #   Drain SQLite writes first to reduce lock contention.
     # ----------------------------------------------------------------
-    # Now that the user's turn is fully processed and the KV slot is saved,
-    # we can resume background tasks to prepare for the next turn.
-    # We unpause the manager first, then launch tasks in priority order.
-    # ----------------------------------------------------------------
-    # First, drain SQLite writes to reduce lock contention
     await self._state_store.drain_writes(timeout=2.0)
 
-    # Get last_activated for prefetch
     last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
 
     self._bg_manager.set_paused(False)
@@ -32233,25 +32538,19 @@ async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         valve_name = task.valve_bg
         if valve_name and not getattr(self.valves, valve_name, True):
             continue
-        # For LOD adaptive, pass the current response as an argument
         if task.name == "lod_adaptive":
             await self._bg_manager.start(
-                task.name,
-                task.bg_func,
-                project_id,
-                assistant_content,  # response_text
+                task.name, task.bg_func, project_id, assistant_content
             )
         elif task.name == "prefetch":
             await self._bg_manager.start(
-                task.name,
-                task.bg_func,
-                project_id,
-                last_activated,  # last_activated
+                task.name, task.bg_func, project_id, last_activated
             )
         else:
             await self._bg_manager.start(task.name, task.bg_func, project_id)
 
     self._log_section(
-        "CONTEXT MANAGER - OUTLET END", duration=time.monotonic() - start_time
+        "CONTEXT MANAGER - OUTLET END",
+        duration=time.monotonic() - start_time,
     )
     return body
