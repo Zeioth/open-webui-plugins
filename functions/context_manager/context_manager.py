@@ -1277,6 +1277,41 @@ class SymbolIndex:
         blob = "\x1e".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
+    def get_signature_snapshot(self, project_id: str) -> Dict[str, str]:
+        """
+        Per-symbol signature blob, keyed by qualified id.
+
+        Same blob construction as compute_structure_hash (parent\x1fname\x1fsig),
+        but returned as a {qid: blob} mapping instead of reduced to a single
+        combined hash. Used to diff against a previously persisted snapshot
+        and find exactly which symbols changed since the last Block A build,
+        so the renderer can order "stable first, changed last" instead of
+        alphabetically/by-centrality — keeping the unchanged majority as a
+        stable KV-cache prefix even when only a handful of symbols changed.
+
+        A symbol absent from a prior snapshot (newly added) and a symbol
+        present with a different blob (modified) are indistinguishable to
+        the caller by design: both invalidate any cached prefix containing
+        them equally, so both are treated as "dirty" by whoever diffs this
+        snapshot against the previous one.
+
+        Args:
+            project_id: The project identifier.
+
+        Returns:
+            Dict mapping each qualified id to its signature blob string.
+            Empty dict if no symbols are indexed for the project.
+        """
+        qids = self.get_all_qualified_names(project_id)
+        snapshot: Dict[str, str] = {}
+        for qid in qids:
+            meta = self._symbol_meta.get((project_id, qid), {})
+            name = meta.get("name", qid)
+            sig = meta.get("signature") or name
+            parent = meta.get("parent_symbol", "")
+            snapshot[qid] = f"{parent}\x1f{name}\x1f{sig}"
+        return snapshot
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Project lifecycle & cleanup
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1395,6 +1430,9 @@ class ConversationState(BaseModel):
 
     # -- Persistent compression stubs ---------------------------------------
     compressed_user_messages: Dict[str, str] = Field(default_factory=dict)
+
+    # -- Symbol signature snapshot (stable-prefix ordering) -----------------
+    symbol_signature_snapshot: Dict[str, str] = Field(default_factory=dict)
 
     def reset_wm_metrics(self) -> None:
         """Reset all WindowManager instrumentation flags at the start of each turn."""
@@ -1771,6 +1809,7 @@ class ConversationStateManager:
             hub_tier_body_hashes=data.get("hub_tier_body_hashes", {}),
             hub_tier_query_heat=data.get("hub_tier_query_heat", {}),
             hub_tier_qids_persisted=data.get("hub_tier_qids_persisted", []),
+            symbol_signature_snapshot=data.get("symbol_signature_snapshot", {}),
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1840,6 +1879,8 @@ class ConversationStateManager:
             "hub_tier_body_hashes": state.hub_tier_body_hashes,
             "hub_tier_query_heat": state.hub_tier_query_heat,
             "hub_tier_qids_persisted": state.hub_tier_qids_persisted,
+            # ── Symbol signature snapshot (stable-prefix ordering) ──
+            "symbol_signature_snapshot": state.symbol_signature_snapshot,
         }
 
         def _write() -> None:
@@ -2372,6 +2413,7 @@ class HubSymbolIndex:
         top_n: int = 30,
         valves=None,
         mode: str = "hubs_only",
+        dirty_qids: Optional[Set[str]] = None,
     ) -> str:
         """
         Build the full Block A symbol text: class outline (unchanged across
@@ -2387,6 +2429,17 @@ class HubSymbolIndex:
         and passed in already-decided — this method does no query/intent logic,
         it only renders. Deterministic while the code is unchanged (alphabetical /
         centrality order), so llama.cpp's KV cache stays stable.
+
+        dirty_qids, when provided, is forwarded to the class outline and to
+        the hubs_only call-graph section so both order stable symbols before
+        recently-changed ones — see _build_class_outline and
+        _build_hub_section for the exact ordering rule. expanded_hubs and
+        full_graph modes are NOT given this treatment in this change: their
+        ordering already follows different rules (centrality-then-neighbors,
+        and pure alphabetical respectively for KV-cache-stability reasons
+        already documented on _build_full_graph_section), and folding
+        dirty-last into those is a separate piece of work, not part of this
+        scope.
         """
         logger.debug(
             f"HubSymbolIndex.build: rendering mode='{mode}' for project='{project_id}'"
@@ -2394,7 +2447,9 @@ class HubSymbolIndex:
 
         sections = []
 
-        outline = self._build_class_outline(symbol_index, project_id, valves)
+        outline = self._build_class_outline(
+            symbol_index, project_id, valves, dirty_qids
+        )
         if outline:
             sections.append(outline)
 
@@ -2419,7 +2474,12 @@ class HubSymbolIndex:
                 )
                 sections.append(
                     self._build_hub_section(
-                        hub_qids, centrality, symbol_index, project_id, enable_callees
+                        hub_qids,
+                        centrality,
+                        symbol_index,
+                        project_id,
+                        enable_callees,
+                        dirty_qids,
                     )
                 )
 
@@ -2618,10 +2678,31 @@ class HubSymbolIndex:
     # 2. Class / function outline (Architecture Map)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _build_class_outline(self, symbol_index, project_id, valves=None) -> str:
+    def _build_class_outline(
+        self,
+        symbol_index,
+        project_id,
+        valves=None,
+        dirty_qids: Optional[Set[str]] = None,
+    ) -> str:
         """Render the ``## Code Architecture Map`` section: one line per class
         listing its methods, plus module-level functions if any.  Respects
         ``architecture_map_max_tokens`` for the overall section budget.
+
+        When dirty_qids is provided (non-None and non-empty), classes are
+        split into two groups before rendering: classes with no member in
+        dirty_qids render first (in their original alphabetical order among
+        themselves), classes with at least one dirty member render after
+        them (also alphabetical among themselves). This keeps the unchanged
+        majority of the section as a stable, contiguous text prefix across
+        turns even when a handful of classes changed — a class containing
+        any dirty member is treated as dirty as a whole, since this section
+        renders one line per class (the per-method position inside that
+        line is not reordered).
+
+        When dirty_qids is None or empty (first build for a project, or
+        nothing changed since the last snapshot), falls back to pure
+        alphabetical order — identical to the original behavior.
         """
         if valves is not None and not getattr(valves, "enable_architecture_map", True):
             return ""
@@ -2632,6 +2713,18 @@ class HubSymbolIndex:
         classes = sorted(symbol_index.get_classes(project_id))
         if not classes:
             return ""
+
+        if dirty_qids:
+
+            def _class_is_dirty(class_name: str) -> bool:
+                members = symbol_index.get_class_members(class_name, project_id)
+                return any(qid in dirty_qids for qid in members)
+
+            stable_classes = [c for c in classes if not _class_is_dirty(c)]
+            dirty_classes = [c for c in classes if _class_is_dirty(c)]
+            ordered_classes = stable_classes + dirty_classes
+        else:
+            ordered_classes = classes
 
         lines = [
             "## Code Architecture Map",
@@ -2644,7 +2737,7 @@ class HubSymbolIndex:
         budget_chars = max_tokens * 4 if max_tokens > 0 else None
         truncated = False
 
-        for class_name in classes:
+        for class_name in ordered_classes:
             member_qids = symbol_index.get_class_members(class_name, project_id)
             if not member_qids:
                 continue
@@ -2674,6 +2767,10 @@ class HubSymbolIndex:
                 == "function"
             )
             if top_level:
+                if dirty_qids:
+                    stable_top = [q for q in top_level if q not in dirty_qids]
+                    dirty_top = [q for q in top_level if q in dirty_qids]
+                    top_level = stable_top + dirty_top
                 line = f"- **(module-level functions)**: {', '.join(top_level)}"
                 if budget_chars is None or total_chars + len(line) <= budget_chars:
                     lines.append(line)
@@ -2687,13 +2784,37 @@ class HubSymbolIndex:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_hub_section(
-        self, hub_qids, centrality, symbol_index, project_id, enable_callees=True
+        self,
+        hub_qids,
+        centrality,
+        symbol_index,
+        project_id,
+        enable_callees=True,
+        dirty_qids: Optional[Set[str]] = None,
     ) -> str:
         """Render the ``## Code Symbol Index`` section listing each hub symbol
         with its centrality score, incoming callers, and (when
-        *enable_callees* is True) outgoing callees."""
+        *enable_callees* is True) outgoing callees.
+
+        When dirty_qids is provided, hub symbols are split into two groups
+        before applying the existing per-file / by-centrality ordering
+        within each group: non-dirty hubs render first, dirty hubs render
+        after. This keeps the (typically larger) stable portion of the hub
+        listing as a contiguous, position-stable prefix across turns, at
+        the cost of hub symbols that did change always appearing at the
+        tail regardless of how central they are. Falls back to pure
+        centrality ordering, unchanged from the original behavior, when
+        dirty_qids is None or empty.
+        """
+        if dirty_qids:
+            stable_hubs = [q for q in hub_qids if q not in dirty_qids]
+            dirty_hubs = [q for q in hub_qids if q in dirty_qids]
+            ordered_hub_qids = stable_hubs + dirty_hubs
+        else:
+            ordered_hub_qids = hub_qids
+
         by_file: dict = {}
-        for qid in hub_qids:
+        for qid in ordered_hub_qids:
             file_path = self._file_for(qid, project_id, symbol_index)
             by_file.setdefault(file_path, []).append(qid)
 
@@ -2705,7 +2826,17 @@ class HubSymbolIndex:
         ]
 
         if len(by_file) == 1 and None in by_file:
-            for qid in sorted(hub_qids, key=lambda q: -centrality.get(q, 0)):
+            if dirty_qids:
+                stable_in_file = [q for q in by_file[None] if q not in dirty_qids]
+                dirty_in_file = [q for q in by_file[None] if q in dirty_qids]
+                stable_in_file.sort(key=lambda q: -centrality.get(q, 0))
+                dirty_in_file.sort(key=lambda q: -centrality.get(q, 0))
+                file_ordered = stable_in_file + dirty_in_file
+            else:
+                file_ordered = sorted(
+                    by_file[None], key=lambda q: -centrality.get(q, 0)
+                )
+            for qid in file_ordered:
                 lines.append(
                     self._format_symbol_line(
                         qid, centrality, symbol_index, project_id, enable_callees
@@ -2716,9 +2847,18 @@ class HubSymbolIndex:
                 if file_path is None:
                     continue
                 lines.append(f"### {file_path}")
-                for qid in sorted(
-                    by_file[file_path], key=lambda q: -centrality.get(q, 0)
-                ):
+                file_qids = by_file[file_path]
+                if dirty_qids:
+                    stable_in_file = [q for q in file_qids if q not in dirty_qids]
+                    dirty_in_file = [q for q in file_qids if q in dirty_qids]
+                    stable_in_file.sort(key=lambda q: -centrality.get(q, 0))
+                    dirty_in_file.sort(key=lambda q: -centrality.get(q, 0))
+                    file_ordered = stable_in_file + dirty_in_file
+                else:
+                    file_ordered = sorted(
+                        file_qids, key=lambda q: -centrality.get(q, 0)
+                    )
+                for qid in file_ordered:
                     lines.append(
                         self._format_symbol_line(
                             qid, centrality, symbol_index, project_id, enable_callees
@@ -4687,6 +4827,27 @@ class ContextBuilder:
         Build Block A: stable, KV-cache-anchoring content.
 
         Returns "" when not a code session.
+
+        Stable-prefix ordering: before rendering the symbol section, the
+        current per-symbol signature snapshot is diffed against the one
+        persisted from the previous successful build (_compute_dirty_qids).
+        The resulting dirty set is threaded into HubSymbolIndex.build() and
+        _build_skeleton_tier(), so unchanged symbols render in a stable
+        position (alphabetical / by-centrality among themselves) BEFORE any
+        recently-changed symbol, instead of the prior pure
+        alphabetical/centrality ordering which scattered changed symbols
+        throughout the section. This keeps the unchanged majority of a
+        large project as a contiguous, position-stable text prefix across
+        turns and across sessions, even though compute_structure_hash (and
+        therefore the KV-slot save/restore filename) still changes whenever
+        ANY symbol changes — the slot-file mechanism remains all-or-nothing,
+        but llama.cpp's in-session prefix-matching cache benefits from this
+        ordering regardless of slot file hits/misses.
+
+        The new snapshot is only persisted (state.symbol_signature_snapshot)
+        after a successful render, at the same point the structure_hash
+        cache key is recorded — an aborted or exception-raising build never
+        advances the comparison baseline.
         """
         if not is_code_session:
             return ""
@@ -4739,6 +4900,18 @@ class ContextBuilder:
             # Continuation: freeze Block A to prevent KV cache misses.
             self._f._log_debug("Block A: frozen for AutoContinue (KV cache stability)")
             return cached_text
+
+        # --- 4c. Diff current symbol signatures against the last persisted
+        #         snapshot to find which symbols changed since the previous
+        #         build. Only meaningful on a genuine rebuild (we're past
+        #         the cache-hit and continuation-freeze returns above).
+        dirty_qids = self._compute_dirty_qids(project_id)
+        if dirty_qids:
+            self._f._log_debug(
+                f"Block A: {len(dirty_qids)} symbol(s) dirty since last build "
+                f"— ordering stable symbols first in Architecture Map, "
+                f"Skeleton, and Hub section"
+            )
 
         # --- 5. Build the static block ---
         parts: List[str] = []
@@ -4794,6 +4967,7 @@ class ContextBuilder:
                     top_n=self._f.valves.symbol_index_max_in_block_a,
                     valves=self._f.valves,
                     mode=resolved_mode,
+                    dirty_qids=dirty_qids,
                 )
                 if symbol_section:
                     parts.append(symbol_section)
@@ -4802,7 +4976,7 @@ class ContextBuilder:
         # 5.3 Skeleton tier
         skeleton_rendered_this_turn = False
         if is_code_session and self._f.valves.enable_code_awareness:
-            skeleton_tier = self._build_skeleton_tier(project_id)
+            skeleton_tier = self._build_skeleton_tier(project_id, dirty_qids)
             if skeleton_tier:
                 parts.append(skeleton_tier)
                 skeleton_rendered_this_turn = True
@@ -4822,6 +4996,14 @@ class ContextBuilder:
         # --- 6. Store in cache with the mode-aware key (using structure hash) ---
         psm.set_block_a_cache_key(project_id, cache_key)
         psm.set_block_a_cached(project_id, static_block)
+
+        # --- 6b. Persist the new snapshot only after a successful render,
+        #         so an aborted build never advances the comparison baseline
+        #         used by the next turn's _compute_dirty_qids.
+        new_snapshot = self._f._symbol_index.get_signature_snapshot(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
+        state.symbol_signature_snapshot = new_snapshot
+        self._f._conversation_state_manager.set(project_id, state)
 
         # --- 7. Record whether skeleton was actually rendered this turn ---
         psm.set_skeleton_rendered_this_turn(project_id, skeleton_rendered_this_turn)
@@ -4884,15 +5066,62 @@ class ContextBuilder:
         if reason:
             self._f._log_debug(f"Block A + skeleton cache invalidated ({reason})")
 
+    def _compute_dirty_qids(self, project_id: str) -> Set[str]:
+        """
+        Diff the current per-symbol signature snapshot against the one
+        persisted from the previous Block A build, returning the set of
+        qualified ids that are new or whose signature blob changed.
+
+        A symbol absent from the previous snapshot (newly added) and one
+        present with a different blob (modified) are both reported as dirty
+        — see get_signature_snapshot's docstring for why this distinction
+        doesn't matter to any caller of this method.
+
+        Does NOT persist the new snapshot itself; that happens in
+        build_block_a() after a successful render, alongside its existing
+        cache-key bookkeeping, so a failed/aborted build never advances the
+        comparison baseline.
+
+        Args:
+            project_id: Current project identifier.
+
+        Returns:
+            Set of qualified ids considered dirty this turn. Empty set on
+            the very first build for a project (nothing to compare against
+            yet — there is no stale baseline to protect, so nothing needs
+            to be pushed to the end of any section).
+        """
+        state = self._f._conversation_state_manager.get(project_id)
+        previous_snapshot = state.symbol_signature_snapshot
+        if not previous_snapshot:
+            return set()
+
+        current_snapshot = self._f._symbol_index.get_signature_snapshot(project_id)
+        dirty: Set[str] = set()
+        for qid, blob in current_snapshot.items():
+            if previous_snapshot.get(qid) != blob:
+                dirty.add(qid)
+
+        return dirty
+
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Skeleton tier (stable signatures inside Block A)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _build_skeleton_tier(self, project_id: str) -> str:
+    def _build_skeleton_tier(
+        self, project_id: str, dirty_qids: Optional[Set[str]] = None
+    ) -> str:
         """
         Render the project skeleton (signatures only) as a STABLE context
         tier, cached by structure_hash so body edits and docstring additions
         do not invalidate it. Returns "" when disabled, empty, or over budget.
+
+        dirty_qids is forwarded to _format_skeleton for stable-prefix
+        ordering (see its docstring). Note this tier still has its OWN
+        cache keyed purely by structure_hash, independent of the dirty set
+        — any symbol change still invalidates this tier's cache entry and
+        forces a re-render, same as before. dirty_qids only affects the
+        ORDER of content within that re-render, not whether one happens.
         """
         psm = self._f._project_state_manager
 
@@ -4916,7 +5145,7 @@ class ContextBuilder:
             psm.set_skeleton_tier_qids(project_id, rendered_qids)
             return cached_tier
 
-        skel = self._format_skeleton(project_id)
+        skel = self._format_skeleton(project_id, dirty_qids)
         if not skel:
             pstate["skeleton_tier_cache_key"] = structure_hash
             pstate["skeleton_tier_cached"] = ""
@@ -5226,8 +5455,21 @@ class ContextBuilder:
     # 2.1 — Project skeleton rendering (signatures only)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _format_skeleton(self, project_id: str) -> str:
-        """Render the project skeleton: signatures of all indexed symbols."""
+    def _format_skeleton(
+        self, project_id: str, dirty_qids: Optional[Set[str]] = None
+    ) -> str:
+        """Render the project skeleton: signatures of all indexed symbols.
+
+        Same stable-prefix ordering as _build_class_outline: when dirty_qids
+        is provided, classes with no dirty member render first (alphabetical
+        among themselves), classes with at least one dirty member render
+        after (alphabetical among themselves). Module-level functions follow
+        the same split. Method order WITHIN a class is left untouched
+        (source line order), since reordering individual method signatures
+        inside an otherwise-stable class would itself introduce a position
+        shift for no benefit — the class as a whole is the unit being
+        protected or sacrificed here.
+        """
         symbol_index = self._f._symbol_index
         qids = sorted(symbol_index.get_all_qualified_names(project_id))
         if not qids:
@@ -5238,8 +5480,20 @@ class ContextBuilder:
 
         classes = sorted(symbol_index.get_classes(project_id))
         if classes:
+            if dirty_qids:
+
+                def _class_is_dirty(class_name: str) -> bool:
+                    members = symbol_index.get_class_members(class_name, project_id)
+                    return any(qid in dirty_qids for qid in members)
+
+                stable_classes = [c for c in classes if not _class_is_dirty(c)]
+                dirty_classes = [c for c in classes if _class_is_dirty(c)]
+                ordered_classes = stable_classes + dirty_classes
+            else:
+                ordered_classes = classes
+
             lines.append("## Classes")
-            for cls_name in classes:
+            for cls_name in ordered_classes:
                 members = symbol_index.get_class_members(cls_name, project_id)
                 if not members:
                     continue
@@ -5265,6 +5519,11 @@ class ContextBuilder:
             == "function"
         ]
         if module_funcs:
+            if dirty_qids:
+                stable_funcs = [q for q in module_funcs if q not in dirty_qids]
+                dirty_funcs = [q for q in module_funcs if q in dirty_qids]
+                module_funcs = stable_funcs + dirty_funcs
+
             if lines:
                 lines.append("")
             lines.append("## Module-level functions")
@@ -6900,25 +7159,6 @@ Output only "YES" or "NO".
             f"_evaluate_lod3_block_relevance_with_llm: LLM failed, including {qid} (conservative)"
         )
         return True
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 7. Slot cleanup helper
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
-        """Delete stale slot files, keeping only the current one."""
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.isdir(slot_dir):
-            return
-        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
-        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
-        try:
-            for fname in os.listdir(slot_dir):
-                if fname.startswith(prefix) and fname != keep:
-                    os.remove(os.path.join(slot_dir, fname))
-                    self._f._log_debug(f"Removed obsolete slot file: {fname}")
-        except Exception as e:
-            self._f._log_debug(f"Slot cleanup error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -8692,6 +8932,7 @@ class StateStore:
             "hub_tier_body_hashes": state.hub_tier_body_hashes,
             "hub_tier_query_heat": state.hub_tier_query_heat,
             "hub_tier_qids_persisted": state.hub_tier_qids_persisted,
+            "symbol_signature_snapshot": state.symbol_signature_snapshot,
         }
 
         # ------------------------------------------------------------------
@@ -22775,23 +23016,41 @@ class EnrichmentTasks:
         qids: List[str],
         project_id: str,
         background: bool = False,
+        stop_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, str]:
         """
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
 
         Cache hits (already in memory or SQLite) are resolved for free, via a
-        SINGLE batched SQL query for all DB-pending qids rather than one
+        single batched SQL query for all DB-pending qids rather than one
         round-trip per qid. Cache misses are generated in groups of
         ``lazy_docstring_batch_size``. Any qid a batch call failed to resolve
         is retried individually — see Phase 4.
 
+        Cooperative cancellation: when ``stop_event`` is provided and becomes
+        set (typically because the inlet is starting and BackgroundTaskManager
+        wants this task to wind down), the function persists everything
+        resolved so far — including any docstrings recovered by the
+        single-item retry loop mid-batch — before returning, instead of
+        letting an external ``task.cancel()`` raise CancelledError partway
+        through and discard work that already paid for a real LLM round-trip.
+        The check happens between batches and between individual retries, so
+        a batch or retry already in flight always finishes and gets persisted
+        before the function exits.
+
         Args:
-            qids:       List of qualified symbol ids to resolve.
-            project_id: Current project identifier.
-            background: When True, enables single-item retry for unresolved
-                        qids. False (lazy/foreground) skips retry to avoid
-                        adding round-trip latency to the user's turn.
+            qids:        List of qualified symbol ids to resolve.
+            project_id:  Current project identifier.
+            background:  When True, enables single-item retry for unresolved
+                         qids. False (lazy/foreground) skips retry to avoid
+                         adding round-trip latency to the user's turn.
+            stop_event:  Optional cooperative-cancellation signal. Checked
+                         between batches and between individual retries.
+                         None means run to completion unconditionally (the
+                         lazy/foreground call sites never pass one, since
+                         they're already budget-bounded by
+                         lazy_docstring_max_per_turn).
 
         Returns:
             Mapping from qualified id to docstring for every symbol resolved.
@@ -22829,10 +23088,6 @@ class EnrichmentTasks:
                 needs_db_check.append(qid)
 
         # ── Phase 1b: one batched SQL query instead of N round-trips ──────────
-        # the original code issued one _db_read() per qid here — each
-        # dispatching to the thread pool via anyio.to_thread.run_sync. A batch
-        # of 8 unresolved qids meant 8 consecutive thread round-trips before
-        # any LLM work even started.
         if needs_db_check:
             placeholders = ",".join("?" * len(needs_db_check))
             try:
@@ -22912,7 +23167,20 @@ class EnrichmentTasks:
             f"batch_size={batch_size}, label={label!r}"
         )
 
+        # ── Phase 4: LLM batch generation loop ───────────────────────────────────
         for i in range(0, len(items), batch_size):
+            # Checked at the START of each batch iteration, never mid-batch:
+            # a batch already in flight always finishes its LLM call and gets
+            # persisted before this function returns. Only the NEXT batch is
+            # skipped once the signal arrives.
+            if stop_event is not None and stop_event.is_set():
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: stop signal received — "
+                    f"halting before batch {i // batch_size + 1}, "
+                    f"{len(resolved)} qid(s) resolved and persisted so far"
+                )
+                break
+
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
             prompt = self._build_docstring_batch_prompt(batch)
@@ -22966,6 +23234,7 @@ class EnrichmentTasks:
                     f"parsed {len(parsed)} docstring(s)"
                 )
 
+            # ── Single-item retry for any qid the batch call failed to resolve ────
             missing = expected - set(parsed.keys())
             if missing and len(batch) > 1 and background:
                 self._f._log_debug(
@@ -22975,6 +23244,19 @@ class EnrichmentTasks:
                 sig_by_qid = {q: s for q, s, _ in batch}
                 recovered = 0
                 for qid in missing:
+                    # Checked between retries, never mid-call: the retry call
+                    # already dispatched always completes and its result (if
+                    # any) is folded into `parsed` before this loop can exit
+                    # on the signal. Only the NEXT retry in the list is
+                    # skipped once stop_event fires.
+                    if stop_event is not None and stop_event.is_set():
+                        self._f._log_debug(
+                            f"ensure_docstrings_batch: batch {batch_num} — "
+                            f"stop signal received mid-retry, "
+                            f"{recovered}/{len(missing)} retries completed "
+                            f"before signal"
+                        )
+                        break
                     single_doc = await self._generate_docstring_single(
                         qid, sig_by_qid.get(qid, qid), label
                     )
@@ -22987,6 +23269,7 @@ class EnrichmentTasks:
                     f"(total now {len(parsed)}/{len(batch)})"
                 )
 
+            # ── Persist whatever this batch resolved, signal or not ───────────────
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -23199,6 +23482,12 @@ class EnrichmentTasks:
         bg_docstring LLM label, which is whitelisted during silent ingestion,
         allowing docstring generation to proceed concurrently.
 
+        stop_event is forwarded into ensure_docstrings_batch() itself, not
+        just checked between the outer five-symbol batches here — this lets
+        a batch already mid-flight (including its single-item retry pass)
+        finish and persist before the LLM call that's actually in progress
+        when the next inlet starts gets torn down by task.cancel().
+
         Args:
             project_id: The current project identifier.
             stop_event: If set, stops the loop gracefully after the current batch.
@@ -23216,10 +23505,6 @@ class EnrichmentTasks:
                 continue
             for sym in block.symbols:
                 if sym.kind in ("function", "method", "class") and not sym.docstring:
-                    # qualify_symbol includes file_path so that module-level
-                    # functions resolve to "module.func" rather than bare "func",
-                    # matching the qualified ids used by the SymbolIndex and by
-                    # ensure_docstrings_batch.
                     qid = qualify_symbol(sym)
                     pending_qids.append(qid)
 
@@ -23268,6 +23553,7 @@ class EnrichmentTasks:
                     batch,
                     project_id,
                     background=True,
+                    stop_event=stop_event,
                 )
                 for qid, docstring in results.items():
                     if docstring:
@@ -32421,6 +32707,20 @@ class Filter:
         enable_kv_cache_stability: bool = Field(default=True)
         enable_slot_persistence: bool = Field(default=True)
         slot_save_path: str = Field(default="/kvcache")
+        warmup_prefill_wait_timeout: float = Field(
+            default=30.0,
+            ge=0.0,
+            description=(
+                "Maximum seconds outlet() waits for a pending hub-tier warmup "
+                "prefill (triggered after silent ingestion) to finish before "
+                "dispatching other background tasks (docstrings, raptor, etc). "
+                "Ensures the new code state's KV slot gets saved to disk before "
+                "the LLM semaphore gets occupied by potentially many docstring "
+                "or RAPTOR calls. 0 disables waiting — background tasks may "
+                "then race the warmup task for the shared semaphore, delaying "
+                "when that slot file becomes available."
+            ),
+        )
         slot_id: int = Field(default=0, ge=0)
         slot_save_max_context_tokens: int = Field(
             default=0,
@@ -32866,6 +33166,9 @@ class Filter:
         # -- Task registry --
         self._task_registry = TaskRegistry(self)
 
+        # -- KVCache warmup --
+        self._pending_warmup_task: Optional[asyncio.Task] = None
+
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
 
@@ -33186,13 +33489,23 @@ class Filter:
             7.  System-prompt assembly (Block A + Block B) with CoT, compression,
                 multi-phase, and adaptive trimming.
 
-        Performance note: use_case_key / use_case_label, computed once here via
-            classify_intent_with_continuation(), are threaded into
-            assemble_for_turn() → SystemPromptBuilder.build() →
-            _build_activated_code() → build_block_b(), eliminating up to 3
-            redundant classify_use_case() calls (each a possible CrossEncoder
-            pass + LLM-fallback round-trip) that previously recomputed the
-            identical result deeper in the pipeline.
+        Per-turn slot-restore guards (_slot_cont_attempted_{filename} /
+        _slot_cont_succeeded_{filename}) live in pstate, which persists across
+        turns, and are cleared at the start of every inlet — the guard inside
+        slot_restore_for_continuity() is meant to prevent double-restores
+        within a single turn, so it must not carry over into the next one.
+
+        slot_restore_attempted / slot_restored are also reset each inlet, so
+        the explicit slot_restore() call issued after preprocessing reflects
+        the clean post-outlet-save state of the slot rather than whatever
+        background-task activity touched it afterward.
+
+        use_case_key / use_case_label, computed once here via
+        classify_intent_with_continuation(), are threaded through
+        assemble_for_turn() → SystemPromptBuilder.build() →
+        _build_activated_code() → build_block_b(), so the rest of the turn
+        reuses this single classification instead of recomputing it via
+        additional classify_use_case() calls deeper in the pipeline.
         """
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
@@ -33224,14 +33537,13 @@ class Filter:
             pstate = psm.get_pstate(project_id)
 
             # ------------------------------------------------------------------
-            # Region: KV-1 fix — clear per-turn slot-restore guards
+            # Region: clear per-turn slot-restore guards
             #
-            # These keys accumulate across turns because pstate is an in-memory
-            # dict that is never wiped between requests.  The guard pattern inside
-            # slot_restore_for_continuity() is correct within a single turn (avoid
-            # double-restores), but wrong across turns (blocks every restore after
-            # the first).  Clearing here restores the intended semantics: at most
-            # one slot restore per auxiliary call TYPE per TURN.
+            # These keys live in pstate, an in-memory dict that persists across
+            # turns. The guard inside slot_restore_for_continuity() exists to
+            # prevent double-restores within a single turn, so it is cleared
+            # here at the start of each turn: at most one slot restore per
+            # auxiliary call type per turn.
             # ------------------------------------------------------------------
             _guards_cleared = [
                 k for k in list(pstate.keys()) if k.startswith("_slot_cont_")
@@ -33240,7 +33552,7 @@ class Filter:
                 del pstate[_key]
             if _guards_cleared:
                 self._log_debug(
-                    f"KV-1: cleared {len(_guards_cleared)} stale slot-restore "
+                    f"Cleared {len(_guards_cleared)} stale slot-restore "
                     f"guard(s) from previous turn"
                 )
 
@@ -33249,8 +33561,9 @@ class Filter:
             #
             # slot_restore() guards itself with slot_restore_attempted to run only
             # once per session.  We reset that flag each inlet so the explicit
-            # post-preprocessing restore below can undo background-task dirt that
-            # accumulated AFTER the previous outlet's slot_save.
+            # post-preprocessing restore below reflects the clean post-outlet-save
+            # state rather than whatever background-task activity touched the
+            # slot afterward.
             # ------------------------------------------------------------------
             psm.set_slot_restore_attempted(project_id, False)
             psm.set_slot_restored(project_id, False)
@@ -33311,10 +33624,10 @@ class Filter:
             #   slot_restore() is a no-op when no slot file exists (cold start),
             #   so this is safe for first-turn requests.
             # ----------------------------------------------------------------
-            if self.valves.enable_slot_persistence and not slot_busy:
+            if self.valves.enable_slot_persistence:
                 _restored = await psm.slot_restore(project_id)
                 self._log_debug(
-                    f"KV-4: initial slot restore → "
+                    f"Initial slot restore → "
                     f"{'OK' if _restored else 'skipped / no slot file'}"
                 )
 
@@ -33460,13 +33773,10 @@ class Filter:
                         await self._activation.rebuild_path_index(project_id)
 
                     # -- invalidate and rebuild Block A eagerly ----------------
-                    # NOTE: invalidate_block_a_cache() is now `async def` — its
+                    # invalidate_block_a_cache() is async: its
                     # recompute_centrality=True path dispatches PageRank to a
-                    # worker thread via anyio.to_thread.run_sync instead of
-                    # running it synchronously on the event loop (a 50-300 ms
-                    # stall previously observed here on every silent-ingestion
-                    # turn). `await` is mandatory; omitting it would silently
-                    # return a coroutine object without running the work.
+                    # worker thread via anyio.to_thread.run_sync, freeing the
+                    # event loop while it runs. `await` is required here.
                     await self._ctx_builder.invalidate_block_a_cache(
                         project_id, "new chunk ingested", recompute_centrality=True
                     )
@@ -33498,7 +33808,13 @@ class Filter:
                         psm.set_hub_tier_qids(project_id, tier_qids)
                         state.hub_tier_qids_persisted = tier_qids
                         self._conversation_state_manager.set(project_id, state)
-                        asyncio.create_task(
+                        # The task handle is kept on the Filter so outlet()
+                        # can wait for this prefill to finish before
+                        # dispatching docstrings/raptor/etc — see the wait
+                        # block near the end of outlet(). This gives the new
+                        # code structure's KV slot priority for the shared
+                        # LLM semaphore over background enrichment work.
+                        self._pending_warmup_task = asyncio.create_task(
                             self._ctx_builder._warmup_tier_prefill(project_id)
                         )
 
@@ -33567,13 +33883,11 @@ class Filter:
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
             #
-            #   Performance: use_case_key / use_case_label computed here are the
-            #   single source of truth for the rest of this turn — they are
-            #   threaded through assemble_for_turn() below instead of being
-            #   silently recomputed by classify_use_case() deeper in the
-            #   pipeline (SystemPromptBuilder.build() Step 4a,
-            #   _build_activated_code()'s suppress_sigs check, and
-            #   build_block_b() Step 3).
+            #   use_case_key / use_case_label computed here are the single source
+            #   of truth for the rest of this turn — they are threaded through
+            #   assemble_for_turn() below so SystemPromptBuilder.build() Step 4a,
+            #   _build_activated_code()'s suppress_sigs check, and build_block_b()
+            #   Step 3 all reuse this one classification instead of recomputing it.
             # ----------------------------------------------------------------
             intent_vector = await self._commands.classify_intent(user_query, project_id)
 
@@ -33610,12 +33924,6 @@ class Filter:
                 slot_busy=slot_busy,
                 is_continuation=is_continuation,
                 intent_vector=intent_vector,
-                # Performance: propagate the use_case classification already
-                # computed above so SystemPromptBuilder.build() and everything
-                # it calls in turn reuse it instead of recomputing via fresh
-                # classify_use_case() calls. Both default to None upstream, so
-                # any call path that doesn't receive them transparently falls
-                # back to the original recompute-from-scratch behavior.
                 use_case=use_case_key,
                 use_case_label=use_case_label,
             )
@@ -33641,9 +33949,9 @@ class Filter:
             #   KV cache — restore stable prefix after all auxiliary LLM work
             #
             #   Each auxiliary LLM call (CoT, contradiction, use-case, etc.) dirties
-            #   the slot.  slot_restore_for_continuity() is called at the end of
-            #   every such call, so the slot is already clean here.
-            #   This final call acts as a safety net in case any path skipped it.
+            #   the slot. slot_restore_for_continuity() is called at the end of
+            #   every such call, so the slot is already clean here. This final
+            #   call acts as a safety net in case any path skipped it.
             # ----------------------------------------------------------------
             if not slot_busy and self.valves.enable_slot_persistence:
                 await psm.slot_restore_for_continuity(project_id)
@@ -33712,9 +34020,6 @@ class Filter:
         assistant_content = ""
 
         try:
-            # ------------------------------------------------------------------
-            # Region: resolve project and per-project state
-            # ------------------------------------------------------------------
             project_id = self._inlet_orch.get_project_id()
             state = self._conversation_state_manager.get(project_id)
             psm = self._project_state_manager
@@ -33730,12 +34035,10 @@ class Filter:
             assistant_content = ""
             assistant_source = ""
 
-            # -- check last message in the history first ----------------------
             if messages and messages[-1].get("role") == "assistant":
                 assistant_content = messages[-1].get("content", "")
                 assistant_source = "messages[-1]"
 
-            # -- fall back to top-level body fields ---------------------------
             if not assistant_content:
                 for field in ("content", "output", "response", "assistant"):
                     val = body.get(field)
@@ -33751,21 +34054,15 @@ class Filter:
                             break
 
             # ------------------------------------------------------------------
-            # Region: never return early from inside this try block
-            #
-            # `inlet()` unconditionally calls `_bg_manager.set_paused(True)` at
-            # the start of every turn. The only call that flips it back to
-            # `False` lives in the unconditional tail of this method, AFTER
-            # the try/except/finally below. A bare `return body` from inside
-            # this try — as both branches below used to do — skips straight
-            # past that tail: `drain_writes()`, `set_paused(False)`, and the
-            # entire background-task scheduling loop never run, leaving
-            # `_bg_manager` paused for the rest of the session (visible as
-            # idle CPU/GPU after a turn with no detectable assistant content,
-            # e.g. the synthetic acknowledgment right after silent ingestion).
-            # Both content-detection outcomes below now fall through into an
-            # if/else instead of returning, so maintenance + background-task
-            # scheduling always run at the end of the method.
+            # A `return` from inside this try block skips every line after
+            # the try/except/finally, including drain_writes(),
+            # set_paused(False), and the whole background-task scheduling
+            # loop — that previously left _bg_manager paused indefinitely
+            # after any turn with no detectable assistant content (e.g. the
+            # synthetic acknowledgment turn right after silent ingestion).
+            # Both content-detection outcomes below now fall through into
+            # an if/else instead of returning, so maintenance + background
+            # tasks still run below regardless of which branch is taken.
             # ------------------------------------------------------------------
             if not assistant_content:
                 self._log_debug(
@@ -33774,9 +34071,6 @@ class Filter:
                     f"(keys={list(body.keys())})"
                 )
             else:
-                # 🔥 STATE MANAGEMENT
-                #   Deduplicate by content hash — skip if already processed
-                # ----------------------------------------------------------------
                 response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
                 if pstate.get("last_outlet_response_hash") == response_hash:
                     self._log_debug(
@@ -33791,14 +34085,8 @@ class Filter:
                         f"{len(assistant_content.split())} words)"
                     )
 
-                    # ------------------------------------------------------------------
-                    # Region: wait for all in-flight LLM tasks before mutating state
-                    # ------------------------------------------------------------------
                     await self._llm_orchestrator.wait_for_llm_tasks()
 
-                    # 🔥 STATE MANAGEMENT
-                    #   Intercept /expand commands in the assistant content
-                    # ----------------------------------------------------------------
                     if is_code_session and "/expand" in assistant_content:
                         modified_content, did_expand = (
                             await self._commands.outlet_intercept_expand(
@@ -33813,9 +34101,6 @@ class Filter:
                                 "outlet: /expand intercepted and expanded in assistant content"
                             )
 
-                    # 🔥 STATE MANAGEMENT
-                    #   Update active code blocks and store message in LTM
-                    # ----------------------------------------------------------------
                     assistant_msg = {"role": "assistant", "content": assistant_content}
 
                     if is_code_session:
@@ -33825,11 +34110,6 @@ class Filter:
                         )
                         await self._update_active_code(assistant_msg, project_id)
 
-                        # -- wait=True so _ltm_store_complete signals only
-                        #   after the ChromaDB upsert finishes, not after the task is
-                        #   merely enqueued.  The event drives inlet's wait() check; if
-                        #   it fires too early, the next turn's retrieval misses this
-                        #   message entirely.
                         self._ltm_store_complete.clear()
 
                         async def _store_and_signal():
@@ -33867,9 +34147,6 @@ class Filter:
 
                             asyncio.create_task(_store_and_signal_noncode())
 
-                    # 🚀 RESOURCE OPTIMISATION
-                    #   Save KV slot NOW — stable state, before long maintenance tasks
-                    # ----------------------------------------------------------------
                     if self.valves.enable_slot_persistence:
                         try:
                             psm.set_last_total_context_tokens(
@@ -33881,15 +34158,9 @@ class Filter:
                             )
                         await psm.slot_save(project_id)
 
-                    # 🔥 STATE MANAGEMENT
-                    #   Persist last response for lazy LOD adaptive adjustment
-                    # ----------------------------------------------------------------
                     psm.set_last_assistant_response(project_id, assistant_content)
                     psm.set_last_response_timestamp(project_id, time.time())
 
-                    # 🔥 STATE MANAGEMENT
-                    #   Response cache — skip partial multi-phase responses
-                    # ----------------------------------------------------------------
                     if (
                         self.valves.enable_response_cache
                         and HAS_SENTENCE
@@ -33923,9 +34194,10 @@ class Filter:
                                     wait=False,
                                 )
 
-            # 🚀 RESOURCE OPTIMISATION
-            #   Purge expired memories and maintain counters
-            # ----------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # 🚀 RESOURCE OPTIMISATION — runs every turn regardless of whether
+            # assistant content was detected above.
+            # ------------------------------------------------------------------
             await self._ltm.purge_expired_memories()
 
             if not hasattr(self, "_write_counter"):
@@ -33936,15 +34208,9 @@ class Filter:
             if interval > 0 and self._write_counter % interval == 0:
                 await self._state_store.purge_orphaned_data(project_id)
 
-            # 🚀 RESOURCE OPTIMISATION
-            #   SQLite WAL checkpoint (every 100 turns)
-            # ----------------------------------------------------------------
             if self._write_counter % 100 == 0:
                 await self._state_store.run_db_checkpoints()
 
-            # 🚀 RESOURCE OPTIMISATION
-            #   Persist typed edges and path views for cross-session restoration
-            # ----------------------------------------------------------------
             if self.valves.enable_edge_persistence:
                 await self._state_store.save_symbol_edges_to_db(project_id)
 
@@ -33953,14 +34219,8 @@ class Filter:
                     project_id, self._path_index.get_all(project_id)
                 )
 
-            # 🔥 STATE MANAGEMENT
-            #   Flush dirty conversation state to SQLite
-            # ----------------------------------------------------------------
             await self._conversation_state_manager.save_if_dirty(project_id)
 
-            # 🔥 STATE MANAGEMENT
-            #   Detect and persist AutoContinue continuation marker
-            # ----------------------------------------------------------------
             genuine = self._detect_genuine_continuation(messages)
             if genuine:
                 turns = psm.increment_continuation_turns(project_id)
@@ -33979,26 +34239,60 @@ class Filter:
             self._log_debug(traceback.format_exc())
 
         finally:
-            # ------------------------------------------------------------------
-            # Region: wait for all background LLM tasks before launching new ones
-            # ------------------------------------------------------------------
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             await self._llm_orchestrator.wait_for_llm_tasks()
 
-            # ------------------------------------------------------------------
-            # Region: clear silent-ingestion flag if it leaked into outlet
-            # ------------------------------------------------------------------
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
 
         # 🚀 BACKGROUND TASKS
         #   Resume after all critical outlet work is done.
         #   Drain SQLite writes first to reduce lock contention.
-        #   This now runs unconditionally — see the early-return note above.
         # ----------------------------------------------------------------
         await self._state_store.drain_writes(timeout=2.0)
 
         last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
+
+        # If silent ingestion fired a hub-tier warmup prefill earlier (or a
+        # previous one is still in flight), give it priority over
+        # docstrings/raptor/etc for the shared LLM semaphore. Its job — get
+        # the new code structure's KV slot saved to disk — is time-sensitive
+        # in a way background enrichment work is not: a new chat opened on
+        # this project before warmup finishes would find no matching slot
+        # file and pay a full prefill it could otherwise have skipped.
+        # asyncio.shield protects the task from being cancelled by the
+        # wait_for timeout itself; on timeout we simply stop waiting and let
+        # it keep running concurrently with whatever gets dispatched next.
+        if (
+            self._pending_warmup_task is not None
+            and not self._pending_warmup_task.done()
+        ):
+            _warmup_timeout = self.valves.warmup_prefill_wait_timeout
+            self._log_debug(
+                f"outlet: waiting up to {_warmup_timeout}s for pending hub-tier "
+                f"warmup prefill to finish before dispatching background tasks"
+            )
+            try:
+                if _warmup_timeout > 0:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._pending_warmup_task),
+                        timeout=_warmup_timeout,
+                    )
+                else:
+                    await self._pending_warmup_task
+                self._log_debug("outlet: warmup prefill finished")
+            except asyncio.TimeoutError:
+                self._log_debug(
+                    f"outlet: warmup prefill still running after "
+                    f"{_warmup_timeout}s — proceeding without waiting further; "
+                    f"it continues running in the background and will "
+                    f"compete with newly-dispatched tasks for the LLM "
+                    f"semaphore from this point on"
+                )
+            except Exception as e:
+                self._log_debug(f"outlet: warmup prefill failed: {e}")
+
+        self._pending_warmup_task = None
 
         self._bg_manager.set_paused(False)
 
