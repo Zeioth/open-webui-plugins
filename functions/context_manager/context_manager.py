@@ -10707,8 +10707,14 @@ class LongTermMemory:
 
     def _get_embedding_dimension(self) -> int:
         """Return the output dimension of the current embedding model."""
+        # encode() returns a numpy array of shape (1, dim) here — no .tolist()
+        # like the other call sites in this class. `if test_vec:` calls bool()
+        # on that array, and numpy raises on arrays with more than one element
+        # ("truth value ... is ambiguous"). Check length explicitly instead.
         test_vec = self._f.embedder.encode(["test"])
-        return len(test_vec[0]) if test_vec else 0
+        if test_vec is None or len(test_vec) == 0:
+            return 0
+        return len(test_vec[0])
 
     def _validate_embedding_model(self) -> bool:
         """
