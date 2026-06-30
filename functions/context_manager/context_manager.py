@@ -4236,22 +4236,22 @@ class RaptorCodeIndex:
     ) -> str:
         """
         Generate an LLM summary describing the cluster's shared responsibility.
-
+    
         Args:
             member_texts: List of member texts (signatures or summaries).
             level: Cluster level (1 or 2).
             summary_model: Model to use.
             summary_max_tokens: Maximum tokens for the summary.
             llm_caller: Async LLM caller function.
-
+    
         Returns:
             The generated summary string, or empty string on failure.
         """
         if not member_texts:
             return ""
-
+    
         listing = "\n".join(f"- {t}" for t in member_texts[:30])
-
+    
         # ------------------------------------------------------------------
         # Build level-specific prompt.
         # ------------------------------------------------------------------
@@ -4268,9 +4268,24 @@ class RaptorCodeIndex:
                 f"larger module:\n{listing}\n\n"
                 f"In 2-3 sentences, describe the module's overall purpose."
             )
-
+    
         # ------------------------------------------------------------------
         # Call the LLM.
+        #
+        # Bug fix: this call previously omitted enable_thinking=False and a
+        # label, unlike every other auxiliary LLM call in the codebase
+        # (bg_docstring, session_summary, etc.). call_llm() defaults to
+        # enable_thinking=True, so on a thinking-capable backend the model
+        # spends summary_max_tokens on hidden <think> reasoning before ever
+        # emitting the requested 2-3 sentence summary, hits finish_reason
+        # =length, and the truncated reasoning fragment gets stored as the
+        # "summary" verbatim. This is the source of the repeated
+        # "LLM output truncated (finish_reason=length, label=-, ...)"
+        # warnings seen during RAPTOR rebuilds. The system prompt already
+        # says "Output only the summary" — enable_thinking=False enforces
+        # that instead of merely requesting it. label="raptor_summary" also
+        # makes these calls identifiable in logs instead of appearing
+        # unlabeled.
         # ------------------------------------------------------------------
         try:
             result = await llm_caller(
@@ -18097,6 +18112,29 @@ Output only the symbol name.
         entry points (symbols with no callers) and building a CodePathView
         for each one. It also precomputes centrality if enabled.
 
+        Performance note (bug fix): an existing, non-stale CodePathView for an
+        entry point is reused as-is instead of triggering a fresh
+        build_activation_graph() + PPR computation. Without this check, every
+        call to this method (once per silent-ingestion turn) recomputed PPR
+        for EVERY entry point in the project unconditionally — even when only
+        one symbol among hundreds actually changed, and even on a turn where
+        nothing about that specific entry point's subgraph differs from the
+        last rebuild. Staleness is verified the same way _post_update_tasks
+        already does: by recomputing structural_hash/call_graph_hash from the
+        EXISTING view's own induced_nodes and comparing against the view's
+        stored hashes. This is cheap (no PPR, no power iteration — just dict
+        lookups against the SymbolIndex) and answers exactly "did anything
+        this view actually covers change", independent of whether unrelated
+        parts of the codebase changed.
+
+        Known limitation, inherited from the existing staleness semantics:
+        compute_call_graph_hash only enumerates OUTGOING edges from the
+        view's induced nodes, so a brand-new edge pointing INTO one of those
+        nodes from a symbol outside the induced set won't be detected as a
+        change here. This is the same blind spot _post_update_tasks already
+        has — this fix applies the existing freshness contract proactively,
+        it does not weaken it further.
+
         Args:
             project_id: Current project identifier.
         """
@@ -18115,16 +18153,53 @@ Output only the symbol name.
         )
 
         # ------------------------------------------------------------------
-        # Step 3: Build a CodePathView for each entry point.
+        # Step 2b: Index existing views by entry_point for the reuse check.
+        # An entry point can have produced more than one historical view
+        # (path_id depends on the full induced node set, which can shift
+        # over time), so reuse succeeds if ANY of them proves non-stale.
         # ------------------------------------------------------------------
+        existing_by_entry: Dict[str, List["CodePathView"]] = defaultdict(list)
+        for view in self._f._path_index.get_all(project_id):
+            existing_by_entry[view.entry_point].append(view)
+
+        # ------------------------------------------------------------------
+        # Step 3: Build a CodePathView for each entry point, reusing an
+        # existing non-stale view instead of recomputing when possible.
+        # ------------------------------------------------------------------
+        reused = 0
+        rebuilt = 0
         for ep in entry_points:
+            candidates = existing_by_entry.get(ep)
+            still_valid = False
+            if candidates:
+                for view in candidates:
+                    current_structural = self.compute_structural_hash(
+                        view.induced_nodes.keys(), project_id
+                    )
+                    current_call_graph = self.compute_call_graph_hash(
+                        view.induced_nodes.keys(), project_id
+                    )
+                    if not view.is_stale(current_structural, current_call_graph):
+                        still_valid = True
+                        break
+
+            if still_valid:
+                reused += 1
+                continue
+
             ag = await self.build_activation_graph(ep, project_id)
             await self._build_view_from_activation(ep, ag, project_id)
+            rebuilt += 1
+
+        self._f._log_debug(
+            f"rebuild_path_index: {reused} entry point(s) reused unchanged, "
+            f"{rebuilt} rebuilt (of {len(entry_points)} total)"
+        )
 
         # ------------------------------------------------------------------
         # Step 4: Precompute centrality if enabled.
         # ------------------------------------------------------------------
-        if self._f.valves.enable_centrality_prior:
+        if self.valves.enable_centrality_prior:
             psm = self._f._project_state_manager
             psm.set_node_centrality(
                 project_id,
@@ -22519,15 +22594,15 @@ class EnrichmentTasks:
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
         """
         Build the user-turn prompt for a batch docstring generation call.
-    
+
         The server-side response_format={"type": "json_object"} enforces JSON
         at the API level; the prompt text repeats the constraint so the model
         never falls back to prose or a numbered list.
-    
+
         Args:
             items: List of (qid, signature, snippet) tuples. Only qid and
                    signature are consumed; snippet is reserved for future use.
-    
+
         Returns:
             str: Ready-to-send prompt string.
         """
@@ -22537,11 +22612,11 @@ class EnrichmentTasks:
             # avoid pushing context beyond the model's effective attention span.
             sig = signature[:80] if signature else qid
             lines.append(f"  - {qid}: {sig}")
-    
+
         listing = "\n".join(lines)
         max_chars = self._f.valves.docstring_max_chars
         n_items = len(items)
-    
+
         return (
             f"Generate a JSON object mapping each identifier below to a "
             f"one-sentence description (under {max_chars} characters).\n\n"
@@ -22567,7 +22642,7 @@ class EnrichmentTasks:
     ) -> Optional[str]:
         """
         Generate a docstring for exactly one symbol via a single-item LLM call.
-    
+
         Recovery fallback for batch items a multi-symbol batch call failed to
         resolve (JSON parse failure, a truncated/merged identifier, or an
         omitted key). With only one key requested, the exact behavior that
@@ -22575,12 +22650,12 @@ class EnrichmentTasks:
         syntactically-valid key-value pair — becomes the CORRECT outcome
         instead of a truncation, which is why a single-item retry recovers
         most cases a 5-item batch lost.
-    
+
         Args:
             qid:       Qualified symbol id to document.
             signature: The symbol's signature string (used as context).
             label:     LLM call label, suffixed for retry-call identification.
-    
+
         Returns:
             A one-sentence docstring, or None on failure.
         """
@@ -22629,7 +22704,7 @@ class EnrichmentTasks:
             return None
         except (json.JSONDecodeError, Exception):
             return None
-    
+
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
@@ -22703,299 +22778,299 @@ class EnrichmentTasks:
             return {}
 
     async def ensure_docstrings_batch(
-            self,
-            qids: List[str],
-            project_id: str,
-            background: bool = False,
-        ) -> Dict[str, str]:
-            """
-            Resolve docstrings for many symbols at once, identified by their
-            QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
-    
-            Uses ``response_format={"type": "json_object"}`` and
-            ``enable_thinking=False`` to force clean JSON output from the server
-            with no reasoning preamble. The server-side GBNF grammar guarantees
-            valid JSON, so the parser calls ``json.loads`` directly with no artifact
-            stripping.
-    
-            Cache hits (already in memory or SQLite) are resolved for free.
-            Cache misses are generated in groups of ``lazy_docstring_batch_size``.
-            Any qid a batch call failed to resolve (parse error, missing key, or
-            a mangled/truncated identifier) is retried individually — see Phase 4.
-    
-            Qualified id convention
-            ───────────────────────
-            Ids must be built with ``qualify_symbol(sym)`` (which includes
-            ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
-            (which omits ``file_path``). Module-level functions without a parent
-            class are indexed by the SymbolIndex as ``"module.function"`` when a
-            file path is available. Omitting the file path produces bare ``"function"``,
-            which never matches SymbolIndex lookups and prevents in-memory symbol
-            objects from being updated after generation.
-    
-            Args:
-                qids:       List of qualified symbol ids to resolve. May contain
-                            duplicates; they are removed before processing.
-                project_id: Current project identifier.
-                background: When ``True``, uses the ``bg_docstring`` LLM label
-                            (whitelisted during silent ingestion), bypasses the
-                            per-turn generation budget, and enables single-item
-                            retry for any qid a batch call failed to resolve.
-                            When ``False``, uses ``lazy_docstring_batch``, respects
-                            the budget, and skips retry (this path runs inside
-                            inlet()'s lazy-task flow and must not add extra
-                            round-trip latency to the user's turn).
-    
-            Returns:
-                Mapping from qualified id to docstring for every symbol that was
-                successfully resolved, whether from cache, batch generation, or
-                single-item retry.
-            """
-            # ── Deduplicate while preserving insertion order ──────────────────────────
-            # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
-            # order, unlike set() which does not.
-            qids = list(dict.fromkeys(qids))
-    
-            self._f._log_debug(
-                f"ensure_docstrings_batch: starting with {len(qids)} qid(s) "
-                f"(background={background})"
-            )
-    
-            state = self._f._conversation_state_manager.get(project_id)
-            resolved: Dict[str, str] = {}
-            pending: List[str] = []
-    
-            # ── Build qid → (symbol, block) lookup index ─────────────────────────────
-            # Built once here to avoid O(N²) scans across active_blocks during the
-            # cache and batch phases.
-            #
-            # qualify_symbol() is used (not qualify_symbol_name without file_path) so
-            # that module-level functions like "foo" in "mymodule.py" are indexed
-            # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
-            # Using qualify_symbol_name(name, parent_symbol) without file_path would
-            # produce bare "foo", which never matches SymbolIndex lookups and prevents
-            # in-memory symbol objects from being updated after docstring generation.
-            _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
-            for _block in state.active_blocks.values():
-                for _sym in _block.symbols:
-                    _q = qualify_symbol(_sym)
-                    if _q not in _qid_index:
-                        _qid_index[_q] = (_sym, _block)
-    
-            def _find_symbol(
-                qid: str,
-            ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
-                return _qid_index.get(qid, (None, None))
-    
-            # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
-            for qid in qids:
-                sym, _ = _find_symbol(qid)
-                found = sym.docstring if sym and sym.docstring else ""
-    
-                if not found:
-                    try:
-                        row = await self._f._state_store._db_read(
-                            lambda: self._f._db_conn.execute(
-                                "SELECT docstring FROM symbol_docstrings "
-                                "WHERE project_id=? AND symbol_name=?",
-                                (project_id, qid),
-                            ).fetchone()
-                        )
-                    except Exception:
-                        row = None
-    
-                    if row and row[0]:
-                        found = row[0]
-                        if sym is not None:
-                            sym.docstring = found
-                        self._f._symbol_index.update_docstring(qid, project_id, found)
-    
-                if found:
-                    resolved[qid] = found
-                else:
-                    pending.append(qid)
-    
-            self._f._log_debug(
-                f"ensure_docstrings_batch: {len(pending)} pending after cache phase"
-            )
-    
-            if not pending:
-                self._f._log_debug(
-                    "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
-                )
-                return resolved
-    
-            # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
-            if not background:
-                budget = self._f.valves.lazy_docstring_max_per_turn
-                if budget > 0:
-                    remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
-                    pending = pending[:remaining]
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: {len(pending)} remaining after "
-                        f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
-                        f"limit={budget})"
+        self,
+        qids: List[str],
+        project_id: str,
+        background: bool = False,
+    ) -> Dict[str, str]:
+        """
+        Resolve docstrings for many symbols at once, identified by their
+        QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
+
+        Uses ``response_format={"type": "json_object"}`` and
+        ``enable_thinking=False`` to force clean JSON output from the server
+        with no reasoning preamble. The server-side GBNF grammar guarantees
+        valid JSON, so the parser calls ``json.loads`` directly with no artifact
+        stripping.
+
+        Cache hits (already in memory or SQLite) are resolved for free.
+        Cache misses are generated in groups of ``lazy_docstring_batch_size``.
+        Any qid a batch call failed to resolve (parse error, missing key, or
+        a mangled/truncated identifier) is retried individually — see Phase 4.
+
+        Qualified id convention
+        ───────────────────────
+        Ids must be built with ``qualify_symbol(sym)`` (which includes
+        ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
+        (which omits ``file_path``). Module-level functions without a parent
+        class are indexed by the SymbolIndex as ``"module.function"`` when a
+        file path is available. Omitting the file path produces bare ``"function"``,
+        which never matches SymbolIndex lookups and prevents in-memory symbol
+        objects from being updated after generation.
+
+        Args:
+            qids:       List of qualified symbol ids to resolve. May contain
+                        duplicates; they are removed before processing.
+            project_id: Current project identifier.
+            background: When ``True``, uses the ``bg_docstring`` LLM label
+                        (whitelisted during silent ingestion), bypasses the
+                        per-turn generation budget, and enables single-item
+                        retry for any qid a batch call failed to resolve.
+                        When ``False``, uses ``lazy_docstring_batch``, respects
+                        the budget, and skips retry (this path runs inside
+                        inlet()'s lazy-task flow and must not add extra
+                        round-trip latency to the user's turn).
+
+        Returns:
+            Mapping from qualified id to docstring for every symbol that was
+            successfully resolved, whether from cache, batch generation, or
+            single-item retry.
+        """
+        # ── Deduplicate while preserving insertion order ──────────────────────────
+        # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
+        # order, unlike set() which does not.
+        qids = list(dict.fromkeys(qids))
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: starting with {len(qids)} qid(s) "
+            f"(background={background})"
+        )
+
+        state = self._f._conversation_state_manager.get(project_id)
+        resolved: Dict[str, str] = {}
+        pending: List[str] = []
+
+        # ── Build qid → (symbol, block) lookup index ─────────────────────────────
+        # Built once here to avoid O(N²) scans across active_blocks during the
+        # cache and batch phases.
+        #
+        # qualify_symbol() is used (not qualify_symbol_name without file_path) so
+        # that module-level functions like "foo" in "mymodule.py" are indexed
+        # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
+        # Using qualify_symbol_name(name, parent_symbol) without file_path would
+        # produce bare "foo", which never matches SymbolIndex lookups and prevents
+        # in-memory symbol objects from being updated after docstring generation.
+        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+        for _block in state.active_blocks.values():
+            for _sym in _block.symbols:
+                _q = qualify_symbol(_sym)
+                if _q not in _qid_index:
+                    _qid_index[_q] = (_sym, _block)
+
+        def _find_symbol(
+            qid: str,
+        ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
+            return _qid_index.get(qid, (None, None))
+
+        # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
+        for qid in qids:
+            sym, _ = _find_symbol(qid)
+            found = sym.docstring if sym and sym.docstring else ""
+
+            if not found:
+                try:
+                    row = await self._f._state_store._db_read(
+                        lambda: self._f._db_conn.execute(
+                            "SELECT docstring FROM symbol_docstrings "
+                            "WHERE project_id=? AND symbol_name=?",
+                            (project_id, qid),
+                        ).fetchone()
                     )
-                if not pending:
-                    return resolved
-            else:
-                self._f._log_debug(
-                    "ensure_docstrings_batch: background mode — per-turn budget skipped"
-                )
-    
-            # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
-            items: List[Tuple[str, str, str]] = []
-            for qid in pending:
-                sym, block = _find_symbol(qid)
-                if sym is not None and block is not None:
-                    signature = sym.signature
-                    if sym.line_start:
-                        lines = block.content.split("\n")
-                        start_idx = max(0, sym.line_start - 1)
-                        end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
-                        snippet = "\n".join(lines[start_idx:end_idx])[:500]
-                    else:
-                        snippet = block.content[:500]
-                else:
-                    signature, snippet = qid, ""
-                items.append((qid, signature, snippet))
-    
-            batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
-            label = "bg_docstring" if background else "lazy_docstring_batch"
-    
-            self._f._log_debug(
-                f"ensure_docstrings_batch: {len(items)} item(s) to generate, "
-                f"batch_size={batch_size}, label={label!r}"
-            )
-    
-            # ── Phase 4: LLM batch generation loop ───────────────────────────────────
-            for i in range(0, len(items), batch_size):
-                batch = items[i : i + batch_size]
-                expected = {q for q, _, _ in batch}
-                prompt = self._build_docstring_batch_prompt(batch)
-    
-                batch_num = i // batch_size + 1
-                total_batches = (len(items) + batch_size - 1) // batch_size
-                prompt_tokens = (
-                    len(self._f.tokenizer.encode(prompt))
-                    if self._f.tokenizer
-                    else len(prompt) // 4
-                )
-                self._f._log_debug(
-                    f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
-                    f"{len(batch)} symbol(s), ~{prompt_tokens} prompt tokens, "
-                    f"label={label!r}"
-                )
-    
-                response = await self._f._llm_orchestrator.call_llm(
-                    prompt=prompt,
-                    system_prompt=(
-                        "You are a code documentation assistant. "
-                        "Output ONLY a valid JSON object. "
-                        "Your entire response must start with { and end with }. "
-                        "No text before { and no text after }."
-                    ),
-                    model_override=self._f.valves.llm_model,
-                    max_tokens=0,
-                    temperature=0.0,
-                    label=label,
-                    response_format={"type": "json_object"},
-                    log_raw_response=False,
-                    enable_thinking=False,
-                )
-    
-                if not background:
-                    self._lazy_docstrings_generated_this_turn += len(batch)
-    
-                # ── Unify the "no response" and "parse failure" paths ────────────────────
-                # Both previously diverged here: a None response used `continue`,
-                # skipping the batch entirely with no recovery; a parse failure fell
-                # through to an empty `parsed` dict. Routing both into the same
-                # `parsed` variable lets the single retry block below handle either
-                # failure mode identically, instead of silently losing the whole batch.
-                if response is None:
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
-                    )
-                    parsed: Dict[str, str] = {}
-                else:
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: batch {batch_num} — "
-                        f"received {len(response)}-char response"
-                    )
-                    parsed = self._parse_docstring_batch_response(response, expected)
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: batch {batch_num} — "
-                        f"parsed {len(parsed)} docstring(s)"
-                    )
-    
-                # ── Retry individually any qid the batch call failed to resolve ──────────
-                # A multi-key JSON request under greedy (temperature=0.0) decoding
-                # can stop right after the first syntactically-valid key-value pair
-                # — the model treats an early closing brace as a legitimate
-                # completion instead of continuing through all requested keys. The
-                # same behaviour is harmless (indeed correct) when only one key was
-                # ever requested, so re-issuing each unresolved qid as its own
-                # single-item call converts the model's bad habit on N-item batches
-                # into the desired outcome on 1-item calls.
-                #
-                # Restricted to background=True: this path is also reached from the
-                # lazy (foreground) flow via run_lazy_tasks() inside inlet(), which
-                # runs synchronously on the user's actual turn. Each retry is a real
-                # LLM round-trip (observed 1-7s elsewhere in this codebase), so
-                # adding them here would trade docstring completeness for added
-                # user-facing latency — not worth it on the foreground path.
-                # Background runs have no such constraint.
-                missing = expected - set(parsed.keys())
-                if missing and len(batch) > 1 and background:
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: batch {batch_num} — "
-                        f"retrying {len(missing)} unresolved qid(s) individually"
-                    )
-                    sig_by_qid = {q: s for q, s, _ in batch}
-                    recovered = 0
-                    for qid in missing:
-                        single_doc = await self._generate_docstring_single(
-                            qid, sig_by_qid.get(qid, qid), label
-                        )
-                        if single_doc:
-                            parsed[qid] = single_doc
-                            recovered += 1
-                    self._f._log_debug(
-                        f"ensure_docstrings_batch: batch {batch_num} — "
-                        f"retry recovered {recovered}/{len(missing)} qid(s) "
-                        f"(total now {len(parsed)}/{len(batch)})"
-                    )
-    
-                # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
-                for qid, docstring in parsed.items():
-                    resolved[qid] = docstring
-                    sym, _ = _find_symbol(qid)
+                except Exception:
+                    row = None
+
+                if row and row[0]:
+                    found = row[0]
                     if sym is not None:
-                        sym.docstring = docstring
-                    self._f._symbol_index.update_docstring(qid, project_id, docstring)
-    
-                if parsed:
-                    rows = [
-                        (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
-                    ]
-    
-                    def _write_batch(rows: list = rows) -> None:
-                        self._f._db_conn.executemany(
-                            "INSERT OR REPLACE INTO symbol_docstrings "
-                            "(project_id, symbol_name, docstring, updated_at) "
-                            "VALUES (?,?,?,?)",
-                            rows,
-                        )
-                        self._f._db_conn.commit()
-    
-                    await self._f._state_store._db_enqueue(_write_batch)
-    
+                        sym.docstring = found
+                    self._f._symbol_index.update_docstring(qid, project_id, found)
+
+            if found:
+                resolved[qid] = found
+            else:
+                pending.append(qid)
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(pending)} pending after cache phase"
+        )
+
+        if not pending:
             self._f._log_debug(
-                f"ensure_docstrings_batch: done — "
-                f"resolved {len(resolved)} / {len(qids)} total"
+                "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
             )
             return resolved
+
+        # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
+        if not background:
+            budget = self._f.valves.lazy_docstring_max_per_turn
+            if budget > 0:
+                remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
+                pending = pending[:remaining]
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: {len(pending)} remaining after "
+                    f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
+                    f"limit={budget})"
+                )
+            if not pending:
+                return resolved
+        else:
+            self._f._log_debug(
+                "ensure_docstrings_batch: background mode — per-turn budget skipped"
+            )
+
+        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
+        items: List[Tuple[str, str, str]] = []
+        for qid in pending:
+            sym, block = _find_symbol(qid)
+            if sym is not None and block is not None:
+                signature = sym.signature
+                if sym.line_start:
+                    lines = block.content.split("\n")
+                    start_idx = max(0, sym.line_start - 1)
+                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
+                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
+                else:
+                    snippet = block.content[:500]
+            else:
+                signature, snippet = qid, ""
+            items.append((qid, signature, snippet))
+
+        batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
+        label = "bg_docstring" if background else "lazy_docstring_batch"
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: {len(items)} item(s) to generate, "
+            f"batch_size={batch_size}, label={label!r}"
+        )
+
+        # ── Phase 4: LLM batch generation loop ───────────────────────────────────
+        for i in range(0, len(items), batch_size):
+            batch = items[i : i + batch_size]
+            expected = {q for q, _, _ in batch}
+            prompt = self._build_docstring_batch_prompt(batch)
+
+            batch_num = i // batch_size + 1
+            total_batches = (len(items) + batch_size - 1) // batch_size
+            prompt_tokens = (
+                len(self._f.tokenizer.encode(prompt))
+                if self._f.tokenizer
+                else len(prompt) // 4
+            )
+            self._f._log_debug(
+                f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
+                f"{len(batch)} symbol(s), ~{prompt_tokens} prompt tokens, "
+                f"label={label!r}"
+            )
+
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a code documentation assistant. "
+                    "Output ONLY a valid JSON object. "
+                    "Your entire response must start with { and end with }. "
+                    "No text before { and no text after }."
+                ),
+                model_override=self._f.valves.llm_model,
+                max_tokens=0,
+                temperature=0.0,
+                label=label,
+                response_format={"type": "json_object"},
+                log_raw_response=False,
+                enable_thinking=False,
+            )
+
+            if not background:
+                self._lazy_docstrings_generated_this_turn += len(batch)
+
+            # ── Unify the "no response" and "parse failure" paths ────────────────────
+            # Both previously diverged here: a None response used `continue`,
+            # skipping the batch entirely with no recovery; a parse failure fell
+            # through to an empty `parsed` dict. Routing both into the same
+            # `parsed` variable lets the single retry block below handle either
+            # failure mode identically, instead of silently losing the whole batch.
+            if response is None:
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
+                )
+                parsed: Dict[str, str] = {}
+            else:
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — "
+                    f"received {len(response)}-char response"
+                )
+                parsed = self._parse_docstring_batch_response(response, expected)
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — "
+                    f"parsed {len(parsed)} docstring(s)"
+                )
+
+            # ── Retry individually any qid the batch call failed to resolve ──────────
+            # A multi-key JSON request under greedy (temperature=0.0) decoding
+            # can stop right after the first syntactically-valid key-value pair
+            # — the model treats an early closing brace as a legitimate
+            # completion instead of continuing through all requested keys. The
+            # same behaviour is harmless (indeed correct) when only one key was
+            # ever requested, so re-issuing each unresolved qid as its own
+            # single-item call converts the model's bad habit on N-item batches
+            # into the desired outcome on 1-item calls.
+            #
+            # Restricted to background=True: this path is also reached from the
+            # lazy (foreground) flow via run_lazy_tasks() inside inlet(), which
+            # runs synchronously on the user's actual turn. Each retry is a real
+            # LLM round-trip (observed 1-7s elsewhere in this codebase), so
+            # adding them here would trade docstring completeness for added
+            # user-facing latency — not worth it on the foreground path.
+            # Background runs have no such constraint.
+            missing = expected - set(parsed.keys())
+            if missing and len(batch) > 1 and background:
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — "
+                    f"retrying {len(missing)} unresolved qid(s) individually"
+                )
+                sig_by_qid = {q: s for q, s, _ in batch}
+                recovered = 0
+                for qid in missing:
+                    single_doc = await self._generate_docstring_single(
+                        qid, sig_by_qid.get(qid, qid), label
+                    )
+                    if single_doc:
+                        parsed[qid] = single_doc
+                        recovered += 1
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num} — "
+                    f"retry recovered {recovered}/{len(missing)} qid(s) "
+                    f"(total now {len(parsed)}/{len(batch)})"
+                )
+
+            # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
+            for qid, docstring in parsed.items():
+                resolved[qid] = docstring
+                sym, _ = _find_symbol(qid)
+                if sym is not None:
+                    sym.docstring = docstring
+                self._f._symbol_index.update_docstring(qid, project_id, docstring)
+
+            if parsed:
+                rows = [
+                    (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
+                ]
+
+                def _write_batch(rows: list = rows) -> None:
+                    self._f._db_conn.executemany(
+                        "INSERT OR REPLACE INTO symbol_docstrings "
+                        "(project_id, symbol_name, docstring, updated_at) "
+                        "VALUES (?,?,?,?)",
+                        rows,
+                    )
+                    self._f._db_conn.commit()
+
+                await self._f._state_store._db_enqueue(_write_batch)
+
+        self._f._log_debug(
+            f"ensure_docstrings_batch: done — "
+            f"resolved {len(resolved)} / {len(qids)} total"
+        )
+        return resolved
 
     async def ensure_cfg_batch(
         self, qids: List[str], project_id: str
@@ -23986,6 +24061,16 @@ class ActiveCodeUpdater:
         existing_contents = {h: b.content for h, b in state.active_blocks.items()}
 
         for new_block in new_blocks:
+            # Bonus optimization: an exact hash match is necessarily a 100%
+            # content match (active_blocks is always keyed by block.hash —
+            # see the dict-key sync logic in _process_duplicate_block).
+            # calculate_code_similarity() would just re-prove what the hash
+            # already guarantees, at the cost of re-parsing potentially large
+            # content. Skip straight to the answer when the key already exists.
+            if new_block.hash in existing_contents:
+                duplicate_info[new_block.hash] = (True, new_block.hash)
+                continue
+
             is_dup = False
             existing_dup = None
             for h, ex_content in existing_contents.items():
@@ -23995,7 +24080,7 @@ class ActiveCodeUpdater:
                     and self._f._code_blocks.calculate_code_similarity(
                         new_block.content, ex_content
                     )
-                    >= self._f.valves.code_similarity_threshold
+                    >= self.valves.code_similarity_threshold
                 ):
                     is_dup = True
                     existing_dup = h
@@ -28562,6 +28647,24 @@ class TaskRegistry:
         tasks = [
             # ------------------------------------------------------------------
             # Task 1: Session summary (highest priority: controls context size).
+            #
+            # Bug fix: skip_if_completed changed from True to False. This task
+            # has no invalidation_func, because its trigger condition (message
+            # count crossing an interval boundary) isn't expressible as a single
+            # comparable hash the way structure_hash or code_state_hash are.
+            # Without an invalidation_func, is_completed()'s third check is
+            # always skipped, so "completed" — once set True by EITHER the lazy
+            # or the background path's first normal completion (which happens
+            # almost immediately in practice, since _bg_session_summary's
+            # no-op early-return when the interval isn't due still counts as a
+            # fast, successful completion) — stays True for the rest of the
+            # process lifetime, permanently disabling lazy catch-up.
+            # skip_if_completed=False (matching lod_adaptive below, which has
+            # the same recurring/interval-shaped trigger condition) makes the
+            # flag irrelevant for gating: lazy always attempts, and its own
+            # internal interval check cheaply no-ops on the vast majority of
+            # turns where nothing is due — exactly like the background variant
+            # already does.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="session_summary",
@@ -28572,7 +28675,7 @@ class TaskRegistry:
                 valve_bg="enable_bg_session_summary",
                 valve_lazy="enable_lazy_session_summary",
                 priority=1,
-                skip_if_completed=True,
+                skip_if_completed=False,
             ),
             # ------------------------------------------------------------------
             # Task 2: Speculative prefetch.
@@ -28608,6 +28711,11 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 4: RAPTOR rebuild.
+            #
+            # No fix needed: _lazy_raptor and _bg_raptor call the identical
+            # underlying RaptorCodeIndex.rebuild(project_id, ...) with the same
+            # arguments (same project-wide scope), differing only in
+            # stop_event. invalidation_func correctly ties to structure_hash.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="raptor",
@@ -28624,6 +28732,11 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 5: Purge old versions (experimental, disabled by default).
+            #
+            # No fix needed: _lazy_purge and _bg_purge call the identical
+            # underlying ContextPager.purge_old_versions(project_id, ...) with
+            # the same scope (project-wide), differing only in stop_event.
+            # invalidation_func correctly ties to code_state_hash.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="purge",
@@ -28640,6 +28753,11 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 6: LOD adaptive (invalidated every turn via message_count).
+            #
+            # No fix needed: already uses skip_if_completed=False, which is
+            # the exact same fix now also applied to session_summary above,
+            # for the same underlying reason (recurring/interval-shaped
+            # trigger that a binary completed-flag can't represent).
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="lod_adaptive",
@@ -28720,7 +28838,10 @@ class TaskRegistry:
         have their lazy valve enabled.
 
         This is called at the beginning of the inlet, after background tasks
-        have been stopped.
+        have been stopped. Note: this method is never reached on a turn that
+        triggers silent ingestion — that branch returns from inlet() before
+        execution reaches this point, so lazy tasks structurally never run on
+        a silent-ingestion turn.
 
         Args:
             project_id: The current project identifier.
@@ -28748,17 +28869,42 @@ class TaskRegistry:
 
             # ------------------------------------------------------------------
             # Step 4: Execute the lazy function.
+            #
+            # Bug fix: lazy variants whose scope is narrower than their
+            # background counterpart (e.g. _lazy_docstrings only resolves
+            # symbols visible THIS turn, not the whole project; _lazy_prefetch
+            # only builds views for THIS turn's query seeds, not the
+            # predictive call-graph-neighbor set background builds) must not
+            # silently mark the SHARED completion flag true on a partial or
+            # no-op success — that would suppress future lazy invocations for
+            # the rest of the session (until the task's invalidation hash
+            # changes), even when a different symbol/seed genuinely still
+            # needs handling on a later turn. lazy_func now signals this via
+            # its return value: False = "ran, but my scope here doesn't
+            # represent full task completion — leave the shared flag
+            # untouched"; any other return value (including the implicit None
+            # most lazy_func implementations still return) = "treat as
+            # before" and mark completed, preserving existing behavior for
+            # tasks whose lazy/background scopes are genuinely equivalent
+            # (raptor, purge) or whose flag is irrelevant for gating anyway
+            # (lod_adaptive, session_summary — see _build_tasks).
             # ------------------------------------------------------------------
             try:
-                await task.lazy_func(project_id)
-                task.mark_completed(pstate, project_id)
-                self._f._log_debug(f"lazy task '{task.name}': completed")
+                outcome = await task.lazy_func(project_id)
+                if outcome is False:
+                    self._f._log_debug(
+                        f"lazy task '{task.name}': ran (partial/empty scope, "
+                        f"shared completion flag left untouched)"
+                    )
+                else:
+                    task.mark_completed(pstate, project_id)
+                    self._f._log_debug(f"lazy task '{task.name}': completed")
             except Exception as e:
                 self._f._log_debug(f"lazy task '{task.name}': FAILED — {e}")
                 task.mark_not_completed(pstate)
 
     # ------------------------------------------------------------------
-    # Region: Background Task Wrappers (Bugs 8 and 13)
+    # Region: Background Task Wrappers
     # ------------------------------------------------------------------
 
     async def _bg_raptor(self, project_id: str, stop_event=None) -> None:
@@ -28878,7 +29024,7 @@ class TaskRegistry:
     # Region: Lazy Implementations (Specific to Each Task)
     # ------------------------------------------------------------------
 
-    async def _lazy_docstrings(self, project_id: str) -> None:
+    async def _lazy_docstrings(self, project_id: str) -> bool:
         """
         Generate docstrings on demand for symbols about to appear in the
         current turn's Block B (LOD-2) or skeleton tier, before context assembly.
@@ -28891,13 +29037,23 @@ class TaskRegistry:
 
         Args:
             project_id: Current project identifier.
+
+        Returns:
+            False always. This method's scope (symbols visible THIS turn only)
+            is narrower than the project-wide scope the shared "docstrings"
+            BackgroundTask completion flag is meant to represent. Returning
+            False signals run_lazy_tasks to leave that shared flag untouched,
+            so project-wide completeness continues to be tracked solely by
+            the background variant (_docstring_generation_loop), which scans
+            every active block on every outlet regardless of this flag's
+            state.
         """
         psm = self._f._project_state_manager
 
         # Region: load current conversation state
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
-            return
+            return False
 
         # Region: determine which symbol tiers are visible this turn
         skeleton_qids = set(psm.get_skeleton_tier_qids(project_id))
@@ -28909,15 +29065,12 @@ class TaskRegistry:
             if block.obsolete:
                 continue
             for sym in block.symbols:
-                # qualify_symbol includes file_path so that module-level functions
-                # resolve to "module.func" rather than bare "func", matching the
-                # qualified ids stored in skeleton_qids and lod2_qids.
                 qid = qualify_symbol(sym)
                 if (qid in skeleton_qids or qid in lod2_qids) and not sym.docstring:
                     qids_needed.add(qid)
 
         if not qids_needed:
-            return
+            return False
 
         # Region: generate missing docstrings via the shared batch helper
         results = await self._f._enrichment.ensure_docstrings_batch(
@@ -28931,8 +29084,9 @@ class TaskRegistry:
                 f"_lazy_docstrings: generated {len(results)} docstring(s) "
                 f"for this turn"
             )
+        return False
 
-    async def _lazy_prefetch(self, project_id: str) -> None:
+    async def _lazy_prefetch(self, project_id: str) -> bool:
         """
         Lazy prefetch: build CodePathView for symbols mentioned in the query.
 
@@ -28942,6 +29096,20 @@ class TaskRegistry:
 
         Args:
             project_id: Current project identifier.
+
+        Returns:
+            False always. This method's scope is conceptually different from
+            and narrower than speculative_prefetch_background's scope: lazy
+            builds views for THIS turn's query seed nodes (top 3), while
+            background builds views for call-graph neighbors of the
+            PREVIOUS turn's most-activated nodes, predicting what the NEXT
+            query might need. The two functions serve different purposes
+            even though both write into the same PathIndex. Returning False
+            tells run_lazy_tasks to leave the shared "prefetch" completion
+            flag untouched, so it continues to be driven solely by
+            speculative_prefetch_background's own completions — which
+            correctly invalidate via compute_code_state_hash whenever the
+            active code changes.
         """
         psm = self._f._project_state_manager
 
@@ -28950,7 +29118,7 @@ class TaskRegistry:
         # ------------------------------------------------------------------
         query = psm.get_last_user_query(project_id)
         if not query:
-            return
+            return False
 
         # ------------------------------------------------------------------
         # Step 2: Build activation graph for the query.
@@ -28966,15 +29134,35 @@ class TaskRegistry:
                     seed, ag, project_id
                 )
 
+        return False
+
     async def _lazy_session_summary(self, project_id: str) -> None:
         """
         Lazy session summary generation. Executed if not already done in background.
+
+        Note (bug fix): unlike _lazy_docstrings/_lazy_prefetch, this function
+        does not need to return False to suppress the shared completion flag.
+        The "session_summary" BackgroundTask entry now has
+        skip_if_completed=False (see _build_tasks), so should_skip_lazy()
+        never consults is_completed() for this task at all — the issue here
+        was different from the docstrings/prefetch scope mismatch. This task
+        has no invalidation_func (its trigger is an interval over
+        message_count, not a single comparable hash like structure_hash or
+        code_state_hash), so once EITHER the lazy or the background path
+        completed normally a single time, the "completed" flag would
+        otherwise stay True for the rest of the process lifetime — and since
+        _bg_session_summary's no-op early-return (when the interval isn't
+        due yet) still counts as a fast, successful completion under
+        _run_task, that happens almost immediately, on essentially the
+        first outlet. skip_if_completed=False sidesteps the missing
+        invalidation entirely, mirroring how lod_adaptive already handles
+        the same recurring/interval-shaped trigger condition.
 
         Args:
             project_id: The current project identifier.
         """
         state = self._f._conversation_state_manager.get(project_id)
-        interval = self._f.valves.session_summary_interval_messages
+        interval = self.valves.session_summary_interval_messages
         if (
             interval <= 0
             or state.message_count % interval != 0
