@@ -4236,22 +4236,22 @@ class RaptorCodeIndex:
     ) -> str:
         """
         Generate an LLM summary describing the cluster's shared responsibility.
-    
+
         Args:
             member_texts: List of member texts (signatures or summaries).
             level: Cluster level (1 or 2).
             summary_model: Model to use.
             summary_max_tokens: Maximum tokens for the summary.
             llm_caller: Async LLM caller function.
-    
+
         Returns:
             The generated summary string, or empty string on failure.
         """
         if not member_texts:
             return ""
-    
+
         listing = "\n".join(f"- {t}" for t in member_texts[:30])
-    
+
         # ------------------------------------------------------------------
         # Build level-specific prompt.
         # ------------------------------------------------------------------
@@ -4268,7 +4268,7 @@ class RaptorCodeIndex:
                 f"larger module:\n{listing}\n\n"
                 f"In 2-3 sentences, describe the module's overall purpose."
             )
-    
+
         # ------------------------------------------------------------------
         # Call the LLM.
         #
@@ -4798,7 +4798,7 @@ class ContextBuilder:
 
         return static_block
 
-    def invalidate_block_a_cache(
+    async def invalidate_block_a_cache(
         self, project_id: str, reason: str = "", recompute_centrality: bool = False
     ) -> None:
         """
@@ -4815,10 +4815,10 @@ class ContextBuilder:
 
         if recompute_centrality:
             try:
-                psm.set_node_centrality(
-                    project_id,
-                    self._f._symbol_index.precompute_centrality(project_id),
+                centrality = await anyio.to_thread.run_sync(
+                    lambda: self._f._symbol_index.precompute_centrality(project_id)
                 )
+                psm.set_node_centrality(project_id, centrality)
             except Exception as e:
                 self._f._log_debug(f"Centrality recomputation failed: {e}")
 
@@ -6005,6 +6005,7 @@ Output only the option name.
         slot_free: bool,
         intent_vector: dict,
         is_continuation: bool,
+        use_case_override: Optional[str] = None,
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
@@ -6012,16 +6013,6 @@ Output only the option name.
         Constructs the per-query dynamic context injected alongside the static
         Block A.  Uses PPR activation, LOD thresholds, semantic filtering, and
         optional LLM-assisted relevance evaluation for LOD-3 blocks.
-
-        Bug 12 fix: after the centrality LOD bump (Step 12), ``lod2_qids`` and
-        ``lod3_qids`` are rebuilt from the bumped scores so that ``_lod_tier()``
-        uses up-to-date sets.  Previously, nodes bumped above ``lod3_threshold``
-        were still rendered at LOD-2.
-
-        Bug 14 fix: ``lod2_candidates`` in Steps 13 and 14 now uses
-        ``lod2_qids - lod3_qids`` instead of plain ``lod2_qids``.  This avoids
-        generating docstrings and CFG skeletons for nodes that will already
-        receive their full body at LOD-3.
 
         Args:
             project_id: Current project identifier.
@@ -6075,9 +6066,15 @@ Output only the option name.
         # ------------------------------------------------------------------
         # Step 3: Use case classification and seed inference.
         # ------------------------------------------------------------------
-        active_use_case, use_case_profile, _ = await self.classify_use_case(
-            query, intent_vector, project_id
-        )
+        if use_case_override is not None:
+            active_use_case = use_case_override
+            use_case_profile = dict(
+                self.LOD_PROFILES.get(active_use_case, self.LOD_PROFILES["C"])
+            )
+        else:
+            active_use_case, use_case_profile, _ = await self.classify_use_case(
+                query, intent_vector, project_id
+            )
 
         inferred_seeds: Dict[str, float] = {}
         if self._f.valves.seed_inference_mode != "off":
@@ -18112,28 +18109,24 @@ Output only the symbol name.
         entry points (symbols with no callers) and building a CodePathView
         for each one. It also precomputes centrality if enabled.
 
-        Performance note (bug fix): an existing, non-stale CodePathView for an
-        entry point is reused as-is instead of triggering a fresh
-        build_activation_graph() + PPR computation. Without this check, every
-        call to this method (once per silent-ingestion turn) recomputed PPR
-        for EVERY entry point in the project unconditionally — even when only
-        one symbol among hundreds actually changed, and even on a turn where
-        nothing about that specific entry point's subgraph differs from the
-        last rebuild. Staleness is verified the same way _post_update_tasks
-        already does: by recomputing structural_hash/call_graph_hash from the
-        EXISTING view's own induced_nodes and comparing against the view's
-        stored hashes. This is cheap (no PPR, no power iteration — just dict
-        lookups against the SymbolIndex) and answers exactly "did anything
-        this view actually covers change", independent of whether unrelated
-        parts of the codebase changed.
+        Performance note: an existing, non-stale CodePathView for an entry
+        point is reused as-is instead of triggering a fresh
+        build_activation_graph() + PPR computation. Staleness is verified
+        the same way _post_update_tasks already does: by recomputing
+        structural_hash/call_graph_hash from the EXISTING view's own
+        induced_nodes and comparing against the view's stored hashes. This
+        is cheap (no PPR, no power iteration — just dict lookups against the
+        SymbolIndex) and answers exactly "did anything this view actually
+        covers change", independent of whether unrelated parts of the
+        codebase changed.
 
         Known limitation, inherited from the existing staleness semantics:
         compute_call_graph_hash only enumerates OUTGOING edges from the
         view's induced nodes, so a brand-new edge pointing INTO one of those
         nodes from a symbol outside the induced set won't be detected as a
         change here. This is the same blind spot _post_update_tasks already
-        has — this fix applies the existing freshness contract proactively,
-        it does not weaken it further.
+        has — this applies the existing freshness contract proactively, it
+        does not weaken it further.
 
         Args:
             project_id: Current project identifier.
@@ -18196,10 +18189,7 @@ Output only the symbol name.
             f"{rebuilt} rebuilt (of {len(entry_points)} total)"
         )
 
-        # ------------------------------------------------------------------
-        # Step 4: Precompute centrality if enabled.
-        # ------------------------------------------------------------------
-        if self.valves.enable_centrality_prior:
+        if self._f.valves.enable_centrality_prior:
             psm = self._f._project_state_manager
             psm.set_node_centrality(
                 project_id,
@@ -22787,48 +22777,22 @@ class EnrichmentTasks:
         Resolve docstrings for many symbols at once, identified by their
         QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
 
-        Uses ``response_format={"type": "json_object"}`` and
-        ``enable_thinking=False`` to force clean JSON output from the server
-        with no reasoning preamble. The server-side GBNF grammar guarantees
-        valid JSON, so the parser calls ``json.loads`` directly with no artifact
-        stripping.
-
-        Cache hits (already in memory or SQLite) are resolved for free.
-        Cache misses are generated in groups of ``lazy_docstring_batch_size``.
-        Any qid a batch call failed to resolve (parse error, missing key, or
-        a mangled/truncated identifier) is retried individually — see Phase 4.
-
-        Qualified id convention
-        ───────────────────────
-        Ids must be built with ``qualify_symbol(sym)`` (which includes
-        ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
-        (which omits ``file_path``). Module-level functions without a parent
-        class are indexed by the SymbolIndex as ``"module.function"`` when a
-        file path is available. Omitting the file path produces bare ``"function"``,
-        which never matches SymbolIndex lookups and prevents in-memory symbol
-        objects from being updated after generation.
+        Cache hits (already in memory or SQLite) are resolved for free, via a
+        SINGLE batched SQL query for all DB-pending qids rather than one
+        round-trip per qid. Cache misses are generated in groups of
+        ``lazy_docstring_batch_size``. Any qid a batch call failed to resolve
+        is retried individually — see Phase 4.
 
         Args:
-            qids:       List of qualified symbol ids to resolve. May contain
-                        duplicates; they are removed before processing.
+            qids:       List of qualified symbol ids to resolve.
             project_id: Current project identifier.
-            background: When ``True``, uses the ``bg_docstring`` LLM label
-                        (whitelisted during silent ingestion), bypasses the
-                        per-turn generation budget, and enables single-item
-                        retry for any qid a batch call failed to resolve.
-                        When ``False``, uses ``lazy_docstring_batch``, respects
-                        the budget, and skips retry (this path runs inside
-                        inlet()'s lazy-task flow and must not add extra
-                        round-trip latency to the user's turn).
+            background: When True, enables single-item retry for unresolved
+                        qids. False (lazy/foreground) skips retry to avoid
+                        adding round-trip latency to the user's turn.
 
         Returns:
-            Mapping from qualified id to docstring for every symbol that was
-            successfully resolved, whether from cache, batch generation, or
-            single-item retry.
+            Mapping from qualified id to docstring for every symbol resolved.
         """
-        # ── Deduplicate while preserving insertion order ──────────────────────────
-        # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
-        # order, unlike set() which does not.
         qids = list(dict.fromkeys(qids))
 
         self._f._log_debug(
@@ -22838,18 +22802,7 @@ class EnrichmentTasks:
 
         state = self._f._conversation_state_manager.get(project_id)
         resolved: Dict[str, str] = {}
-        pending: List[str] = []
 
-        # ── Build qid → (symbol, block) lookup index ─────────────────────────────
-        # Built once here to avoid O(N²) scans across active_blocks during the
-        # cache and batch phases.
-        #
-        # qualify_symbol() is used (not qualify_symbol_name without file_path) so
-        # that module-level functions like "foo" in "mymodule.py" are indexed
-        # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
-        # Using qualify_symbol_name(name, parent_symbol) without file_path would
-        # produce bare "foo", which never matches SymbolIndex lookups and prevents
-        # in-memory symbol objects from being updated after docstring generation.
         _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
         for _block in state.active_blocks.values():
             for _sym in _block.symbols:
@@ -22862,30 +22815,45 @@ class EnrichmentTasks:
         ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
             return _qid_index.get(qid, (None, None))
 
-        # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
+        # ── Phase 1a: resolve from in-memory symbol objects ───────────────────
+        needs_db_check: List[str] = []
         for qid in qids:
             sym, _ = _find_symbol(qid)
             found = sym.docstring if sym and sym.docstring else ""
-
-            if not found:
-                try:
-                    row = await self._f._state_store._db_read(
-                        lambda: self._f._db_conn.execute(
-                            "SELECT docstring FROM symbol_docstrings "
-                            "WHERE project_id=? AND symbol_name=?",
-                            (project_id, qid),
-                        ).fetchone()
-                    )
-                except Exception:
-                    row = None
-
-                if row and row[0]:
-                    found = row[0]
-                    if sym is not None:
-                        sym.docstring = found
-                    self._f._symbol_index.update_docstring(qid, project_id, found)
-
             if found:
+                resolved[qid] = found
+            else:
+                needs_db_check.append(qid)
+
+        # ── Phase 1b: one batched SQL query instead of N round-trips ──────────
+        # Bug fix: the original code issued one _db_read() per qid here — each
+        # dispatching to the thread pool via anyio.to_thread.run_sync. A batch
+        # of 8 unresolved qids meant 8 consecutive thread round-trips before
+        # any LLM work even started.
+        if needs_db_check:
+            placeholders = ",".join("?" * len(needs_db_check))
+            try:
+                rows = await self._f._state_store._db_read(
+                    lambda: self._f._db_conn.execute(
+                        f"SELECT symbol_name, docstring FROM symbol_docstrings "
+                        f"WHERE project_id=? AND symbol_name IN ({placeholders})",
+                        [project_id] + needs_db_check,
+                    ).fetchall()
+                )
+            except Exception:
+                rows = []
+            db_cache: Dict[str, str] = {row[0]: row[1] for row in rows if row[1]}
+        else:
+            db_cache = {}
+
+        pending: List[str] = []
+        for qid in needs_db_check:
+            found = db_cache.get(qid, "")
+            if found:
+                sym, _ = _find_symbol(qid)
+                if sym is not None:
+                    sym.docstring = found
+                self._f._symbol_index.update_docstring(qid, project_id, found)
                 resolved[qid] = found
             else:
                 pending.append(qid)
@@ -22900,7 +22868,6 @@ class EnrichmentTasks:
             )
             return resolved
 
-        # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
         if not background:
             budget = self._f.valves.lazy_docstring_max_per_turn
             if budget > 0:
@@ -22918,7 +22885,6 @@ class EnrichmentTasks:
                 "ensure_docstrings_batch: background mode — per-turn budget skipped"
             )
 
-        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
         items: List[Tuple[str, str, str]] = []
         for qid in pending:
             sym, block = _find_symbol(qid)
@@ -22943,7 +22909,6 @@ class EnrichmentTasks:
             f"batch_size={batch_size}, label={label!r}"
         )
 
-        # ── Phase 4: LLM batch generation loop ───────────────────────────────────
         for i in range(0, len(items), batch_size):
             batch = items[i : i + batch_size]
             expected = {q for q, _, _ in batch}
@@ -22982,12 +22947,6 @@ class EnrichmentTasks:
             if not background:
                 self._lazy_docstrings_generated_this_turn += len(batch)
 
-            # ── Unify the "no response" and "parse failure" paths ────────────────────
-            # Both previously diverged here: a None response used `continue`,
-            # skipping the batch entirely with no recovery; a parse failure fell
-            # through to an empty `parsed` dict. Routing both into the same
-            # `parsed` variable lets the single retry block below handle either
-            # failure mode identically, instead of silently losing the whole batch.
             if response is None:
                 self._f._log_debug(
                     f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
@@ -23004,23 +22963,6 @@ class EnrichmentTasks:
                     f"parsed {len(parsed)} docstring(s)"
                 )
 
-            # ── Retry individually any qid the batch call failed to resolve ──────────
-            # A multi-key JSON request under greedy (temperature=0.0) decoding
-            # can stop right after the first syntactically-valid key-value pair
-            # — the model treats an early closing brace as a legitimate
-            # completion instead of continuing through all requested keys. The
-            # same behaviour is harmless (indeed correct) when only one key was
-            # ever requested, so re-issuing each unresolved qid as its own
-            # single-item call converts the model's bad habit on N-item batches
-            # into the desired outcome on 1-item calls.
-            #
-            # Restricted to background=True: this path is also reached from the
-            # lazy (foreground) flow via run_lazy_tasks() inside inlet(), which
-            # runs synchronously on the user's actual turn. Each retry is a real
-            # LLM round-trip (observed 1-7s elsewhere in this codebase), so
-            # adding them here would trade docstring completeness for added
-            # user-facing latency — not worth it on the foreground path.
-            # Background runs have no such constraint.
             missing = expected - set(parsed.keys())
             if missing and len(batch) > 1 and background:
                 self._f._log_debug(
@@ -23042,7 +22984,6 @@ class EnrichmentTasks:
                     f"(total now {len(parsed)}/{len(batch)})"
                 )
 
-            # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
             for qid, docstring in parsed.items():
                 resolved[qid] = docstring
                 sym, _ = _find_symbol(qid)
@@ -25238,9 +25179,30 @@ class SystemPromptBuilder:
         slot_busy: bool = False,
         is_continuation: bool = False,
         intent_vector: Optional[dict] = None,
+        use_case: Optional[str] = None,
+        use_case_label: Optional[str] = None,
     ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
         """
         Orchestrate the construction of the two-block system prompt.
+
+        Performance notes:
+          - use_case / use_case_label: when the caller (inlet(), via
+            classify_intent_with_continuation) already computed these this
+            turn, pass them in to skip a redundant classify_use_case() call
+            in Step 4a. Both are threaded further into _build_activated_code()
+            / build_block_b(), eliminating what was previously up to 3
+            additional classify_use_case() calls and 1 additional
+            classify_intent() call per turn.
+          - Step 4b (LTM retrieval) and Step 4c (parallel checks) are
+            independent, read-mostly operations against ChromaDB/CrossEncoder
+            and now run concurrently via asyncio.gather() instead of
+            sequentially. _build_activated_code() (Step 4d) is deliberately
+            NOT included — it writes per-project state (LOD hysteresis
+            tracking, hub-tier bookkeeping inside build_block_b()) and today's
+            early-return on cached_response skips it entirely; running it
+            concurrently would risk interleaving those state writes and would
+            mean paying for it even on a cache hit. It stays sequential, after
+            the pair, exactly where the cached_response early-return expects it.
 
         Returns (static_block, dynamic_injections, cached_response, prelim_system).
         """
@@ -25260,11 +25222,9 @@ class SystemPromptBuilder:
         hub_tier_text, hub_tier_hash, hub_tier_qids = (
             self._f._ctx_builder._build_hub_bodies_tier(project_id)
         )
-        # Almacenar en pstate (raw para claves de una sola clase)
         pstate_raw = psm.get_pstate(project_id)
         pstate_raw["hub_tier_text"] = hub_tier_text
         pstate_raw["hub_tier_hash"] = hub_tier_hash
-        # Usar accesores tipados para claves compartidas
         psm.set_hub_tier_qids(project_id, hub_tier_qids)
         psm.set_hub_tier_prev_seeds(
             project_id,
@@ -25276,32 +25236,48 @@ class SystemPromptBuilder:
         dynamic_injections: List[Tuple[str, str]] = []
 
         # 4a: Compute use_case label
-        use_case, _, use_case_label = await self._f._ctx_builder.classify_use_case(
-            user_query, intent_vector or {}, project_id
-        )
+        if use_case is None or use_case_label is None:
+            use_case, _, use_case_label = await self._f._ctx_builder.classify_use_case(
+                user_query, intent_vector or {}, project_id
+            )
 
-        # 4b: LTM retrieval (with current messages for deduplication)
-        self._f._log_debug("🔄 Block B – Step 1/5: LTM per-query retrieval")
-        ltm_text = await self._build_ltm_injection(
-            project_id,
-            user_question,
-            user_query,
-            is_code_session,
-            slot_free,
-            use_case_label,
-            is_continuation=is_continuation,
-            current_messages=messages,
+        # 4b + 4c: LTM retrieval and parallel checks, run concurrently.
+        self._f._log_debug(
+            "🔄 Block B – Step 1-2/5: LTM retrieval + parallel checks (concurrent)"
         )
-        if ltm_text:
-            dynamic_injections.append(("high", ltm_text))
-
-        # -- 4c: Parallel checks --
-        self._f._log_debug("🔄 Block B – Step 2/5: Parallel checks")
-        contradiction_warning, cached_response, duplicate_match = (
-            await self._build_parallel_checks(
+        ltm_task = asyncio.create_task(
+            self._build_ltm_injection(
+                project_id,
+                user_question,
+                user_query,
+                is_code_session,
+                slot_free,
+                use_case_label,
+                is_continuation=is_continuation,
+                current_messages=messages,
+            )
+        )
+        checks_task = asyncio.create_task(
+            self._build_parallel_checks(
                 messages, user_query, project_id, state, slot_free
             )
         )
+        ltm_text, checks_result = await asyncio.gather(
+            ltm_task, checks_task, return_exceptions=True
+        )
+
+        if isinstance(ltm_text, Exception):
+            self._f._log_debug(f"_build_ltm_injection failed: {ltm_text}")
+            ltm_text = None
+        if ltm_text:
+            dynamic_injections.append(("high", ltm_text))
+
+        if isinstance(checks_result, Exception):
+            self._f._log_debug(f"_build_parallel_checks failed: {checks_result}")
+            contradiction_warning = cached_response = duplicate_match = None
+        else:
+            contradiction_warning, cached_response, duplicate_match = checks_result
+
         if cached_response:
             return static_block, [], cached_response, ""
         if contradiction_warning and self._f.valves.contradiction_inject_warning:
@@ -25318,7 +25294,13 @@ class SystemPromptBuilder:
         # -- 4d: Activated code --
         self._f._log_debug("🔄 Block B – Step 3/5: Code activated by query")
         active_ctx = await self._build_activated_code(
-            user_query, project_id, messages, is_code_session, slot_free
+            user_query,
+            project_id,
+            messages,
+            is_code_session,
+            slot_free,
+            intent_vector=intent_vector,
+            use_case=use_case,
         )
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
@@ -25339,7 +25321,6 @@ class SystemPromptBuilder:
             messages,
         )
 
-        # Guardar últimas puntuaciones de activación para prefetch y seguimiento LOD
         pstate["last_activation_scores"] = getattr(
             self._f, "_last_activation_scores", {}
         ).get(project_id, {})
@@ -25774,15 +25755,19 @@ class SystemPromptBuilder:
         messages: List[dict],
         is_code_session: bool,
         slot_free: bool,
+        intent_vector: Optional[dict] = None,
+        use_case: Optional[str] = None,
     ) -> Optional[str]:
         """Obtain LOD-activated code context for the current query, if applicable."""
         if not (is_code_session and self._f.valves.enable_code_awareness):
             return None
 
         if self._f.valves.enable_path_analysis:
-            intent_vector = await self._f._commands.classify_intent(
-                user_query, project_id
-            )
+            if intent_vector is None:
+                intent_vector = await self._f._commands.classify_intent(
+                    user_query, project_id
+                )
+
             active_ctx = await self._f._ctx_builder.build_block_b(
                 project_id=project_id,
                 query=user_query,
@@ -25790,12 +25775,16 @@ class SystemPromptBuilder:
                 slot_free=slot_free,
                 intent_vector=intent_vector,
                 is_continuation=not slot_free,
+                use_case_override=use_case,
             )
 
             # --- Check suppression before falling back ---
-            active_use_case, _, _ = await self._f._ctx_builder.classify_use_case(
-                user_query, intent_vector, project_id
-            )
+            if use_case is not None:
+                active_use_case = use_case
+            else:
+                active_use_case, _, _ = await self._f._ctx_builder.classify_use_case(
+                    user_query, intent_vector, project_id
+                )
             suppress_sigs = (
                 self._f.valves.skeleton_tier_suppresses_block_b_signatures
                 and active_use_case != "D"
@@ -25805,14 +25794,12 @@ class SystemPromptBuilder:
             if active_ctx:
                 return active_ctx
             elif suppress_sigs:
-                # If suppression is active, don't fall back to full context
                 self._f._log_debug(
                     "Skeleton tier active and suppress_sigs=True, "
                     "skipping fallback to active_code_context to avoid duplication"
                 )
                 return ""
             else:
-                # Fallback to full context
                 return self._f._activation.get_active_code_context(
                     project_id, user_query
                 )
@@ -28035,36 +28022,15 @@ class ContextAssembler:
         slot_busy: bool = False,
         is_continuation: bool = False,
         intent_vector: Optional[dict] = None,
+        use_case: Optional[str] = None,
+        use_case_label: Optional[str] = None,
     ) -> Tuple[List[dict], Optional[dict]]:
         """
         Execute the full context assembly pipeline for one turn.
 
-        Phase 1: Build Block A + Block B injections via SystemPromptBuilder.
-        Phase 2: Assemble the final message list via MessageAssembler.
-
-        Args:
-            messages: Current conversation message list.
-            project_id: Current project identifier.
-            user_query: Raw user query string.
-            user_question: Cleaned user question (code spans removed).
-            is_code_session: Whether the session involves code.
-            last_user_msg: The last user message dict, if any.
-            state: The persistent ConversationState for this project.
-            __user__: OpenWebUI user context.
-            has_code_blocks: Whether the user message contained code fences.
-            slot_busy: True if the KV slot is occupied (cold-start or
-                background tasks active).
-            is_continuation: True only for genuine AutoContinue turns
-                (the 'triangle CONTINUA:' marker was present in the last
-                assistant message).
-            intent_vector: Intent classification probabilities dict.
-
         Returns:
             Tuple of (final_messages, cached_response).
-            If cached_response is not None, the caller should short-circuit
-            and return the cached response without calling the LLM.
         """
-        # -- Phase 1: Build system injections (Block A + Block B) ----------
         static_block, dynamic_injections, cached_response, prelim_system = (
             await self._f._system_prompt_builder.build(
                 messages=messages,
@@ -28077,13 +28043,14 @@ class ContextAssembler:
                 slot_busy=slot_busy,
                 is_continuation=is_continuation,
                 intent_vector=intent_vector,
+                use_case=use_case,
+                use_case_label=use_case_label,
             )
         )
 
         if cached_response:
             return messages, cached_response
 
-        # -- Phase 2: Assemble final messages (CoT, compression, trimming) -
         final_messages = await self._f._message_assembler.assemble(
             messages=messages,
             project_id=project_id,
@@ -28100,10 +28067,6 @@ class ContextAssembler:
             is_continuation=is_continuation,
         )
 
-        # -- Validate active_blocks integrity after assembly ---------------
-        # ConversationState.active_blocks must always be a dict. If corrupted
-        # during assembly (e.g. failed DB load), reset it here so the inlet
-        # never returns an invalid state to the LLM.
         _state = self._f._conversation_state_manager.get(project_id)
         if not isinstance(_state.active_blocks, dict):
             self._f._log_debug(
@@ -31259,7 +31222,17 @@ class Filter:
             default="chat",
             description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
         )
-
+        llm_semaphore_concurrency: int = Field(
+            default=1,
+            ge=1,
+            le=8,
+            description=(
+                "Concurrent LLM requests. Keep at 1 for llama.cpp --parallel 1. "
+                "Set to 2+ only if your backend exposes per-call slot isolation "
+                "(vLLM, OpenAI API, or llama.cpp with --parallel N AND "
+                "enable_slot_persistence=False)."
+            ),
+        )
         # ── 2.2 Timeouts & retries ────────────────────────────────────────────
         llm_request_timeout: int = Field(
             default=900,
@@ -33337,17 +33310,13 @@ class Filter:
             7.  System-prompt assembly (Block A + Block B) with CoT, compression,
                 multi-phase, and adaptive trimming.
 
-        KV-1 fix: _slot_cont_attempted_{filename} / _slot_cont_succeeded_{filename}
-            guards are stored in pstate, which survives across turns.  Without
-            clearing them, the guard set on the first auxiliary LLM call of turn N
-            blocks ALL slot restores in turns N+1, N+2, … indefinitely, causing
-            a permanent KV-cache miss after the very first turn.
-
-        KV-4 fix: slot_restore_attempted / slot_restored are reset so that the
-            explicit slot_restore() call issued after preprocessing undoes the
-            background-task dirt that accumulated after the previous outlet's
-            slot_save.  Without this reset, slot_restore() is a no-op on every
-            turn after the first (the once-per-session guard stays True).
+        Performance note: use_case_key / use_case_label, computed once here via
+            classify_intent_with_continuation(), are threaded into
+            assemble_for_turn() → SystemPromptBuilder.build() →
+            _build_activated_code() → build_block_b(), eliminating up to 3
+            redundant classify_use_case() calls (each a possible CrossEncoder
+            pass + LLM-fallback round-trip) that previously recomputed the
+            identical result deeper in the pipeline.
         """
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
@@ -33615,7 +33584,14 @@ class Filter:
                         await self._activation.rebuild_path_index(project_id)
 
                     # -- invalidate and rebuild Block A eagerly ----------------
-                    self._ctx_builder.invalidate_block_a_cache(
+                    # NOTE: invalidate_block_a_cache() is now `async def` — its
+                    # recompute_centrality=True path dispatches PageRank to a
+                    # worker thread via anyio.to_thread.run_sync instead of
+                    # running it synchronously on the event loop (a 50-300 ms
+                    # stall previously observed here on every silent-ingestion
+                    # turn). `await` is mandatory; omitting it would silently
+                    # return a coroutine object without running the work.
+                    await self._ctx_builder.invalidate_block_a_cache(
                         project_id, "new chunk ingested", recompute_centrality=True
                     )
                     try:
@@ -33714,6 +33690,14 @@ class Filter:
 
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
+            #
+            #   Performance: use_case_key / use_case_label computed here are the
+            #   single source of truth for the rest of this turn — they are
+            #   threaded through assemble_for_turn() below instead of being
+            #   silently recomputed by classify_use_case() deeper in the
+            #   pipeline (SystemPromptBuilder.build() Step 4a,
+            #   _build_activated_code()'s suppress_sigs check, and
+            #   build_block_b() Step 3).
             # ----------------------------------------------------------------
             intent_vector = await self._commands.classify_intent(user_query, project_id)
 
@@ -33750,6 +33734,14 @@ class Filter:
                 slot_busy=slot_busy,
                 is_continuation=is_continuation,
                 intent_vector=intent_vector,
+                # Performance: propagate the use_case classification already
+                # computed above so SystemPromptBuilder.build() and everything
+                # it calls in turn reuse it instead of recomputing via fresh
+                # classify_use_case() calls. Both default to None upstream, so
+                # any call path that doesn't receive them transparently falls
+                # back to the original recompute-from-scratch behavior.
+                use_case=use_case_key,
+                use_case_label=use_case_label,
             )
             _inlet_timing("Step 6/6: Assemble context and final messages", step_start)
 
