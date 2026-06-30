@@ -4273,15 +4273,16 @@ class RaptorCodeIndex:
         # Call the LLM.
         # ------------------------------------------------------------------
         try:
-            return (
-                await llm_caller(
-                    prompt,
-                    system_prompt="You are a code summarisation assistant. Output only the summary.",
-                    model_override=summary_model,
-                    max_tokens=summary_max_tokens,
-                    temperature=0.2,
-                )
-            ).strip()
+            result = await llm_caller(
+                prompt,
+                system_prompt="You are a code summarisation assistant. Output only the summary.",
+                model_override=summary_model,
+                max_tokens=summary_max_tokens,
+                temperature=0.2,
+                label="raptor_summary",
+                enable_thinking=False,
+            )
+            return result.strip() if result else ""
         except Exception:
             return ""
 
@@ -10610,8 +10611,15 @@ class LongTermMemory:
 
         # ------------------------------------------------------------------
         # Region: Lazy-initialise purge lock
+        #
+        # Bug fix: __init__ already sets self._purge_lock = None, so the
+        # attribute always exists — hasattr() returns True from construction
+        # onward and this branch never ran. self._purge_lock stayed None
+        # forever, and the next line (.locked()) raised AttributeError on
+        # every call. Checking identity against None instead of attribute
+        # presence is the correct lazy-init guard here.
         # ------------------------------------------------------------------
-        if not hasattr(self, "_purge_lock"):
+        if self._purge_lock is None:
             self._purge_lock = asyncio.Lock()
 
         if self._purge_lock.locked():
@@ -22511,15 +22519,15 @@ class EnrichmentTasks:
     def _build_docstring_batch_prompt(self, items: List[Tuple[str, str, str]]) -> str:
         """
         Build the user-turn prompt for a batch docstring generation call.
-
+    
         The server-side response_format={"type": "json_object"} enforces JSON
         at the API level; the prompt text repeats the constraint so the model
         never falls back to prose or a numbered list.
-
+    
         Args:
             items: List of (qid, signature, snippet) tuples. Only qid and
                    signature are consumed; snippet is reserved for future use.
-
+    
         Returns:
             str: Ready-to-send prompt string.
         """
@@ -22529,22 +22537,99 @@ class EnrichmentTasks:
             # avoid pushing context beyond the model's effective attention span.
             sig = signature[:80] if signature else qid
             lines.append(f"  - {qid}: {sig}")
-
+    
         listing = "\n".join(lines)
         max_chars = self._f.valves.docstring_max_chars
-
+        n_items = len(items)
+    
         return (
             f"Generate a JSON object mapping each identifier below to a "
             f"one-sentence description (under {max_chars} characters).\n\n"
+            f"There are exactly {n_items} identifiers listed below. "
+            f"Your output MUST contain exactly {n_items} key-value pairs — "
+            f"one per identifier, never fewer.\n\n"
             f"Rules:\n"
-            f"  - Keys: exact identifiers as listed "
-            f"(preserve 'ClassName.method' dot notation).\n"
-            f"  - Values: plain strings, one sentence each.\n"
-            f"  - Output ONLY the JSON object. "
+            f"  - Keys: copy each identifier EXACTLY character-for-character "
+            f"as listed (preserve 'ClassName.method' dot notation). "
+            f"Never abbreviate, truncate, or merge an identifier.\n"
+            f"  - Values: plain strings, one sentence each. Never leave a "
+            f"value empty.\n"
+            f"  - Output ONLY the JSON object, with all {n_items} entries. "
             f"No markdown fences, no preamble, no explanation.\n\n"
-            f"Identifiers:\n{listing}"
+            f"Identifiers ({n_items} total):\n{listing}"
         )
 
+    async def _generate_docstring_single(
+        self,
+        qid: str,
+        signature: str,
+        label: str,
+    ) -> Optional[str]:
+        """
+        Generate a docstring for exactly one symbol via a single-item LLM call.
+    
+        Recovery fallback for batch items a multi-symbol batch call failed to
+        resolve (JSON parse failure, a truncated/merged identifier, or an
+        omitted key). With only one key requested, the exact behavior that
+        causes batch failures — the model emitting EOS right after the first
+        syntactically-valid key-value pair — becomes the CORRECT outcome
+        instead of a truncation, which is why a single-item retry recovers
+        most cases a 5-item batch lost.
+    
+        Args:
+            qid:       Qualified symbol id to document.
+            signature: The symbol's signature string (used as context).
+            label:     LLM call label, suffixed for retry-call identification.
+    
+        Returns:
+            A one-sentence docstring, or None on failure.
+        """
+        sig = signature[:80] if signature else qid
+        max_chars = self._f.valves.docstring_max_chars
+        prompt = (
+            f"Generate a one-sentence description (under {max_chars} "
+            f"characters) for this identifier.\n\n"
+            f"Identifier: {qid}\n"
+            f"Signature: {sig}\n\n"
+            f'Output only the JSON object, e.g. {{"{qid}": "..."}}'
+        )
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a code documentation assistant. "
+                "Output ONLY a valid JSON object with exactly one key-value "
+                "pair. Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.llm_model,
+            max_tokens=0,
+            temperature=0.0,
+            label=f"{label}_retry1",
+            response_format={"type": "json_object"},
+            log_raw_response=False,
+            enable_thinking=False,
+        )
+        if not response:
+            return None
+        try:
+            data = json.loads(response)
+            if not isinstance(data, dict):
+                return None
+            value = data.get(qid)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:max_chars]
+            # Defensive: even in a single-item request the model can still
+            # truncate/mangle the key it emits. Since exactly one item was
+            # requested, any non-empty string value present is necessarily
+            # intended for this qid regardless of the literal key string —
+            # accept it as a last resort rather than discarding good content
+            # over a cosmetic key mismatch.
+            for v in data.values():
+                if isinstance(v, str) and v.strip():
+                    return v.strip()[:max_chars]
+            return None
+        except (json.JSONDecodeError, Exception):
+            return None
+    
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
@@ -22618,250 +22703,299 @@ class EnrichmentTasks:
             return {}
 
     async def ensure_docstrings_batch(
-        self,
-        qids: List[str],
-        project_id: str,
-        background: bool = False,
-    ) -> Dict[str, str]:
-        """
-        Resolve docstrings for many symbols at once, identified by their
-        QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
-
-        Uses ``response_format={"type": "json_object"}`` and
-        ``enable_thinking=False`` to force clean JSON output from the server
-        with no reasoning preamble. The server-side GBNF grammar guarantees
-        valid JSON, so the parser calls ``json.loads`` directly with no artifact
-        stripping.
-
-        Cache hits (already in memory or SQLite) are resolved for free.
-        Cache misses are generated in groups of ``lazy_docstring_batch_size``.
-
-        Qualified id convention
-        ───────────────────────
-        Ids must be built with ``qualify_symbol(sym)`` (which includes
-        ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
-        (which omits ``file_path``). Module-level functions without a parent
-        class are indexed by the SymbolIndex as ``"module.function"`` when a
-        file path is available. Omitting the file path produces bare ``"function"``,
-        which never matches SymbolIndex lookups and prevents in-memory symbol
-        objects from being updated after generation.
-
-        Args:
-            qids:       List of qualified symbol ids to resolve. May contain
-                        duplicates; they are removed before processing.
-            project_id: Current project identifier.
-            background: When ``True``, uses the ``bg_docstring`` LLM label
-                        (whitelisted during silent ingestion) and bypasses the
-                        per-turn generation budget. When ``False``, uses
-                        ``lazy_docstring_batch`` and respects the budget.
-
-        Returns:
-            Mapping from qualified id to docstring for every symbol that was
-            successfully resolved, whether from cache or LLM generation.
-        """
-        # ── Deduplicate while preserving insertion order ──────────────────────────
-        # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
-        # order, unlike set() which does not.
-        qids = list(dict.fromkeys(qids))
-
-        self._f._log_debug(
-            f"ensure_docstrings_batch: starting with {len(qids)} qid(s) "
-            f"(background={background})"
-        )
-
-        state = self._f._conversation_state_manager.get(project_id)
-        resolved: Dict[str, str] = {}
-        pending: List[str] = []
-
-        # ── Build qid → (symbol, block) lookup index ─────────────────────────────
-        # Built once here to avoid O(N²) scans across active_blocks during the
-        # cache and batch phases.
-        #
-        # qualify_symbol() is used (not qualify_symbol_name without file_path) so
-        # that module-level functions like "foo" in "mymodule.py" are indexed
-        # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
-        # Using qualify_symbol_name(name, parent_symbol) without file_path would
-        # produce bare "foo", which never matches SymbolIndex lookups and prevents
-        # in-memory symbol objects from being updated after docstring generation.
-        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
-        for _block in state.active_blocks.values():
-            for _sym in _block.symbols:
-                _q = qualify_symbol(_sym)
-                if _q not in _qid_index:
-                    _qid_index[_q] = (_sym, _block)
-
-        def _find_symbol(
-            qid: str,
-        ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
-            return _qid_index.get(qid, (None, None))
-
-        # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
-        for qid in qids:
-            sym, _ = _find_symbol(qid)
-            found = sym.docstring if sym and sym.docstring else ""
-
-            if not found:
-                try:
-                    row = await self._f._state_store._db_read(
-                        lambda: self._f._db_conn.execute(
-                            "SELECT docstring FROM symbol_docstrings "
-                            "WHERE project_id=? AND symbol_name=?",
-                            (project_id, qid),
-                        ).fetchone()
-                    )
-                except Exception:
-                    row = None
-
-                if row and row[0]:
-                    found = row[0]
-                    if sym is not None:
-                        sym.docstring = found
-                    self._f._symbol_index.update_docstring(qid, project_id, found)
-
-            if found:
-                resolved[qid] = found
-            else:
-                pending.append(qid)
-
-        self._f._log_debug(
-            f"ensure_docstrings_batch: {len(pending)} pending after cache phase"
-        )
-
-        if not pending:
+            self,
+            qids: List[str],
+            project_id: str,
+            background: bool = False,
+        ) -> Dict[str, str]:
+            """
+            Resolve docstrings for many symbols at once, identified by their
+            QUALIFIED id (e.g. ``"ClassName.__init__"`` or ``"module.function"``).
+    
+            Uses ``response_format={"type": "json_object"}`` and
+            ``enable_thinking=False`` to force clean JSON output from the server
+            with no reasoning preamble. The server-side GBNF grammar guarantees
+            valid JSON, so the parser calls ``json.loads`` directly with no artifact
+            stripping.
+    
+            Cache hits (already in memory or SQLite) are resolved for free.
+            Cache misses are generated in groups of ``lazy_docstring_batch_size``.
+            Any qid a batch call failed to resolve (parse error, missing key, or
+            a mangled/truncated identifier) is retried individually — see Phase 4.
+    
+            Qualified id convention
+            ───────────────────────
+            Ids must be built with ``qualify_symbol(sym)`` (which includes
+            ``file_path``) rather than ``qualify_symbol_name(name, parent_symbol)``
+            (which omits ``file_path``). Module-level functions without a parent
+            class are indexed by the SymbolIndex as ``"module.function"`` when a
+            file path is available. Omitting the file path produces bare ``"function"``,
+            which never matches SymbolIndex lookups and prevents in-memory symbol
+            objects from being updated after generation.
+    
+            Args:
+                qids:       List of qualified symbol ids to resolve. May contain
+                            duplicates; they are removed before processing.
+                project_id: Current project identifier.
+                background: When ``True``, uses the ``bg_docstring`` LLM label
+                            (whitelisted during silent ingestion), bypasses the
+                            per-turn generation budget, and enables single-item
+                            retry for any qid a batch call failed to resolve.
+                            When ``False``, uses ``lazy_docstring_batch``, respects
+                            the budget, and skips retry (this path runs inside
+                            inlet()'s lazy-task flow and must not add extra
+                            round-trip latency to the user's turn).
+    
+            Returns:
+                Mapping from qualified id to docstring for every symbol that was
+                successfully resolved, whether from cache, batch generation, or
+                single-item retry.
+            """
+            # ── Deduplicate while preserving insertion order ──────────────────────────
+            # dict.fromkeys() is the idiomatic O(N) deduplication that preserves
+            # order, unlike set() which does not.
+            qids = list(dict.fromkeys(qids))
+    
             self._f._log_debug(
-                "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
+                f"ensure_docstrings_batch: starting with {len(qids)} qid(s) "
+                f"(background={background})"
+            )
+    
+            state = self._f._conversation_state_manager.get(project_id)
+            resolved: Dict[str, str] = {}
+            pending: List[str] = []
+    
+            # ── Build qid → (symbol, block) lookup index ─────────────────────────────
+            # Built once here to avoid O(N²) scans across active_blocks during the
+            # cache and batch phases.
+            #
+            # qualify_symbol() is used (not qualify_symbol_name without file_path) so
+            # that module-level functions like "foo" in "mymodule.py" are indexed
+            # under "mymodule.foo", matching the qualified ids produced by SymbolIndex.
+            # Using qualify_symbol_name(name, parent_symbol) without file_path would
+            # produce bare "foo", which never matches SymbolIndex lookups and prevents
+            # in-memory symbol objects from being updated after docstring generation.
+            _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+            for _block in state.active_blocks.values():
+                for _sym in _block.symbols:
+                    _q = qualify_symbol(_sym)
+                    if _q not in _qid_index:
+                        _qid_index[_q] = (_sym, _block)
+    
+            def _find_symbol(
+                qid: str,
+            ) -> Tuple[Optional["CodeSymbol"], Optional["CodeBlock"]]:
+                return _qid_index.get(qid, (None, None))
+    
+            # ── Phase 1: resolve from in-memory symbol objects and SQLite ─────────────
+            for qid in qids:
+                sym, _ = _find_symbol(qid)
+                found = sym.docstring if sym and sym.docstring else ""
+    
+                if not found:
+                    try:
+                        row = await self._f._state_store._db_read(
+                            lambda: self._f._db_conn.execute(
+                                "SELECT docstring FROM symbol_docstrings "
+                                "WHERE project_id=? AND symbol_name=?",
+                                (project_id, qid),
+                            ).fetchone()
+                        )
+                    except Exception:
+                        row = None
+    
+                    if row and row[0]:
+                        found = row[0]
+                        if sym is not None:
+                            sym.docstring = found
+                        self._f._symbol_index.update_docstring(qid, project_id, found)
+    
+                if found:
+                    resolved[qid] = found
+                else:
+                    pending.append(qid)
+    
+            self._f._log_debug(
+                f"ensure_docstrings_batch: {len(pending)} pending after cache phase"
+            )
+    
+            if not pending:
+                self._f._log_debug(
+                    "ensure_docstrings_batch: all resolved from cache, no LLM call needed"
+                )
+                return resolved
+    
+            # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
+            if not background:
+                budget = self._f.valves.lazy_docstring_max_per_turn
+                if budget > 0:
+                    remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
+                    pending = pending[:remaining]
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: {len(pending)} remaining after "
+                        f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
+                        f"limit={budget})"
+                    )
+                if not pending:
+                    return resolved
+            else:
+                self._f._log_debug(
+                    "ensure_docstrings_batch: background mode — per-turn budget skipped"
+                )
+    
+            # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
+            items: List[Tuple[str, str, str]] = []
+            for qid in pending:
+                sym, block = _find_symbol(qid)
+                if sym is not None and block is not None:
+                    signature = sym.signature
+                    if sym.line_start:
+                        lines = block.content.split("\n")
+                        start_idx = max(0, sym.line_start - 1)
+                        end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
+                        snippet = "\n".join(lines[start_idx:end_idx])[:500]
+                    else:
+                        snippet = block.content[:500]
+                else:
+                    signature, snippet = qid, ""
+                items.append((qid, signature, snippet))
+    
+            batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
+            label = "bg_docstring" if background else "lazy_docstring_batch"
+    
+            self._f._log_debug(
+                f"ensure_docstrings_batch: {len(items)} item(s) to generate, "
+                f"batch_size={batch_size}, label={label!r}"
+            )
+    
+            # ── Phase 4: LLM batch generation loop ───────────────────────────────────
+            for i in range(0, len(items), batch_size):
+                batch = items[i : i + batch_size]
+                expected = {q for q, _, _ in batch}
+                prompt = self._build_docstring_batch_prompt(batch)
+    
+                batch_num = i // batch_size + 1
+                total_batches = (len(items) + batch_size - 1) // batch_size
+                prompt_tokens = (
+                    len(self._f.tokenizer.encode(prompt))
+                    if self._f.tokenizer
+                    else len(prompt) // 4
+                )
+                self._f._log_debug(
+                    f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
+                    f"{len(batch)} symbol(s), ~{prompt_tokens} prompt tokens, "
+                    f"label={label!r}"
+                )
+    
+                response = await self._f._llm_orchestrator.call_llm(
+                    prompt=prompt,
+                    system_prompt=(
+                        "You are a code documentation assistant. "
+                        "Output ONLY a valid JSON object. "
+                        "Your entire response must start with { and end with }. "
+                        "No text before { and no text after }."
+                    ),
+                    model_override=self._f.valves.llm_model,
+                    max_tokens=0,
+                    temperature=0.0,
+                    label=label,
+                    response_format={"type": "json_object"},
+                    log_raw_response=False,
+                    enable_thinking=False,
+                )
+    
+                if not background:
+                    self._lazy_docstrings_generated_this_turn += len(batch)
+    
+                # ── Unify the "no response" and "parse failure" paths ────────────────────
+                # Both previously diverged here: a None response used `continue`,
+                # skipping the batch entirely with no recovery; a parse failure fell
+                # through to an empty `parsed` dict. Routing both into the same
+                # `parsed` variable lets the single retry block below handle either
+                # failure mode identically, instead of silently losing the whole batch.
+                if response is None:
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
+                    )
+                    parsed: Dict[str, str] = {}
+                else:
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: batch {batch_num} — "
+                        f"received {len(response)}-char response"
+                    )
+                    parsed = self._parse_docstring_batch_response(response, expected)
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: batch {batch_num} — "
+                        f"parsed {len(parsed)} docstring(s)"
+                    )
+    
+                # ── Retry individually any qid the batch call failed to resolve ──────────
+                # A multi-key JSON request under greedy (temperature=0.0) decoding
+                # can stop right after the first syntactically-valid key-value pair
+                # — the model treats an early closing brace as a legitimate
+                # completion instead of continuing through all requested keys. The
+                # same behaviour is harmless (indeed correct) when only one key was
+                # ever requested, so re-issuing each unresolved qid as its own
+                # single-item call converts the model's bad habit on N-item batches
+                # into the desired outcome on 1-item calls.
+                #
+                # Restricted to background=True: this path is also reached from the
+                # lazy (foreground) flow via run_lazy_tasks() inside inlet(), which
+                # runs synchronously on the user's actual turn. Each retry is a real
+                # LLM round-trip (observed 1-7s elsewhere in this codebase), so
+                # adding them here would trade docstring completeness for added
+                # user-facing latency — not worth it on the foreground path.
+                # Background runs have no such constraint.
+                missing = expected - set(parsed.keys())
+                if missing and len(batch) > 1 and background:
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: batch {batch_num} — "
+                        f"retrying {len(missing)} unresolved qid(s) individually"
+                    )
+                    sig_by_qid = {q: s for q, s, _ in batch}
+                    recovered = 0
+                    for qid in missing:
+                        single_doc = await self._generate_docstring_single(
+                            qid, sig_by_qid.get(qid, qid), label
+                        )
+                        if single_doc:
+                            parsed[qid] = single_doc
+                            recovered += 1
+                    self._f._log_debug(
+                        f"ensure_docstrings_batch: batch {batch_num} — "
+                        f"retry recovered {recovered}/{len(missing)} qid(s) "
+                        f"(total now {len(parsed)}/{len(batch)})"
+                    )
+    
+                # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
+                for qid, docstring in parsed.items():
+                    resolved[qid] = docstring
+                    sym, _ = _find_symbol(qid)
+                    if sym is not None:
+                        sym.docstring = docstring
+                    self._f._symbol_index.update_docstring(qid, project_id, docstring)
+    
+                if parsed:
+                    rows = [
+                        (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
+                    ]
+    
+                    def _write_batch(rows: list = rows) -> None:
+                        self._f._db_conn.executemany(
+                            "INSERT OR REPLACE INTO symbol_docstrings "
+                            "(project_id, symbol_name, docstring, updated_at) "
+                            "VALUES (?,?,?,?)",
+                            rows,
+                        )
+                        self._f._db_conn.commit()
+    
+                    await self._f._state_store._db_enqueue(_write_batch)
+    
+            self._f._log_debug(
+                f"ensure_docstrings_batch: done — "
+                f"resolved {len(resolved)} / {len(qids)} total"
             )
             return resolved
-
-        # ── Phase 2: apply per-turn budget (foreground / lazy mode only) ──────────
-        if not background:
-            budget = self._f.valves.lazy_docstring_max_per_turn
-            if budget > 0:
-                remaining = max(0, budget - self._lazy_docstrings_generated_this_turn)
-                pending = pending[:remaining]
-                self._f._log_debug(
-                    f"ensure_docstrings_batch: {len(pending)} remaining after "
-                    f"per-turn budget (used={self._lazy_docstrings_generated_this_turn}, "
-                    f"limit={budget})"
-                )
-            if not pending:
-                return resolved
-        else:
-            self._f._log_debug(
-                "ensure_docstrings_batch: background mode — per-turn budget skipped"
-            )
-
-        # ── Phase 3: build (qid, signature, snippet) items for LLM ───────────────
-        items: List[Tuple[str, str, str]] = []
-        for qid in pending:
-            sym, block = _find_symbol(qid)
-            if sym is not None and block is not None:
-                signature = sym.signature
-                if sym.line_start:
-                    lines = block.content.split("\n")
-                    start_idx = max(0, sym.line_start - 1)
-                    end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
-                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
-                else:
-                    snippet = block.content[:500]
-            else:
-                signature, snippet = qid, ""
-            items.append((qid, signature, snippet))
-
-        batch_size = max(1, self._f.valves.lazy_docstring_batch_size)
-        label = "bg_docstring" if background else "lazy_docstring_batch"
-
-        self._f._log_debug(
-            f"ensure_docstrings_batch: {len(items)} item(s) to generate, "
-            f"batch_size={batch_size}, label={label!r}"
-        )
-
-        # ── Phase 4: LLM batch generation loop ───────────────────────────────────
-        for i in range(0, len(items), batch_size):
-            batch = items[i : i + batch_size]
-            expected = {q for q, _, _ in batch}
-            prompt = self._build_docstring_batch_prompt(batch)
-
-            batch_num = i // batch_size + 1
-            total_batches = (len(items) + batch_size - 1) // batch_size
-            prompt_tokens = (
-                len(self._f.tokenizer.encode(prompt))
-                if self._f.tokenizer
-                else len(prompt) // 4
-            )
-            self._f._log_debug(
-                f"ensure_docstrings_batch: batch {batch_num}/{total_batches} — "
-                f"{len(batch)} symbol(s), ~{prompt_tokens} prompt tokens, "
-                f"label={label!r}"
-            )
-
-            response = await self._f._llm_orchestrator.call_llm(
-                prompt=prompt,
-                system_prompt=(
-                    "You are a code documentation assistant. "
-                    "Output ONLY a valid JSON object. "
-                    "Your entire response must start with { and end with }. "
-                    "No text before { and no text after }."
-                ),
-                model_override=self._f.valves.llm_model,
-                max_tokens=0,
-                temperature=0.0,
-                label=label,
-                response_format={"type": "json_object"},
-                log_raw_response=False,
-                enable_thinking=False,
-            )
-
-            if not background:
-                self._lazy_docstrings_generated_this_turn += len(batch)
-
-            if response is None:
-                self._f._log_debug(
-                    f"ensure_docstrings_batch: batch {batch_num} — LLM returned None"
-                )
-                continue
-
-            self._f._log_debug(
-                f"ensure_docstrings_batch: batch {batch_num} — "
-                f"received {len(response)}-char response"
-            )
-
-            parsed = self._parse_docstring_batch_response(response, expected)
-
-            self._f._log_debug(
-                f"ensure_docstrings_batch: batch {batch_num} — "
-                f"parsed {len(parsed)} docstring(s)"
-            )
-
-            # ── Update in-memory symbol objects, SymbolIndex, and SQLite ─────────
-            for qid, docstring in parsed.items():
-                resolved[qid] = docstring
-                sym, _ = _find_symbol(qid)
-                if sym is not None:
-                    sym.docstring = docstring
-                self._f._symbol_index.update_docstring(qid, project_id, docstring)
-
-            if parsed:
-                rows = [
-                    (project_id, qid, doc, time.time()) for qid, doc in parsed.items()
-                ]
-
-                def _write_batch(rows: list = rows) -> None:
-                    self._f._db_conn.executemany(
-                        "INSERT OR REPLACE INTO symbol_docstrings "
-                        "(project_id, symbol_name, docstring, updated_at) "
-                        "VALUES (?,?,?,?)",
-                        rows,
-                    )
-                    self._f._db_conn.commit()
-
-                await self._f._state_store._db_enqueue(_write_batch)
-
-        self._f._log_debug(
-            f"ensure_docstrings_batch: done — "
-            f"resolved {len(resolved)} / {len(qids)} total"
-        )
-        return resolved
 
     async def ensure_cfg_batch(
         self, qids: List[str], project_id: str
@@ -23905,6 +24039,47 @@ class ActiveCodeUpdater:
                            impossible to recover afterwards.
         """
         # ------------------------------------------------------------------
+        # Region: Exact byte-identical fast path
+        #
+        # Bug fix: when new_block.hash == existing.hash (MD5 of content —
+        # collision odds are negligible), the content is byte-for-byte
+        # identical, so nothing about indexed symbols, call edges, or
+        # data-flow edges could possibly have changed. Both branches below
+        # this point unconditionally call _reindex_block_symbols_with_docstrings(),
+        # which re-runs a full-file AST/regex pass via extract_data_flow_edges()
+        # — thousands of edges on large files — purely to reproduce results
+        # that are already correct in the index. This is the source of the
+        # "edges regenerated with no cache hit" symptom seen when the same
+        # large file is re-submitted: every duplicate-content update paid the
+        # full reindex cost regardless of whether anything actually changed.
+        # Bumping only recency-tracking fields and returning early restores
+        # the intended "this is a content no-op" behavior. Genuinely modified
+        # content (similar but not identical) still falls through to the
+        # branches below, which correctly need the full reindex since
+        # structure may have changed.
+        #
+        # _update_importance() is called explicitly here because it is the
+        # one side effect _reindex_block_symbols_with_docstrings() normally
+        # provides at its tail (recalculating importance from the updated
+        # mention_count / last_mentioned) — it's a pure, cheap function of
+        # fields already on the block, so paying for it costs nothing while
+        # keeping recency-based eviction/paging priority accurate.
+        # ------------------------------------------------------------------
+        if existing.hash == new_block.hash:
+            existing.timestamp = time.time()
+            existing.mention_count += 1
+            existing.last_mentioned = time.time()
+            existing.last_mentioned_msg_idx = state.message_count
+            if new_block.file_path and not existing.file_path:
+                existing.file_path = new_block.file_path
+            existing._update_importance()
+            self._f._log_debug(
+                f"Duplicate block {existing.hash[:8]}: content identical to "
+                f"existing — skipping reindex (recency metadata updated only)"
+            )
+            return
+
+        # ------------------------------------------------------------------
         # Region: Pinned / raw-override path — force content replacement
         # ------------------------------------------------------------------
         if existing.pinned or new_block.is_raw:
@@ -23949,7 +24124,7 @@ class ActiveCodeUpdater:
         # ------------------------------------------------------------------
         # Region: Prioritise-recent-code path — replace with newest version
         # ------------------------------------------------------------------
-        if self._f.valves.prioritize_recent_code:
+        if self.valves.prioritize_recent_code:
 
             # Remove the old symbols from the index before changing content.
             self._f._symbol_index.remove_all_for_block(
