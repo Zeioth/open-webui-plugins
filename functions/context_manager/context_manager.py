@@ -3423,12 +3423,6 @@ class ContextPager:
 
                     # ----------------------------------------------------------
                     # Fallback: paging is unavailable (ChromaDB down or disabled).
-                    #
-                    # Bug J fix: original code deleted unconditionally, silently
-                    # destroying content with no log and no operator override.
-                    # Now we warn explicitly and require purge_allow_hard_delete=True
-                    # for the block to be removed.  The default (False) keeps the
-                    # block so no content is lost without operator consent.
                     # ----------------------------------------------------------
                     if self._f.valves.purge_allow_hard_delete:
                         self._f._log_debug(
@@ -3782,12 +3776,6 @@ class RaptorCodeIndex:
                 stop_event=stop_event,
             )
 
-        # ------------------------------------------------------------------
-        # Bug 34 fix: check stop_event AFTER L2 build and BEFORE pruning.
-        # The original code only checked after L1. If the task is cancelled
-        # while L2 is building, the prune step would still execute, which
-        # could incorrectly delete valid cluster ids from a concurrent build.
-        # ------------------------------------------------------------------
         if stop_event and stop_event.is_set():
             return
 
@@ -3917,12 +3905,6 @@ class RaptorCodeIndex:
             return 0
         except Exception as e:
             err_str = str(e)
-            # Detect sklearn ABI mismatch — Cython extension compiled against
-            # a different sklearn version than currently installed.
-            # Symptom: "C function sklearn.utils._sorting.__pyx_fuse_N...
-            # has wrong signature" or similar _sorting import errors.
-            # Fix: pip install --force-reinstall scikit-learn==1.9.0
-            # Prevention: scikit-learn==1.9.0 is pinned in requirements.
             if (
                 "wrong signature" in err_str
                 or "_sorting" in err_str
@@ -4271,21 +4253,6 @@ class RaptorCodeIndex:
 
         # ------------------------------------------------------------------
         # Call the LLM.
-        #
-        # Bug fix: this call previously omitted enable_thinking=False and a
-        # label, unlike every other auxiliary LLM call in the codebase
-        # (bg_docstring, session_summary, etc.). call_llm() defaults to
-        # enable_thinking=True, so on a thinking-capable backend the model
-        # spends summary_max_tokens on hidden <think> reasoning before ever
-        # emitting the requested 2-3 sentence summary, hits finish_reason
-        # =length, and the truncated reasoning fragment gets stored as the
-        # "summary" verbatim. This is the source of the repeated
-        # "LLM output truncated (finish_reason=length, label=-, ...)"
-        # warnings seen during RAPTOR rebuilds. The system prompt already
-        # says "Output only the summary" — enable_thinking=False enforces
-        # that instead of merely requesting it. label="raptor_summary" also
-        # makes these calls identifiable in logs instead of appearing
-        # unlabeled.
         # ------------------------------------------------------------------
         try:
             result = await llm_caller(
@@ -4602,17 +4569,109 @@ class ContextBuilder:
         )
 
     # ======================================================================
-    # B4 – warmup stub
+    # Warmup stub
     # ======================================================================
 
     async def _warmup_tier_prefill(self, project_id: str) -> None:
         """
-        Phase‑2 placeholder: pre‑warms the stable tier prefix into the KV slot
-        immediately after silent ingestion, so the next inlet finds it hot.
-        Currently a no‑op; full implementation deferred to Phase 2 (KV‑slot
-        prediction).
+        Background prefill of the stable KV-cache prefix (Block A + Hub-Bodies
+        Tier) immediately after silent ingestion, so the next inlet's
+        slot_restore() finds a fresh, compatible slot file instead of either
+        finding nothing or finding a stale file the server rejects.
+
+        Gated by enable_slot_persistence (checked here) plus
+        enable_hub_bodies_tier / hub_bodies_tier_warmup_on_ingestion (already
+        checked by the call site before this task is even scheduled). Fired
+        as a background asyncio.create_task() from inlet()'s silent-ingestion
+        branch, so it never blocks the synthetic acknowledgment response
+        from returning to the user.
+
+        Mechanism: issues ONE minimal auxiliary LLM call (max_tokens=1) whose
+        system_prompt is exactly the static_block + hub_tier text that the
+        *next* real turn's system prompt will begin with, forcing llama.cpp
+        to compute and hold the KV cache for that prefix in the shared
+        inference slot. Immediately afterward, slot_save(force=True)
+        persists that freshly-computed KV state to disk under the
+        structure-hash-derived filename — the exact filename the next
+        inlet's slot_restore() will look for. Both static_block and
+        hub_tier_text are read back from pstate rather than passed as
+        parameters: build_block_a() and the call site already populate
+        block_a_cached / pstate["hub_tier_text"] moments before this task
+        is created, so no signature change at the call site is needed.
+
+        This uses the SAME single shared slot (valves.slot_id) as every
+        other auxiliary call in this Filter. The warmup call necessarily
+        "dirties" that slot exactly like any auxiliary call does, but since
+        this method's entire purpose IS to leave the slot warmed with this
+        prefix and then immediately save it, no slot_restore_for_continuity()
+        call follows — the opposite of every other auxiliary call site in
+        this codebase.
+
+        Cost caveat: this issues a real prefill of the entire static prefix
+        (often 15-20k+ tokens per the logs in this project) — genuine GPU
+        work, just relocated to a moment when the user isn't actively
+        waiting on it rather than eliminated. Worth monitoring after
+        enabling: confirm "✓ Slot saved" appears right after silent
+        ingestion in the logs, and that the "Slot restore failed: HTTP 400"
+        pattern previously seen at the start of the following turn
+        disappears.
+
+        Args:
+            project_id: Current project identifier.
         """
-        pass
+        if not (
+            self._f.valves.enable_slot_persistence
+            and self._f.valves.enable_hub_bodies_tier
+            and self._f.valves.hub_bodies_tier_warmup_on_ingestion
+        ):
+            return
+
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+
+        static_block = psm.get_block_a_cached(project_id) or ""
+        hub_tier_text = pstate.get("hub_tier_text", "") or ""
+
+        prefix_text = (
+            static_block + "\n\n---\n\n" + hub_tier_text
+            if (static_block and hub_tier_text)
+            else (static_block or hub_tier_text)
+        )
+
+        if not prefix_text.strip():
+            self._f._log_debug(
+                "_warmup_tier_prefill: empty Block A + tier text, skipping warmup"
+            )
+            return
+
+        self._f._log_debug(
+            f"_warmup_tier_prefill: warming KV cache for "
+            f"~{self._f._tokens.estimate_code_tokens(prefix_text)}-token "
+            f"static prefix"
+        )
+
+        try:
+            await self._f._llm_orchestrator.call_llm(
+                prompt="Acknowledge silently.",
+                system_prompt=prefix_text,
+                model_override=self._f.valves.llm_model,
+                max_tokens=1,
+                temperature=0.0,
+                label="tier_prefill_warmup",
+                enable_thinking=False,
+            )
+        except Exception as e:
+            self._f._log_debug(f"_warmup_tier_prefill: warmup call failed: {e}")
+            return
+
+        try:
+            saved = await psm.slot_save(project_id, force=True)
+            self._f._log_debug(
+                f"_warmup_tier_prefill: slot_save → "
+                f"{'OK' if saved else 'failed/skipped'}"
+            )
+        except Exception as e:
+            self._f._log_debug(f"_warmup_tier_prefill: slot_save raised: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Block A – static, KV‑cache‑anchoring content
@@ -4905,11 +4964,6 @@ class ContextBuilder:
         Build the Hub-Bodies Tier: full bodies of top-N hubs by centrality,
         ordered by stability (last_modified_turn), truncated by budget.
 
-        Bug 10 fix: the previous tier_hash computation performed ``str + bytes``
-        (a ``TypeError``) because ``.encode()`` was applied only to the right-hand
-        side of the ``+`` operator.  The fix encloses the full concatenated string
-        in parentheses before calling ``.encode()``.
-
         Returns:
             Tuple of (tier_text, tier_hash, kept_qids).
             tier_text is empty when the tier is disabled or no hubs qualify.
@@ -5026,7 +5080,7 @@ class ContextBuilder:
 
         tier_text = "\n".join(lines)
 
-        # ── Bug 10 fix: encode the entire concatenated string, not just the rhs ───
+        # ── Encode the entire concatenated string, not just the rhs ───
         # Previous code: f"{config_prefix}|" + "|".join(...).encode()
         # → TypeError: can only concatenate str (not "bytes") to str
         config_prefix = (
@@ -6343,7 +6397,7 @@ Output only the option name.
         # ------------------------------------------------------------------
         # Step 14: Batched LOD-2.5 CFG pre-resolution.
         #
-        # Bug 14 fix: use (lod2_qids - lod3_qids) so CFG skeletons are only
+        # Use (lod2_qids - lod3_qids) so CFG skeletons are only
         # generated for symbols rendered at LOD-2.  CFG at LOD-3 is redundant
         # because the full body is already injected.
         # ------------------------------------------------------------------
@@ -7072,12 +7126,6 @@ class SignatureExtractor:
 
         Results are cached with a 1-hour TTL to avoid re-parsing the same block.
 
-        Bug 11 fix: the write path previously stored the ``symbols`` list by
-        reference.  Any mutation by the caller (e.g. assigning
-        ``sym.parent_block_hash`` in ``ActiveCodeUpdater._process_new_block``)
-        silently corrupted the cached entry for subsequent callers.  Both the
-        stored list and its elements are now stored as copies.
-
         Args:
             code: The source code.
             file_path: The file path (used for language detection).
@@ -7133,7 +7181,7 @@ class SignatureExtractor:
                                 calls.append(c)
                     sym.calls = calls
 
-                # ── Bug 11 fix: store copies in the cache ─────────────────────────
+                # ── Store copies in the cache ─────────────────────────
                 _cached_symbols = [s.copy() for s in symbols]
                 with SignatureExtractor._EXTRACTION_CACHE_LOCK:
                     if (
@@ -7202,7 +7250,7 @@ class SignatureExtractor:
                                 calls.append(c)
                     sym.calls = calls
 
-                # ── Bug 11 fix: store copies in the cache ─────────────────────────
+                # ── Store copies in the cache ─────────────────────────
                 _cached_symbols = [s.copy() for s in symbols]
                 with SignatureExtractor._EXTRACTION_CACHE_LOCK:
                     if (
@@ -8751,13 +8799,6 @@ class StateStore:
         Returns the number of edges restored (0 if stale, no data, or already
         fully loaded).
 
-        Bug 9 fix: the previous guard ``if existing: return 0`` skipped the
-        restore whenever *any* edges were present in memory, even if the
-        in-memory count was lower than the persisted count (e.g., only ``calls``
-        edges loaded but ``data_flow`` / ``reads`` / ``writes`` still missing).
-        The new guard compares the actual in-memory edge count against the
-        persisted count and only skips when they are equal or higher.
-
         Args:
             project_id: The current project identifier.
 
@@ -8793,7 +8834,7 @@ class StateStore:
             )
             return 0
 
-        # ── Bug 9 fix: compare counts, not just presence ───────────────────────────
+        # ── Compare counts, not just presence ───────────────────────────
         # Only skip the restore if the number of in-memory edges already equals or
         # exceeds the persisted count for this code state.  A lower in-memory count
         # means some edge types (data_flow, reads, writes, inherits…) were not yet
@@ -10623,13 +10664,6 @@ class LongTermMemory:
 
         # ------------------------------------------------------------------
         # Region: Lazy-initialise purge lock
-        #
-        # Bug fix: __init__ already sets self._purge_lock = None, so the
-        # attribute always exists — hasattr() returns True from construction
-        # onward and this branch never ran. self._purge_lock stayed None
-        # forever, and the next line (.locked()) raised AttributeError on
-        # every call. Checking identity against None instead of attribute
-        # presence is the correct lazy-init guard here.
         # ------------------------------------------------------------------
         if self._purge_lock is None:
             self._purge_lock = asyncio.Lock()
@@ -11420,11 +11454,6 @@ class ReasoningEngine:
             is_continuation=True          → {level:0}
             empty content                 → {level:0}
             enable_cot_llm_detection=False → stage 1 only
-
-        Bug 156 fix: removed all ENABLE_COT_STICKY updates from this method.
-            state.last_cot_level is now updated only in _detect_and_generate_cot
-            after successful reasoning generation, preventing sticky pollution
-            when generation ultimately fails.
         """
         _sv = signal_vector or {
             "n_mentioned": 0,
@@ -12144,7 +12173,7 @@ class ReasoningEngine:
         )
 
         # ------------------------------------------------------------------
-        # Region: KV-2 fix — restore slot after auxiliary LLM call
+        # Region: Restore slot after auxiliary LLM call
         # ------------------------------------------------------------------
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
@@ -13057,7 +13086,7 @@ class ReasoningEngine:
             self._f._log_debug(
                 "Scientific L3: insufficient hypotheses — falling back to L2 CoT"
             )
-            # KV-2 fix: pass project_id so the fallback call restores the slot
+            # Pass project_id so the fallback call restores the slot
             return await self.generate_cot_reasoning(
                 question, context, label, project_id=project_id
             )
@@ -13084,7 +13113,7 @@ class ReasoningEngine:
             self._f._log_debug(
                 "Scientific L3: no valid hypothesis survived — falling back to L2 CoT"
             )
-            # KV-2 fix: pass project_id so the fallback call restores the slot
+            # Pass project_id so the fallback call restores the slot
             return await self.generate_cot_reasoning(
                 question, context, label, project_id=project_id
             )
@@ -13125,11 +13154,6 @@ class ReasoningEngine:
         Uses obj_weight=0.4 / llm_weight=0.6 because in design mode the LLM's
         architectural judgment is more valuable than structural verification
         of a proposed (not yet existing) interface.
-
-        KV-2 fix: the generate_architecture_reasoning() fallback already received
-            project_id in the original code, so no new change is needed on the
-            fallback path.  This docstring documents the invariant explicitly so
-            future refactors do not regress it.
 
         Args:
             question: The user's architecture or design question.
@@ -17651,12 +17675,6 @@ Output only the symbol name.
         Build an activation graph combining lexical, structural, and historical
         seed vectors.
 
-        Bug 33 fix: the previous implementation ran all three PPR propagations
-        (lexical, structural, historical) before checking ``cached_scores``.
-        When the PPR cache was hit, the propagation work was discarded entirely.
-        The fix checks ``cached_scores`` immediately after building the seed
-        sets (which are cheap) and skips all propagations on a cache hit.
-
         Args:
             exact_seeds: Symbols found verbatim in the query.
             partial_seeds: Symbols found via partial/fuzzy match.
@@ -17739,7 +17757,7 @@ Output only the symbol name.
                 source="seed",
             )
 
-        # ── Bug 33 fix: short-circuit before propagations on cache hit ────────────
+        # ── Short-circuit before propagations on cache hit ────────────
         # cached_scores is not None only when _get_or_compute_ppr_scores returned
         # a cache hit.  Building ag_final directly from cached_scores avoids all
         # three PPR propagations (which are the expensive part of this function).
@@ -19530,7 +19548,7 @@ class MetacognitiveReasoningEngine:
                        delimit_scope (synthesis, H6 dialectical order —
                        always AFTER peer_review so critique informs synthesis)
         PROJECT:       _debrief_competition → _performance_history (all iterations,
-                       including total-failure case — Bug B fix)
+                       including total-failure case)
                        → _get_adaptive_strategy (next call)
 
         H6 (Dialectical order): peer_review BEFORE delimit_scope.
@@ -19770,7 +19788,7 @@ class MetacognitiveReasoningEngine:
                 "compete_hypotheses: no valid hypothesis survived — "
                 "all falsified across all iterations"
             )
-            # Bug B fix: record total-failure in performance history so
+            # Record total-failure in performance history so
             # _get_adaptive_strategy can learn from this failure mode.
             # Without this, the project's persistent failure pattern
             # (e.g., always falsified by call_relations) is invisible.
@@ -19853,13 +19871,12 @@ class MetacognitiveReasoningEngine:
                     "will inform dialectical scope delimitation"
                 )
 
-        # CONVERSATION LEVEL: peer review (antithesis — H6)
+        # CONVERSATION LEVEL: peer review (antithesis)
         # Signal: enable_peer_review=True AND uncertainty >= threshold.
         # Epistemic uncertainty gate:
         #   score < 0.4 → uncertainty high but hypothesis already failed → noise
         #   score > 0.85 → uncertainty low, hypothesis won clearly → wasteful
         #   useful range [0.4, 0.85] maps to uncertainty >= threshold
-        # Bug 2 fix: only call when valve is enabled (avoids needless None returns)
         if self._f.valves.enable_peer_review:
             _uncertainty_justifies_review = (
                 best_scored.epistemic_uncertainty
@@ -19892,7 +19909,7 @@ class MetacognitiveReasoningEngine:
                 f"Critiques (about demoted winner): {peer_review.critiques}"
             )
             best_scored = runner_up
-            # Bug 16 fix: peer_review critiques describe the DEMOTED winner,
+            # peer_review critiques describe the DEMOTED winner,
             # not the promoted runner-up. Passing them to delimit_scope would
             # synthesize scope for the wrong hypothesis using irrelevant critiques.
             # Clear peer_review — the runner-up has not been independently reviewed.
@@ -20733,13 +20750,8 @@ class MetacognitiveReasoningEngine:
         Results are collected and returned; any single-question failure is
         non-fatal and that question is simply skipped.
 
-        CONVERSATION LEVEL (H5 temporal hierarchy).
+        CONVERSATION LEVEL (temporal hierarchy).
         Gated by enable_focal_reasoning valve.
-
-        KV-2 fix: project_id is now passed to generate_cot_reasoning() so that
-            the slot is restored after each per-question LLM call.  Without this,
-            the slot accumulates the state of every CoT call in the loop, causing
-            a KV-cache miss for the main inference that follows.
 
         Args:
             questions: List of independent questions from QueryDecomposition.
@@ -20801,7 +20813,7 @@ class MetacognitiveReasoningEngine:
                     f"💭 Reasoning about question {i + 1}/{len(questions)}..."
                 )
 
-                # KV-2 fix: pass project_id so generate_cot_reasoning() restores
+                # Pass project_id so generate_cot_reasoning() restores
                 # the slot after its LLM call, keeping it clean for the next
                 # question's activation graph and for the main inference.
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
@@ -21023,7 +21035,7 @@ Code context (recent symbols referenced):
         # ------------------------------------------------------------------
         _PART_HEADER = re.compile(r"##\s*Código\s*[—\-]\s*Parte\s*(\d+)/(\d+)")
 
-        # Bug 67 fix: extend regex to also match the force-compressed marker
+        # Extend regex to also match the force-compressed marker
         # produced by _build_legacy_commit_summary(force_no_expand=True):
         #   [🗜️ CÓDIGO COMPRIMIDO — sin índice]
         # The original regex only matched:
@@ -21252,7 +21264,7 @@ Code context (recent symbols referenced):
             expected = set(_FUNC_RE.findall(content))
 
         # ------------------------------------------------------------------
-        # Region: Handle case where no Python symbols were detected (Bug H fix)
+        # Region: Handle case where no Python symbols were detected
         # ------------------------------------------------------------------
         if not expected:
             # Check whether the project has ANY indexed symbols at all.
@@ -22263,15 +22275,6 @@ class EnrichmentTasks:
         if not words:
             return
 
-        # ------------------------------------------------------------------
-        # Bug 113 fix: filter out symbol names shorter than MIN_MENTION_LENGTH
-        # before computing the intersection. Short symbols like 'id', 'db',
-        # 'get', 'set', 'run', 'app', 'log' are extremely common in natural
-        # language and would cause every message containing those words to
-        # falsely boost the importance of unrelated code blocks.
-        # A minimum of 4 characters eliminates the most common false positives
-        # while preserving genuine short symbols like 'http', 'json', 'csrf'.
-        # ------------------------------------------------------------------
         MIN_MENTION_LENGTH = 4
         qualified_symbols = {
             name for name in all_symbol_names if len(name) >= MIN_MENTION_LENGTH
@@ -22310,7 +22313,7 @@ class EnrichmentTasks:
 
         Supports two call paths:
 
-        **In-lock path** (Bug G fix): when ``_post_update_tasks`` already holds
+        **In-lock path**: when ``_post_update_tasks`` already holds
         the project lock and has the current in-flight state, it passes ``state``
         directly.  Using the provided object avoids re-reading a stale snapshot
         from ``ConversationStateManager`` (which has not yet received the
@@ -22826,7 +22829,7 @@ class EnrichmentTasks:
                 needs_db_check.append(qid)
 
         # ── Phase 1b: one batched SQL query instead of N round-trips ──────────
-        # Bug fix: the original code issued one _db_read() per qid here — each
+        # the original code issued one _db_read() per qid here — each
         # dispatching to the thread pool via anyio.to_thread.run_sync. A batch
         # of 8 unresolved qids meant 8 consecutive thread round-trips before
         # any LLM work even started.
@@ -23162,7 +23165,7 @@ class EnrichmentTasks:
         skeleton_qids: Set[str] = set(psm.get_skeleton_tier_qids(project_id))
         block_b_qids: Set[str] = set(psm.get_block_b_qids_this_turn(project_id))
 
-        # Get cached PPR scores if available (from Q2 fix cache)
+        # Get cached PPR scores if available
         ppr_scores: Dict[str, float] = (
             self._f._activation._ppr_cache.get(
                 pstate.get("code_state_hash", ""),
@@ -23920,11 +23923,11 @@ class ActiveCodeUpdater:
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Extraction & preparation of new blocks
     # ═══════════════════════════════════════════════════════════════════════════
-
-    async def _extract_and_prepare_new_blocks(
-        self, content: str, role: str
-    ) -> Tuple[
-        List["CodeBlock"], List[List["CodeSymbol"]], Dict[str, List["CodeSymbol"]]
+    async def _extract_and_prepare_new_blocks(self, content: str, role: str) -> Tuple[
+        List["CodeBlock"],
+        List[List["CodeSymbol"]],
+        Dict[str, List["CodeSymbol"]],
+        List[dict],
     ]:
         """Extract code blocks from content, build CodeBlock objects, and extract symbols."""
         extracted_blocks, block_spans = await self._f._code_blocks.extract_code_blocks(
@@ -23962,7 +23965,6 @@ class ActiveCodeUpdater:
                 new_block.importance_score = 10.0
                 new_block.pinned = True
             new_blocks_pending.append(new_block)
-
         symbols_list = []
         for idx, (blk, block_info) in enumerate(
             zip(new_blocks_pending, extracted_blocks)
@@ -23975,13 +23977,11 @@ class ActiveCodeUpdater:
                     blk.content, blk.file_path
                 )
             symbols_list.append(syms)
-
         content_to_syms: Dict[str, List[CodeSymbol]] = {
             blk.content: syms
             for blk, syms in zip(new_blocks_pending, symbols_list)
             if not isinstance(syms, Exception)
         }
-
         return new_blocks_pending, symbols_list, content_to_syms, extracted_blocks
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -23998,9 +23998,7 @@ class ActiveCodeUpdater:
         duplicate_info: Dict[str, Tuple[bool, Optional[str]]] = {}
         if not state or not new_blocks:
             return duplicate_info
-
         existing_contents = {h: b.content for h, b in state.active_blocks.items()}
-
         for new_block in new_blocks:
             # Bonus optimization: an exact hash match is necessarily a 100%
             # content match (active_blocks is always keyed by block.hash —
@@ -24011,7 +24009,6 @@ class ActiveCodeUpdater:
             if new_block.hash in existing_contents:
                 duplicate_info[new_block.hash] = (True, new_block.hash)
                 continue
-
             is_dup = False
             existing_dup = None
             for h, ex_content in existing_contents.items():
@@ -24021,13 +24018,12 @@ class ActiveCodeUpdater:
                     and self._f._code_blocks.calculate_code_similarity(
                         new_block.content, ex_content
                     )
-                    >= self.valves.code_similarity_threshold
+                    >= self._f.valves.code_similarity_threshold
                 ):
                     is_dup = True
                     existing_dup = h
                     break
             duplicate_info[new_block.hash] = (is_dup, existing_dup)
-
         return duplicate_info
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -24066,30 +24062,6 @@ class ActiveCodeUpdater:
         """
         # ------------------------------------------------------------------
         # Region: Exact byte-identical fast path
-        #
-        # Bug fix: when new_block.hash == existing.hash (MD5 of content —
-        # collision odds are negligible), the content is byte-for-byte
-        # identical, so nothing about indexed symbols, call edges, or
-        # data-flow edges could possibly have changed. Both branches below
-        # this point unconditionally call _reindex_block_symbols_with_docstrings(),
-        # which re-runs a full-file AST/regex pass via extract_data_flow_edges()
-        # — thousands of edges on large files — purely to reproduce results
-        # that are already correct in the index. This is the source of the
-        # "edges regenerated with no cache hit" symptom seen when the same
-        # large file is re-submitted: every duplicate-content update paid the
-        # full reindex cost regardless of whether anything actually changed.
-        # Bumping only recency-tracking fields and returning early restores
-        # the intended "this is a content no-op" behavior. Genuinely modified
-        # content (similar but not identical) still falls through to the
-        # branches below, which correctly need the full reindex since
-        # structure may have changed.
-        #
-        # _update_importance() is called explicitly here because it is the
-        # one side effect _reindex_block_symbols_with_docstrings() normally
-        # provides at its tail (recalculating importance from the updated
-        # mention_count / last_mentioned) — it's a pure, cheap function of
-        # fields already on the block, so paying for it costs nothing while
-        # keeping recency-based eviction/paging priority accurate.
         # ------------------------------------------------------------------
         if existing.hash == new_block.hash:
             existing.timestamp = time.time()
@@ -24150,7 +24122,7 @@ class ActiveCodeUpdater:
         # ------------------------------------------------------------------
         # Region: Prioritise-recent-code path — replace with newest version
         # ------------------------------------------------------------------
-        if self.valves.prioritize_recent_code:
+        if self._f.valves.prioritize_recent_code:
 
             # Remove the old symbols from the index before changing content.
             self._f._symbol_index.remove_all_for_block(
@@ -24515,7 +24487,7 @@ class ActiveCodeUpdater:
         already contains all in-flight mutations for this turn.  Performs:
           - Message-count increment
           - Duplicate block removal
-          - Time-based block expiration (Bug G fix: passes ``state`` directly)
+          - Time-based block expiration
           - Session summary (interval-based)
           - Oversized-block summary scheduling
           - Lightweight activation cache invalidation
@@ -25504,7 +25476,6 @@ class SystemPromptBuilder:
             else:
                 # ── Fallback to substring + fuzzy matching ─────────────────
                 for m in memories:
-                    # Bug 61 fix: same guard for the fallback path.
                     doc_content = m.get("doc")
                     if not doc_content or not isinstance(doc_content, str):
                         continue
@@ -27291,8 +27262,6 @@ class MessageAssembler:
                 )
 
             else:
-                # KV-2 fix: pass project_id so generate_cot_reasoning() restores
-                # the slot after its internal LLM call.
                 reasoning = await self._f._reasoning.generate_cot_reasoning(
                     question, prelim_for_cot, project_id=project_id
                 )
@@ -27309,7 +27278,6 @@ class MessageAssembler:
             self._f._log_debug(
                 "🧠 Scientific reasoning failed — falling back to linear L2"
             )
-            # KV-2 fix: pass project_id for slot restoration in the fallback call
             reasoning = await self._f._reasoning.generate_cot_reasoning(
                 user_question, prelim_for_cot, project_id=project_id
             )
@@ -27723,10 +27691,6 @@ class MessageAssembler:
         instructions are skipped on continuation turns to prevent the model from
         restarting the cycle (Fase 1 — Análisis, etc.) instead of continuing
         from where it left off.
-
-        Bug 157 fix: added early return for continuation turns after the critical
-        wrap-up hint check, preventing the model from receiving full multi-phase
-        protocol instructions that would restart the task cycle.
         """
         if not (
             self._f.valves.enable_multi_phase_response
@@ -28610,24 +28574,6 @@ class TaskRegistry:
         tasks = [
             # ------------------------------------------------------------------
             # Task 1: Session summary (highest priority: controls context size).
-            #
-            # Bug fix: skip_if_completed changed from True to False. This task
-            # has no invalidation_func, because its trigger condition (message
-            # count crossing an interval boundary) isn't expressible as a single
-            # comparable hash the way structure_hash or code_state_hash are.
-            # Without an invalidation_func, is_completed()'s third check is
-            # always skipped, so "completed" — once set True by EITHER the lazy
-            # or the background path's first normal completion (which happens
-            # almost immediately in practice, since _bg_session_summary's
-            # no-op early-return when the interval isn't due still counts as a
-            # fast, successful completion) — stays True for the rest of the
-            # process lifetime, permanently disabling lazy catch-up.
-            # skip_if_completed=False (matching lod_adaptive below, which has
-            # the same recurring/interval-shaped trigger condition) makes the
-            # flag irrelevant for gating: lazy always attempts, and its own
-            # internal interval check cheaply no-ops on the vast majority of
-            # turns where nothing is due — exactly like the background variant
-            # already does.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="session_summary",
@@ -28674,11 +28620,6 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 4: RAPTOR rebuild.
-            #
-            # No fix needed: _lazy_raptor and _bg_raptor call the identical
-            # underlying RaptorCodeIndex.rebuild(project_id, ...) with the same
-            # arguments (same project-wide scope), differing only in
-            # stop_event. invalidation_func correctly ties to structure_hash.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="raptor",
@@ -28695,11 +28636,6 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 5: Purge old versions (experimental, disabled by default).
-            #
-            # No fix needed: _lazy_purge and _bg_purge call the identical
-            # underlying ContextPager.purge_old_versions(project_id, ...) with
-            # the same scope (project-wide), differing only in stop_event.
-            # invalidation_func correctly ties to code_state_hash.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="purge",
@@ -28716,11 +28652,6 @@ class TaskRegistry:
             ),
             # ------------------------------------------------------------------
             # Task 6: LOD adaptive (invalidated every turn via message_count).
-            #
-            # No fix needed: already uses skip_if_completed=False, which is
-            # the exact same fix now also applied to session_summary above,
-            # for the same underlying reason (recurring/interval-shaped
-            # trigger that a binary completed-flag can't represent).
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="lod_adaptive",
@@ -28832,25 +28763,6 @@ class TaskRegistry:
 
             # ------------------------------------------------------------------
             # Step 4: Execute the lazy function.
-            #
-            # Bug fix: lazy variants whose scope is narrower than their
-            # background counterpart (e.g. _lazy_docstrings only resolves
-            # symbols visible THIS turn, not the whole project; _lazy_prefetch
-            # only builds views for THIS turn's query seeds, not the
-            # predictive call-graph-neighbor set background builds) must not
-            # silently mark the SHARED completion flag true on a partial or
-            # no-op success — that would suppress future lazy invocations for
-            # the rest of the session (until the task's invalidation hash
-            # changes), even when a different symbol/seed genuinely still
-            # needs handling on a later turn. lazy_func now signals this via
-            # its return value: False = "ran, but my scope here doesn't
-            # represent full task completion — leave the shared flag
-            # untouched"; any other return value (including the implicit None
-            # most lazy_func implementations still return) = "treat as
-            # before" and mark completed, preserving existing behavior for
-            # tasks whose lazy/background scopes are genuinely equivalent
-            # (raptor, purge) or whose flag is irrelevant for gating anyway
-            # (lod_adaptive, session_summary — see _build_tasks).
             # ------------------------------------------------------------------
             try:
                 outcome = await task.lazy_func(project_id)
@@ -29102,24 +29014,6 @@ class TaskRegistry:
     async def _lazy_session_summary(self, project_id: str) -> None:
         """
         Lazy session summary generation. Executed if not already done in background.
-
-        Note (bug fix): unlike _lazy_docstrings/_lazy_prefetch, this function
-        does not need to return False to suppress the shared completion flag.
-        The "session_summary" BackgroundTask entry now has
-        skip_if_completed=False (see _build_tasks), so should_skip_lazy()
-        never consults is_completed() for this task at all — the issue here
-        was different from the docstrings/prefetch scope mismatch. This task
-        has no invalidation_func (its trigger is an interval over
-        message_count, not a single comparable hash like structure_hash or
-        code_state_hash), so once EITHER the lazy or the background path
-        completed normally a single time, the "completed" flag would
-        otherwise stay True for the rest of the process lifetime — and since
-        _bg_session_summary's no-op early-return (when the interval isn't
-        due yet) still counts as a fast, successful completion under
-        _run_task, that happens almost immediately, on essentially the
-        first outlet. skip_if_completed=False sidesteps the missing
-        invalidation entirely, mirroring how lod_adaptive already handles
-        the same recurring/interval-shaped trigger condition.
 
         Args:
             project_id: The current project identifier.
@@ -29778,12 +29672,6 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) to locate the correct
         slot file, ensuring that docstring population does not cause a miss.
 
-        Bug 22 fix: when both ``structure_hash_for_cache`` and
-        ``block_a_cached`` are absent (cold restart with empty pstate),
-        the previous implementation returned False immediately.  The fix adds
-        a directory scan fallback via ``_find_most_recent_slot_hash`` so that
-        slot files from the previous session can still be restored.
-
         Args:
             project_id: The project identifier.
 
@@ -29809,7 +29697,7 @@ class ProjectStateManager:
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
 
-        # ── Bug 22 fix: fallback to directory scan when pstate has no hash ────────
+        # ── Fallback to directory scan when pstate has no hash ────────
         if not static_hash:
             self._f._log_debug(
                 "slot_restore: no hash in pstate — scanning slot directory for "
@@ -29868,18 +29756,6 @@ class ProjectStateManager:
         Called at the end of every auxiliary LLM call when
         ``enable_slot_persistence=True``.
 
-        Bug 23 fix: the previous implementation re-attempted the HTTP restore
-        on every invocation, regardless of whether a previous attempt in the
-        same turn had already succeeded or failed.  In a single turn with
-        multiple auxiliary calls (CoT + contradiction + use-case classification),
-        this could produce 5–10 redundant HTTP requests to the llama.cpp API.
-
-        The fix tracks attempt and outcome per slot filename in pstate.  A
-        filename-scoped key is used (rather than a plain boolean) so that a
-        code change mid-session (which produces a new filename) gets its own
-        fresh attempt, while the same filename within a turn is restored only
-        once.
-
         Args:
             project_id: The project identifier.
 
@@ -29909,7 +29785,7 @@ class ProjectStateManager:
 
         filename = self._slot_filename(project_id, static_hash)
 
-        # ── Bug 23 fix: per-filename attempt guard ────────────────────────────────
+        # ── Per-filename attempt guard ────────────────────────────────
         # Track attempt and outcome keyed by the slot filename so that:
         #   - Multiple auxiliary calls in the same turn do not re-attempt.
         #   - A code change that yields a new filename gets a fresh attempt.
@@ -33766,7 +33642,7 @@ class Filter:
             #
             #   Each auxiliary LLM call (CoT, contradiction, use-case, etc.) dirties
             #   the slot.  slot_restore_for_continuity() is called at the end of
-            #   every such call (KV-2 fix), so the slot is already clean here.
+            #   every such call, so the slot is already clean here.
             #   This final call acts as a safety net in case any path skipped it.
             # ----------------------------------------------------------------
             if not slot_busy and self.valves.enable_slot_persistence:
@@ -33949,7 +33825,7 @@ class Filter:
                         )
                         await self._update_active_code(assistant_msg, project_id)
 
-                        # -- LTM-1 fix: wait=True so _ltm_store_complete signals only
+                        # -- wait=True so _ltm_store_complete signals only
                         #   after the ChromaDB upsert finishes, not after the task is
                         #   merely enqueued.  The event drives inlet's wait() check; if
                         #   it fires too early, the next turn's retrieval misses this
