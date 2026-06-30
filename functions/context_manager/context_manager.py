@@ -33468,6 +33468,18 @@ class Filter:
             )
             self._outlet_body_structure_logged = True
 
+        # ------------------------------------------------------------------
+        # Region: defensive pre-try defaults
+        # project_id / pstate / assistant_content are referenced in the
+        # background-task tail below, which now runs even when the try
+        # block raises before reaching its own assignment of these names.
+        # Without this, an early exception would surface as a NameError
+        # instead of being handled by the except/finally below it.
+        # ------------------------------------------------------------------
+        project_id = self.valves.project_id
+        pstate = self._project_state_manager.get_pstate(project_id)
+        assistant_content = ""
+
         try:
             # ------------------------------------------------------------------
             # Region: resolve project and per-project state
@@ -33507,152 +33519,178 @@ class Filter:
                             assistant_source = f"body['{field}']['content']"
                             break
 
+            # ------------------------------------------------------------------
+            # Region: never return early from inside this try block
+            #
+            # `inlet()` unconditionally calls `_bg_manager.set_paused(True)` at
+            # the start of every turn. The only call that flips it back to
+            # `False` lives in the unconditional tail of this method, AFTER
+            # the try/except/finally below. A bare `return body` from inside
+            # this try — as both branches below used to do — skips straight
+            # past that tail: `drain_writes()`, `set_paused(False)`, and the
+            # entire background-task scheduling loop never run, leaving
+            # `_bg_manager` paused for the rest of the session (visible as
+            # idle CPU/GPU after a turn with no detectable assistant content,
+            # e.g. the synthetic acknowledgment right after silent ingestion).
+            # Both content-detection outcomes below now fall through into an
+            # if/else instead of returning, so maintenance + background-task
+            # scheduling always run at the end of the method.
+            # ------------------------------------------------------------------
             if not assistant_content:
                 self._log_debug(
                     "outlet: no assistant response found in body — "
-                    "_update_active_code skipped. "
+                    "_update_active_code and LTM store skipped for this turn. "
                     f"(keys={list(body.keys())})"
                 )
-                return body
-
-            # 🔥 STATE MANAGEMENT
-            #   Deduplicate by content hash — skip if already processed
-            # ----------------------------------------------------------------
-            response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
-            if pstate.get("last_outlet_response_hash") == response_hash:
-                self._log_debug(
-                    f"outlet: response already processed (hash={response_hash}), skipping"
-                )
-                return body
-
-            pstate["last_outlet_response_hash"] = response_hash
-            self._log_debug(
-                f"outlet: processing assistant response "
-                f"(source={assistant_source}, hash={response_hash}, "
-                f"{len(assistant_content.split())} words)"
-            )
-
-            # ------------------------------------------------------------------
-            # Region: wait for all in-flight LLM tasks before mutating state
-            # ------------------------------------------------------------------
-            await self._llm_orchestrator.wait_for_llm_tasks()
-
-            # 🔥 STATE MANAGEMENT
-            #   Intercept /expand commands in the assistant content
-            # ----------------------------------------------------------------
-            if is_code_session and "/expand" in assistant_content:
-                modified_content, did_expand = (
-                    await self._commands.outlet_intercept_expand(
-                        assistant_content, project_id
-                    )
-                )
-                if did_expand:
-                    if assistant_source == "messages[-1]":
-                        messages[-1]["content"] = modified_content
-                    assistant_content = modified_content
-                    self._log_debug(
-                        "outlet: /expand intercepted and expanded in assistant content"
-                    )
-
-            # 🔥 STATE MANAGEMENT
-            #   Update active code blocks and store message in LTM
-            # ----------------------------------------------------------------
-            assistant_msg = {"role": "assistant", "content": assistant_content}
-
-            if is_code_session:
-                self._log_debug(
-                    "🔥 STATE MANAGEMENT – Updating active code blocks "
-                    "and storing in LTM (assistant code detected)"
-                )
-                await self._update_active_code(assistant_msg, project_id)
-
-                # -- LTM-1 fix: wait=True so _ltm_store_complete signals only
-                #   after the ChromaDB upsert finishes, not after the task is
-                #   merely enqueued.  The event drives inlet's wait() check; if
-                #   it fires too early, the next turn's retrieval misses this
-                #   message entirely.
-                self._ltm_store_complete.clear()
-
-                async def _store_and_signal():
-                    try:
-                        await self._ltm.store_messages(
-                            project_id, [assistant_msg], wait=True
-                        )
-                    except Exception as _ltm_err:
-                        self._log_debug(f"LTM: store_messages failed: {_ltm_err}")
-                    finally:
-                        self._ltm_store_complete.set()
-
-                asyncio.create_task(_store_and_signal())
-
             else:
-                if not self.valves.ltm_store_only_code_sessions:
+                # 🔥 STATE MANAGEMENT
+                #   Deduplicate by content hash — skip if already processed
+                # ----------------------------------------------------------------
+                response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
+                if pstate.get("last_outlet_response_hash") == response_hash:
                     self._log_debug(
-                        "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
+                        f"outlet: response already processed "
+                        f"(hash={response_hash}), skipping"
                     )
-                    self._ltm_store_complete.clear()
+                else:
+                    pstate["last_outlet_response_hash"] = response_hash
+                    self._log_debug(
+                        f"outlet: processing assistant response "
+                        f"(source={assistant_source}, hash={response_hash}, "
+                        f"{len(assistant_content.split())} words)"
+                    )
 
-                    async def _store_and_signal_noncode():
-                        try:
-                            await self._ltm.store_messages(
-                                project_id, [assistant_msg], wait=True
+                    # ------------------------------------------------------------------
+                    # Region: wait for all in-flight LLM tasks before mutating state
+                    # ------------------------------------------------------------------
+                    await self._llm_orchestrator.wait_for_llm_tasks()
+
+                    # 🔥 STATE MANAGEMENT
+                    #   Intercept /expand commands in the assistant content
+                    # ----------------------------------------------------------------
+                    if is_code_session and "/expand" in assistant_content:
+                        modified_content, did_expand = (
+                            await self._commands.outlet_intercept_expand(
+                                assistant_content, project_id
                             )
-                        except Exception as _ltm_err:
+                        )
+                        if did_expand:
+                            if assistant_source == "messages[-1]":
+                                messages[-1]["content"] = modified_content
+                            assistant_content = modified_content
                             self._log_debug(
-                                f"LTM: store_messages (non-code) failed: {_ltm_err}"
+                                "outlet: /expand intercepted and expanded in assistant content"
                             )
-                        finally:
-                            self._ltm_store_complete.set()
 
-                    asyncio.create_task(_store_and_signal_noncode())
+                    # 🔥 STATE MANAGEMENT
+                    #   Update active code blocks and store message in LTM
+                    # ----------------------------------------------------------------
+                    assistant_msg = {"role": "assistant", "content": assistant_content}
 
-            # 🚀 RESOURCE OPTIMISATION
-            #   Save KV slot NOW — stable state, before long maintenance tasks
-            # ----------------------------------------------------------------
-            if self.valves.enable_slot_persistence:
-                try:
-                    psm.set_last_total_context_tokens(
-                        project_id, self._tokens.estimate_tokens(messages)
-                    )
-                except Exception as _tok_err:
-                    self._log_debug(f"outlet: token estimation failed: {_tok_err}")
-                await psm.slot_save(project_id)
-
-            # 🔥 STATE MANAGEMENT
-            #   Persist last response for lazy LOD adaptive adjustment
-            # ----------------------------------------------------------------
-            psm.set_last_assistant_response(project_id, assistant_content)
-            psm.set_last_response_timestamp(project_id, time.time())
-
-            # 🔥 STATE MANAGEMENT
-            #   Response cache — skip partial multi-phase responses
-            # ----------------------------------------------------------------
-            if (
-                self.valves.enable_response_cache
-                and HAS_SENTENCE
-                and len(messages) >= 2
-            ):
-                last_user = next(
-                    (m for m in reversed(messages) if m.get("role") == "user"), None
-                )
-                if last_user:
-                    _is_partial_mp = self.valves.enable_multi_phase_response and any(
-                        marker in assistant_content
-                        for marker in self._MULTI_PHASE_MARKERS
-                    )
-                    if not _is_partial_mp:
-                        context_hash = self._activation.compute_context_hash(messages)
-                        code_state_hash = self._activation.compute_code_state_hash(
-                            project_id
+                    if is_code_session:
+                        self._log_debug(
+                            "🔥 STATE MANAGEMENT – Updating active code blocks "
+                            "and storing in LTM (assistant code detected)"
                         )
-                        await self._ltm.store_response_in_cache(
-                            last_user.get("content", ""),
-                            assistant_content,
-                            context_hash,
-                            state,
-                            code_state_hash,
-                            wait=False,
+                        await self._update_active_code(assistant_msg, project_id)
+
+                        # -- LTM-1 fix: wait=True so _ltm_store_complete signals only
+                        #   after the ChromaDB upsert finishes, not after the task is
+                        #   merely enqueued.  The event drives inlet's wait() check; if
+                        #   it fires too early, the next turn's retrieval misses this
+                        #   message entirely.
+                        self._ltm_store_complete.clear()
+
+                        async def _store_and_signal():
+                            try:
+                                await self._ltm.store_messages(
+                                    project_id, [assistant_msg], wait=True
+                                )
+                            except Exception as _ltm_err:
+                                self._log_debug(
+                                    f"LTM: store_messages failed: {_ltm_err}"
+                                )
+                            finally:
+                                self._ltm_store_complete.set()
+
+                        asyncio.create_task(_store_and_signal())
+
+                    else:
+                        if not self.valves.ltm_store_only_code_sessions:
+                            self._log_debug(
+                                "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
+                            )
+                            self._ltm_store_complete.clear()
+
+                            async def _store_and_signal_noncode():
+                                try:
+                                    await self._ltm.store_messages(
+                                        project_id, [assistant_msg], wait=True
+                                    )
+                                except Exception as _ltm_err:
+                                    self._log_debug(
+                                        f"LTM: store_messages (non-code) failed: {_ltm_err}"
+                                    )
+                                finally:
+                                    self._ltm_store_complete.set()
+
+                            asyncio.create_task(_store_and_signal_noncode())
+
+                    # 🚀 RESOURCE OPTIMISATION
+                    #   Save KV slot NOW — stable state, before long maintenance tasks
+                    # ----------------------------------------------------------------
+                    if self.valves.enable_slot_persistence:
+                        try:
+                            psm.set_last_total_context_tokens(
+                                project_id, self._tokens.estimate_tokens(messages)
+                            )
+                        except Exception as _tok_err:
+                            self._log_debug(
+                                f"outlet: token estimation failed: {_tok_err}"
+                            )
+                        await psm.slot_save(project_id)
+
+                    # 🔥 STATE MANAGEMENT
+                    #   Persist last response for lazy LOD adaptive adjustment
+                    # ----------------------------------------------------------------
+                    psm.set_last_assistant_response(project_id, assistant_content)
+                    psm.set_last_response_timestamp(project_id, time.time())
+
+                    # 🔥 STATE MANAGEMENT
+                    #   Response cache — skip partial multi-phase responses
+                    # ----------------------------------------------------------------
+                    if (
+                        self.valves.enable_response_cache
+                        and HAS_SENTENCE
+                        and len(messages) >= 2
+                    ):
+                        last_user = next(
+                            (m for m in reversed(messages) if m.get("role") == "user"),
+                            None,
                         )
+                        if last_user:
+                            _is_partial_mp = (
+                                self.valves.enable_multi_phase_response
+                                and any(
+                                    marker in assistant_content
+                                    for marker in self._MULTI_PHASE_MARKERS
+                                )
+                            )
+                            if not _is_partial_mp:
+                                context_hash = self._activation.compute_context_hash(
+                                    messages
+                                )
+                                code_state_hash = (
+                                    self._activation.compute_code_state_hash(project_id)
+                                )
+                                await self._ltm.store_response_in_cache(
+                                    last_user.get("content", ""),
+                                    assistant_content,
+                                    context_hash,
+                                    state,
+                                    code_state_hash,
+                                    wait=False,
+                                )
 
             # 🚀 RESOURCE OPTIMISATION
             #   Purge expired memories and maintain counters
@@ -33725,6 +33763,7 @@ class Filter:
         # 🚀 BACKGROUND TASKS
         #   Resume after all critical outlet work is done.
         #   Drain SQLite writes first to reduce lock contention.
+        #   This now runs unconditionally — see the early-return note above.
         # ----------------------------------------------------------------
         await self._state_store.drain_writes(timeout=2.0)
 
