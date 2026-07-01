@@ -11699,6 +11699,12 @@ class ReasoningEngine:
             Reinforced by stage 0+1 via _reinforce_cot_scores.
             If BOTH level AND scientific confident → CoTConfig, done.
             If uncertain on ANY → stage 3.
+            The scientific dimension additionally requires a SymbolGraph
+            anchor (n_found >= 1) to count as confident: a CE "scientific"
+            lean with no indexed symbol has nothing to falsify structurally,
+            so it is treated as uncertain and deferred to the LLM arbiter,
+            which carries the n_found==0 rule. A "linear" lean needs no such
+            backing and keeps its confidence.
 
         STAGE 3 — LLM (summarization_model, cheap)
             Full context: query + CE scores + signal_vector + hints.
@@ -11709,6 +11715,10 @@ class ReasoningEngine:
             is_continuation=True          → {level:0}
             empty content                 → {level:0}
             enable_cot_llm_detection=False → stage 1 only
+
+        The reasoning level (state.last_cot_level) is not updated here. It is
+        managed in _detect_and_generate_cot so it is only set when reasoning is
+        actually generated.
         """
         _sv = signal_vector or {
             "n_mentioned": 0,
@@ -11777,9 +11787,6 @@ class ReasoningEngine:
                     f"ambiguity={hints['ambiguity_score']}"
                 ),
             }
-            # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
-            # state.last_cot_level is now managed in _detect_and_generate_cot
-            # so that it is only set when reasoning is actually generated.
             return config
 
         # ── STAGE 2: CrossEncoder ──────────────────────────────────────────
@@ -11879,7 +11886,7 @@ class ReasoningEngine:
                     level_scores, raw_sci, hints
                 )
 
-                # Confidence check on both dimensions
+                # ── Confidence check on both dimensions ────────────────────
                 sorted_lv = sorted(level_scores, reverse=True)
                 level_diff = sorted_lv[0] - sorted_lv[1]
                 sci_diff = sci_scores[0] - sci_scores[1]  # + = scientific wins
@@ -11887,8 +11894,22 @@ class ReasoningEngine:
                 level_confident = (
                     level_diff >= self._f.valves.cot_cascade_uncertainty_threshold
                 )
-                sci_confident = (
+
+                # Scientific confidence needs both a clear CE lean AND, when that
+                # lean is toward scientific, a SymbolGraph anchor to falsify
+                # against. compete_hypotheses validates hypotheses via
+                # gather_evidence → is_falsified; with n_found == 0 there is
+                # nothing to contradict, so unverifiable claims are granted
+                # benefit of the doubt and the competition emits a confident
+                # hallucination about code that does not exist. A CE "scientific"
+                # lean over a symbol-less input is therefore confidence the CE
+                # cannot ground: withhold it and defer to the LLM arbiter, which
+                # already carries the n_found==0 rule. A "linear" lean is kept.
+                _sci_magnitude_confident = (
                     abs(sci_diff) >= self._f.valves.cot_scientific_ce_threshold
+                )
+                sci_confident = _sci_magnitude_confident and not (
+                    sci_diff > 0 and hints["n_found"] < 1
                 )
 
                 self._f._log_debug(
@@ -11916,10 +11937,6 @@ class ReasoningEngine:
                     # Both dimensions confident → return from CE
                     best_level = int(np.argmax(level_scores))
                     use_scientific = sci_diff > 0 and best_level >= 2
-
-                    # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
-                    # state.last_cot_level is now managed in _detect_and_generate_cot
-                    # so that it is only set when reasoning is actually generated.
 
                     config = {
                         "level": best_level,
@@ -11973,10 +11990,6 @@ class ReasoningEngine:
                 hints,
                 project_id,
             )
-
-        # NOTE (Bug 156): ENABLE_COT_STICKY update intentionally removed here.
-        # state.last_cot_level is now managed in _detect_and_generate_cot
-        # so that it is only set when reasoning is actually generated.
 
         return config
 
@@ -12143,9 +12156,15 @@ class ReasoningEngine:
             count 2, medium patterns count 1.
 
         heuristic_suggests_scientific: pre-computed recommendation.
-            True when: ambiguity_score >= 2
-                    OR (has_traceback AND n_found >= 1)
-                    OR (ambiguity_score >= 1 AND n_found >= 2)
+            Scientific mode is only meaningful when the query is anchored to at
+            least one indexed symbol (n_found >= 1) — that is what
+            compete_hypotheses falsifies against. Without an anchor there is
+            nothing to contradict, so the recommendation is withheld regardless
+            of how ambiguous the phrasing looks.
+            True when n_found >= 1 AND any of:
+                ambiguity_score >= 2
+                has_traceback
+                (ambiguity_score >= 1 AND n_found >= 2)
             Advisory — CE reinforcement and LLM can confirm or override.
         """
         content_lower = user_content.lower()
@@ -12210,10 +12229,19 @@ class ReasoningEngine:
         multi_question = len(paragraphs_with_q) >= 2 or len(spanish_questions) >= 2
 
         # ── Derived recommendation ─────────────────────────────────────────
+        # n_found >= 1 is a precondition, not a nice-to-have: scientific mode is
+        # defined by structural falsification against the SymbolGraph. Requiring
+        # an anchor here keeps every consumer (reinforcement nudge, LLM prompt,
+        # heuristic-only fallback) from proposing a competition that has nothing
+        # to falsify. The three inner clauses are the original signals; the
+        # anchor requirement now applies uniformly across all of them.
         heuristic_suggests_scientific = bool(
-            ambiguity_score >= 2
-            or (has_traceback and n_found >= 1)
-            or (ambiguity_score >= 1 and n_found >= 2)
+            n_found >= 1
+            and (
+                ambiguity_score >= 2
+                or has_traceback
+                or (ambiguity_score >= 1 and n_found >= 2)
+            )
         )
 
         return {
@@ -22873,15 +22901,25 @@ class EnrichmentTasks:
         Adjust lod3_threshold based on which symbols appear in the LLM's
         response compared to the LOD level they received.
 
+        Idempotent per response: a hash of `response_text` is recorded in
+        pstate once an adaptation cycle runs, and a later call with the same
+        text returns immediately. This lets the inlet lazy path (_lazy_lod) and
+        the outlet background dispatch (lod_adaptive) both target the previous
+        turn's response without adapting it twice — the first to run wins.
+
         Args:
             project_id (str): The current project identifier.
             response_text (str): The assistant's response text.
             stop_event (Optional[asyncio.Event]): Optional event to signal early termination.
         """
+        # ── Step 1: Early exits — cancellation, valve, empty text ──
         if stop_event and stop_event.is_set():
             return
 
         if not self._f.valves.enable_lod_adaptive:
+            return
+
+        if not response_text or not response_text.strip():
             return
 
         psm = self._f._project_state_manager
@@ -22889,6 +22927,21 @@ class EnrichmentTasks:
         if not last_lod_map:
             return
 
+        # ── Step 2: Per-response dedup guard ──
+        # _lazy_lod (inlet) runs before the outlet bg dispatch and pairs this
+        # response with the lod_map that actually produced it, so it wins; the
+        # bg pass then self-skips. When enable_lazy_lod is off, the bg pass is
+        # the sole adapter and records the hash itself.
+        pstate = psm.get_pstate(project_id)
+        resp_hash = hashlib.md5(response_text.encode()).hexdigest()[:12]
+        if pstate.get("_last_lod_adapted_hash") == resp_hash:
+            self._f._log_debug(
+                "LOD adaptive: response already adapted this cycle, skipping"
+            )
+            return
+        pstate["_last_lod_adapted_hash"] = resp_hash
+
+        # ── Step 3: Determine which referenced symbols were under/over-served ──
         bare_names = self._f._symbol_index.get_all_names(project_id)
         response_words = set(re.findall(r"\b\w+\b", response_text))
         bare_referenced = bare_names.intersection(response_words)
@@ -22906,6 +22959,7 @@ class EnrichmentTasks:
             if last_lod_map[sym] == 3 and sym not in referenced
         ]
 
+        # ── Step 4: Apply the threshold adjustment ──
         old_threshold = self._f.valves.lod3_threshold
         changed = False
 
@@ -25518,7 +25572,7 @@ class InletOrchestrator:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Intent classification with continuation inheritance – NEW (E2)
+    # 7. Intent classification with continuation inheritance
     # ═══════════════════════════════════════════════════════════════════════════
 
     # ── E2: continuation detection ──────────────────────────────────────────
@@ -25586,6 +25640,215 @@ class InletOrchestrator:
             pstate["last_use_case"] = use_case_key
 
         return use_case_key, profile_copy, human_label
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. Make inlet messages available for the outlet (for background tasks)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def process_prev_assistant_turn(
+        self, messages: list, project_id: str, state
+    ) -> None:
+        """
+        Process the previous turn's assistant response at the start of inlet.
+
+        OpenWebUI invokes Filter.outlet() on a pre-stream snapshot whose
+        assistant content is empty, so the content-dependent steps that used to
+        run there never received real data. The message history handed to the
+        NEXT inlet does carry the fully streamed assistant turn, so those steps
+        run here instead, against the last assistant message in ``messages``.
+
+        Covers, in the same order they ran in outlet:
+            1. /expand interception — history-only (see note below).
+            2. Active-code indexing into the SymbolGraph.
+            3. LTM store of the assistant message (fire-and-forget).
+            4. last-assistant bookkeeping in pstate.
+            5. Response-cache population (fire-and-forget).
+
+        Continuation detection (the sixth concern) is handled by the caller,
+        Filter.inlet(), which reconciles it with the AutoContinue watchdog and
+        the multi-phase marker scan; it is deliberately not duplicated here.
+
+        Idempotent across reentries via a per-response hash guard in pstate.
+        Synthetic silent-ingestion acknowledgements are skipped: that path
+        already indexed the pasted code, and caching the acknowledgement could
+        make a later identical paste replay it instead of re-ingesting.
+
+        /expand is history-only: the user already saw the un-expanded text last
+        turn. Rewriting the assistant message here only changes what the LLM
+        sees from now on; a user-visible fix would require a stream filter,
+        which is out of scope for this method.
+
+        Args:
+            messages:   The current conversation message list (post-preprocess),
+                        whose trailing message is the current user query.
+            project_id: Current project identifier.
+            state:      The live ConversationState, forwarded to the response
+                        cache for API compatibility.
+        """
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+
+        # ------------------------------------------------------------------
+        # Region: locate the previous assistant message + history through it
+        #
+        # history_through_assistant is `messages` sliced to end at the last
+        # assistant turn, excluding the current user query. Classifying and
+        # hashing over this slice reproduces the shape the outlet originally
+        # saw, where the assistant response was the trailing message and
+        # classify_session's last_user was the message that PROMPTED it.
+        # ------------------------------------------------------------------
+        last_assistant = None
+        asst_rev_idx = None
+        for i, m in enumerate(reversed(messages)):
+            if m.get("role") == "assistant":
+                last_assistant = m
+                asst_rev_idx = i
+                break
+        if last_assistant is None:
+            return
+
+        history_through_assistant = messages[: len(messages) - asst_rev_idx]
+
+        assistant_content = self._f._coerce_message_content(
+            last_assistant.get("content")
+        )
+        if not assistant_content.strip():
+            self._f._log_debug("prev-assistant: no content to process — skipping")
+            return
+
+        response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
+
+        # ------------------------------------------------------------------
+        # Region: skip synthetic silent-ingestion acknowledgements
+        #
+        # The silent-ingestion early-return path already indexed the pasted
+        # code and recorded its acknowledgement hash in pstate. Re-indexing is
+        # a no-op, but caching the acknowledgement would let a later identical
+        # paste replay it instead of re-ingesting.
+        # ------------------------------------------------------------------
+        if response_hash == pstate.get("_last_silent_ack_hash"):
+            self._f._log_debug(
+                "prev-assistant: skipping synthetic silent-ingestion ack"
+            )
+            pstate["_last_processed_assistant_hash"] = response_hash
+            return
+
+        # ------------------------------------------------------------------
+        # Region: idempotency guard — never process one response twice
+        # ------------------------------------------------------------------
+        if pstate.get("_last_processed_assistant_hash") == response_hash:
+            self._f._log_debug(
+                f"prev-assistant: already processed (hash={response_hash}), skipping"
+            )
+            return
+        pstate["_last_processed_assistant_hash"] = response_hash
+
+        self._f._log_debug(
+            f"prev-assistant: processing (hash={response_hash}, "
+            f"{len(assistant_content.split())} words)"
+        )
+
+        # ------------------------------------------------------------------
+        # Region: classify session over the sliced history
+        #
+        # Cached under the prompting user message's key; step 5's
+        # inlet_prepare_code_session classifies over the current user message
+        # (a different key), so the two do not collide. For an ongoing code
+        # session the active_blocks fast path dominates and both return True.
+        # ------------------------------------------------------------------
+        is_code_session = await self.classify_session(
+            history_through_assistant, project_id
+        )
+
+        # -- flush any in-flight auxiliary LLM work before indexing ----------
+        await self._f._llm_orchestrator.wait_for_llm_tasks()
+
+        # ------------------------------------------------------------------
+        # Region: point 1 — /expand interception (history-only)
+        #
+        # Mutates last_assistant["content"] in place, so body["messages"]
+        # carries the expanded body to the LLM from this turn on.
+        # ------------------------------------------------------------------
+        if is_code_session and "/expand" in assistant_content:
+            modified_content, did_expand = (
+                await self._f._commands.outlet_intercept_expand(
+                    assistant_content, project_id
+                )
+            )
+            if did_expand:
+                last_assistant["content"] = modified_content
+                assistant_content = modified_content
+                self._f._log_debug(
+                    "prev-assistant: /expand expanded in history (LLM-visible only)"
+                )
+
+        assistant_msg = {"role": "assistant", "content": assistant_content}
+
+        # ------------------------------------------------------------------
+        # Region: points 2 + 3 — index assistant code, store in LTM
+        #
+        # store_messages(wait=False) reuses LongTermMemory's own fire-and-forget
+        # path; it already skips short / partial-multi-phase content and strips
+        # assistant CoT before embedding, so no pre-filtering is needed here.
+        # ------------------------------------------------------------------
+        if is_code_session:
+            self._f._log_debug(
+                "prev-assistant: indexing assistant code + LTM store (code session)"
+            )
+            await self._f._update_active_code(assistant_msg, project_id)
+            await self._f._ltm.store_messages(project_id, [assistant_msg], wait=False)
+        elif not self._f.valves.ltm_store_only_code_sessions:
+            self._f._log_debug("prev-assistant: LTM store (non-code session)")
+            await self._f._ltm.store_messages(project_id, [assistant_msg], wait=False)
+
+        # ------------------------------------------------------------------
+        # Region: point 4 — last-assistant bookkeeping
+        #
+        # Feeds adaptive-LOD (update_lod_thresholds_from_response reads the
+        # response text) and any other consumer of the most recent response.
+        # ------------------------------------------------------------------
+        psm.set_last_assistant_response(project_id, assistant_content)
+        psm.set_last_response_timestamp(project_id, time.time())
+
+        # ------------------------------------------------------------------
+        # Region: point 5 — populate the response cache (fire-and-forget)
+        #
+        # Partial multi-phase responses are never cached: replaying half a
+        # multi-phase answer to a repeated question would truncate it. The
+        # response is paired with the user message that PROMPTED it (the last
+        # user turn within history_through_assistant), not the current query.
+        # code_state_hash is taken AFTER _update_active_code, so the entry is
+        # keyed to the post-response code state — matching the outlet's order.
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+            prompt_user = next(
+                (
+                    m
+                    for m in reversed(history_through_assistant)
+                    if m.get("role") == "user"
+                ),
+                None,
+            )
+            if prompt_user is not None:
+                is_partial_mp = self._f.valves.enable_multi_phase_response and any(
+                    marker in assistant_content
+                    for marker in self._f._MULTI_PHASE_MARKERS
+                )
+                if not is_partial_mp:
+                    context_hash = self._f._activation.compute_context_hash(
+                        history_through_assistant
+                    )
+                    code_state_hash = self._f._activation.compute_code_state_hash(
+                        project_id
+                    )
+                    await self._f._ltm.store_response_in_cache(
+                        prompt_user.get("content", ""),
+                        assistant_content,
+                        context_hash,
+                        state,
+                        code_state_hash,
+                        wait=False,
+                    )
 
 
 class SystemPromptBuilder:
@@ -33951,7 +34214,11 @@ class Filter:
         """
         Pre-process the incoming request before the LLM sees it.
 
-        Orchestrates seven sequential steps:
+        Orchestrates the per-turn pipeline:
+            0.  Previous-turn assistant processing (prologue): the content-
+                dependent steps that used to run in outlet, performed here
+                against the fully streamed assistant turn now present in the
+                message history. See InletOrchestrator.process_prev_assistant_turn.
             1.  Project-switch detection, cache loading.
             2.  User-info extraction (last message, question, explicit commands).
             3.  Explicit command dispatch (/forget, /status, /clean, /expand).
@@ -33961,33 +34228,27 @@ class Filter:
             7.  System-prompt assembly (Block A + Block B) with CoT, compression,
                 multi-phase, and adaptive trimming.
 
+        AutoContinue continuation state is authoritative here: the previous
+        assistant response's marker (via _detect_genuine_continuation) decides
+        whether the current turn is a continuation, increments the continuation
+        counter, and persists is_continuation for the watchdog. The outlet no
+        longer touches continuation — it cannot see streamed content — so this
+        is the single source of truth.
+
         Per-turn slot-restore guards (_slot_cont_attempted_{filename} /
         _slot_cont_succeeded_{filename}) live in pstate, which persists across
-        turns, and are cleared at the start of every inlet — the guard inside
-        slot_restore_for_continuity() is meant to prevent double-restores
-        within a single turn, so it must not carry over into the next one.
+        turns, and are cleared at the start of every inlet.
 
         slot_restore_attempted / slot_restored are also reset each inlet, so
-        the explicit slot_restore() call issued after preprocessing reflects
-        the clean post-outlet-save state of the slot rather than whatever
+        the explicit slot_restore() call issued after preprocessing reflects the
+        clean post-outlet-save state of the slot rather than whatever
         background-task activity touched it afterward.
 
         use_case_key / use_case_label, computed once here via
         classify_intent_with_continuation(), are threaded through
         assemble_for_turn() → SystemPromptBuilder.build() →
         _build_activated_code() → build_block_b(), so the rest of the turn
-        reuses this single classification instead of recomputing it via
-        additional classify_use_case() calls deeper in the pipeline.
-
-        Silent ingestion note: OpenWebUI does not appear to persist this
-        filter's in-place mutation of an earlier turn's user message content
-        (the stub written below) as the canonical record of that turn — it
-        re-supplies the original, uncompressed message on later turns. The
-        normal (non-silent-ingestion) path is unaffected because
-        MessageAssembler.assemble() always runs
-        ensure_compressed_user_messages() over the full message list on
-        every turn; this early-return path must do the same explicitly for
-        any earlier messages, since it bypasses that call entirely.
+        reuses this single classification.
         """
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
@@ -34020,12 +34281,6 @@ class Filter:
 
             # ------------------------------------------------------------------
             # Region: clear per-turn slot-restore guards
-            #
-            # These keys live in pstate, an in-memory dict that persists across
-            # turns. The guard inside slot_restore_for_continuity() exists to
-            # prevent double-restores within a single turn, so it is cleared
-            # here at the start of each turn: at most one slot restore per
-            # auxiliary call type per turn.
             # ------------------------------------------------------------------
             _guards_cleared = [
                 k for k in list(pstate.keys()) if k.startswith("_slot_cont_")
@@ -34040,12 +34295,6 @@ class Filter:
 
             # ------------------------------------------------------------------
             # Reset once-per-session slot lifecycle flags
-            #
-            # slot_restore() guards itself with slot_restore_attempted to run only
-            # once per session.  We reset that flag each inlet so the explicit
-            # post-preprocessing restore below reflects the clean post-outlet-save
-            # state rather than whatever background-task activity touched the
-            # slot afterward.
             # ------------------------------------------------------------------
             psm.set_slot_restore_attempted(project_id, False)
             psm.set_slot_restored(project_id, False)
@@ -34061,6 +34310,11 @@ class Filter:
             is_continuation = psm.get_is_continuation(project_id)
 
             # -- AC-A-WD: watchdog for stuck AutoContinue loops ---------------
+            #
+            # _watchdog_broke forces this turn to be treated as non-continuation
+            # by the reconciliation block below, so a forced break cannot be
+            # immediately undone by re-detecting the marker.
+            _watchdog_broke = False
             if is_continuation:
                 turns = psm.get_continuation_turns(project_id)
                 max_turns = self.valves.max_autocontinue_turns
@@ -34071,6 +34325,7 @@ class Filter:
                     )
                     psm.set_is_continuation(project_id, False)
                     is_continuation = False
+                    _watchdog_broke = True
                     if self.valves.enable_slot_persistence:
                         await psm.slot_restore_for_continuity(project_id)
 
@@ -34098,13 +34353,6 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION
             #   Explicit slot restore after preprocessing completes
-            #
-            #   Background tasks (docstrings, RAPTOR, prefetch) run in the outlet
-            #   AFTER slot_save, leaving the slot in a dirty state.  Restoring
-            #   here — before any auxiliary LLM work — guarantees the slot reflects
-            #   the clean post-outlet-save state for the entire inlet.
-            #   slot_restore() is a no-op when no slot file exists (cold start),
-            #   so this is safe for first-turn requests.
             # ----------------------------------------------------------------
             if self.valves.enable_slot_persistence:
                 _restored = await psm.slot_restore(project_id)
@@ -34112,6 +34360,22 @@ class Filter:
                     f"Initial slot restore → "
                     f"{'OK' if _restored else 'skipped / no slot file'}"
                 )
+
+            # 🔥 STATE MANAGEMENT
+            #   0. Process previous turn's assistant response (prologue)
+            #
+            #   Runs after preprocess (so `messages` carries the full streamed
+            #   assistant turn) because outlet() only ever sees a pre-stream
+            #   snapshot with empty content. Indexes assistant code, stores to
+            #   LTM (fire-and-forget), populates the response cache, and records
+            #   last-assistant bookkeeping. Continuation is handled separately
+            #   below.
+            # ----------------------------------------------------------------
+            step_start = time.monotonic()
+            await self._inlet_orch.process_prev_assistant_turn(
+                messages, project_id, state
+            )
+            _inlet_timing("Step 0/6: Process previous assistant turn", step_start)
 
             # 🔥 STATE MANAGEMENT
             #   2. Extract user info
@@ -34126,46 +34390,49 @@ class Filter:
             ) = await self._inlet_orch.inlet_extract_user_info(messages)
             _inlet_timing("Step 2/6: Extract user info", step_start)
 
-            # -- wait for previous turn's LTM store to complete -----------
-            if not self._ltm_store_complete.is_set():
-                self._log_debug(
-                    "LTM: store pending from previous turn — waiting up to 3 s"
-                )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._ltm_store_complete.wait()),
-                        timeout=3.0,
-                    )
-                    self._log_debug("LTM: store completed — proceeding with retrieval")
-                except asyncio.TimeoutError:
-                    self._log_debug(
-                        "LTM: store timeout (>3 s) — retrieval may miss previous turn"
-                    )
-
-            # -- detect AutoContinue continuation from last assistant message ---
-            _last_assistant = next(
-                (m for m in reversed(messages) if m.get("role") == "assistant"), None
+            # -- reconcile AutoContinue continuation state --------------------
+            #
+            #   Single authority for continuation. The previous assistant
+            #   response's marker decides whether THIS turn is a continuation;
+            #   the outlet no longer sets this. _watchdog_broke overrides a
+            #   detected marker so a forced loop-break holds for one turn.
+            genuine = (not _watchdog_broke) and self._detect_genuine_continuation(
+                messages
             )
-            _hint = ""
-            if _last_assistant and not is_continuation:
-                _ac = _last_assistant.get("content", "")
-                for _marker in self._MULTI_PHASE_MARKERS:
-                    if _marker in _ac:
-                        is_continuation = True
-                        _idx = _ac.find(_marker)
-                        _hint_line = _ac[_idx:].split("\n")[0]
-                        _hint = re.sub(
-                            r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
-                            "",
-                            _hint_line,
-                            flags=re.IGNORECASE,
-                        ).strip()
-                        if _hint:
-                            user_question = _hint
-                            self._log_debug(
-                                f"AutoContinue detected — LOD query: '{user_question}'"
-                            )
-                        break
+            if genuine:
+                turns = psm.increment_continuation_turns(project_id)
+                psm.set_is_continuation(project_id, True)
+                is_continuation = True
+                self._log_debug(
+                    f"AutoContinue: continuation marker detected "
+                    f"(turn {turns} of continuation)"
+                )
+                # -- derive the LOD query from the marker line ---------------
+                _last_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                    None,
+                )
+                if _last_assistant is not None:
+                    _ac = _last_assistant.get("content", "")
+                    for _marker in self._MULTI_PHASE_MARKERS:
+                        if _marker in _ac:
+                            _idx = _ac.find(_marker)
+                            _hint_line = _ac[_idx:].split("\n")[0]
+                            _hint = re.sub(
+                                r"▶\s*CONTINÚA[:\s]+(?:Parte\s*\d+[/\d]*\s*[—\-]?\s*)?",
+                                "",
+                                _hint_line,
+                                flags=re.IGNORECASE,
+                            ).strip()
+                            if _hint:
+                                user_question = _hint
+                                self._log_debug(
+                                    f"AutoContinue detected — LOD query: '{user_question}'"
+                                )
+                            break
+            else:
+                psm.set_is_continuation(project_id, False)
+                is_continuation = False
 
             # ⚡ COMMAND HANDLING
             #   3. Explicit commands (/forget, /status, /clean, /expand)
@@ -34213,21 +34480,6 @@ class Filter:
                 and last_user_msg is not None
                 and not is_explicit_command
             ):
-                # DIAGNOSTIC (temporary): confirms the exact value/length of
-                # user_query as seen by is_code_only_message. Motivated by an
-                # observed misclassification of "hola, ¿cómo estás?" as
-                # code-only — tracing the function's own entry guard
-                # (len(content.strip()) < 20) against that literal string
-                # shows it should return False immediately, before reaching
-                # any of the cascade logic. If this log reports a length
-                # materially different from what the user actually typed
-                # (extra whitespace, residual content from a previous turn,
-                # etc.), the root cause is upstream of this function, not
-                # inside its classification logic. Remove once confirmed.
-                self._log_debug(
-                    f"is_code_only_message check: len={len(user_query)}, "
-                    f"repr={user_query!r}"
-                )
                 if await self._commands.is_code_only_message(user_query, project_id):
                     self._log_section("SILENT INGESTION MODE")
 
@@ -34254,19 +34506,10 @@ class Filter:
                             )
                         )
 
-                    # -- safety net: is_code_only_message() can, in principle,
-                    #    misclassify ordinary prose as code-only. If symbol
-                    #    extraction genuinely found nothing, this was never a
-                    #    code paste — abandon silent ingestion and fall
-                    #    through to the normal pipeline instead of emitting a
-                    #    nonsensical "0 symbols in 0 classes" acknowledgment
-                    #    that both discards the user's actual message and
-                    #    never lets the LLM respond to it. This is a backstop
-                    #    layered on top of the classifier fix
-                    #    (is_code_only_message Step 3's question-mark check
-                    #    now runs before its length-based short-circuit), not
-                    #    a replacement for it — it catches any future
-                    #    misclassification the fix doesn't anticipate.
+                    # -- safety net: is_code_only_message() can misclassify
+                    #    ordinary prose as code-only. If symbol extraction found
+                    #    nothing, this was never a code paste — abandon silent
+                    #    ingestion and fall through to the normal pipeline.
                     if not raw_symbols:
                         self._log_debug(
                             "Silent ingestion aborted: is_code_only_message "
@@ -34290,10 +34533,6 @@ class Filter:
                             await self._activation.rebuild_path_index(project_id)
 
                         # -- invalidate and rebuild Block A eagerly ----------------
-                        # invalidate_block_a_cache() is async: its
-                        # recompute_centrality=True path dispatches PageRank to a
-                        # worker thread via anyio.to_thread.run_sync, freeing the
-                        # event loop while it runs. `await` is required here.
                         await self._ctx_builder.invalidate_block_a_cache(
                             project_id, "new chunk ingested", recompute_centrality=True
                         )
@@ -34325,12 +34564,6 @@ class Filter:
                             psm.set_hub_tier_qids(project_id, tier_qids)
                             state.hub_tier_qids_persisted = tier_qids
                             self._conversation_state_manager.set(project_id, state)
-                            # The task handle is kept on the Filter so outlet()
-                            # can wait for this prefill to finish before
-                            # dispatching docstrings/raptor/etc — see the wait
-                            # block near the end of outlet(). This gives the new
-                            # code structure's KV slot priority for the shared
-                            # LLM semaphore over background enrichment work.
                             self._pending_warmup_task = asyncio.create_task(
                                 self._ctx_builder._warmup_tier_prefill(project_id)
                             )
@@ -34341,27 +34574,6 @@ class Filter:
 
                         # -- re-stub earlier user messages OpenWebUI re-supplied
                         #    with their original, uncompressed content ----------
-                        #
-                        # OpenWebUI does not persist this filter's in-place
-                        # mutation of an earlier turn's messages[-1]["content"]
-                        # (the stub written below) as the canonical record of
-                        # that turn — confirmed directly: a follow-up context
-                        # dump showed an earlier turn's user message back in its
-                        # full, raw form, despite that turn having replaced it
-                        # with the stub. The normal (non-silent-ingestion) path
-                        # is unaffected because MessageAssembler.assemble()
-                        # always runs ensure_compressed_user_messages() over the
-                        # *entire* message list on every turn. This early-return
-                        # silent-ingestion path bypasses that entirely, so it
-                        # must call the same function itself — but only over the
-                        # messages BEFORE the current one, since the current
-                        # user message is handled explicitly below (it needs the
-                        # post-ingestion symbol count, which
-                        # ensure_compressed_user_messages does not have access
-                        # to here). Reuses the `state` object already in scope
-                        # from the top of this function — the hub-bodies-tier
-                        # warmup block above relies on the same assumption that
-                        # it is still the live, cache-backed ConversationState.
                         if len(messages) > 1:
                             messages[:-1] = (
                                 self._history_compressor.ensure_compressed_user_messages(
@@ -34387,6 +34599,14 @@ class Filter:
                             f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
                             f"implementations."
                         )
+
+                        # -- record the ack hash so next turn's prologue skips
+                        #    it: the code is already indexed, and caching the ack
+                        #    would let an identical future paste replay it -------
+                        pstate_local["_last_silent_ack_hash"] = hashlib.md5(
+                            response.encode()
+                        ).hexdigest()[:12]
+
                         messages.append({"role": "assistant", "content": response})
 
                         # -- optional context dump --------------------------------
@@ -34429,12 +34649,6 @@ class Filter:
 
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
-            #
-            #   use_case_key / use_case_label computed here are the single source
-            #   of truth for the rest of this turn — they are threaded through
-            #   assemble_for_turn() below so SystemPromptBuilder.build() Step 4a,
-            #   _build_activated_code()'s suppress_sigs check, and build_block_b()
-            #   Step 3 all reuse this one classification instead of recomputing it.
             # ----------------------------------------------------------------
             intent_vector = await self._commands.classify_intent(user_query, project_id)
 
@@ -34494,11 +34708,6 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION
             #   KV cache — restore stable prefix after all auxiliary LLM work
-            #
-            #   Each auxiliary LLM call (CoT, contradiction, use-case, etc.) dirties
-            #   the slot. slot_restore_for_continuity() is called at the end of
-            #   every such call, so the slot is already clean here. This final
-            #   call acts as a safety net in case any path skipped it.
             # ----------------------------------------------------------------
             if not slot_busy and self.valves.enable_slot_persistence:
                 await psm.slot_restore_for_continuity(project_id)
@@ -34512,11 +34721,7 @@ class Filter:
 
         finally:
             # Region: per-request teardown — always execute regardless of exit path
-            # Clear the event emitter to prevent cross-request leaks.
             self._event_emitter = None
-            # Reset the silent-ingestion guard unconditionally so that a request
-            # that raised an exception after setting the flag cannot suppress LLM
-            # calls in subsequent requests.
             self._is_silent_ingestion = False
 
     # ==========================================================================
@@ -34528,42 +34733,15 @@ class Filter:
     # ==========================================================================
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
-        Post-process the response after the LLM has generated it.
+        Post-process the request after the LLM has generated its response.
 
-        Stores the assistant message in LTM, updates the code SymbolGraph, saves
-        the KV slot, refreshes the response cache, runs maintenance tasks, and
-        queues background enrichment work for the next turn.
+        Content-independent only: save the KV slot, run DB maintenance, persist
+        symbol edges / path views / conversation state, then resume background
+        enrichment for the next turn. Assistant-content processing (indexing,
+        LTM store, response cache, continuation) is handled by the next inlet's
+        prologue.
         """
         self._log_debug("outlet called")
-
-        # DIAGNOSTIC (temporary): count outlet() invocations per chat/message id,
-        # and log full body structure + raw content length on every call (not
-        # just the first) to distinguish a genuinely empty streamed content from
-        # OpenWebUI calling outlet() on a pre-stream snapshot.
-        _chat_id = body.get("chat_id", "?")
-        _msg_id = body.get("id", "?")
-        if not hasattr(self, "_outlet_call_counts"):
-            self._outlet_call_counts = {}
-        _call_key = f"{_chat_id}:{_msg_id}"
-        self._outlet_call_counts[_call_key] = (
-            self._outlet_call_counts.get(_call_key, 0) + 1
-        )
-        self._log_debug(
-            f"outlet: invocation #{self._outlet_call_counts[_call_key]} "
-            f"for chat_id={_chat_id}, id={_msg_id}"
-        )
-        _diag_messages = body.get("messages", [])
-        _diag_last = _diag_messages[-1] if _diag_messages else {}
-        _diag_raw_content = _diag_last.get("content")
-        self._log_debug(
-            f"outlet: body keys={list(body.keys())}, "
-            f"n_messages={len(_diag_messages)}, "
-            f"last_role={_diag_last.get('role', '?')}, "
-            f"raw_content_type={type(_diag_raw_content).__name__}, "
-            f"raw_content_len={len(str(_diag_raw_content)) if _diag_raw_content is not None else 'None'}, "
-            f"raw_content_is_none={_diag_raw_content is None}"
-        )
-
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
@@ -34572,213 +34750,27 @@ class Filter:
             return body
 
         # ------------------------------------------------------------------
-        # Region: log body structure once for easier debugging
-        # ------------------------------------------------------------------
-        if not getattr(self, "_outlet_body_structure_logged", False):
-            self._log_debug(
-                f"outlet body structure (first call): "
-                f"keys={list(body.keys())}, "
-                f"messages_count={len(body.get('messages', []))}, "
-                f"last_role={body.get('messages', [{}])[-1].get('role', 'N/A')}"
-            )
-            self._outlet_body_structure_logged = True
-
-        # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
-        # project_id / pstate / assistant_content are referenced in the
-        # background-task tail below, which now runs even when the try
-        # block raises before reaching its own assignment of these names.
-        # Without this, an early exception would surface as a NameError
-        # instead of being handled by the except/finally below it.
+        #
+        # project_id / pstate are referenced in the background-task tail below,
+        # which runs even when the try block raises before assigning them.
         # ------------------------------------------------------------------
         project_id = self.valves.project_id
         pstate = self._project_state_manager.get_pstate(project_id)
-        assistant_content = ""
 
         try:
             project_id = self._inlet_orch.get_project_id()
-            state = self._conversation_state_manager.get(project_id)
             psm = self._project_state_manager
             pstate = psm.get_pstate(project_id)
             messages = body.get("messages", [])
-            is_code_session = await self._inlet_orch.classify_session(
-                messages, project_id
-            )
 
+            # ------------------------------------------------------------------
             # 🔥 STATE MANAGEMENT
-            #   Detect assistant response from body
+            #   KV slot save — content-independent.
             #
-            #   content is normalized via _coerce_message_content rather than
-            #   read as a raw string: OpenWebUI may represent it as a list of
-            #   {"type": "text", "text": ...} parts instead of a plain string
-            #   for some message shapes, which would otherwise make a
-            #   non-empty assistant turn look empty here (every observed
-            #   outlet() call so far has logged "no assistant response found"
-            #   despite inlet() having produced non-empty content, including
-            #   the synthetic silent-ingestion acknowledgment, which is the
-            #   evidence motivating this change). The diagnostic log below
-            #   captures the exact type/repr seen, so if this normalization
-            #   is not the actual cause, the next run gives the real answer
-            #   instead of another guess.
-            # ----------------------------------------------------------------
-            assistant_content = ""
-            assistant_source = ""
-
-            if messages and messages[-1].get("role") == "assistant":
-                raw_content = messages[-1].get("content")
-                self._log_debug(
-                    f"outlet: messages[-1] role=assistant, "
-                    f"content_type={type(raw_content).__name__}, "
-                    f"content_repr={raw_content!r:.300}"
-                )
-                coerced = self._coerce_message_content(raw_content)
-                if coerced:
-                    assistant_content = coerced
-                    assistant_source = "messages[-1]"
-
-            if not assistant_content:
-                for field in ("content", "output", "response", "assistant"):
-                    val = body.get(field)
-                    coerced = self._coerce_message_content(val)
-                    if coerced.strip():
-                        assistant_content = coerced
-                        assistant_source = f"body['{field}']"
-                        break
-
-            # ------------------------------------------------------------------
-            # A `return` from inside this try block skips every line after
-            # the try/except/finally, including drain_writes(),
-            # set_paused(False), and the whole background-task scheduling
-            # loop — that previously left _bg_manager paused indefinitely
-            # after any turn with no detectable assistant content (e.g. the
-            # synthetic acknowledgment turn right after silent ingestion).
-            # Both content-detection outcomes below now fall through into
-            # an if/else instead of returning, so maintenance + background
-            # tasks still run below regardless of which branch is taken.
-            # ------------------------------------------------------------------
-            if not assistant_content:
-                self._log_debug(
-                    "outlet: no assistant response found in body — "
-                    "_update_active_code and LTM store skipped for this turn. "
-                    f"(keys={list(body.keys())})"
-                )
-            else:
-                response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
-                if pstate.get("last_outlet_response_hash") == response_hash:
-                    self._log_debug(
-                        f"outlet: response already processed "
-                        f"(hash={response_hash}), skipping"
-                    )
-                else:
-                    pstate["last_outlet_response_hash"] = response_hash
-                    self._log_debug(
-                        f"outlet: processing assistant response "
-                        f"(source={assistant_source}, hash={response_hash}, "
-                        f"{len(assistant_content.split())} words)"
-                    )
-
-                    await self._llm_orchestrator.wait_for_llm_tasks()
-
-                    if is_code_session and "/expand" in assistant_content:
-                        modified_content, did_expand = (
-                            await self._commands.outlet_intercept_expand(
-                                assistant_content, project_id
-                            )
-                        )
-                        if did_expand:
-                            if assistant_source == "messages[-1]":
-                                messages[-1]["content"] = modified_content
-                            assistant_content = modified_content
-                            self._log_debug(
-                                "outlet: /expand intercepted and expanded in assistant content"
-                            )
-
-                    assistant_msg = {"role": "assistant", "content": assistant_content}
-
-                    if is_code_session:
-                        self._log_debug(
-                            "🔥 STATE MANAGEMENT – Updating active code blocks "
-                            "and storing in LTM (assistant code detected)"
-                        )
-                        await self._update_active_code(assistant_msg, project_id)
-
-                        self._ltm_store_complete.clear()
-
-                        async def _store_and_signal():
-                            try:
-                                await self._ltm.store_messages(
-                                    project_id, [assistant_msg], wait=True
-                                )
-                            except Exception as _ltm_err:
-                                self._log_debug(
-                                    f"LTM: store_messages failed: {_ltm_err}"
-                                )
-                            finally:
-                                self._ltm_store_complete.set()
-
-                        asyncio.create_task(_store_and_signal())
-
-                    else:
-                        if not self.valves.ltm_store_only_code_sessions:
-                            self._log_debug(
-                                "🔥 STATE MANAGEMENT – Storing non-code session message in LTM"
-                            )
-                            self._ltm_store_complete.clear()
-
-                            async def _store_and_signal_noncode():
-                                try:
-                                    await self._ltm.store_messages(
-                                        project_id, [assistant_msg], wait=True
-                                    )
-                                except Exception as _ltm_err:
-                                    self._log_debug(
-                                        f"LTM: store_messages (non-code) failed: {_ltm_err}"
-                                    )
-                                finally:
-                                    self._ltm_store_complete.set()
-
-                            asyncio.create_task(_store_and_signal_noncode())
-
-                    psm.set_last_assistant_response(project_id, assistant_content)
-                    psm.set_last_response_timestamp(project_id, time.time())
-
-                    if (
-                        self.valves.enable_response_cache
-                        and HAS_SENTENCE
-                        and len(messages) >= 2
-                    ):
-                        last_user = next(
-                            (m for m in reversed(messages) if m.get("role") == "user"),
-                            None,
-                        )
-                        if last_user:
-                            _is_partial_mp = (
-                                self.valves.enable_multi_phase_response
-                                and any(
-                                    marker in assistant_content
-                                    for marker in self._MULTI_PHASE_MARKERS
-                                )
-                            )
-                            if not _is_partial_mp:
-                                context_hash = self._activation.compute_context_hash(
-                                    messages
-                                )
-                                code_state_hash = (
-                                    self._activation.compute_code_state_hash(project_id)
-                                )
-                                await self._ltm.store_response_in_cache(
-                                    last_user.get("content", ""),
-                                    assistant_content,
-                                    context_hash,
-                                    state,
-                                    code_state_hash,
-                                    wait=False,
-                                )
-
-            # ------------------------------------------------------------------
-            # 🔥 STATE MANAGEMENT
-            #   KV slot save — deliberately OUTSIDE the assistant-content branch
-            #   above.
+            #   slot_save() keys off the code structure hash, not assistant
+            #   content, and guards against redundant / oversized writes
+            #   internally. It runs unconditionally every turn.
             # ------------------------------------------------------------------
             if self.valves.enable_slot_persistence:
                 try:
@@ -34790,8 +34782,7 @@ class Filter:
                 await psm.slot_save(project_id)
 
             # ------------------------------------------------------------------
-            # 🚀 RESOURCE OPTIMISATION — runs every turn regardless of whether
-            # assistant content was detected above.
+            # 🚀 RESOURCE OPTIMISATION — maintenance, every turn
             # ------------------------------------------------------------------
             await self._ltm.purge_expired_memories()
 
@@ -34816,17 +34807,6 @@ class Filter:
 
             await self._conversation_state_manager.save_if_dirty(project_id)
 
-            genuine = self._detect_genuine_continuation(messages)
-            if genuine:
-                turns = psm.increment_continuation_turns(project_id)
-                psm.set_is_continuation(project_id, True)
-                self._log_debug(
-                    f"AutoContinue: genuine marker detected "
-                    f"(turn {turns} of continuation)"
-                )
-            else:
-                psm.set_is_continuation(project_id, False)
-
         except Exception as _outlet_err:
             self._log_debug(f"❌ outlet error: {_outlet_err}")
             import traceback
@@ -34848,6 +34828,22 @@ class Filter:
 
         last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
 
+        # -- adaptive-LOD input: the last assistant response now lives in
+        #    pstate (written by this turn's inlet prologue), NOT in the empty
+        #    outlet body. This is the previous turn's response, which the inlet
+        #    lazy-LOD path (_lazy_lod) has already adapted on earlier this turn
+        #    with the correct response↔lod_map pairing. update_lod_thresholds_
+        #    from_response now carries a per-response dedup guard (PIECE 4), so
+        #    this bg dispatch is a no-op when lazy already ran, and only does
+        #    real work when enable_lazy_lod is off. It also self-skips on empty
+        #    text (e.g. the first turn, before any assistant response exists).
+        _last_response = self._project_state_manager.get_last_assistant_response(
+            project_id
+        )
+
+        # If silent ingestion fired a hub-tier warmup prefill earlier (or a
+        # previous one is still in flight), give it priority over
+        # docstrings/raptor/etc for the shared LLM semaphore.
         if (
             self._pending_warmup_task is not None
             and not self._pending_warmup_task.done()
@@ -34869,10 +34865,7 @@ class Filter:
             except asyncio.TimeoutError:
                 self._log_debug(
                     f"outlet: warmup prefill still running after "
-                    f"{_warmup_timeout}s — proceeding without waiting further; "
-                    f"it continues running in the background and will "
-                    f"compete with newly-dispatched tasks for the LLM "
-                    f"semaphore from this point on"
+                    f"{_warmup_timeout}s — proceeding without waiting further"
                 )
             except Exception as e:
                 self._log_debug(f"outlet: warmup prefill failed: {e}")
@@ -34889,7 +34882,7 @@ class Filter:
                 continue
             if task.name == "lod_adaptive":
                 await self._bg_manager.start(
-                    task.name, task.bg_func, project_id, assistant_content
+                    task.name, task.bg_func, project_id, _last_response
                 )
             elif task.name == "prefetch":
                 await self._bg_manager.start(
