@@ -4953,6 +4953,14 @@ class ContextBuilder:
             state = self._f._conversation_state_manager.get(project_id)
             if state and state.active_blocks:
                 centrality = psm.get_node_centrality(project_id)
+                # DIAGNOSTIC (temporary): pairs with the write-side log in
+                # invalidate_block_a_cache. See that function's comment for
+                # how to interpret the two logs together.
+                self._f._log_debug(
+                    f"build_block_a: read {len(centrality)} centrality "
+                    f"entries for project '{project_id}' before rendering "
+                    f"symbol section"
+                )
                 resolved_mode = (
                     psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
                 )
@@ -5060,6 +5068,20 @@ class ContextBuilder:
                     lambda: self._f._symbol_index.precompute_centrality(project_id)
                 )
                 psm.set_node_centrality(project_id, centrality)
+                # DIAGNOSTIC (temporary): pairs with the read-side log in
+                # build_block_a. Investigating a regression where the Hub
+                # Symbols section silently disappears from Block A on some
+                # turns despite this call completing without an exception.
+                # If this reports 0 entries, the problem is upstream (likely
+                # precompute_centrality / get_all_qualified_names seeing an
+                # empty symbol set at this exact moment). If this reports a
+                # healthy count but build_block_a's read-side log reports 0,
+                # something clears or overwrites it in between. Remove both
+                # diagnostic lines once the root cause is confirmed.
+                self._f._log_debug(
+                    f"invalidate_block_a_cache: centrality recomputed, "
+                    f"{len(centrality)} entries stored for project '{project_id}'"
+                )
             except Exception as e:
                 self._f._log_debug(f"Centrality recomputation failed: {e}")
 
@@ -7339,15 +7361,6 @@ class SignatureExtractor:
         # 5. Fallback: unknown language
         return "unknown"
 
-    @staticmethod
-    def _infer_code_language(code_snippet: str) -> str:
-        """Simple heuristic language detection for a code snippet."""
-        if re.search(r"\bdef\s+\w+\s*\(", code_snippet):
-            return "python"
-        if re.search(r"\bfunction\s+\w+\s*\(", code_snippet):
-            return "javascript"
-        return "unknown"
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Main extraction entry point (with caching)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -7374,13 +7387,14 @@ class SignatureExtractor:
         Returns:
             List[CodeSymbol]: Extracted symbols, or an empty list on failure.
         """
-        if not CodeBlockManager._is_likely_code(code):
+        # ── Step 1: cheap code-likelihood gate before any parsing work ────────────
+        if not await CodeBlockManager._is_likely_code(code):
             logger.debug("Skipping extraction: text does not appear to be code.")
             return []
 
         cache_key = SignatureExtractor._cache_key(code, file_path, language)
 
-        # ── Cache read: return copies so caller mutations don't corrupt the cache ──
+        # ── Step 2: cache read — return copies so caller mutations don't corrupt the cache
         with SignatureExtractor._EXTRACTION_CACHE_LOCK:
             if cache_key in SignatureExtractor._extraction_cache:
                 cached_symbols, ts = SignatureExtractor._extraction_cache[cache_key]
@@ -7405,7 +7419,7 @@ class SignatureExtractor:
             )
             return []
 
-        # ── Python path: AST extraction ────────────────────────────────────────────
+        # ── Step 3: Python path — AST extraction ───────────────────────────────────
         if lang == "python":
             try:
                 symbols = SignatureExtractor._extract_symbols_from_ast(code, file_path)
@@ -7443,7 +7457,7 @@ class SignatureExtractor:
                     f"AST extraction failed for Python: {e} — falling back to tree-sitter"
                 )
 
-        # ── Non-Python path: tree-sitter via process() ────────────────────────────
+        # ── Step 4: non-Python path — tree-sitter via process() ────────────────────
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
@@ -15382,41 +15396,218 @@ class CommandRouter:
     # 9. Code detection helpers
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def is_code_only_message(self, content: str, project_id: str) -> bool:
+    @staticmethod
+    def _has_request_lead(text: str) -> bool:
+        """Return True when the message opens with a question or request marker.
+
+        The strong intent signal: real questions and requests begin with an
+        interrogative word, an imperative verb, or the Spanish opening '¿',
+        whereas pasted code virtually never does. Only the opening of the text is
+        inspected, so a marker word appearing mid-paste (e.g. inside a comment)
+        does not trigger it. Used to veto a code-only verdict even for content
+        that is otherwise structurally code-like.
         """
-        Detect if a message contains only code without a question.
+
+        _INTERROGATIVE_LEADS: frozenset = frozenset(
+            {
+                # Spanish — interrogatives
+                "que ",
+                "qué ",
+                "como ",
+                "cómo ",
+                "por que ",
+                "por qué ",
+                "para que ",
+                "para qué ",
+                "cual ",
+                "cuál ",
+                "cuales ",
+                "cuáles ",
+                "cuando ",
+                "cuándo ",
+                "donde ",
+                "dónde ",
+                "quien ",
+                "quién ",
+                # Spanish — requests / imperatives (explanation)
+                "dime ",
+                "dinos ",
+                "explica ",
+                "explicame ",
+                "explícame ",
+                "muestra ",
+                "muestrame ",
+                "muéstrame ",
+                "describe ",
+                "resume ",
+                "analiza ",
+                "revisa ",
+                "comenta ",
+                "documenta ",
+                "cuentame ",
+                "cuéntame ",
+                "necesito ",
+                "quiero ",
+                "puedes ",
+                "podrias ",
+                "podrías ",
+                "dame ",
+                "hazme ",
+                "enumera ",
+                "lista ",
+                "compara ",
+                # Spanish — requests / imperatives (code action)
+                "arregla ",
+                "corrige ",
+                "soluciona ",
+                "optimiza ",
+                "refactoriza ",
+                "mejora ",
+                "cambia ",
+                "modifica ",
+                "añade ",
+                "agrega ",
+                "implementa ",
+                "crea ",
+                "genera ",
+                "escribe ",
+                "haz ",
+                "traduce ",
+                "convierte ",
+                "adapta ",
+                "completa ",
+                "actualiza ",
+                "reescribe ",
+                "simplifica ",
+                "depura ",
+                "verifica ",
+                "comprueba ",
+                # English — interrogatives
+                "what ",
+                "how ",
+                "why ",
+                "which ",
+                "when ",
+                "where ",
+                "who ",
+                "whose ",
+                "is there ",
+                "are there ",
+                # English — requests / imperatives (explanation)
+                "tell ",
+                "explain ",
+                "describe ",
+                "show ",
+                "summarize ",
+                "summarise ",
+                "give me ",
+                "walk me ",
+                "help me ",
+                "can you ",
+                "could you ",
+                "would you ",
+                "please ",
+                "list ",
+                "compare ",
+                # English — requests / imperatives (code action)
+                "fix ",
+                "correct ",
+                "solve ",
+                "optimize ",
+                "optimise ",
+                "refactor ",
+                "improve ",
+                "change ",
+                "modify ",
+                "add ",
+                "implement ",
+                "create ",
+                "generate ",
+                "write ",
+                "make ",
+                "translate ",
+                "convert ",
+                "adapt ",
+                "complete ",
+                "update ",
+                "rewrite ",
+                "simplify ",
+                "debug ",
+                "check ",
+                "verify ",
+            }
+        )
+
+        if not text:
+            return False
+        head = text.lstrip().lower()[:60]
+        if head.startswith("¿"):
+            return True
+        return any(head.startswith(lead) for lead in _INTERROGATIVE_LEADS)
+
+    @staticmethod
+    def _looks_interrogative(text: str) -> bool:
+        """Return True when the text reads as a question or a request.
+
+        Broader than _has_request_lead: it additionally treats any embedded '?'
+        or '¿' as a question signal. Intended to run over prose spans (the text
+        outside code fences, or the prose lines extracted from a mixed message),
+        where a question mark anywhere is meaningful — not over raw code, where a
+        '?' may live in a string or comment.
+        """
+        if not text:
+            return False
+        if "?" in text or "¿" in text:
+            return True
+        return CommandRouter._has_request_lead(text)
+
+    @staticmethod
+    def _text_outside_spans(content: str, byte_spans: List[Tuple[int, int]]) -> str:
+        """Return the message text lying outside the given byte spans.
+
+        tree-sitter reports offsets over the UTF-8 encoding, so removal is done
+        in byte space and decoded afterwards. Slicing a str with byte offsets
+        would corrupt multibyte characters (accents, '¿', '¡').
+        """
+        data = content.encode("utf-8")
+        kept = bytearray()
+        cursor = 0
+        for start, end in sorted(byte_spans):
+            start = max(0, min(start, len(data)))
+            end = max(start, min(end, len(data)))
+            if start > cursor:
+                kept += data[cursor:start]
+            cursor = max(cursor, end)
+        kept += data[cursor:]
+        return kept.decode("utf-8", errors="ignore").strip()
+
+    async def is_code_only_message(self, content: str, project_id: str) -> bool:
+        """Decide whether a message is a bare code paste with no question.
 
         Cascade:
-        1. Tree-sitter (fast): parses the message as markdown to detect fenced
-           code blocks. If the text outside the fences is minimal and contains
-           no question marker, classifies as code-only immediately.
-        2. CrossEncoder with heuristic reinforcement: handles large files and
-           unfenced code with high structural line ratios.
-        3. LLM (only when CrossEncoder diff < llm_threshold).
-        4. Heuristic structural fallback (when ce_threshold > diff >= llm_threshold).
+        1. Tree-sitter: detect fenced code blocks; if the text outside the
+           fences is minimal and shows no request intent, classify as code-only.
+        2. CrossEncoder (with heuristic reinforcement) for large/unfenced code.
+        3. LLM arbitration when the CrossEncoder margin is inconclusive.
+        4. Structural heuristic fallback for the remaining ambiguous band.
 
-        Restores KV slot after any LLM call.
+        A code-only verdict requires positive code evidence and no question or
+        request intent. Restores the KV slot after any auxiliary LLM call.
         """
+        # ── Guard clauses & message metrics ──
         if not content or len(content.strip()) < 20:
             return False
 
         stripped = content.strip()
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
-        total_lines = len(stripped.splitlines())
+        all_line_count = len(stripped.splitlines())
         non_empty_lines = [l for l in stripped.splitlines() if l.strip()]
 
-        # ── Step 1: Tree-sitter ──
-        # Parse the message as markdown to locate fenced code block spans.
-        # ProcessConfig() without a language defaults to '' which triggers a
-        # grammar download attempt for an unknown language and always fails.
-        # "markdown" is the correct grammar: we want fence detection, not
-        # source-code parsing.
-        #
-        # Threshold is 80 chars (not the original 30) so that short questions
-        # adjacent to a fence — e.g. "¿Puedes arreglarlo?" (22 chars) or
-        # "can you fix this?" (17 chars) — are not misclassified as code-only.
-        # The '?' guard catches interrogative sentences regardless of length.
-        # Unfenced code is handled by Step 3 (structural heuristic).
+        # ── Step 1: fenced code detection (tree-sitter) ──
+        # Parse the message as markdown to locate code-fence spans. The markdown
+        # grammar is mandatory: an empty language triggers a grammar download
+        # that always fails. At least one real fence must exist for this
+        # short-circuit; otherwise fall through to the heuristic path.
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
@@ -15424,20 +15615,29 @@ class CommandRouter:
                 config = ProcessConfig()
                 config.language = "markdown"
                 blocks = process(content, config)
-                if blocks and hasattr(blocks, "blocks"):
-                    spans = [(b.start_byte, b.end_byte) for b in blocks.blocks]
-                    text_outside = CodeBlockManager.remove_code_spans(
-                        content, spans
-                    ).strip()
+                fence_spans = [
+                    (b.start_byte, b.end_byte)
+                    for b in (getattr(blocks, "blocks", None) or [])
+                ]
+                if fence_spans:
+                    text_outside = self._text_outside_spans(content, fence_spans)
+                    # Minimal non-code text and no request intent → code-only.
+                    # The 80-char margin avoids swallowing short adjacent prompts
+                    # ("¿puedes arreglarlo?"), and _looks_interrogative now also
+                    # catches lead imperatives ("refactoriza esto").
                     if not text_outside or (
-                        len(text_outside) < 80 and "?" not in text_outside
+                        len(text_outside) < 80
+                        and not self._looks_interrogative(text_outside)
                     ):
                         return True
             except Exception:
                 pass
 
-        # ── Step 2: CrossEncoder ──
+        # ── Step 2: CrossEncoder classification ──
         if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
+            # Head request intent, computed once and reused as a veto below.
+            head_is_request = self._has_request_lead(content)
+
             query = content[:500]
             pairs = [
                 (
@@ -15449,10 +15649,16 @@ class CommandRouter:
             scores = await self._predict_cross_encoder(pairs)
             if scores is not None and len(scores) >= 2:
                 scores_reinforced = list(scores)
-                if "?" not in content and len(content.split()) < 30:
+
+                # Nudge toward code-only only for short messages that carry no
+                # request intent. Short imperative questions ("dime ...") are
+                # short and unmarked, and must not be nudged.
+                if not self._looks_interrogative(content) and len(content.split()) < 30:
                     scores_reinforced[0] += 0.2
 
-                if total_lines > 500:
+                # Very large messages: decide by structural-line ratio, but never
+                # auto-classify a paste that opens with an explicit request.
+                if all_line_count > 500 and not head_is_request:
                     structural_lines = sum(
                         1
                         for l in non_empty_lines
@@ -15466,25 +15672,32 @@ class CommandRouter:
                     )
                     if ratio > 0.6:
                         return True
-                    if total_lines > 1000 and content.count("?") < 3:
+                    if all_line_count > 1000 and content.count("?") < 3:
                         return True
 
+                # Threshold bands. The clamp keeps the LLM band strictly below
+                # the confidence band even under incoherent valve values.
+                ce_threshold = self._f.valves.code_only_ce_threshold
+                llm_threshold = self._f.valves.code_only_llm_threshold
+                if llm_threshold > ce_threshold:
+                    llm_threshold = ce_threshold
+
                 diff = scores_reinforced[0] - scores_reinforced[1]
-                CE_CONFIDENCE_THRESHOLD = self._f.valves.code_only_ce_threshold
-                LLM_FALLBACK_THRESHOLD = self._f.valves.code_only_llm_threshold
-                if diff >= CE_CONFIDENCE_THRESHOLD:
+                if diff >= ce_threshold:
                     return scores_reinforced[0] > scores_reinforced[1]
-                elif diff < LLM_FALLBACK_THRESHOLD:
+                elif diff < llm_threshold:
                     return await self._is_code_only_with_llm(
                         query, scores_reinforced, project_id
                     )
 
-        # ── Step 3: Heuristic fallback ──
+        # ── Step 3: structural heuristic fallback ──
+        # Step 3a — classify each non-blank line as structural or prose. Noise
+        # stripping is applied line by line so the result stays aligned with the
+        # original lines regardless of what _strip_code_noise does to line count.
         raw_lines = stripped.splitlines()
-        cleaned_lines = self._strip_code_noise(stripped).splitlines()
         non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
-        total_lines = len(non_blank_idx)
-        if total_lines == 0:
+        code_line_count = len(non_blank_idx)
+        if code_line_count == 0:
             return False
 
         structural_lines = 0
@@ -15496,20 +15709,43 @@ class CommandRouter:
             ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
                 structural_lines += 1
                 continue
-            cleaned_line = cleaned_lines[i].strip() if i < len(cleaned_lines) else ""
+            cleaned_line = self._strip_code_noise(raw_line).strip()
             if not cleaned_line:
                 structural_lines += 1
                 continue
             prose_candidates.append(cleaned_line)
 
-        structural_ratio = structural_lines / total_lines if total_lines else 0
+        structural_ratio = (
+            structural_lines / code_line_count if code_line_count else 0.0
+        )
+        prose_text = " ".join(prose_candidates).strip()
+
+        # ── Step 3b: verdict (intent first, then structural poles) ──
+        # 1. Request/question lead at the message head → the user wants an
+        #    answer. Evaluated first, so it holds regardless of how the
+        #    structural regexes classify the line (this is what rescues prompts
+        #    like "dime qué hace build_block_b").
+        if self._has_request_lead(stripped):
+            return False
+        # 2. Question or request intent inside the extracted prose (not inside
+        #    code lines) → answer it.
+        if prose_text and self._looks_interrogative(prose_text):
+            return False
+        # 3. No code lines at all → prose, never a paste (positive-evidence rule).
+        if structural_lines == 0:
+            return False
+        # 4. No prose lines at all → pure code paste.
+        if not prose_candidates:
+            return True
+        # 5. Mixed content, no detected question. Overwhelmingly structural →
+        #    paste (the sparse prose is a caption/comment already cleared of
+        #    intent by steps 1-2).
         if structural_ratio > 0.70:
             return True
-        prose_text = " ".join(prose_candidates).strip()
-        if not prose_text or len(prose_text) < 30:
-            return True
-        if "?" in prose_text:
+        # 6. Substantial non-question prose beside code → treat as a message.
+        if len(prose_text) >= 30:
             return False
+        # 7. Sparse prose beside real code lines → paste.
         return True
 
     async def _is_code_only_with_llm(
@@ -15803,76 +16039,6 @@ class CodeBlockManager:
             and chunk_start_line <= s.line_start <= chunk_end_line
         ]
 
-    @staticmethod
-    def _is_likely_code(text: str, languages: Optional[List[str]] = None) -> bool:
-        """
-        Determine if the given text is likely source code, using tree-sitter.
-
-        To keep it fast, only the first SAMPLE_SIZE characters are analyzed.
-        This is sufficient because the nature of the code (keywords, structure)
-        is usually evident in the first few lines.
-
-        Args:
-            text (str): The text to test.
-            languages (Optional[List[str]]): List of language names to try.
-                                             Defaults to common languages.
-
-        Returns:
-            bool: True if the text is likely code, False otherwise.
-        """
-        SAMPLE_SIZE = 500  # Reduced from 5000 to 500 for speed
-
-        if not text or len(text.strip()) < 20:
-            return False
-
-        # Use a sample to keep it fast
-        sample = text[:SAMPLE_SIZE]
-
-        if not HAS_TREE_SITTER:
-            # Fallback to simple heuristics when tree-sitter is unavailable
-            return bool(
-                re.search(
-                    r"\b(def|class|import|from|function|const|let|var|fn|pub|use|"
-                    r"package|interface|type|enum|struct|impl|trait|"
-                    r"public|private|protected|static|void|int|float|string|bool)\b",
-                    sample,
-                )
-            )
-
-        if languages is None:
-            languages = [
-                "python",
-                "javascript",
-                "tsx",
-                "go",
-                "rust",
-                "java",
-                "cpp",
-                "c",
-                "ruby",
-                "php",
-                "c_sharp",
-                "swift",
-                "kotlin",
-                "typescript",
-            ]
-
-        from tree_sitter import Parser as TSParser
-        from tree_sitter_language_pack import get_language
-
-        for lang in languages:
-            try:
-                lang_obj = get_language(lang)
-                parser = TSParser(lang_obj)
-                tree = parser.parse(sample.encode())
-                root = tree.root_node
-                if root.children and any(n.type != "ERROR" for n in root.children):
-                    return True
-            except Exception:
-                continue
-
-        return False
-
     async def extract_code_blocks(
         self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
@@ -15982,7 +16148,7 @@ class CodeBlockManager:
             else:
                 if len(indented) >= 3:
                     code = "\n".join(indented)
-                    if self._is_likely_code(code) and len(code) <= 200_000:
+                    if await self._is_likely_code(code) and len(code) <= 200_000:
                         lang = SignatureExtractor._guess_language(None, code) or "text"
                         blocks.append(
                             {"language": lang, "code": code, "type": "indented"}
@@ -15997,7 +16163,7 @@ class CodeBlockManager:
 
         if len(indented) >= 3:
             code = "\n".join(indented)
-            if self._is_likely_code(code) and len(code) <= 200_000:
+            if await self._is_likely_code(code) and len(code) <= 200_000:
                 lang = SignatureExtractor._guess_language(None, code) or "text"
                 blocks.append({"language": lang, "code": code, "type": "indented"})
                 start_offset = line_offsets[total_lines - len(indented)]
@@ -16005,7 +16171,11 @@ class CodeBlockManager:
                 spans.append((start_offset, end_offset))
 
         # ── Section 5: Entire small content as a single block ─────────────
-        if not blocks and len(content) <= 20_000 and self._is_likely_code(content):
+        if (
+            not blocks
+            and len(content) <= 20_000
+            and await self._is_likely_code(content)
+        ):
             lang = SignatureExtractor._guess_language(None, content) or "text"
             blocks.append({"language": lang, "code": content, "type": "indented"})
             spans.append((0, len(content)))
@@ -16053,12 +16223,25 @@ class CodeBlockManager:
         return processed_blocks, processed_spans
 
     @staticmethod
-    def _is_likely_code(text: str) -> bool:
+    async def _is_likely_code(text: str) -> bool:
         """
-        Lightweight heuristic to determine if text looks like source code.
+        Determine if text looks like source code via a cheap regex pre-filter
+        with a CrossEncoder fallback for ambiguous cases.
 
-        This is a fallback when tree-sitter Markdown detection is unavailable.
-        It does NOT parse grammar; it simply checks for structural keywords.
+        Stage 1 (regex): matches a cross-language keyword set. A confident
+        hit returns True with no model call.
+        Stage 2 (CrossEncoder, only when Stage 1 finds nothing and the text
+        is long enough to be worth a second look): catches languages or
+        styles the keyword list misses entirely — Ruby, Lua, SQL, shell,
+        minified code, or a keyword-free fragment.
+
+        No LLM fallback by design — this is a hot-path gate called once per
+        extracted block, potentially many times per message.
+
+        Locking: uses the module-level _CROSS_ENCODER_LOCK (threading.Lock)
+        rather than Filter._cross_encoder_lock (asyncio.Lock), since this
+        staticmethod has no Filter reference. Serializes predict() calls
+        made through this path only, not against CommandRouter's.
 
         Args:
             text: The text to evaluate.
@@ -16066,17 +16249,44 @@ class CodeBlockManager:
         Returns:
             True if it looks like code, False otherwise.
         """
+        # ── Step 1: minimum length guard ──────────────────────────────────────────
         if not text or len(text.strip()) < 20:
             return False
         sample = text[:500]
-        return bool(
-            re.search(
-                r"\b(def|class|import|from|function|const|let|var|fn|pub|use|"
-                r"package|interface|type|enum|struct|impl|trait|"
-                r"public|private|protected|static|void|int|float|string|bool)\b",
-                sample,
-            )
-        )
+
+        # ── Step 2: regex pre-filter — fast, multi-language, zero cost ────────────
+        if re.search(
+            r"\b(def|class|import|function|return|async|await|const|var|fn|"
+            r"pub|package|interface|enum|struct|impl|trait|type|"
+            r"public|private|protected|static|void|int|float|string|bool)\b",
+            sample,
+        ):
+            return True
+
+        # ── Step 3: skip CrossEncoder fallback for very short ambiguous text ──────
+        if len(sample) < 60:
+            return False
+
+        # ── Step 4: CrossEncoder fallback for languages the regex can't see ───────
+        ce = _get_cross_encoder()
+        if ce is None:
+            return False
+
+        pairs = [
+            (sample, "This is a fragment of source code."),
+            (sample, "This is natural language prose."),
+        ]
+
+        def _predict_locked():
+            with _CROSS_ENCODER_LOCK:
+                return ce.predict(pairs)
+
+        try:
+            scores = await anyio.to_thread.run_sync(_predict_locked)
+        except Exception:
+            return False
+
+        return bool(scores is not None and len(scores) >= 2 and scores[0] > scores[1])
 
     def _is_filter_internal(self, file_path: Optional[str]) -> bool:
         """
@@ -16109,25 +16319,6 @@ class CodeBlockManager:
             return None
         paths = self.extract_file_paths(content)
         return paths[0] if paths else None
-
-    async def _infer_code_language(self, code_snippet: str) -> str:
-        """
-        Simple heuristic language detection for a code snippet.
-
-        Used as a fallback when tree-sitter language detection fails or
-        returns "unknown". Only detects Python and JavaScript currently.
-
-        Args:
-            code_snippet: The source code to analyze.
-
-        Returns:
-            A language string ("python", "javascript", or "unknown").
-        """
-        if re.search(r"\bdef\s+\w+\s*\(", code_snippet):
-            return "python"
-        if re.search(r"\bfunction\s+\w+\s*\(", code_snippet):
-            return "javascript"
-        return "unknown"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Content classification
@@ -28415,7 +28606,7 @@ class ContextDumper:
                 self._f._log_debug(f"Context dump inline write failed: {exc}")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 2. Payload capture (sync, cheap, mutation‑safe) – MODIFIED (M7)
+    # 2. Payload capture (sync, cheap, mutation‑safe)
     # ═══════════════════════════════════════════════════════════════════════
 
     def _capture_payload(
@@ -28459,13 +28650,27 @@ class ContextDumper:
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
 
+        # ── Turn number for the dump label ───────────────────────────────────
+        # Derived from len(messages) rather than ConversationState.message_count.
+        # message_count only advances when a turn contains indexable code (see
+        # ActiveCodeUpdater._post_update_tasks) — a purely conversational turn
+        # never touches it, which made this label read "turn 0" for the first
+        # plain-conversation turn of a session even though a real turn had
+        # completed. messages is already available here at the exact point
+        # each turn is captured, so counting user/assistant pairs directly
+        # needs no new persistent counter and can't drift out of sync with
+        # what actually happened. This value flows unchanged into both
+        # _write_async's log line and _write_sync's filename/JSONL record —
+        # both read payload["turn"] rather than recomputing it, so fixing it
+        # here is the single point of correction for every place "turn N" is
+        # shown or persisted.
+        turn = (len(messages) + 1) // 2
+
         # ── Get persistent state via ConversationStateManager ───────────────
         try:
             state = self._f._conversation_state_manager.get(project_id)
-            turn = state.message_count
             n_active_blocks = len(state.active_blocks)
         except Exception:
-            turn = 0
             n_active_blocks = 0
 
         try:
@@ -29305,7 +29510,7 @@ class TaskRegistry:
             project_id: The current project identifier.
         """
         state = self._f._conversation_state_manager.get(project_id)
-        interval = self.valves.session_summary_interval_messages
+        interval = self._f.valves.session_summary_interval_messages
         if (
             interval <= 0
             or state.message_count % interval != 0
@@ -29808,6 +30013,22 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
 
+        Timeout semantics
+        ──────────────────
+        The HTTP call is bounded by valves.slot_operation_timeout, but this
+        is a backstop for a genuinely hung server, NOT the primary
+        reliability mechanism for slot persistence. That role belongs to
+        BackgroundTaskManager.stop_all() never hard-cancelling in-flight LLM
+        calls (see its docstring) — under --parallel 1, a cancelled asyncio
+        Task does not reliably stop server-side generation, and the orphaned
+        work then queues every subsequent request (including this one)
+        behind it. Observed in practice: a slot_restore call blocked for
+        326s with no timeout at all, and still failed — proving the
+        unbounded wait bought zero reliability, only a much slower failure.
+        With stop_all() no longer self-inflicting this contention, this
+        timeout should rarely fire; set slot_operation_timeout=0 to wait
+        indefinitely (bounded only by llm_per_call_timeout).
+
         Args:
             project_id: The project identifier.
             force: Whether to force save even if the hash hasn't changed.
@@ -29851,7 +30072,7 @@ class ProjectStateManager:
         if base.endswith("/v1"):
             base = base[:-3]
 
-        try:
+        async def _do_save():
             from shared_resources import get_http_session as _shared_get_http_session
 
             session = await _shared_get_http_session(
@@ -29866,19 +30087,38 @@ class ProjectStateManager:
                 },
             ) as resp:
                 if resp.status == 200:
-                    self.set_last_saved_slot_hash(project_id, static_hash)
                     data = await resp.json()
-                    self._f._log_debug(
-                        f"✓ Slot saved → {filename} "
-                        f"({data.get('n_saved', '?')} tokens, "
-                        f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
-                    )
-                    await self._cleanup_old_slot_files(project_id, filename)
-                    return True
-                else:
-                    body = await resp.text()
-                    self._f._log_debug(f"Slot save failed: HTTP {resp.status} — {body}")
-                    return False
+                    return True, data, None
+                body_text = await resp.text()
+                return False, None, (resp.status, body_text)
+
+        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
+        _timeout = self._f.valves.slot_operation_timeout
+
+        try:
+            if _timeout > 0:
+                ok, data, err = await asyncio.wait_for(_do_save(), timeout=_timeout)
+            else:
+                ok, data, err = await _do_save()
+
+            if ok:
+                self.set_last_saved_slot_hash(project_id, static_hash)
+                self._f._log_debug(
+                    f"✓ Slot saved → {filename} "
+                    f"({data.get('n_saved', '?')} tokens, "
+                    f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
+                )
+                await self._cleanup_old_slot_files(project_id, filename)
+                return True
+            status, body_text = err
+            self._f._log_debug(f"Slot save failed: HTTP {status} — {body_text}")
+            return False
+        except asyncio.TimeoutError:
+            self._f._log_debug(
+                f"Slot save timed out after {_timeout}s — the server may still "
+                f"be processing other work. Skipping save for this turn."
+            )
+            return False
         except Exception as e:
             self._f._log_debug(f"Slot save error: {e}")
             return False
@@ -29958,6 +30198,12 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) to locate the correct
         slot file, ensuring that docstring population does not cause a miss.
 
+        Timeout semantics — see slot_save() for the full rationale. This is
+        the exact call observed blocking 326s (no bound at all) and still
+        failing — the backstop here exists for genuinely hung servers, not
+        as the fix for that stall. The fix for that stall is
+        BackgroundTaskManager.stop_all() no longer orphaning generations.
+
         Args:
             project_id: The project identifier.
 
@@ -30002,7 +30248,7 @@ class ProjectStateManager:
         if base.endswith("/v1"):
             base = base[:-3]
 
-        try:
+        async def _do_restore():
             from shared_resources import get_http_session as _shared_get_http_session
 
             session = await _shared_get_http_session(
@@ -30017,19 +30263,37 @@ class ProjectStateManager:
                 },
             ) as resp:
                 if resp.status == 200:
-                    self.set_slot_restored(project_id, True)
                     data = await resp.json()
-                    self._f._log_debug(
-                        f"✓ Slot restored ← {filename} "
-                        f"({data.get('n_restored', '?')} tokens)"
-                    )
-                    return True
-                else:
-                    body = await resp.text()
-                    self._f._log_debug(
-                        f"Slot restore failed: HTTP {resp.status} — {body}"
-                    )
-                    return False
+                    return True, data, None
+                body_text = await resp.text()
+                return False, None, (resp.status, body_text)
+
+        # --- 5. Execute, bounded only if slot_operation_timeout > 0 ---
+        _timeout = self._f.valves.slot_operation_timeout
+
+        try:
+            if _timeout > 0:
+                ok, data, err = await asyncio.wait_for(_do_restore(), timeout=_timeout)
+            else:
+                ok, data, err = await _do_restore()
+
+            if ok:
+                self.set_slot_restored(project_id, True)
+                self._f._log_debug(
+                    f"✓ Slot restored ← {filename} "
+                    f"({data.get('n_restored', '?')} tokens)"
+                )
+                return True
+            status, body_text = err
+            self._f._log_debug(f"Slot restore failed: HTTP {status} — {body_text}")
+            return False
+        except asyncio.TimeoutError:
+            self._f._log_debug(
+                f"Slot restore timed out after {_timeout}s — the server may "
+                f"still be processing other work. Proceeding without restore "
+                f"(full prefill will be paid)."
+            )
+            return False
         except Exception as e:
             self._f._log_debug(f"Slot restore error: {e}")
             return False
@@ -30041,6 +30305,13 @@ class ProjectStateManager:
 
         Called at the end of every auxiliary LLM call when
         ``enable_slot_persistence=True``.
+
+        Timeout semantics — see slot_save() for the full rationale. This
+        call sits between every auxiliary LLM call and the next within a
+        single turn; an unbounded stall here compounds across however many
+        auxiliary calls that turn makes, which is exactly the kind of
+        cascading delay the backstop exists for once the structural fix
+        (stop_all() no longer orphaning generations) is in place.
 
         Args:
             project_id: The project identifier.
@@ -30108,7 +30379,7 @@ class ProjectStateManager:
             f"with hash {static_hash} → {filename}"
         )
 
-        try:
+        async def _do_restore():
             from shared_resources import get_http_session as _shared_get_http_session
 
             session = await _shared_get_http_session(
@@ -30124,21 +30395,40 @@ class ProjectStateManager:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    pstate[_success_key] = True
-                    self._f._log_debug(
-                        f"✓ KV cache restored post-aux ← {filename} "
-                        f"({data.get('n_restored', '?')} tokens)"
-                    )
-                    return True
+                    return True, data, None
+                body_text = await resp.text()
+                return False, None, (resp.status, body_text)
 
-                body = await resp.text()
-                pstate[_success_key] = False
+        # --- 5. Execute, bounded only if slot_operation_timeout > 0 ---
+        _timeout = self._f.valves.slot_operation_timeout
+
+        try:
+            if _timeout > 0:
+                ok, data, err = await asyncio.wait_for(_do_restore(), timeout=_timeout)
+            else:
+                ok, data, err = await _do_restore()
+
+            if ok:
+                pstate[_success_key] = True
                 self._f._log_debug(
-                    f"slot_restore_for_continuity: restore failed: "
-                    f"HTTP {resp.status} — {body}"
+                    f"✓ KV cache restored post-aux ← {filename} "
+                    f"({data.get('n_restored', '?')} tokens)"
                 )
-                return False
-
+                return True
+            status, body_text = err
+            pstate[_success_key] = False
+            self._f._log_debug(
+                f"slot_restore_for_continuity: restore failed: "
+                f"HTTP {status} — {body_text}"
+            )
+            return False
+        except asyncio.TimeoutError:
+            pstate[_success_key] = False
+            self._f._log_debug(
+                f"slot_restore_for_continuity: timed out after {_timeout}s — "
+                f"server may still be processing other work"
+            )
+            return False
         except Exception as e:
             pstate[_success_key] = False
             self._f._log_debug(f"slot_restore_for_continuity: error: {e}")
@@ -30341,6 +30631,7 @@ class BackgroundTaskManager:
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._paused = True
+        self._detached_tasks: Dict[str, asyncio.Task] = {}
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
@@ -30375,6 +30666,21 @@ class BackgroundTaskManager:
                     f"bg_manager: task '{name}' already running, skipped"
                 )
                 return
+
+            # ------------------------------------------------------------------
+            # Avoid duplicating a still-running detached orphan from a
+            # previous turn — its work is not lost, just not blocking us.
+            # ------------------------------------------------------------------
+            orphan = self._detached_tasks.get(name)
+            if orphan is not None:
+                if not orphan.done():
+                    self._f._log_debug(
+                        f"bg_manager: task '{name}' skipped — a detached "
+                        f"orphan from a previous turn is still finishing "
+                        f"server-side work"
+                    )
+                    return
+                del self._detached_tasks[name]
 
             # ------------------------------------------------------------------
             # Do not start if paused (inlet active).
@@ -30421,22 +30727,57 @@ class BackgroundTaskManager:
 
     async def stop_all(self, timeout: float = None) -> None:
         """
-        Gracefully stop all running background tasks without deadlock.
+        Gracefully stop all running background tasks without deadlock, and
+        without ever hard-cancelling a task whose coroutine may currently be
+        awaiting an in-flight HTTP call to the inference server.
 
-        Signals tasks and releases the lock before waiting for them.
-        This avoids the deadlock where stop_all holds the lock while tasks
-        need it to clean up.
+        Why hard cancellation is unsafe here
+        ─────────────────────────────────────
+        Under --parallel 1, llama.cpp serves exactly one generation at a
+        time through a single shared slot. Cancelling the local asyncio.Task
+        that issued an LLM call only tears down the CLIENT side of that
+        request — closing the aiohttp connection does not reliably
+        interrupt token generation already in progress on the SERVER.
+        Observed in practice: a docstring/raptor task force-cancelled here
+        left an orphaned generation running server-side that queued every
+        subsequent request (including slot_restore) behind it for over five
+        minutes, and that request still failed at the end of the wait —
+        proving the cancellation itself was the source of the unreliability,
+        not a fix for it.
+
+        Policy
+        ──────
+        1. Signal stop_event (cooperative). Tasks already check this between
+           LLM calls (e.g. between docstring batches) and exit cleanly.
+        2. Wait up to `timeout` seconds for cooperative completion.
+        3. Any task still running after the timeout is DETACHED, not
+           cancelled: moved to self._detached_tasks and left to finish on
+           its own. inlet() proceeds immediately without waiting further.
+           In the common case this converges quickly anyway — the detached
+           task still holds the same (already-set) stop_event, so its own
+           internal loop exits cooperatively the moment its current in-flight
+           LLM call returns; detaching only skips US waiting for that moment.
+        4. start() consults self._detached_tasks before launching a new task
+           of the same name, so a still-running orphan is never duplicated.
+        5. A done_callback (_on_detached_done) logs the eventual outcome and
+           cleans up the registry entry, so detached tasks stay observable
+           instead of vanishing silently.
+
+        This trades "every inlet starts from a guaranteed-quiescent state"
+        for "inlet never blocks for minutes on a task that cannot actually
+        be stopped" — the former guarantee was illusory anyway, since the
+        cancelled task's server-side work kept running regardless of what
+        the client believed.
 
         Args:
-            timeout: Maximum seconds to wait for graceful shutdown.
-                     If None, uses valve bg_task_stop_timeout.
+            timeout: Maximum seconds to wait for graceful (cooperative)
+                     shutdown before detaching. If None, uses
+                     valves.bg_task_stop_timeout.
         """
         if timeout is None:
             timeout = self._f.valves.bg_task_stop_timeout
 
-        # ------------------------------------------------------------------
-        # Signal and snapshot under lock, then release BEFORE waiting.
-        # ------------------------------------------------------------------
+        # ── Signal and snapshot under lock, then release before waiting ──────────
         async with self._lock:
             if not self._tasks:
                 return
@@ -30448,11 +30789,10 @@ class BackgroundTaskManager:
                 if self._f.valves.bg_task_log_detailed:
                     self._f._log_debug(f"bg_manager: stop signal → '{name}'")
 
-            tasks_to_wait = [t for t in self._tasks.values() if not t.done()]
+            tasks_snapshot = dict(self._tasks)
+            tasks_to_wait = [t for t in tasks_snapshot.values() if not t.done()]
 
-        # ------------------------------------------------------------------
-        # Lock is released here — tasks can now acquire it in their finally blocks.
-        # ------------------------------------------------------------------
+        # ── Lock released here — tasks can now acquire it in their finally blocks ──
         if tasks_to_wait:
             self._f._log_debug(
                 f"bg_manager: waiting for {len(tasks_to_wait)} task(s) "
@@ -30463,16 +30803,30 @@ class BackgroundTaskManager:
 
             self._f._log_debug(
                 f"bg_manager: {len(done)} task(s) finished gracefully, "
-                f"{len(still_pending)} cancelled"
+                f"{len(still_pending)} detached (not cancelled)"
             )
 
-            for task in still_pending:
-                if not task.done():
-                    task.cancel()
+            if still_pending:
+                async with self._lock:
+                    for task in still_pending:
+                        task_name = next(
+                            (n for n, t in tasks_snapshot.items() if t is task),
+                            "<unknown>",
+                        )
+                        self._f._log_debug(
+                            f"bg_manager: detaching '{task_name}' — still "
+                            f"running after {timeout}s. NOT cancelled "
+                            f"(cancellation cannot stop server-side "
+                            f"generation under --parallel 1); letting it "
+                            f"finish on its own, tracked as an orphan so "
+                            f"it is never duplicated."
+                        )
+                        self._detached_tasks[task_name] = task
+                        task.add_done_callback(
+                            lambda t, n=task_name: self._on_detached_done(n, t)
+                        )
 
-        # ------------------------------------------------------------------
-        # Final cleanup: tasks self-clean via finally, but clear any remnants.
-        # ------------------------------------------------------------------
+        # ── Clear the active registry; orphans now live only in _detached_tasks ──
         async with self._lock:
             self._tasks.clear()
             self._stop_events.clear()
@@ -30483,8 +30837,22 @@ class BackgroundTaskManager:
         self._f._log_debug(f"Background tasks {'paused' if paused else 'resumed'}")
 
     def is_running(self, name: str) -> bool:
-        """Check if a specific background task is currently running."""
-        return name in self._tasks and not self._tasks[name].done()
+        """
+        Check if a specific background task is currently running, either
+        tracked normally or as a detached orphan still finishing
+        server-side work from a previous turn.
+
+        Args:
+            name: The task name to check.
+
+        Returns:
+            bool: True if a task of this name is active in either registry.
+        """
+        if name in self._tasks and not self._tasks[name].done():
+            return True
+        if name in self._detached_tasks and not self._detached_tasks[name].done():
+            return True
+        return False
 
     # ═══════════════════════════════════════════════════════════════════════
     # Internal methods
@@ -30577,6 +30945,40 @@ class BackgroundTaskManager:
                 if self._tasks.get(name) is _me:
                     self._tasks.pop(name, None)
                     self._stop_events.pop(name, None)
+
+    def _on_detached_done(self, name: str, task: asyncio.Task) -> None:
+        """
+        Completion callback for a previously-detached orphaned task.
+
+        Runs synchronously on the event loop (asyncio done_callbacks are
+        not coroutines), so the dict mutation below needs no lock — no
+        other coroutine can interleave mid-statement on a single-threaded
+        event loop.
+
+        Logs the eventual outcome of the orphan and removes its entry from
+        self._detached_tasks so start() can launch a fresh task of this
+        name on a future turn instead of being blocked by a stale,
+        already-finished orphan reference.
+
+        Args:
+            name: The task name this orphan was registered under.
+            task: The completed (or cancelled, or failed) asyncio.Task.
+        """
+        try:
+            exc = task.exception() if not task.cancelled() else None
+        except asyncio.CancelledError:
+            exc = None
+
+        if exc:
+            self._f._log_debug(
+                f"bg_manager: detached orphan '{name}' finished with error: {exc}"
+            )
+        else:
+            self._f._log_debug(f"bg_manager: detached orphan '{name}' finished")
+
+        existing = self._detached_tasks.get(name)
+        if existing is task:
+            del self._detached_tasks[name]
 
 
 class SemanticSeedInferencer:
@@ -32727,6 +33129,22 @@ class Filter:
             ge=0,
             description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
         )
+        slot_operation_timeout: float = Field(
+            default=60.0,
+            ge=0.0,
+            le=600.0,
+            description=(
+                "Bound, in seconds, for individual slot save/restore HTTP "
+                "calls to llama.cpp, independent of llm_per_call_timeout. "
+                "This is a backstop for a genuinely hung server — NOT the "
+                "primary reliability mechanism for slot persistence. That "
+                "role belongs to BackgroundTaskManager never hard-cancelling "
+                "in-flight LLM calls (see stop_all() docstring); with that "
+                "fix in place this should rarely if ever fire. Set to 0 to "
+                "disable the bound entirely and wait until the underlying "
+                "HTTP session times out (llm_per_call_timeout, default 900s)."
+            ),
+        )
 
         # ── 12.2 Volatility‑tiered context ───────────────────────────────────
         enable_skeleton_tier: bool = Field(
@@ -33441,12 +33859,66 @@ class Filter:
     # 5. Continuation detection
     # ═══════════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _coerce_message_content(content: Any) -> str:
+        """
+        Normalize a chat message 'content' field to plain text.
+
+        OpenWebUI (and the underlying OpenAI-compatible message schema) may
+        represent content as:
+          - a plain string (the shape this filter was originally written
+            against everywhere)
+          - a list of content parts for multi-modal messages, e.g.
+            [{"type": "text", "text": "..."}, {"type": "image_url", ...}]
+          - occasionally a single dict carrying a "content" or "text" key
+
+        Only text-bearing parts are extracted; non-text parts (images,
+        tool-call payloads, etc.) are skipped since they carry nothing
+        relevant to LTM storage, SymbolGraph updates, or continuation-marker
+        detection.
+
+        Returns "" for None, an empty/non-text list, or any other
+        unrecognized shape — this function never raises, regardless of
+        input.
+
+        Args:
+            content: The raw 'content' value from a chat message dict.
+
+        Returns:
+            The extracted plain-text content, or "" if none was found.
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(p for p in parts if p)
+        if isinstance(content, dict):
+            for key in ("text", "content"):
+                val = content.get(key)
+                if isinstance(val, str) and val:
+                    return val
+        return ""
+
     # TODO: Refactor  this funcion into some class. Don't have it here.
     def _detect_genuine_continuation(self, messages: list) -> bool:
         """
         Return True if the most recent assistant message contains the
         AutoContinue marker, indicating the model has split its response
         and expects to be called again.
+
+        Uses _coerce_message_content so that multi-part content (a list of
+        {"type": "text", "text": ...} blocks, as OpenWebUI may produce for
+        some message shapes) is checked the same way a plain string would
+        be. Without this, `marker in content` on a list never raises but
+        also never matches, silently making a real continuation marker
+        invisible to this check.
 
         Args:
             messages: The current conversation message list.
@@ -33456,7 +33928,7 @@ class Filter:
         """
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
-                content = msg.get("content", "")
+                content = self._coerce_message_content(msg.get("content"))
                 return any(marker in content for marker in self._MULTI_PHASE_MARKERS)
         return False
 
@@ -33506,6 +33978,16 @@ class Filter:
         _build_activated_code() → build_block_b(), so the rest of the turn
         reuses this single classification instead of recomputing it via
         additional classify_use_case() calls deeper in the pipeline.
+
+        Silent ingestion note: OpenWebUI does not appear to persist this
+        filter's in-place mutation of an earlier turn's user message content
+        (the stub written below) as the canonical record of that turn — it
+        re-supplies the original, uncompressed message on later turns. The
+        normal (non-silent-ingestion) path is unaffected because
+        MessageAssembler.assemble() always runs
+        ensure_compressed_user_messages() over the full message list on
+        every turn; this early-return path must do the same explicitly for
+        any earlier messages, since it bypasses that call entirely.
         """
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
@@ -33731,6 +34213,21 @@ class Filter:
                 and last_user_msg is not None
                 and not is_explicit_command
             ):
+                # DIAGNOSTIC (temporary): confirms the exact value/length of
+                # user_query as seen by is_code_only_message. Motivated by an
+                # observed misclassification of "hola, ¿cómo estás?" as
+                # code-only — tracing the function's own entry guard
+                # (len(content.strip()) < 20) against that literal string
+                # shows it should return False immediately, before reaching
+                # any of the cascade logic. If this log reports a length
+                # materially different from what the user actually typed
+                # (extra whitespace, residual content from a previous turn,
+                # etc.), the root cause is upstream of this function, not
+                # inside its classification logic. Remove once confirmed.
+                self._log_debug(
+                    f"is_code_only_message check: len={len(user_query)}, "
+                    f"repr={user_query!r}"
+                )
                 if await self._commands.is_code_only_message(user_query, project_id):
                     self._log_section("SILENT INGESTION MODE")
 
@@ -33757,114 +34254,164 @@ class Filter:
                             )
                         )
 
-                    pstate_local["raw_ingested_symbols"] = raw_symbols
-
-                    # -- index the pasted code --------------------------------
-                    _msg_to_index = last_user_msg
-                    self._is_silent_ingestion = True
-                    try:
-                        await self._update_active_code(_msg_to_index, project_id)
-                    finally:
-                        pass
-
-                    # -- rebuild graph and path index --------------------------
-                    await self._activation.resolve_dangling_edges(project_id)
-                    if self.valves.enable_path_analysis:
-                        await self._activation.rebuild_path_index(project_id)
-
-                    # -- invalidate and rebuild Block A eagerly ----------------
-                    # invalidate_block_a_cache() is async: its
-                    # recompute_centrality=True path dispatches PageRank to a
-                    # worker thread via anyio.to_thread.run_sync, freeing the
-                    # event loop while it runs. `await` is required here.
-                    await self._ctx_builder.invalidate_block_a_cache(
-                        project_id, "new chunk ingested", recompute_centrality=True
-                    )
-                    try:
-                        static_block = await self._ctx_builder.build_block_a(
-                            project_id, is_code_session=True, is_continuation=False
-                        )
+                    # -- safety net: is_code_only_message() can, in principle,
+                    #    misclassify ordinary prose as code-only. If symbol
+                    #    extraction genuinely found nothing, this was never a
+                    #    code paste — abandon silent ingestion and fall
+                    #    through to the normal pipeline instead of emitting a
+                    #    nonsensical "0 symbols in 0 classes" acknowledgment
+                    #    that both discards the user's actual message and
+                    #    never lets the LLM respond to it. This is a backstop
+                    #    layered on top of the classifier fix
+                    #    (is_code_only_message Step 3's question-mark check
+                    #    now runs before its length-based short-circuit), not
+                    #    a replacement for it — it catches any future
+                    #    misclassification the fix doesn't anticipate.
+                    if not raw_symbols:
                         self._log_debug(
-                            "Block A scaffold (hub symbols + skeleton tier) "
-                            "pre-built after silent ingestion"
+                            "Silent ingestion aborted: is_code_only_message "
+                            "classified this as code, but symbol extraction "
+                            "found nothing — falling through to normal pipeline"
                         )
-                    except Exception as _scaffold_err:
-                        static_block = ""
-                        self._log_debug(
-                            f"Eager Block A scaffold build failed (non-fatal): "
-                            f"{_scaffold_err}"
-                        )
+                    else:
+                        pstate_local["raw_ingested_symbols"] = raw_symbols
 
-                    # -- optional hub-bodies tier warmup ----------------------
-                    if (
-                        self.valves.enable_hub_bodies_tier
-                        and self.valves.hub_bodies_tier_warmup_on_ingestion
-                    ):
-                        tier_text, tier_hash, tier_qids = (
-                            self._ctx_builder._build_hub_bodies_tier(project_id)
-                        )
-                        pstate_local["hub_tier_text"] = tier_text
-                        pstate_local["hub_tier_hash"] = tier_hash
-                        psm.set_hub_tier_qids(project_id, tier_qids)
-                        state.hub_tier_qids_persisted = tier_qids
-                        self._conversation_state_manager.set(project_id, state)
-                        # The task handle is kept on the Filter so outlet()
-                        # can wait for this prefill to finish before
-                        # dispatching docstrings/raptor/etc — see the wait
-                        # block near the end of outlet(). This gives the new
-                        # code structure's KV slot priority for the shared
-                        # LLM semaphore over background enrichment work.
-                        self._pending_warmup_task = asyncio.create_task(
-                            self._ctx_builder._warmup_tier_prefill(project_id)
-                        )
-
-                    # -- persist state ----------------------------------------
-                    self._conversation_state_manager.mark_dirty(project_id)
-                    await self._conversation_state_manager.save_if_dirty(project_id)
-
-                    # -- build user-facing stub and acknowledgement -----------
-                    state = self._conversation_state_manager.get(project_id)
-                    num_blocks = len(state.active_blocks)
-                    num_symbols = len(self._symbol_index.get_all_names(project_id))
-                    num_classes = len(self._symbol_index.get_classes(project_id))
-
-                    stub = self._history_compressor._build_user_stub(num_symbols)
-                    content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
-                    state.compressed_user_messages[content_hash] = stub
-                    self._conversation_state_manager.mark_dirty(project_id)
-
-                    messages[-1] = {**messages[-1], "content": stub}
-                    response = (
-                        f"✅ {num_symbols} symbols in {num_classes} classes "
-                        f"({num_blocks} active blocks). Code is in the SymbolGraph. "
-                        f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
-                        f"implementations."
-                    )
-                    messages.append({"role": "assistant", "content": response})
-
-                    # -- optional context dump --------------------------------
-                    if self.valves.enable_context_dump:
+                        # -- index the pasted code --------------------------------
+                        _msg_to_index = last_user_msg
+                        self._is_silent_ingestion = True
                         try:
-                            self._context_dumper.schedule_inlet_snapshot(
-                                project_id=project_id,
-                                static_block=static_block,
-                                dynamic_block="",
-                                final_system=static_block,
-                                messages=messages,
+                            await self._update_active_code(_msg_to_index, project_id)
+                        finally:
+                            pass
+
+                        # -- rebuild graph and path index --------------------------
+                        await self._activation.resolve_dangling_edges(project_id)
+                        if self.valves.enable_path_analysis:
+                            await self._activation.rebuild_path_index(project_id)
+
+                        # -- invalidate and rebuild Block A eagerly ----------------
+                        # invalidate_block_a_cache() is async: its
+                        # recompute_centrality=True path dispatches PageRank to a
+                        # worker thread via anyio.to_thread.run_sync, freeing the
+                        # event loop while it runs. `await` is required here.
+                        await self._ctx_builder.invalidate_block_a_cache(
+                            project_id, "new chunk ingested", recompute_centrality=True
+                        )
+                        try:
+                            static_block = await self._ctx_builder.build_block_a(
+                                project_id, is_code_session=True, is_continuation=False
                             )
-                        except Exception as _dump_err:
                             self._log_debug(
-                                f"Context dump scheduling failed (silent ingestion): "
-                                f"{_dump_err}"
+                                "Block A scaffold (hub symbols + skeleton tier) "
+                                "pre-built after silent ingestion"
+                            )
+                        except Exception as _scaffold_err:
+                            static_block = ""
+                            self._log_debug(
+                                f"Eager Block A scaffold build failed (non-fatal): "
+                                f"{_scaffold_err}"
                             )
 
-                    body["messages"] = messages
-                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                    self._log_section(
-                        "CONTEXT MANAGER - INLET END",
-                        duration=time.monotonic() - inlet_start,
-                    )
-                    return body
+                        # -- optional hub-bodies tier warmup ----------------------
+                        if (
+                            self.valves.enable_hub_bodies_tier
+                            and self.valves.hub_bodies_tier_warmup_on_ingestion
+                        ):
+                            tier_text, tier_hash, tier_qids = (
+                                self._ctx_builder._build_hub_bodies_tier(project_id)
+                            )
+                            pstate_local["hub_tier_text"] = tier_text
+                            pstate_local["hub_tier_hash"] = tier_hash
+                            psm.set_hub_tier_qids(project_id, tier_qids)
+                            state.hub_tier_qids_persisted = tier_qids
+                            self._conversation_state_manager.set(project_id, state)
+                            # The task handle is kept on the Filter so outlet()
+                            # can wait for this prefill to finish before
+                            # dispatching docstrings/raptor/etc — see the wait
+                            # block near the end of outlet(). This gives the new
+                            # code structure's KV slot priority for the shared
+                            # LLM semaphore over background enrichment work.
+                            self._pending_warmup_task = asyncio.create_task(
+                                self._ctx_builder._warmup_tier_prefill(project_id)
+                            )
+
+                        # -- persist state ----------------------------------------
+                        self._conversation_state_manager.mark_dirty(project_id)
+                        await self._conversation_state_manager.save_if_dirty(project_id)
+
+                        # -- re-stub earlier user messages OpenWebUI re-supplied
+                        #    with their original, uncompressed content ----------
+                        #
+                        # OpenWebUI does not persist this filter's in-place
+                        # mutation of an earlier turn's messages[-1]["content"]
+                        # (the stub written below) as the canonical record of
+                        # that turn — confirmed directly: a follow-up context
+                        # dump showed an earlier turn's user message back in its
+                        # full, raw form, despite that turn having replaced it
+                        # with the stub. The normal (non-silent-ingestion) path
+                        # is unaffected because MessageAssembler.assemble()
+                        # always runs ensure_compressed_user_messages() over the
+                        # *entire* message list on every turn. This early-return
+                        # silent-ingestion path bypasses that entirely, so it
+                        # must call the same function itself — but only over the
+                        # messages BEFORE the current one, since the current
+                        # user message is handled explicitly below (it needs the
+                        # post-ingestion symbol count, which
+                        # ensure_compressed_user_messages does not have access
+                        # to here). Reuses the `state` object already in scope
+                        # from the top of this function — the hub-bodies-tier
+                        # warmup block above relies on the same assumption that
+                        # it is still the live, cache-backed ConversationState.
+                        if len(messages) > 1:
+                            messages[:-1] = (
+                                self._history_compressor.ensure_compressed_user_messages(
+                                    messages[:-1], state, project_id
+                                )
+                            )
+
+                        # -- build user-facing stub and acknowledgement -----------
+                        state = self._conversation_state_manager.get(project_id)
+                        num_blocks = len(state.active_blocks)
+                        num_symbols = len(self._symbol_index.get_all_names(project_id))
+                        num_classes = len(self._symbol_index.get_classes(project_id))
+
+                        stub = self._history_compressor._build_user_stub(num_symbols)
+                        content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
+                        state.compressed_user_messages[content_hash] = stub
+                        self._conversation_state_manager.mark_dirty(project_id)
+
+                        messages[-1] = {**messages[-1], "content": stub}
+                        response = (
+                            f"✅ {num_symbols} symbols in {num_classes} classes "
+                            f"({num_blocks} active blocks). Code is in the SymbolGraph. "
+                            f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
+                            f"implementations."
+                        )
+                        messages.append({"role": "assistant", "content": response})
+
+                        # -- optional context dump --------------------------------
+                        if self.valves.enable_context_dump:
+                            try:
+                                self._context_dumper.schedule_inlet_snapshot(
+                                    project_id=project_id,
+                                    static_block=static_block,
+                                    dynamic_block="",
+                                    final_system=static_block,
+                                    messages=messages,
+                                )
+                            except Exception as _dump_err:
+                                self._log_debug(
+                                    f"Context dump scheduling failed (silent ingestion): "
+                                    f"{_dump_err}"
+                                )
+
+                        body["messages"] = messages
+                        _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                        self._log_section(
+                            "CONTEXT MANAGER - INLET END",
+                            duration=time.monotonic() - inlet_start,
+                        )
+                        return body
 
             # 🔥 STATE MANAGEMENT
             #   5. Prepare code session (classify, update active code blocks)
@@ -33972,13 +34519,13 @@ class Filter:
             # calls in subsequent requests.
             self._is_silent_ingestion = False
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     # OUTLET – Post‑response processing
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     # Value categories (same as inlet):
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Post-process the response after the LLM has generated it.
@@ -33988,6 +34535,35 @@ class Filter:
         queues background enrichment work for the next turn.
         """
         self._log_debug("outlet called")
+
+        # DIAGNOSTIC (temporary): count outlet() invocations per chat/message id,
+        # and log full body structure + raw content length on every call (not
+        # just the first) to distinguish a genuinely empty streamed content from
+        # OpenWebUI calling outlet() on a pre-stream snapshot.
+        _chat_id = body.get("chat_id", "?")
+        _msg_id = body.get("id", "?")
+        if not hasattr(self, "_outlet_call_counts"):
+            self._outlet_call_counts = {}
+        _call_key = f"{_chat_id}:{_msg_id}"
+        self._outlet_call_counts[_call_key] = (
+            self._outlet_call_counts.get(_call_key, 0) + 1
+        )
+        self._log_debug(
+            f"outlet: invocation #{self._outlet_call_counts[_call_key]} "
+            f"for chat_id={_chat_id}, id={_msg_id}"
+        )
+        _diag_messages = body.get("messages", [])
+        _diag_last = _diag_messages[-1] if _diag_messages else {}
+        _diag_raw_content = _diag_last.get("content")
+        self._log_debug(
+            f"outlet: body keys={list(body.keys())}, "
+            f"n_messages={len(_diag_messages)}, "
+            f"last_role={_diag_last.get('role', '?')}, "
+            f"raw_content_type={type(_diag_raw_content).__name__}, "
+            f"raw_content_len={len(str(_diag_raw_content)) if _diag_raw_content is not None else 'None'}, "
+            f"raw_content_is_none={_diag_raw_content is None}"
+        )
+
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
@@ -34031,27 +34607,43 @@ class Filter:
 
             # 🔥 STATE MANAGEMENT
             #   Detect assistant response from body
+            #
+            #   content is normalized via _coerce_message_content rather than
+            #   read as a raw string: OpenWebUI may represent it as a list of
+            #   {"type": "text", "text": ...} parts instead of a plain string
+            #   for some message shapes, which would otherwise make a
+            #   non-empty assistant turn look empty here (every observed
+            #   outlet() call so far has logged "no assistant response found"
+            #   despite inlet() having produced non-empty content, including
+            #   the synthetic silent-ingestion acknowledgment, which is the
+            #   evidence motivating this change). The diagnostic log below
+            #   captures the exact type/repr seen, so if this normalization
+            #   is not the actual cause, the next run gives the real answer
+            #   instead of another guess.
             # ----------------------------------------------------------------
             assistant_content = ""
             assistant_source = ""
 
             if messages and messages[-1].get("role") == "assistant":
-                assistant_content = messages[-1].get("content", "")
-                assistant_source = "messages[-1]"
+                raw_content = messages[-1].get("content")
+                self._log_debug(
+                    f"outlet: messages[-1] role=assistant, "
+                    f"content_type={type(raw_content).__name__}, "
+                    f"content_repr={raw_content!r:.300}"
+                )
+                coerced = self._coerce_message_content(raw_content)
+                if coerced:
+                    assistant_content = coerced
+                    assistant_source = "messages[-1]"
 
             if not assistant_content:
                 for field in ("content", "output", "response", "assistant"):
                     val = body.get(field)
-                    if isinstance(val, str) and val.strip():
-                        assistant_content = val
+                    coerced = self._coerce_message_content(val)
+                    if coerced.strip():
+                        assistant_content = coerced
                         assistant_source = f"body['{field}']"
                         break
-                    if isinstance(val, dict):
-                        val = val.get("content", "")
-                        if val:
-                            assistant_content = val
-                            assistant_source = f"body['{field}']['content']"
-                            break
 
             # ------------------------------------------------------------------
             # A `return` from inside this try block skips every line after
@@ -34147,17 +34739,6 @@ class Filter:
 
                             asyncio.create_task(_store_and_signal_noncode())
 
-                    if self.valves.enable_slot_persistence:
-                        try:
-                            psm.set_last_total_context_tokens(
-                                project_id, self._tokens.estimate_tokens(messages)
-                            )
-                        except Exception as _tok_err:
-                            self._log_debug(
-                                f"outlet: token estimation failed: {_tok_err}"
-                            )
-                        await psm.slot_save(project_id)
-
                     psm.set_last_assistant_response(project_id, assistant_content)
                     psm.set_last_response_timestamp(project_id, time.time())
 
@@ -34193,6 +34774,20 @@ class Filter:
                                     code_state_hash,
                                     wait=False,
                                 )
+
+            # ------------------------------------------------------------------
+            # 🔥 STATE MANAGEMENT
+            #   KV slot save — deliberately OUTSIDE the assistant-content branch
+            #   above.
+            # ------------------------------------------------------------------
+            if self.valves.enable_slot_persistence:
+                try:
+                    psm.set_last_total_context_tokens(
+                        project_id, self._tokens.estimate_tokens(messages)
+                    )
+                except Exception as _tok_err:
+                    self._log_debug(f"outlet: token estimation failed: {_tok_err}")
+                await psm.slot_save(project_id)
 
             # ------------------------------------------------------------------
             # 🚀 RESOURCE OPTIMISATION — runs every turn regardless of whether
@@ -34253,16 +34848,6 @@ class Filter:
 
         last_activated = pstate.get("last_activation_scores", {}).get(project_id, {})
 
-        # If silent ingestion fired a hub-tier warmup prefill earlier (or a
-        # previous one is still in flight), give it priority over
-        # docstrings/raptor/etc for the shared LLM semaphore. Its job — get
-        # the new code structure's KV slot saved to disk — is time-sensitive
-        # in a way background enrichment work is not: a new chat opened on
-        # this project before warmup finishes would find no matching slot
-        # file and pay a full prefill it could otherwise have skipped.
-        # asyncio.shield protects the task from being cancelled by the
-        # wait_for timeout itself; on timeout we simply stop waiting and let
-        # it keep running concurrently with whatever gets dispatched next.
         if (
             self._pending_warmup_task is not None
             and not self._pending_warmup_task.done()
