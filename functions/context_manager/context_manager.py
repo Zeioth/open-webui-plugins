@@ -5044,8 +5044,40 @@ class ContextBuilder:
             else len(static_block) // 4
         )
         self._f._log_debug(f"Static Context Block: ~{tokens} tokens")
+        self._check_block_a_vs_keep(project_id, tokens)
 
         return static_block
+
+    def _check_block_a_vs_keep(self, project_id: str, block_a_tokens: int) -> None:
+        """
+        Warn when the assembled Block A exceeds llama.cpp's --keep window.
+
+        Block A is only preserved across llama.cpp context shifts up to n_keep
+        (--keep) leading tokens. Beyond that the server evicts Block A's tail on
+        the next shift, voiding the stable-prefix guarantee this entire tier
+        exists to provide. Because the hub-bodies tier and Block B sit in the
+        prompt right after Block A, --keep ideally exceeds Block A plus that
+        tier; this guard tracks Block A alone, which is the hard floor — if even
+        Block A overruns --keep the contract is already broken. Pure diagnostic:
+        it never mutates the prompt, only logs, so a misconfigured or unknown
+        --keep can never suppress context. No-op when llama_cpp_keep_tokens is 0.
+
+        Args:
+            project_id: Current project identifier (for the log line only).
+            block_a_tokens: Final token count of the assembled Block A.
+        """
+        keep = self._f.valves.llama_cpp_keep_tokens
+        if keep <= 0:
+            return
+        if block_a_tokens > keep:
+            self._f._log_debug(
+                f"⚠️ Block A ({block_a_tokens} tokens) exceeds llama.cpp --keep "
+                f"({keep}) for project '{project_id}'. The server will evict the "
+                f"overflow on the next context shift, breaking Block A's stable-"
+                f"prefix / KV-cache contract. Drop call_graph_context_mode toward "
+                f"hubs_only, shrink the hub-bodies / skeleton tier, or raise "
+                f"--keep to at least {block_a_tokens}."
+            )
 
     async def invalidate_block_a_cache(
         self, project_id: str, reason: str = "", recompute_centrality: bool = False
@@ -6040,6 +6072,15 @@ class ContextBuilder:
         Uses heuristic reinforcement, CrossEncoder, and LLM fallback to decide
         between 'hubs_only', 'expanded_hubs', and 'full_graph'.
 
+        Every resolved mode — whether it comes from the CrossEncoder-confident
+        branch, the LLM fallback, or the heuristic tail — is passed through the
+        same symbol-count ceiling and free-token floor guards via _clamp_mode
+        before being returned. Previously only the heuristic tail consulted
+        those guards, so a 'full_graph' verdict from a confident CrossEncoder or
+        from the LLM was applied verbatim on a large project, inflating Block A
+        well past the configured ceilings. Clamping at the return boundary keeps
+        a single source of truth for what each token budget permits.
+
         Args:
             query: User query.
             intent_vector: Intent classification probabilities.
@@ -6067,7 +6108,7 @@ class ContextBuilder:
                 use_case = "A"
 
         # ------------------------------------------------------------------
-        # Step 3: Calculate token availability.
+        # Step 3: Calculate token availability and define the budget guards.
         # ------------------------------------------------------------------
         total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
         free_tokens = self.get_effective_context_budget(project_id)
@@ -6093,6 +6134,37 @@ class ContextBuilder:
                 * self._f.valves.expanded_hubs_min_free_token_ratio
             )
             return symbol_ok and (free_tokens >= eh_floor)
+
+        def _clamp_mode(mode: str) -> str:
+            """
+            Downgrade a proposed mode when its budget guard is not satisfied.
+
+            full_graph collapses to expanded_hubs (and, if that is also denied,
+            to hubs_only); expanded_hubs collapses to hubs_only; hubs_only is
+            always permitted. This is the single point every branch of the
+            cascade routes through, so a confident CrossEncoder or an LLM
+            verdict can never bypass the symbol-count ceiling or the free-token
+            floor.
+            """
+            if mode == "full_graph":
+                if _full_graph_allowed():
+                    return "full_graph"
+                self._f._log_debug(
+                    f"_resolve_call_graph_mode: 'full_graph' denied "
+                    f"(symbols={total_symbols}, free_tokens={free_tokens}) "
+                    f"→ trying 'expanded_hubs'"
+                )
+                mode = "expanded_hubs"
+            if mode == "expanded_hubs":
+                if _expanded_hubs_allowed():
+                    return "expanded_hubs"
+                self._f._log_debug(
+                    f"_resolve_call_graph_mode: 'expanded_hubs' denied "
+                    f"(symbols={total_symbols}, free_tokens={free_tokens}) "
+                    f"→ falling back to 'hubs_only'"
+                )
+                return "hubs_only"
+            return "hubs_only"
 
         # ------------------------------------------------------------------
         # Step 4: CrossEncoder for mode resolution.
@@ -6147,9 +6219,14 @@ class ContextBuilder:
                 if diff >= CE_CONFIDENCE_THRESHOLD:
                     best_idx = int(np.argmax(scores_reinforced))
                     modes = ["hubs_only", "expanded_hubs", "full_graph"]
-                    resolved_mode = modes[best_idx]
+                    # Clamp the confident verdict against the budget guards
+                    # before returning, so a 'full_graph' pick on an oversized
+                    # project degrades instead of bloating Block A.
+                    resolved_mode = _clamp_mode(modes[best_idx])
                     self._f._log_debug(
-                        f"_resolve_call_graph_mode: CE confident (diff={diff:.2f}) → '{resolved_mode}'"
+                        f"_resolve_call_graph_mode: CE confident "
+                        f"(diff={diff:.2f}, raw='{modes[best_idx]}') → "
+                        f"'{resolved_mode}'"
                     )
                     return resolved_mode
 
@@ -6194,15 +6271,19 @@ Output only the option name.
                     if llm_response:
                         llm_mode = llm_response.strip().lower()
                         if llm_mode in ("hubs_only", "expanded_hubs", "full_graph"):
+                            # The LLM answer is subject to the same guards as
+                            # every other branch — it never overrides the budget.
+                            resolved_mode = _clamp_mode(llm_mode)
                             self._f._log_debug(
-                                f"_resolve_call_graph_mode: LLM decided '{llm_mode}'"
+                                f"_resolve_call_graph_mode: LLM decided "
+                                f"'{llm_mode}' → applied '{resolved_mode}'"
                             )
-                            return llm_mode
+                            return resolved_mode
 
                 # Middle zone: fall through to heuristic.
 
         # ------------------------------------------------------------------
-        # Step 5: Heuristic fallback.
+        # Step 5: Heuristic fallback (already guard-aware; kept as-is).
         # ------------------------------------------------------------------
         if use_case == "A":
             if _full_graph_allowed():
@@ -25552,6 +25633,43 @@ class InletOrchestrator:
     # 6. Message utilities
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def dump_handled_turn(self, project_id: str, messages: list) -> None:
+        """
+        Record a context snapshot for a turn short-circuited by command handling.
+
+        Explicit commands (/forget, /status, /clean, /expand) and natural-language
+        intents (forget, remember, obsolete) return from Filter.inlet before the
+        assembly pipeline runs, so they never reach the snapshot that
+        ContextAssembler.assemble_for_turn schedules for a normal turn. That
+        leaves a hole in the per-turn dump sequence and in evolution.jsonl,
+        because turn numbers are derived from message count: a handled turn still
+        advances the count while producing no file, so the next normal turn's
+        number jumps. This captures the turn with an empty Block A / Block B
+        (none was built) plus the post-handling messages, keeping the sequence
+        contiguous.
+
+        Best-effort and fully decoupled from correctness: never raises, and is
+        gated by enable_context_dump so it is a no-op when dumping is disabled.
+
+        Args:
+            project_id: Current project identifier.
+            messages: The message list as returned to the caller for this turn.
+        """
+        if not self._f.valves.enable_context_dump:
+            return
+        try:
+            self._f._context_dumper.schedule_inlet_snapshot(
+                project_id=project_id,
+                static_block="",
+                dynamic_block="",
+                final_system="",
+                messages=messages,
+            )
+        except Exception as _dump_err:
+            self._f._log_debug(
+                f"Context dump scheduling failed (handled turn): {_dump_err}"
+            )
+
     def ensure_last_message_is_user(self, messages: list) -> list:
         """Ensure the last message in the list is from the user."""
         if not messages:
@@ -31980,6 +32098,20 @@ class Filter:
             default=262000,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
+        llama_cpp_keep_tokens: int = Field(
+            default=8000,
+            ge=0,
+            description=(
+                "Value of llama.cpp's --keep (n_keep): the number of leading "
+                "prompt tokens the server pins across context shifts. Block A is "
+                "designed to be exactly that pinned, KV-cacheable prefix, so if "
+                "Block A grows past this figure the server starts evicting its "
+                "tail on the next shift, silently voiding the stable-prefix "
+                "contract (symptom: KV cache miss + full reprefill with no code "
+                "change). 0 = unknown/disabled, guard is a no-op. Set to match "
+                "your --keep flag exactly."
+            ),
+        )
         response_reserve_tokens: int = Field(
             default=4096,
             ge=256,
@@ -34444,6 +34576,7 @@ class Filter:
             _inlet_timing("Step 3/6: Handle explicit commands", step_start)
             if handled:
                 body["messages"] = handled_messages
+                self._inlet_orch.dump_handled_turn(project_id, handled_messages)
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
@@ -34465,6 +34598,7 @@ class Filter:
             _inlet_timing("Step 4/6: Handle natural language intents", step_start)
             if handled:
                 body["messages"] = handled_messages
+                self._inlet_orch.dump_handled_turn(project_id, handled_messages)
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
