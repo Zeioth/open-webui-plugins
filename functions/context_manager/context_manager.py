@@ -25065,43 +25065,33 @@ class ActiveCodeUpdater:
         Register a brand‑new block: symbols, edges, conflict/obsolete checks,
         and hard eviction if max_active_blocks is exceeded.
 
-        Q6: Migrates docstrings from renamed symbols before processing.
+        Symbol indexing (symbols, call edges, data-flow edges, source-docstring
+        harvest, token accounting) is delegated to
+        _reindex_block_symbols_with_docstrings — the same helper the duplicate-
+        block path uses. This unifies the two block-processing paths on one
+        indexing routine and, crucially, gives brand-new blocks the free
+        source-docstring harvest that the former inline add loop here never did:
+        previously only re-pasted (duplicate) blocks harvested docstrings from
+        source, so fresh code — the common case, e.g. a first paste of a whole
+        file — fell through to full LLM docstring generation even for symbols
+        that were already documented in the source. Now both paths harvest.
         """
-        for sym in syms:
-            sym.parent_block_hash = new_block.hash
         new_block.symbols = syms
         new_block.last_mentioned_msg_idx = state.message_count
 
-        # --- 1. Index symbols and call-graph edges ---
-        for sym in syms:
-            self._f._symbol_index.add(sym, new_block.hash, project_id)
-            caller_qid = qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
-            for callee_name in sym.calls:
-                edge = Edge(
-                    src=caller_qid,
-                    dst=callee_name,
-                    type="calls",
-                    weight=EDGE_WEIGHTS["calls"],
-                    confidence=1.0,
-                )
-                self._f._symbol_index.add_edge(edge, project_id)
-
-        # --- 2. Data-flow edges: ONE full-file AST pass per block ---
-        if self._f.valves.enable_data_flow_analysis and new_block.file_path:
-            df_edges = self._f._code_blocks.extract_data_flow_edges(
-                new_block.content, new_block.file_path, project_id
-            )
-            for df_edge in df_edges:
-                self._f._symbol_index.add_edge(df_edge, project_id)
-            if df_edges:
-                self._f._log_debug(
-                    f"Data flow: {len(df_edges)} edge(s) extracted from {new_block.file_path}"
-                )
+        # --- 1. Index symbols, edges, data-flow, and harvest source docstrings ---
+        # The helper sets parent_block_hash per symbol, registers each symbol and
+        # its call/data-flow edges, lifts any docstrings already present in the
+        # source into sym.docstring (persisting them to symbol_docstrings for
+        # cross-session inheritance), and refreshes the block's token count and
+        # importance. new_block.symbols must be assigned before this call, since
+        # the helper iterates block.symbols.
+        await self._reindex_block_symbols_with_docstrings(new_block, project_id)
 
         if any(s.calls for s in syms):
             state.has_any_calls = True
 
-        # --- 3. Check for conflicting proposed changes ---
+        # --- 2. Check for conflicting proposed changes ---
         is_conflicting = False
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             is_conflicting = self._f._code_blocks.has_conflicting_proposed_changes(
@@ -25110,10 +25100,10 @@ class ActiveCodeUpdater:
             if is_conflicting:
                 new_block.importance_score = max(new_block.importance_score, 7.0)
 
-        # --- 4. Insert the new block into active_blocks ---
+        # --- 3. Insert the new block into active_blocks ---
         state.active_blocks[new_block.hash] = new_block
 
-        # --- 5. Mark older blocks for the same file as obsolete (step 13) ---
+        # --- 4. Mark older blocks for the same file as obsolete (step 13) ---
         obsolete_hashes = []
         if new_block.file_path and self._f.valves.enable_obsolete_marking:
             for h, blk in list(state.active_blocks.items()):
@@ -25157,7 +25147,7 @@ class ActiveCodeUpdater:
                         f"out of {len(obsolete_blocks)} (max_obsolete_versions_per_file={max_keep})."
                     )
 
-        # --- 6. Handle content-type specific actions ---
+        # --- 5. Handle content-type specific actions ---
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             if new_block.file_path:
                 state.recent_changes = [
@@ -25194,7 +25184,7 @@ class ActiveCodeUpdater:
         ):
             new_block.importance_score = min(new_block.importance_score + 3.0, 10.0)
 
-        # --- 7. Hard eviction if too many active blocks ---
+        # --- 6. Hard eviction if too many active blocks ---
         if (
             self._f.valves.max_active_blocks > 0
             and len(state.active_blocks) > self._f.valves.max_active_blocks
@@ -33900,13 +33890,16 @@ class Filter:
             ),
         )
         block_a_freeze_break_on_ingestion: bool = Field(
-            default=False,  # Recommended true, but false can improve turn 1 cache hits when working with the same code.
+            default=False, # 
             description=(
                 "When True (default), silent ingestion of a code paste breaks "
                 "the freeze and re-captures, since a large paste changes the "
                 "structure wholesale and freezing a map of just-replaced code "
                 "would be maximally misleading. When False, ingestion leaves the "
                 "current freeze window untouched."
+                "In short: Determines if code pasted mid session will trigger prefill."
+                "It doesn't affect turn 2: It will prefill no matter what."
+                "(but improves thanks to the existing kvcache from previous sessions)"
             ),
         )
 
