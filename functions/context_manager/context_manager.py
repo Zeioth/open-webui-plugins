@@ -29877,23 +29877,23 @@ class TaskRegistry:
 
     def _validate_and_order(self) -> None:
         """
-        Validate the background_priority valve and sort tasks in execution order.
+        Validate the task_priority valve and sort tasks in execution order.
 
         Priority convention: lower number = higher urgency = runs first.
-        Tasks absent from background_priority retain their built-in default value.
-        Unknown names in background_priority are logged as warnings.
+        Tasks absent from task_priority retain their built-in default value.
+        Unknown names in task_priority are logged as warnings.
         """
         # Region: warn about unrecognised task names in the valve
         valid_names = {t.name for t in self._bg_tasks}
-        for name in self._f.valves.background_priority:
+        for name in self._f.valves.task_priority:
             if name not in valid_names:
                 self._f._log_debug(
-                    f"WARNING: background_priority contains unknown task '{name}'"
+                    f"WARNING: task_priority contains unknown task '{name}'"
                 )
 
         # Region: apply effective priority from the valve or fall back to the default
         for task in self._bg_tasks:
-            task._effective_priority = self._f.valves.background_priority.get(
+            task._effective_priority = self._f.valves.task_priority.get(
                 task.name, task.priority
             )
 
@@ -33890,7 +33890,7 @@ class Filter:
             ),
         )
         block_a_freeze_break_on_ingestion: bool = Field(
-            default=False, # 
+            default=False,  #
             description=(
                 "When True (default), silent ingestion of a code paste breaks "
                 "the freeze and re-captures, since a large paste changes the "
@@ -34117,20 +34117,20 @@ class Filter:
         )
 
         # ── 15.2 Lazy tasks (inlet) ───────────────────────────────────────────
-        enable_lazy_docstrings: bool = Field(
+        enable_lazy_session_summary: bool = Field(
             default=False,
-            description="Enable lazy generation of docstrings in inlet.",
+            description="Enable lazy session summary generation in inlet.",
         )
         enable_lazy_prefetch: bool = Field(
             default=True,
             description="Enable lazy prefetch of CodePathViews in inlet.",
         )
-        enable_lazy_session_summary: bool = Field(
-            default=True,
-            description="Enable lazy session summary generation in inlet.",
+        enable_lazy_docstrings: bool = Field(
+            default=False,
+            description="Enable lazy generation of docstrings in inlet.",
         )
         enable_lazy_raptor: bool = Field(
-            default=True,
+            default=False,
             description="Enable lazy RAPTOR rebuild in inlet.",
         )
         enable_lazy_purge: bool = Field(
@@ -34169,7 +34169,7 @@ class Filter:
         )
 
         # ── 15.4 Priority & performance ───────────────────────────────────────
-        background_priority: Dict[str, int] = Field(
+        task_priority: Dict[str, int] = Field(
             default_factory=lambda: {
                 "session_summary": 1,  # Controls window size — direct impact every turn
                 "docstrings": 2,  # LOD-2 quality — benefit visible in Block B immediately
@@ -34180,9 +34180,19 @@ class Filter:
             },
             description=(
                 "Task execution order: lower number runs first (1 = highest urgency). "
-                "Tasks absent from this mapping use their built-in default value."
+                "Tasks absent from this mapping use their built-in default value. "
+                "It affects both background and lazy tasks execution order."
             ),
         )
+        bg_task_max_concurrent: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description=(
+                "Maximum number of background tasks that can run concurrently (per manager). "
+                "The specified amount of bg tasks will spawn at the same time, by priority order."
+            ),
+        )        
         bg_task_stop_timeout: float = Field(
             default=2.0,
             ge=1.0,
@@ -34199,12 +34209,6 @@ class Filter:
         bg_task_measure_performance: bool = Field(
             default=True,
             description="If True, record and log execution time for each background task run.",
-        )
-        bg_task_max_concurrent: int = Field(
-            default=5,
-            ge=1,
-            le=20,
-            description="Maximum number of background tasks that can run concurrently (per manager).",
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
