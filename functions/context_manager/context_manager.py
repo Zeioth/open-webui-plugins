@@ -11286,6 +11286,15 @@ class LLMOrchestrator:
     ) -> Optional[str]:
         """
         Call the LLM with in-memory response cache and call deduplication.
+
+        Cancellation safety: because CancelledError subclasses BaseException it
+        bypasses the `except Exception` clause below, so the producer's future
+        is resolved explicitly in a dedicated `except asyncio.CancelledError`
+        handler. Without it, cancelling the producer mid-call would leave the
+        future in _pending_llm unresolved forever, hanging every deduplicated
+        consumer (is_producer=False) that is awaiting it. This matters now that
+        the underlying streaming call is genuinely cancellable — a cancel that
+        actually reaches the socket must also unblock any waiters.
         """
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
@@ -11397,6 +11406,14 @@ class LLMOrchestrator:
                     async with self._f._active_llm_tasks_lock:
                         self._f._active_llm_tasks.discard(task)
 
+            except asyncio.CancelledError:
+                # CancelledError subclasses BaseException, so it bypasses the
+                # `except Exception` below. Propagate the cancellation to any
+                # deduplicated consumers awaiting this future instead of
+                # stranding them on a future that will never resolve.
+                if not future.done():
+                    future.cancel()
+                raise
             except Exception as exc:
                 future.set_exception(exc)
                 raise
@@ -22751,7 +22768,6 @@ class EnrichmentTasks:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self._lazy_docstrings_generated_this_turn: int = 0
-        self._active_bg_task: Optional[asyncio.Task] = None
         self._bg_docstring_count: int = 0
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -23928,6 +23944,20 @@ class EnrichmentTasks:
         finish and persist before the LLM call that's actually in progress
         when the next inlet starts gets torn down by task.cancel().
 
+        Completion is tied to the real queue, not just to a clean exit. The
+        queue of pending symbols is derived every run from `not sym.docstring`,
+        so a symbol only leaves it once its docstring is persisted. A run can
+        exit cleanly (no stop signal) while still leaving symbols unresolved —
+        a batch that came back 4/5, an individual retry that failed. If we let
+        _run_task mark the task 'completed' in that case, its invalidation hash
+        (the symbol structure hash) freezes, and the loop will not run again
+        until the structure changes — so those stragglers wait for an unrelated
+        edit to rescue them. To keep "nothing leaves the queue until it is
+        actually done" true in time, not just in principle, this method marks
+        the task not_completed whenever it returns with symbols still pending.
+        That forces is_completed() to stay False and the loop to re-run next
+        turn, re-snapshotting the survivors, even if nothing else changed.
+
         Args:
             project_id: The current project identifier.
             stop_event: If set, stops the loop gracefully after the current batch.
@@ -23938,6 +23968,23 @@ class EnrichmentTasks:
         # Region: snapshot all symbols without docstrings from active blocks
         state = self._f._conversation_state_manager.get(project_id)
         pstate = self._f._project_state_manager.get_pstate(project_id)
+
+        def _count_pending() -> int:
+            # Re-derive the queue from live state: a symbol is pending iff it
+            # still has no docstring. Used both to build the initial worklist
+            # and to check, at the end, whether the task may call itself done.
+            n = 0
+            _state = self._f._conversation_state_manager.get(project_id)
+            for block in _state.active_blocks.values():
+                if block.obsolete:
+                    continue
+                for sym in block.symbols:
+                    if (
+                        sym.kind in ("function", "method", "class")
+                        and not sym.docstring
+                    ):
+                        n += 1
+            return n
 
         pending_qids: List[str] = []
         for block in state.active_blocks.values():
@@ -23980,8 +24027,10 @@ class EnrichmentTasks:
 
         # Region: process batches with cooperative cancellation via stop_event
         total_docstrings = 0
+        stopped = False
         for batch_idx, batch in enumerate(batches):
             if stop_event.is_set():
+                stopped = True
                 self._f._log_debug(
                     f"bg_docstring: stop signal received, exiting after "
                     f"{batch_idx}/{len(batches)} batches"
@@ -24018,31 +24067,48 @@ class EnrichmentTasks:
                 f"generated {total_docstrings} docstrings"
             )
 
-        self._f._log_debug("bg_docstring: finished")
-
-    def start_docstring_loop(self, project_id: str) -> None:
-        """Launch the background docstring generation loop (if not already running)."""
-        if self._active_bg_task is not None and not self._active_bg_task.done():
-            return
-
-        self._active_bg_task = asyncio.create_task(
-            self._docstring_generation_loop(project_id)
-        )
+        # Region: keep the task incomplete while the queue is non-empty
+        # A clean exit (no stop signal) still does not mean "done" — batches
+        # can resolve fewer symbols than requested. If any symbol is still
+        # without a docstring, override the completed mark _run_task would
+        # otherwise apply, so the invalidation hash never freezes over an
+        # unfinished queue and the loop re-runs next turn to finish the job.
+        # When stopped by signal, _run_task already marks not_completed, so
+        # this is only decisive on the clean-exit path.
+        remaining = _count_pending()
+        if remaining > 0 and not stopped:
+            task_def = self._f._task_registry.get_task_definition("docstrings")
+            if task_def is not None:
+                task_def.mark_not_completed(pstate)
+            self._f._log_debug(
+                f"bg_docstring: finished with {remaining} symbol(s) still "
+                f"pending — task kept not-completed so it re-runs next turn"
+            )
+        else:
+            self._f._log_debug("bg_docstring: finished")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Helper methods for background docstring (unchanged)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def cancel_docstring_tasks(self) -> None:
-        """Cancel the background docstring generation loop gracefully."""
-        if self._active_bg_task is not None and not self._active_bg_task.done():
-            self._active_bg_task.cancel()
-            try:
-                await asyncio.wait_for(self._active_bg_task, timeout=10.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-        self._active_bg_task = None
+        """
+        Flush pending docstring DB writes before the inlet reads project state.
 
+        Cancellation of the background docstring loop is no longer done here.
+        The loop runs as a BackgroundTaskManager task named 'docstrings' and is
+        stopped by stop_all() at the top of inlet() — cooperatively first, then
+        hard-cancelled once the grace elapses. Because streaming makes that
+        cancellation actually free the inference slot, there is no longer a
+        separate docstring task for this method to tear down.
+
+        What remains is a write barrier. A batch that persisted docstrings just
+        before being stopped may still have rows queued in the async DB writer.
+        Draining them here guarantees the about-to-run inlet reads a consistent
+        symbol_docstrings table instead of racing the tail of the previous
+        turn's writes.
+        """
+        # ── Drain any queued docstring writes before the inlet reads state ──
         drain_deadline = time.monotonic() + 5.0
         while not self._f._db_write_queue.empty():
             if time.monotonic() > drain_deadline:
@@ -31294,7 +31360,6 @@ class BackgroundTaskManager:
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._paused = True
-        self._detached_tasks: Dict[str, asyncio.Task] = {}
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
@@ -31321,40 +31386,19 @@ class BackgroundTaskManager:
             return
 
         async with self._lock:
-            # ------------------------------------------------------------------
-            # Avoid duplicate running tasks.
-            # ------------------------------------------------------------------
+            # ── Step 1: avoid duplicate running tasks ──
             if name in self._tasks and not self._tasks[name].done():
                 self._f._log_debug(
                     f"bg_manager: task '{name}' already running, skipped"
                 )
                 return
 
-            # ------------------------------------------------------------------
-            # Avoid duplicating a still-running detached orphan from a
-            # previous turn — its work is not lost, just not blocking us.
-            # ------------------------------------------------------------------
-            orphan = self._detached_tasks.get(name)
-            if orphan is not None:
-                if not orphan.done():
-                    self._f._log_debug(
-                        f"bg_manager: task '{name}' skipped — a detached "
-                        f"orphan from a previous turn is still finishing "
-                        f"server-side work"
-                    )
-                    return
-                del self._detached_tasks[name]
-
-            # ------------------------------------------------------------------
-            # Do not start if paused (inlet active).
-            # ------------------------------------------------------------------
+            # ── Step 2: do not start if paused (inlet active) ──
             if self._paused:
                 self._f._log_debug(f"bg_manager: task '{name}' not started (paused)")
                 return
 
-            # ------------------------------------------------------------------
-            # Check concurrency limit using max_concurrent (not semaphore._value).
-            # ------------------------------------------------------------------
+            # ── Step 3: enforce the concurrency limit ──
             if len(self._tasks) >= self._max_concurrent:
                 if self._f.valves.bg_task_log_detailed:
                     self._f._log_debug(
@@ -31363,9 +31407,7 @@ class BackgroundTaskManager:
                     )
                 return
 
-            # ------------------------------------------------------------------
-            # Create stop event and mark task as in_progress in pstate.
-            # ------------------------------------------------------------------
+            # ── Step 4: create stop event and mark in-progress in pstate ──
             stop_event = asyncio.Event()
             self._stop_events[name] = stop_event
 
@@ -31374,9 +31416,7 @@ class BackgroundTaskManager:
                 pstate = self._f._project_state_manager.get_pstate(project_id)
                 task_def.mark_in_progress(pstate)
 
-            # ------------------------------------------------------------------
-            # Create and store the task.
-            # ------------------------------------------------------------------
+            # ── Step 5: create and register the task ──
             task = asyncio.create_task(
                 self._run_task(name, coro, stop_event, project_id, *args, **kwargs)
             )
@@ -31390,57 +31430,46 @@ class BackgroundTaskManager:
 
     async def stop_all(self, timeout: float = None) -> None:
         """
-        Gracefully stop all running background tasks without deadlock, and
-        without ever hard-cancelling a task whose coroutine may currently be
-        awaiting an in-flight HTTP call to the inference server.
+        Stop all running background tasks: signal cooperatively, wait a short
+        grace, then hard-cancel any straggler and wait for it to unwind.
 
-        Why hard cancellation is unsafe here
+        Why hard cancellation is now correct
         ─────────────────────────────────────
-        Under --parallel 1, llama.cpp serves exactly one generation at a
-        time through a single shared slot. Cancelling the local asyncio.Task
-        that issued an LLM call only tears down the CLIENT side of that
-        request — closing the aiohttp connection does not reliably
-        interrupt token generation already in progress on the SERVER.
-        Observed in practice: a docstring/raptor task force-cancelled here
-        left an orphaned generation running server-side that queued every
-        subsequent request (including slot_restore) behind it for over five
-        minutes, and that request still failed at the end of the wait —
-        proving the cancellation itself was the source of the unreliability,
-        not a fix for it.
+        Previously a cancelled task could not stop the generation already in
+        flight on the server: the LLM call awaited the whole response body, and
+        llama.cpp only notices a dropped client when it next writes a token, so
+        with nothing to write until the end it generated to completion and kept
+        the single --parallel 1 slot busy regardless. Detaching such a task was
+        the only non-blocking option, which is why the orphan machinery existed.
 
-        Policy
-        ──────
-        1. Signal stop_event (cooperative). Tasks already check this between
-           LLM calls (e.g. between docstring batches) and exit cleanly.
-        2. Wait up to `timeout` seconds for cooperative completion.
-        3. Any task still running after the timeout is DETACHED, not
-           cancelled: moved to self._detached_tasks and left to finish on
-           its own. inlet() proceeds immediately without waiting further.
-           In the common case this converges quickly anyway — the detached
-           task still holds the same (already-set) stop_event, so its own
-           internal loop exits cooperatively the moment its current in-flight
-           LLM call returns; detaching only skips US waiting for that moment.
-        4. start() consults self._detached_tasks before launching a new task
-           of the same name, so a still-running orphan is never duplicated.
-        5. A done_callback (_on_detached_done) logs the eventual outcome and
-           cleans up the registry entry, so detached tasks stay observable
-           instead of vanishing silently.
+        Now that auxiliary LLM calls stream, cancelling the task closes the
+        socket mid-stream and the server aborts the in-flight generation within
+        roughly one token, freeing the slot immediately. So the policy becomes:
 
-        This trades "every inlet starts from a guaranteed-quiescent state"
-        for "inlet never blocks for minutes on a task that cannot actually
-        be stopped" — the former guarantee was illusory anyway, since the
-        cancelled task's server-side work kept running regardless of what
-        the client believed.
+        1. Set every stop_event (cooperative). Tasks check it between LLM calls
+           (between docstring batches and retries) and exit cleanly, persisting
+           whatever they resolved so far.
+        2. Wait up to `timeout` seconds for that cooperative wind-down. A batch
+           whose in-flight call returns within the grace finishes and persists
+           with no lost work.
+        3. Hard-cancel anything still running (a call wedged past the grace —
+           e.g. a stalled server). The cancel reaches the socket, so the slot
+           is released even for a generation the server had stalled.
+        4. Await the cancelled tasks (bounded by bg_task_cancel_timeout) so
+           their CancelledError propagates and their finally-blocks run before
+           inlet proceeds.
+
+        The lock is released before every wait so that a task's finally-block,
+        which re-acquires it, can run without deadlocking against us.
 
         Args:
-            timeout: Maximum seconds to wait for graceful (cooperative)
-                     shutdown before detaching. If None, uses
+            timeout: Cooperative grace before hard-cancelling. If None, uses
                      valves.bg_task_stop_timeout.
         """
         if timeout is None:
             timeout = self._f.valves.bg_task_stop_timeout
 
-        # ── Signal and snapshot under lock, then release before waiting ──────────
+        # ── Step 1: signal + snapshot under lock, then release before waiting ──
         async with self._lock:
             if not self._tasks:
                 return
@@ -31455,41 +31484,53 @@ class BackgroundTaskManager:
             tasks_snapshot = dict(self._tasks)
             tasks_to_wait = [t for t in tasks_snapshot.values() if not t.done()]
 
-        # ── Lock released here — tasks can now acquire it in their finally blocks ──
+        # ── Step 2: cooperative grace ──
         if tasks_to_wait:
             self._f._log_debug(
-                f"bg_manager: waiting for {len(tasks_to_wait)} task(s) "
-                f"to finish (timeout={timeout}s): {running_names}"
+                f"bg_manager: waiting up to {timeout}s for {len(tasks_to_wait)} "
+                f"task(s) to wind down cooperatively: {running_names}"
             )
 
-            done, still_pending = await asyncio.wait(tasks_to_wait, timeout=timeout)
+            _done, still_pending = await asyncio.wait(tasks_to_wait, timeout=timeout)
 
             self._f._log_debug(
-                f"bg_manager: {len(done)} task(s) finished gracefully, "
-                f"{len(still_pending)} detached (not cancelled)"
+                f"bg_manager: {len(_done)} task(s) finished cooperatively, "
+                f"{len(still_pending)} to cancel"
             )
 
+            # ── Step 3: hard-cancel stragglers (now that cancel frees the slot) ──
             if still_pending:
-                async with self._lock:
-                    for task in still_pending:
-                        task_name = next(
-                            (n for n, t in tasks_snapshot.items() if t is task),
-                            "<unknown>",
-                        )
-                        self._f._log_debug(
-                            f"bg_manager: detaching '{task_name}' — still "
-                            f"running after {timeout}s. NOT cancelled "
-                            f"(cancellation cannot stop server-side "
-                            f"generation under --parallel 1); letting it "
-                            f"finish on its own, tracked as an orphan so "
-                            f"it is never duplicated."
-                        )
-                        self._detached_tasks[task_name] = task
-                        task.add_done_callback(
-                            lambda t, n=task_name: self._on_detached_done(n, t)
-                        )
+                for task in still_pending:
+                    task_name = next(
+                        (n for n, t in tasks_snapshot.items() if t is task),
+                        "<unknown>",
+                    )
+                    self._f._log_debug(
+                        f"bg_manager: cancelling '{task_name}' after {timeout}s "
+                        f"grace — streaming cancel closes the socket, so the "
+                        f"server aborts its in-flight generation and releases "
+                        f"the slot"
+                    )
+                    task.cancel()
 
-        # ── Clear the active registry; orphans now live only in _detached_tasks ──
+                # ── Step 4: await the cancellations, bounded ──
+                _cancel_done, cancel_pending = await asyncio.wait(
+                    still_pending,
+                    timeout=self._f.valves.bg_task_cancel_timeout,
+                )
+                if cancel_pending:
+                    # Should be unreachable now that the cancel reaches the
+                    # socket. Logged rather than tracked as an orphan: the slot
+                    # was already released when the socket closed, so proceeding
+                    # is safe even in this degenerate case.
+                    self._f._log_debug(
+                        f"bg_manager: {len(cancel_pending)} task(s) did not "
+                        f"unwind within {self._f.valves.bg_task_cancel_timeout}s "
+                        f"of cancel — proceeding; the inference slot was already "
+                        f"released when the socket closed"
+                    )
+
+        # ── Step 5: clear the registry ──
         async with self._lock:
             self._tasks.clear()
             self._stop_events.clear()
@@ -31501,26 +31542,19 @@ class BackgroundTaskManager:
 
     def is_running(self, name: str) -> bool:
         """
-        Check if a specific background task is currently running, either
-        tracked normally or as a detached orphan still finishing
-        server-side work from a previous turn.
+        Check whether a specific background task is currently running.
 
         Args:
             name: The task name to check.
 
         Returns:
-            bool: True if a task of this name is active in either registry.
+            bool: True if a task of this name is registered and not yet done.
         """
-        if name in self._tasks and not self._tasks[name].done():
-            return True
-        if name in self._detached_tasks and not self._detached_tasks[name].done():
-            return True
-        return False
+        return name in self._tasks and not self._tasks[name].done()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Internal methods
     # ═══════════════════════════════════════════════════════════════════════
-
     async def _run_task(
         self,
         name: str,
@@ -31533,6 +31567,19 @@ class BackgroundTaskManager:
         """
         Execute a background task with proper project_id forwarding and race-safe cleanup.
 
+        Completion marking respects a self-declared incompletion. A coroutine
+        may write not_completed into its own pstate slot before returning to
+        signal that, although it exited cleanly (no stop signal, no exception),
+        its work is not actually finished — the docstring loop does this when a
+        clean run still leaves symbols without a docstring. In that case we must
+        NOT overwrite that state with completed: doing so would freeze the
+        task's invalidation hash over an unfinished queue and stop it re-running
+        until something unrelated invalidated it. So the clean-exit branch only
+        marks completed when the slot does not already say not_completed. Tasks
+        that never touch their own state slot mid-run (all others) are
+        unaffected: their slot has no 'completed' key set to False, so the guard
+        passes and they mark completed exactly as before.
+
         Args:
             name: Task identifier.
             coro: Coroutine to execute.
@@ -31543,12 +31590,10 @@ class BackgroundTaskManager:
         pstate = self._f._project_state_manager.get_pstate(project_id)
         task_def = self._f._task_registry.get_task_definition(name)
         start_time = time.monotonic()
-
         self._f._log_debug(
             f"bg_manager: task '{name}' starting "
             f"(project={project_id}, args={len(args)} extra arg(s))"
         )
-
         try:
             # ------------------------------------------------------------------
             # Acquire semaphore for concurrency control.
@@ -31560,10 +31605,23 @@ class BackgroundTaskManager:
                 await coro(project_id, *args, stop_event=stop_event, **kwargs)
 
             # ------------------------------------------------------------------
-            # Mark as completed if not cancelled.
+            # Mark as completed if not cancelled AND the coroutine did not
+            # already self-declare not_completed. A clean return normally means
+            # "done", but a coro whose work is queue-derived (docstrings) can
+            # exit cleanly with items still pending and write not_completed into
+            # its own slot to force a re-run; honour that instead of clobbering
+            # it with completed.
             # ------------------------------------------------------------------
             if task_def and not stop_event.is_set():
-                task_def.mark_completed(pstate, project_id)
+                _slot = pstate.get(task_def.state_key, {})
+                _self_declared_incomplete = _slot.get("completed") is False
+                if _self_declared_incomplete:
+                    self._f._log_debug(
+                        f"bg_manager: task '{name}' returned but self-declared "
+                        f"not-completed — leaving it to re-run next turn"
+                    )
+                else:
+                    task_def.mark_completed(pstate, project_id)
             elif task_def and stop_event.is_set():
                 task_def.mark_not_completed(pstate)
 
@@ -31576,7 +31634,6 @@ class BackgroundTaskManager:
                 self._f._log_debug(
                     f"bg_manager: task '{name}' stopped by signal after {duration:.2f}s"
                 )
-
         except asyncio.CancelledError:
             if task_def:
                 task_def.mark_not_completed(pstate)
@@ -31585,7 +31642,6 @@ class BackgroundTaskManager:
                 f"bg_manager: task '{name}' was cancelled after {duration:.2f}s"
             )
             raise
-
         except Exception as e:
             import traceback as _tb
 
@@ -31596,7 +31652,6 @@ class BackgroundTaskManager:
             )
             if task_def:
                 task_def.mark_not_completed(pstate)
-
         finally:
             # ------------------------------------------------------------------
             # Race-safe cleanup: only remove if we are still the registered task.
@@ -31608,40 +31663,6 @@ class BackgroundTaskManager:
                 if self._tasks.get(name) is _me:
                     self._tasks.pop(name, None)
                     self._stop_events.pop(name, None)
-
-    def _on_detached_done(self, name: str, task: asyncio.Task) -> None:
-        """
-        Completion callback for a previously-detached orphaned task.
-
-        Runs synchronously on the event loop (asyncio done_callbacks are
-        not coroutines), so the dict mutation below needs no lock — no
-        other coroutine can interleave mid-statement on a single-threaded
-        event loop.
-
-        Logs the eventual outcome of the orphan and removes its entry from
-        self._detached_tasks so start() can launch a fresh task of this
-        name on a future turn instead of being blocked by a stale,
-        already-finished orphan reference.
-
-        Args:
-            name: The task name this orphan was registered under.
-            task: The completed (or cancelled, or failed) asyncio.Task.
-        """
-        try:
-            exc = task.exception() if not task.cancelled() else None
-        except asyncio.CancelledError:
-            exc = None
-
-        if exc:
-            self._f._log_debug(
-                f"bg_manager: detached orphan '{name}' finished with error: {exc}"
-            )
-        else:
-            self._f._log_debug(f"bg_manager: detached orphan '{name}' finished")
-
-        existing = self._detached_tasks.get(name)
-        if existing is task:
-            del self._detached_tasks[name]
 
 
 class SemanticSeedInferencer:
@@ -34119,11 +34140,14 @@ class Filter:
             ),
         )
         bg_task_stop_timeout: float = Field(
-            default=5.0,
+            default=2.0,
             ge=1.0,
             le=30.0,
             description="Maximum seconds to wait for background tasks to finish gracefully at inlet.",
         )
+        bg_task_cancel_timeout: float = Field(
+            default=5.0
+        )  # Bound on awaiting the cancel
         bg_task_log_detailed: bool = Field(
             default=False,
             description="If True, log start/stop/duration for every background task.",
