@@ -6252,338 +6252,56 @@ class ContextBuilder:
         return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 4. Call graph mode resolution (cascade: Heuristic → CE → LLM)
+    # 4. Call Graph Mode Resolution with Hysteresis
     # ═══════════════════════════════════════════════════════════════════════
-
-    async def _resolve_call_graph_mode(
-        self,
-        query: str,
-        intent_vector: dict,
-        project_id: str,
-    ) -> str:
-        """
-        Resolve the effective call-graph depth for Block A using a cascade.
-
-        Uses heuristic reinforcement, CrossEncoder, and LLM fallback to decide
-        between 'hubs_only', 'expanded_hubs', and 'full_graph'.
-
-        Every resolved mode — whether it comes from the CrossEncoder-confident
-        branch, the LLM fallback, or the heuristic tail — is passed through the
-        same symbol-count ceiling and free-token floor guards via _clamp_mode
-        before being returned. Previously only the heuristic tail consulted
-        those guards, so a 'full_graph' verdict from a confident CrossEncoder or
-        from the LLM was applied verbatim on a large project, inflating Block A
-        well past the configured ceilings. Clamping at the return boundary keeps
-        a single source of truth for what each token budget permits.
-
-        Args:
-            query: User query.
-            intent_vector: Intent classification probabilities.
-            project_id: Current project identifier.
-
-        Returns:
-            'hubs_only', 'expanded_hubs', or 'full_graph'.
-        """
-        # ------------------------------------------------------------------
-        # Step 1: Manual override via valve.
-        # ------------------------------------------------------------------
-        valve = self._f.valves.call_graph_context_mode
-        if valve != "auto":
-            self._f._log_debug(f"_resolve_call_graph_mode: valve override → '{valve}'")
-            return valve
-
-        # ------------------------------------------------------------------
-        # Step 2: Determine use case from intent_vector.
-        # ------------------------------------------------------------------
-        use_case = "C"  # Default: Programming.
-        if intent_vector:
-            if intent_vector.get("refactor", 0.0) >= 0.30:
-                use_case = "D"
-            elif intent_vector.get("explain", 0.0) >= 0.5:
-                use_case = "A"
-
-        # ------------------------------------------------------------------
-        # Step 3: Calculate token availability and define the budget guards.
-        # ------------------------------------------------------------------
-        total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
-        free_tokens = self.get_effective_context_budget(project_id)
-
-        def _full_graph_allowed() -> bool:
-            symbol_ok = (
-                total_symbols
-                <= self._f.valves.call_graph_auto_full_graph_symbol_ceiling
-            )
-            fg_floor = int(
-                self._f.valves.context_window_tokens
-                * self._f.valves.full_graph_min_free_token_ratio
-            )
-            return symbol_ok and (free_tokens >= fg_floor)
-
-        def _expanded_hubs_allowed() -> bool:
-            symbol_ok = (
-                total_symbols
-                <= self._f.valves.call_graph_auto_expanded_hubs_symbol_ceiling
-            )
-            eh_floor = int(
-                self._f.valves.context_window_tokens
-                * self._f.valves.expanded_hubs_min_free_token_ratio
-            )
-            return symbol_ok and (free_tokens >= eh_floor)
-
-        def _clamp_mode(mode: str) -> str:
-            """
-            Downgrade a proposed mode when its budget guard is not satisfied.
-
-            full_graph collapses to expanded_hubs (and, if that is also denied,
-            to hubs_only); expanded_hubs collapses to hubs_only; hubs_only is
-            always permitted. This is the single point every branch of the
-            cascade routes through, so a confident CrossEncoder or an LLM
-            verdict can never bypass the symbol-count ceiling or the free-token
-            floor.
-            """
-            if mode == "full_graph":
-                if _full_graph_allowed():
-                    return "full_graph"
-                self._f._log_debug(
-                    f"_resolve_call_graph_mode: 'full_graph' denied "
-                    f"(symbols={total_symbols}, free_tokens={free_tokens}) "
-                    f"→ trying 'expanded_hubs'"
-                )
-                mode = "expanded_hubs"
-            if mode == "expanded_hubs":
-                if _expanded_hubs_allowed():
-                    return "expanded_hubs"
-                self._f._log_debug(
-                    f"_resolve_call_graph_mode: 'expanded_hubs' denied "
-                    f"(symbols={total_symbols}, free_tokens={free_tokens}) "
-                    f"→ falling back to 'hubs_only'"
-                )
-                return "hubs_only"
-            return "hubs_only"
-
-        # ------------------------------------------------------------------
-        # Step 4: CrossEncoder for mode resolution.
-        # ------------------------------------------------------------------
-        if (
-            self._f._cross_encoder is not None
-            and self._f.valves.enable_cot_llm_detection
-        ):
-            stripped = self._f._commands._extract_text_for_classification(query)
-            query_short = stripped[:500] if stripped else query[:500]
-            pairs = [
-                (
-                    query_short,
-                    "The user only needs the top hub symbols, no full call graph.",
-                ),
-                (
-                    query_short,
-                    "The user needs the top hub symbols plus their direct callers/callees.",
-                ),
-                (query_short, "The user needs the full call graph with all symbols."),
-            ]
-            scores = await self._f._commands._predict_cross_encoder(pairs)
-
-            if scores is not None and len(scores) >= 3:
-                # Apply heuristic reinforcement.
-                h_weight = self._f.valves.heuristic_reinforcement_weight
-                scores_reinforced = list(scores)
-
-                if use_case == "A":
-                    scores_reinforced[2] += (
-                        h_weight * 0.3
-                    )  # full_graph for architecture.
-                elif use_case == "D":
-                    scores_reinforced[1] += (
-                        h_weight * 0.3
-                    )  # expanded_hubs for refactor.
-
-                if intent_vector.get("debug", 0) > 0.3:
-                    scores_reinforced[1] += h_weight * 0.2
-
-                max_score = max(scores_reinforced)
-                second_max = (
-                    sorted(scores_reinforced, reverse=True)[1]
-                    if len(scores_reinforced) > 1
-                    else 0
-                )
-                diff = max_score - second_max
-
-                CE_CONFIDENCE_THRESHOLD = self._f.valves.graph_mode_ce_threshold
-                LLM_FALLBACK_THRESHOLD = self._f.valves.graph_mode_llm_threshold
-
-                if diff >= CE_CONFIDENCE_THRESHOLD:
-                    best_idx = int(np.argmax(scores_reinforced))
-                    modes = ["hubs_only", "expanded_hubs", "full_graph"]
-                    # Clamp the confident verdict against the budget guards
-                    # before returning, so a 'full_graph' pick on an oversized
-                    # project degrades instead of bloating Block A.
-                    resolved_mode = _clamp_mode(modes[best_idx])
-                    self._f._log_debug(
-                        f"_resolve_call_graph_mode: CE confident "
-                        f"(diff={diff:.2f}, raw='{modes[best_idx]}') → "
-                        f"'{resolved_mode}'"
-                    )
-                    return resolved_mode
-
-                elif diff < LLM_FALLBACK_THRESHOLD:
-                    self._f._log_debug(
-                        f"_resolve_call_graph_mode: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                        "using LLM fallback"
-                    )
-                    # ------------------------------------------------------------------
-                    # LLM fallback for mode resolution.
-                    # ------------------------------------------------------------------
-                    ce_summary = "\n".join(
-                        [
-                            f"- Hubs only: {scores_reinforced[0]:.2f}",
-                            f"- Expanded hubs: {scores_reinforced[1]:.2f}",
-                            f"- Full graph: {scores_reinforced[2]:.2f}",
-                        ]
-                    )
-                    prompt = f"""
-The CrossEncoder is uncertain. Scores:
-{ce_summary}
-
-User query:
-{query[:500]}
-
-Choose the call graph depth.
-Options:
-- hubs_only: only top hub symbols
-- expanded_hubs: hubs + direct callers/callees
-- full_graph: all symbols
-
-Output only the option name.
-"""
-                    llm_response = await self._f._llm_orchestrator.call_llm(
-                        prompt=prompt,
-                        system_prompt="You are a context planner. Output only 'hubs_only', 'expanded_hubs', or 'full_graph'.",
-                        model_override=self._f.valves.summarization_model,
-                        max_tokens=10,
-                        temperature=0.0,
-                        label="graph_mode_llm",
-                    )
-                    if llm_response:
-                        llm_mode = llm_response.strip().lower()
-                        if llm_mode in ("hubs_only", "expanded_hubs", "full_graph"):
-                            # The LLM answer is subject to the same guards as
-                            # every other branch — it never overrides the budget.
-                            resolved_mode = _clamp_mode(llm_mode)
-                            self._f._log_debug(
-                                f"_resolve_call_graph_mode: LLM decided "
-                                f"'{llm_mode}' → applied '{resolved_mode}'"
-                            )
-                            return resolved_mode
-
-                # Middle zone: fall through to heuristic.
-
-        # ------------------------------------------------------------------
-        # Step 5: Heuristic fallback (already guard-aware; kept as-is).
-        # ------------------------------------------------------------------
-        if use_case == "A":
-            if _full_graph_allowed():
-                return "full_graph"
-            if _expanded_hubs_allowed():
-                return "expanded_hubs"
-            return "hubs_only"
-
-        if use_case == "D":
-            if _expanded_hubs_allowed():
-                return "expanded_hubs"
-            return "hubs_only"
-
-        return "hubs_only"
-
-    # ------------------------------------------------------------------
-    # Region: Call Graph Mode Resolution with Hysteresis
-    # ------------------------------------------------------------------
 
     async def prepare_call_graph_mode(
         self, project_id: str, query: str, intent_vector: dict
     ) -> str:
         """
-        Resolve and apply the call-graph mode for this turn before Block A is built.
+        Apply the fixed call-graph mode for this turn and persist it before
+        Block A is built.
 
-        Implements hysteresis: upgrades are applied immediately; downgrades are
-        deferred by call_graph_mode_downgrade_after_turns.
+        call_graph_context_mode is operator-chosen and constant for the session.
+        The former 'auto' cascade (_resolve_call_graph_mode resolving depth from
+        the query via CrossEncoder + LLM) and its downgrade hysteresis were
+        removed: resolving depth per turn varied the mode, and any variation
+        changed the Block A cache key, forcing a full KV prefill on nothing more
+        than a differently-phrased question. A constant mode keeps the Block A
+        prefix — and thus the slot file — stable across the whole session.
+
+        The one behaviour preserved from the old global-scope branch is the
+        multi-phase trigger: a whole-project question still forces multi-phase
+        this turn. It no longer bumps the graph mode (the mode is absolute now),
+        because multi-phase is response planning, orthogonal to context depth.
 
         Args:
             project_id: Current project identifier.
-            query: The user query string.
-            intent_vector: Intent classification probabilities.
+            query: The user query string (used only for global-scope detection).
+            intent_vector: Retained for signature stability; no longer consulted.
 
         Returns:
-            The resolved call-graph mode string ('hubs_only', 'expanded_hubs',
+            The configured call-graph mode string ('hubs_only', 'expanded_hubs',
             or 'full_graph').
         """
         psm = self._f._project_state_manager
-        pstate = psm.get_pstate(project_id)
+        mode = self._f.valves.call_graph_context_mode
 
-        # ------------------------------------------------------------------
-        # Step 1: Global scope detection forces full_graph.
-        # ------------------------------------------------------------------
+        # ── Global scope still forces multi-phase this turn ──
+        # Independent of the (now fixed) call-graph mode: a whole-project
+        # question benefits from multi-phase response planning regardless of
+        # how the map is rendered.
         if hasattr(
             self._f, "_seed_inferencer"
         ) and self._f._seed_inferencer.is_global_scope(query):
-            psm.set_resolved_call_graph_mode(project_id, "full_graph")
             psm.set_force_multi_phase_this_turn(project_id, True)
-            pstate["graph_mode_downgrade_streak"] = 0
             self._f._log_debug(
-                "prepare_call_graph_mode: global scope detected -> "
-                "full_graph forced + multi-phase activated this turn."
+                "prepare_call_graph_mode: global scope detected -> multi-phase "
+                f"activated this turn (mode stays fixed at '{mode}')"
             )
-            return "full_graph"
 
-        # ------------------------------------------------------------------
-        # Step 2: Resolve the raw mode using the cascade.
-        # ------------------------------------------------------------------
-        raw_resolved_mode = await self._resolve_call_graph_mode(
-            query, intent_vector, project_id
-        )
-
-        # ------------------------------------------------------------------
-        # Step 3: Hysteresis - defer downgrades to avoid KV-cache thrash.
-        # ------------------------------------------------------------------
-        _MODE_RANK = {"hubs_only": 0, "expanded_hubs": 1, "full_graph": 2}
-
-        previous_mode = psm.get_resolved_call_graph_mode(project_id)
-        streak = pstate.get("graph_mode_downgrade_streak", 0)
-
-        if previous_mode is None or _MODE_RANK.get(
-            raw_resolved_mode, 0
-        ) >= _MODE_RANK.get(previous_mode, 0):
-            # Upgrade or first time: apply immediately.
-            resolved_graph_mode = raw_resolved_mode
-            pstate["graph_mode_downgrade_streak"] = 0
-        else:
-            # Downgrade: defer until streak reaches threshold.
-            streak += 1
-            pstate["graph_mode_downgrade_streak"] = streak
-            if streak >= self._f.valves.call_graph_mode_downgrade_after_turns:
-                resolved_graph_mode = raw_resolved_mode
-                pstate["graph_mode_downgrade_streak"] = 0
-            else:
-                resolved_graph_mode = previous_mode
-                self._f._log_debug(
-                    f"Call graph mode: downgrade to {raw_resolved_mode} "
-                    f"deferred ({streak}/"
-                    f"{self._f.valves.call_graph_mode_downgrade_after_turns}"
-                    f" turns) - keeping {previous_mode} to avoid "
-                    f"KV-cache thrash"
-                )
-
-        # ------------------------------------------------------------------
-        # Step 4: Store and log the resolved mode if changed.
-        # ------------------------------------------------------------------
-        if previous_mode != resolved_graph_mode:
-            self._f._log_debug(
-                f"Call graph mode: {previous_mode or '(none)'} -> "
-                f"{resolved_graph_mode} (resolved before Block A "
-                f"build this turn)"
-            )
-            psm.set_resolved_call_graph_mode(project_id, resolved_graph_mode)
-
-        return resolved_graph_mode
+        psm.set_resolved_call_graph_mode(project_id, mode)
+        return mode
 
     # ═══════════════════════════════════════════════════════════════════════
     # 5. Block B — dynamic, per‑query LOD‑activated context
@@ -25142,7 +24860,38 @@ class ActiveCodeUpdater:
     async def _reindex_block_symbols_with_docstrings(
         self, block: "CodeBlock", project_id: str
     ) -> None:
-        """Re‑extract symbols for a block and register them + edges in the index."""
+        """Re-extract symbols for a block and register them + edges in the index.
+
+        Source-docstring harvest: before registering symbols, docstrings already
+        present in the pasted/generated source are lifted straight from the AST
+        (SignatureExtractor._extract_docstrings_python) into sym.docstring. This
+        is free — no LLM call — and definitive: a symbol whose docstring came
+        from source is never handed to the background generation loop, because
+        that loop derives its queue from `not sym.docstring`, and it is
+        persisted to symbol_docstrings so a later session inherits it without
+        regenerating. Only genuinely undocumented symbols fall through to LLM
+        generation. The harvest never overwrites an existing docstring
+        (_extract_docstrings_python skips any symbol that already has one), so a
+        previously generated or previously harvested docstring is preserved.
+        """
+        # ── Step 1: harvest docstrings already present in the source ──
+        # Runs before add() so the SymbolIndex indexes each symbol with its
+        # docstring from the outset. Python-only: the AST walker is Python-
+        # specific; other languages simply get no harvest and fall through to
+        # generation as before.
+        harvested: List[Tuple[str, str]] = []
+        if block.content:
+            try:
+                SignatureExtractor._extract_docstrings_python(
+                    block.content, block.symbols
+                )
+            except Exception as _harvest_err:
+                self._f._log_debug(
+                    f"Docstring harvest skipped for block {block.hash}: "
+                    f"{_harvest_err}"
+                )
+
+        # ── Step 2: register symbols and their call edges ──
         for s in block.symbols:
             s.parent_block_hash = block.hash
             self._f._symbol_index.add(s, block.hash, project_id)
@@ -25157,7 +24906,16 @@ class ActiveCodeUpdater:
                 )
                 self._f._symbol_index.add_edge(edge, project_id)
 
-        # Data-flow edges: ONE full-file AST pass per block, not per symbol.
+            # -- collect harvested docstrings for persistence --------------
+            # qualify_symbol (with file_path) is the id used everywhere else:
+            # SymbolIndex, the symbol_docstrings table, and the generation
+            # loop's `not sym.docstring` queue. Persisting under this id is what
+            # lets a future session's cache phase resolve it as a hit instead of
+            # regenerating.
+            if s.docstring:
+                harvested.append((qualify_symbol(s), s.docstring))
+
+        # ── Step 3: data-flow edges (ONE full-file AST pass per block) ──
         if self._f.valves.enable_data_flow_analysis and block.file_path:
             df_edges = self._f._code_blocks.extract_data_flow_edges(
                 block.content, block.file_path, project_id
@@ -25169,6 +24927,31 @@ class ActiveCodeUpdater:
                     f"Data flow: {len(df_edges)} edge(s) extracted from {block.file_path}"
                 )
 
+        # ── Step 4: persist harvested docstrings to SQLite ──
+        # Mirrors ensure_docstrings_batch's write shape so the two paths are
+        # indistinguishable to readers of symbol_docstrings. Fire-and-forget via
+        # the DB queue: the in-memory sym.docstring (set in Step 1) already
+        # satisfies this turn's rendering; this write only serves future
+        # sessions and future cache-phase lookups.
+        if harvested:
+            rows = [(project_id, qid, doc, time.time()) for qid, doc in harvested]
+
+            def _write_harvested(rows: list = rows) -> None:
+                self._f._db_conn.executemany(
+                    "INSERT OR REPLACE INTO symbol_docstrings "
+                    "(project_id, symbol_name, docstring, updated_at) "
+                    "VALUES (?,?,?,?)",
+                    rows,
+                )
+                self._f._db_conn.commit()
+
+            await self._f._state_store._db_enqueue(_write_harvested)
+            self._f._log_debug(
+                f"Docstring harvest: {len(harvested)} docstring(s) lifted from "
+                f"source and persisted for block {block.hash}"
+            )
+
+        # ── Step 5: token accounting + importance refresh ──
         if self._f.tokenizer:
             block._cached_token_count = len(self._f.tokenizer.encode(block.content))
         else:
@@ -32964,9 +32747,18 @@ class Filter:
             le=1.0,
             description="Minimum ratio of free tokens to enable expanded_hubs mode.",
         )
-        call_graph_context_mode: str = Field(
-            default="full_graph",
-            description="'auto', 'hubs_only', 'expanded_hubs', or 'full_graph'. Be aware 'auto' is calculated every turn, and it will invalidate kvcache.",
+        call_graph_context_mode: Literal["hubs_only", "expanded_hubs", "full_graph"] = (
+            Field(
+                default="full_graph",
+                description=(
+                    "Call-graph rendering depth in Block A. Fixed, operator-chosen: "
+                    "'hubs_only' (arch map + hub section), 'expanded_hubs' (adds "
+                    "direct callers/callees), 'full_graph' (all symbols). The former "
+                    "'auto' mode was removed — resolving depth from the query per "
+                    "turn changed the Block A cache key and forced needless KV "
+                    "prefills."
+                ),
+            )
         )
         call_graph_auto_full_graph_symbol_ceiling: int = Field(
             default=300,
