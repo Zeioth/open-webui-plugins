@@ -4834,15 +4834,17 @@ class ContextBuilder:
         The resulting dirty set is threaded into HubSymbolIndex.build() and
         _build_skeleton_tier(), so unchanged symbols render in a stable
         position (alphabetical / by-centrality among themselves) BEFORE any
-        recently-changed symbol, instead of the prior pure
-        alphabetical/centrality ordering which scattered changed symbols
-        throughout the section. This keeps the unchanged majority of a
-        large project as a contiguous, position-stable text prefix across
-        turns and across sessions, even though compute_structure_hash (and
-        therefore the KV-slot save/restore filename) still changes whenever
-        ANY symbol changes — the slot-file mechanism remains all-or-nothing,
-        but llama.cpp's in-session prefix-matching cache benefits from this
-        ordering regardless of slot file hits/misses.
+        recently-changed symbol.
+
+        Block A freeze: when a freeze window is active (see
+        _evaluate_block_a_freeze, called earlier in the inlet), the cache key
+        is built from the FROZEN structure hash rather than the current one,
+        so the cached text is served byte-identically for the whole window
+        even as the underlying code changes. A staleness header is prepended
+        at capture time (and thus lives inside the cached text) telling the
+        model the map may lag and to trust Block B / history for anything it
+        is actively editing. Because the header is fixed for the window (no
+        per-turn counter), serving the cached text never perturbs the prefix.
 
         The new snapshot is only persisted (state.symbol_signature_snapshot)
         after a successful render, at the same point the structure_hash
@@ -4854,8 +4856,6 @@ class ContextBuilder:
 
         # --- 1. Resolve per-project state ---
         psm = self._f._project_state_manager
-        # pstate_raw is kept for keys that have no typed accessor:
-        # skeleton_render_mode, last_static_prefix_hash, hub_tier_qids_persisted.
         pstate_raw = psm.get_pstate(project_id)
 
         # -- E4: prune ghost hub qids -------------------------------------
@@ -4881,30 +4881,39 @@ class ContextBuilder:
         structure_hash = self._f._symbol_index.compute_structure_hash(project_id)
         if not structure_hash:
             structure_hash = hashlib.md5("no_symbols".encode()).hexdigest()[:16]
-        psm.set_structure_hash_for_cache(project_id, structure_hash)
+
+        # --- 2b. Block A freeze: use the frozen hash as the cache key while a
+        #         window is active, so the same cached text (and the same slot
+        #         file, pinned in _evaluate_block_a_freeze) is reused across
+        #         structural edits. structure_hash_for_cache was already pinned
+        #         to the frozen value by _evaluate_block_a_freeze; we mirror it
+        #         into the local key here so the cache lookup below matches.
+        freeze_active = pstate_raw.get("block_a_freeze_active", False)
+        frozen_hash = pstate_raw.get("block_a_frozen_structure_hash")
+        if freeze_active and frozen_hash:
+            effective_hash = frozen_hash
+        else:
+            effective_hash = structure_hash
+        psm.set_structure_hash_for_cache(project_id, effective_hash)
 
         # --- 3. Resolved call graph mode ---
         mode = psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
 
-        # --- 4. Build cache key using structure hash (not the rendered text) ---
-        cache_key = f"{structure_hash}__{mode}"
+        # --- 4. Build cache key using the effective (possibly frozen) hash ---
+        cache_key = f"{effective_hash}__{mode}"
         cached_text = psm.get_block_a_cached(project_id)
         stored_key = psm.get_block_a_cache_key(project_id)
 
         if stored_key and stored_key == cache_key and cached_text is not None:
-            # --- 4a. Cache hit: same code + same mode ---
+            # --- 4a. Cache hit: same (effective) code + same mode ---
             return cached_text
 
         # --- 4b. Cache miss or continuation freeze ---
         if is_continuation and cached_text is not None:
-            # Continuation: freeze Block A to prevent KV cache misses.
             self._f._log_debug("Block A: frozen for AutoContinue (KV cache stability)")
             return cached_text
 
-        # --- 4c. Diff current symbol signatures against the last persisted
-        #         snapshot to find which symbols changed since the previous
-        #         build. Only meaningful on a genuine rebuild (we're past
-        #         the cache-hit and continuation-freeze returns above).
+        # --- 4c. Diff current signatures against the last persisted snapshot ---
         dirty_qids = self._compute_dirty_qids(project_id)
         if dirty_qids:
             self._f._log_debug(
@@ -4915,6 +4924,18 @@ class ContextBuilder:
 
         # --- 5. Build the static block ---
         parts: List[str] = []
+
+        # 5.0 Block A freeze staleness header (inside the cached text so it is
+        #     part of the frozen prefix; fixed wording, no per-turn counter).
+        if freeze_active and frozen_hash:
+            parts.append(
+                "> ⚠️ **Architecture map may be stale.** The symbol map and "
+                "signatures below were captured at the start of a KV-cache "
+                "stability window and may not reflect the most recent edits to "
+                "signatures or symbols. For the current state of any symbol you "
+                'are editing, trust the active code in the "Code Context" '
+                "section and the conversation history over this map."
+            )
 
         # 5.1 Base instructions (completely static)
         if is_code_session and self._f.valves.enable_confidence_scoring:
@@ -4954,28 +4975,6 @@ class ContextBuilder:
             if state and state.active_blocks:
                 centrality = psm.get_node_centrality(project_id)
 
-                # ── Structural self-heal for centrality ──────────────────
-                # Centrality is a property of the symbol call-graph and must
-                # be refreshed exactly when that graph changes. It is recomputed
-                # here only when the persisted scores do not match the current
-                # structure, detected in two ways:
-                #   • empty  — some invalidation path blanked it (or this is
-                #     the first render before any ingestion recomputed it);
-                #     get_hub_names({}) would drop the entire Hub section.
-                #   • stale  — the scores were last computed against a different
-                #     structural hash than the current one, i.e. the graph
-                #     changed since without an ingestion turn refreshing it.
-                # The stamp comparison (rather than the dirty_qids proxy used
-                # previously) is what the check actually wants to express:
-                # "is the centrality fresh for THIS structure?". dirty_qids is
-                # non-empty on an ingestion turn even though invalidate_block_a_
-                # cache(recompute_centrality=True) already refreshed centrality
-                # moments earlier and stamped the matching hash — so keying off
-                # dirty_qids double-computed on every ingestion. Keying off the
-                # stamp skips that redundant pass: the stamped hash equals
-                # structure_hash here, so the recompute is bypassed, while a
-                # genuinely stale turn still triggers it. precompute_centrality
-                # memoises into the SymbolIndex cache regardless.
                 stamped_hash = pstate_raw.get("node_centrality_structure_hash")
                 centrality_stale = stamped_hash != structure_hash
                 if not centrality or centrality_stale:
@@ -5044,13 +5043,11 @@ class ContextBuilder:
 
         static_block = "\n\n".join(p for p in parts if p.strip())
 
-        # --- 6. Store in cache with the mode-aware key (using structure hash) ---
+        # --- 6. Store in cache with the mode-aware (possibly frozen) key ---
         psm.set_block_a_cache_key(project_id, cache_key)
         psm.set_block_a_cached(project_id, static_block)
 
-        # --- 6b. Persist the new snapshot only after a successful render,
-        #         so an aborted build never advances the comparison baseline
-        #         used by the next turn's _compute_dirty_qids.
+        # --- 6b. Persist the new snapshot only after a successful render ---
         new_snapshot = self._f._symbol_index.get_signature_snapshot(project_id)
         state = self._f._conversation_state_manager.get(project_id)
         state.symbol_signature_snapshot = new_snapshot
@@ -5061,7 +5058,7 @@ class ContextBuilder:
         pstate_raw["skeleton_render_mode"] = mode
 
         # --- 8. Detect and log prefix changes (KV cache miss) ---
-        new_prefix_hash = structure_hash
+        new_prefix_hash = effective_hash
         last_hash = pstate_raw.get("last_static_prefix_hash")
         if last_hash and last_hash != new_prefix_hash:
             self._f._log_debug(
@@ -5200,6 +5197,161 @@ class ContextBuilder:
                 dirty.add(qid)
 
         return dirty
+
+    def _evaluate_block_a_freeze(self, project_id: str) -> None:
+        """
+        Decide the Block A freeze state for this turn, before the call-graph
+        mode and Block A are built.
+
+        The freeze makes Block A a byte-identical KV prefix across a window of
+        counted structural edits, so edits do not each pay a full prefill.
+        While the freeze is active this pins structure_hash_for_cache to the
+        hash captured at the window's start; because slot_save, slot_restore
+        and slot_restore_for_continuity all key their filename off
+        get_structure_hash_for_cache, pinning it here makes all three reuse the
+        same slot file for the whole window — no other slot code changes.
+
+        Two independent measurements, for two distinct purposes:
+
+        - "Did THIS turn edit structure?" — compares the current structure hash
+          against block_a_last_turn_structure_hash, a per-turn baseline that
+          advances every turn regardless of the freeze. This must NOT use
+          _compute_dirty_qids: that diffs against state.symbol_signature_
+          snapshot, which build_block_a only advances on a real render (paso
+          6b) and therefore freezes along with Block A during a cache-hit
+          window. Keyed off the frozen snapshot, a single early edit would read
+          as "dirty" on every subsequent turn, spuriously spending the whole
+          budget in N consecutive turns for one real edit.
+
+        - "How much has drifted since capture?" — uses _compute_dirty_qids
+          against the (frozen) snapshot, which is exactly the accumulated drift
+          from the capture point, the correct signal for block_a_freeze_max_drift.
+
+        Counting policy: block_a_freeze_turns == 0 disables the feature. A turn
+        counts toward the budget when it edited structure (default) or on every
+        Block-A turn (block_a_freeze_count_all_changes=True). Pure Q&A turns
+        never spend budget, so the freeze is effectively infinite while nothing
+        changes. The window breaks (and re-captures on the current fresh state,
+        paying one prefill this turn) when edits_used reaches the limit, or —
+        if block_a_freeze_max_drift > 0 — when accumulated drift exceeds it.
+        """
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+
+        # ── Step 1: current structure hash + per-turn edit detection ──
+        current_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        last_turn_hash = pstate.get("block_a_last_turn_structure_hash")
+        structural_edit_this_turn = (
+            last_turn_hash is not None and current_hash != last_turn_hash
+        )
+        # Advance the per-turn baseline immediately, unconditionally: it tracks
+        # "structure as of the previous turn", independent of the freeze and of
+        # whether Block A renders fresh or from cache this turn.
+        pstate["block_a_last_turn_structure_hash"] = current_hash
+
+        # ── Step 2: feature disabled → force inactive, pin nothing ──
+        freeze_turns = self._f.valves.block_a_freeze_turns
+        if freeze_turns <= 0:
+            if pstate.get("block_a_freeze_active"):
+                self._f._log_debug(
+                    "Block A freeze: disabled by valve — clearing active window"
+                )
+            pstate["block_a_freeze_active"] = False
+            pstate["block_a_frozen_structure_hash"] = None
+            pstate["block_a_freeze_edits_used"] = 0
+            return
+
+        # ── Step 3: does this turn count toward the budget? ──
+        if self._f.valves.block_a_freeze_count_all_changes:
+            counts_as_change = True
+        else:
+            counts_as_change = structural_edit_this_turn
+
+        state = self._f._conversation_state_manager.get(project_id)
+        current_turn = state.message_count if state else 0
+        active = pstate.get("block_a_freeze_active", False)
+
+        # ── Step 4: no active window → capture a fresh one ──
+        if not active:
+            self._start_block_a_freeze_window(
+                project_id, current_hash, current_turn, reason="no active window"
+            )
+            return
+
+        # ── Step 5: active window, this turn does not count → hold ──
+        if not counts_as_change:
+            psm.set_structure_hash_for_cache(
+                project_id, pstate["block_a_frozen_structure_hash"]
+            )
+            return
+
+        # ── Step 6: active window, counted change → maybe break ──
+        edits_used = pstate.get("block_a_freeze_edits_used", 0) + 1
+        pstate["block_a_freeze_edits_used"] = edits_used
+
+        # Accumulated drift since capture: dirty vs the frozen snapshot.
+        dirty = self._compute_dirty_qids(project_id)
+        total_symbols = len(self._f._symbol_index.get_all_qualified_names(project_id))
+        drift_ratio = (len(dirty) / total_symbols) if total_symbols else 0.0
+        max_drift = self._f.valves.block_a_freeze_max_drift
+
+        break_on_count = edits_used >= freeze_turns
+        break_on_drift = max_drift > 0.0 and drift_ratio > max_drift
+
+        if break_on_count or break_on_drift:
+            _why = (
+                f"edits_used={edits_used} >= {freeze_turns}"
+                if break_on_count
+                else f"drift {drift_ratio:.0%} > {max_drift:.0%}"
+            )
+            self._f._log_debug(
+                f"Block A freeze: breaking window ({_why}) — paying one prefill "
+                f"and re-capturing on current state"
+            )
+            psm.set_block_a_cache_key(project_id, None)
+            psm.set_block_a_cached(project_id, None)
+            pstate["skeleton_tier_cache_key"] = None
+            pstate["skeleton_tier_cached"] = None
+            self._start_block_a_freeze_window(
+                project_id, current_hash, current_turn, reason=_why
+            )
+            return
+
+        # ── Step 7: counted change within budget → stay frozen ──
+        psm.set_structure_hash_for_cache(
+            project_id, pstate["block_a_frozen_structure_hash"]
+        )
+        self._f._log_debug(
+            f"Block A freeze: holding frozen map "
+            f"({edits_used}/{freeze_turns} counted edits used, "
+            f"accumulated drift {drift_ratio:.0%})"
+        )
+
+    def _start_block_a_freeze_window(
+        self, project_id: str, structure_hash: str, capture_turn: int, reason: str
+    ) -> None:
+        """
+        Begin a new Block A freeze window anchored on the given structure hash.
+
+        Captures the hash that will be pinned for the window's lifetime, resets
+        the counted-change tally, and records the capture turn used only by the
+        staleness header in build_block_a. Pins structure_hash_for_cache
+        immediately so this turn's slot save/restore already target the window's
+        file. The Block A text built this turn (fresh, since a capture only
+        happens on the first turn or right after a break invalidated the cache)
+        becomes the frozen text served for the rest of the window.
+        """
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+        pstate["block_a_freeze_active"] = True
+        pstate["block_a_frozen_structure_hash"] = structure_hash
+        pstate["block_a_freeze_edits_used"] = 0
+        pstate["block_a_freeze_capture_turn"] = capture_turn
+        psm.set_structure_hash_for_cache(project_id, structure_hash)
+        self._f._log_debug(
+            f"Block A freeze: new window captured (hash={structure_hash}, "
+            f"turn={capture_turn}, {reason})"
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Skeleton tier (stable signatures inside Block A)
@@ -29307,6 +29459,13 @@ class ContextDumper:
             dict: A complete payload dictionary with all context data and metrics.
 
         M7: Includes block_a_rebuild_reason from pstate.
+
+        Block A freeze: also captures the freeze window state (active flag,
+        frozen vs current structure hash, counted edits used) so the evolution
+        series explains why a turn with a real code edit still shows an
+        unchanged Block A prefix hash — that is the freeze holding the KV prefix
+        stable on purpose, not an assembly regression. Without this a reviewer
+        scanning the dumps would read a frozen turn as a bug.
         """
         max_chars = self._f.valves.context_dump_message_max_chars
         msg_copy: List[Tuple[str, str]] = []
@@ -29333,123 +29492,28 @@ class ContextDumper:
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
 
+        # ── Block A freeze state ────────────────────────────────────────────
+        # Captured so a frozen turn is legible in the evolution series: when
+        # active, the Block A prefix hash above is the frozen hash, deliberately
+        # held stable across structural edits. current_structure_hash is the
+        # live hash the code would produce right now; the gap between them is
+        # exactly the staleness the freeze is trading for KV-cache stability.
+        freeze_active = pstate.get("block_a_freeze_active", False)
+        try:
+            current_structure_hash = self._f._symbol_index.compute_structure_hash(
+                project_id
+            )
+        except Exception:
+            current_structure_hash = ""
+        freeze_frozen_hash = pstate.get("block_a_frozen_structure_hash") or ""
+        freeze_edits_used = pstate.get("block_a_freeze_edits_used", 0)
+        freeze_capture_turn = pstate.get("block_a_freeze_capture_turn", 0)
+        freeze_turns_limit = self._f.valves.block_a_freeze_turns
+
         # ── Hub-Bodies Tier text ────────────────────────────────────────────
         # The tier is injected between Block A and Block B in the final prompt
         # (see _assemble_prelim_system), so it lives in neither static_block
-        # nor dynamic_block. Read it straight from pstate — where build()
-        # persists it each turn — so the dump can show it as its own section
-        # instead of dropping it into the gap between the two captured blocks.
-        hub_tier_text = pstate.get("hub_tier_text", "") or ""
-
-        # ── Turn number for the dump label ───────────────────────────────────
-        # Derived from len(messages) rather than ConversationState.message_count.
-        # message_count only advances when a turn contains indexable code (see
-        # ActiveCodeUpdater._post_update_tasks) — a purely conversational turn
-        # never touches it, which made this label read "turn 0" for the first
-        # plain-conversation turn of a session even though a real turn had
-        # completed. messages is already available here at the exact point
-        # each turn is captured, so counting user/assistant pairs directly
-        # needs no new persistent counter and can't drift out of sync with
-        # what actually happened. This value flows unchanged into both
-        # _write_async's log line and _write_sync's filename/JSONL record —
-        # both read payload["turn"] rather than recomputing it, so fixing it
-        # here is the single point of correction for every place "turn N" is
-        # shown or persisted.
-        #
-        # The formula is also correct on the served-from-cache path, where
-        # messages arrives WITHOUT the injected system message: the sequence
-        # always ends in a user message, so it has 2N-1 entries without the
-        # system and 2N with it, and (len + 1) // 2 yields N in both cases.
-        turn = turn_override if turn_override is not None else (len(messages) + 1) // 2
-
-        # ── Get persistent state via ConversationStateManager ───────────────
-        try:
-            state = self._f._conversation_state_manager.get(project_id)
-            n_active_blocks = len(state.active_blocks)
-        except Exception:
-            n_active_blocks = 0
-
-        try:
-            n_symbols = len(self._f._symbol_index.get_all_names(project_id))
-        except Exception:
-            n_symbols = 0
-
-        # ── Class membership metrics ────────────────────────────────────────
-        try:
-            all_names = self._f._symbol_index.get_all_names(project_id)
-            n_with_parent = sum(
-                1
-                for n in all_names
-                if self._f._symbol_index.get_parent_symbol(n, project_id)
-            )
-            n_classes = len(self._f._symbol_index.get_classes(project_id))
-        except Exception:
-            n_with_parent, n_classes = 0, 0
-
-        # ── WindowManager metrics (now persistent in ConversationState) ────
-        try:
-            state = self._f._conversation_state_manager.get(project_id)
-            wm_fired = state.wm_fired
-            wm_msgs_evicted = state.wm_msgs_evicted
-            wm_turns_evicted = state.wm_turns_evicted
-            wm_summary_ok = state.wm_summary_ok
-            wm_emergency_cap = state.wm_emergency_cap
-            wm_batch_too_small = state.wm_batch_too_small
-            wm_no_slot = state.wm_no_slot
-            wm_degradation_guard = state.wm_degradation_guard
-            frontier_hwm = state.summarized_turn_hwm
-            summaries = state.conversation_summaries
-            n_summaries_l1 = sum(1 for s in summaries if s.get("level", 1) == 1)
-            n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
-        except Exception:
-            wm_fired = wm_summary_ok = wm_emergency_cap = False
-            wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
-            wm_msgs_evicted = wm_turns_evicted = 0
-            frontier_hwm = n_summaries_l1 = n_summaries_l2 = 0
-
-        now = time.time()
-        return {
-            # ── Existing fields ──────────────────────────────────────────────
-            "project_id": project_id,
-            "turn": turn,
-            "timestamp": now,
-            "iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "static_block": static_block or "",
-            "hub_tier_text": hub_tier_text,
-            "dynamic_block": dynamic_block or "",
-            "final_system": final_system or "",
-            "messages": msg_copy,
-            "block_a_hash": block_a_hash,
-            # ── M7: rebuild reason ─────────────────────────────────────────────
-            "block_a_rebuild_reason": pstate.get("block_a_rebuild_reason"),
-            "code_state_hash": code_state_hash,
-            "slot_saved_hash": slot_hash,
-            "n_active_blocks": n_active_blocks,
-            "n_symbols": n_symbols,
-            "n_symbols_with_parent": n_with_parent,
-            "n_classes": n_classes,
-            # ── Dump kind marker ────────────────────────────────────────────
-            # Declares which pipeline path produced this snapshot so that
-            # empty Block A/B token counts are self-explanatory in the
-            # evolution series (expected for non-"full" kinds, a regression
-            # signal only for "full").
-            "dump_kind": dump_kind,
-            # ── WindowManager metrics ──────────────────────────────────────
-            "wm_fired": wm_fired,
-            "wm_msgs_evicted": wm_msgs_evicted,
-            "wm_turns_evicted": wm_turns_evicted,
-            "wm_summary_ok": wm_summary_ok,
-            "wm_emergency_cap": wm_emergency_cap,
-            "wm_batch_too_small": wm_batch_too_small,
-            "wm_no_slot": wm_no_slot,
-            "wm_degradation_guard": wm_degradation_guard,
-            # ── HWM and summaries ───────────────────────────────────────────
-            "frontier_hwm": frontier_hwm,
-            "n_summaries_l1": n_summaries_l1,
-            "n_summaries_l2": n_summaries_l2,
-        }
+        # nor
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Writing (async + sync)
@@ -29621,6 +29685,34 @@ class ContextDumper:
         lines.append(f"- Block A prefix hash: `{payload['block_a_hash'] or 'N/A'}`")
         lines.append(f"- code_state_hash:     `{payload['code_state_hash'] or 'N/A'}`")
         lines.append(f"- slot saved hash:     `{payload['slot_saved_hash'] or 'N/A'}`")
+
+        # ── Block A freeze state ────────────────────────────────────────────
+        # Made explicit so a frozen turn reads as intentional. When active, the
+        # prefix hash above is the frozen hash; the current structure hash below
+        # is what the live code would produce, and their divergence is the
+        # staleness the freeze is deliberately holding to keep the KV prefix
+        # stable across edits.
+        _freeze_active = payload.get("block_a_freeze_active", False)
+        if _freeze_active:
+            _limit = payload.get("block_a_freeze_turns_limit", 0)
+            _used = payload.get("block_a_freeze_edits_used", 0)
+            _frozen = payload.get("block_a_frozen_structure_hash") or "N/A"
+            _current = payload.get("block_a_current_structure_hash") or "N/A"
+            _cap_turn = payload.get("block_a_freeze_capture_turn", 0)
+            _stale = _frozen != _current and _current != "N/A"
+            lines.append(
+                f"- Block A freeze: **ACTIVE** "
+                f"({_used}/{_limit} counted edits used, "
+                f"captured at turn {_cap_turn})"
+            )
+            lines.append(f"  - frozen structure hash:  `{_frozen}`")
+            lines.append(
+                f"  - current structure hash: `{_current}`"
+                + ("  ⚠️ **map is stale**" if _stale else "  (in sync)")
+            )
+        else:
+            lines.append("- Block A freeze: inactive")
+
         lines.append(f"- active blocks: {payload['n_active_blocks']}")
         lines.append(f"- indexed symbols: {payload['n_symbols']}")
         lines.append(
@@ -29659,6 +29751,13 @@ class ContextDumper:
 
         lines.append("")
         lines.append("## Block A — static (KV-cache prefix)")
+        if _freeze_active:
+            lines.append(
+                "_⚠️ Block A is FROZEN this turn (KV-cache stability window). "
+                "The map below reflects the code as of the capture turn and may "
+                "not match the current structure hash in the metadata above. "
+                "This is deliberate — see the staleness header inside the block._"
+            )
         lines.append("```text")
         lines.append(payload["static_block"] or "(empty)")
         lines.append("```")
@@ -30443,6 +30542,12 @@ class ProjectStateManager:
             "summarize_inactive_in_progress": False,
             "force_compressed_keys": [],
             "block_a_rebuild_reason": None,
+            # -- Block A freeze (KV prefix stability across edits) --------
+            "block_a_freeze_active": False,
+            "block_a_frozen_structure_hash": None,
+            "block_a_freeze_edits_used": 0,
+            "block_a_freeze_capture_turn": 0,
+            "block_a_last_turn_structure_hash": None,
         }
 
     def get_pstate(self, project_id: str) -> dict:
@@ -32860,8 +32965,8 @@ class Filter:
             description="Minimum ratio of free tokens to enable expanded_hubs mode.",
         )
         call_graph_context_mode: str = Field(
-            default="auto",
-            description="'auto', 'hubs_only', 'expanded_hubs', or 'full_graph'.",
+            default="full_graph",
+            description="'auto', 'hubs_only', 'expanded_hubs', or 'full_graph'. Be aware 'auto' is calculated every turn, and it will invalidate kvcache.",
         )
         call_graph_auto_full_graph_symbol_ceiling: int = Field(
             default=300,
@@ -33876,6 +33981,56 @@ class Filter:
                 "HTTP session times out (llm_per_call_timeout, default 900s)."
             ),
         )
+        # ── 12.1b Block A freeze (KV prefix stability across edits) ──────────
+        block_a_freeze_turns: int = Field(
+            default=10,
+            ge=0,
+            description=(
+                "Freeze Block A (and its slot hash) for up to N counted changes, "
+                "so structural edits do not each trigger a full KV prefill. "
+                "During the window the same slot file is reused and Block A "
+                "serves its cached text with a staleness header. The window "
+                "breaks and re-captures on the Nth counted change (paying one "
+                "prefill then). What counts as a change is governed by "
+                "block_a_freeze_count_all_changes. 0 = feature disabled (every "
+                "structural change invalidates Block A immediately, as before)."
+            ),
+        )
+        block_a_freeze_count_all_changes: bool = Field(
+            default=False,
+            description=(
+                "When True, every turn that would rebuild Block A counts toward "
+                "block_a_freeze_turns. When False (default), only structural "
+                "edits count — turns where the symbol signature snapshot changed "
+                "(dirty_qids non-empty). False keeps the freeze effectively "
+                "infinite during pure Q&A (nothing changed, prefix was stable "
+                "anyway) and only spends the budget on real edits, minimizing "
+                "how stale the frozen map can get per counted step."
+            ),
+        )
+        block_a_freeze_max_drift: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "When > 0, the freeze also breaks early if the fraction of "
+                "dirty symbols (dirty_qids / total) exceeds this ratio on a "
+                "counted change, even before block_a_freeze_turns is reached — "
+                "a safety valve so a single large refactor mid-window does not "
+                "keep serving a badly-stale map. 0 = disabled (only the turn "
+                "count governs breakage)."
+            ),
+        )
+        block_a_freeze_break_on_ingestion: bool = Field(
+            default=True,
+            description=(
+                "When True (default), silent ingestion of a code paste breaks "
+                "the freeze and re-captures, since a large paste changes the "
+                "structure wholesale and freezing a map of just-replaced code "
+                "would be maximally misleading. When False, ingestion leaves the "
+                "current freeze window untouched."
+            ),
+        )
 
         # ── 12.2 Volatility‑tiered context ───────────────────────────────────
         enable_skeleton_tier: bool = Field(
@@ -34074,7 +34229,7 @@ class Filter:
 
         # ── 15.2 Lazy tasks (inlet) ───────────────────────────────────────────
         enable_lazy_docstrings: bool = Field(
-            default=True,
+            default=False,
             description="Enable lazy generation of docstrings in inlet.",
         )
         enable_lazy_prefetch: bool = Field(
@@ -35032,6 +35187,15 @@ class Filter:
                             await self._activation.rebuild_path_index(project_id)
 
                         # -- invalidate and rebuild Block A eagerly ----------------
+                        if self.valves.block_a_freeze_break_on_ingestion:
+                            _pstate_freeze = psm.get_pstate(project_id)
+                            _pstate_freeze["block_a_freeze_active"] = False
+                            _pstate_freeze["block_a_frozen_structure_hash"] = None
+                            _pstate_freeze["block_a_freeze_edits_used"] = 0
+                            self._log_debug(
+                                "Block A freeze: broken by silent ingestion "
+                                "(structure changed wholesale)"
+                            )
                         await self._ctx_builder.invalidate_block_a_cache(
                             project_id, "new chunk ingested", recompute_centrality=True
                         )
@@ -35161,6 +35325,14 @@ class Filter:
             psm.set_last_user_query(project_id, user_query)
 
             await self._task_registry.run_lazy_tasks(project_id, pstate)
+
+            # 🚀 RESOURCE OPTIMISATION
+            #   Evaluate Block A freeze BEFORE mode resolution and assembly, so
+            #   the frozen structure hash is pinned before slot save/restore and
+            #   build_block_a consult it. With call_graph_context_mode fixed
+            #   (not 'auto'), the mode is already constant; the freeze governs
+            #   only the structure hash.
+            await self._ctx_builder._evaluate_block_a_freeze(project_id)
 
             await self._ctx_builder.prepare_call_graph_mode(
                 project_id, user_query, intent_vector
