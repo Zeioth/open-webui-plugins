@@ -546,8 +546,17 @@ def _build_request(
     stop: Optional[List[str]],
     top_p: Optional[float],
     extra_body: Optional[Dict[str, Any]],
+    stream: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Build the (url, payload) for the resolved backend."""
+    """
+    Build the (url, payload) for the resolved backend.
+
+    When stream is True the payload requests incremental token delivery
+    (SSE for openai/llamacpp, newline-delimited JSON for ollama). Streaming
+    is what makes client-side cancellation effective: the server only notices
+    a dropped connection when it next writes a token, so a non-streaming
+    request runs to completion server-side regardless of what the client does.
+    """
     if backend == "ollama":
         url = f"{base_url_clean}/api/generate"
         options: Dict[str, Any] = {"temperature": temperature}
@@ -559,19 +568,15 @@ def _build_request(
             options["top_p"] = top_p
         if stop:
             options["stop"] = stop
-        # Ollama 0.7.0+: disable chain-of-thought when not needed.
         if not enable_thinking:
             options["think"] = False
         payload: Dict[str, Any] = {
             "model": model_str,
             "prompt": prompt,
             "system": system,
-            "stream": False,
+            "stream": stream,
             "options": options,
         }
-        # Ollama supports structured output via `format` rather than
-        # `response_format`. Translate the common OpenAI shapes instead of
-        # silently dropping the constraint.
         if isinstance(response_format, dict):
             rf_type = response_format.get("type")
             if rf_type == "json_object":
@@ -582,7 +587,6 @@ def _build_request(
                     payload["format"] = schema
 
     else:
-        # openai-compatible path, shared by the "openai" and "llamacpp" backends.
         if endpoint_type == "completion":
             url = f"{base_url_clean}/v1/completions"
             payload = {
@@ -610,16 +614,11 @@ def _build_request(
             payload["stop"] = stop
         if response_format is not None:
             payload["response_format"] = response_format
-        # `thinking` / `chat_template_kwargs` are llama.cpp-specific. Only send
-        # them when the backend is *known* to be llama.cpp — a real OpenAI
-        # endpoint may reject unknown fields with HTTP 400. For a prefix-less
-        # llama.cpp server, pass backend="llamacpp" to re-enable this.
         if not enable_thinking and backend == "llamacpp":
             payload["thinking"] = False
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["stream"] = stream
 
-    # Caller-supplied overrides win. For Ollama, a nested "options" dict is
-    # merged into options rather than replacing the whole sub-dict.
     if extra_body:
         for k, v in extra_body.items():
             if k == "options" and isinstance(v, dict) and isinstance(payload.get("options"), dict):
@@ -678,6 +677,94 @@ def _parse_response(
     return content, finish_reason, prompt_tokens, completion_tokens
 
 
+async def _consume_stream(
+    resp: aiohttp.ClientResponse,
+    *,
+    backend: str,
+    endpoint_type: str,
+) -> Tuple[str, Optional[str], Optional[int], Optional[int]]:
+    """
+    Consume a streaming LLM response line by line, accumulating content.
+
+    Reading token by token (instead of awaiting the whole body) is precisely
+    what makes cancellation work: llama.cpp only checks whether the client is
+    still connected when it next tries to write a token, so a non-streaming
+    request generates to completion no matter what the client does. Under
+    streaming, closing the socket between tokens lets the server observe the
+    disconnect and abort the in-flight generation within roughly one token.
+
+    Handles both wire formats:
+        - openai / llamacpp: Server-Sent Events, one JSON object per `data:`
+          line, terminated by `data: [DONE]`.
+        - ollama: newline-delimited JSON, one object per line, final object
+          carrying `done: true`.
+
+    Returns:
+        (content, finish_reason, prompt_tokens, completion_tokens). Token
+        counts are None when the server does not report usage in the stream.
+
+    Raises:
+        LLMEmptyResponseError: the stream closed without any content.
+    """
+    chunks: List[str] = []
+    finish_reason: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+
+    async for raw_line in resp.content:
+        line = raw_line.decode("utf-8", "ignore").strip()
+        if not line:
+            continue
+
+        # ── Step 1: unwrap the SSE envelope for openai / llamacpp ──
+        if backend != "ollama":
+            if not line.startswith("data:"):
+                continue
+            line = line[len("data:"):].strip()
+            if line == "[DONE]":
+                break
+
+        # ── Step 2: parse one event; skip anything unparseable ──
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        # ── Step 3: accumulate the incremental content + bookkeeping ──
+        if backend == "ollama":
+            chunks.append(event.get("response", "") or "")
+            if event.get("done"):
+                finish_reason = event.get("done_reason") or finish_reason
+                prompt_tokens = event.get("prompt_eval_count", prompt_tokens)
+                completion_tokens = event.get("eval_count", completion_tokens)
+                break
+        else:
+            choices = event.get("choices") or []
+            if choices:
+                choice0 = choices[0] or {}
+                if endpoint_type == "completion":
+                    chunks.append(choice0.get("text", "") or "")
+                else:
+                    delta = choice0.get("delta") or {}
+                    piece = delta.get("content", "")
+                    if piece:
+                        chunks.append(piece)
+                    else:
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            chunks.append(reasoning)
+                if choice0.get("finish_reason"):
+                    finish_reason = choice0["finish_reason"]
+            usage = event.get("usage") or {}
+            if usage:
+                prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                completion_tokens = usage.get("completion_tokens", completion_tokens)
+
+    content = "".join(chunks)
+    if not content:
+        raise LLMEmptyResponseError("Empty content")
+    return content, finish_reason, prompt_tokens, completion_tokens
+
 # 3.2.4 ── Public entry point ────────────────────────────────────────────────
 # NOTE: get_model_backend / get_model_name are defined elsewhere in this same module.
 async def call_llm(
@@ -708,6 +795,9 @@ async def call_llm(
     return_meta: bool = False,
     log_raw_response: bool = False,
     label: str = "",
+    # --- new: streaming + stall detection ---
+    stream: bool = True,
+    sock_read: Optional[int] = None,
 ) -> Union[str, LLMResult]:
     """
     Async LLM call with retries, typed errors, and optional response metadata.
@@ -721,6 +811,16 @@ async def call_llm(
     Backward compatible: by default returns the response text as a stripped
     str, and every error subclasses RuntimeError. Pass return_meta=True to get
     an LLMResult with token counts, finish_reason, latency and resolved backend.
+
+    Streaming (stream=True, the default) is what makes client-side cancellation
+    effective. A non-streaming request awaits the whole body: llama.cpp only
+    checks whether the client is still connected when it next writes a token, so
+    with nothing to write until the end it generates to completion server-side
+    regardless of what the client does — which is exactly how a cancelled or
+    abandoned call left an orphaned generation holding the single --parallel 1
+    slot. Under streaming, the body is consumed token by token, so closing the
+    socket mid-stream lets the server observe the disconnect and abort the
+    in-flight generation within roughly one token.
 
     Args:
         prompt: The user prompt.
@@ -774,16 +874,17 @@ async def call_llm(
                           each line prefixed [RAW][label]. Payloads are
                           redacted for credential-like keys. Opt-in; do not
                           leave on for high-frequency callers.
-
-                          Three lines are emitted per call:
-                            [RAW][label] → <url>\npayload: <json>   (before send)
-                            [RAW][label] ← HTTP 200\n<response_json> (on success)
-                            [RAW][label] ← HTTP <N>\n<error_body>    (on error)
-
-                          Isolate one caller's output with:
-                            docker logs open-webui 2>&1 | grep "\[RAW\]\[my_label\]"
         label: Identifier used only in log prefixes. Always set it when
                log_raw_response=True so the [RAW][label] prefix is meaningful.
+        stream: Request incremental token delivery and consume the response as
+                it arrives. Default True. This is the property that makes
+                cancellation actually free the server-side slot; set False only
+                for a backend that cannot stream.
+        sock_read: Per-socket read timeout in seconds. Fires when the server
+                   stops emitting tokens mid-stream, turning an indefinite
+                   server-side stall (GPU idle, no tokens, forever) into a
+                   bounded, retryable timeout. None means "use `timeout`", i.e.
+                   no finer-grained stall detection than the overall cap.
 
     Returns:
         str (default) or LLMResult (when return_meta=True). Content is stripped.
@@ -844,6 +945,7 @@ async def call_llm(
         stop=stop,
         top_p=top_p,
         extra_body=extra_body,
+        stream=stream,
     )
 
     start = time.monotonic()
@@ -862,23 +964,59 @@ async def call_llm(
                     f"payload: {json.dumps(_redact(payload), ensure_ascii=False, indent=2)}"
                 )
 
-            async with session.post(url, json=payload, headers=headers) as resp:
+            # ── Per-request timeout ──
+            # `total` bounds the whole call; `sock_read` fires when the server
+            # stops emitting tokens mid-stream. That converts an indefinite
+            # server-side stall (GPU idle, no tokens, forever) into a bounded,
+            # retryable timeout instead of a permanent hang — the amplifier
+            # behind the multi-minute and 44-minute blocks. When sock_read is
+            # None it falls back to `total`, i.e. no finer-grained detection.
+            req_timeout = aiohttp.ClientTimeout(
+                total=timeout,
+                sock_read=(sock_read if sock_read is not None else timeout),
+            )
+
+            async with session.post(
+                url, json=payload, headers=headers, timeout=req_timeout
+            ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     if log_raw_response:
-                        _logger.info(f"[RAW][{label}] ← HTTP {resp.status}\n{text[:2000]}")
+                        _logger.info(
+                            f"[RAW][{label}] ← HTTP {resp.status}\n{text[:2000]}"
+                        )
                     raise LLMHTTPError(resp.status, text)
-                data = await resp.json()
+
+                # ── Read the body, streaming or whole ──
+                # On cancel or a mid-stream stall, force the socket shut so the
+                # server observes the disconnect and aborts the in-flight
+                # generation. close() (not release()) is what sends the RST/FIN:
+                # release() would return the connection to the pool while the
+                # slot keeps generating to completion — the exact behaviour that
+                # left orphaned generations blocking the single --parallel 1
+                # slot.
+                try:
+                    if stream:
+                        content, finish_reason, ptok, ctok = await _consume_stream(
+                            resp,
+                            backend=resolved_backend,
+                            endpoint_type=endpoint_type,
+                        )
+                    else:
+                        data = await resp.json()
+                        content, finish_reason, ptok, ctok = _parse_response(
+                            backend=resolved_backend,
+                            endpoint_type=endpoint_type,
+                            data=data,
+                        )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    resp.close()
+                    raise
 
             if log_raw_response:
                 _logger.info(
-                    f"[RAW][{label}] ← HTTP 200\n"
-                    f"{json.dumps(data, ensure_ascii=False, indent=2)[:4000]}"
+                    f"[RAW][{label}] ← HTTP 200 (stream={stream}) ~{len(content)} chars"
                 )
-
-            content, finish_reason, ptok, ctok = _parse_response(
-                backend=resolved_backend, endpoint_type=endpoint_type, data=data
-            )
 
             truncated = (finish_reason or "") in _TRUNCATION_REASONS
             if truncated:
@@ -916,7 +1054,9 @@ async def call_llm(
             # Non-retryable (4xx except 429, config errors): re-raise the actual
             # typed exception so callers keep `.status` etc. — no string parsing.
             if not _is_retryable(exc, retry_on_empty):
-                _logger.warning("LLM call failed (non-retryable, label=%s): %s", tag, exc)
+                _logger.warning(
+                    "LLM call failed (non-retryable, label=%s): %s", tag, exc
+                )
                 raise
 
             # Last attempt — re-raise the original typed exception, preserving
