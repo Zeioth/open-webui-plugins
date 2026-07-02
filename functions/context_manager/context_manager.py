@@ -15507,7 +15507,7 @@ class CommandRouter:
             f"🔒 Block A frozen for {limit} structural edit(s) (until /unfreeze "
             f"or the budget is spent). The map is pinned at its current state."
         )
-    
+
     async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
         """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
         if (
@@ -33900,7 +33900,7 @@ class Filter:
             ),
         )
         block_a_freeze_break_on_ingestion: bool = Field(
-            default=True,
+            default=False,  # Recommended true, but false can improve turn 1 cache hits when working with the same code.
             description=(
                 "When True (default), silent ingestion of a code paste breaks "
                 "the freeze and re-captures, since a large paste changes the "
@@ -34035,7 +34035,7 @@ class Filter:
                 "ignored and fall through as ordinary messages."
             ),
         )
-        
+
         # ── 13.2 Proactive suggestions ────────────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
