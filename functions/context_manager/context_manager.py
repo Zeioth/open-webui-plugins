@@ -14513,11 +14513,27 @@ class CommandRouter:
         Detect natural-language intents (forget, remember, obsolete) using a cascade.
 
         Cascade:
-        1. Heuristic reinforcement: code indicators boost relevance of code-related actions.
-        2. CrossEncoder (fast) scores candidate actions.
-        3. If confident (diff >= CE_THRESHOLD), use the highest-scoring action.
-        4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        5. Middle zone: default to "none" (conservative, no action).
+        1. Heuristic reinforcement: code-artifact wording nudges CrossEncoder
+           scores toward the "_last" actions. This is advisory only — it never
+           decides by itself, it only shifts which candidate the CrossEncoder
+           ends up favoring.
+        2. CrossEncoder (fast) scores every candidate action.
+        3. If confident (diff >= CE_THRESHOLD), the CrossEncoder's top score
+           decides.
+        4. If extremely uncertain (diff < LLM_THRESHOLD), fall through to the
+           LLM, which sees the CrossEncoder's own scores as context.
+        5. Middle zone (neither confident nor uncertain enough for either of
+           the above): default to "none".
+
+        The standalone heuristic parser is deliberately never used as a
+        decision-maker in this cascade — not in the middle zone, and not when
+        the CrossEncoder is unavailable. Bare keyword matching is a strictly
+        weaker signal than a CrossEncoder score that had every chance to decide
+        or escalate to the LLM, and letting it decide on its own is exactly how
+        an ordinary question ("cual es el proposito de build_block_b?") gets
+        misclassified as a memory-management command. The heuristic survives
+        only as a last-resort fallback inside _parse_all_intents_with_llm, for
+        when the LLM itself fails to return parseable output.
 
         Restores KV slot after any LLM call.
         """
@@ -14608,15 +14624,35 @@ class CommandRouter:
 
         none = {"action": "none"}
         if scores is None:
-            return await self._parse_all_intents_heuristic(prose)
+            # The CrossEncoder is unavailable (model not loaded, or the auxiliary
+            # server is down). Rather than fall back to the standalone heuristic
+            # — whose bare keyword matching is exactly the false-positive vector
+            # this cascade exists to avoid — default to no action. The heuristic
+            # is not a substitute decision-maker; without a CrossEncoder score to
+            # reinforce or hand to the LLM, the conservative choice is to do
+            # nothing and let the message reach the model normally.
+            self._f._log_debug(
+                "_parse_all_intents: CrossEncoder unavailable, defaulting to no action"
+            )
+            return {"forget": none, "remember": none, "obsolete": none}
 
         scores_reinforced = list(scores)
         h_weight = self._f.valves.heuristic_reinforcement_weight
         content_lower = prose.lower()
 
+        # ── Step: heuristic reinforcement for code-referencing phrasing ──
+        # Boosts "_last" actions when the message names a code artifact
+        # ("this block", "ese archivo"), which correlates with genuine
+        # forget/pin/obsolete requests. This only nudges the CrossEncoder's
+        # own scores — it never decides on its own. Matched on word
+        # boundaries: a substring check here would fire on any identifier
+        # that happens to contain one of these words (e.g. "block" inside
+        # "build_block_b"), misclassifying an ordinary question about that
+        # symbol as a memory-management command.
+        _REINFORCEMENT_KEYWORDS = ("code", "block", "file", "hash", "func", "class")
         if any(
-            kw in content_lower
-            for kw in ("code", "block", "file", "hash", "func", "class")
+            re.search(rf"\b{re.escape(kw)}\b", content_lower)
+            for kw in _REINFORCEMENT_KEYWORDS
         ):
             for i, (category, _, action) in enumerate(candidates):
                 if action["action"] in (
@@ -14664,7 +14700,16 @@ class CommandRouter:
                 query, candidates, scores_reinforced, project_id
             )
 
-        return await self._parse_all_intents_heuristic(prose)
+        # ── Middle zone: neither confident nor uncertain enough ──
+        # A deliberate no-op. Using the standalone heuristic here would let
+        # bare keyword matching override a CrossEncoder score that landed
+        # close-but-not-quite, which is a strictly weaker signal.
+        self._f._log_debug(
+            f"_parse_all_intents: CE diff={diff:.2f} in middle zone "
+            f"(neither >= {CE_CONFIDENCE_THRESHOLD:.2f} nor < {LLM_FALLBACK_THRESHOLD:.2f}), "
+            "defaulting to no action"
+        )
+        return {"forget": none, "remember": none, "obsolete": none}
 
     async def _parse_all_intents_with_llm(
         self,
@@ -14784,30 +14829,41 @@ class CommandRouter:
             return await self._parse_all_intents_heuristic(query)
 
     async def _parse_all_intents_heuristic(self, prose: str) -> Dict[str, Any]:
-        """Heuristic fallback for natural language intent detection."""
+        """
+        Last-resort keyword fallback for natural language intent detection.
+
+        Used only when the CrossEncoder is entirely unavailable (no model
+        loaded) or when the LLM fallback fails to parse — never as part of
+        the normal confident/uncertain cascade in _parse_all_intents, where
+        a bare keyword match would be a weaker signal than a CrossEncoder
+        score that already had every chance to decide or escalate to the LLM.
+
+        Keywords are matched on word boundaries so that a memory-management
+        term embedded inside an unrelated word or identifier (e.g. "pin"
+        inside "opinión", "block" inside a symbol like "build_block_b")
+        cannot trigger a false positive.
+        """
         none = {"action": "none"}
         result = {"forget": none, "remember": none, "obsolete": none}
         content_lower = prose.lower()
 
-        if any(
-            kw in content_lower
-            for kw in ("forget", "olvida", "olvid", "remove", "borra", "quita")
-        ):
+        def _has_keyword(keywords: Tuple[str, ...]) -> bool:
+            return any(
+                re.search(rf"\b{re.escape(kw)}\b", content_lower) for kw in keywords
+            )
+
+        if _has_keyword(("forget", "olvida", "olvid", "remove", "borra", "quita")):
             if "all" in content_lower or "todo" in content_lower:
                 result["forget"] = {"action": "forget_all"}
             else:
                 result["forget"] = {"action": "forget_last"}
-        elif any(
-            kw in content_lower
-            for kw in ("pin", "fija", "remember", "recuerda", "keep", "mantén")
-        ):
+        elif _has_keyword(("pin", "fija", "remember", "recuerda", "keep", "mantén")):
             if "all" in content_lower or "todo" in content_lower:
                 result["remember"] = {"action": "pin_all"}
             else:
                 result["remember"] = {"action": "pin_last"}
-        elif any(
-            kw in content_lower
-            for kw in (
+        elif _has_keyword(
+            (
                 "obsolete",
                 "obsoleto",
                 "deprecated",
@@ -34834,6 +34890,16 @@ class Filter:
             )
             _inlet_timing("Step 3/6: Handle explicit commands", step_start)
             if handled:
+                # Re-stub any user message OpenWebUI resent in raw form (e.g. the
+                # original silent-ingestion paste): handled turns never reach
+                # MessageAssembler, so this is the only re-stubbing point on this
+                # path. Without it, a handled turn echoes the raw paste back into
+                # body["messages"], which OpenWebUI then resends on the next turn.
+                handled_messages = (
+                    self._history_compressor.ensure_compressed_user_messages(
+                        handled_messages, state, project_id
+                    )
+                )
                 body["messages"] = handled_messages
                 # `messages` is passed as the original, pre-handling list so the
                 # snapshot is numbered by the true conversation turn: the handler
@@ -34862,6 +34928,12 @@ class Filter:
             )
             _inlet_timing("Step 4/6: Handle natural language intents", step_start)
             if handled:
+                # Same re-stub as the explicit-command branch above.
+                handled_messages = (
+                    self._history_compressor.ensure_compressed_user_messages(
+                        handled_messages, state, project_id
+                    )
+                )
                 body["messages"] = handled_messages
                 # Original `messages` drives the turn number; see the explicit-
                 # command branch above for why handled_messages cannot.
