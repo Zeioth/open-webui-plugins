@@ -34192,7 +34192,7 @@ class Filter:
                 "Maximum number of background tasks that can run concurrently (per manager). "
                 "The specified amount of bg tasks will spawn at the same time, by priority order."
             ),
-        )        
+        )
         bg_task_stop_timeout: float = Field(
             default=2.0,
             ge=1.0,
@@ -35225,7 +35225,7 @@ class Filter:
             #   build_block_a consult it. With call_graph_context_mode fixed
             #   (not 'auto'), the mode is already constant; the freeze governs
             #   only the structure hash.
-            await self._ctx_builder._evaluate_block_a_freeze(project_id)
+            self._ctx_builder._evaluate_block_a_freeze(project_id)
 
             await self._ctx_builder.prepare_call_graph_mode(
                 project_id, user_query, intent_vector
