@@ -29384,27 +29384,9 @@ class ContextDumper:
         hub_tier_text = pstate.get("hub_tier_text", "") or ""
 
         # ── Turn number for the dump label ───────────────────────────────────
-        # Derived from len(messages) rather than ConversationState.message_count.
-        # message_count only advances when a turn contains indexable code (see
-        # ActiveCodeUpdater._post_update_tasks) — a purely conversational turn
-        # never touches it, which made this label read "turn 0" for the first
-        # plain-conversation turn of a session even though a real turn had
-        # completed. messages is already available here at the exact point
-        # each turn is captured, so counting user/assistant pairs directly
-        # needs no new persistent counter and can't drift out of sync with
-        # what actually happened. This value flows unchanged into both
-        # _write_async's log line and _write_sync's filename/JSONL record —
-        # both read payload["turn"] rather than recomputing it, so fixing it
-        # here is the single point of correction for every place "turn N" is
-        # shown or persisted.
-        #
-        # The formula is also correct on the served-from-cache path, where
-        # messages arrives WITHOUT the injected system message: the sequence
-        # always ends in a user message, so it has 2N-1 entries without the
-        # system and 2N with it, and (len + 1) // 2 yields N in both cases.
         turn = turn_override if turn_override is not None else (len(messages) + 1) // 2
 
-        # ── Get persistent state via ConversationStateManager ───────────────
+        # ── Persistent state metrics ─────────────────────────────────────────
         try:
             state = self._f._conversation_state_manager.get(project_id)
             n_active_blocks = len(state.active_blocks)
@@ -29416,7 +29398,6 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
-        # ── Class membership metrics ────────────────────────────────────────
         try:
             all_names = self._f._symbol_index.get_all_names(project_id)
             n_with_parent = sum(
@@ -29428,7 +29409,7 @@ class ContextDumper:
         except Exception:
             n_with_parent, n_classes = 0, 0
 
-        # ── WindowManager metrics (now persistent in ConversationState) ────
+        # ── WindowManager metrics (persistent in ConversationState) ──────────
         try:
             state = self._f._conversation_state_manager.get(project_id)
             wm_fired = state.wm_fired
@@ -29451,7 +29432,6 @@ class ContextDumper:
 
         now = time.time()
         return {
-            # ── Existing fields ──────────────────────────────────────────────
             "project_id": project_id,
             "turn": turn,
             "timestamp": now,
@@ -29464,7 +29444,6 @@ class ContextDumper:
             "final_system": final_system or "",
             "messages": msg_copy,
             "block_a_hash": block_a_hash,
-            # ── M7: rebuild reason ─────────────────────────────────────────────
             "block_a_rebuild_reason": pstate.get("block_a_rebuild_reason"),
             "code_state_hash": code_state_hash,
             "slot_saved_hash": slot_hash,
@@ -29472,20 +29451,13 @@ class ContextDumper:
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
-            # ── Block A freeze state ────────────────────────────────────────
             "block_a_freeze_active": freeze_active,
             "block_a_frozen_structure_hash": freeze_frozen_hash,
             "block_a_current_structure_hash": current_structure_hash,
             "block_a_freeze_edits_used": freeze_edits_used,
             "block_a_freeze_turns_limit": freeze_turns_limit,
             "block_a_freeze_capture_turn": freeze_capture_turn,
-            # ── Dump kind marker ────────────────────────────────────────────
-            # Declares which pipeline path produced this snapshot so that
-            # empty Block A/B token counts are self-explanatory in the
-            # evolution series (expected for non-"full" kinds, a regression
-            # signal only for "full").
             "dump_kind": dump_kind,
-            # ── WindowManager metrics ──────────────────────────────────────
             "wm_fired": wm_fired,
             "wm_msgs_evicted": wm_msgs_evicted,
             "wm_turns_evicted": wm_turns_evicted,
@@ -29494,7 +29466,6 @@ class ContextDumper:
             "wm_batch_too_small": wm_batch_too_small,
             "wm_no_slot": wm_no_slot,
             "wm_degradation_guard": wm_degradation_guard,
-            # ── HWM and summaries ───────────────────────────────────────────
             "frontier_hwm": frontier_hwm,
             "n_summaries_l1": n_summaries_l1,
             "n_summaries_l2": n_summaries_l2,
