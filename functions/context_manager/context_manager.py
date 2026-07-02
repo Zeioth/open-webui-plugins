@@ -15049,7 +15049,7 @@ class CommandRouter:
         last_user_msg: Optional[dict],
         __user__: Optional[dict],
     ) -> Tuple[bool, Optional[list]]:
-        """Handle /forget, /status, /clean, /expand.
+        """Handle /forget, /status, /clean, /expand, /freeze, /unfreeze.
         Returns (handled, messages) if a command was processed, else (False, None).
         """
         if not last_user_msg:
@@ -15103,6 +15103,19 @@ class CommandRouter:
 
         if content.startswith("/expand"):
             response = await self._handle_expand_command(content, project_id)
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+
+        # /freeze [N] and /unfreeze: manual control of the Block A KV freeze.
+        # Gated behind enable_freeze_command; when disabled, these fall through
+        # untouched and reach the model as ordinary text. The startswith checks
+        # are ordered so that "/unfreeze" is matched by its own prefix and never
+        # mistaken for a "/freeze" argument.
+        if self._f.valves.enable_freeze_command and (
+            content.startswith("/unfreeze") or content.startswith("/freeze")
+        ):
+            response = await self._handle_freeze_command(content, project_id)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
             return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
@@ -15417,6 +15430,84 @@ class CommandRouter:
         """Delegate to ActivationEngine — single source of truth for inactive block detection."""
         return self._f._activation.get_inactive_block_candidates(project_id)
 
+    async def _handle_freeze_command(self, content: str, project_id: str) -> str:
+        """
+        Handle /freeze [N] and /unfreeze: manual control of the Block A freeze.
+
+        /freeze          → freeze using the valve's block_a_freeze_turns as the
+                           manual edit budget.
+        /freeze N        → freeze for N counted structural edits.
+        /freeze 0        → freeze indefinitely, until /unfreeze.
+        /unfreeze        → clear the freeze immediately; the next turn rebuilds
+                           Block A fresh and likely pays one prefill.
+
+        A manual freeze outranks the automatic policy and even a disabled
+        feature valve (block_a_freeze_turns == 0), because it is an explicit
+        user instruction. Manipulates the same freeze state that
+        _evaluate_block_a_freeze reads, then invalidates the Block A cache so
+        the change takes effect from the very next build.
+        """
+        psm = self._f._project_state_manager
+        pstate = psm.get_pstate(project_id)
+        stripped = content.strip()
+
+        # ── /unfreeze ──
+        if stripped.startswith("/unfreeze"):
+            was_active = pstate.get("block_a_freeze_active", False)
+            pstate["block_a_freeze_manual"] = False
+            pstate["block_a_freeze_manual_limit"] = 0
+            pstate["block_a_freeze_active"] = False
+            pstate["block_a_frozen_structure_hash"] = None
+            pstate["block_a_freeze_edits_used"] = 0
+            # Invalidate so the next build renders fresh under the live hash.
+            await self._f._ctx_builder.invalidate_block_a_cache(
+                project_id, "manual /unfreeze"
+            )
+            if was_active:
+                return (
+                    "🔓 Block A unfrozen. The architecture map will refresh next "
+                    "turn (this likely triggers one KV-cache prefill)."
+                )
+            return "🔓 Block A was not frozen. Nothing to do."
+
+        # ── /freeze [N] ──
+        parts = stripped.split()
+        limit = self._f.valves.block_a_freeze_turns
+        if len(parts) > 1:
+            try:
+                limit = int(parts[1])
+                if limit < 0:
+                    return "⚠️ /freeze N requires N >= 0 (0 = until /unfreeze)."
+            except ValueError:
+                return (
+                    f"⚠️ Could not parse '{parts[1]}' as a number. "
+                    f"Use /freeze, /freeze N, or /freeze 0."
+                )
+
+        current_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        state = self._f._conversation_state_manager.get(project_id)
+        current_turn = state.message_count if state else 0
+
+        # Capture a manual window anchored on the CURRENT state, so the map the
+        # user sees frozen is today's map. Reuse the shared window-start helper
+        # for the hash/pin/reset bookkeeping, then stamp the manual flags on top.
+        self._f._ctx_builder._start_block_a_freeze_window(
+            project_id, current_hash, current_turn, reason="manual /freeze"
+        )
+        pstate["block_a_freeze_manual"] = True
+        pstate["block_a_freeze_manual_limit"] = limit
+
+        if limit == 0:
+            return (
+                "🔒 Block A frozen indefinitely (until /unfreeze). The "
+                "architecture map is pinned at its current state; structural "
+                "edits will not trigger KV-cache prefills."
+            )
+        return (
+            f"🔒 Block A frozen for {limit} structural edit(s) (until /unfreeze "
+            f"or the budget is spent). The map is pinned at its current state."
+        )
+    
     async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
         """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
         if (
@@ -33926,7 +34017,25 @@ class Filter:
             default=True,
             description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
         )
-
+        enable_freeze_command: bool = Field(
+            default=True,
+            description=(
+                "Enable the /freeze and /unfreeze chat commands for manual "
+                "control of the Block A KV-cache freeze.\n"
+                "  /freeze       → freeze the architecture map using "
+                "block_a_freeze_turns as the edit budget.\n"
+                "  /freeze N     → freeze for N structural edits.\n"
+                "  /freeze 0     → freeze indefinitely, until /unfreeze.\n"
+                "  /unfreeze     → release immediately; the next turn rebuilds "
+                "Block A fresh (likely one prefill) and hands control back to "
+                "the automatic freeze policy.\n"
+                "A manual freeze overrides both the automatic policy and a "
+                "disabled block_a_freeze_turns valve, since it is an explicit "
+                "user instruction. When this valve is False, both commands are "
+                "ignored and fall through as ordinary messages."
+            ),
+        )
+        
         # ── 13.2 Proactive suggestions ────────────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
         command_suggestion_cooldown_minutes: int = Field(default=10)
