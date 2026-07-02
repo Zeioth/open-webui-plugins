@@ -29421,6 +29421,29 @@ class ContextDumper:
                 "frontier_hwm": payload.get("frontier_hwm", 0),
                 "n_summaries_l1": payload.get("n_summaries_l1", 0),
                 "n_summaries_l2": payload.get("n_summaries_l2", 0),
+                # ── Block A freeze telemetry ────────────────────────────────
+                # Emitted so the evolution series can be filtered/plotted by
+                # freeze state: which turns served a frozen prefix, how much of
+                # the budget was spent, and the gap between the frozen hash and
+                # the live structure hash (the staleness the freeze is trading
+                # for KV-cache stability). This is the metric to watch when
+                # tuning block_a_freeze_turns.
+                "block_a_freeze_active": payload.get("block_a_freeze_active", False),
+                "block_a_frozen_structure_hash": payload.get(
+                    "block_a_frozen_structure_hash", ""
+                ),
+                "block_a_current_structure_hash": payload.get(
+                    "block_a_current_structure_hash", ""
+                ),
+                "block_a_freeze_edits_used": payload.get(
+                    "block_a_freeze_edits_used", 0
+                ),
+                "block_a_freeze_turns_limit": payload.get(
+                    "block_a_freeze_turns_limit", 0
+                ),
+                "block_a_freeze_capture_turn": payload.get(
+                    "block_a_freeze_capture_turn", 0
+                ),
             }
             jsonl_path = os.path.join(project_dir, "evolution.jsonl")
             with open(jsonl_path, "a", encoding="utf-8") as f:
