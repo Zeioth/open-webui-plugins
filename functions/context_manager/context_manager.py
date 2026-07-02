@@ -25,7 +25,7 @@ import math
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable
+from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable, Literal
 from enum import Enum
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -2425,8 +2425,9 @@ class HubSymbolIndex:
           full_graph     → every qualified symbol with its direct
                            callers/callees, alphabetically sorted.
 
-        *mode* is resolved by the CALLER (ContextBuilder._resolve_call_graph_mode)
-        and passed in already-decided — this method does no query/intent logic,
+        *mode* is the operator-chosen call_graph_context_mode, pinned into
+        pstate by ContextBuilder.prepare_call_graph_mode and passed in
+        already-decided — this method does no query/intent logic,
         it only renders. Deterministic while the code is unchanged (alphabetical /
         centrality order), so llama.cpp's KV cache stays stable.
 
@@ -30265,7 +30266,6 @@ class ProjectStateManager:
             # -- Call-graph mode ------------------------------------------
             "resolved_call_graph_mode": None,
             "current_call_graph_mode": None,
-            "graph_mode_downgrade_streak": 0,
             # -- Silent ingestion -----------------------------------------
             "ingested_lang": None,
             "raw_ingested_symbols": None,
@@ -32760,16 +32760,6 @@ class Filter:
                 ),
             )
         )
-        call_graph_auto_full_graph_symbol_ceiling: int = Field(
-            default=300,
-            ge=10,
-            description="Max symbols in project to auto‑select full_graph.",
-        )
-        call_graph_auto_expanded_hubs_symbol_ceiling: int = Field(
-            default=1000,
-            ge=50,
-            description="Max symbols in project to auto‑select expanded_hubs.",
-        )
         full_graph_max_tokens: int = Field(
             default=20000,
             ge=1000,
@@ -32779,12 +32769,6 @@ class Filter:
             default=4000,
             ge=500,
             description="Token budget for expanded_hubs mode.",
-        )
-        call_graph_mode_downgrade_after_turns: int = Field(
-            default=3,
-            ge=1,
-            le=10,
-            description="Turns to keep upgraded mode before downgrading.",
         )
 
         # ═════════════════════════════════════════════════════════════════════════
@@ -32976,18 +32960,6 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for LOD‑3 block relevance.",
-        )
-        graph_mode_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for call graph mode resolution.",
-        )
-        graph_mode_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for call graph mode resolution.",
         )
         paging_ce_threshold: float = Field(
             default=0.30,
