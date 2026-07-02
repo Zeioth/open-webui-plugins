@@ -4953,9 +4953,52 @@ class ContextBuilder:
             state = self._f._conversation_state_manager.get(project_id)
             if state and state.active_blocks:
                 centrality = psm.get_node_centrality(project_id)
-                # DIAGNOSTIC (temporary): pairs with the write-side log in
-                # invalidate_block_a_cache. See that function's comment for
-                # how to interpret the two logs together.
+
+                # ── Structural self-heal for centrality ──────────────────
+                # Centrality is a property of the symbol call-graph and must
+                # be refreshed exactly when that graph changes. It is recomputed
+                # here only when the persisted scores do not match the current
+                # structure, detected in two ways:
+                #   • empty  — some invalidation path blanked it (or this is
+                #     the first render before any ingestion recomputed it);
+                #     get_hub_names({}) would drop the entire Hub section.
+                #   • stale  — the scores were last computed against a different
+                #     structural hash than the current one, i.e. the graph
+                #     changed since without an ingestion turn refreshing it.
+                # The stamp comparison (rather than the dirty_qids proxy used
+                # previously) is what the check actually wants to express:
+                # "is the centrality fresh for THIS structure?". dirty_qids is
+                # non-empty on an ingestion turn even though invalidate_block_a_
+                # cache(recompute_centrality=True) already refreshed centrality
+                # moments earlier and stamped the matching hash — so keying off
+                # dirty_qids double-computed on every ingestion. Keying off the
+                # stamp skips that redundant pass: the stamped hash equals
+                # structure_hash here, so the recompute is bypassed, while a
+                # genuinely stale turn still triggers it. precompute_centrality
+                # memoises into the SymbolIndex cache regardless.
+                stamped_hash = pstate_raw.get("node_centrality_structure_hash")
+                centrality_stale = stamped_hash != structure_hash
+                if not centrality or centrality_stale:
+                    try:
+                        centrality = await anyio.to_thread.run_sync(
+                            lambda: self._f._symbol_index.precompute_centrality(
+                                project_id
+                            )
+                        )
+                        psm.set_node_centrality(project_id, centrality)
+                        pstate_raw["node_centrality_structure_hash"] = structure_hash
+                        _reason = "empty" if not centrality else "stale (hash mismatch)"
+                        self._f._log_debug(
+                            f"build_block_a: centrality recomputed in place "
+                            f"({_reason}); {len(centrality)} entries for "
+                            f"project '{project_id}'"
+                        )
+                    except Exception as e:
+                        self._f._log_debug(
+                            f"build_block_a: in-place centrality recompute "
+                            f"failed ({e}); Hub section may render degraded"
+                        )
+
                 self._f._log_debug(
                     f"build_block_a: read {len(centrality)} centrality "
                     f"entries for project '{project_id}' before rendering "
@@ -5076,7 +5119,7 @@ class ContextBuilder:
                 f"overflow on the next context shift, breaking Block A's stable-"
                 f"prefix / KV-cache contract. Drop call_graph_context_mode toward "
                 f"hubs_only, shrink the hub-bodies / skeleton tier, or raise "
-                f"--keep to at least {block_a_tokens}."
+                f"--keep to at least {block_a_tokens} (recommended)."
             )
 
     async def invalidate_block_a_cache(
@@ -5100,16 +5143,16 @@ class ContextBuilder:
                     lambda: self._f._symbol_index.precompute_centrality(project_id)
                 )
                 psm.set_node_centrality(project_id, centrality)
-                # DIAGNOSTIC (temporary): pairs with the read-side log in
-                # build_block_a. Investigating a regression where the Hub
-                # Symbols section silently disappears from Block A on some
-                # turns despite this call completing without an exception.
-                # If this reports 0 entries, the problem is upstream (likely
-                # precompute_centrality / get_all_qualified_names seeing an
-                # empty symbol set at this exact moment). If this reports a
-                # healthy count but build_block_a's read-side log reports 0,
-                # something clears or overwrites it in between. Remove both
-                # diagnostic lines once the root cause is confirmed.
+                # Stamp the structural hash the centrality was computed
+                # against. build_block_a compares this against the current
+                # structure_hash to decide whether its own self-heal needs to
+                # recompute: on this ingestion path the stamp matches the state
+                # build_block_a will see moments later, so it skips the
+                # redundant recompute; on a later turn where the graph has
+                # since changed, the hashes differ and the self-heal refreshes.
+                raw["node_centrality_structure_hash"] = (
+                    self._f._symbol_index.compute_structure_hash(project_id)
+                )
                 self._f._log_debug(
                     f"invalidate_block_a_cache: centrality recomputed, "
                     f"{len(centrality)} entries stored for project '{project_id}'"
@@ -19014,12 +19057,27 @@ Output only the symbol name.
         return candidates
 
     def invalidate_lightweight_cache(self, project_id: str) -> None:
-        """Clear cached lightweight context and centrality so the next request rebuilds them."""
+        """
+        Clear the cached lightweight context so the next request rebuilds it.
+
+        Deliberately does NOT touch node_centrality. Centrality is a property
+        of the symbol call-graph, not of the lightweight context or the current
+        query, so it only goes stale when the graph structure changes. This
+        function is a hot, near-every-turn invalidation fired from ~17 call
+        sites (intent execution, active-code updates, etc.), the vast majority
+        of which leave the graph intact. Blanking centrality here made the Hub
+        Symbols section of Block A vanish on any turn that rebuilt it without
+        re-ingesting code, because HubSymbolIndex.get_hub_names({}) returns an
+        empty list and the whole hub section renders empty — dropping ~1300
+        tokens of the stable prefix and forcing a KV-cache miss. Centrality's
+        refresh is owned by the structural path (see build_block_a, which
+        recomputes it whenever dirty_qids is non-empty), so it is left
+        untouched here to survive query/context invalidations.
+        """
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
         pstate["cached_lightweight_context"] = ""
         pstate["cached_code_state_hash"] = None
-        psm.set_node_centrality(project_id, {})
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 10. Static evidence (for scientific CoT)
@@ -25633,37 +25691,54 @@ class InletOrchestrator:
     # 6. Message utilities
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def dump_handled_turn(self, project_id: str, messages: list) -> None:
+    def dump_handled_turn(
+        self,
+        project_id: str,
+        handled_messages: list,
+        original_messages: list,
+        dump_kind: str,
+    ) -> None:
         """
         Record a context snapshot for a turn short-circuited by command handling.
 
-        Explicit commands (/forget, /status, /clean, /expand) and natural-language
-        intents (forget, remember, obsolete) return from Filter.inlet before the
-        assembly pipeline runs, so they never reach the snapshot that
-        ContextAssembler.assemble_for_turn schedules for a normal turn. That
-        leaves a hole in the per-turn dump sequence and in evolution.jsonl,
-        because turn numbers are derived from message count: a handled turn still
-        advances the count while producing no file, so the next normal turn's
-        number jumps. This captures the turn with an empty Block A / Block B
-        (none was built) plus the post-handling messages, keeping the sequence
+        Explicit commands (/forget, /status, /clean, /expand) and natural-
+        language intents (forget, remember, obsolete) return from Filter.inlet
+        before the assembly pipeline runs, so they never reach the snapshot the
+        normal path schedules. This captures the turn with empty blocks (none
+        was built) plus the post-handling messages, keeping the sequence
         contiguous.
+
+        The turn number is derived from original_messages, not from
+        handled_messages: the handler rewrites the list (truncation, synthetic
+        replies), so its length no longer encodes the conversation turn and
+        would mislabel the snapshot as the previous turn.
 
         Best-effort and fully decoupled from correctness: never raises, and is
         gated by enable_context_dump so it is a no-op when dumping is disabled.
 
         Args:
             project_id: Current project identifier.
-            messages: The message list as returned to the caller for this turn.
+            handled_messages: The message list as returned to the caller.
+            original_messages: The unmodified per-turn list, used only to
+                derive the correct turn number.
+            dump_kind: "handled_command" or "handled_intent", recorded in the
+                snapshot so its empty blocks are self-explanatory.
         """
         if not self._f.valves.enable_context_dump:
             return
         try:
+            # ── Step 1: Derive the turn from the pre-handling list ──
+            turn = (len(original_messages) + 1) // 2
+
+            # ── Step 2: Schedule the snapshot with explicit kind + turn ──
             self._f._context_dumper.schedule_inlet_snapshot(
                 project_id=project_id,
                 static_block="",
                 dynamic_block="",
                 final_system="",
-                messages=messages,
+                messages=handled_messages,
+                dump_kind=dump_kind,
+                turn_override=turn,
             )
         except Exception as _dump_err:
             self._f._log_debug(
@@ -28850,56 +28925,119 @@ class ContextAssembler:
         """
         Execute the full context assembly pipeline for one turn.
 
+        The context dump is guaranteed on every exit path. On the normal path
+        the full snapshot (with the real Block A / Block B / final_system
+        breakdown) is scheduled by MessageAssembler as before. The finally
+        block only schedules a fallback snapshot when that path was not
+        reached — a cached_response short-circuit, which never runs
+        MessageAssembler, or an exception raised during assembly — so a
+        served-from-cache or failed turn is still recorded instead of leaving
+        a silent gap in the evolution log.
+
         Returns:
             Tuple of (final_messages, cached_response).
         """
-        static_block, dynamic_injections, cached_response, prelim_system = (
-            await self._f._system_prompt_builder.build(
+        # ── Step 1: Fallback-dump bookkeeping ──
+        # assembler_scheduled_dump flips to True only once MessageAssembler
+        # returns, which is the point where its internal snapshot has already
+        # fired. If we short-circuit or raise before that, the finally block
+        # owns the capture instead.
+        assembler_scheduled_dump = False
+        served_from_cache = False
+        static_block = ""
+        final_messages = messages
+
+        try:
+            # ── Step 2: Build the two-block system prompt ──
+            static_block, dynamic_injections, cached_response, prelim_system = (
+                await self._f._system_prompt_builder.build(
+                    messages=messages,
+                    project_id=project_id,
+                    user_query=user_query,
+                    user_question=user_question,
+                    is_code_session=is_code_session,
+                    last_user_msg=last_user_msg,
+                    state=state,
+                    slot_busy=slot_busy,
+                    is_continuation=is_continuation,
+                    intent_vector=intent_vector,
+                    use_case=use_case,
+                    use_case_label=use_case_label,
+                )
+            )
+
+            # ── Step 3: Cache-hit short-circuit ──
+            # The response is served verbatim from cache: no Block B, no LLM
+            # assembly, no system injection. The finally block still records
+            # a cache-flagged snapshot for this turn.
+            if cached_response:
+                served_from_cache = True
+                return messages, cached_response
+
+            # ── Step 4: Full assembly (schedules its own complete snapshot) ──
+            final_messages = await self._f._message_assembler.assemble(
                 messages=messages,
                 project_id=project_id,
-                user_query=user_query,
-                user_question=user_question,
-                is_code_session=is_code_session,
+                static_block=static_block,
+                dynamic_injections=dynamic_injections,
+                prelim_system=prelim_system,
                 last_user_msg=last_user_msg,
+                is_code_session=is_code_session,
                 state=state,
+                __user__=__user__,
+                user_question=user_question,
+                has_code_blocks=has_code_blocks,
                 slot_busy=slot_busy,
                 is_continuation=is_continuation,
-                intent_vector=intent_vector,
-                use_case=use_case,
-                use_case_label=use_case_label,
             )
-        )
+            assembler_scheduled_dump = True
 
-        if cached_response:
-            return messages, cached_response
+            # ── Step 5: Guard against corrupted active_blocks ──
+            _state = self._f._conversation_state_manager.get(project_id)
+            if not isinstance(_state.active_blocks, dict):
+                self._f._log_debug(
+                    "CRITICAL: active_blocks corrupted after assembly; "
+                    "resetting to empty. Delete %s if this recurs."
+                    % self._f.valves.state_db_path
+                )
+                _state.active_blocks = {}
+                self._f._conversation_state_manager.set(project_id, _state)
 
-        final_messages = await self._f._message_assembler.assemble(
-            messages=messages,
-            project_id=project_id,
-            static_block=static_block,
-            dynamic_injections=dynamic_injections,
-            prelim_system=prelim_system,
-            last_user_msg=last_user_msg,
-            is_code_session=is_code_session,
-            state=state,
-            __user__=__user__,
-            user_question=user_question,
-            has_code_blocks=has_code_blocks,
-            slot_busy=slot_busy,
-            is_continuation=is_continuation,
-        )
+            return final_messages, None
 
-        _state = self._f._conversation_state_manager.get(project_id)
-        if not isinstance(_state.active_blocks, dict):
-            self._f._log_debug(
-                "CRITICAL: active_blocks corrupted after assembly; "
-                "resetting to empty. Delete %s if this recurs."
-                % self._f.valves.state_db_path
-            )
-            _state.active_blocks = {}
-            self._f._conversation_state_manager.set(project_id, _state)
-
-        return final_messages, None
+        finally:
+            # ── Step 6: Fallback dump — cache-hit path ONLY ──
+            # The fallback exists to cover the cached_response short-circuit,
+            # which never runs MessageAssembler and so never reaches the normal
+            # dump. That path is benign and expected: Block A was built before
+            # build()'s early-return, only Block B / final_system are empty.
+            #
+            # An exception is deliberately NOT dumped here. Reaching this point
+            # with served_from_cache False and assembler_scheduled_dump False
+            # means assembly raised: static_block is empty and final_messages is
+            # the raw, uncompressed input (potentially megabytes of pasted code).
+            # A snapshot of that is degenerate and, if the assembler already
+            # dumped before raising, a duplicate of the turn. The traceback is
+            # the useful artifact, so we log and let the exception propagate
+            # unchanged to the caller.
+            if not assembler_scheduled_dump:
+                if served_from_cache:
+                    self._f._context_dumper.schedule_inlet_snapshot(
+                        project_id=project_id,
+                        static_block=static_block or "",
+                        dynamic_block="",
+                        final_system="",
+                        messages=final_messages,
+                        dump_kind="cache_hit",
+                    )
+                else:
+                    exc = sys.exc_info()[1]
+                    if exc is not None:
+                        self._f._log_debug(
+                            f"assemble_for_turn: assembly raised "
+                            f"{type(exc).__name__}: {exc}; skipping degenerate "
+                            f"fallback snapshot (traceback is the useful record)"
+                        )
 
 
 # ---------------------------------------------------------------------------
@@ -28952,6 +29090,8 @@ class ContextDumper:
         dynamic_block: str,
         final_system: str,
         messages: List[dict],
+        dump_kind: str = "full",
+        turn_override: Optional[int] = None,
     ) -> None:
         """
         Capture the snapshot payload now and offload the write to a task.
@@ -28959,21 +29099,47 @@ class ContextDumper:
         Called from a synchronous context inside the async inlet, so a running
         loop exists; if it does not (unexpected), fall back to a blocking write.
 
+        There is intentionally no per-turn dedup guard here. Duplicate dumps
+        for one turn are prevented upstream by construction: each exit path of
+        the inlet schedules exactly one snapshot, each declaring its dump_kind.
+
         Args:
             project_id: The project identifier.
             static_block: The rendered Block A (static, KV-cacheable).
             dynamic_block: The rendered Block B (dynamic, per-query).
             final_system: The fully assembled system prompt.
-            messages: The final message list sent to the LLM.
+            messages: The message list this snapshot should record.
+            dump_kind: Which pipeline path produced this snapshot:
+                "full"             — normal assembly (Block A + B + inference)
+                "cache_hit"        — served verbatim from the response cache
+                "handled_command"  — short-circuited by an explicit command
+                "handled_intent"   — short-circuited by a natural-language intent
+                "silent_ingestion" — large code-only paste indexed silently
+                Non-"full" kinds legitimately carry empty blocks.
+            turn_override: Explicit turn number. Handled turns pass a modified
+                message list whose length no longer encodes the turn, so their
+                call site derives the number from the original list instead.
         """
+        # ── Step 1: Valve gate ──
         if not self._f.valves.enable_context_dump:
             return
 
-        self._f._log_debug(f"📸 Scheduling context dump for project '{project_id}'")
-
-        payload = self._capture_payload(
-            project_id, static_block, dynamic_block, final_system, messages
+        # ── Step 2: Capture payload synchronously (race-free) ──
+        self._f._log_debug(
+            f"📸 Scheduling context dump for project '{project_id}' "
+            f"(kind={dump_kind})"
         )
+        payload = self._capture_payload(
+            project_id,
+            static_block,
+            dynamic_block,
+            final_system,
+            messages,
+            dump_kind=dump_kind,
+            turn_override=turn_override,
+        )
+
+        # ── Step 3: Schedule the write ──
         try:
             task = asyncio.create_task(self._write_async(payload))
             self._tasks.add(task)
@@ -28997,9 +29163,23 @@ class ContextDumper:
         dynamic_block: str,
         final_system: str,
         messages: List[dict],
+        dump_kind: str = "full",
+        turn_override: Optional[int] = None,
     ) -> dict:
         """
         Snapshot strings + metadata immediately so later mutation can't race.
+
+        Args:
+            dump_kind: Which pipeline path produced this snapshot ("full",
+                "cache_hit", "handled_command", "handled_intent",
+                "silent_ingestion"). Recorded in the payload so downstream
+                renderers can distinguish a legitimately empty turn (non-"full"
+                kinds carry zero Block B / empty final_system) from an assembly
+                regression.
+            turn_override: Explicit turn number for paths whose message list no
+                longer encodes the turn (handled turns pass the count derived
+                from the original, pre-handling list). None means derive from
+                len(messages).
 
         Returns:
             dict: A complete payload dictionary with all context data and metrics.
@@ -29031,6 +29211,14 @@ class ContextDumper:
         block_a_hash = pstate.get("last_static_prefix_hash", "")
         slot_hash = pstate.get("last_saved_slot_hash", "")
 
+        # ── Hub-Bodies Tier text ────────────────────────────────────────────
+        # The tier is injected between Block A and Block B in the final prompt
+        # (see _assemble_prelim_system), so it lives in neither static_block
+        # nor dynamic_block. Read it straight from pstate — where build()
+        # persists it each turn — so the dump can show it as its own section
+        # instead of dropping it into the gap between the two captured blocks.
+        hub_tier_text = pstate.get("hub_tier_text", "") or ""
+
         # ── Turn number for the dump label ───────────────────────────────────
         # Derived from len(messages) rather than ConversationState.message_count.
         # message_count only advances when a turn contains indexable code (see
@@ -29045,7 +29233,12 @@ class ContextDumper:
         # both read payload["turn"] rather than recomputing it, so fixing it
         # here is the single point of correction for every place "turn N" is
         # shown or persisted.
-        turn = (len(messages) + 1) // 2
+        #
+        # The formula is also correct on the served-from-cache path, where
+        # messages arrives WITHOUT the injected system message: the sequence
+        # always ends in a user message, so it has 2N-1 entries without the
+        # system and 2N with it, and (len + 1) // 2 yields N in both cases.
+        turn = turn_override if turn_override is not None else (len(messages) + 1) // 2
 
         # ── Get persistent state via ConversationStateManager ───────────────
         try:
@@ -29102,6 +29295,7 @@ class ContextDumper:
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
             "static_block": static_block or "",
+            "hub_tier_text": hub_tier_text,
             "dynamic_block": dynamic_block or "",
             "final_system": final_system or "",
             "messages": msg_copy,
@@ -29114,6 +29308,12 @@ class ContextDumper:
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
             "n_classes": n_classes,
+            # ── Dump kind marker ────────────────────────────────────────────
+            # Declares which pipeline path produced this snapshot so that
+            # empty Block A/B token counts are self-explanatory in the
+            # evolution series (expected for non-"full" kinds, a regression
+            # signal only for "full").
+            "dump_kind": dump_kind,
             # ── WindowManager metrics ──────────────────────────────────────
             "wm_fired": wm_fired,
             "wm_msgs_evicted": wm_msgs_evicted,
@@ -29233,6 +29433,8 @@ class ContextDumper:
                 "n_active_blocks": payload.get("n_active_blocks", 0),
                 "n_symbols": payload.get("n_symbols", 0),
                 "block_a_hash": payload.get("block_a_hash", ""),
+                # ── Dump kind (full | cache_hit | handled_* | silent_ingestion) ──
+                "dump_kind": payload.get("dump_kind", "full"),
                 # ── M7: rebuild reason (string or null) ──────────────────────
                 "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
                 "code_state_hash": payload.get("code_state_hash", ""),
@@ -29304,6 +29506,11 @@ class ContextDumper:
             f"{payload['n_symbols_with_parent']}/{payload['n_symbols']}"
         )
         lines.append(f"- classes detected: {payload['n_classes']}")
+        _kind = payload.get("dump_kind", "full")
+        lines.append(
+            f"- dump kind: {_kind}"
+            + ("" if _kind == "full" else " (no full assembly this turn)")
+        )
 
         # ── WindowManager metrics ────────────────────────────────────────────
         lines.append("")
@@ -29334,10 +29541,28 @@ class ContextDumper:
         lines.append(payload["static_block"] or "(empty)")
         lines.append("```")
         lines.append("")
-
+        lines.append("## Hub-Bodies Tier (stable full bodies, between A and B)")
+        lines.append(
+            "_Full bodies of the most central symbols. Injected between Block A "
+            "and Block B in the real prompt; refreshes when a hub's code changes, "
+            "so unlike Block A it never shows stale bodies._"
+        )
+        lines.append("```text")
+        lines.append(
+            payload.get("hub_tier_text")
+            or "(empty — tier disabled or no hubs qualified)"
+        )
+        lines.append("```")
+        lines.append("")
         lines.append("## Block B — dynamic (per-query)")
         lines.append("```text")
-        lines.append(payload["dynamic_block"] or "(empty)")
+        if _kind != "full":
+            lines.append(
+                f"(empty — {_kind} turn: the assembly pipeline did not run, "
+                f"so no Block B was built)"
+            )
+        else:
+            lines.append(payload["dynamic_block"] or "(empty)")
         lines.append("```")
         lines.append("")
 
@@ -30054,6 +30279,7 @@ class ProjectStateManager:
             "skeleton_tier_qids": [],
             # -- Centrality and lightweight context -----------------------
             "node_centrality": {},
+            "node_centrality_structure_hash": None,
             "cached_lightweight_context": "",
             "cached_code_state_hash": None,
             "structure_hash_for_cache": None,
@@ -32095,11 +32321,11 @@ class Filter:
 
         # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
-            default=262000,
+            default=393216,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
-            default=8000,
+            default=28000,
             ge=0,
             description=(
                 "Value of llama.cpp's --keep (n_keep): the number of leading "
@@ -32729,6 +32955,39 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for natural language intent detection.",
+        )
+        nl_intent_confidence_threshold: float = Field(
+            default=0.70,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum sigmoid-normalized CrossEncoder confidence for a "
+                "natural-language memory action (forget/remember/obsolete) to "
+                "fire once the CrossEncoder is confident about the margin. "
+                "Distinct from nl_intent_ce_threshold / nl_intent_llm_threshold, "
+                "which gate the diff between candidates: this gates the absolute "
+                "confidence of the winning action. Replaces the former "
+                "hard-coded 0.5 raw-logit gate; because the score is passed "
+                "through a sigmoid first, this is an interpretable probability, "
+                "so a short technical question no longer trips a low-margin "
+                "forget/obsolete intent."
+            ),
+        )
+        nl_intent_interrogative_weight: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Additive reinforcement applied to the 'none' candidate when the "
+                "prose reads as a question or explanation request "
+                "(ReasoningEngine._looks_interrogative), mirroring "
+                "heuristic_reinforcement_weight for the code-keyword hint. A "
+                "message like 'cual es el proposito de build_block_b?' asks for "
+                "an answer, not a memory action; nudging 'none' upward lets it "
+                "win the margin or, failing that, pushes the decision into the "
+                "LLM tie-breaker instead of a false-positive action. Set to 0.0 "
+                "to disable the interrogative hint."
+            ),
         )
 
         # ── 7.6 Structural decisions (relevance, graph, paging, purge) ───────
@@ -34576,7 +34835,13 @@ class Filter:
             _inlet_timing("Step 3/6: Handle explicit commands", step_start)
             if handled:
                 body["messages"] = handled_messages
-                self._inlet_orch.dump_handled_turn(project_id, handled_messages)
+                # `messages` is passed as the original, pre-handling list so the
+                # snapshot is numbered by the true conversation turn: the handler
+                # rewrites handled_messages (truncation / synthetic replies), so
+                # its length no longer encodes the turn number.
+                self._inlet_orch.dump_handled_turn(
+                    project_id, handled_messages, messages, "handled_command"
+                )
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
@@ -34598,7 +34863,11 @@ class Filter:
             _inlet_timing("Step 4/6: Handle natural language intents", step_start)
             if handled:
                 body["messages"] = handled_messages
-                self._inlet_orch.dump_handled_turn(project_id, handled_messages)
+                # Original `messages` drives the turn number; see the explicit-
+                # command branch above for why handled_messages cannot.
+                self._inlet_orch.dump_handled_turn(
+                    project_id, handled_messages, messages, "handled_intent"
+                )
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
@@ -34752,6 +35021,7 @@ class Filter:
                                     dynamic_block="",
                                     final_system=static_block,
                                     messages=messages,
+                                    dump_kind="silent_ingestion",
                                 )
                             except Exception as _dump_err:
                                 self._log_debug(
