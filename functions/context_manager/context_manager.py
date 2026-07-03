@@ -11152,7 +11152,7 @@ class LLMOrchestrator:
       duplicate LLM requests.
     * A concurrency semaphore (``_llm_semaphore``) that serialises
       inference for llama.cpp's ``--parallel 1`` mode.
-    * ``should_keep_full_code(query)`` — lightweight CrossEncoder call
+    * ``infer_user_wants_full_code(query)`` — lightweight CrossEncoder call
       that decides whether the user wants the full implementation or a
       summary.
     * ``wait_for_slot()`` / ``wait_for_llm_tasks()`` — coordination
@@ -11358,30 +11358,45 @@ class LLMOrchestrator:
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def should_keep_full_code(
+    async def infer_user_wants_full_code(
         self, user_question: str, project_id: str = ""
     ) -> bool:
-        """
-        Decide whether to keep the full code in context or provide only a summary.
+        """Infer whether the user likely wants full code rather than a summary.
 
-        Cascade:
-        1. Heuristic reinforcement (keywords for summary/full) with weight.
-        2. CrossEncoder (primary).
-        3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD).
-        4. Conservative default (True) in middle zone or on failure.
+        Produces a soft intent signal, NOT a hard gate. The returned boolean is
+        stored as ``_user_intent_full_code`` and consumed only as an
+        ``intent_hint`` string ("The user likely needs the full code" /
+        "...only a summary") that flavours the CoT-level detection query in
+        MessageAssembler / ReasoningEngine. It does not decide whether code is
+        kept or summarised in the assembled context — no downstream path evicts
+        or compresses code based on this value.
 
-        Restores KV slot after any LLM call.
+        Because the signal is advisory, a wrong verdict at worst mislabels a
+        hint fed to another classifier; it never drops code. The cascade is a
+        query/summary-vs-full-code relevance ranking between two concrete poles:
+            1. Context tagging — [CODE]/[SHORT] hints prepended to the query.
+            2. CrossEncoder — ranks "wants full implementation" vs "wants
+               summary" (the primary signal; falls back to the LLM if the CE is
+               unavailable).
+            3. Heuristic reinforcement — summary/full keyword nudges.
+            4. LLM arbitration — only when the CrossEncoder margin is below
+               keep_full_code_llm_threshold.
+            5. Conservative default — keep full (True) in the middle band.
+
+        Restores the KV slot after any auxiliary LLM call.
 
         Args:
             user_question (str): The user's question.
             project_id (str): Project id for slot restoration.
 
         Returns:
-            bool: True if full code should be kept.
+            bool: True when the user likely wants full code, False for a summary.
         """
+        # ── Step 1: guard clause ──
         if not user_question.strip():
             return False
 
+        # ── Step 2: build the context-tagged query ──
         context_parts = []
         if any(
             kw in user_question
@@ -11393,6 +11408,7 @@ class LLMOrchestrator:
         context_prefix = " ".join(context_parts)
         query = f"{context_prefix} {user_question}" if context_parts else user_question
 
+        # ── Step 3: CrossEncoder relevance ranking (two concrete poles) ──
         pairs = [
             (
                 query,
@@ -11406,11 +11422,11 @@ class LLMOrchestrator:
         scores = await self._f._commands._predict_cross_encoder(pairs)
 
         if scores is None or len(scores) < 2:
-            return await self._should_keep_full_code_with_llm(
+            return await self._infer_user_wants_full_code_with_llm(
                 user_question, None, project_id
             )
 
-        # ── Heuristic reinforcement with weight ──
+        # ── Step 4: heuristic reinforcement with weight ──
         content_lower = user_question.lower()
         summary_keywords = (
             "resume",
@@ -11437,43 +11453,48 @@ class LLMOrchestrator:
         if any(kw in content_lower for kw in full_code_keywords):
             scores_reinforced[0] += h_weight * 0.2
 
+        # ── Step 5: threshold bands → verdict ──
         diff = scores_reinforced[0] - scores_reinforced[1]
         CE_CONFIDENCE_THRESHOLD = self._f.valves.keep_full_code_ce_threshold
         LLM_FALLBACK_THRESHOLD = self._f.valves.keep_full_code_llm_threshold
 
         if diff >= CE_CONFIDENCE_THRESHOLD:
+            # CE is confident — use its ranking directly.
             result = scores_reinforced[0] > scores_reinforced[1]
             self._f._log_debug(
-                f"should_keep_full_code: CE confident (diff={diff:.2f}) → {result}"
+                f"infer_user_wants_full_code: CE confident (diff={diff:.2f}) → {result}"
             )
             return result
         elif diff < LLM_FALLBACK_THRESHOLD:
+            # CE is uncertain — arbitrate with the LLM.
             self._f._log_debug(
-                f"should_keep_full_code: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                "using LLM"
+                f"infer_user_wants_full_code: CE uncertain (diff={diff:.2f} < "
+                f"{LLM_FALLBACK_THRESHOLD:.2f}), using LLM"
             )
-            return await self._should_keep_full_code_with_llm(
+            return await self._infer_user_wants_full_code_with_llm(
                 user_question, scores_reinforced, project_id
             )
 
-        # Middle zone: conservative (keep full code)
+        # Middle band — conservative default (assume full code wanted).
         return True
 
-    async def _should_keep_full_code_with_llm(
+    async def _infer_user_wants_full_code_with_llm(
         self,
         user_question: str,
         ce_scores: Optional[List[float]] = None,
         project_id: str = "",
     ) -> bool:
-        """
-        LLM fallback to decide whether to show full code or a summary.
+        """LLM arbiter for the full-code intent hint when the CrossEncoder is unsure.
 
-        Called when the CrossEncoder diff falls below keep_full_code_llm_threshold.
-        Uses response_format={"type":"json_object"} and enable_thinking=False for
-        a clean structured answer with no reasoning preamble.
-
-        The default on parse failure is True (keep full code) to avoid silently
-        omitting implementation details the user may need.
+        Reached when the CrossEncoder margin falls below
+        keep_full_code_llm_threshold (or when the CE is unavailable). Like its
+        caller, this produces a soft advisory signal consumed only as a CoT
+        detection hint — it does not gate code retention. Uses
+        response_format={"type":"json_object"} and enable_thinking=False so the
+        server-side GBNF grammar returns clean JSON with no reasoning preamble.
+        The default on empty/parse failure is True (assume full code) to avoid
+        biasing the hint toward omitting implementation detail. Restores the KV
+        slot afterwards.
 
         Args:
             user_question: The user's message (truncated to 500 chars).
@@ -11481,8 +11502,9 @@ class LLMOrchestrator:
             project_id: Current project identifier, used for slot restoration.
 
         Returns:
-            bool: True to keep full code, False to use summary only.
+            bool: True to signal full-code intent, False for summary intent.
         """
+        # ── Step 1: build the classification prompt ──
         if ce_scores is not None:
             ce_block = (
                 f"CrossEncoder scores — keep_full: {ce_scores[0]:.2f}, "
@@ -11502,6 +11524,7 @@ class LLMOrchestrator:
             f"When uncertain, prefer true to avoid omitting critical code."
         )
 
+        # ── Step 2: call the LLM under a JSON grammar, no thinking ──
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -11518,13 +11541,14 @@ class LLMOrchestrator:
             log_raw_response=False,
         )
 
-        # Restore the KV slot after any auxiliary LLM call.
+        # ── Step 3: restore the KV slot dirtied by the auxiliary call ──
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
+        # ── Step 4: parse the structured verdict (conservative default True) ──
         if not response:
             self._f._log_debug(
-                "_should_keep_full_code_with_llm: empty response, defaulting to FULL"
+                "_infer_user_wants_full_code_with_llm: empty response, defaulting to FULL"
             )
             return True
 
@@ -11532,12 +11556,13 @@ class LLMOrchestrator:
             data = json.loads(response)
             result = bool(data.get("keep_full", True))
             self._f._log_debug(
-                f"_should_keep_full_code_with_llm: decided {'FULL' if result else 'SUMMARY'}"
+                f"_infer_user_wants_full_code_with_llm: decided "
+                f"{'FULL' if result else 'SUMMARY'}"
             )
             return result
         except (json.JSONDecodeError, Exception):
             self._f._log_debug(
-                f"_should_keep_full_code_with_llm: JSON parse error — "
+                f"_infer_user_wants_full_code_with_llm: JSON parse error — "
                 f"response: {response[:200]!r}, defaulting to FULL"
             )
             return True
@@ -14355,26 +14380,55 @@ class CommandRouter:
         last_user_msg: Optional[dict],
         slot_free: bool = True,
     ) -> Tuple[bool, Optional[list]]:
-        """Handle natural language intents (forget, remember, obsolete).
-        Returns (handled, messages) if an intent was processed, else (False, None).
+        """Detect and execute natural-language memory intents (forget, remember, obsolete).
+
+        Entry is gated by the master switch ``enable_natural_language_intents``;
+        the per-intent switches and the "no eligible type" early-exit live inside
+        ``_parse_all_intents``, which also masks any disabled type back to 'none'
+        before returning. Explicit slash commands are handled elsewhere and are
+        skipped here (``is_explicit_command``), as are messages carrying code
+        indicators (a paste is never a command) and turns with no free llama.cpp
+        slot (the intent LLM call would contend for it).
+
+        Note the extra ``enable_obsolete_marking`` gate on the obsolete branch:
+        that valve controls the obsolete-marking feature as a whole (it also
+        guards automatic version marking on block registration), so it acts as a
+        second, feature-level gate on top of the per-intent detection switch.
+
+        Returns (handled, messages) when an intent was executed — with a synthetic
+        assistant confirmation appended — else (False, None) to let the turn
+        proceed normally.
         """
+        # ── Step 1: Eligibility guard ──
+        # Master switch off, no user message, an explicit command (handled
+        # elsewhere), or code present → this turn carries no natural-language
+        # intent. The master check short-circuits before _parse_all_intents so no
+        # LLM call is even scheduled when the feature is disabled.
         if (
-            not self._f.valves.enable_natural_language_forget
+            not self._f.valves.enable_natural_language_intents
             or not last_user_msg
             or is_explicit_command
             or self.has_code_indicators(last_user_msg.get("content", ""))
         ):
             return False, None
 
+        # ── Step 2: Slot-availability guard ──
+        # Intent detection needs an LLM call; with no free slot it is skipped
+        # rather than queued, to avoid blocking the inlet critical path.
         if not slot_free:
             self._f._log_debug(
                 "⚡ COMMAND HANDLING – Natural intents skipped (no free slot)"
             )
             return False, None
 
+        # ── Step 3: Parse intents (LLM-only; per-intent gating applied inside) ──
         intents = await self._parse_all_intents(
             last_user_msg.get("content", ""), project_id
         )
+
+        # ── Step 4: Dispatch the first active intent to its executor ──
+        # Disabled types already arrive as 'none' and are skipped here. Obsolete
+        # additionally requires the feature-level enable_obsolete_marking valve.
         for intent_type in ("forget", "remember", "obsolete"):
             fi = intents.get(intent_type, {})
             if fi.get("action") in (None, "none"):
@@ -14402,6 +14456,16 @@ class CommandRouter:
         """
         Detect natural-language intents (forget, remember, obsolete) via LLM only.
 
+        Gating (evaluated before any work):
+          * enable_natural_language_intents is the master switch; when off, no
+            intent is recognised and the LLM call is skipped.
+          * enable_natural_language_{forget,remember,obsolete} gate each type
+            individually. An intent is eligible only when the master and its own
+            switch are both on. If no type is eligible the LLM call is skipped.
+          * A single LLM call detects all three intents at once, so when at least
+            one type is eligible the call is made and any disabled type is masked
+            back to 'none' afterwards (never executed).
+
         The CrossEncoder, heuristic reinforcement and heuristic fallback were all
         removed from this path. A complete intent — action *plus* object ("forget
         the last block") — is semantic inference, not similarity ranking. The
@@ -14422,12 +14486,23 @@ class CommandRouter:
         Restores KV slot after the LLM call.
         """
         none = {"action": "none"}
+        all_none = {"forget": none, "remember": none, "obsolete": none}
 
-        # ── Step 1: Respect the feature toggle ──
-        if not self._f.valves.enable_natural_language_forget:
-            return {"forget": none, "remember": none, "obsolete": none}
+        # ── Step 1: Master switch ──
+        if not self._f.valves.enable_natural_language_intents:
+            return all_none
 
-        # ── Step 2: Strip code — only prose is eligible for intent detection ──
+        # ── Step 2: Per-intent eligibility ──
+        # Skip the LLM call entirely when no intent type is enabled.
+        enabled = {
+            "forget": self._f.valves.enable_natural_language_forget,
+            "remember": self._f.valves.enable_natural_language_remember,
+            "obsolete": self._f.valves.enable_natural_language_obsolete,
+        }
+        if not any(enabled.values()):
+            return all_none
+
+        # ── Step 3: Strip code — only prose is eligible for intent detection ──
         try:
             code_spans = await self._f._code_blocks.get_code_spans(user_message)
         except Exception:
@@ -14438,10 +14513,19 @@ class CommandRouter:
             else user_message
         )
         if not prose or len(prose) < 3:
-            return {"forget": none, "remember": none, "obsolete": none}
+            return all_none
 
-        # ── Step 3: Delegate the full decision to the LLM (prose only) ──
-        return await self._parse_all_intents_with_llm(prose, project_id)
+        # ── Step 4: Delegate to the LLM, then mask disabled intents ──
+        # One call classifies all three intents; any type whose switch is off is
+        # forced back to 'none' so it is never executed, even if the model
+        # reported it.
+        raw = await self._parse_all_intents_with_llm(prose, project_id)
+        if not isinstance(raw, dict):
+            return all_none
+        return {
+            t: (raw.get(t, none) if enabled[t] else none)
+            for t in ("forget", "remember", "obsolete")
+        }
 
     async def _parse_all_intents_with_llm(
         self, prose: str, project_id: str
@@ -27765,10 +27849,10 @@ class MessageAssembler:
 
             parallel_tasks = []
 
-            # Task 0: should_keep_full_code
+            # Task 0: infer_user_wants_full_code
             if not _skip_intent_llm:
                 parallel_tasks.append(
-                    self._f._llm_orchestrator.should_keep_full_code(
+                    self._f._llm_orchestrator.infer_user_wants_full_code(
                         user_question, project_id
                     )
                 )
@@ -27826,11 +27910,11 @@ class MessageAssembler:
             # from cancelling Tasks 1 and 2.
             results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
 
-            # -- extract Task 0 (should_keep_full_code) ----------------------
+            # -- extract Task 0 (infer_user_wants_full_code) ----------------------
             _t0 = results[0]
             if isinstance(_t0, Exception):
                 self._f._log_debug(
-                    f"CoT Task 0 (should_keep_full_code) failed: {_t0} — "
+                    f"CoT Task 0 (infer_user_wants_full_code) failed: {_t0} — "
                     "defaulting to keep_full=True"
                 )
                 self._f._user_intent_full_code = True
@@ -32834,18 +32918,6 @@ class Filter:
         )
 
         # ── 7.2 Session & code‑only detection ────────────────────────────────
-        session_classify_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for session classification.",
-        )
-        session_classify_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for session classification.",
-        )
         code_only_ce_threshold: float = Field(
             default=0.35,
             ge=0.0,
@@ -33886,7 +33958,6 @@ class Filter:
 
         # ── 13.1 Commands & expansion ─────────────────────────────────────────
         enable_forget_command: bool = Field(default=True)
-        enable_natural_language_forget: bool = Field(default=True)
         outlet_expand_intercept_enabled: bool = Field(default=True)
         outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
         outlet_expand_intercept_depth: int = Field(default=5, ge=0)
@@ -33913,6 +33984,14 @@ class Filter:
                 "ignored and fall through as ordinary messages."
             ),
         )
+
+        # ── 13.1.2 Natural language commands ──────────────────────────────────
+        # Only these commands are implemented through natural language.
+        enable_natural_language_intents: bool = Field(default=False)
+        enable_forget_command: bool = Field(default=True)
+        enable_natural_language_forget: bool = Field(default=True)
+        enable_natural_language_remember: bool = Field(default=True)
+        enable_natural_language_obsolete: bool = Field(default=True)
 
         # ── 13.2 Proactive suggestions ────────────────────────────────────────
         enable_command_suggestions: bool = Field(default=True)
