@@ -5719,6 +5719,14 @@ class ContextBuilder:
         inside an otherwise-stable class would itself introduce a position
         shift for no benefit — the class as a whole is the unit being
         protected or sacrificed here.
+
+        Class-level docstrings are shown inline on the `class X:` line when
+        present and skeleton_include_docstrings is on, symmetric to how
+        members and module functions are annotated. This surfaces intent that
+        lives only on the class (abstract bases, field-only dataclasses/enums)
+        instead of rendering the class header bare. It never perturbs the KV
+        prefix: docstrings are excluded from structure_hash, so annotating the
+        header does not change what the cache keys on.
         """
         symbol_index = self._f._symbol_index
         qids = sorted(symbol_index.get_all_qualified_names(project_id))
@@ -5747,7 +5755,17 @@ class ContextBuilder:
                 members = symbol_index.get_class_members(cls_name, project_id)
                 if not members:
                     continue
-                lines.append(f"class {cls_name}:")
+                if include_docstrings:
+                    cls_meta = symbol_index.get_symbol_meta(cls_name, project_id) or {}
+                    cls_doc = cls_meta.get("docstring", "")
+                    if cls_doc:
+                        lines.append(
+                            f"class {cls_name}:  # {cls_doc.split(chr(10))[0]}"
+                        )
+                    else:
+                        lines.append(f"class {cls_name}:")
+                else:
+                    lines.append(f"class {cls_name}:")
                 for member_qid in members:
                     meta = symbol_index.get_symbol_meta(member_qid, project_id) or {}
                     sig = meta.get("signature", member_qid)
@@ -7571,7 +7589,15 @@ class SignatureExtractor:
                         kind = "method"
                         break
                 # Build signature string (first line of the function definition)
-                signature = ast.unparse(node).split("\n")[0][:200]
+                _unparsed_lines = ast.unparse(node).split("\n")
+                signature = next(
+                    (
+                        ln
+                        for ln in _unparsed_lines
+                        if ln.lstrip().startswith(("def ", "async def "))
+                    ),
+                    _unparsed_lines[0],
+                )[:200]
                 line_start = node.lineno
                 line_end = node.end_lineno or node.lineno
                 symbols.append(
@@ -7873,13 +7899,14 @@ class SignatureExtractor:
     # 4. Call extraction from tree-sitter
     # ═══════════════════════════════════════════════════════════════════════════
 
-    @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
         """
         Extract docstrings from Python source code using AST with class context awareness.
         Uses a DFS visitor that tracks the current class name, so docstrings are keyed by qualified name
         (ClassName.method) to avoid collisions. Also handles line-wrapped docstrings by joining lines
-        until sentence punctuation is found.
+        until sentence punctuation is found. Class-level docstrings are harvested too, keyed by the
+        bare class name, so classes whose own docstring carries intent the methods don't (abstract
+        bases, field-only dataclasses/enums) are documented in the skeleton instead of rendered bare.
         """
         try:
             tree = ast.parse(code)
@@ -7904,6 +7931,16 @@ class SignatureExtractor:
             """DFS visitor that carries the current class name."""
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.ClassDef):
+                    # Harvest the class's own docstring under its bare name, so a
+                    # class carrying intent its methods don't (abstract base,
+                    # field-only dataclass/enum) is not rendered bare in the
+                    # skeleton. Symmetric to the function branch below; first
+                    # definition wins.
+                    cls_ds = ast.get_docstring(child)
+                    if cls_ds:
+                        cls_first = _first_complete_line(cls_ds)
+                        if cls_first and child.name not in doc_map:
+                            doc_map[child.name] = cls_first
                     _visit(child, child.name)
                 elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     ds = ast.get_docstring(child)
@@ -14398,37 +14435,34 @@ class CommandRouter:
         self, user_message: str, project_id: str
     ) -> Dict[str, Any]:
         """
-        Detect natural-language intents (forget, remember, obsolete) using a cascade.
+        Detect natural-language intents (forget, remember, obsolete) via LLM only.
 
-        Cascade:
-        1. Heuristic reinforcement: code-artifact wording nudges CrossEncoder
-           scores toward the "_last" actions. This is advisory only — it never
-           decides by itself, it only shifts which candidate the CrossEncoder
-           ends up favoring.
-        2. CrossEncoder (fast) scores every candidate action.
-        3. If confident (diff >= CE_THRESHOLD), the CrossEncoder's top score
-           decides.
-        4. If extremely uncertain (diff < LLM_THRESHOLD), fall through to the
-           LLM, which sees the CrossEncoder's own scores as context.
-        5. Middle zone (neither confident nor uncertain enough for either of
-           the above): default to "none".
+        The CrossEncoder, heuristic reinforcement and heuristic fallback were all
+        removed from this path. A complete intent — action *plus* object ("forget
+        the last block") — is semantic inference, not similarity ranking. The
+        CrossEncoder is a reranker: it can pick the closest of a fixed set of
+        descriptions, but the pragmatic distinction that separates a command
+        ("forget X") from an ordinary question about the same symbol ("what does X
+        do?") is exactly where a 0.6B reranker fails — its two class scores for an
+        innocent question landed within ~0.05 of the action threshold, so a mere
+        rephrasing could tip a question into being executed as a memory command.
+        The decision is therefore delegated entirely to the LLM, which understands
+        the sentence. On any LLM failure the result is 'none' (no fallback): a
+        missed command is a cheap, self-correcting error; a false positive is not.
 
-        The standalone heuristic parser is deliberately never used as a
-        decision-maker in this cascade — not in the middle zone, and not when
-        the CrossEncoder is unavailable. Bare keyword matching is a strictly
-        weaker signal than a CrossEncoder score that had every chance to decide
-        or escalate to the LLM, and letting it decide on its own is exactly how
-        an ordinary question ("cual es el proposito de build_block_b?") gets
-        misclassified as a memory-management command. The heuristic survives
-        only as a last-resort fallback inside _parse_all_intents_with_llm, for
-        when the LLM itself fails to return parseable output.
+        Only the PROSE reaches the LLM: any fenced/inline code is stripped first,
+        so identifiers inside code (e.g. build_block_b) can never be read as a
+        command.
 
-        Restores KV slot after any LLM call.
+        Restores KV slot after the LLM call.
         """
+        none = {"action": "none"}
+
+        # ── Step 1: Respect the feature toggle ──
         if not self._f.valves.enable_natural_language_forget:
-            none = {"action": "none"}
             return {"forget": none, "remember": none, "obsolete": none}
 
+        # ── Step 2: Strip code — only prose is eligible for intent detection ──
         try:
             code_spans = await self._f._code_blocks.get_code_spans(user_message)
         except Exception:
@@ -14439,197 +14473,35 @@ class CommandRouter:
             else user_message
         )
         if not prose or len(prose) < 3:
-            none = {"action": "none"}
             return {"forget": none, "remember": none, "obsolete": none}
 
-        context_parts = []
-        if code_spans or "```" in user_message:
-            context_parts.append("[CODE]")
-        context_prefix = " ".join(context_parts)
-        query = f"{context_prefix} {prose}" if context_parts else prose
-
-        candidates: List[Tuple[str, str, dict]] = [
-            (
-                "forget",
-                "The user wants to forget or discard the last code block mentioned.",
-                {"action": "forget_last"},
-            ),
-            (
-                "forget",
-                "The user wants to forget or discard all context and start fresh.",
-                {"action": "forget_all"},
-            ),
-            (
-                "forget",
-                "The user wants to forget or discard this specific code block or file.",
-                {"action": "forget_last"},
-            ),
-            (
-                "remember",
-                "The user wants to pin or remember the last code block so it is kept.",
-                {"action": "pin_last"},
-            ),
-            (
-                "remember",
-                "The user wants to pin or remember this specific code block.",
-                {"action": "pin_last"},
-            ),
-            (
-                "remember",
-                "The user wants to unpin or forget the last code block.",
-                {"action": "unpin_last"},
-            ),
-            (
-                "remember",
-                "The user wants to unpin or forget all pinned code blocks.",
-                {"action": "unpin_all"},
-            ),
-            (
-                "obsolete",
-                "The user wants to mark the last code block as obsolete or deprecated.",
-                {"action": "obsolete_last"},
-            ),
-            (
-                "obsolete",
-                "The user wants to mark all code blocks as obsolete.",
-                {"action": "obsolete_all"},
-            ),
-            (
-                "obsolete",
-                "The user wants to revive or unmark the last code block as obsolete.",
-                {"action": "revive_last"},
-            ),
-            (
-                "obsolete",
-                "The user wants to revive or unmark all code blocks as obsolete.",
-                {"action": "revive_all"},
-            ),
-            ("none", "The user is not requesting any action.", {"action": "none"}),
-        ]
-
-        pairs = [(query, desc) for _, desc, _ in candidates]
-        scores = await self._predict_cross_encoder(pairs)
-
-        none = {"action": "none"}
-        if scores is None:
-            # The CrossEncoder is unavailable (model not loaded, or the auxiliary
-            # server is down). Rather than fall back to the standalone heuristic
-            # — whose bare keyword matching is exactly the false-positive vector
-            # this cascade exists to avoid — default to no action. The heuristic
-            # is not a substitute decision-maker; without a CrossEncoder score to
-            # reinforce or hand to the LLM, the conservative choice is to do
-            # nothing and let the message reach the model normally.
-            self._f._log_debug(
-                "_parse_all_intents: CrossEncoder unavailable, defaulting to no action"
-            )
-            return {"forget": none, "remember": none, "obsolete": none}
-
-        scores_reinforced = list(scores)
-        h_weight = self._f.valves.heuristic_reinforcement_weight
-        content_lower = prose.lower()
-
-        # ── Step: heuristic reinforcement for code-referencing phrasing ──
-        # Boosts "_last" actions when the message names a code artifact
-        # ("this block", "ese archivo"), which correlates with genuine
-        # forget/pin/obsolete requests. This only nudges the CrossEncoder's
-        # own scores — it never decides on its own. Matched on word
-        # boundaries: a substring check here would fire on any identifier
-        # that happens to contain one of these words (e.g. "block" inside
-        # "build_block_b"), misclassifying an ordinary question about that
-        # symbol as a memory-management command.
-        _REINFORCEMENT_KEYWORDS = ("code", "block", "file", "hash", "func", "class")
-        if any(
-            re.search(rf"\b{re.escape(kw)}\b", content_lower)
-            for kw in _REINFORCEMENT_KEYWORDS
-        ):
-            for i, (category, _, action) in enumerate(candidates):
-                if action["action"] in (
-                    "forget_last",
-                    "pin_last",
-                    "obsolete_last",
-                    "revive_last",
-                ):
-                    scores_reinforced[i] += h_weight * 0.1
-
-        max_score = max(scores_reinforced)
-        second_max = (
-            sorted(scores_reinforced, reverse=True)[1]
-            if len(scores_reinforced) > 1
-            else 0
-        )
-        diff = max_score - second_max
-
-        CE_CONFIDENCE_THRESHOLD = self._f.valves.nl_intent_ce_threshold
-        LLM_FALLBACK_THRESHOLD = self._f.valves.nl_intent_llm_threshold
-
-        if diff >= CE_CONFIDENCE_THRESHOLD:
-            best: Dict[str, Tuple[float, dict]] = {}
-            for (category, _, action), score in zip(candidates, scores_reinforced):
-                if score > best.get(category, (-1.0, none))[0]:
-                    best[category] = (score, action)
-
-            result: Dict[str, dict] = {
-                "forget": none,
-                "remember": none,
-                "obsolete": none,
-            }
-            CONFIDENCE_THRESHOLD = 0.5
-            for category, (score, action) in best.items():
-                if score >= CONFIDENCE_THRESHOLD and action["action"] != "none":
-                    result[category] = action
-            return result
-
-        elif diff < LLM_FALLBACK_THRESHOLD:
-            self._f._log_debug(
-                f"_parse_all_intents: CrossEncoder uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
-                "using LLM with CrossEncoder context"
-            )
-            return await self._parse_all_intents_with_llm(
-                query, candidates, scores_reinforced, project_id
-            )
-
-        # ── Middle zone: neither confident nor uncertain enough ──
-        # A deliberate no-op. Using the standalone heuristic here would let
-        # bare keyword matching override a CrossEncoder score that landed
-        # close-but-not-quite, which is a strictly weaker signal.
-        self._f._log_debug(
-            f"_parse_all_intents: CE diff={diff:.2f} in middle zone "
-            f"(neither >= {CE_CONFIDENCE_THRESHOLD:.2f} nor < {LLM_FALLBACK_THRESHOLD:.2f}), "
-            "defaulting to no action"
-        )
-        return {"forget": none, "remember": none, "obsolete": none}
+        # ── Step 3: Delegate the full decision to the LLM (prose only) ──
+        return await self._parse_all_intents_with_llm(prose, project_id)
 
     async def _parse_all_intents_with_llm(
-        self,
-        query: str,
-        candidates: List[Tuple[str, str, dict]],
-        ce_scores: List[float],
-        project_id: str,
+        self, prose: str, project_id: str
     ) -> Dict[str, Any]:
         """
-        LLM fallback for natural language intent detection when the CrossEncoder
-        diff falls below nl_intent_llm_threshold.
+        LLM-only natural-language intent classifier.
 
-        Uses response_format={"type":"json_object"} and enable_thinking=False
-        for a clean structured answer. Falls back to the heuristic parser on
-        any parse failure.
+        Uses response_format={"type":"json_object"} and enable_thinking=False for
+        a clean structured answer with no reasoning preamble (which would consume
+        the token budget and truncate the JSON). Receives PROSE only — the caller
+        has already stripped any code. On empty output, unparseable JSON, or an
+        action outside the valid set, returns 'none': no heuristic fallback, since
+        keyword matching was the original false-positive vector this path exists
+        to eliminate.
 
         Args:
-            query: The user's message (truncated to 500 chars).
-            candidates: List of (category, description, meta) tuples.
-            ce_scores: CE score for each candidate (parallel list).
+            prose: The user's message with code spans already removed.
             project_id: Current project identifier, used for slot restoration.
 
         Returns:
             Dict[str, Any]: Intent dict with keys forget/remember/obsolete,
                             each containing {"action": <action_name>}.
         """
-        # Build the CE summary showing the top-3 candidates by score.
-        scored = sorted(zip(candidates, ce_scores), key=lambda x: x[1], reverse=True)
-        ce_block = "\n".join(
-            f"  {cat} (score: {score:.2f}) — {desc}"
-            for (cat, desc, _), score in scored[:3]
-        )
+        _NONE = {"action": "none"}
+        _RESULT_NONE = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
 
         _VALID_ACTIONS = {
             "forget_last",
@@ -14644,18 +14516,21 @@ class CommandRouter:
             "none",
         }
 
+        # ── Step 1: Build the classification prompt (prose only) ──
         prompt = (
-            f"CrossEncoder top candidates:\n{ce_block}\n\n"
-            f"User message:\n{query[:500]}\n\n"
+            f"User message:\n{prose[:500]}\n\n"
             f"Determine if the user wants to perform one of these memory actions:\n"
             f"  forget_last / forget_all      — remove code block(s) from context\n"
             f"  pin_last / unpin_last / unpin_all — keep or release a code block\n"
             f"  obsolete_last / obsolete_all  — mark code block(s) as obsolete\n"
             f"  revive_last / revive_all      — un-mark obsolete code block(s)\n"
             f"  none                          — no memory action intended\n\n"
+            f"Only classify explicit memory-management requests. An ordinary "
+            f"question or discussion about code is 'none'.\n\n"
             f'Output only the JSON object, e.g. {{"action": "forget_last"}}'
         )
 
+        # ── Step 2: LLM call (strict JSON, no thinking) ──
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -14674,97 +14549,45 @@ class CommandRouter:
             log_raw_response=False,
         )
 
-        # Restore the KV slot after any auxiliary LLM call.
+        # ── Step 3: Restore the KV slot after the auxiliary LLM call ──
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
-        _NONE = {"action": "none"}
-        _FALLBACK = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
-
+        # ── Step 4: Parse — any failure resolves to 'none', no fallback ──
         if not response:
             self._f._log_debug(
-                "_parse_all_intents_with_llm: empty response, falling back to heuristic"
+                "_parse_all_intents_with_llm: empty response, resolving to none"
             )
-            return await self._parse_all_intents_heuristic(query)
+            return _RESULT_NONE
 
         try:
             data = json.loads(response)
             action = str(data.get("action", "none")).strip().lower()
-
-            if action not in _VALID_ACTIONS:
-                self._f._log_debug(
-                    f"_parse_all_intents_with_llm: unknown action {action!r}, "
-                    f"falling back to heuristic"
-                )
-                return await self._parse_all_intents_heuristic(query)
-
-            result = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
-            if action.startswith("forget"):
-                result["forget"] = {"action": action}
-            elif action.startswith("pin") or action.startswith("unpin"):
-                result["remember"] = {"action": action}
-            elif action.startswith("obsolete") or action.startswith("revive"):
-                result["obsolete"] = {"action": action}
-
-            self._f._log_debug(f"_parse_all_intents_with_llm: action={action!r}")
-            return result
-
         except (json.JSONDecodeError, Exception):
             self._f._log_debug(
                 f"_parse_all_intents_with_llm: JSON parse error — "
-                f"response: {response[:200]!r}, falling back to heuristic"
+                f"response: {response[:200]!r}, resolving to none"
             )
-            return await self._parse_all_intents_heuristic(query)
+            return _RESULT_NONE
 
-    async def _parse_all_intents_heuristic(self, prose: str) -> Dict[str, Any]:
-        """
-        Last-resort keyword fallback for natural language intent detection.
+        if action not in _VALID_ACTIONS or action == "none":
+            if action not in _VALID_ACTIONS:
+                self._f._log_debug(
+                    f"_parse_all_intents_with_llm: unknown action {action!r}, "
+                    f"resolving to none"
+                )
+            return _RESULT_NONE
 
-        Used only when the CrossEncoder is entirely unavailable (no model
-        loaded) or when the LLM fallback fails to parse — never as part of
-        the normal confident/uncertain cascade in _parse_all_intents, where
-        a bare keyword match would be a weaker signal than a CrossEncoder
-        score that already had every chance to decide or escalate to the LLM.
+        # ── Step 5: Map the action to its intent category ──
+        result = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
+        if action.startswith("forget"):
+            result["forget"] = {"action": action}
+        elif action.startswith("pin") or action.startswith("unpin"):
+            result["remember"] = {"action": action}
+        elif action.startswith("obsolete") or action.startswith("revive"):
+            result["obsolete"] = {"action": action}
 
-        Keywords are matched on word boundaries so that a memory-management
-        term embedded inside an unrelated word or identifier (e.g. "pin"
-        inside "opinión", "block" inside a symbol like "build_block_b")
-        cannot trigger a false positive.
-        """
-        none = {"action": "none"}
-        result = {"forget": none, "remember": none, "obsolete": none}
-        content_lower = prose.lower()
-
-        def _has_keyword(keywords: Tuple[str, ...]) -> bool:
-            return any(
-                re.search(rf"\b{re.escape(kw)}\b", content_lower) for kw in keywords
-            )
-
-        if _has_keyword(("forget", "olvida", "olvid", "remove", "borra", "quita")):
-            if "all" in content_lower or "todo" in content_lower:
-                result["forget"] = {"action": "forget_all"}
-            else:
-                result["forget"] = {"action": "forget_last"}
-        elif _has_keyword(("pin", "fija", "remember", "recuerda", "keep", "mantén")):
-            if "all" in content_lower or "todo" in content_lower:
-                result["remember"] = {"action": "pin_all"}
-            else:
-                result["remember"] = {"action": "pin_last"}
-        elif _has_keyword(
-            (
-                "obsolete",
-                "obsoleto",
-                "deprecated",
-                "ya no",
-                "revive",
-                "revivir",
-            )
-        ):
-            if "all" in content_lower or "todo" in content_lower:
-                result["obsolete"] = {"action": "obsolete_all"}
-            else:
-                result["obsolete"] = {"action": "obsolete_last"}
-
+        self._f._log_debug(f"_parse_all_intents_with_llm: action={action!r}")
         return result
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -32077,6 +31900,47 @@ class SemanticSeedInferencer:
     # Region: Main Seed Inference Entry Point
     # ------------------------------------------------------------------
 
+    def _resolve_literal_seeds(self, query: str, project_id: str) -> Dict[str, float]:
+        """Seed symbols mentioned literally in the query, without LLM or fuzzy.
+
+        Only deterministic matches are accepted: a full qid present in the index,
+        or a bare name that resolves to exactly one qid (non-ambiguous). Fuzzy
+        matching is deliberately avoided — a common natural-language token must
+        not be able to seed spurious symbols. Returns {} when there is no reliable
+        literal mention, letting the flow fall through to the _should_infer gate
+        and the LLM.
+
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
+
+        Returns:
+            Dictionary mapping literally-mentioned qualified ids to the seed score.
+        """
+        # ── Step 1: Tokenize candidate identifiers ──
+        tokens = re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", query)
+        if not tokens:
+            return {}
+
+        # ── Step 2: Resolve exact (full qid, or bare name with a single match) ──
+        score = self._f.valves.seed_inference_score
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+        seeds: Dict[str, float] = {}
+        for tok in tokens:
+            # Full qualified id present verbatim in the index.
+            if tok in all_qids:
+                seeds[tok] = score
+                continue
+            # Bare name: only seed when it resolves unambiguously to one qid.
+            matches = {
+                q
+                for q in self._f._symbol_index.get_qualified_names_for(tok, project_id)
+                if q in all_qids
+            }
+            if len(matches) == 1:
+                seeds[next(iter(matches))] = score
+        return seeds
+
     async def infer_seeds(
         self,
         query: str,
@@ -32087,6 +31951,10 @@ class SemanticSeedInferencer:
     ) -> Dict[str, float]:
         """
         Return {qualified_id: seed_score} of symbols the LLM judges relevant.
+
+        Fast path: if the query mentions existing symbols literally (exact,
+        non-ambiguous resolution), they are seeded directly without invoking the
+        LLM. The LLM only runs for conceptual queries with no literal mention.
 
         Returns {} when:
           - slot is not free (AutoContinue active: no inference on parts).
@@ -32104,6 +31972,7 @@ class SemanticSeedInferencer:
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
         """
+        # ── Step 1: Entry guards ──
         if not slot_free:
             return {}
 
@@ -32115,10 +31984,22 @@ class SemanticSeedInferencer:
             )
             return {}
 
+        # ── Step 2: Fast path — literal exact resolution (no LLM) ──
+        direct_seeds = self._resolve_literal_seeds(query, project_id)
+        if direct_seeds:
+            sample = sorted(direct_seeds)[:8]
+            ellipsis = "..." if len(direct_seeds) > 8 else ""
+            self._f._log_debug(
+                f"SemanticSeedInferencer: {len(direct_seeds)} seed(s) resolved "
+                f"literally, LLM skipped → {sample}{ellipsis}"
+            )
+            return direct_seeds
+
+        # ── Step 3: Inference gate (CrossEncoder + heuristic) ──
         if not await self._should_infer(query, project_id, intent_vector, use_case):
             return {}
 
-        # Retrieve the skeleton (signatures only).
+        # ── Step 4: Retrieve the skeleton (signatures only) ──
         skeleton = await self._f._ctx_builder._get_skeleton_for_cot(project_id, query)
         if not skeleton.strip():
             self._f._log_debug("SemanticSeedInferencer: empty skeleton, cannot infer.")
@@ -32131,6 +32012,7 @@ class SemanticSeedInferencer:
 
         n = self._f.valves.seed_inference_max_symbols
 
+        # ── Step 5: Build prompt ──
         prompt = (
             f"Project skeleton (signatures only — no bodies):\n"
             f"```\n{skeleton}\n```\n\n"
@@ -32146,6 +32028,10 @@ class SemanticSeedInferencer:
             f'e.g. {{"symbols": ["ClassName.method", "other_fn"]}}'
         )
 
+        # ── Step 6: LLM call (strict JSON, thinking disabled) ──
+        # enable_thinking=False is the core fix: with thinking on, the model
+        # reasons in prose outside the JSON grammar, exhausts max_tokens, and is
+        # cut off by finish_reason=length before emitting the constrained JSON.
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -32161,7 +32047,7 @@ class SemanticSeedInferencer:
             temperature=0.0,
             label="seed_inference",
             response_format={"type": "json_object"},
-            enable_thinking=True,
+            enable_thinking=False,
             log_raw_response=False,
         )
 
@@ -32169,7 +32055,7 @@ class SemanticSeedInferencer:
             self._f._log_debug("SemanticSeedInferencer: LLM returned no response.")
             return {}
 
-        # Parse the JSON response and resolve tokens.
+        # ── Step 7: Parse response and resolve tokens ──
         tokens: List[str] = []
         try:
             data = json.loads(response)
@@ -32485,7 +32371,7 @@ class Filter:
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
-            default=28000,
+            default=50000,
             ge=0,
             description=(
                 "Value of llama.cpp's --keep (n_keep): the number of leading "
@@ -32838,7 +32724,7 @@ class Filter:
             description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
         )
         seed_inference_max_tokens: int = Field(
-            default=200,
+            default=350,
             ge=50,
             description="Token cap for the planner's response.",
         )
@@ -33096,51 +32982,6 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for use case classification.",
-        )
-        nl_intent_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for natural language intent detection.",
-        )
-        nl_intent_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for natural language intent detection.",
-        )
-        nl_intent_confidence_threshold: float = Field(
-            default=0.70,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Minimum sigmoid-normalized CrossEncoder confidence for a "
-                "natural-language memory action (forget/remember/obsolete) to "
-                "fire once the CrossEncoder is confident about the margin. "
-                "Distinct from nl_intent_ce_threshold / nl_intent_llm_threshold, "
-                "which gate the diff between candidates: this gates the absolute "
-                "confidence of the winning action. Replaces the former "
-                "hard-coded 0.5 raw-logit gate; because the score is passed "
-                "through a sigmoid first, this is an interpretable probability, "
-                "so a short technical question no longer trips a low-margin "
-                "forget/obsolete intent."
-            ),
-        )
-        nl_intent_interrogative_weight: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Additive reinforcement applied to the 'none' candidate when the "
-                "prose reads as a question or explanation request "
-                "(ReasoningEngine._looks_interrogative), mirroring "
-                "heuristic_reinforcement_weight for the code-keyword hint. A "
-                "message like 'cual es el proposito de build_block_b?' asks for "
-                "an answer, not a memory action; nudging 'none' upward lets it "
-                "win the margin or, failing that, pushes the decision into the "
-                "LLM tie-breaker instead of a false-positive action. Set to 0.0 "
-                "to disable the interrogative hint."
-            ),
         )
 
         # ── 7.6 Structural decisions (relevance, graph, paging, purge) ───────
