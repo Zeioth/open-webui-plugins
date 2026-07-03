@@ -26056,14 +26056,32 @@ class InletOrchestrator:
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. File handling
-    # ═══════════════════════════════════════════════════════════════════════════                    
+    # ═══════════════════════════════════════════════════════════════════════════
     _EXT_TO_LANG = {
-        "py": "python", "js": "javascript", "ts": "typescript",
-        "jsx": "jsx", "tsx": "tsx", "go": "go", "rs": "rust",
-        "java": "java", "cpp": "cpp", "cc": "cpp", "cxx": "cpp",
-        "c": "c", "h": "c", "hpp": "cpp", "rb": "ruby", "php": "php",
-        "sh": "bash", "sql": "sql", "json": "json", "yaml": "yaml",
-        "yml": "yaml", "toml": "toml", "html": "html", "css": "css",
+        "py": "python",
+        "js": "javascript",
+        "ts": "typescript",
+        "jsx": "jsx",
+        "tsx": "tsx",
+        "go": "go",
+        "rs": "rust",
+        "java": "java",
+        "cpp": "cpp",
+        "cc": "cpp",
+        "cxx": "cpp",
+        "c": "c",
+        "h": "c",
+        "hpp": "cpp",
+        "rb": "ruby",
+        "php": "php",
+        "sh": "bash",
+        "sql": "sql",
+        "json": "json",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "toml": "toml",
+        "html": "html",
+        "css": "css",
     }
 
     async def merge_pasted_files(self, body: dict, messages: list) -> list:
@@ -26097,16 +26115,12 @@ class InletOrchestrator:
             message (mutated in place and returned for convenience).
         """
         # ── Step 1: collect references from both locations, dedup by id ──
-        refs = (body.get("files") or []) + (
-            body.get("metadata", {}).get("files") or []
-        )
+        refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
         if not refs:
             return messages
 
         # ── Step 2: locate the last user message to append into ──
-        target = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
+        target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
         if target is None:
             return messages
 
@@ -26123,9 +26137,7 @@ class InletOrchestrator:
             seen_ids.add(file_id)
 
             name = (
-                finfo.get("filename")
-                or ref.get("name")
-                or f"attachment_{file_id[:8]}"
+                finfo.get("filename") or ref.get("name") or f"attachment_{file_id[:8]}"
             )
             content = self._read_uploaded_file(finfo.get("path"))
             if not content:
@@ -26134,7 +26146,7 @@ class InletOrchestrator:
                     f"(id={file_id[:8]}), skipping"
                 )
                 continue
-            merged_blocks.append(self._format_pasted_file(name, content))
+            merged_blocks.append(await self._format_pasted_file(name, content))
 
         if not merged_blocks:
             return messages
@@ -26175,7 +26187,7 @@ class InletOrchestrator:
             self._f._log_debug(f"_read_uploaded_file: {path!r} → {exc}")
             return ""
 
-    def _format_pasted_file(self, name: str, content: str) -> str:
+    async def _format_pasted_file(self, name: str, content: str) -> str:
         """Format one attached file as a labelled, optionally fenced block.
 
         The real filename becomes a header line so the user and the model can
@@ -26185,6 +26197,9 @@ class InletOrchestrator:
         a content heuristic for generic extensions such as the .txt that pasted
         text always produces. Prose is left unfenced so the code-vs-prose
         machinery downstream does not misread it as code.
+
+        Async because the content-heuristic fallback (_is_likely_code) is an
+        async static method.
 
         Args:
             name: The real filename of the attachment.
@@ -26205,14 +26220,13 @@ class InletOrchestrator:
         elif ext in ("md", "rst", "log", "csv"):
             fenced, fence_lang = False, ""
         else:
-            fenced, fence_lang = CodeBlockManager._is_likely_code(content), ""
+            fenced, fence_lang = await CodeBlockManager._is_likely_code(content), ""
 
         # ── Step 3: assemble header + body ──
         body_text = content.rstrip()
         if fenced:
             return f"{name}\n```{fence_lang}\n{body_text}\n```"
-        return f"{name}\n{body_text}"            
-        
+        return f"{name}\n{body_text}"
 
 
 class SystemPromptBuilder:
@@ -34498,7 +34512,7 @@ class Filter:
 
         # --- File handling ---
         self.file_handler = True
-        
+
         print("[CodeAware] Filter loaded")
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -34906,12 +34920,6 @@ class Filter:
             inlet_start = time.monotonic()
             self._log_section("CONTEXT MANAGER - INLET START")
 
-            # NOTA: BORRAME. LOG TEMPORAL.
-            self._log_debug(
-                f"FILES meta={body.get('metadata', {}).get('files')} "
-                f"top={body.get('files')}"
-            )
-
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
             # ------------------------------------------------------------------
@@ -35033,7 +35041,7 @@ class Filter:
             # 🔥 STATE MANAGEMENT
             # 0. File extraction
             messages = await self._inlet_orch.merge_pasted_files(body, messages)
-            
+
             # 🔥 STATE MANAGEMENT
             #   2. Extract user info
             # ----------------------------------------------------------------
