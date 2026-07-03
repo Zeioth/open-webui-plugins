@@ -26054,6 +26054,166 @@ class InletOrchestrator:
                         wait=False,
                     )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. File handling
+    # ═══════════════════════════════════════════════════════════════════════════                    
+    _EXT_TO_LANG = {
+        "py": "python", "js": "javascript", "ts": "typescript",
+        "jsx": "jsx", "tsx": "tsx", "go": "go", "rs": "rust",
+        "java": "java", "cpp": "cpp", "cc": "cpp", "cxx": "cpp",
+        "c": "c", "h": "c", "hpp": "cpp", "rb": "ruby", "php": "php",
+        "sh": "bash", "sql": "sql", "json": "json", "yaml": "yaml",
+        "yml": "yaml", "toml": "toml", "html": "html", "css": "css",
+    }
+
+    async def merge_pasted_files(self, body: dict, messages: list) -> list:
+        """Splice attached-file content into the last user message before detection.
+
+        OpenWebUI's "Paste Large Text as File" (and any attachment in full-context
+        mode) hands the filter only a *reference* at inlet time — id, name, and an
+        on-disk uploads path — never the text (file.data and file.meta.data are
+        empty). This reads each file from its path and appends it to the last user
+        message as a labelled, optionally fenced block, so the whole existing
+        pipeline — is_code_only_message, code-span extraction, ActiveCodeUpdater
+        symbol indexing — sees it exactly as if the user had pasted it inline.
+
+        The merge is faithful, not smart: it does not pre-classify a file as code
+        or prose. Fencing is decided by the real extension (which also yields the
+        fence language) and, for generic extensions like the .txt that pasted text
+        always produces, by a cheap content heuristic. Whether a block is treated
+        as code or prose is left to the downstream machinery that already makes
+        that call, so mixed-content files need no special handling.
+
+        Runs at maximum priority (before user-info extraction) so the merged
+        content is present for every downstream detection step.
+
+        Args:
+            body: The inlet request body; file references live in body["files"]
+                and body["metadata"]["files"].
+            messages: The current message list.
+
+        Returns:
+            The message list with pasted-file content merged into the last user
+            message (mutated in place and returned for convenience).
+        """
+        # ── Step 1: collect references from both locations, dedup by id ──
+        refs = (body.get("files") or []) + (
+            body.get("metadata", {}).get("files") or []
+        )
+        if not refs:
+            return messages
+
+        # ── Step 2: locate the last user message to append into ──
+        target = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if target is None:
+            return messages
+
+        # ── Step 3: read and format each file, skipping the unreadable ──
+        merged_blocks: List[str] = []
+        seen_ids: set = set()
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            finfo = ref.get("file", {}) or {}
+            file_id = finfo.get("id") or ref.get("id")
+            if not file_id or file_id in seen_ids:
+                continue
+            seen_ids.add(file_id)
+
+            name = (
+                finfo.get("filename")
+                or ref.get("name")
+                or f"attachment_{file_id[:8]}"
+            )
+            content = self._read_uploaded_file(finfo.get("path"))
+            if not content:
+                self._f._log_debug(
+                    f"merge_pasted_files: unreadable '{name}' "
+                    f"(id={file_id[:8]}), skipping"
+                )
+                continue
+            merged_blocks.append(self._format_pasted_file(name, content))
+
+        if not merged_blocks:
+            return messages
+
+        # ── Step 4: append after the user's own text ──
+        # Appending (not prepending) keeps any question at the message head, so
+        # the head-based intent guards in is_code_only_message still fire.
+        original = (target.get("content", "") or "").rstrip()
+        joined = "\n\n".join(merged_blocks)
+        target["content"] = f"{original}\n\n{joined}" if original else joined
+        self._f._log_debug(
+            f"merge_pasted_files: merged {len(merged_blocks)} file(s) "
+            f"into last user message"
+        )
+        return messages
+
+    def _read_uploaded_file(self, path: Optional[str]) -> str:
+        """Read an uploaded file's raw text from its on-disk uploads path.
+
+        The filter runs inside the Open WebUI process, so the container path in
+        the file reference (/app/backend/data/uploads/...) is directly readable.
+        Decoding errors are replaced rather than raised: pasted text is always
+        UTF-8 text/plain, but arbitrary uploads may not be. Returns "" on any
+        failure so the caller can skip the file cleanly.
+
+        Args:
+            path: Absolute uploads path from the file reference, or None.
+
+        Returns:
+            The file's text content, or "" if it could not be read.
+        """
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception as exc:
+            self._f._log_debug(f"_read_uploaded_file: {path!r} → {exc}")
+            return ""
+
+    def _format_pasted_file(self, name: str, content: str) -> str:
+        """Format one attached file as a labelled, optionally fenced block.
+
+        The real filename becomes a header line so the user and the model can
+        refer to the file by name, and so extract_file_path_for_block can resolve
+        a file_path when the name carries a code extension. Fencing is decided by
+        extension first — which also selects the fence language — falling back to
+        a content heuristic for generic extensions such as the .txt that pasted
+        text always produces. Prose is left unfenced so the code-vs-prose
+        machinery downstream does not misread it as code.
+
+        Args:
+            name: The real filename of the attachment.
+            content: The file's text content.
+
+        Returns:
+            A single string: header line plus the optionally fenced content.
+        """
+        # ── Step 1: resolve fence language from the extension ──
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        lang = self._EXT_TO_LANG.get(ext)
+
+        # ── Step 2: decide fencing ──
+        # Known code extension → fence with its language. Known prose extension →
+        # no fence. Ambiguous (.txt, none, unknown) → decide by content.
+        if lang is not None:
+            fenced, fence_lang = True, lang
+        elif ext in ("md", "rst", "log", "csv"):
+            fenced, fence_lang = False, ""
+        else:
+            fenced, fence_lang = CodeBlockManager._is_likely_code(content), ""
+
+        # ── Step 3: assemble header + body ──
+        body_text = content.rstrip()
+        if fenced:
+            return f"{name}\n```{fence_lang}\n{body_text}\n```"
+        return f"{name}\n{body_text}"            
+        
+
 
 class SystemPromptBuilder:
     """Assembles the complete system prompt from two layers: a stable,
@@ -32495,7 +32655,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -32541,15 +32701,15 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -32805,7 +32965,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
         )
         path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
@@ -33454,15 +33614,15 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
 
@@ -33511,7 +33671,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -33568,7 +33728,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_rebuild_interval: int = Field(default=20)
@@ -33683,11 +33843,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
+            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
             description="Fallback model for summarization when the primary model is unavailable.",
         )
 
@@ -34336,6 +34496,9 @@ class Filter:
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
 
+        # --- File handling ---
+        self.file_handler = True
+        
         print("[CodeAware] Filter loaded")
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -34733,6 +34896,7 @@ class Filter:
         _build_activated_code() → build_block_b(), so the rest of the turn
         reuses this single classification.
         """
+
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
         # ------------------------------------------------------------------
@@ -34741,6 +34905,12 @@ class Filter:
             self._log_debug("inlet called")
             inlet_start = time.monotonic()
             self._log_section("CONTEXT MANAGER - INLET START")
+
+            # NOTA: BORRAME. LOG TEMPORAL.
+            self._log_debug(
+                f"FILES meta={body.get('metadata', {}).get('files')} "
+                f"top={body.get('files')}"
+            )
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
@@ -34860,6 +35030,10 @@ class Filter:
             )
             _inlet_timing("Step 0/6: Process previous assistant turn", step_start)
 
+            # 🔥 STATE MANAGEMENT
+            # 0. File extraction
+            messages = await self._inlet_orch.merge_pasted_files(body, messages)
+            
             # 🔥 STATE MANAGEMENT
             #   2. Extract user info
             # ----------------------------------------------------------------
