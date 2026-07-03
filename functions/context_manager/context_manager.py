@@ -16124,7 +16124,7 @@ class CodeBlockManager:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         return "\n".join(lines)
-    
+
     async def extract_code_blocks(
         self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
@@ -24600,20 +24600,50 @@ class ActiveCodeUpdater:
         Dict[str, List["CodeSymbol"]],
         List[dict],
     ]:
-        """Extract code blocks from content, build CodeBlock objects, and extract symbols."""
+        """Extract code blocks from content, build CodeBlock objects, and pair each with its symbols.
+
+        Blocks come from CodeBlockManager.extract_code_blocks, which may return
+        them via one of two channels: the pre-extracted path (Section 0/1 — blocks
+        that already carry precomputed_symbols and a resolved file_path, e.g. from
+        attached files parsed on raw bytes) or the markdown-parsing path. This
+        method is agnostic to which channel produced them:
+
+          * file_path — a block that arrives with its own file_path (pre-resolved
+            upstream) is trusted as-is. Only when it is absent does this fall back
+            to scanning backwards from the block's span for a path pattern, or to
+            the single-block whole-content guess. This matters because pre-extracted
+            blocks carry dummy spans, so the span-based scan cannot resolve them.
+          * symbols — a block that arrives with precomputed_symbols reuses them
+            directly (they were parsed from clean raw source with aligned line
+            numbers); otherwise symbols are extracted from the block content here.
+
+        Args:
+            content: The raw message content the blocks were extracted from.
+            role: "user" or "assistant"; sets generated_by_assistant on each block.
+
+        Returns:
+            Tuple of (new CodeBlock objects, per-block symbol lists, a
+            content→symbols map, and the raw extracted-block dicts).
+        """
+        # ── Step 1: extract raw blocks and their spans ──
         extracted_blocks, block_spans = await self._f._code_blocks.extract_code_blocks(
             content
         )
+
+        # ── Step 2: build a CodeBlock per extracted block ──
         new_blocks_pending = []
         for idx, block_info in enumerate(extracted_blocks):
-            blk_file = None
-            if self._f.valves.track_file_paths and block_spans:
+            # Prefer a file_path resolved upstream (pre-extracted channel); only
+            # fall back to span-scan / whole-content guess when it is absent.
+            blk_file = block_info.get("file_path")
+            if not blk_file and self._f.valves.track_file_paths and block_spans:
                 blk_file = self._f._code_blocks.extract_file_path_for_block(
                     content, block_spans[idx][0]
                 )
             if not blk_file and len(extracted_blocks) == 1:
                 extracted_paths = self._f._code_blocks.extract_file_paths(content)
                 blk_file = extracted_paths[0] if extracted_paths else None
+
             content_type = self._f._code_blocks.classify_content(
                 content, extracted_blocks
             )
@@ -24636,6 +24666,8 @@ class ActiveCodeUpdater:
                 new_block.importance_score = 10.0
                 new_block.pinned = True
             new_blocks_pending.append(new_block)
+
+        # ── Step 3: pair each block with its symbols (reuse precomputed) ──
         symbols_list = []
         for idx, (blk, block_info) in enumerate(
             zip(new_blocks_pending, extracted_blocks)
@@ -24648,6 +24680,8 @@ class ActiveCodeUpdater:
                     blk.content, blk.file_path
                 )
             symbols_list.append(syms)
+
+        # ── Step 4: map block content → symbols (skip failed extractions) ──
         content_to_syms: Dict[str, List[CodeSymbol]] = {
             blk.content: syms
             for blk, syms in zip(new_blocks_pending, symbols_list)
@@ -26129,85 +26163,6 @@ class InletOrchestrator:
         "css": "css",
     }
 
-    async def merge_pasted_files(self, body: dict, messages: list) -> list:
-        """Splice attached-file content into the last user message before detection.
-
-        OpenWebUI's "Paste Large Text as File" (and any attachment in full-context
-        mode) hands the filter only a *reference* at inlet time — id, name, and an
-        on-disk uploads path — never the text (file.data and file.meta.data are
-        empty). This reads each file from its path and appends it to the last user
-        message as a labelled, optionally fenced block, so the whole existing
-        pipeline — is_code_only_message, code-span extraction, ActiveCodeUpdater
-        symbol indexing — sees it exactly as if the user had pasted it inline.
-
-        The merge is faithful, not smart: it does not pre-classify a file as code
-        or prose. Fencing is decided by the real extension (which also yields the
-        fence language) and, for generic extensions like the .txt that pasted text
-        always produces, by a cheap content heuristic. Whether a block is treated
-        as code or prose is left to the downstream machinery that already makes
-        that call, so mixed-content files need no special handling.
-
-        Runs at maximum priority (before user-info extraction) so the merged
-        content is present for every downstream detection step.
-
-        Args:
-            body: The inlet request body; file references live in body["files"]
-                and body["metadata"]["files"].
-            messages: The current message list.
-
-        Returns:
-            The message list with pasted-file content merged into the last user
-            message (mutated in place and returned for convenience).
-        """
-        # ── Step 1: collect references from both locations, dedup by id ──
-        refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
-        if not refs:
-            return messages
-
-        # ── Step 2: locate the last user message to append into ──
-        target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-        if target is None:
-            return messages
-
-        # ── Step 3: read and format each file, skipping the unreadable ──
-        merged_blocks: List[str] = []
-        seen_ids: set = set()
-        for ref in refs:
-            if not isinstance(ref, dict):
-                continue
-            finfo = ref.get("file", {}) or {}
-            file_id = finfo.get("id") or ref.get("id")
-            if not file_id or file_id in seen_ids:
-                continue
-            seen_ids.add(file_id)
-
-            name = (
-                finfo.get("filename") or ref.get("name") or f"attachment_{file_id[:8]}"
-            )
-            content = self._read_uploaded_file(finfo.get("path"))
-            if not content:
-                self._f._log_debug(
-                    f"merge_pasted_files: unreadable '{name}' "
-                    f"(id={file_id[:8]}), skipping"
-                )
-                continue
-            merged_blocks.append(await self._format_pasted_file(name, content))
-
-        if not merged_blocks:
-            return messages
-
-        # ── Step 4: append after the user's own text ──
-        # Appending (not prepending) keeps any question at the message head, so
-        # the head-based intent guards in is_code_only_message still fire.
-        original = (target.get("content", "") or "").rstrip()
-        joined = "\n\n".join(merged_blocks)
-        target["content"] = f"{original}\n\n{joined}" if original else joined
-        self._f._log_debug(
-            f"merge_pasted_files: merged {len(merged_blocks)} file(s) "
-            f"into last user message"
-        )
-        return messages
-
     def _read_uploaded_file(self, path: Optional[str]) -> str:
         """Read an uploaded file's raw text from its on-disk uploads path.
 
@@ -26232,46 +26187,201 @@ class InletOrchestrator:
             self._f._log_debug(f"_read_uploaded_file: {path!r} → {exc}")
             return ""
 
-    async def _format_pasted_file(self, name: str, content: str) -> str:
-        """Format one attached file as a labelled, optionally fenced block.
+    async def _resolve_pasted_fence(self, name: str, content: str) -> Tuple[bool, str]:
+        """Decide whether an attachment is code (to be fenced) and its language.
 
-        The real filename becomes a header line so the user and the model can
-        refer to the file by name, and so extract_file_path_for_block can resolve
-        a file_path when the name carries a code extension. Fencing is decided by
-        extension first — which also selects the fence language — falling back to
-        a content heuristic for generic extensions such as the .txt that pasted
-        text always produces. Prose is left unfenced so the code-vs-prose
-        machinery downstream does not misread it as code.
+        Extension first — which also names the fence language — falling back to a
+        content heuristic for generic extensions such as the .txt that pasted text
+        always produces. Known prose extensions are never treated as code.
 
-        Async because the content-heuristic fallback (_is_likely_code) is an
-        async static method.
+        Returns:
+            (is_code, fence_language). fence_language is "" for code of unknown
+            language and is unused when is_code is False.
+        """
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        lang = self._EXT_TO_LANG.get(ext)
+        if lang is not None:
+            return True, lang
+        if ext in ("md", "rst", "log", "csv"):
+            return False, ""
+        return await CodeBlockManager._is_likely_code(content), ""
+
+    async def _extract_symbols_from_raw(
+        self, content: str, file_path: str, fence_lang: str
+    ) -> Tuple[List["CodeSymbol"], str]:
+        """Extract symbols from raw source text, bypassing markdown entirely.
+
+        The content is the raw file bytes — never fenced — so the strict parser
+        (ast.parse for Python) consumes it directly and a file that itself
+        contains ``` cannot corrupt anything. The language comes from the
+        extension hint, falling back to a content guess and finally python, so a
+        generic .txt paste of real code is parsed instead of being rejected as an
+        unknown language. Symbols are enriched against the same raw text, so their
+        line numbers stay aligned with it (and with the block that will store it).
+
+        Args:
+            content: Raw source text of the file.
+            file_path: The file's name, used as a detection hint.
+            fence_lang: Language resolved from the extension, or "" if unknown.
+
+        Returns:
+            Tuple of (symbols, resolved_language). symbols may be empty.
+        """
+        # ── Step 1: resolve a concrete language for the parser ──
+        lang = fence_lang
+        if not lang or lang == "text":
+            lang = SignatureExtractor._guess_language(file_path, content)
+        if not lang or lang == "unknown":
+            lang = "python"
+
+        # ── Step 2: parse the raw bytes and enrich with parent-class context ──
+        symbols = await SignatureExtractor.extract_async(
+            content, file_path, language=lang
+        )
+        if symbols:
+            symbols = SignatureExtractor.enrich_symbols_with_parent_info(
+                symbols, content
+            )
+        return symbols, lang
+
+    def _format_pasted_file(
+        self, name: str, content: str, is_code: bool, fence_lang: str
+    ) -> str:
+        """Render one attachment as a labelled block for the message text.
+
+        The filename becomes a header line so the user and the model can refer to
+        the file by name. Code is fenced (for readability and is_code_only's
+        structural detection); prose is left as plain labelled text. The fence
+        length adapts to the content — a source file may contain triple-backtick
+        runs that would close a plain ``` fence early and corrupt the rendered
+        block, so the opener is sized to one more than the longest backtick run
+        inside. This fence is purely presentational: symbol extraction happens on
+        the raw bytes via the side channel, never on this fenced text.
 
         Args:
             name: The real filename of the attachment.
             content: The file's text content.
+            is_code: Whether to fence the content as code.
+            fence_lang: Fence language tag (may be "").
 
         Returns:
-            A single string: header line plus the optionally fenced content.
+            The header line plus the optionally fenced content.
         """
-        # ── Step 1: resolve fence language from the extension ──
-        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        lang = self._EXT_TO_LANG.get(ext)
-
-        # ── Step 2: decide fencing ──
-        # Known code extension → fence with its language. Known prose extension →
-        # no fence. Ambiguous (.txt, none, unknown) → decide by content.
-        if lang is not None:
-            fenced, fence_lang = True, lang
-        elif ext in ("md", "rst", "log", "csv"):
-            fenced, fence_lang = False, ""
-        else:
-            fenced, fence_lang = await CodeBlockManager._is_likely_code(content), ""
-
-        # ── Step 3: assemble header + body ──
         body_text = content.rstrip()
-        if fenced:
-            return f"{name}\n```{fence_lang}\n{body_text}\n```"
-        return f"{name}\n{body_text}"
+        if not is_code:
+            return f"{name}\n{body_text}"
+
+        # ── Size the fence to outlast any backtick run inside the content ──
+        longest_run = 0
+        current_run = 0
+        for ch in body_text:
+            if ch == "`":
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0
+        fence = "`" * max(3, longest_run + 1)
+        return f"{name}\n{fence}{fence_lang}\n{body_text}\n{fence}"
+
+    async def merge_pasted_files(self, body: dict, messages: list) -> list:
+        """Splice attached-file content into the last user message and pre-extract symbols.
+
+        OpenWebUI hands the filter only a reference at inlet time — id, name, and
+        an on-disk uploads path — never the text. This reads each file from its
+        path, appends it to the last user message as a labelled block (so the LLM
+        sees it and is_code_only_message can detect it), and — crucially — for
+        code files extracts symbols from the RAW bytes and stashes them per file
+        on pstate["merged_file_blocks"]. That side channel is consumed by
+        extract_code_blocks (Section 0) for both silent ingestion and the normal
+        pipeline, so downstream indexing never re-parses the fenced message —
+        which is essential because a source file may contain ``` that would break
+        every markdown parse.
+
+        The merge stays faithful, not smart: code-vs-prose is decided per file by
+        extension then content heuristic, and mixed files are handled by the
+        existing downstream machinery. Runs at maximum priority (before user-info
+        extraction) so the content and symbols are ready for every later step.
+
+        Args:
+            body: The inlet request body; file references live in body["files"]
+                and body["metadata"]["files"].
+            messages: The current message list.
+
+        Returns:
+            The message list with attachment content merged into the last user
+            message (mutated in place and returned for convenience).
+        """
+        # ── Step 1: clear any stale side-channel entry from a prior turn ──
+        pstate = self._f._project_state_manager.get_pstate(self.get_project_id())
+        pstate["merged_file_blocks"] = None
+
+        # ── Step 2: collect references from both locations, dedup by id ──
+        refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
+        if not refs:
+            return messages
+        target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if target is None:
+            return messages
+
+        # ── Step 3: read, render, and pre-extract each file ──
+        merged_text: List[str] = []
+        merged_file_blocks: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            finfo = ref.get("file", {}) or {}
+            file_id = finfo.get("id") or ref.get("id")
+            if not file_id or file_id in seen_ids:
+                continue
+            seen_ids.add(file_id)
+
+            name = (
+                finfo.get("filename") or ref.get("name") or f"attachment_{file_id[:8]}"
+            )
+            content = self._read_uploaded_file(finfo.get("path"))
+            if not content:
+                self._f._log_debug(
+                    f"merge_pasted_files: unreadable '{name}' "
+                    f"(id={file_id[:8]}), skipping"
+                )
+                continue
+
+            is_code, fence_lang = await self._resolve_pasted_fence(name, content)
+            merged_text.append(
+                self._format_pasted_file(name, content, is_code, fence_lang)
+            )
+            if is_code:
+                symbols, lang = await self._extract_symbols_from_raw(
+                    content, name, fence_lang
+                )
+                if symbols:
+                    merged_file_blocks.append(
+                        {
+                            "file_path": name,
+                            "raw_code": content,
+                            "symbols": symbols,
+                            "language": lang,
+                        }
+                    )
+
+        if not merged_text:
+            return messages
+
+        # ── Step 4: append after the user's own text (question stays at head) ──
+        original = (target.get("content", "") or "").rstrip()
+        joined = "\n\n".join(merged_text)
+        target["content"] = f"{original}\n\n{joined}" if original else joined
+
+        # ── Step 5: publish pre-extracted symbols on the side channel ──
+        if merged_file_blocks:
+            pstate["merged_file_blocks"] = merged_file_blocks
+
+        self._f._log_debug(
+            f"merge_pasted_files: merged {len(merged_text)} file(s), "
+            f"pre-extracted symbols for {len(merged_file_blocks)}"
+        )
+        return messages
 
 
 class SystemPromptBuilder:
@@ -30552,9 +30662,12 @@ class ProjectStateManager:
             # -- Call-graph mode ------------------------------------------
             "resolved_call_graph_mode": None,
             "current_call_graph_mode": None,
-            # -- Silent ingestion -----------------------------------------
+            # -- Ingestion -----------------------------------------
             "ingested_lang": None,
             "raw_ingested_symbols": None,
+            "ingested_lang": None,
+            "raw_ingested_symbols": None,
+            "merged_file_blocks": None,
             # -- Block A / skeleton cache ---------------------------------
             "block_a_cache_key": None,
             "block_a_cached": None,
@@ -35233,29 +35346,38 @@ class Filter:
                     pstate_local = self._project_state_manager.get_pstate(project_id)
 
                     # -- pull raw code out of the markdown fences --------------
-                    # is_code_only_message classified this as code, but the
-                    # message still carries fence markers and (for merged
-                    # attachments) a filename header. Feeding that straight to
-                    # extract_async makes the strict Python AST parser choke on
-                    # the non-code lines and return nothing. Extract the inner
-                    # code from each fenced span first; fall back to the raw text
-                    # when no fence is present (a bare, unfenced paste).
                     _code_for_extraction = user_query
+                    self._log_debug(
+                        f"DIAG: user_query={len(user_query)} chars, "
+                        f"triple-backtick runs={user_query.count(chr(96)*3)}"
+                    )
                     try:
                         _spans = await self._code_blocks.get_code_spans(user_query)
+                        self._log_debug(
+                            f"DIAG: get_code_spans → {len(_spans)} span(s): {_spans[:5]}"
+                        )
                         if _spans:
                             _code_for_extraction = "\n\n".join(
                                 CodeBlockManager._strip_fence_markers(user_query[s:e])
                                 for s, e in _spans
                             )
-                    except Exception:
+                    except Exception as _e:
+                        self._log_debug(f"DIAG: get_code_spans raised {_e!r}")
                         _code_for_extraction = user_query
+
+                    self._log_debug(
+                        f"DIAG: _code_for_extraction={len(_code_for_extraction)} chars, "
+                        f"head={_code_for_extraction[:150]!r}"
+                    )
 
                     # -- detect language and pre-extract symbols ---------------
                     _guessed_lang = SignatureExtractor._guess_language(
                         None, _code_for_extraction
                     )
                     _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                    self._log_debug(
+                        f"DIAG: guessed_lang={_guessed_lang!r} → using {_lang!r}"
+                    )
                     pstate_local["ingested_lang"] = _lang
 
                     raw_symbols = []
@@ -35264,8 +35386,12 @@ class Filter:
                             raw_symbols = await SignatureExtractor.extract_async(
                                 _code_for_extraction, None, language=_lang
                             )
-                        except Exception:
+                        except Exception as _e:
+                            self._log_debug(f"DIAG: extract_async raised {_e!r}")
                             raw_symbols = []
+                    self._log_debug(
+                        f"DIAG: extract_async → {len(raw_symbols)} symbol(s)"
+                    )
 
                     if raw_symbols:
                         raw_symbols = (
