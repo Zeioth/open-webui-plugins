@@ -13936,12 +13936,27 @@ class CommandRouter:
     ) -> Optional[str]:
         """
         Check if the last user message contradicts recent conversation history.
+
+        LLM-only. The CrossEncoder and keyword heuristic were removed from this
+        path. Detecting whether a message contradicts *anything* across the whole
+        history is presence detection against an unbounded background — the "no
+        contradiction" class is everything that isn't a contradiction — which is
+        exactly where a reranker fails: its scores for an ordinary clarification
+        ("no, I meant the other function") sat close to the action threshold, and
+        the keyword boost on words like "no"/"not"/"but" pushed benign messages
+        over it, injecting a false contradiction warning into the prompt. The
+        judgement is delegated entirely to the LLM, which reads the actual
+        semantic relationship. On any failure the result is None (no warning):
+        a missed contradiction is silent and harmless; a false one pollutes the
+        model's context.
+
         Returns a warning string if a contradiction is detected, else None.
 
         Args:
             messages: The list of conversation messages.
-            project_id: The current project identifier (used for slot restoration if needed).
+            project_id: The current project identifier (used for slot restoration).
         """
+        # ── Step 1: Entry guards ──
         if not self._f.valves.enable_contradiction_detection or len(messages) < 3:
             return None
 
@@ -13961,98 +13976,47 @@ class CommandRouter:
         if not history_text.strip():
             return None
 
+        # ── Step 2: Delegate the full decision to the LLM ──
         hist = history_text[-8000:]
         new_msg = last_user["content"]
-
-        # Heuristic reinforcement
-        content_lower = new_msg.lower()
-        contradiction_keywords = (
-            "but",
-            "actually",
-            "instead",
-            "wait",
-            "no",
-            "not",
-            "error",
-            "wrong",
-            "correction",
-        )
-        h_weight = self._f.valves.heuristic_reinforcement_weight
-        heuristic_boost = (
-            0.2 if any(kw in content_lower for kw in contradiction_keywords) else 0.0
-        )
-
-        pairs = [
-            (
-                f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message directly contradicts a specific previous statement or decision in the conversation.",
-            ),
-            (
-                f"History: {hist}\n\nNew message: {new_msg}",
-                "The new message is consistent with and builds upon the previous conversation history.",
-            ),
-        ]
-        scores = await self._predict_cross_encoder(pairs)
-
-        if scores is None or len(scores) < 2:
-            return None
-
-        scores_reinforced = list(scores)
-        scores_reinforced[0] += h_weight * heuristic_boost
-
-        diff = scores_reinforced[0] - scores_reinforced[1]
-        CE_CONFIDENCE_THRESHOLD = self._f.valves.contradiction_ce_threshold
-        LLM_FALLBACK_THRESHOLD = self._f.valves.contradiction_llm_threshold
-
-        if diff >= CE_CONFIDENCE_THRESHOLD:
-            if scores_reinforced[0] > scores_reinforced[1]:
-                return (
-                    "⚠️ **Contradiction detected**: The last message appears to contradict something established earlier. "
-                    "Please review and clarify if needed."
-                )
-            return None
-
-        elif diff < LLM_FALLBACK_THRESHOLD:
-            # LLM fallback
-            return await self._detect_contradictions_with_llm(
-                hist, new_msg, scores_reinforced, project_id
-            )
-
-        return None
+        return await self._detect_contradictions_with_llm(hist, new_msg, project_id)
 
     async def _detect_contradictions_with_llm(
         self,
         history: str,
         new_msg: str,
-        ce_scores: List[float],
         project_id: str,
     ) -> Optional[str]:
         """
-        LLM fallback for contradiction detection when the CrossEncoder diff
-        falls below contradiction_llm_threshold.
+        LLM-only contradiction classifier.
 
-        Uses response_format={"type":"json_object"} and enable_thinking=False
-        for a clean structured answer with no reasoning preamble.
+        Uses response_format={"type":"json_object"} and enable_thinking=False for
+        a clean structured answer with no reasoning preamble (which would consume
+        the token budget and truncate the JSON). Returns None on empty output or
+        unparseable JSON — no fallback, since the removed CrossEncoder/keyword
+        path was the false-positive vector this rewrite exists to eliminate.
 
         Args:
             history: Excerpt of the conversation history (truncated to 1500 chars).
             new_msg: The new user message to check (truncated to 500 chars).
-            ce_scores: [contradiction_score, consistent_score] from the CrossEncoder.
             project_id: Current project identifier, used for slot restoration.
 
         Returns:
             Optional[str]: A warning string if a contradiction is detected,
                            or None if the message is consistent.
         """
+        # ── Step 1: Build the classification prompt ──
         prompt = (
-            f"CrossEncoder scores — contradiction: {ce_scores[0]:.2f}, "
-            f"consistent: {ce_scores[1]:.2f}\n\n"
             f"Conversation history (excerpt):\n{history[:1500]}\n\n"
             f"New message:\n{new_msg[:500]}\n\n"
-            f"Does the new message contradict something established in the history?\n"
+            f"Does the new message contradict a specific statement or decision "
+            f"established earlier in the history? A correction, clarification, or "
+            f"change of mind is NOT a contradiction unless it conflicts with "
+            f"something the user previously asserted as settled.\n"
             f'Output {{"contradiction": true}} if yes, {{"contradiction": false}} if no.'
         )
 
+        # ── Step 2: LLM call (strict JSON, no thinking) ──
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -14069,28 +14033,29 @@ class CommandRouter:
             log_raw_response=False,
         )
 
-        # Restore the KV slot after any auxiliary LLM call.
+        # ── Step 3: Restore the KV slot after the auxiliary LLM call ──
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
+        # ── Step 4: Parse — any failure resolves to None, no fallback ──
         if not response:
             return None
-
         try:
             data = json.loads(response)
-            if data.get("contradiction", False):
-                return (
-                    "⚠️ **Contradiction detected**: The last message appears to "
-                    "contradict something established earlier. "
-                    "Please review and clarify if needed."
-                )
-            return None
         except (json.JSONDecodeError, Exception):
             self._f._log_debug(
                 f"_detect_contradictions_with_llm: JSON parse error — "
                 f"response: {response[:200]!r}"
             )
             return None
+
+        if data.get("contradiction", False):
+            return (
+                "⚠️ **Contradiction detected**: The last message appears to "
+                "contradict something established earlier. "
+                "Please review and clarify if needed."
+            )
+        return None
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Text extraction & intent classification (cascade: Heuristic → CE → LLM)
@@ -33023,18 +32988,6 @@ class Filter:
         )
 
         # ── 7.7 Quality & contradiction ───────────────────────────────────────
-        contradiction_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for contradiction detection.",
-        )
-        contradiction_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for contradiction detection.",
-        )
         duplicate_ce_threshold: float = Field(
             default=0.40,
             ge=0.0,
