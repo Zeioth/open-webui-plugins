@@ -16098,6 +16098,33 @@ class CodeBlockManager:
             and chunk_start_line <= s.line_start <= chunk_end_line
         ]
 
+    @staticmethod
+    def _strip_fence_markers(block: str) -> str:
+        """Strip a leading ```lang line (and any header before it) and a trailing ``` line.
+
+        get_code_spans returns markdown fenced-block spans whose text may include
+        the fence delimiters and, for merged attachments, a preceding filename
+        header. This leaves only the raw source, so a strict parser (ast.parse for
+        Python) does not choke on the non-code fence/header lines. A block with no
+        fences is returned unchanged.
+
+        Args:
+            block: The raw text of a fenced span.
+
+        Returns:
+            The inner source with fence delimiters and any leading header removed.
+        """
+        lines = block.strip().split("\n")
+        # ── Step 1: drop everything up to and including the opening fence ──
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("```"):
+                lines = lines[i + 1 :]
+                break
+        # ── Step 2: drop the closing fence line if present ──
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines)
+    
     async def extract_code_blocks(
         self, content: str, project_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
@@ -16175,20 +16202,38 @@ class CodeBlockManager:
                 )
 
         # ── Section 3: Regex fallback for fenced code blocks ──────────────
+        # Blocks are gated by code-likelihood, not by a raw char count: real
+        # source files parse cheaply at any size and are always kept, while a
+        # large non-code blob (minified bundle, data dump, base64) is dropped
+        # because extracting and LTM-embedding it wastes work for no symbols.
+        # max_extractable_block_chars is only an absolute memory backstop
+        # against an accidental huge non-text paste. Both rejection paths emit a
+        # WARNING: dropping a block is unexpected behaviour, so it must leave a
+        # trace even when it is protecting the process.
+        _max_block = self._f.valves.max_extractable_block_chars
         for match in self._f.code_pattern.finditer(content):
             lang = match.group(1) or "text"
             code = match.group(2).strip()
-            if len(code) > 200_000:
+
+            if _max_block and len(code) > _max_block:
                 self._f._log_debug(
-                    f"Skipping oversized fenced block ({len(code)} chars)"
+                    f"⚠️ WARNING: dropping fenced block over the memory backstop "
+                    f"({len(code)} chars > max_extractable_block_chars={_max_block}). "
+                    f"Content will NOT be indexed. Raise or disable the valve "
+                    f"(0) if this was legitimate code."
                 )
                 continue
+
+            if len(code) > 50_000 and not await CodeBlockManager._is_likely_code(code):
+                self._f._log_debug(
+                    f"⚠️ WARNING: dropping large fenced block ({len(code)} chars) — "
+                    f"failed the code-likelihood gate (looks like a data/binary "
+                    f"paste, not source). Content will NOT be indexed."
+                )
+                continue
+
             blocks.append({"language": lang, "code": code, "type": "fenced"})
             spans.append((match.start(), match.end()))
-
-        if blocks:
-            self._f._log_debug(f"regex found {len(blocks)} fenced block(s)")
-            return self._postprocess_blocks(blocks, spans, content)
 
         # ── Section 4: Indented blocks (only if no fenced blocks) ─────────
         lines = content.split("\n")
@@ -32639,6 +32684,15 @@ class Filter:
             default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited.",
         )
+        max_extractable_block_chars: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Memory protection against (huge) accidental code pastes. "
+                "If the code has more than n chars, it will be skipped "
+                "with a warning in the logs."
+            ),
+        )
         code_block_overflow_action: str = Field(
             default="summarize",
             description="Action when a block exceeds max_code_block_tokens: 'warn', 'truncate', or 'summarize'.",
@@ -35178,8 +35232,29 @@ class Filter:
 
                     pstate_local = self._project_state_manager.get_pstate(project_id)
 
+                    # -- pull raw code out of the markdown fences --------------
+                    # is_code_only_message classified this as code, but the
+                    # message still carries fence markers and (for merged
+                    # attachments) a filename header. Feeding that straight to
+                    # extract_async makes the strict Python AST parser choke on
+                    # the non-code lines and return nothing. Extract the inner
+                    # code from each fenced span first; fall back to the raw text
+                    # when no fence is present (a bare, unfenced paste).
+                    _code_for_extraction = user_query
+                    try:
+                        _spans = await self._code_blocks.get_code_spans(user_query)
+                        if _spans:
+                            _code_for_extraction = "\n\n".join(
+                                CodeBlockManager._strip_fence_markers(user_query[s:e])
+                                for s, e in _spans
+                            )
+                    except Exception:
+                        _code_for_extraction = user_query
+
                     # -- detect language and pre-extract symbols ---------------
-                    _guessed_lang = SignatureExtractor._guess_language(None, user_query)
+                    _guessed_lang = SignatureExtractor._guess_language(
+                        None, _code_for_extraction
+                    )
                     _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
                     pstate_local["ingested_lang"] = _lang
 
@@ -35187,7 +35262,7 @@ class Filter:
                     if HAS_TREE_SITTER:
                         try:
                             raw_symbols = await SignatureExtractor.extract_async(
-                                user_query, None, language=_lang
+                                _code_for_extraction, None, language=_lang
                             )
                         except Exception:
                             raw_symbols = []
@@ -35195,7 +35270,7 @@ class Filter:
                     if raw_symbols:
                         raw_symbols = (
                             SignatureExtractor.enrich_symbols_with_parent_info(
-                                raw_symbols, user_query
+                                raw_symbols, _code_for_extraction
                             )
                         )
 
