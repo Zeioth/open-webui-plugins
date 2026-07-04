@@ -31517,12 +31517,29 @@ class ProjectStateManager:
                 return True
             status, body_text = err
             self._f._log_debug(f"Slot restore failed: HTTP {status} — {body_text}")
+            # A failed restore often means a corrupt / truncated .bin (e.g. a
+            # save that timed out mid-write). Delete it so the next turn does
+            # not rediscover it by directory scan and hang again.
+            self._delete_slot_file(filename)
+            self._f._log_debug(
+                f"⚠️ WARNING: deleted slot file '{filename}' after a failed "
+                f"restore — the next turn will pay a full prefill. This usually "
+                f"means the file was written incompletely."
+            )
             return False
         except asyncio.TimeoutError:
             self._f._log_debug(
-                f"Slot restore timed out after {_timeout}s — the server may "
-                f"still be processing other work. Proceeding without restore "
-                f"(full prefill will be paid)."
+                f"Slot restore timed out after {_timeout}s — treating the slot "
+                f"file as corrupt and removing it (a full prefill will be paid)."
+            )
+            # ⚠️ Root-cause guard: a restore that times out is the exact symptom
+            # of a corrupt/truncated slot .bin. Delete it so it cannot poison
+            # subsequent turns with repeated 60s timeouts. Do NOT retry the
+            # restore — retrying a corrupt file just times out again.
+            self._delete_slot_file(filename)
+            self._f._log_debug(
+                f"⚠️ WARNING: deleted corrupt slot file '{filename}'. Restore "
+                f"skipped; a full KV prefill will be paid this turn."
             )
             return False
         except Exception as e:
@@ -31691,6 +31708,29 @@ class ProjectStateManager:
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
         return f"slot{self._f.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
 
+    def _delete_slot_file(self, filename: str) -> None:
+        """Delete a single slot .bin file by name, tolerating its absence.
+
+        Used to purge a slot file that failed to restore (corrupt / truncated,
+        typically from a save that timed out mid-write) so a directory scan on a
+        later turn does not rediscover it and hang on another restore timeout.
+
+        Args:
+            filename: The slot filename as passed to the llama.cpp API (the
+                same value _slot_filename produces).
+        """
+        import os
+
+        # ── Resolve the on-disk path the server writes to ──
+        slot_dir = self._f.valves.slot_save_path or "."
+        path = os.path.join(slot_dir, filename)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                self._f._log_debug(f"Deleted slot file: {path}")
+        except Exception as _e:
+            self._f._log_debug(f"Could not delete slot file {path!r}: {_e}")
+    
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """
         Delete stale slot files, keeping only the current one.
@@ -35942,7 +35982,7 @@ class Filter:
                 # wait_for_llm_tasks() in the finally block below reaps it
                 # naturally, concurrently with the DB maintenance that follows.
                 self._pending_slot_save_task = asyncio.create_task(
-                    psm.slot_save(project_id), wait_slot_free=True
+                    psm.slot_save(project_id, wait_slot_free=True)
                 )
 
             # ------------------------------------------------------------------
