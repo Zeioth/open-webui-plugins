@@ -35393,9 +35393,7 @@ class Filter:
                     else:
                         _code_for_extraction = user_query
                         try:
-                            _spans = await self._code_blocks.get_code_spans(
-                                user_query
-                            )
+                            _spans = await self._code_blocks.get_code_spans(user_query)
                             if _spans:
                                 _code_for_extraction = "\n\n".join(
                                     CodeBlockManager._strip_fence_markers(
@@ -35445,49 +35443,6 @@ class Filter:
                         # that channel is left untouched here.
                         if not _from_merge:
                             pstate_local["raw_ingested_symbols"] = raw_symbols
-
-                    # -- detect language and pre-extract symbols ---------------
-                    _guessed_lang = SignatureExtractor._guess_language(
-                        None, _code_for_extraction
-                    )
-                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
-                    self._log_debug(
-                        f"DIAG: guessed_lang={_guessed_lang!r} → using {_lang!r}"
-                    )
-                    pstate_local["ingested_lang"] = _lang
-
-                    raw_symbols = []
-                    if HAS_TREE_SITTER:
-                        try:
-                            raw_symbols = await SignatureExtractor.extract_async(
-                                _code_for_extraction, None, language=_lang
-                            )
-                        except Exception as _e:
-                            self._log_debug(f"DIAG: extract_async raised {_e!r}")
-                            raw_symbols = []
-                    self._log_debug(
-                        f"DIAG: extract_async → {len(raw_symbols)} symbol(s)"
-                    )
-
-                    if raw_symbols:
-                        raw_symbols = (
-                            SignatureExtractor.enrich_symbols_with_parent_info(
-                                raw_symbols, _code_for_extraction
-                            )
-                        )
-
-                    # -- safety net: is_code_only_message() can misclassify
-                    #    ordinary prose as code-only. If symbol extraction found
-                    #    nothing, this was never a code paste — abandon silent
-                    #    ingestion and fall through to the normal pipeline.
-                    if not raw_symbols:
-                        self._log_debug(
-                            "Silent ingestion aborted: is_code_only_message "
-                            "classified this as code, but symbol extraction "
-                            "found nothing — falling through to normal pipeline"
-                        )
-                    else:
-                        pstate_local["raw_ingested_symbols"] = raw_symbols
 
                         # -- index the pasted code --------------------------------
                         _msg_to_index = last_user_msg
