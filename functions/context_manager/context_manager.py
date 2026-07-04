@@ -17215,27 +17215,37 @@ class CodeBlockManager:
         self, code: str, file_path: Optional[str], project_id: str
     ) -> List["Edge"]:
         """
-        Extract data flow edges from Python code using AST, with regex fallback.
+        Extract data flow edges from source code using a single AST pass.
 
-        For Python code, this uses AST analysis to track:
-        1. Variable assignments.
-        2. Which variables are passed as arguments to function calls.
-        3. The flow of data from producers to consumers.
+        For each function, tracks variables assigned from within it and emits a
+        data-flow edge from the function to every known symbol it calls with
+        arguments (a producer→consumer relationship). Falls back to a regex
+        heuristic only when the source does not parse as Python.
 
-        The key insight is that if a variable is assigned from a function call
-        and later passed to another function, there's a data flow edge from
-        the producer to the consumer.
+        Routing is by PARSEABILITY, not by file extension: Open WebUI's
+        paste-as-file always names the upload Pasted_Text_*.txt, so gating on
+        ".py" sent 36k lines of real Python down the O(matches × names × len)
+        regex path (~75s per ingestion). Trying ast.parse first is the correct
+        signal and puts Python on the linear AST path.
+
+        The AST pass is single-traversal. Class/function context is tracked on a
+        stack via a NodeVisitor, so cost is O(nodes). The previous implementation
+        nested ast.walk() three deep (whole tree × per-function × per-function),
+        which was superlinear on large modules.
 
         Args:
             code: The source code to analyze.
-            file_path: The file path (used to determine language).
+            file_path: The file path (only a hint; parseability decides routing).
             project_id: The current project identifier.
 
         Returns:
             A list of Edge objects representing data flow relationships.
         """
-        # ── 1. Non-Python: use regex fallback ──────────────────────────────
-        if not file_path or not file_path.endswith(".py"):
+        # ── Step 1: try the Python AST path; fall back to regex only if the
+        #    source does not parse as Python (the file NAME is unreliable) ──
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
             return self._extract_data_flow_edges_regex(code, project_id)
 
         all_names = self._f._symbol_index.get_all_names(project_id)
@@ -17244,84 +17254,73 @@ class CodeBlockManager:
 
         edges: List[Edge] = []
 
-        # ── 2. Parse Python AST ─────────────────────────────────────────────
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return []
+        # ── Step 2: single-pass visitor tracking enclosing class + function ──
+        class _DataFlowVisitor(ast.NodeVisitor):
+            """Walk the tree once, emitting producer→consumer edges per function."""
 
-        # ── 3. Map line numbers to enclosing classes ────────────────────────
-        line_to_class: Dict[int, str] = {}
+            def __init__(self):
+                # ── Context stacks maintained during the single walk ──
+                self._class_stack: List[str] = []
+                # Each frame: (caller_qid, caller_bare_name, assigned_vars set)
+                self._func_stack: List[Tuple[str, str, Set[str]]] = []
 
-        def _mark_classes(node, current_class: str) -> None:
-            """Recursively mark lines with their enclosing class name."""
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, ast.ClassDef):
-                    end = getattr(child, "end_lineno", child.lineno)
-                    for ln in range(child.lineno, end + 1):
-                        line_to_class[ln] = current_class
-                    _mark_classes(child, child.name)
-                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    end = getattr(child, "end_lineno", child.lineno)
-                    for ln in range(child.lineno, end + 1):
-                        line_to_class[ln] = current_class
-                    _mark_classes(child, current_class)
-                else:
-                    _mark_classes(child, current_class)
+            def visit_ClassDef(self, node: ast.ClassDef):
+                self._class_stack.append(node.name)
+                self.generic_visit(node)
+                self._class_stack.pop()
 
-        _mark_classes(tree, "")
+            def _visit_function(self, node):
+                caller_name = node.name
+                parent_class = self._class_stack[-1] if self._class_stack else ""
+                caller_qid = qualify_symbol_name(caller_name, parent_class)
 
-        # ── 4. Analyze each function for data flow ──────────────────────────
-        for func_node in ast.walk(tree):
-            if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
+                # ── Pre-scan this function's body for locally assigned vars ──
+                assigned_vars: Set[str] = set()
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Assign):
+                        for target in child.targets:
+                            if isinstance(target, ast.Name):
+                                assigned_vars.add(target.id)
 
-            caller_name = func_node.name
-            if caller_name not in all_names:
-                continue
+                self._func_stack.append((caller_qid, caller_name, assigned_vars))
+                self.generic_visit(node)
+                self._func_stack.pop()
 
-            caller_class = line_to_class.get(func_node.lineno, "")
-            caller_qid = qualify_symbol_name(caller_name, caller_class)
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                self._visit_function(node)
 
-            # ── 4a. Collect variables assigned in this function ────────────
-            assigned_vars: Set[str] = set()
-            for child in ast.walk(func_node):
-                if isinstance(child, ast.Assign):
-                    for target in child.targets:
-                        if isinstance(target, ast.Name):
-                            assigned_vars.add(target.id)
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+                self._visit_function(node)
 
-            # ── 4b. Find calls that use assigned variables as arguments ────
-            for child in ast.walk(func_node):
-                if not isinstance(child, ast.Call):
-                    continue
+            def visit_Call(self, node: ast.Call):
+                # ── Attribute the call to the innermost enclosing function ──
+                if self._func_stack:
+                    caller_qid, caller_name, assigned_vars = self._func_stack[-1]
+                    if caller_name in all_names:
+                        callee_name = None
+                        if isinstance(node.func, ast.Name):
+                            callee_name = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            callee_name = node.func.attr
 
-                callee_name = None
-                if isinstance(child.func, ast.Name):
-                    callee_name = child.func.id
-                elif isinstance(child.func, ast.Attribute):
-                    callee_name = child.func.attr
+                        if callee_name in all_names and callee_name != caller_name:
+                            args_are_local_vars = any(
+                                isinstance(arg, ast.Name) and arg.id in assigned_vars
+                                for arg in node.args
+                            )
+                            if args_are_local_vars or node.args:
+                                edges.append(
+                                    Edge(
+                                        src=caller_qid,
+                                        dst=callee_name,
+                                        type="data_flow",
+                                        weight=EDGE_WEIGHTS["data_flow"],
+                                        confidence=0.7,
+                                    )
+                                )
+                self.generic_visit(node)
 
-                if callee_name not in all_names or callee_name == caller_name:
-                    continue
-
-                # Check if any argument is a variable assigned earlier.
-                args_are_local_vars = any(
-                    isinstance(arg, ast.Name) and arg.id in assigned_vars
-                    for arg in child.args
-                )
-
-                if args_are_local_vars or child.args:
-                    edges.append(
-                        Edge(
-                            src=caller_qid,
-                            dst=callee_name,
-                            type="data_flow",
-                            weight=EDGE_WEIGHTS["data_flow"],
-                            confidence=0.7,
-                        )
-                    )
-
+        _DataFlowVisitor().visit(tree)
         return edges
 
 
@@ -24524,8 +24523,13 @@ class ActiveCodeUpdater:
         # ------------------------------------------------------------------
         # Region: Extract code blocks and build CodeBlock objects
         # ------------------------------------------------------------------
+        self._f._log_debug("DIAG proc: extract+prepare blocks START")
         new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
             await self._extract_and_prepare_new_blocks(content, role)
+        )
+        self._f._log_debug(
+            f"DIAG proc: extract+prepare DONE ({len(new_blocks_pending)} block(s), "
+            f"{sum(len(s) for s in symbols_list if not isinstance(s, Exception))} syms)"
         )
 
         # ------------------------------------------------------------------
@@ -24536,10 +24540,10 @@ class ActiveCodeUpdater:
 
         # ------------------------------------------------------------------
         # Region: Detect near-duplicates before entering the lock
-        # Detection runs on state_before; existing_hash values remain valid
-        # inside the lock assuming no concurrent project mutations.
         # ------------------------------------------------------------------
+        self._f._log_debug("DIAG proc: detect_duplicates START")
         duplicate_info = self._detect_duplicates(new_blocks_pending, state_before)
+        self._f._log_debug("DIAG proc: detect_duplicates DONE")
 
         async with lock:
             state = self._f._conversation_state_manager.get(project_id)
@@ -24547,6 +24551,7 @@ class ActiveCodeUpdater:
             # ------------------------------------------------------------------
             # Region: Housekeeping — update mention counts from raw message text
             # ------------------------------------------------------------------
+            self._f._log_debug("DIAG proc: mentions/similarity scan START")
             self._f._enrichment.update_mentions_from_message(state, content, project_id)
             for block in state.active_blocks.values():
                 if (
@@ -24560,14 +24565,13 @@ class ActiveCodeUpdater:
                     block.last_mentioned = time.time()
                     block.last_mentioned_msg_idx = state.message_count
                     block._update_importance()
+            self._f._log_debug("DIAG proc: mentions/similarity scan DONE")
 
             if not content and not new_blocks_pending:
                 return
 
             # ------------------------------------------------------------------
             # Region: Capture pre-processing qualified ids for rename detection
-            # Snapshot taken before the loop so added_qids / deleted_qids can be
-            # computed accurately after all blocks have been processed.
             # ------------------------------------------------------------------
             pre_process_qids: Set[str] = set(
                 self._f._symbol_index.get_all_qualified_names(project_id)
@@ -24576,7 +24580,12 @@ class ActiveCodeUpdater:
             # ------------------------------------------------------------------
             # Region: Process each extracted block
             # ------------------------------------------------------------------
-            for new_block, syms in zip(new_blocks_pending, symbols_list):
+            self._f._log_debug(
+                f"DIAG proc: block loop START ({len(new_blocks_pending)} block(s))"
+            )
+            for _bi, (new_block, syms) in enumerate(
+                zip(new_blocks_pending, symbols_list)
+            ):
                 if isinstance(syms, Exception):
                     syms = []
 
@@ -24595,15 +24604,19 @@ class ActiveCodeUpdater:
                     state.active_blocks.get(existing_hash) if existing_hash else None
                 )
 
+                self._f._log_debug(
+                    f"DIAG proc: block #{_bi} process START "
+                    f"(dup={is_dup}, {len(syms)} syms, {len(new_block.content)} chars)"
+                )
                 if is_dup and existing:
-                    # Pass existing_hash explicitly so _process_duplicate_block
-                    # can synchronise the active_blocks dict key when the block
-                    # hash changes after a content update.
                     await self._process_duplicate_block(
                         existing, new_block, syms, state, project_id, existing_hash
                     )
                 else:
                     await self._process_new_block(new_block, syms, state, project_id)
+                self._f._log_debug(f"DIAG proc: block #{_bi} process DONE")
+
+            self._f._log_debug("DIAG proc: block loop DONE")
 
             # ------------------------------------------------------------------
             # Region: Merge assistant-generated code into matching base blocks
@@ -24616,6 +24629,7 @@ class ActiveCodeUpdater:
             # ------------------------------------------------------------------
             # Region: Detect and migrate symbol renames
             # ------------------------------------------------------------------
+            self._f._log_debug("DIAG proc: rename detection START")
             post_process_qids: Set[str] = set(
                 self._f._symbol_index.get_all_qualified_names(project_id)
             )
@@ -24631,13 +24645,16 @@ class ActiveCodeUpdater:
                     self._f._log_debug(
                         f"_detect_and_migrate_renames: non-fatal error — {_e}"
                     )
+            self._f._log_debug("DIAG proc: rename detection DONE")
 
             # ------------------------------------------------------------------
             # Region: Post-update maintenance tasks
             # ------------------------------------------------------------------
+            self._f._log_debug("DIAG proc: post_update_tasks START")
             await self._post_update_tasks(
                 state, project_id, new_blocks_pending, is_continuation
             )
+            self._f._log_debug("DIAG proc: post_update_tasks DONE")
 
             self._f._conversation_state_manager.set(project_id, state)
 
@@ -31201,21 +31218,20 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
 
-        Timeout semantics
-        ──────────────────
-        The HTTP call is bounded by valves.slot_operation_timeout, but this
-        is a backstop for a genuinely hung server, NOT the primary
-        reliability mechanism for slot persistence. That role belongs to
-        BackgroundTaskManager.stop_all() never hard-cancelling in-flight LLM
-        calls (see its docstring) — under --parallel 1, a cancelled asyncio
-        Task does not reliably stop server-side generation, and the orphaned
-        work then queues every subsequent request (including this one)
-        behind it. Observed in practice: a slot_restore call blocked for
-        326s with no timeout at all, and still failed — proving the
-        unbounded wait bought zero reliability, only a much slower failure.
-        With stop_all() no longer self-inflicting this contention, this
-        timeout should rarely fire; set slot_operation_timeout=0 to wait
-        indefinitely (bounded only by llm_per_call_timeout).
+        Slot-contention semantics
+        ─────────────────────────
+        Under --parallel 1 the server processes one request at a time. If this
+        save POSTs while the turn's own prefill/generation is still in flight
+        (e.g. the ~43k-token Block A prefill right after a large ingestion), it
+        queues behind that work and burns the whole slot_operation_timeout for
+        nothing. To avoid that, the save first waits for the inference slot to
+        drain via the shared LLM semaphore, then POSTs into an idle server.
+
+        This wait is intentionally unbounded: slot_save is dispatched as a
+        detached task from Filter.outlet (never awaited on the critical path),
+        so nothing is blocked while it waits and there is no reason to cap it.
+        The HTTP call itself remains bounded by slot_operation_timeout as a
+        backstop for a genuinely hung server.
 
         Args:
             project_id: The project identifier.
@@ -31254,7 +31270,16 @@ class ProjectStateManager:
         if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
             return False
 
-        # --- 5. Build filename and call llama.cpp API ---
+        # --- 5. Wait (unbounded) for the inference slot to drain before POSTing.
+        # This is what prevents the save from queuing behind an in-flight prefill
+        # under --parallel 1 and burning the HTTP backstop. No timeout here on
+        # purpose: this runs as a detached outlet task, so nothing waits on it.
+        try:
+            await self._f._llm_orchestrator.wait_for_slot()
+        except Exception as _wait_err:
+            self._f._log_debug(f"Slot save: slot-wait error (non-fatal): {_wait_err}")
+
+        # --- 6. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -31280,7 +31305,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
+        # --- 7. Execute, bounded only if slot_operation_timeout > 0 ---
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -34856,6 +34881,7 @@ class Filter:
 
         # -- KVCache warmup --
         self._pending_warmup_task: Optional[asyncio.Task] = None
+        self._pending_slot_save_task = None
 
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
@@ -35890,7 +35916,16 @@ class Filter:
                     )
                 except Exception as _tok_err:
                     self._log_debug(f"outlet: token estimation failed: {_tok_err}")
-                await psm.slot_save(project_id)
+                # slot_save is a KV-continuity optimization, not a correctness
+                # step: nothing later in outlet depends on it. Under --parallel 1
+                # it can wait for an in-flight prefill to drain before POSTing, so
+                # awaiting it here would block the whole outlet — including the
+                # background-task launch. Fire it as a tracked task; the
+                # wait_for_llm_tasks() in the finally block below reaps it
+                # naturally, concurrently with the DB maintenance that follows.
+                self._pending_slot_save_task = asyncio.create_task(
+                    psm.slot_save(project_id)
+                )
 
             # ------------------------------------------------------------------
             # 🚀 RESOURCE OPTIMISATION — maintenance, every turn
@@ -35924,10 +35959,16 @@ class Filter:
 
             self._log_debug(traceback.format_exc())
 
-        finally:
+         finally:
             self._log_debug("outlet: waiting for background LLM tasks to complete")
+            _slot_task = getattr(self, "_pending_slot_save_task", None)
+            if _slot_task is not None:
+                try:
+                    await _slot_task
+                except Exception as _ss_err:
+                    self._log_debug(f"outlet: slot_save task error: {_ss_err}")
+                self._pending_slot_save_task = None
             await self._llm_orchestrator.wait_for_llm_tasks()
-
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
 
