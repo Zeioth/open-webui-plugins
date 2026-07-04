@@ -35959,7 +35959,7 @@ class Filter:
 
             self._log_debug(traceback.format_exc())
 
-         finally:
+        finally:
             self._log_debug("outlet: waiting for background LLM tasks to complete")
             _slot_task = getattr(self, "_pending_slot_save_task", None)
             if _slot_task is not None:
