@@ -22982,8 +22982,9 @@ Code context (recent symbols referenced):
         Fire-and-forget oversized-block summary generation.
 
         Returns immediately. Does nothing if the block already has a summary,
-        is under the size threshold, or a background attempt is already
-        in flight for this exact block hash.
+        is under the size threshold, is above block_summary_max_source_tokens
+        (too large for a representative prose summary), or a background attempt
+        is already in flight for this exact block hash.
         """
         if block.block_summary or block.hash in self._pending_block_summaries:
             return
@@ -22992,6 +22993,19 @@ Code context (recent symbols referenced):
             self._f.valves.max_code_block_tokens <= 0
             or tok <= self._f.valves.max_code_block_tokens
         ):
+            return
+
+        # ── Upper bound: skip blocks too large for a representative summary ───
+        # Past this ceiling the LLM only sees the first summary_code_max_chars
+        # of the block, so the 3-5 sentence blurb describes an unrepresentative
+        # prefix while the SymbolGraph already captures the block structurally.
+        # Prevents multi-second futile summary calls on codebase-scale pastes.
+        if tok > self._f.valves.block_summary_max_source_tokens:
+            self._f._log_debug(
+                f"Block {block.hash[:8]}: skipping oversized-block summary — "
+                f"{tok} tokens exceeds block_summary_max_source_tokens "
+                f"({self._f.valves.block_summary_max_source_tokens})"
+            )
             return
 
         self._pending_block_summaries.add(block.hash)
@@ -23009,8 +23023,29 @@ Code context (recent symbols referenced):
 
         asyncio.create_task(_run())
 
+        self._pending_block_summaries.add(block.hash)
+
+        async def _run() -> None:
+            try:
+                await self.maybe_generate_block_summary(block)
+                if block.block_summary:
+                    # Mark state dirty so the next save_state_if_dirty() persists it.
+                    self._f._conversation_state_manager.mark_dirty(project_id)
+            except Exception as exc:
+                self._f._log_debug(f"Background block summary failed: {exc}")
+            finally:
+                self._pending_block_summaries.discard(block.hash)
+
+        asyncio.create_task(_run())
+
     async def maybe_generate_block_summary(self, block: "CodeBlock") -> None:
-        """Generate a summary for an oversized code block when overflow action is 'summarize'."""
+        """Generate a summary for an oversized code block when overflow action is 'summarize'.
+
+        Skips blocks above block_summary_max_source_tokens: the prompt only
+        carries the block's first summary_code_max_chars, so past that ceiling
+        the summary would describe an unrepresentative prefix. The SymbolGraph
+        already represents such blocks structurally.
+        """
         if not (
             self._f.valves.max_code_block_tokens > 0
             and self._f.valves.code_block_overflow_action == "summarize"
@@ -23018,6 +23053,8 @@ Code context (recent symbols referenced):
             return
         tok = block._cached_token_count or (len(block.content) // 4)
         if tok <= self._f.valves.max_code_block_tokens:
+            return
+        if tok > self._f.valves.block_summary_max_source_tokens:
             return
         if block.block_summary:
             return
@@ -33626,6 +33663,18 @@ class Filter:
             default=350,
             description="Max tokens for the generated summary of an oversized code block.",
         )
+        block_summary_max_source_tokens: int = Field(
+            default=20000,
+            description=(
+                "Upper bound for oversized-block summarization. Blocks larger "
+                "than this are skipped: the summary LLM only sees the first "
+                "summary_code_max_chars of the block, so past this size the blurb "
+                "describes an unrepresentative prefix while the SymbolGraph "
+                "already captures the block structurally. Must exceed "
+                "max_code_block_tokens for any summary to be produced."
+                "The purpose is to skip summarization of silent ingestion."
+            ),
+        )
 
         # ═════════════════════════════════════════════════════════════════════════
         # 2. LLM & ORCHESTRATION
@@ -35711,6 +35760,26 @@ class Filter:
                     f"block_paging_threshold ({v.block_paging_threshold}) >= "
                     f"max_active_blocks ({v.max_active_blocks}). Paging will never "
                     f"activate because the hard eviction cap is reached first."
+                )
+
+        # ------------------------------------------------------------------
+        # 8b. Oversized-block summarization ceiling vs floor
+        # ------------------------------------------------------------------
+        if hasattr(v, "block_summary_max_source_tokens") and hasattr(
+            v, "max_code_block_tokens"
+        ):
+            if (
+                v.max_code_block_tokens > 0
+                and v.code_block_overflow_action == "summarize"
+                and v.block_summary_max_source_tokens <= v.max_code_block_tokens
+            ):
+                warnings.append(
+                    f"block_summary_max_source_tokens "
+                    f"({v.block_summary_max_source_tokens}) <= max_code_block_tokens "
+                    f"({v.max_code_block_tokens}): the summarizable band is empty, so "
+                    f"code_block_overflow_action='summarize' never produces a summary "
+                    f"(every oversized block also exceeds the ceiling and is skipped). "
+                    f"Raise block_summary_max_source_tokens above max_code_block_tokens."
                 )
 
         # ------------------------------------------------------------------
