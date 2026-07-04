@@ -15680,22 +15680,56 @@ class CommandRouter:
         kept += data[cursor:]
         return kept.decode("utf-8", errors="ignore").strip()
 
+    @classmethod
+    def _line_carries_request(cls, raw_line: str) -> bool:
+        """Return True when a single line carries genuine user request intent.
+
+        Detects intent independently of the structural / prose line split, so a
+        question is never lost because a heuristic regex tagged its line as
+        code. Robust in three moves:
+
+          1. Code noise (strings, comments, docstrings) is blanked first, so a
+             '?' inside a regex literal or a comment cannot fire.
+          2. Leading formatting — list markers ("1.", "-", "*"), bold ("**"),
+             blockquote (">"), and a short "Label:" prefix — is stripped, so
+             "1. ¿qué hace X?" and "Pregunta: dime Y" reduce to their core.
+          3. The exposed remainder is checked for a '?'/'¿' or a request lead.
+
+        Request leads (dime, explica, qué, fix, improve, ...) require a trailing
+        space and so never collide with identifiers (improve_thing,
+        classify_use_case); '?'/'¿' is only trusted after noise blanking. The
+        asymmetry is deliberate: leads are near-zero-collision and trusted
+        broadly, punctuation is leaky and must be guarded.
+        """
+        # ── Step 1: blank code noise; bail on pure-code / blank lines ─────────
+        cleaned = cls._strip_code_noise(raw_line).strip()
+        if not cleaned:
+            return False
+
+        # ── Step 2: strip leading formatting so the prose lead is exposed ─────
+        cleaned = re.sub(r"^(?:\d+[.)]\s*|[-*+>]\s+|\*\*)+", "", cleaned)
+        cleaned = re.sub(r"^[^\W\d][\w áéíóúñ]{0,18}:\s+", "", cleaned)
+
+        # ── Step 3: interrogative or request lead on the exposed prose ────────
+        return cls._looks_interrogative(cleaned)
+
     async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """Decide whether a message is a bare code paste with no question.
 
         A code-only verdict requires positive code evidence AND the absence of
-        any request or question intent. Intent is detected position-independently
-        over extracted prose — never over raw code — so a trailing imperative
-        after a large paste ("<10k lines> ... dime qué hace build_block_b") is
-        recognised as a question, while a '?' living inside a regex literal or a
-        '# fix ...' comment is not mistaken for one.
+        any request or question intent. Intent is detected independently of the
+        structural/prose split (via _line_carries_request), so a numbered or
+        labelled question ("1. ¿qué hace X?", "Pregunta: dime Y") that the line
+        regexes tag as structural is still recognised, and a '?' inside a regex
+        literal or a '# fix ...' comment is never mistaken for one.
 
         Cascade:
         1. Prose / structural split: comments, docstrings and string/regex
-           literals are blanked, so only genuine natural-language lines survive
-           as prose. Computed once and reused by every later step.
-        2. Intent veto: a head request lead or ANY interrogative prose line
-           vetoes the code-only verdict outright — the user wants an answer.
+           literals are blanked. Feeds the structural ratio and the CrossEncoder
+           query below. Computed once and reused.
+        2. Intent veto: a head request lead or ANY line carrying request intent
+           (scanned at the paste edges) vetoes the code-only verdict outright —
+           the user wants an answer.
         3. Fenced short-circuit (tree-sitter): a fenced paste with negligible
            surrounding prose and no intent is code-only.
         4. Structural poles + CrossEncoder for the genuinely ambiguous band;
@@ -15719,8 +15753,8 @@ class CommandRouter:
         # ── Step 1: prose / structural split (single pass, reused below) ──────
         # _strip_code_noise blanks comments, docstrings and string/regex
         # literals, so only real natural-language lines reach prose_candidates.
-        # This is what makes the Step 2 intent check safe: code punctuation can
-        # never masquerade as a question.
+        # This split feeds the structural ratio (Steps 4-5) and the CrossEncoder
+        # query; the intent check in Step 2 is deliberately NOT tied to it.
         structural_lines = 0
         prose_candidates: List[str] = []
         for i in non_blank_idx:
@@ -15741,14 +15775,25 @@ class CommandRouter:
         )
         prose_text = " ".join(prose_candidates).strip()
 
-        # ── Step 2: intent veto (position-independent, prose-only) ────────────
-        # Head lead catches "dime ... <code>". Scanning every prose line catches
-        # the far more common "<code> ... dime" shape that a head-only check
-        # missed and that let a trailing question slip into silent ingestion.
-        # Positive intent is decisive — return before any code-only path.
-        head_is_request = self._has_request_lead(stripped)
-        prose_is_request = any(self._looks_interrogative(p) for p in prose_candidates)
-        if head_is_request or prose_is_request:
+        # ── Step 2: intent veto (decoupled from the structural split) ─────────
+        # _line_carries_request does its own noise-blanking and strips leading
+        # formatting (list markers, "Label:", bullets) before checking for a
+        # lead or '?'/'¿', so a question the line regexes mis-tagged as
+        # structural is still caught. A question lives at the head or the tail
+        # of a paste, never buried in line 18000, so a large body is scanned
+        # only at its edges — bounding cost regardless of size while covering
+        # every realistic case. Small messages are scanned whole.
+        intent_edge_scan = 12
+        if code_line_count <= 2 * intent_edge_scan:
+            _scan_idx = non_blank_idx
+        else:
+            _scan_idx = (
+                non_blank_idx[:intent_edge_scan] + non_blank_idx[-intent_edge_scan:]
+            )
+
+        if self._has_request_lead(stripped) or any(
+            self._line_carries_request(raw_lines[i]) for i in _scan_idx
+        ):
             return False
 
         # ── Step 3: fenced code short-circuit (tree-sitter) ───────────────────
