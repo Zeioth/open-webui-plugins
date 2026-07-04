@@ -31730,7 +31730,7 @@ class ProjectStateManager:
                 self._f._log_debug(f"Deleted slot file: {path}")
         except Exception as _e:
             self._f._log_debug(f"Could not delete slot file {path!r}: {_e}")
-    
+
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """
         Delete stale slot files, keeping only the current one.
@@ -35974,16 +35974,11 @@ class Filter:
                     )
                 except Exception as _tok_err:
                     self._log_debug(f"outlet: token estimation failed: {_tok_err}")
-                # slot_save is a KV-continuity optimization, not a correctness
-                # step: nothing later in outlet depends on it. Under --parallel 1
-                # it can wait for an in-flight prefill to drain before POSTing, so
-                # awaiting it here would block the whole outlet — including the
-                # background-task launch. Fire it as a tracked task; the
-                # wait_for_llm_tasks() in the finally block below reaps it
-                # naturally, concurrently with the DB maintenance that follows.
-                self._pending_slot_save_task = asyncio.create_task(
-                    psm.slot_save(project_id, wait_slot_free=True)
-                )
+                # The KV save itself is deferred to after wait_for_llm_tasks()
+                # (see the sequential-save block below). It is a critical,
+                # non-deferrable step — it captures the clean main-chat KV before
+                # the background tasks dirty the slot — so it must run
+                # synchronously, in order, not detached.
 
             # ------------------------------------------------------------------
             # 🚀 RESOURCE OPTIMISATION — maintenance, every turn
@@ -36019,16 +36014,26 @@ class Filter:
 
         finally:
             self._log_debug("outlet: waiting for background LLM tasks to complete")
-            _slot_task = getattr(self, "_pending_slot_save_task", None)
-            if _slot_task is not None:
-                try:
-                    await _slot_task
-                except Exception as _ss_err:
-                    self._log_debug(f"outlet: slot_save task error: {_ss_err}")
-                self._pending_slot_save_task = None
             await self._llm_orchestrator.wait_for_llm_tasks()
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
+
+        # 🔥 KV SLOT SAVE — sequential, critical, non-deferrable.
+        # wait_for_llm_tasks() in the finally above drained every auxiliary call
+        # of this turn, so the slot now holds the clean main-chat KV and is idle.
+        # The next thing to touch it are the background tasks launched by
+        # set_paused(False) / start() below, which dirty it. Saving here — after
+        # the drain, before the launch — captures the clean KV so the next turn's
+        # slot_restore recovers it instead of a version polluted by raptor /
+        # docstrings. Synchronous by design: a detached save races the background
+        # tasks and can be truncated mid-write, producing the corrupt .bin that
+        # hangs the next restore. The slot is idle here, so no wait_slot_free is
+        # needed.
+        if self.valves.enable_slot_persistence:
+            try:
+                await self._project_state_manager.slot_save(project_id)
+            except Exception as _save_err:
+                self._log_debug(f"outlet: slot_save failed (non-fatal): {_save_err}")
 
         # 🚀 BACKGROUND TASKS
         #   Resume after all critical outlet work is done.
