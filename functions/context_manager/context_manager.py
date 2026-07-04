@@ -31207,7 +31207,9 @@ class ProjectStateManager:
     # 3 — KVCache persistence
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def slot_save(self, project_id: str, force: bool = False) -> bool:
+    async def slot_save(
+        self, project_id: str, force: bool = False, wait_slot_free: bool = False
+    ) -> bool:
         """
         Save the KV slot after a turn.
 
@@ -31221,21 +31223,34 @@ class ProjectStateManager:
         Slot-contention semantics
         ─────────────────────────
         Under --parallel 1 the server processes one request at a time. If this
-        save POSTs while the turn's own prefill/generation is still in flight
-        (e.g. the ~43k-token Block A prefill right after a large ingestion), it
-        queues behind that work and burns the whole slot_operation_timeout for
-        nothing. To avoid that, the save first waits for the inference slot to
-        drain via the shared LLM semaphore, then POSTs into an idle server.
+        save POSTs while a prefill/generation is still in flight (e.g. the ~43k-
+        token Block A prefill right after a large ingestion), it queues behind
+        that work and burns the whole slot_operation_timeout for nothing.
 
-        This wait is intentionally unbounded: slot_save is dispatched as a
-        detached task from Filter.outlet (never awaited on the critical path),
-        so nothing is blocked while it waits and there is no reason to cap it.
-        The HTTP call itself remains bounded by slot_operation_timeout as a
-        backstop for a genuinely hung server.
+        wait_slot_free controls how that is handled, and the default is the SAFE
+        one:
+
+        • wait_slot_free=False (default): do NOT block waiting for the slot.
+          The save POSTs immediately; the HTTP call is bounded by
+          slot_operation_timeout, which absorbs the contention. Correct for
+          callers ON THE CRITICAL PATH (inlet: WindowManager._persist and the
+          build_block_a saves) where an unbounded wait could hang the whole
+          request behind an in-flight generation.
+
+        • wait_slot_free=True: first wait (unbounded) for the inference slot to
+          drain via the shared LLM semaphore, then POST into an idle server so
+          the save completes cleanly in milliseconds. Only safe for a DETACHED
+          caller that nothing awaits — currently just Filter.outlet, which fires
+          this as a background task. The wait is best-effort: the semaphore is
+          released before the POST, so another task could momentarily re-take
+          the slot; slot_operation_timeout remains the backstop either way.
 
         Args:
             project_id: The project identifier.
             force: Whether to force save even if the hash hasn't changed.
+            wait_slot_free: Whether to wait for the inference slot to drain
+                before POSTing. Only pass True from a detached (non-awaited)
+                caller; see semantics above.
 
         Returns:
             bool: True if the slot was saved successfully.
@@ -31270,14 +31285,17 @@ class ProjectStateManager:
         if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
             return False
 
-        # --- 5. Wait (unbounded) for the inference slot to drain before POSTing.
-        # This is what prevents the save from queuing behind an in-flight prefill
-        # under --parallel 1 and burning the HTTP backstop. No timeout here on
-        # purpose: this runs as a detached outlet task, so nothing waits on it.
-        try:
-            await self._f._llm_orchestrator.wait_for_slot()
-        except Exception as _wait_err:
-            self._f._log_debug(f"Slot save: slot-wait error (non-fatal): {_wait_err}")
+        # --- 5. Optionally wait for the inference slot to drain before POSTing.
+        # Only detached callers (Filter.outlet) request this; on-critical-path
+        # callers pass wait_slot_free=False and rely on slot_operation_timeout
+        # to bound the POST instead of risking an unbounded wait.
+        if wait_slot_free:
+            try:
+                await self._f._llm_orchestrator.wait_for_slot()
+            except Exception as _wait_err:
+                self._f._log_debug(
+                    f"Slot save: slot-wait error (non-fatal): {_wait_err}"
+                )
 
         # --- 6. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
@@ -35924,7 +35942,7 @@ class Filter:
                 # wait_for_llm_tasks() in the finally block below reaps it
                 # naturally, concurrently with the DB maintenance that follows.
                 self._pending_slot_save_task = asyncio.create_task(
-                    psm.slot_save(project_id)
+                    psm.slot_save(project_id), wait_slot_free=True
                 )
 
             # ------------------------------------------------------------------
