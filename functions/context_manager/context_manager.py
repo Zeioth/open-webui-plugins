@@ -815,8 +815,17 @@ class SymbolIndex:
 
         Returns:
             A set of block hash strings. Empty set when the symbol is not found
-            under either resolution strategy.
+            under either resolution strategy, or when the key is not a string.
         """
+        # ── Step 0: type guard ───────────────────────────────────────────────────
+        # A qualified id or bare name is always a str by contract. A non-str value
+        # (e.g. a dict leaking in from a malformed seed) makes the tuple key
+        # (project_id, name_or_qid) unhashable and raises inside .get(); treat it
+        # as "not found" so a single bad key degrades like an unknown symbol
+        # instead of killing the caller (notably the background path_index rebuild).
+        if not isinstance(name_or_qid, str):
+            return set()
+
         # ── Step 1: exact qualified-id lookup ─────────────────────────────────────
         exact = self._name_to_blocks.get((project_id, name_or_qid))
         if exact is not None:
@@ -896,9 +905,18 @@ class SymbolIndex:
             project_id: The project scope to search within.
 
         Returns:
-            A set of qualified id strings. Never empty: at minimum, contains
-            ``{bare_name}`` as a fallback when no match is found.
+            A set of qualified id strings. Normally never empty: at minimum it
+            contains ``{bare_name}`` as a fallback when no match is found. The
+            single exception is a non-str ``bare_name``, which returns an empty
+            set (see the type guard below).
         """
+        # ── Type guard ────────────────────────────────────────────────────────────
+        # Mirror find_blocks: a non-str bare_name cannot key the reverse index and
+        # must not reach the {bare_name} fallback either — building a set around a
+        # dict would raise the same unhashable failure. Degrade to an empty set.
+        if not isinstance(bare_name, str):
+            return set()
+
         # ── Bare-name reverse-index lookup ────────────────────────────────────────
         qids = self._bare_index.get((project_id, bare_name))
         return set(qids) if qids else {bare_name}
@@ -6414,18 +6432,25 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         # Step 3: Use case classification and seed inference.
         # ------------------------------------------------------------------
+        self._f._log_debug(
+            f"DIAG bbb: Step 3 START slot_free={slot_free}, "
+            f"seed_mode={self._f.valves.seed_inference_mode!r}"
+        )
         if use_case_override is not None:
             active_use_case = use_case_override
             use_case_profile = dict(
                 self.LOD_PROFILES.get(active_use_case, self.LOD_PROFILES["C"])
             )
         else:
+            self._f._log_debug("DIAG bbb: >>> classify_use_case (may hit CE/LLM)…")
             active_use_case, use_case_profile, _ = await self.classify_use_case(
                 query, intent_vector, project_id
             )
+            self._f._log_debug(f"DIAG bbb: <<< classify_use_case → {active_use_case!r}")
 
         inferred_seeds: Dict[str, float] = {}
         if self._f.valves.seed_inference_mode != "off":
+            self._f._log_debug("DIAG bbb: >>> infer_seeds (may hit LLM slot)…")
             inferred_seeds = await self._f._seed_inferencer.infer_seeds(
                 query=query,
                 project_id=project_id,
@@ -6433,19 +6458,21 @@ class ContextBuilder:
                 use_case=active_use_case,
                 slot_free=slot_free,
             )
+            self._f._log_debug(
+                f"DIAG bbb: <<< infer_seeds → {len(inferred_seeds)} seed(s)"
+            )
 
         # ------------------------------------------------------------------
         # Step 4: Build ActivationGraph and get activated nodes.
         # ------------------------------------------------------------------
+        self._f._log_debug("DIAG bbb: >>> build_activation_graph…")
         ag = await self._f._activation.build_activation_graph(
             query,
             project_id,
             messages=messages,
             inferred_seeds=inferred_seeds,
         )
-        activated = ag.get_activated_nodes(
-            threshold=self._f.valves.path_activation_threshold
-        )
+        self._f._log_debug("DIAG bbb: <<< build_activation_graph DONE")
         if not activated:
             self._f._log_debug(
                 "build_block_b: no activated nodes, falling back to full context"
@@ -18273,8 +18300,26 @@ Output only the symbol name.
             base_score_fn,
             target: ActivationGraph,
         ) -> None:
-            """Register a list of bare names as seeds with computed scores."""
+            """
+            Register a list of bare names as seeds with computed scores.
+
+            Non-str entries are skipped and logged rather than passed downstream:
+            a dict (or any non-str) reaching _compute_node_specificity /
+            get_qualified_names_for would raise ``unhashable type`` and abort the
+            whole activation build (e.g. the background path_index rebuild). The
+            debug line surfaces the offending value so its producer can be traced.
+            """
             for sym_name in names:
+                # ── Guard: skip and surface malformed (non-str) seed names ────────
+                if not isinstance(sym_name, str):
+                    self._f._log_debug(
+                        f"[PPR] _register_seeds: skipping non-str seed "
+                        f"(type={type(sym_name).__name__}, "
+                        f"repr={repr(sym_name)[:120]})"
+                    )
+                    continue
+
+                # ── Compute specificity-weighted score and fan out to qids ────────
                 specificity = self._compute_node_specificity(sym_name, project_id)
                 score = base_score_fn(specificity)
                 qids = symbol_index.get_qualified_names_for(sym_name, project_id)
@@ -18525,9 +18570,11 @@ Output only the symbol name.
         # ------------------------------------------------------------------
         # Region: Extract seeds from query, traceback, and history
         # ------------------------------------------------------------------
+        self._f._log_debug("DIAG bag: >>> _prepare_seed_symbols…")
         exact_seeds, partial_seeds, tb_seeds, history_boosts = (
             await self._prepare_seed_symbols(query, project_id, messages)
         )
+        self._f._log_debug("DIAG bag: <<< _prepare_seed_symbols DONE")
 
         self._f._log_debug(
             f"[PPR] Seeds extracted: exact={len(exact_seeds)}, "
@@ -18559,6 +18606,11 @@ Output only the symbol name.
         # ------------------------------------------------------------------
         code_state_hash = self.compute_code_state_hash(project_id)
 
+        self._f._log_debug(
+            f"DIAG bag: computing PPR (sync, no LLM) — "
+            f"{len(seed_qids)} seed(s), {len(edges_out)} edge sources, "
+            f"steps={effective_steps}"
+        )
         cached_scores = self._get_or_compute_ppr_scores(
             seed_qids=seed_qids,
             project_id=project_id,
@@ -18568,6 +18620,7 @@ Output only the symbol name.
             min_score=0.05,
             alpha=self._f.valves.ppr_alpha,
         )
+        self._f._log_debug(f"DIAG bag: PPR done → {len(cached_scores)} scores")
 
         # ------------------------------------------------------------------
         # Region: Build the activation graph (single or multi-seed)
@@ -18580,10 +18633,9 @@ Output only the symbol name.
                 partial_seeds,
                 tb_seeds,
                 history_boosts,
-                edges_out,
-                project_id,
                 _inferred,
-                cached_scores=cached_scores,
+                cached_scores,
+                project_id,
             )
         else:
             self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
@@ -18592,42 +18644,18 @@ Output only the symbol name.
                 partial_seeds,
                 tb_seeds,
                 history_boosts,
-                edges_out,
-                project_id,
                 _inferred,
-                cached_scores=cached_scores,
+                cached_scores,
+                project_id,
             )
 
         # ------------------------------------------------------------------
-        # Region: Persist activation scores (skipped in volatile mode)
+        # Region: Persist activation scores (unless volatile)
         # ------------------------------------------------------------------
         if persist:
             self._store_activation_scores(ag, project_id)
 
-        # ------------------------------------------------------------------
-        # Region: Normalize scores and log distribution
-        # ------------------------------------------------------------------
-        activated = ag.get_activated_nodes(
-            threshold=self._f.valves.path_activation_threshold
-        )
-        activated = self._normalize_ppr_scores(activated)
-
-        self._f._log_debug(
-            f"[PPR] Activation complete: {len(activated)} nodes activated "
-            f"(threshold={self._f.valves.path_activation_threshold}, "
-            f"steps={effective_steps})"
-        )
-
-        if self._f.valves.debug and activated:
-            sorted_scores = sorted(activated.values(), reverse=True)
-            if sorted_scores:
-                p50 = sorted_scores[len(sorted_scores) // 2]
-                self._f._log_debug(
-                    f"[PPR] score dist: max={sorted_scores[0]:.3f}, "
-                    f"p50={p50:.3f}, "
-                    f"min={sorted_scores[-1]:.3f}"
-                )
-
+        self._f._log_debug("DIAG bag: RETURN")
         return ag
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -31429,11 +31457,28 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) to locate the correct
         slot file, ensuring that docstring population does not cause a miss.
 
-        Timeout semantics — see slot_save() for the full rationale. This is
-        the exact call observed blocking 326s (no bound at all) and still
-        failing — the backstop here exists for genuinely hung servers, not
-        as the fix for that stall. The fix for that stall is
-        BackgroundTaskManager.stop_all() no longer orphaning generations.
+        Timeout semantics
+        ─────────────────
+        A restore has two distinct failure modes, and they must NOT be
+        conflated:
+
+        * HTTP failure (the ``err`` branch): the server received the file,
+          tried to deserialize it, and rejected it (400/500). That is real
+          evidence of a corrupt/truncated ``.bin`` — delete it so a directory
+          scan does not rediscover it next turn.
+        * Timeout (this branch): the server never answered within
+          ``slot_operation_timeout``. This is the symptom of a *busy* server —
+          e.g. the single --parallel 1 slot is held by an in-flight background
+          generation — NOT of a corrupt file. Deleting on timeout would throw
+          away a perfectly valid slot (observed: a clean 6112-token save wiped
+          because a bg_docstring call monopolised the slot for 337s). So on
+          timeout we skip the restore and LEAVE the file: a genuinely corrupt
+          file will still be deleted later via the HTTP-failure path once the
+          server actually gets to process it.
+
+        The underlying stall (an orphaned auxiliary generation holding the
+        slot) is addressed in BackgroundTaskManager.stop_all(); this method
+        only guarantees it no longer destroys good cache as a side effect.
 
         Args:
             project_id: The project identifier.
@@ -31444,23 +31489,23 @@ class ProjectStateManager:
         if not self._f.valves.enable_slot_persistence:
             return False
 
-        # --- 1. Resolve per-project state ---
+        # ── Step 1: resolve per-project state ─────────────────────────────────────
         pstate = self.get_pstate(project_id)
 
-        # --- 2. Skip if already attempted this session ---
+        # ── Step 2: skip if already attempted this session ────────────────────────
         if self.get_slot_restore_attempted(project_id):
             return self.get_slot_restored(project_id)
 
         self.set_slot_restore_attempted(project_id, True)
 
-        # --- 3. Resolve the structural hash ---
+        # ── Step 3: resolve the structural hash ───────────────────────────────────
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             cached = self.get_block_a_cached(project_id)
             if cached:
                 static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
 
-        # ── Fallback to directory scan when pstate has no hash ────────
+        # -- Fallback to directory scan when pstate has no hash --
         if not static_hash:
             self._f._log_debug(
                 "slot_restore: no hash in pstate — scanning slot directory for "
@@ -31473,7 +31518,7 @@ class ProjectStateManager:
                 )
                 return False
 
-        # --- 4. Build filename and call llama.cpp API ---
+        # ── Step 4: build filename and call llama.cpp API ─────────────────────────
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -31499,7 +31544,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # --- 5. Execute, bounded only if slot_operation_timeout > 0 ---
+        # ── Step 5: execute, bounded only if slot_operation_timeout > 0 ───────────
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -31515,11 +31560,10 @@ class ProjectStateManager:
                     f"({data.get('n_restored', '?')} tokens)"
                 )
                 return True
+
+            # -- HTTP failure: server rejected the file → real corruption evidence --
             status, body_text = err
             self._f._log_debug(f"Slot restore failed: HTTP {status} — {body_text}")
-            # A failed restore often means a corrupt / truncated .bin (e.g. a
-            # save that timed out mid-write). Delete it so the next turn does
-            # not rediscover it by directory scan and hang again.
             self._delete_slot_file(filename)
             self._f._log_debug(
                 f"⚠️ WARNING: deleted slot file '{filename}' after a failed "
@@ -31527,21 +31571,23 @@ class ProjectStateManager:
                 f"means the file was written incompletely."
             )
             return False
+
         except asyncio.TimeoutError:
+            # -- Busy server, NOT a corrupt file: keep the .bin, skip the restore --
+            # A timeout is zero evidence of corruption; the single --parallel 1
+            # slot was almost certainly held by an in-flight generation. Deleting
+            # here destroys valid cache. A genuinely corrupt file is still caught
+            # by the HTTP-failure branch above on a later turn, when the server
+            # actually processes it. The full prefill paid this turn is the price
+            # of a busy server, not a reason to discard next turn's cache too.
             self._f._log_debug(
-                f"Slot restore timed out after {_timeout}s — treating the slot "
-                f"file as corrupt and removing it (a full prefill will be paid)."
-            )
-            # ⚠️ Root-cause guard: a restore that times out is the exact symptom
-            # of a corrupt/truncated slot .bin. Delete it so it cannot poison
-            # subsequent turns with repeated 60s timeouts. Do NOT retry the
-            # restore — retrying a corrupt file just times out again.
-            self._delete_slot_file(filename)
-            self._f._log_debug(
-                f"⚠️ WARNING: deleted corrupt slot file '{filename}'. Restore "
-                f"skipped; a full KV prefill will be paid this turn."
+                f"Slot restore timed out after {_timeout}s — server busy, not "
+                f"corruption. Keeping '{filename}'; restore skipped this turn "
+                f"(a full KV prefill will be paid). File left intact for the "
+                f"next attempt."
             )
             return False
+
         except Exception as e:
             self._f._log_debug(f"Slot restore error: {e}")
             return False
@@ -32588,15 +32634,11 @@ class SemanticSeedInferencer:
         """
         Return {qualified_id: seed_score} of symbols the LLM judges relevant.
 
+        [INSTRUMENTED — DIAG at every boundary to locate a slot-wait hang.]
+
         Fast path: if the query mentions existing symbols literally (exact,
         non-ambiguous resolution), they are seeded directly without invoking the
         LLM. The LLM only runs for conceptual queries with no literal mention.
-
-        Returns {} when:
-          - slot is not free (AutoContinue active: no inference on parts).
-          - global scope detected (routed to multi-phase + full_graph).
-          - the gate _should_infer fails.
-          - skeleton is empty or LLM call fails.
 
         Args:
             query: The user query.
@@ -32608,11 +32650,14 @@ class SemanticSeedInferencer:
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
         """
+        self._f._log_debug(
+            f"DIAG infer: START slot_free={slot_free}, query={query[:50]!r}"
+        )
         # ── Step 1: Entry guards ──
         if not slot_free:
+            self._f._log_debug("DIAG infer: slot_free=False → return {} (no LLM)")
             return {}
 
-        # Global scope detection → delegate to multi-phase + full_graph.
         if self.is_global_scope(query):
             self._f._log_debug(
                 "SemanticSeedInferencer: global scope detected → "
@@ -32632,8 +32677,13 @@ class SemanticSeedInferencer:
             return direct_seeds
 
         # ── Step 3: Inference gate (CrossEncoder + heuristic) ──
+        self._f._log_debug(
+            "DIAG infer: no literal seeds → _should_infer (CrossEncoder)…"
+        )
         if not await self._should_infer(query, project_id, intent_vector, use_case):
+            self._f._log_debug("DIAG infer: _should_infer=False → return {}")
             return {}
+        self._f._log_debug("DIAG infer: _should_infer=True → building skeleton…")
 
         # ── Step 4: Retrieve the skeleton (signatures only) ──
         skeleton = await self._f._ctx_builder._get_skeleton_for_cot(project_id, query)
@@ -32641,7 +32691,6 @@ class SemanticSeedInferencer:
             self._f._log_debug("SemanticSeedInferencer: empty skeleton, cannot infer.")
             return {}
 
-        # Trim skeleton to the configured token budget.
         max_sk = self._f.valves.seed_inference_skeleton_max_tokens
         if max_sk > 0:
             skeleton = self._f._tokens.truncate_text_to_tokens(skeleton, max_sk)
@@ -32665,9 +32714,10 @@ class SemanticSeedInferencer:
         )
 
         # ── Step 6: LLM call (strict JSON, thinking disabled) ──
-        # enable_thinking=False is the core fix: with thinking on, the model
-        # reasons in prose outside the JSON grammar, exhausts max_tokens, and is
-        # cut off by finish_reason=length before emitting the constrained JSON.
+        self._f._log_debug(
+            "DIAG infer: >>> entering call_llm(seed_inference) — if it hangs "
+            "HERE with low GPU, the slot is busy and slot_free was wrongly True"
+        )
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -32686,6 +32736,7 @@ class SemanticSeedInferencer:
             enable_thinking=False,
             log_raw_response=False,
         )
+        self._f._log_debug("DIAG infer: <<< call_llm(seed_inference) RETURNED")
 
         if not response:
             self._f._log_debug("SemanticSeedInferencer: LLM returned no response.")
@@ -32697,37 +32748,10 @@ class SemanticSeedInferencer:
             data = json.loads(response)
             tokens = [str(s) for s in data.get("symbols", []) if s]
         except (json.JSONDecodeError, Exception):
-            self._f._log_debug(
-                f"SemanticSeedInferencer: JSON parse error — "
-                f"response: {response[:200]!r}"
-            )
+            self._f._log_debug("SemanticSeedInferencer: failed to parse LLM JSON.")
             return {}
-
         seeds = self._parse_and_resolve(tokens, project_id)
-
-        if seeds:
-            sample = sorted(seeds)[:8]
-            ellipsis = "..." if len(seeds) > 8 else ""
-            self._f._log_debug(
-                f"SemanticSeedInferencer: {len(seeds)} symbol(s) seeded "
-                f"→ {sample}{ellipsis}"
-            )
-        elif not tokens:
-            # LLM returned {"symbols": []} intentionally — query doesn't
-            # require any specific symbol bodies (e.g. general questions).
-            self._f._log_debug(
-                "SemanticSeedInferencer: LLM returned empty symbol list "
-                "(no symbols needed for this query)."
-            )
-        else:
-            # LLM returned symbol names but none matched the index —
-            # likely hallucinated identifiers not present in the skeleton.
-            self._f._log_debug(
-                f"SemanticSeedInferencer: LLM returned {len(tokens)} symbol(s) "
-                f"but none matched the index (possible hallucinations): "
-                f"{tokens[:5]}"
-            )
-
+        self._f._log_debug(f"DIAG infer: RETURN {len(seeds)} seed(s)")
         return seeds
 
     # ------------------------------------------------------------------
