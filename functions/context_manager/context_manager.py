@@ -15732,8 +15732,10 @@ class CommandRouter:
            the user wants an answer.
         3. Fenced short-circuit (tree-sitter): a fenced paste with negligible
            surrounding prose and no intent is code-only.
-        4. Structural poles + CrossEncoder for the genuinely ambiguous band;
-           LLM arbitration when the CrossEncoder margin is inconclusive.
+        4. Structural poles + CrossEncoder for the genuinely ambiguous band.
+           Substantial user prose defers the structural short-circuits to the
+           CrossEncoder/LLM, so a markerless declarative ("esto no me cuadra")
+           is judged semantically instead of being swallowed as code.
         5. Structural verdict for the remainder.
 
         Restores the KV slot after any auxiliary LLM call.
@@ -15821,24 +15823,35 @@ class CommandRouter:
                 pass
 
         # ── Step 4: structural poles + CrossEncoder for the ambiguous band ────
-        # A huge, overwhelmingly-structural paste is code with no question
-        # (intent was ruled out above), so short-circuit without the CrossEncoder
-        # — it only sees content[:500] and adds nothing on a body this structural.
-        if code_line_count > 500 and structural_ratio > 0.6:
-            return True
+        # A coherent prose line (>= code_only_prose_min_words words) is the user
+        # talking, not code noise (comments/strings were already blanked out of
+        # prose_candidates). Its presence defers the structural short-circuits to
+        # the semantic layer below, which can recognise a markerless declarative
+        # that carries no lead and no '?'/'¿'. The CrossEncoder backstops false
+        # positives, so this signal is deliberately sensitive.
+        min_words = self._f.valves.code_only_prose_min_words
+        has_user_prose = any(len(p.split()) >= min_words for p in prose_candidates)
 
-        # Some real code lines and no surviving prose → pure paste.
-        if structural_lines > 0 and not prose_candidates:
-            return True
+        if not has_user_prose:
+            # A huge, overwhelmingly-structural paste with no user prose is code
+            # with no question (intent was ruled out above), so short-circuit
+            # without the CrossEncoder — it only sees a prose/content head and
+            # adds nothing on a body this structural.
+            if code_line_count > 500 and structural_ratio > 0.6:
+                return True
+            # Real code lines and no surviving prose → pure paste.
+            if structural_lines > 0 and not prose_candidates:
+                return True
 
-        # CrossEncoder only for the genuine remainder: enough code to matter,
-        # some prose, no explicit intent. It decides snippet-vs-question
-        # semantically; the LLM arbitrates an inconclusive margin.
-        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
-            # Feed the CrossEncoder the extracted prose, not the paste head:
-            # over a large paste content[:500] is pure code and blind to a
-            # trailing question, whereas prose_text is exactly the natural-
-            # language the classifier needs to judge implicit intent.
+        # CrossEncoder for the genuine remainder: enough code to matter, OR user
+        # prose present (a possible markerless question). It decides
+        # snippet-vs-question semantically; the LLM arbitrates an inconclusive
+        # margin. query = prose_text so the classifier sees the natural language,
+        # not the code head.
+        if (
+            estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2
+            or has_user_prose
+        ):
             query = prose_text[:500] if prose_text else content[:500]
             pairs = [
                 (
@@ -15870,11 +15883,14 @@ class CommandRouter:
                     )
 
         # ── Step 5: structural verdict (no intent, CrossEncoder inconclusive) ─
+        # With user prose present but nothing resolving it as code, lean toward
+        # answering: a coherent typed sentence that survived every check is far
+        # more likely a message than an unlabelled paste.
         if structural_lines == 0:
             return False
-        if structural_ratio > 0.70:
+        if not has_user_prose and structural_ratio > 0.70:
             return True
-        if len(prose_text) >= 30:
+        if has_user_prose or len(prose_text) >= 30:
             return False
         return True
 
@@ -34124,6 +34140,18 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for code‑only detection.",
+        )
+        code_only_prose_min_words: int = Field(
+            default=3,
+            description=(
+                "Minimum word count for a prose line to count as user-typed "
+                "prose in is_code_only_message. A line at or above this defers "
+                "the structural code-only short-circuits to the CrossEncoder/LLM, "
+                "so a markerless declarative ('esto no me cuadra') is judged "
+                "semantically instead of being swallowed as code. Lower = catches "
+                "shorter statements at the cost of more CrossEncoder calls on "
+                "file-noise fragments (which the CrossEncoder then filters out)."
+            ),
         )
         keep_full_code_ce_threshold: float = Field(
             default=0.30,
