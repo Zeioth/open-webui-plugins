@@ -33610,7 +33610,7 @@ class Filter:
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
-            default=50000,
+            default=65000,
             ge=0,
             description=(
                 "Value of llama.cpp's --keep (n_keep): the number of leading "
