@@ -7267,15 +7267,28 @@ class SignatureExtractor:
         Heuristically determine the programming language of a code block.
 
         Resolution order (first match wins):
+        0. Ignore generic container extensions (.txt/.text/.log): they carry no
+           language signal — Open WebUI's "Paste Large Text as File" names every
+           paste Pasted_Text_*.txt — and tree-sitter's extension table maps
+           txt → vimdoc (Vim help files use .txt), silently selecting a useless
+           grammar that returns zero symbols. For these, drop the path so the
+           content heuristics decide instead.
         1. tree-sitter extension detection if *file_path* is provided.
         2. Extension‑to‑language map (``_LANG_MAP``).
         3. Source‑code heuristics: Python keywords (def, class, import, from, async def)
            or JavaScript 'function' keyword.
-        4. (NEW) Use tree-sitter to detect the language from the content itself
-           by attempting to parse with each known language and checking if the
-           parse tree has meaningful nodes (not just ERROR nodes).
+        4. Use tree-sitter to detect the language from the content itself by
+           attempting to parse with each known language and checking if the parse
+           tree has meaningful nodes (not just ERROR nodes).
         5. Fallback to "unknown" — callers will skip tree-sitter extraction.
         """
+        # 0. Generic container extensions carry no language signal → ignore the
+        #    path so content heuristics (steps 3/4) run instead of mis-resolving
+        #    a .txt of real source to 'vimdoc'.
+        if file_path and "." in file_path:
+            if file_path.rsplit(".", 1)[-1].lower() in ("txt", "text", "log"):
+                file_path = None
+
         # 1. Try extension-based detection using tree-sitter (if file_path is given)
         if file_path and HAS_TREE_SITTER:
             try:
@@ -7638,13 +7651,18 @@ class SignatureExtractor:
         """
         Extract call relationships from Python source code using AST.
 
-        For each `Call` node, it determines the callee name and the enclosing
-        function/method (caller). The caller is qualified with its parent class
-        if it is a method. The result is a dict mapping caller qualified name
-        to a list of callee bare names.
+        For each Call node, determine the callee name and the enclosing
+        function/method (caller), qualifying the caller with its parent class if
+        it is a method. Returns a dict mapping caller qualified id → callee bare
+        names.
+
+        Single-pass NodeVisitor: class/function context is tracked on a stack as
+        the tree is walked once, so the cost is O(nodes). The previous
+        implementation nested three ast.walk(tree) calls (O(nodes³)), which
+        stalled a single CPU core for hours on large files.
 
         Args:
-            code (str): The Python source code.
+            code: The Python source code.
 
         Returns:
             Dict[str, List[str]]: {caller_qualified_id: [callee_name, ...]}
@@ -7656,48 +7674,47 @@ class SignatureExtractor:
 
         from collections import defaultdict
 
-        call_map = defaultdict(set)
+        call_map: Dict[str, set] = defaultdict(set)
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
+        class _CallGraphVisitor(ast.NodeVisitor):
+            """Walk the tree once, tracking the enclosing class and function."""
 
-            # Resolve callee name
-            callee = None
-            if isinstance(node.func, ast.Name):
-                callee = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                callee = node.func.attr
+            def __init__(self):
+                # ── Context stacks maintained during the single walk ──
+                self._class_stack: List[str] = []
+                self._func_stack: List[str] = []
 
-            if not callee:
-                continue
+            def visit_ClassDef(self, node: ast.ClassDef):
+                self._class_stack.append(node.name)
+                self.generic_visit(node)
+                self._class_stack.pop()
 
-            # Find the enclosing function/method that contains this call
-            caller_name = None
-            parent_class = ""
-            for parent in ast.walk(tree):
-                if (
-                    isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node in parent.body
-                ):
-                    caller_name = parent.name
-                    # Check if this function is a method (inside a class)
-                    for cls_node in ast.walk(tree):
-                        if (
-                            isinstance(cls_node, ast.ClassDef)
-                            and parent in cls_node.body
-                        ):
-                            parent_class = cls_node.name
-                            break
-                    break
+            def _visit_function(self, node):
+                parent_class = self._class_stack[-1] if self._class_stack else ""
+                caller_qid = qualify_symbol_name(node.name, parent_class)
+                self._func_stack.append(caller_qid)
+                self.generic_visit(node)
+                self._func_stack.pop()
 
-            if not caller_name:
-                continue
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                self._visit_function(node)
 
-            # Qualify caller name with its parent class (if any)
-            caller_qid = qualify_symbol_name(caller_name, parent_class)
-            call_map[caller_qid].add(callee)
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+                self._visit_function(node)
 
+            def visit_Call(self, node: ast.Call):
+                # ── Resolve callee bare name ──
+                callee = None
+                if isinstance(node.func, ast.Name):
+                    callee = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    callee = node.func.attr
+                # ── Attribute the call to the innermost enclosing function ──
+                if callee and self._func_stack:
+                    call_map[self._func_stack[-1]].add(callee)
+                self.generic_visit(node)
+
+        _CallGraphVisitor().visit(tree)
         return {k: list(v) for k, v in call_map.items()}
 
     @staticmethod
@@ -26226,15 +26243,29 @@ class InletOrchestrator:
     async def _extract_symbols_from_raw(
         self, content: str, file_path: str, fence_lang: str
     ) -> Tuple[List["CodeSymbol"], str]:
-        """Extract symbols from raw source text, bypassing markdown entirely.
+        """Extract symbols from raw source text, bypassing markdown AND the
+        code-likelihood gate.
 
-        The content is the raw file bytes — never fenced — so the strict parser
-        (ast.parse for Python) consumes it directly and a file that itself
-        contains ``` cannot corrupt anything. The language comes from the
-        extension hint, falling back to a content guess and finally python, so a
-        generic .txt paste of real code is parsed instead of being rejected as an
-        unknown language. Symbols are enriched against the same raw text, so their
-        line numbers stay aligned with it (and with the block that will store it).
+        The content is the raw file bytes — never fenced — parsed directly. Two
+        things are deliberately bypassed relative to SignatureExtractor.extract_async:
+
+        1. The markdown layer: content is already clean source, and a file that
+           contains ``` must never reach a fence parser.
+        2. The _is_likely_code gate inside extract_async: it samples only the
+           first 500 chars, and a module opening with a \"\"\"docstring\"\"\" header
+           (title/description/author, no code keywords) fails the regex and falls
+           through to a CrossEncoder call that can block on a shared lock in
+           cold-start — hanging the whole inlet. We already know this is code
+           (is_code_only_message and _resolve_pasted_fence both confirmed it), so
+           for the Python path we call the AST extractors directly and only defer
+           to extract_async for non-Python languages.
+
+        Language resolution stays defensive: any language, from the extension
+        hint or the content guess, that is not in the symbol-parseable set
+        collapses to python — the dominant paste case.
+
+        Symbols are enriched against the same raw text, so their line numbers
+        stay aligned with the block that will store it.
 
         Args:
             content: Raw source text of the file.
@@ -26244,17 +26275,63 @@ class InletOrchestrator:
         Returns:
             Tuple of (symbols, resolved_language). symbols may be empty.
         """
-        # ── Step 1: resolve a concrete language for the parser ──
+        # ── Step 1: resolve a concrete, parseable language ──
+        _PARSEABLE = {
+            "python",
+            "javascript",
+            "typescript",
+            "tsx",
+            "jsx",
+            "go",
+            "rust",
+            "java",
+            "cpp",
+            "c",
+            "ruby",
+            "php",
+        }
         lang = fence_lang
-        if not lang or lang == "text":
-            lang = SignatureExtractor._guess_language(file_path, content)
-        if not lang or lang == "unknown":
-            lang = "python"
+        if not lang or lang == "text" or lang not in _PARSEABLE:
+            guessed = SignatureExtractor._guess_language(file_path, content)
+            lang = guessed if guessed in _PARSEABLE else "python"
 
-        # ── Step 2: parse the raw bytes and enrich with parent-class context ──
-        symbols = await SignatureExtractor.extract_async(
-            content, file_path, language=lang
-        )
+        # ── Step 2: extract symbols directly, bypassing the _is_likely_code gate ──
+        symbols: List["CodeSymbol"] = []
+        if lang == "python":
+            # Direct AST path — mirrors extract_async's Python branch (symbols +
+            # call wiring) but skips the CrossEncoder likelihood gate that hangs
+            # on a docstring-first header in cold-start.
+            try:
+                symbols = SignatureExtractor._extract_symbols_from_ast(
+                    content, file_path
+                )
+                call_map = SignatureExtractor._extract_calls_from_ast(content)
+                for sym in symbols:
+                    qid = qualify_symbol_name(
+                        sym.name, sym.parent_symbol, sym.file_path
+                    )
+                    calls = list(call_map.get(qid, []))
+                    if qid != sym.name:
+                        for c in call_map.get(sym.name, []):
+                            if c not in calls:
+                                calls.append(c)
+                    sym.calls = calls
+            except Exception as _e:
+                self._f._log_debug(
+                    f"_extract_symbols_from_raw: AST extraction failed ({_e!r}), "
+                    f"falling back to extract_async"
+                )
+                symbols = await SignatureExtractor.extract_async(
+                    content, file_path, language=lang
+                )
+        else:
+            # Non-Python: extract_async handles the tree-sitter path. These
+            # rarely hit the docstring-header edge case, so the gate is fine.
+            symbols = await SignatureExtractor.extract_async(
+                content, file_path, language=lang
+            )
+
+        # ── Step 3: enrich with parent-class context (line numbers stay aligned) ──
         if symbols:
             symbols = SignatureExtractor.enrich_symbols_with_parent_info(
                 symbols, content
@@ -26303,60 +26380,51 @@ class InletOrchestrator:
     async def merge_pasted_files(self, body: dict, messages: list) -> list:
         """Splice attached-file content into the last user message and pre-extract symbols.
 
-        OpenWebUI hands the filter only a reference at inlet time — id, name, and
-        an on-disk uploads path — never the text. This reads each file from its
-        path, appends it to the last user message as a labelled block (so the LLM
-        sees it and is_code_only_message can detect it), and — crucially — for
-        code files extracts symbols from the RAW bytes and stashes them per file
-        on pstate["merged_file_blocks"]. That side channel is consumed by
-        extract_code_blocks (Section 0) for both silent ingestion and the normal
-        pipeline, so downstream indexing never re-parses the fenced message —
-        which is essential because a source file may contain ``` that would break
-        every markdown parse.
-
-        The merge stays faithful, not smart: code-vs-prose is decided per file by
-        extension then content heuristic, and mixed files are handled by the
-        existing downstream machinery. Runs at maximum priority (before user-info
-        extraction) so the content and symbols are ready for every later step.
-
-        Args:
-            body: The inlet request body; file references live in body["files"]
-                and body["metadata"]["files"].
-            messages: The current message list.
-
-        Returns:
-            The message list with attachment content merged into the last user
-            message (mutated in place and returned for convenience).
+        [INSTRUMENTED — DIAG logs at every boundary to locate a hang.]
         """
+        self._f._log_debug("DIAG merge: ENTER")
+
         # ── Step 1: clear any stale side-channel entry from a prior turn ──
         pstate = self._f._project_state_manager.get_pstate(self.get_project_id())
         pstate["merged_file_blocks"] = None
+        self._f._log_debug("DIAG merge: pstate resolved + cleared")
 
         # ── Step 2: collect references from both locations, dedup by id ──
         refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
+        self._f._log_debug(f"DIAG merge: refs collected → {len(refs)} ref(s)")
         if not refs:
+            self._f._log_debug("DIAG merge: no refs, returning")
             return messages
         target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
         if target is None:
+            self._f._log_debug("DIAG merge: no user message target, returning")
             return messages
+        self._f._log_debug("DIAG merge: target user message found")
 
         # ── Step 3: read, render, and pre-extract each file ──
         merged_text: List[str] = []
         merged_file_blocks: List[Dict[str, Any]] = []
         seen_ids: set = set()
-        for ref in refs:
+        for _ridx, ref in enumerate(refs):
+            self._f._log_debug(f"DIAG merge: ── ref #{_ridx} START")
             if not isinstance(ref, dict):
+                self._f._log_debug(f"DIAG merge: ref #{_ridx} not a dict, skip")
                 continue
             finfo = ref.get("file", {}) or {}
             file_id = finfo.get("id") or ref.get("id")
             if not file_id or file_id in seen_ids:
+                self._f._log_debug(f"DIAG merge: ref #{_ridx} no id / dup, skip")
                 continue
             seen_ids.add(file_id)
 
             name = (
                 finfo.get("filename") or ref.get("name") or f"attachment_{file_id[:8]}"
             )
+            self._f._log_debug(
+                f"DIAG merge: ref #{_ridx} name={name!r}, reading from path…"
+            )
             content = self._read_uploaded_file(finfo.get("path"))
+            self._f._log_debug(f"DIAG merge: ref #{_ridx} read {len(content)} chars")
             if not content:
                 self._f._log_debug(
                     f"merge_pasted_files: unreadable '{name}' "
@@ -26364,13 +26432,28 @@ class InletOrchestrator:
                 )
                 continue
 
+            self._f._log_debug(f"DIAG merge: ref #{_ridx} resolving fence…")
             is_code, fence_lang = await self._resolve_pasted_fence(name, content)
+            self._f._log_debug(
+                f"DIAG merge: ref #{_ridx} fence → is_code={is_code}, "
+                f"lang={fence_lang!r}"
+            )
+
+            self._f._log_debug(f"DIAG merge: ref #{_ridx} formatting…")
             merged_text.append(
                 self._format_pasted_file(name, content, is_code, fence_lang)
             )
+            self._f._log_debug(f"DIAG merge: ref #{_ridx} formatted")
+
             if is_code:
+                self._f._log_debug(
+                    f"DIAG merge: ref #{_ridx} extracting symbols from raw…"
+                )
                 symbols, lang = await self._extract_symbols_from_raw(
                     content, name, fence_lang
+                )
+                self._f._log_debug(
+                    f"DIAG merge: ref #{_ridx} extracted {len(symbols)} symbol(s)"
                 )
                 if symbols:
                     merged_file_blocks.append(
@@ -26381,11 +26464,14 @@ class InletOrchestrator:
                             "language": lang,
                         }
                     )
+            self._f._log_debug(f"DIAG merge: ── ref #{_ridx} DONE")
 
         if not merged_text:
+            self._f._log_debug("DIAG merge: no merged_text, returning")
             return messages
 
         # ── Step 4: append after the user's own text (question stays at head) ──
+        self._f._log_debug("DIAG merge: appending to target message…")
         original = (target.get("content", "") or "").rstrip()
         joined = "\n\n".join(merged_text)
         target["content"] = f"{original}\n\n{joined}" if original else joined
@@ -30118,7 +30204,23 @@ class TaskRegistry:
                 skip_if_completed=True,
             ),
             # ------------------------------------------------------------------
-            # Task 3: Docstrings (lower priority, can be generated lazily).
+            # Task 3: Path index.
+            # ------------------------------------------------------------------
+            BackgroundTask(
+                name="path_index",
+                state_key="bg_path_index_state",
+                lazy_func=self._lazy_path_index,
+                bg_func=self._bg_path_index,
+                invalidation_func=lambda pid: self._f._activation.compute_code_state_hash(
+                    pid
+                ),
+                valve_bg="enable_bg_path_index",
+                valve_lazy="enable_lazy_path_index",
+                priority=2,
+                skip_if_completed=True,
+            ),
+            # ------------------------------------------------------------------
+            # Task 4: Docstrings (lower priority, can be generated lazily).
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="docstrings",
@@ -30134,7 +30236,7 @@ class TaskRegistry:
                 skip_if_completed=True,
             ),
             # ------------------------------------------------------------------
-            # Task 4: RAPTOR rebuild.
+            # Task 5: RAPTOR rebuild.
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="raptor",
@@ -30150,7 +30252,7 @@ class TaskRegistry:
                 skip_if_completed=True,
             ),
             # ------------------------------------------------------------------
-            # Task 5: Purge old versions (experimental, disabled by default).
+            # Task 6: Purge old versions (experimental, disabled by default).
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="purge",
@@ -30166,7 +30268,7 @@ class TaskRegistry:
                 skip_if_completed=True,
             ),
             # ------------------------------------------------------------------
-            # Task 6: LOD adaptive (invalidated every turn via message_count).
+            # Task 7: LOD adaptive (invalidated every turn via message_count).
             # ------------------------------------------------------------------
             BackgroundTask(
                 name="lod_adaptive",
@@ -30337,6 +30439,44 @@ class TaskRegistry:
             graph_weight=graph_weight,
             stop_event=stop_event,
         )
+
+    async def _lazy_path_index(self, project_id: str) -> bool:
+        """Lazy path-index rebuild during inlet when the background pass has not
+        completed yet.
+
+        Unlike _lazy_prefetch (whose scope is narrower than its background
+        counterpart, so it returns False to leave the shared flag untouched),
+        this does the SAME full rebuild as the background task, so it returns
+        True: run_lazy_tasks then marks the task completed and the background
+        pass is skipped. Respects the master enable_path_analysis gate.
+
+        Args:
+            project_id: Current project identifier.
+
+        Returns:
+            True once the rebuild is done (or skipped because path analysis is
+            disabled), so the completion flag is stamped and it is not retried
+            until the code state changes.
+        """
+        if not self._f.valves.enable_path_analysis:
+            return True
+        await self._f._activation.rebuild_path_index(project_id)
+        return True
+
+    async def _bg_path_index(self, project_id: str, stop_event=None) -> None:
+        """Background path-index rebuild, off the critical inlet path.
+
+        Runs from the outlet after a code-state change (e.g. a large silent
+        ingestion), so the next turn finds the path index already built and pays
+        no rebuild cost. Respects the master enable_path_analysis gate.
+
+        Args:
+            project_id: Current project identifier.
+            stop_event: Cooperative-cancellation signal from the task manager.
+        """
+        if not self._f.valves.enable_path_analysis:
+            return
+        await self._f._activation.rebuild_path_index(project_id)
 
     async def _bg_session_summary(self, project_id: str, stop_event=None) -> None:
         """
@@ -34456,11 +34596,16 @@ class Filter:
             default=False,
             description="Enable lazy purge of old versions in inlet (experimental).",
         )
+        enable_lazy_path_index: bool = Field(
+            default=True,
+            description="Enable lazy path-index rebuild in inlet as a fallback when "
+            "the background pass has not finished. Rebuilds CodePathViews for all "
+            "entry points; invalidated by code-state changes (e.g. an ingestion).",
+        )
         enable_lazy_lod: bool = Field(
             default=True,
             description="Enable lazy LOD adaptive adjustment in inlet (uses last response).",
         )
-
         # ── 15.3 Background tasks (outlet) ────────────────────────────────────
         enable_bg_docstrings: bool = Field(
             default=True,
@@ -34481,6 +34626,12 @@ class Filter:
         enable_bg_purge: bool = Field(
             default=False,
             description="Enable background purge of old versions between turns (experimental).",
+        )
+        enable_bg_path_index: bool = Field(
+            default=True,
+            description="Enable background path-index rebuild between turns. Moves the "
+            "per-entry-point CodePathView build off the critical inlet path (the "
+            "dominant cost on a large first ingestion); invalidated by code-state changes.",
         )
         enable_bg_lod: bool = Field(
             default=True,
@@ -35446,10 +35597,15 @@ class Filter:
                         finally:
                             pass
 
-                        # -- rebuild graph and path index --------------------------
+                        # -- resolve cross-chunk edges (cheap; needed before Block A)
+                        # The path-index rebuild that used to run here is the
+                        # dominant cost on a large ingestion (a build_activation_graph
+                        # per entry point). It now runs off the critical path as the
+                        # 'path_index' background task, with a lazy fallback on the
+                        # next turn — see TaskRegistry._build_tasks. Block A keeps its
+                        # correct centrality via invalidate_block_a_cache below, which
+                        # recomputes it independently of the path index.
                         await self._activation.resolve_dangling_edges(project_id)
-                        if self.valves.enable_path_analysis:
-                            await self._activation.rebuild_path_index(project_id)
 
                         # -- invalidate and rebuild Block A eagerly ----------------
                         if self.valves.block_a_freeze_break_on_ingestion:
