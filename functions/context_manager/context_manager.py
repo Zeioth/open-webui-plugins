@@ -16133,7 +16133,10 @@ class CodeBlockManager:
 
         Uses tree-sitter process() as a Markdown block detector (without
         extract_symbols=True), falling back to regex for fenced blocks and
-        indentation scanning for plain text code snippets.
+        indentation scanning for plain text code snippets. Two pre-extracted
+        paths (Section 0 and Section 1) short-circuit all markdown parsing when
+        symbols were already extracted upstream from raw source — essential for
+        attached files, which may contain ``` that would corrupt fence detection.
 
         Args:
             content: Raw message content.
@@ -16150,6 +16153,33 @@ class CodeBlockManager:
         spans = []
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
+
+        # ── Section 0: Pre-extracted per-file symbols (from merge_pasted_files) ──
+        # Attached files had their symbols extracted from raw bytes, so no
+        # markdown re-parsing is needed — and must not be attempted, since the
+        # file may contain ``` that would corrupt fence detection. Emit one block
+        # per file with its own raw code and aligned symbols. Consumed once.
+        merged = pstate.get("merged_file_blocks")
+        if merged:
+            pstate["merged_file_blocks"] = None
+            m_blocks: List[Dict[str, Any]] = []
+            m_spans: List[Tuple[int, int]] = []
+            for mfb in merged:
+                fp = mfb.get("file_path")
+                if self._is_filter_internal(fp):
+                    continue
+                m_blocks.append(
+                    {
+                        "language": mfb.get("language", "python"),
+                        "code": mfb["raw_code"],
+                        "type": "indented",
+                        "precomputed_symbols": mfb["symbols"],
+                        "file_path": fp,
+                    }
+                )
+                m_spans.append((0, 0))
+            if m_blocks:
+                return m_blocks, m_spans
 
         # ── Section 1: Silent ingestion path (pre-extracted symbols) ──────
         raw = pstate.get("raw_ingested_symbols")
@@ -35345,30 +35375,76 @@ class Filter:
 
                     pstate_local = self._project_state_manager.get_pstate(project_id)
 
-                    # -- pull raw code out of the markdown fences --------------
-                    _code_for_extraction = user_query
-                    self._log_debug(
-                        f"DIAG: user_query={len(user_query)} chars, "
-                        f"triple-backtick runs={user_query.count(chr(96)*3)}"
-                    )
-                    try:
-                        _spans = await self._code_blocks.get_code_spans(user_query)
-                        self._log_debug(
-                            f"DIAG: get_code_spans → {len(_spans)} span(s): {_spans[:5]}"
+                    # -- obtain symbols: prefer the merge's raw pre-extraction --
+                    # When this turn's code arrived as attached files, the merge
+                    # already extracted symbols from raw bytes (immune to files
+                    # containing ```). Reuse them and let Section 0 of
+                    # extract_code_blocks build the blocks. Otherwise fall back to
+                    # stripping fences off an inline paste before parsing.
+                    _merged = pstate_local.get("merged_file_blocks")
+                    _from_merge = bool(_merged)
+                    if _from_merge:
+                        raw_symbols = [
+                            s for mfb in _merged for s in mfb.get("symbols", [])
+                        ]
+                        pstate_local["ingested_lang"] = _merged[0].get(
+                            "language", "python"
                         )
-                        if _spans:
-                            _code_for_extraction = "\n\n".join(
-                                CodeBlockManager._strip_fence_markers(user_query[s:e])
-                                for s, e in _spans
-                            )
-                    except Exception as _e:
-                        self._log_debug(f"DIAG: get_code_spans raised {_e!r}")
+                    else:
                         _code_for_extraction = user_query
+                        try:
+                            _spans = await self._code_blocks.get_code_spans(
+                                user_query
+                            )
+                            if _spans:
+                                _code_for_extraction = "\n\n".join(
+                                    CodeBlockManager._strip_fence_markers(
+                                        user_query[s:e]
+                                    )
+                                    for s, e in _spans
+                                )
+                        except Exception:
+                            _code_for_extraction = user_query
 
-                    self._log_debug(
-                        f"DIAG: _code_for_extraction={len(_code_for_extraction)} chars, "
-                        f"head={_code_for_extraction[:150]!r}"
-                    )
+                        _guessed_lang = SignatureExtractor._guess_language(
+                            None, _code_for_extraction
+                        )
+                        _lang = (
+                            _guessed_lang if _guessed_lang != "unknown" else "python"
+                        )
+                        pstate_local["ingested_lang"] = _lang
+
+                        raw_symbols = []
+                        if HAS_TREE_SITTER:
+                            try:
+                                raw_symbols = await SignatureExtractor.extract_async(
+                                    _code_for_extraction, None, language=_lang
+                                )
+                            except Exception:
+                                raw_symbols = []
+                        if raw_symbols:
+                            raw_symbols = (
+                                SignatureExtractor.enrich_symbols_with_parent_info(
+                                    raw_symbols, _code_for_extraction
+                                )
+                            )
+
+                    # -- safety net: is_code_only_message() can misclassify
+                    #    ordinary prose as code-only. If symbol extraction found
+                    #    nothing, this was never a code paste — abandon silent
+                    #    ingestion and fall through to the normal pipeline.
+                    if not raw_symbols:
+                        self._log_debug(
+                            "Silent ingestion aborted: is_code_only_message "
+                            "classified this as code, but symbol extraction "
+                            "found nothing — falling through to normal pipeline"
+                        )
+                    else:
+                        # Inline pastes hand symbols to Section 1; merged files
+                        # are consumed by Section 0 via merged_file_blocks, so
+                        # that channel is left untouched here.
+                        if not _from_merge:
+                            pstate_local["raw_ingested_symbols"] = raw_symbols
 
                     # -- detect language and pre-extract symbols ---------------
                     _guessed_lang = SignatureExtractor._guess_language(
