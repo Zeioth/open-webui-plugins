@@ -30694,9 +30694,6 @@ class ProjectStateManager:
             "current_call_graph_mode": None,
             # -- Ingestion -----------------------------------------
             "ingested_lang": None,
-            "raw_ingested_symbols": None,
-            "ingested_lang": None,
-            "raw_ingested_symbols": None,
             "merged_file_blocks": None,
             # -- Block A / skeleton cache ---------------------------------
             "block_a_cache_key": None,
@@ -35375,15 +35372,17 @@ class Filter:
 
                     pstate_local = self._project_state_manager.get_pstate(project_id)
 
-                    # -- obtain symbols: prefer the merge's raw pre-extraction --
-                    # When this turn's code arrived as attached files, the merge
-                    # already extracted symbols from raw bytes (immune to files
-                    # containing ```). Reuse them and let Section 0 of
-                    # extract_code_blocks build the blocks. Otherwise fall back to
-                    # stripping fences off an inline paste before parsing.
+                    # -- extract symbols onto the unified pre-extraction channel
+                    # Both attachments and inline pastes end up as one or more
+                    # blocks on pstate["merged_file_blocks"], which Section 0 of
+                    # extract_code_blocks turns into aligned blocks. This keeps
+                    # file ingestion and chat ingestion identical: a block's code
+                    # is always the clean source its symbols were parsed from,
+                    # never the fenced/prefixed message.
                     _merged = pstate_local.get("merged_file_blocks")
-                    _from_merge = bool(_merged)
-                    if _from_merge:
+                    if _merged:
+                        # File path: merge_pasted_files already populated the
+                        # channel. raw_symbols is only needed for the abort check.
                         raw_symbols = [
                             s for mfb in _merged for s in mfb.get("symbols", [])
                         ]
@@ -35391,6 +35390,8 @@ class Filter:
                             "language", "python"
                         )
                     else:
+                        # Inline path: strip fences, parse the clean source, and
+                        # publish it on the same channel as a single block.
                         _code_for_extraction = user_query
                         try:
                             _spans = await self._code_blocks.get_code_spans(user_query)
@@ -35426,6 +35427,16 @@ class Filter:
                                     raw_symbols, _code_for_extraction
                                 )
                             )
+                            pstate_local["merged_file_blocks"] = [
+                                {
+                                    "file_path": self._code_blocks._guess_file_path(
+                                        user_query
+                                    ),
+                                    "raw_code": _code_for_extraction,
+                                    "symbols": raw_symbols,
+                                    "language": _lang,
+                                }
+                            ]
 
                     # -- safety net: is_code_only_message() can misclassify
                     #    ordinary prose as code-only. If symbol extraction found
@@ -35438,13 +35449,9 @@ class Filter:
                             "found nothing — falling through to normal pipeline"
                         )
                     else:
-                        # Inline pastes hand symbols to Section 1; merged files
-                        # are consumed by Section 0 via merged_file_blocks, so
-                        # that channel is left untouched here.
-                        if not _from_merge:
-                            pstate_local["raw_ingested_symbols"] = raw_symbols
-
                         # -- index the pasted code --------------------------------
+                        # Section 0 of extract_code_blocks consumes
+                        # merged_file_blocks (populated above for both paths).
                         _msg_to_index = last_user_msg
                         self._is_silent_ingestion = True
                         try:
