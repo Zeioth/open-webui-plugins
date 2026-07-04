@@ -15683,122 +15683,44 @@ class CommandRouter:
     async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """Decide whether a message is a bare code paste with no question.
 
-        Cascade:
-        1. Tree-sitter: detect fenced code blocks; if the text outside the
-           fences is minimal and shows no request intent, classify as code-only.
-        2. CrossEncoder (with heuristic reinforcement) for large/unfenced code.
-        3. LLM arbitration when the CrossEncoder margin is inconclusive.
-        4. Structural heuristic fallback for the remaining ambiguous band.
+        A code-only verdict requires positive code evidence AND the absence of
+        any request or question intent. Intent is detected position-independently
+        over extracted prose — never over raw code — so a trailing imperative
+        after a large paste ("<10k lines> ... dime qué hace build_block_b") is
+        recognised as a question, while a '?' living inside a regex literal or a
+        '# fix ...' comment is not mistaken for one.
 
-        A code-only verdict requires positive code evidence and no question or
-        request intent. Restores the KV slot after any auxiliary LLM call.
+        Cascade:
+        1. Prose / structural split: comments, docstrings and string/regex
+           literals are blanked, so only genuine natural-language lines survive
+           as prose. Computed once and reused by every later step.
+        2. Intent veto: a head request lead or ANY interrogative prose line
+           vetoes the code-only verdict outright — the user wants an answer.
+        3. Fenced short-circuit (tree-sitter): a fenced paste with negligible
+           surrounding prose and no intent is code-only.
+        4. Structural poles + CrossEncoder for the genuinely ambiguous band;
+           LLM arbitration when the CrossEncoder margin is inconclusive.
+        5. Structural verdict for the remainder.
+
+        Restores the KV slot after any auxiliary LLM call.
         """
-        # ── Guard clauses & message metrics ──
+        # ── Step 0: guard clauses & line inventory ────────────────────────────
         if not content or len(content.strip()) < 20:
             return False
 
         stripped = content.strip()
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
-        all_line_count = len(stripped.splitlines())
-        non_empty_lines = [l for l in stripped.splitlines() if l.strip()]
-
-        # ── Step 1: fenced code detection (tree-sitter) ──
-        # Parse the message as markdown to locate code-fence spans. The markdown
-        # grammar is mandatory: an empty language triggers a grammar download
-        # that always fails. At least one real fence must exist for this
-        # short-circuit; otherwise fall through to the heuristic path.
-        if HAS_TREE_SITTER:
-            try:
-                from tree_sitter_language_pack import process, ProcessConfig
-
-                config = ProcessConfig()
-                config.language = "markdown"
-                blocks = process(content, config)
-                fence_spans = [
-                    (b.start_byte, b.end_byte)
-                    for b in (getattr(blocks, "blocks", None) or [])
-                ]
-                if fence_spans:
-                    text_outside = self._text_outside_spans(content, fence_spans)
-                    # Minimal non-code text and no request intent → code-only.
-                    # The 80-char margin avoids swallowing short adjacent prompts
-                    # ("¿puedes arreglarlo?"), and _looks_interrogative now also
-                    # catches lead imperatives ("refactoriza esto").
-                    if not text_outside or (
-                        len(text_outside) < 80
-                        and not self._looks_interrogative(text_outside)
-                    ):
-                        return True
-            except Exception:
-                pass
-
-        # ── Step 2: CrossEncoder classification ──
-        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
-            # Head request intent, computed once and reused as a veto below.
-            head_is_request = self._has_request_lead(content)
-
-            query = content[:500]
-            pairs = [
-                (
-                    query,
-                    "This is a code snippet or technical content without a question.",
-                ),
-                (query, "This is a natural language question or explanation."),
-            ]
-            scores = await self._predict_cross_encoder(pairs)
-            if scores is not None and len(scores) >= 2:
-                scores_reinforced = list(scores)
-
-                # Nudge toward code-only only for short messages that carry no
-                # request intent. Short imperative questions ("dime ...") are
-                # short and unmarked, and must not be nudged.
-                if not self._looks_interrogative(content) and len(content.split()) < 30:
-                    scores_reinforced[0] += 0.2
-
-                # Very large messages: decide by structural-line ratio, but never
-                # auto-classify a paste that opens with an explicit request.
-                if all_line_count > 500 and not head_is_request:
-                    structural_lines = sum(
-                        1
-                        for l in non_empty_lines
-                        if self._STRUCTURAL_LINE_START.match(l)
-                        or self._CONTINUATION_OR_LITERAL.match(l)
-                    )
-                    ratio = (
-                        structural_lines / len(non_empty_lines)
-                        if non_empty_lines
-                        else 0
-                    )
-                    if ratio > 0.6:
-                        return True
-                    if all_line_count > 1000 and content.count("?") < 3:
-                        return True
-
-                # Threshold bands. The clamp keeps the LLM band strictly below
-                # the confidence band even under incoherent valve values.
-                ce_threshold = self._f.valves.code_only_ce_threshold
-                llm_threshold = self._f.valves.code_only_llm_threshold
-                if llm_threshold > ce_threshold:
-                    llm_threshold = ce_threshold
-
-                diff = scores_reinforced[0] - scores_reinforced[1]
-                if diff >= ce_threshold:
-                    return scores_reinforced[0] > scores_reinforced[1]
-                elif diff < llm_threshold:
-                    return await self._is_code_only_with_llm(
-                        query, scores_reinforced, project_id
-                    )
-
-        # ── Step 3: structural heuristic fallback ──
-        # Step 3a — classify each non-blank line as structural or prose. Noise
-        # stripping is applied line by line so the result stays aligned with the
-        # original lines regardless of what _strip_code_noise does to line count.
         raw_lines = stripped.splitlines()
         non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
         code_line_count = len(non_blank_idx)
         if code_line_count == 0:
             return False
 
+        # ── Step 1: prose / structural split (single pass, reused below) ──────
+        # _strip_code_noise blanks comments, docstrings and string/regex
+        # literals, so only real natural-language lines reach prose_candidates.
+        # This is what makes the Step 2 intent check safe: code punctuation can
+        # never masquerade as a question.
         structural_lines = 0
         prose_candidates: List[str] = []
         for i in non_blank_idx:
@@ -15819,32 +15741,96 @@ class CommandRouter:
         )
         prose_text = " ".join(prose_candidates).strip()
 
-        # ── Step 3b: verdict (intent first, then structural poles) ──
-        # 1. Request/question lead at the message head → the user wants an
-        #    answer. Evaluated first, so it holds regardless of how the
-        #    structural regexes classify the line (this is what rescues prompts
-        #    like "dime qué hace build_block_b").
-        if self._has_request_lead(stripped):
+        # ── Step 2: intent veto (position-independent, prose-only) ────────────
+        # Head lead catches "dime ... <code>". Scanning every prose line catches
+        # the far more common "<code> ... dime" shape that a head-only check
+        # missed and that let a trailing question slip into silent ingestion.
+        # Positive intent is decisive — return before any code-only path.
+        head_is_request = self._has_request_lead(stripped)
+        prose_is_request = any(self._looks_interrogative(p) for p in prose_candidates)
+        if head_is_request or prose_is_request:
             return False
-        # 2. Question or request intent inside the extracted prose (not inside
-        #    code lines) → answer it.
-        if prose_text and self._looks_interrogative(prose_text):
-            return False
-        # 3. No code lines at all → prose, never a paste (positive-evidence rule).
+
+        # ── Step 3: fenced code short-circuit (tree-sitter) ───────────────────
+        # No intent survived Step 2, so a fenced paste with negligible
+        # surrounding prose is code-only.
+        if HAS_TREE_SITTER:
+            try:
+                from tree_sitter_language_pack import process, ProcessConfig
+
+                config = ProcessConfig()
+                config.language = "markdown"
+                blocks = process(content, config)
+                fence_spans = [
+                    (b.start_byte, b.end_byte)
+                    for b in (getattr(blocks, "blocks", None) or [])
+                ]
+                if fence_spans:
+                    text_outside = self._text_outside_spans(content, fence_spans)
+                    if not text_outside or (
+                        len(text_outside) < 80
+                        and not self._looks_interrogative(text_outside)
+                    ):
+                        return True
+            except Exception:
+                pass
+
+        # ── Step 4: structural poles + CrossEncoder for the ambiguous band ────
+        # A huge, overwhelmingly-structural paste is code with no question
+        # (intent was ruled out above), so short-circuit without the CrossEncoder
+        # — it only sees content[:500] and adds nothing on a body this structural.
+        if code_line_count > 500 and structural_ratio > 0.6:
+            return True
+
+        # Some real code lines and no surviving prose → pure paste.
+        if structural_lines > 0 and not prose_candidates:
+            return True
+
+        # CrossEncoder only for the genuine remainder: enough code to matter,
+        # some prose, no explicit intent. It decides snippet-vs-question
+        # semantically; the LLM arbitrates an inconclusive margin.
+        if estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2:
+            # Feed the CrossEncoder the extracted prose, not the paste head:
+            # over a large paste content[:500] is pure code and blind to a
+            # trailing question, whereas prose_text is exactly the natural-
+            # language the classifier needs to judge implicit intent.
+            query = prose_text[:500] if prose_text else content[:500]
+            pairs = [
+                (
+                    query,
+                    "This is a code snippet or technical content without a question.",
+                ),
+                (query, "This is a natural language question or explanation."),
+            ]
+            scores = await self._predict_cross_encoder(pairs)
+            if scores is not None and len(scores) >= 2:
+                scores_reinforced = list(scores)
+
+                # Short, intent-free messages lean code-only. Intent was already
+                # excluded in Step 2, so no interrogative re-check is needed here.
+                if len(content.split()) < 30:
+                    scores_reinforced[0] += 0.2
+
+                ce_threshold = self._f.valves.code_only_ce_threshold
+                llm_threshold = self._f.valves.code_only_llm_threshold
+                if llm_threshold > ce_threshold:
+                    llm_threshold = ce_threshold
+
+                diff = scores_reinforced[0] - scores_reinforced[1]
+                if diff >= ce_threshold:
+                    return scores_reinforced[0] > scores_reinforced[1]
+                elif diff < llm_threshold:
+                    return await self._is_code_only_with_llm(
+                        query, scores_reinforced, project_id
+                    )
+
+        # ── Step 5: structural verdict (no intent, CrossEncoder inconclusive) ─
         if structural_lines == 0:
             return False
-        # 4. No prose lines at all → pure code paste.
-        if not prose_candidates:
-            return True
-        # 5. Mixed content, no detected question. Overwhelmingly structural →
-        #    paste (the sparse prose is a caption/comment already cleared of
-        #    intent by steps 1-2).
         if structural_ratio > 0.70:
             return True
-        # 6. Substantial non-question prose beside code → treat as a message.
         if len(prose_text) >= 30:
             return False
-        # 7. Sparse prose beside real code lines → paste.
         return True
 
     async def _is_code_only_with_llm(
