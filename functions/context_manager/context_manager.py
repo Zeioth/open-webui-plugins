@@ -16133,10 +16133,11 @@ class CodeBlockManager:
 
         Uses tree-sitter process() as a Markdown block detector (without
         extract_symbols=True), falling back to regex for fenced blocks and
-        indentation scanning for plain text code snippets. Two pre-extracted
-        paths (Section 0 and Section 1) short-circuit all markdown parsing when
-        symbols were already extracted upstream from raw source — essential for
-        attached files, which may contain ``` that would corrupt fence detection.
+        indentation scanning for plain text code snippets. Section 1 short-
+        circuits all markdown parsing when symbols were already extracted
+        upstream from raw source — both attached files (merge_pasted_files) and
+        inline pastes (silent ingestion) publish there. This is mandatory because
+        the source may contain ``` that would corrupt fence detection.
 
         Args:
             content: Raw message content.
@@ -16154,11 +16155,13 @@ class CodeBlockManager:
         if not self._f.valves.auto_detect_code_blocks:
             return blocks, spans
 
-        # ── Section 0: Pre-extracted per-file symbols (from merge_pasted_files) ──
-        # Attached files had their symbols extracted from raw bytes, so no
-        # markdown re-parsing is needed — and must not be attempted, since the
-        # file may contain ``` that would corrupt fence detection. Emit one block
-        # per file with its own raw code and aligned symbols. Consumed once.
+        # ── Section 1: Pre-extracted per-file symbols ────────────────────
+        # File ingestion (merge_pasted_files) and chat ingestion (silent
+        # ingestion, inline pastes) both publish their clean, raw source plus
+        # already-parsed symbols on pstate["merged_file_blocks"]. Emit one block
+        # per entry with its own raw code and aligned symbols, bypassing markdown
+        # parsing entirely — which is mandatory since the source may contain ```
+        # that would corrupt fence detection. Consumed once, then cleared.
         merged = pstate.get("merged_file_blocks")
         if merged:
             pstate["merged_file_blocks"] = None
@@ -16180,22 +16183,6 @@ class CodeBlockManager:
                 m_spans.append((0, 0))
             if m_blocks:
                 return m_blocks, m_spans
-
-        # ── Section 1: Silent ingestion path (pre-extracted symbols) ──────
-        raw = pstate.get("raw_ingested_symbols")
-        if raw is not None:
-            pstate["raw_ingested_symbols"] = None
-            lang = pstate.get("ingested_lang", "python")
-            block = {
-                "language": lang,
-                "code": content,
-                "type": "indented",
-                "precomputed_symbols": raw,
-            }
-            block["file_path"] = self._guess_file_path(content)
-            if not self._is_filter_internal(block["file_path"]):
-                return [block], [(0, len(content))]
-            return [], []
 
         # ── Section 2: Tree-sitter Markdown block detection ───────────────
         # Parse as markdown to locate fenced code block spans.
