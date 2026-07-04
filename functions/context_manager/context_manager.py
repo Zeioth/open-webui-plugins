@@ -34387,7 +34387,7 @@ class Filter:
             description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
         )
         slot_operation_timeout: float = Field(
-            default=60.0,
+            default=10.0,  # This could be low, be aware of this.
             ge=0.0,
             le=600.0,
             description=(
