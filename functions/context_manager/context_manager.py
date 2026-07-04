@@ -784,61 +784,57 @@ class SymbolIndex:
         """
         Return the set of block hashes that contain a given symbol.
 
-        Resolution order
-        ────────────────
-        1. Exact qualified-id lookup in ``_name_to_blocks``. This is the precise
-           path; callers that hold a qualified id should always take it.
-        2. Bare-name fallback via ``_bare_index``: collects every qualified id
-           that shares the bare name and unions their block sets. This is
-           inherently ambiguous — e.g. ``"__init__"`` matches every class's
-           constructor. Callers that need a deterministic single result should
-           first resolve the qualified id via ``get_qualified_names_for``.
+        Resolution order:
+            1. Exact qualified-id lookup in ``_name_to_blocks``.
+            2. Bare-name fallback via ``_bare_index``.
 
-        Atomicity in asyncio
-        ────────────────────
-        This method is synchronous. In Python's single-threaded asyncio event
-        loop, synchronous code runs to completion without yielding control, so
-        this call is atomic with respect to any other concurrently scheduled
-        coroutine.
-
-        The atomicity guarantee applies to *this single call only*. If an async
-        caller performs multiple sequential calls to this method with ``await``
-        expressions between them, each call is individually atomic but the
-        sequence as a whole is not: another coroutine may call ``add`` or
-        ``remove`` during those await points, so the second call may observe
-        a different state than the first.
+        Defensive sanitisation ensures that both arguments are strings before
+        any dictionary lookup, preventing `unhashable type` errors caused by
+        stray dicts or non‑string values propagating from upstream.
 
         Args:
-            name_or_qid: A fully-qualified symbol id (e.g. ``"Cls.method"``) or
-                         a bare name (e.g. ``"method"``).
-            project_id:  The project scope to search within.
+            name_or_qid: A symbol name (bare) or qualified id (e.g. "ClassName.method").
+            project_id:  The project scope under which the symbol is indexed.
 
         Returns:
-            A set of block hash strings. Empty set when the symbol is not found
-            under either resolution strategy, or when the key is not a string.
+            A set of block hash strings. Empty set if no blocks are found.
         """
-        # ── Step 0: type guard ───────────────────────────────────────────────────
-        # A qualified id or bare name is always a str by contract. A non-str value
-        # (e.g. a dict leaking in from a malformed seed) makes the tuple key
-        # (project_id, name_or_qid) unhashable and raises inside .get(); treat it
-        # as "not found" so a single bad key degrades like an unknown symbol
-        # instead of killing the caller (notably the background path_index rebuild).
+        # ---- Region: Input sanitisation ----
+        # Force both parameters to strings. This is the single place where
+        # we guarantee that dictionary keys are always strings, regardless of
+        # what garbage upstream may have passed.
         if not isinstance(name_or_qid, str):
-            return set()
+            self._f._log_debug(
+                f"[SANITIZE] find_blocks: name_or_qid was {type(name_or_qid).__name__}, converting to string"
+            )
+            name_or_qid = str(name_or_qid)
 
-        # ── Step 1: exact qualified-id lookup ─────────────────────────────────────
+        if not isinstance(project_id, str):
+            self._f._log_debug(
+                f"[SANITIZE] find_blocks: project_id was {type(project_id).__name__}, converting to string"
+            )
+            project_id = str(project_id)
+
+        # ---- Region: Exact qualified-id lookup ----
         exact = self._name_to_blocks.get((project_id, name_or_qid))
         if exact is not None:
             return exact
 
-        # ── Step 2: bare-name fallback via the reverse index ─────────────────────
+        # ---- Region: Bare-name fallback ----
         qids = self._bare_index.get((project_id, name_or_qid))
         if not qids:
             return set()
 
         result: Set[str] = set()
         for qid in qids:
+            # qid should already be a string, but we are defensive.
+            if not isinstance(qid, str):
+                self._f._log_debug(
+                    f"[SANITIZE] find_blocks: skipping non‑str qid {qid}"
+                )
+                continue
             result |= self._name_to_blocks.get((project_id, qid), set())
+
         return result
 
     def get_all_names(self, project_id: str) -> Set[str]:
@@ -17510,9 +17506,39 @@ class ActivationEngine:
         self._f = filter_ref
         self._ppr_cache = self._PPRCache(maxsize=20)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
+    # Utility methods (sanitization)
+    # ======================================================================
+
+    @staticmethod
+    def _sanitize_symbol_list(items: Iterable) -> List[str]:
+        """
+        Filter an iterable to keep only strings.
+
+        Args:
+            items: Any iterable (list, set, tuple, etc.)
+
+        Returns:
+            List[str]: A new list containing only string elements from the input.
+        """
+        return [item for item in items if isinstance(item, str)]
+
+    @staticmethod
+    def _sanitize_symbol_dict(items: Dict) -> Dict[str, Any]:
+        """
+        Filter a dictionary to keep only keys that are strings.
+
+        Args:
+            items: A dictionary.
+
+        Returns:
+            Dict[str, Any]: A new dictionary with only string keys.
+        """
+        return {k: v for k, v in items.items() if isinstance(k, str)}
+
+    # ======================================================================
     # 1. Active code context (fallback when path analysis is disabled)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     def get_active_code_context(self, project_id: str, user_query: str = "") -> str:
         """Return a formatted string with the currently active code context for the LLM."""
@@ -17721,29 +17747,30 @@ class ActivationEngine:
                 inside = not inside
         return inside
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 2. Seed extraction helpers
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     async def _extract_query_seeds(
-        self, query: str, project_id: str
+        self,
+        query: str,
+        project_id: str,
     ) -> Tuple[List[str], List[str]]:
         """
         Extract seed symbols from the query using exact match, CrossEncoder, and LLM.
 
-        Args:
-            query: The user query.
-            project_id: Current project identifier.
-
         Returns:
             A tuple of (exact_matches, partial_matches).
+            Both lists are guaranteed to contain only strings.
         """
+        # ---- Region: Initial setup ----
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
 
         exact = list(all_names.intersection(query_words))
         partial = []
 
+        # ---- Region: If few exact matches, try CrossEncoder/LLM ----
         if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
             candidates = set()
             for word in query_words:
@@ -17784,6 +17811,7 @@ class ActivationEngine:
                         elif scored:
                             partial = [scored[0][0]]
 
+        # ---- Region: Fallback to substring matching ----
         if len(partial) < 3:
             for word in query_words:
                 if len(word) < 4:
@@ -17797,9 +17825,31 @@ class ActivationEngine:
                         partial.append(name)
                         if len(partial) >= 5:
                             break
-                if len(partial) >= 5:
-                    break
+                    if len(partial) >= 5:
+                        break
 
+        # ---- Region: Final sanitisation ----
+        # Ensure every element is a string and non-empty
+        def _to_str_list(items):
+            cleaned = []
+            for item in items:
+                if isinstance(item, str):
+                    val = item.strip()
+                    if val:
+                        cleaned.append(val)
+                elif isinstance(item, (int, float)):
+                    val = str(item).strip()
+                    if val:
+                        cleaned.append(val)
+                # dicts or other types are silently dropped
+            return cleaned
+
+        exact = _to_str_list(exact)
+        partial = _to_str_list(partial)
+
+        self._f._log_debug(
+            f"[SANITIZE] exact after: {len(exact)} elements; partial after: {len(partial)}"
+        )
         return exact, partial
 
     async def _extract_seeds_with_llm(
@@ -17808,17 +17858,22 @@ class ActivationEngine:
         """
         Use the LLM to disambiguate between multiple candidate symbols.
 
-        Args:
-            query: The user query.
-            candidates: List of (symbol_name, score) tuples from CrossEncoder.
-            project_id: Current project identifier.
-
         Returns:
-            The selected symbol name, or None.
+            The selected symbol name as a string, or None.
         """
         if not candidates:
             return None
-        scores_str = "\n".join([f"{name}: {score:.2f}" for name, score in candidates])
+
+        # Ensure candidates are strings
+        clean_candidates = [
+            (str(name), score) for name, score in candidates if isinstance(name, str)
+        ]
+        if not clean_candidates:
+            return None
+
+        scores_str = "\n".join(
+            [f"{name}: {score:.2f}" for name, score in clean_candidates]
+        )
         prompt = f"""
 The CrossEncoder is uncertain between these symbols for the query "{query}".
 
@@ -17838,7 +17893,11 @@ Output only the symbol name.
         )
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-        return response.strip() if response else None
+
+        if response:
+            candidate = response.strip()
+            return candidate if isinstance(candidate, str) else None
+        return None
 
     def _extract_traceback_seeds(
         self, content: str, project_id: str
@@ -17901,26 +17960,11 @@ Output only the symbol name.
             adjusted = min(1.0, score * min(specificity, 1.5))
             results.append((func_name, adjusted))
 
-        self._f._log_debug(
-            f"Traceback seeds: {len(results)} frame(s) detected "
-            f"({[r[0] for r in results]})"
-        )
+        # ---- SANITIZE: keep only tuples where the name is a string ----
+        self._f._log_debug(f"[SANITIZE] traceback before: {len(results)} entries")
+        results = [(name, score) for name, score in results if isinstance(name, str)]
+        self._f._log_debug(f"[SANITIZE] traceback after: {len(results)} entries")
         return results
-
-    def _compute_node_specificity(self, symbol_name: str, project_id: str) -> float:
-        """
-        IDF-like specificity of a symbol.
-        Symbols appearing in many blocks are less specific (like stop-words).
-        Returns a multiplier in [0.1, 3.0] to adjust its weight as a seed.
-        """
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        total = max(len(all_names), 1)
-        n_blocks = len(self._f._symbol_index.find_blocks(symbol_name, project_id))
-        if n_blocks == 0:
-            return 1.0
-        specificity = math.log(total / n_blocks) + 1.0
-        return max(0.1, min(3.0, specificity))
 
     def _extract_history_seeds(
         self, messages: Optional[List[dict]], project_id: str, lookback: int = 6
@@ -17948,7 +17992,7 @@ Output only the symbol name.
             return {}
 
         max_count = max(mention_counts.values())
-        return {
+        result = {
             sym: min(
                 self._f.valves.history_seeds_max_boost,
                 self._f.valves.history_seeds_max_boost * (count / max_count),
@@ -17956,6 +18000,83 @@ Output only the symbol name.
             for sym, count in mention_counts.items()
             if count > 0
         }
+
+        # ---- SANITIZE: keep only string keys ----
+        self._f._log_debug(f"[SANITIZE] history before: {len(result)} keys")
+        result = self._sanitize_symbol_dict(result)
+        self._f._log_debug(f"[SANITIZE] history after: {len(result)} keys")
+        return result
+
+    def _compute_node_specificity(self, symbol_name, project_id: str) -> float:
+        """
+        Compute the IDF‑like specificity of a symbol.
+
+        Symbols that appear in many blocks are less specific (like stop‑words).
+        Returns a multiplier in [0.1, 3.0] to adjust its weight as a seed.
+
+        The method is fully defensive: it converts any non‑string input to a string,
+        and if that conversion fails or the symbol is not found, it returns a neutral
+        value (1.0) so that the caller can continue without crashing.
+
+        Args:
+            symbol_name: The symbol name (must be a string, but we handle anything).
+            project_id:  Current project identifier.
+
+        Returns:
+            Specificity multiplier in [0.1, 3.0], or 1.0 for invalid inputs.
+        """
+        # ---- Region: Force conversion to string ----
+        if not isinstance(symbol_name, str):
+            self._f._log_debug(
+                f"[DIAG] _compute_node_specificity received non‑str: {type(symbol_name).__name__}, repr={repr(symbol_name)[:200]}"
+            )
+            # If it's a dict, try to extract a meaningful name
+            if isinstance(symbol_name, dict):
+                safe_name = (
+                    symbol_name.get("name")
+                    or symbol_name.get("symbol")
+                    or symbol_name.get("id")
+                )
+                if isinstance(safe_name, str):
+                    symbol_name = safe_name
+                else:
+                    # No usable string found – return neutral value
+                    self._f._log_debug(
+                        f"[DIAG] _compute_node_specificity: dict has no 'name'/'symbol'/'id' key → returning 1.0"
+                    )
+                    return 1.0
+            else:
+                # Convert int, float, etc. to string
+                symbol_name = str(symbol_name)
+
+        # Double‑check: if it still isn't a string, return 1.0
+        if not isinstance(symbol_name, str):
+            self._f._log_debug(
+                f"[DIAG] _compute_node_specificity: final type is not str, returning 1.0"
+            )
+            return 1.0
+
+        # ---- Region: Compute specificity ----
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        total = max(len(all_names), 1)
+
+        # ---- Defensive call to find_blocks ----
+        try:
+            block_set = self._f._symbol_index.find_blocks(symbol_name, project_id)
+            n_blocks = len(block_set)
+        except TypeError as e:
+            # This should never happen now that find_blocks sanitises inputs,
+            # but we keep the guard for extra safety.
+            self._f._log_debug(
+                f"[DIAG] _compute_node_specificity: find_blocks raised {e} for '{symbol_name}' → returning 1.0"
+            )
+            return 1.0
+
+        if n_blocks == 0:
+            return 1.0
+
+        specificity = math.log(total / n_blocks) + 1.0
+        return max(0.1, min(3.0, specificity))
 
     def _audit_seed_types(
         self,
@@ -17989,6 +18110,7 @@ Output only the symbol name.
             history_boosts: {symbol: boost} from recent message history.
             inferred_seeds: Optional {qid: score} from LLM seed inference.
         """
+
         # ── Local helper: never let the audit itself raise ────────────────────────
         def _safe_repr(obj) -> str:
             try:
@@ -18024,18 +18146,17 @@ Output only the symbol name.
             ("history_boosts", history_boosts),
             ("inferred_seeds", inferred_seeds),
         ):
-            for k in (mapping or {}):
+            for k in mapping or {}:
                 if not isinstance(k, str):
                     self._f._log_debug(
                         f"[SEED-AUDIT] ⚠️ non-str key in {dict_name} "
                         f"(type={type(k).__name__}, repr={_safe_repr(k)}) "
                         f"— query={_safe_repr(query)}"
                     )
-    
+
     async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
-    ) -> Tuple[List[str], List[str], List[Tuple[str, float]], Dict[str, float]]:
-        """Extract exact, partial, traceback and historical seed symbols."""
+    ):
         exact_seeds, partial_seeds = await self._extract_query_seeds(query, project_id)
         tb_seeds = (
             self._extract_traceback_seeds(query, project_id)
@@ -18049,11 +18170,52 @@ Output only the symbol name.
             if (self._f.valves.enable_history_seeds and messages)
             else {}
         )
+
+        # --- SANITIZACIÓN DE CADA TIPO ---
+        # exact_seeds y partial_seeds deben ser listas de strings
+        exact_seeds = [
+            str(s)
+            for s in exact_seeds
+            if isinstance(s, (str, int, float)) and str(s).strip()
+        ]
+        partial_seeds = [
+            str(s)
+            for s in partial_seeds
+            if isinstance(s, (str, int, float)) and str(s).strip()
+        ]
+
+        # tb_seeds es lista de tuplas (name, score)
+        tb_seeds = [
+            (str(name), score)
+            for name, score in tb_seeds
+            if isinstance(name, (str, int, float))
+        ]
+
+        # history_boosts es dict {symbol: boost}
+        history_boosts = {
+            str(k): v
+            for k, v in history_boosts.items()
+            if isinstance(k, (str, int, float))
+        }
+
+        self._f._log_debug(
+            f"[DIAG] _prepare_seed_symbols returning exact={repr(exact_seeds)}"
+        )
+        self._f._log_debug(
+            f"[DIAG] _prepare_seed_symbols returning partial={repr(partial_seeds)}"
+        )
+        self._f._log_debug(
+            f"[DIAG] _prepare_seed_symbols returning tb_seeds={repr(tb_seeds)}"
+        )
+        self._f._log_debug(
+            f"[DIAG] _prepare_seed_symbols returning history={repr(history_boosts)}"
+        )
+
         return exact_seeds, partial_seeds, tb_seeds, history_boosts
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 3. PPR computation with caching (Q2)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     def _get_or_compute_ppr_scores(
         self,
@@ -18189,9 +18351,106 @@ Output only the symbol name.
 
         return scores
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 4. Activation graph builders
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
+
+    def _register_seeds(
+        self,
+        names: List[Any],
+        base_score_fn: Callable[[float], float],
+        target_graph: ActivationGraph,
+        project_id: str,
+        lexical_seed_qids: Set[str],
+    ) -> None:
+        """
+        Register a list of symbol names as seeds into an ActivationGraph.
+
+        Each name is resolved to its qualified ids via the SymbolIndex, and a
+        seed score (computed by base_score_fn applied to the symbol's specificity)
+        is distributed equally among all its qualified ids.
+
+        The method thoroughly sanitises the input list: any element that is not a
+        string is either converted (if it has a string key like 'name' or 'symbol')
+        or discarded, with a debug log entry.
+
+        Args:
+            names: List of symbol names (should be strings, but may be anything).
+            base_score_fn: Callable that takes specificity (float) and returns a score.
+            target_graph: The ActivationGraph to receive the seed activations.
+            project_id: Current project identifier.
+            lexical_seed_qids: A set to collect all qualified ids added as seeds.
+        """
+        # ---- Region: Sanitise input list ----
+        clean_names: List[str] = []
+        for item in names or []:
+            if isinstance(item, str):
+                clean_names.append(item.strip())
+            elif isinstance(item, dict):
+                # Try to extract a name from common keys
+                maybe_name = item.get("name") or item.get("symbol") or item.get("id")
+                if isinstance(maybe_name, str):
+                    clean_names.append(maybe_name.strip())
+                else:
+                    self._f._log_debug(
+                        f"[SANITIZE] _register_seeds: skipping dict without name key: {repr(item)[:100]}"
+                    )
+            else:
+                # Try to convert to string (int, float, etc.)
+                try:
+                    converted = str(item).strip()
+                    if converted:
+                        clean_names.append(converted)
+                except Exception:
+                    self._f._log_debug(
+                        f"[SANITIZE] _register_seeds: could not convert {type(item)} to string"
+                    )
+
+        if not clean_names:
+            return
+
+        # ---- Region: Register each seed ----
+        symbol_index = self._f._symbol_index
+
+        for sym_name in clean_names:
+            # Extra safety: ensure it's a string
+            if not isinstance(sym_name, str):
+                continue
+
+            self._f._log_debug(
+                f"[DIAG] _register_seeds sym_name (after sanitise): {repr(sym_name)}"
+            )
+
+            # Compute specificity and base score
+            specificity = self._compute_node_specificity(sym_name, project_id)
+            score = base_score_fn(specificity)
+
+            # Resolve to qualified ids
+            qids = symbol_index.get_qualified_names_for(sym_name, project_id)
+            if not qids:
+                continue
+
+            # Add to the lexical seed set
+            lexical_seed_qids.update(qids)
+
+            # Distribute score equally among all qualified ids for this name
+            share = score / len(qids)
+            for qid in qids:
+                existing = target_graph._activations.get(qid)
+                if existing:
+                    target_graph._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=min(1.0, existing.score + share),
+                        depth=0,
+                        source=existing.source,
+                    )
+                else:
+                    target_graph._activations[qid] = ActivationState(
+                        node_id=qid,
+                        score=share,
+                        depth=0,
+                        source="seed",
+                    )
 
     def _build_single_seed_graph(
         self,
@@ -18204,39 +18463,75 @@ Output only the symbol name.
         inferred_seeds: Optional[Dict[str, float]] = None,
         cached_scores: Optional[Dict[str, float]] = None,
     ) -> "ActivationGraph":
-        """Build activation graph when multi‑seed activation is disabled.
+        """
+        Build activation graph when multi‑seed activation is disabled.
 
         Each bare‑name seed is split across its qualified id(s) before being
         written into the graph, since edges_out is now keyed by qualified id.
 
         Q2: If cached_scores is provided, skip propagation and load scores directly.
+
+        Args:
+            exact_seeds: List of exact query‑matched symbol names (strings).
+            partial_seeds: List of fuzzy/CrossEncoder/LLM‑matched symbol names.
+            tb_seeds: List of (symbol_name, confidence) from traceback frames.
+            history_boosts: Dict mapping symbol names to boost scores from history.
+            edges_out: Call‑graph edges used for PPR propagation.
+            project_id: Current project identifier.
+            inferred_seeds: Optional {qid: score} from LLM‑guided inference.
+            cached_scores: Optional precomputed PPR scores to load instead of recomputing.
+
+        Returns:
+            ActivationGraph with propagated scores.
         """
+        # ---- Region: Sanitise all inputs ----
+        exact_seeds = self._sanitize_symbol_list(exact_seeds)
+        partial_seeds = self._sanitize_symbol_list(partial_seeds)
+        tb_seeds = [(name, score) for name, score in tb_seeds if isinstance(name, str)]
+        history_boosts = self._sanitize_symbol_dict(history_boosts)
+
+        if not isinstance(inferred_seeds, dict):
+            self._f._log_debug(
+                f"[SANITIZE] inferred_seeds is not a dict: {type(inferred_seeds)} - setting to empty dict"
+            )
+            inferred_seeds = {}
+        else:
+            inferred_seeds = {
+                k: v for k, v in inferred_seeds.items() if isinstance(k, str)
+            }
+
+        self._f._log_debug(f"[DIAG] exact_seeds after sanitize: {repr(exact_seeds)}")
+        self._f._log_debug(
+            f"[DIAG] partial_seeds after sanitize: {repr(partial_seeds)}"
+        )
+        self._f._log_debug(f"[DIAG] tb_seeds after sanitize: {repr(tb_seeds)}")
+        self._f._log_debug(
+            f"[DIAG] history_boosts after sanitize: {repr(history_boosts)}"
+        )
+
+        # ---- Region: Initialise graph and seed collection ----
         symbol_index = self._f._symbol_index
         ag = ActivationGraph()
         lexical_seed_qids: Set[str] = set()
 
-        if exact_seeds:
-            for sym_name in exact_seeds:
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(1.0, 0.5 + 0.5 * min(specificity, 1.0))
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    ag._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
-        if partial_seeds:
-            for sym_name in partial_seeds:
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = min(0.6, 0.3 + 0.3 * min(specificity, 1.0))
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    ag._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
+        # ---- Region: Register lexical seeds (exact & partial) using the shared helper ----
+        self._register_seeds(
+            names=exact_seeds,
+            base_score_fn=lambda sp: min(1.0, 0.5 + 0.5 * min(sp, 1.0)),
+            target_graph=ag,
+            project_id=project_id,
+            lexical_seed_qids=lexical_seed_qids,
+        )
+
+        self._register_seeds(
+            names=partial_seeds,
+            base_score_fn=lambda sp: min(0.6, 0.3 + 0.3 * min(sp, 1.0)),
+            target_graph=ag,
+            project_id=project_id,
+            lexical_seed_qids=lexical_seed_qids,
+        )
+
+        # ---- Region: Process traceback seeds ----
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
@@ -18254,6 +18549,8 @@ Output only the symbol name.
                     ag._activations[qid] = ActivationState(
                         node_id=qid, score=share, depth=0, source="seed"
                     )
+
+        # ---- Region: Process history boosts ----
         for sym_name, boost in history_boosts.items():
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
@@ -18272,7 +18569,8 @@ Output only the symbol name.
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        for qid, inf_score in (inferred_seeds or {}).items():
+        # ---- Region: Process inferred seeds ----
+        for qid, inf_score in inferred_seeds.items():
             lexical_seed_qids.add(qid)
             existing = ag._activations.get(qid)
             if existing:
@@ -18290,6 +18588,7 @@ Output only the symbol name.
                     source="seed",
                 )
 
+        # ---- Region: Cached scores path ----
         if cached_scores is not None:
             for qid, score in cached_scores.items():
                 if score >= 0.01:
@@ -18302,33 +18601,37 @@ Output only the symbol name.
                         source="seed" if qid in lexical_seed_qids else "propagation",
                     )
             self._f._log_debug(f"PPR: loaded {len(cached_scores)} scores from cache")
-        else:
-            if not ag._activations:
-                psm = self._f._project_state_manager
-                centrality = psm.get_node_centrality(project_id)
-                entry_points = self._f._path_index.find_entry_points(
-                    symbol_index, project_id
-                )
-                if entry_points:
-                    sorted_eps = sorted(
-                        entry_points,
-                        key=lambda ep: centrality.get(ep, 0.0),
-                        reverse=True,
-                    )
-                    for sym_name in sorted_eps[:3]:
-                        cent_score = centrality.get(sym_name, 0.0)
-                        seed_score = 0.2 + 0.2 * cent_score
-                        ag._activations[sym_name] = ActivationState(
-                            node_id=sym_name, score=seed_score, depth=0, source="seed"
-                        )
-                        lexical_seed_qids.add(sym_name)
+            return ag
 
-            ag.propagate(
-                edges_out=edges_out,
-                max_steps=20,
-                min_score=0.05,
-                alpha=self._f.valves.ppr_alpha,
+        # ---- Region: No cached scores: run PPR propagation ----
+        if not ag._activations:
+            psm = self._f._project_state_manager
+            centrality = psm.get_node_centrality(project_id)
+            entry_points = self._f._path_index.find_entry_points(
+                symbol_index, project_id
             )
+            if entry_points:
+                sorted_eps = sorted(
+                    entry_points,
+                    key=lambda ep: centrality.get(ep, 0.0),
+                    reverse=True,
+                )
+                for sym_name in sorted_eps[:3]:
+                    cent_score = centrality.get(sym_name, 0.0)
+                    seed_score = 0.2 + 0.2 * cent_score
+                    ag._activations[sym_name] = ActivationState(
+                        node_id=sym_name, score=seed_score, depth=0, source="seed"
+                    )
+                    lexical_seed_qids.add(sym_name)
+
+        # Propagate using the provided edges_out
+        ag.propagate(
+            edges_out=edges_out,
+            max_steps=20,
+            min_score=0.05,
+            alpha=self._f.valves.ppr_alpha,
+        )
+
         return ag
 
     def _build_multi_seed_graph(
@@ -18345,79 +18648,62 @@ Output only the symbol name.
         """
         Build an activation graph combining lexical, structural, and historical
         seed vectors.
-
-        Args:
-            exact_seeds: Symbols found verbatim in the query.
-            partial_seeds: Symbols found via partial/fuzzy match.
-            tb_seeds: (symbol, score) pairs from traceback frames.
-            history_boosts: {symbol: boost} from recent message history.
-            edges_out: Call-graph outgoing edges for PPR propagation.
-            project_id: Current project identifier.
-            inferred_seeds: Optional {qid: score} from LLM seed inference.
-            cached_scores: Pre-computed PPR scores from the PPR cache.
-                           When not None, all propagations are skipped.
-
-        Returns:
-            ActivationGraph with propagated (or cache-loaded) scores.
         """
+        # ---- SANITIZE ALL INPUTS ----
+        exact_seeds = self._sanitize_symbol_list(exact_seeds)
+        partial_seeds = self._sanitize_symbol_list(partial_seeds)
+        self._f._log_debug(f"[SANITIZE] tb_seeds before: {len(tb_seeds)} entries")
+        tb_seeds = [(name, score) for name, score in tb_seeds if isinstance(name, str)]
+        self._f._log_debug(f"[SANITIZE] tb_seeds after: {len(tb_seeds)} entries")
+        history_boosts = self._sanitize_symbol_dict(history_boosts)
+
+        if not isinstance(inferred_seeds, dict):
+            self._f._log_debug(
+                f"[SANITIZE] inferred_seeds is not a dict: {type(inferred_seeds)} - setting to empty dict"
+            )
+            inferred_seeds = {}
+        else:
+            inferred_seeds = {
+                k: v for k, v in inferred_seeds.items() if isinstance(k, str)
+            }
+
+        self._f._log_debug(f"[DIAG] exact_seeds after sanitize: {repr(exact_seeds)}")
+        self._f._log_debug(
+            f"[DIAG] partial_seeds after sanitize: {repr(partial_seeds)}"
+        )
+        self._f._log_debug(f"[DIAG] tb_seeds after sanitize: {repr(tb_seeds)}")
+        self._f._log_debug(
+            f"[DIAG] history_boosts after sanitize: {repr(history_boosts)}"
+        )
+
         w_lex = self._f.valves.multi_seed_weight_lexical
         w_str = self._f.valves.multi_seed_weight_structural
         w_his = self._f.valves.multi_seed_weight_historical
         symbol_index = self._f._symbol_index
 
-        # ── Step 1: Build lexical seed set and initial activations ────────────────
-        # Always computed (cheap): needed for source="seed" attribution
-        # even when cached_scores is used.
+        # ---- INICIALIZAR lexical_seed_qids UNA SOLA VEZ ----
         lexical_seed_qids: Set[str] = set()
 
-        def _register_seeds(
-            names: List[str],
-            base_score_fn,
-            target: ActivationGraph,
-        ) -> None:
-            """
-            Register a list of bare names as seeds with computed scores.
-
-            Non-str entries are skipped and logged rather than passed downstream:
-            a dict (or any non-str) reaching _compute_node_specificity /
-            get_qualified_names_for would raise ``unhashable type`` and abort the
-            whole activation build (e.g. the background path_index rebuild). The
-            debug line surfaces the offending value so its producer can be traced.
-            """
-            for sym_name in names:
-                # ── Guard: skip and surface malformed (non-str) seed names ────────
-                if not isinstance(sym_name, str):
-                    self._f._log_debug(
-                        f"[PPR] _register_seeds: skipping non-str seed "
-                        f"(type={type(sym_name).__name__}, "
-                        f"repr={repr(sym_name)[:120]})"
-                    )
-                    continue
-
-                # ── Compute specificity-weighted score and fan out to qids ────────
-                specificity = self._compute_node_specificity(sym_name, project_id)
-                score = base_score_fn(specificity)
-                qids = symbol_index.get_qualified_names_for(sym_name, project_id)
-                lexical_seed_qids.update(qids)
-                share = score / len(qids) if qids else 0.0
-                for qid in qids:
-                    target._activations[qid] = ActivationState(
-                        node_id=qid, score=share, depth=0, source="seed"
-                    )
-
+        # ---- REGISTRAR SEMILLAS LÉXICAS USANDO EL MÉTODO DE CLASE ----
         ag_lex = ActivationGraph()
 
-        _register_seeds(
-            exact_seeds,
-            lambda sp: min(1.0, 0.5 + 0.5 * min(sp, 1.0)),
-            ag_lex,
-        )
-        _register_seeds(
-            partial_seeds,
-            lambda sp: min(0.6, 0.3 + 0.3 * min(sp, 1.0)),
-            ag_lex,
+        self._register_seeds(
+            names=exact_seeds,
+            base_score_fn=lambda sp: min(1.0, 0.5 + 0.5 * min(sp, 1.0)),
+            target_graph=ag_lex,
+            project_id=project_id,
+            lexical_seed_qids=lexical_seed_qids,
         )
 
+        self._register_seeds(
+            names=partial_seeds,
+            base_score_fn=lambda sp: min(0.6, 0.3 + 0.3 * min(sp, 1.0)),
+            target_graph=ag_lex,
+            project_id=project_id,
+            lexical_seed_qids=lexical_seed_qids,
+        )
+
+        # ---- PROCESAR tb_seeds ----
         for sym_name, tb_score in tb_seeds:
             qids = symbol_index.get_qualified_names_for(sym_name, project_id)
             lexical_seed_qids.update(qids)
@@ -18436,7 +18722,8 @@ Output only the symbol name.
                         node_id=qid, score=share, depth=0, source="seed"
                     )
 
-        for qid, inf_score in (inferred_seeds or {}).items():
+        # ---- PROCESAR inferred_seeds ----
+        for qid, inf_score in inferred_seeds.items():
             lexical_seed_qids.add(qid)
             existing = ag_lex._activations.get(qid)
             ag_lex._activations[qid] = ActivationState(
@@ -18446,10 +18733,7 @@ Output only the symbol name.
                 source="seed",
             )
 
-        # ── Short-circuit before propagations on cache hit ────────────
-        # cached_scores is not None only when _get_or_compute_ppr_scores returned
-        # a cache hit.  Building ag_final directly from cached_scores avoids all
-        # three PPR propagations (which are the expensive part of this function).
+        # ---- CACHED SCORES PATH ----
         if cached_scores is not None:
             ag_final = ActivationGraph()
             for qid, score in cached_scores.items():
@@ -18467,7 +18751,7 @@ Output only the symbol name.
             )
             return ag_final
 
-        # ── Step 2: Propagate lexical graph ───────────────────────────────────────
+        # ---- PROPAGACIÓN LÉXICA ----
         if ag_lex._activations:
             ag_lex.propagate(
                 edges_out=edges_out,
@@ -18476,7 +18760,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Step 3: Structural graph (entry-point seeds from PathIndex) ───────────
+        # ---- PROPAGACIÓN ESTRUCTURAL ----
         ag_str = ActivationGraph()
         seed_qids_for_structural = set(lexical_seed_qids)
         structural_seeds: Set[str] = set()
@@ -18485,6 +18769,12 @@ Output only the symbol name.
                 if lex_seed in view.induced_nodes:
                     structural_seeds.add(view.entry_point)
                     break
+
+        structural_seeds = {s for s in structural_seeds if isinstance(s, str)}
+        self._f._log_debug(
+            f"[SANITIZE] structural_seeds: {len(structural_seeds)} entries"
+        )
+
         if structural_seeds:
             for sym_name in structural_seeds:
                 specificity = self._compute_node_specificity(sym_name, project_id)
@@ -18502,7 +18792,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Step 4: Historical graph (frequent mentions in recent messages) ────────
+        # ---- PROPAGACIÓN HISTÓRICA ----
         ag_his = ActivationGraph()
         if history_boosts:
             for sym_name, boost in history_boosts.items():
@@ -18519,7 +18809,7 @@ Output only the symbol name.
                 alpha=self._f.valves.ppr_alpha,
             )
 
-        # ── Step 5: Combine three graphs into ag_final ────────────────────────────
+        # ---- COMBINAR GRÁFICOS ----
         all_activated = (
             set(ag_lex.get_activated_nodes(0.01).keys())
             | set(ag_str.get_activated_nodes(0.01).keys())
@@ -18528,7 +18818,6 @@ Output only the symbol name.
 
         ag_final = ActivationGraph()
         if not all_activated:
-            # Fallback: seed from entry points weighted by centrality
             psm = self._f._project_state_manager
             centrality = psm.get_node_centrality(project_id)
             entry_points = self._f._path_index.find_entry_points(
@@ -18536,9 +18825,7 @@ Output only the symbol name.
             )
             if entry_points:
                 sorted_eps = sorted(
-                    entry_points,
-                    key=lambda ep: centrality.get(ep, 0.0),
-                    reverse=True,
+                    entry_points, key=lambda ep: centrality.get(ep, 0.0), reverse=True
                 )
                 for sym_name in sorted_eps[:3]:
                     cent_score = centrality.get(sym_name, 0.0)
@@ -18586,18 +18873,30 @@ Output only the symbol name.
 
         return ag_final
 
-    def _store_activation_scores(self, ag: ActivationGraph, project_id: str) -> None:
-        """Save activation scores for speculative prefetch and LOD tracking."""
-        activated = ag.get_activated_nodes(
-            threshold=self._f.valves.path_activation_threshold
-        )
-        if not hasattr(self._f, "_last_activation_scores"):
-            self._f._last_activation_scores: Dict[str, Dict[str, float]] = {}
-        self._f._last_activation_scores[project_id] = activated
-
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 5. Main entry point: build_activation_graph
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
+
+    def _store_activation_scores(self, ag: ActivationGraph, project_id: str) -> None:
+        """
+        Store the activation scores from a graph for later use by other subsystems.
+
+        The scores are stored in the parent Filter instance under the key
+        `_last_activation_scores[project_id]`. This allows the ContextPager,
+        LOD adaptive adjustments, and other subsystems to read the current
+        activation state without recomputing.
+
+        Args:
+            ag: The ActivationGraph whose scores to store.
+            project_id: The project identifier under which to store the scores.
+        """
+        scores = ag.get_activated_nodes(threshold=0.01)
+        if not hasattr(self._f, "_last_activation_scores"):
+            self._f._last_activation_scores = {}
+        self._f._last_activation_scores[project_id] = scores
+        self._f._log_debug(
+            f"Stored activation scores for project {project_id}: {len(scores)} nodes"
+        )
 
     async def build_activation_graph(
         self,
@@ -18624,16 +18923,12 @@ Output only the symbol name.
         Returns:
             ActivationGraph with propagated scores.
         """
+        # ---- Region: Logging and parameter setup ----
         self._f._log_debug(
             f"[PPR] build_activation_graph: query='{query[:100]}', "
-            f"project_id='{project_id}', "
-            f"persist={persist}"
+            f"project_id='{project_id}', persist={persist}"
         )
 
-        # ------------------------------------------------------------------
-        # Resolve effective propagation steps from valve when
-        # the caller did not provide an explicit non-zero override.
-        # ------------------------------------------------------------------
         effective_steps = (
             max_propagation_steps
             if max_propagation_steps > 0
@@ -18642,55 +18937,54 @@ Output only the symbol name.
 
         edges_out = self._f._symbol_index.get_all_edges_out(project_id)
 
-        # ------------------------------------------------------------------
-        # Region: Extract seeds from query, traceback, and history
-        # ------------------------------------------------------------------
-        self._f._log_debug("DIAG bag: >>> _prepare_seed_symbols…")
+        # ---- Region: Sanitise inferred_seeds ----
+        if inferred_seeds is None:
+            inferred_seeds = {}
+        elif not isinstance(inferred_seeds, dict):
+            self._f._log_debug(
+                f"[SANITIZE] inferred_seeds is not a dict, got {type(inferred_seeds)}. Normalising to empty dict."
+            )
+            inferred_seeds = {}
+        inferred_seeds = {
+            str(k): float(v)
+            for k, v in inferred_seeds.items()
+            if isinstance(v, (int, float))
+        }
+
+        # ---- Region: Extract seeds ----
         exact_seeds, partial_seeds, tb_seeds, history_boosts = (
             await self._prepare_seed_symbols(query, project_id, messages)
         )
-        self._f._log_debug("DIAG bag: <<< _prepare_seed_symbols DONE")
 
-        # ── Tripwire: surface any non-str seed before the guards absorb it ────────
-        self._audit_seed_types(
-            query, exact_seeds, partial_seeds, tb_seeds, history_boosts, inferred_seeds
-        )
-        
         self._f._log_debug(
             f"[PPR] Seeds extracted: exact={len(exact_seeds)}, "
             f"partial={len(partial_seeds)}, "
             f"tb={len(tb_seeds)}, history={len(history_boosts)}"
         )
 
-        # ------------------------------------------------------------------
-        # Region: Resolve qualified seed ids
-        # ------------------------------------------------------------------
+        # ---- Region: Resolve qualified seed ids ----
         seed_qids: List[str] = []
         all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
 
         for sym in exact_seeds:
-            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-            seed_qids.extend(qids)
+            seed_qids.extend(
+                self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            )
         for sym in partial_seeds:
-            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-            seed_qids.extend(qids)
+            seed_qids.extend(
+                self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            )
         for sym, _ in tb_seeds:
-            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-            seed_qids.extend(qids)
+            seed_qids.extend(
+                self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            )
         if inferred_seeds:
             seed_qids.extend(inferred_seeds.keys())
         seed_qids = list(set(seed_qids) & set(all_qids))
 
-        # ------------------------------------------------------------------
-        # Region: Get or compute PPR scores (with cache)
-        # ------------------------------------------------------------------
-        code_state_hash = self.compute_code_state_hash(project_id)
+        # ---- Region: Get or compute PPR scores ----
+        code_state_hash = self.compute_code_state_hash(project_id)  # <-- CORREGIDO
 
-        self._f._log_debug(
-            f"DIAG bag: computing PPR (sync, no LLM) — "
-            f"{len(seed_qids)} seed(s), {len(edges_out)} edge sources, "
-            f"steps={effective_steps}"
-        )
         cached_scores = self._get_or_compute_ppr_scores(
             seed_qids=seed_qids,
             project_id=project_id,
@@ -18700,47 +18994,41 @@ Output only the symbol name.
             min_score=0.05,
             alpha=self._f.valves.ppr_alpha,
         )
-        self._f._log_debug(f"DIAG bag: PPR done → {len(cached_scores)} scores")
 
-        # ------------------------------------------------------------------
-        # Region: Build the activation graph (single or multi-seed)
-        # ------------------------------------------------------------------
-        _inferred = inferred_seeds or {}
+        # ---- Region: Build the activation graph ----
         if not self._f.valves.enable_multi_seed_activation:
-            self._f._log_debug("[PPR] Using SINGLE-SEED activation mode")
             ag = self._build_single_seed_graph(
-                exact_seeds,
-                partial_seeds,
-                tb_seeds,
-                history_boosts,
-                _inferred,
-                cached_scores,
-                project_id,
+                exact_seeds=exact_seeds,
+                partial_seeds=partial_seeds,
+                tb_seeds=tb_seeds,
+                history_boosts=history_boosts,
+                edges_out=edges_out,
+                project_id=project_id,
+                inferred_seeds=inferred_seeds,
+                cached_scores=cached_scores,
             )
         else:
-            self._f._log_debug("[PPR] Using MULTI-SEED activation mode")
             ag = self._build_multi_seed_graph(
-                exact_seeds,
-                partial_seeds,
-                tb_seeds,
-                history_boosts,
-                _inferred,
-                cached_scores,
-                project_id,
+                exact_seeds=exact_seeds,
+                partial_seeds=partial_seeds,
+                tb_seeds=tb_seeds,
+                history_boosts=history_boosts,
+                edges_out=edges_out,
+                project_id=project_id,
+                inferred_seeds=inferred_seeds,
+                cached_scores=cached_scores,
             )
 
-        # ------------------------------------------------------------------
-        # Region: Persist activation scores (unless volatile)
-        # ------------------------------------------------------------------
+        # ---- Region: Store scores if requested ----
         if persist:
-            self._store_activation_scores(ag, project_id)
+            self._store_activation_scores(ag, project_id)  # <-- AHORA EXISTE
 
         self._f._log_debug("DIAG bag: RETURN")
         return ag
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 6. Path index & cross‑chunk edges
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     async def _build_view_from_activation(
         self, entry_point: str, ag: ActivationGraph, project_id: str
@@ -18949,9 +19237,9 @@ Output only the symbol name.
             )
         return resolved
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 7. Speculative prefetch
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     async def speculative_prefetch(
         self,
@@ -19066,9 +19354,9 @@ Output only the symbol name.
             ag.propagate(edges_out, max_steps=2, min_score=0.1)
             await self._build_view_from_activation(sym_name, ag, project_id)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 8. Hash utilities
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     def compute_structural_hash(
         self, symbol_names: Iterable[str], project_id: str
@@ -19142,9 +19430,9 @@ Output only the symbol name.
         context_str = "\n".join([m.get("content", "") for m in sys_msgs])
         return hashlib.md5(context_str.encode()).hexdigest()[:16]
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 9. Inactive block candidates & cache invalidation
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     def get_inactive_block_candidates(self, project_id: str) -> list:
         """
@@ -19194,9 +19482,9 @@ Output only the symbol name.
         pstate["cached_lightweight_context"] = ""
         pstate["cached_code_state_hash"] = None
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
     # 10. Static evidence (for scientific CoT)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ======================================================================
 
     def _gather_static_evidence(
         self, hypothesis_text: str, project_id: str
@@ -32654,7 +32942,7 @@ class SemanticSeedInferencer:
             if ratio >= threshold:
                 scored.append((ratio, qid))
 
-        # ── Sort descending, cap at 5 to avoid noise ──────────────────────────────
+        # ── Sort descending, cap at 5 to avoid noise ──
         scored.sort(key=lambda t: -t[0])
         return [qid for _, qid in scored[:5]]
 
@@ -32703,6 +32991,109 @@ class SemanticSeedInferencer:
                 seeds[next(iter(matches))] = score
         return seeds
 
+    def _parse_and_resolve(
+        self,
+        tokens: List[str],
+        project_id: str,
+    ) -> Dict[str, float]:
+        """
+        Resolve a list of symbol tokens to actual qualified ids.
+
+        Resolution strategies applied in priority order:
+            1. Exact qualified-id match against the SymbolIndex.
+            2. Dotted-name decomposition (e.g. "ClassName.method").
+            3. Bare-name lookup via the SymbolIndex reverse index.
+            4. Fuzzy matching via rapidfuzz (requires HAS_FUZZ).
+
+        All tokens are sanitised to strings before processing.
+
+        Args:
+            tokens: Identifier strings parsed from the LLM JSON response.
+            project_id: Current project identifier.
+
+        Returns:
+            Dictionary mapping qualified symbol ids to seed scores,
+            capped at seed_inference_max_symbols entries.
+            Keys are guaranteed to be strings.
+        """
+        # ---- Region: Sanitise and validate input ----
+        # Ensure tokens is a list of strings; drop any non-string items
+        clean_tokens = []
+        for t in tokens:
+            if isinstance(t, str):
+                clean_tokens.append(t.strip())
+            elif isinstance(t, (int, float)):
+                clean_tokens.append(str(t).strip())
+            # dicts or other types are ignored
+        tokens = [t for t in clean_tokens if t]
+
+        score = self._f.valves.seed_inference_score
+        max_syms = self._f.valves.seed_inference_max_symbols
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
+        seeds: Dict[str, float] = {}
+
+        # ---- Region: Process each token ----
+        for token in tokens:
+            if len(seeds) >= max_syms:
+                break
+
+            # 1. Exact qualified-id match
+            if token in all_qids:
+                seeds[token] = max(seeds.get(token, 0.0), score)
+                continue
+
+            # 2. Dotted-name decomposition
+            if "." in token:
+                parent_name, method_part = token.rsplit(".", 1)
+                constructed_qid = qualify_symbol_name(method_part, parent_name)
+                if constructed_qid in all_qids:
+                    seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
+                    continue
+                # Fallback: bare method-name lookup across all classes
+                by_method = self._f._symbol_index.get_qualified_names_for(
+                    method_part, project_id
+                )
+                if by_method:
+                    share = score / len(by_method)
+                    for q in by_method:
+                        if q in all_qids:
+                            seeds[q] = max(seeds.get(q, 0.0), share)
+                            if len(seeds) >= max_syms:
+                                break
+                    continue
+
+            # 3. Bare-name resolution
+            qids = {
+                q
+                for q in self._f._symbol_index.get_qualified_names_for(
+                    token, project_id
+                )
+                if q in all_qids
+            }
+            if qids:
+                share = score / len(qids)
+                for q in qids:
+                    seeds[q] = max(seeds.get(q, 0.0), share)
+                    if len(seeds) >= max_syms:
+                        break
+                continue
+
+            # 4. Fuzzy matching fallback
+            if HAS_FUZZ:
+                fuzzy_matches = self._fuzzy_resolve(token, project_id)
+                if fuzzy_matches:
+                    fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
+                    for q in fuzzy_matches:
+                        seeds[q] = max(seeds.get(q, 0.0), fuzzy_score)
+                        if len(seeds) >= max_syms:
+                            break
+
+        # ---- Region: Final sanitisation of keys ----
+        seeds = {k: v for k, v in seeds.items() if isinstance(k, str)}
+        self._f._log_debug(f"[SANITIZE] resolved seeds: {len(seeds)} entries")
+        return seeds
+
     async def infer_seeds(
         self,
         query: str,
@@ -32729,10 +33120,12 @@ class SemanticSeedInferencer:
 
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
+            Keys are guaranteed to be strings via _parse_and_resolve sanitization.
         """
         self._f._log_debug(
             f"DIAG infer: START slot_free={slot_free}, query={query[:50]!r}"
         )
+
         # ── Step 1: Entry guards ──
         if not slot_free:
             self._f._log_debug("DIAG infer: slot_free=False → return {} (no LLM)")
@@ -32830,103 +33223,9 @@ class SemanticSeedInferencer:
         except (json.JSONDecodeError, Exception):
             self._f._log_debug("SemanticSeedInferencer: failed to parse LLM JSON.")
             return {}
+
         seeds = self._parse_and_resolve(tokens, project_id)
         self._f._log_debug(f"DIAG infer: RETURN {len(seeds)} seed(s)")
-        return seeds
-
-    # ------------------------------------------------------------------
-    # Region: Parsing and Resolution
-    # ------------------------------------------------------------------
-
-    def _parse_and_resolve(
-        self, tokens: List[str], project_id: str
-    ) -> Dict[str, float]:
-        """
-        Resolve a list of symbol tokens to actual qualified ids.
-
-        Resolution strategies applied in priority order:
-          1. Exact qualified-id match against the SymbolIndex.
-          2. Dotted-name decomposition (e.g. "ClassName.method").
-          3. Bare-name lookup via the SymbolIndex reverse index.
-          4. Fuzzy matching via rapidfuzz (requires HAS_FUZZ).
-
-        The max_syms cap (seed_inference_max_symbols) is enforced both at
-        the outer token loop and inside each multi-qid inner loop so that no
-        single token can push the seed count beyond the configured limit.
-
-        Args:
-            tokens:     Identifier strings parsed from the LLM JSON response.
-            project_id: Current project identifier.
-
-        Returns:
-            Dictionary mapping qualified symbol ids to seed scores,
-            capped at seed_inference_max_symbols entries.
-        """
-        score = self._f.valves.seed_inference_score
-        max_syms = self._f.valves.seed_inference_max_symbols
-        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
-
-        seeds: Dict[str, float] = {}
-
-        for token in tokens:
-            # Region: enforce the cap at the start of each token iteration
-            if len(seeds) >= max_syms:
-                break
-
-            token = str(token).strip()
-            if not token:
-                continue
-
-            # Region: exact qualified-id match (fastest path)
-            if token in all_qids:
-                seeds[token] = max(seeds.get(token, 0.0), score)
-                continue
-
-            # Region: dotted-name decomposition (e.g. "ClassName.method")
-            if "." in token:
-                parent_name, method_part = token.rsplit(".", 1)
-                constructed_qid = qualify_symbol_name(method_part, parent_name)
-                if constructed_qid in all_qids:
-                    seeds[constructed_qid] = max(seeds.get(constructed_qid, 0.0), score)
-                    continue
-                # Fallback: bare method-name lookup across all classes
-                by_method = self._f._symbol_index.get_qualified_names_for(
-                    method_part, project_id
-                )
-                if by_method:
-                    share = score / len(by_method)
-                    for q in by_method:
-                        if q in all_qids:
-                            seeds[q] = max(seeds.get(q, 0.0), share)
-                            if len(seeds) >= max_syms:
-                                break
-                    continue
-
-            # Region: bare-name resolution via the SymbolIndex reverse index
-            qids = {
-                q
-                for q in self._f._symbol_index.get_qualified_names_for(
-                    token, project_id
-                )
-                if q in all_qids
-            }
-            if qids:
-                share = score / len(qids)
-                for q in qids:
-                    seeds[q] = max(seeds.get(q, 0.0), share)
-                    if len(seeds) >= max_syms:
-                        break
-                continue
-
-            # Region: fuzzy matching fallback (requires rapidfuzz)
-            fuzzy_matches = self._fuzzy_resolve(token, project_id)
-            if fuzzy_matches:
-                fuzzy_score = score * self._f.valves.seed_inference_fuzzy_penalty
-                for q in fuzzy_matches:
-                    seeds[q] = max(seeds.get(q, 0.0), fuzzy_score)
-                    if len(seeds) >= max_syms:
-                        break
-
         return seeds
 
 
