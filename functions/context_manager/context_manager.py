@@ -36313,6 +36313,9 @@ class Filter:
                         ).hexdigest()[:12]
 
                         messages.append({"role": "assistant", "content": response})
+                        messages[:] = self._inlet_orch.ensure_last_message_is_user(
+                            messages
+                        )
 
                         # -- optional context dump --------------------------------
                         if self.valves.enable_context_dump:
