@@ -23725,28 +23725,126 @@ class EnrichmentTasks:
         except (json.JSONDecodeError, Exception):
             return None
 
+    def _deescape_structural_quotes(self, text: str) -> str:
+        """
+        Remove spurious backslashes from quotes sitting in JSON-structural
+        positions, leaving genuinely-escaped inner quotes untouched.
+
+        A multi-token-prediction backend can drift mid-object and emit \\"
+        where a bare " delimiter belongs, on both keys and values (e.g.
+        `\\"Class.method\\": \\"text\\"`). Such a backslash only appears next
+        to structural punctuation, so stripping is gated on adjacency to
+        `{ , :` (opening side) or `: , }` (closing side). A legitimately
+        escaped quote inside a sentence — a value documenting the literal
+        \\"json_object\\" token, say — is flanked by ordinary characters,
+        never structural punctuation, and is therefore preserved.
+
+        Args:
+            text: Raw response text with possibly over-escaped delimiters.
+
+        Returns:
+            str: Text with structural \\" collapsed to ", inner escapes kept.
+        """
+        # ── Step 1: opening delimiters — \" right after { , or : ──────────────
+        text = re.sub(r'([{,:]\s*)\\"', r'\1"', text)
+
+        # ── Step 2: closing delimiters — \" right before : , or } ─────────────
+        text = re.sub(r'\\"(\s*[:,}])', r'"\1', text)
+
+        return text
+
+    def _fuzzy_remap_keys(
+        self, raw_map: Dict[str, Any], expected_names: Set[str]
+    ) -> Dict[str, str]:
+        """
+        Reconcile parsed keys against the expected identifier set, recovering
+        keys the model mangled (e.g. `Class.__.init__` for `Class.__init__`).
+
+        Exact matches pass straight through. Any leftover key is fuzzy-matched
+        against the still-unresolved expected names via rapidfuzz; the single
+        best candidate is accepted only when it clears a strict threshold,
+        which keeps distinct class prefixes (SymbolIndex vs SubgraphExtractor)
+        from cross-assigning. Non-string or empty values are dropped.
+
+        When a leftover clears no candidate, its key, best candidate and score
+        are logged. This turns an otherwise silent `N-1/N` reconcile into a
+        traceable event, distinguishing the three miss causes without needing
+        the raw response: a prefix-family collision (best is a super/substring
+        of the key, score below threshold), a mangled dunder that landed too
+        far off, or an empty value (which never reaches Step 2 and shows up as
+        an absent key here).
+
+        Args:
+            raw_map:        Parsed {key: value} map with possibly-mangled keys.
+            expected_names: Canonical qualified ids valid for this batch.
+
+        Returns:
+            Dict[str, str]: {canonical_qid: value} for every reconciled entry.
+        """
+        # ── Step 1: split exact hits from candidates needing reconciliation ───
+        resolved: Dict[str, str] = {}
+        leftovers: List[Tuple[str, str]] = []
+        for key, value in raw_map.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if key in expected_names:
+                resolved[key] = value
+            else:
+                leftovers.append((key, value))
+
+        # ── Step 2: fuzzy-match leftovers against still-unresolved names ───────
+        if leftovers and HAS_FUZZ:
+            for key, value in leftovers:
+                unresolved = expected_names - resolved.keys()
+                if not unresolved:
+                    break
+                best_name: Optional[str] = None
+                best_score = 0.0
+                for cand in unresolved:
+                    score = fuzz.ratio(key.lower(), cand.lower())
+                    if score > best_score:
+                        best_score = score
+                        best_name = cand
+                if best_name is not None and best_score >= 88.0:
+                    resolved[best_name] = value
+                else:
+                    # Leftover key cleared no candidate — surface exactly what
+                    # the model emitted and how close it landed, so a recurring
+                    # miss can be traced to its cause without the raw response.
+                    self._f._log_debug(
+                        f"_fuzzy_remap_keys: unmatched key {key!r} "
+                        f"(best={best_name!r} score={best_score:.1f} < 88.0)"
+                    )
+
+        return resolved
+
     def _parse_docstring_batch_response(
         self, response: str, expected_names: Set[str]
     ) -> Dict[str, str]:
         """
         Parse the LLM response as a JSON object mapping identifiers to docstrings.
 
-        The response is expected to be a valid JSON object produced under
-        response_format={"type":"json_object"} with enable_thinking=False.
-        The server-side GBNF grammar guarantees the output starts with { and
-        ends with }, so no stripping of think blocks, markdown fences, or
-        leading prose is needed.
+        The happy path is a strict json.loads: under an enforced json_object
+        grammar the response is valid JSON and nothing else runs. When the
+        backend does not actually constrain generation (multi-token prediction
+        bypassing the grammar), the output degrades in two independent ways this
+        parser salvages: structural quotes emitted as \\" (repaired by
+        _deescape_structural_quotes) and mangled keys such as `Class.__.init__`
+        (recovered by _fuzzy_remap_keys against expected_names). Every layer
+        funnels into one reconcile-and-filter tail, so clean and salvaged
+        responses are treated identically — and the key reconciliation also
+        rescues valid-JSON responses that merely mis-spelled a dunder key.
 
-        Only entries whose key is present in expected_names and whose value
-        is a non-empty string are returned.
+        Only entries whose reconciled key is in expected_names and whose value
+        is a non-empty string are returned, truncated to docstring_max_chars.
 
         Args:
-            response: Raw LLM response string.
+            response:       Raw LLM response string.
             expected_names: Set of qualified symbol identifiers that are valid.
 
         Returns:
-            Dict[str, str]: Accepted {qid: docstring} mapping. Values are
-            truncated to docstring_max_chars. Empty dict on any parse failure.
+            Dict[str, str]: Accepted {qid: docstring} mapping. Empty dict when
+            nothing could be recovered.
         """
         if not response or not response.strip():
             self._f._log_debug(
@@ -23759,43 +23857,61 @@ class EnrichmentTasks:
             f"(expecting {len(expected_names)} identifiers)"
         )
 
+        data: Optional[Dict[str, Any]] = None
+
+        # ── Step 1: strict parse — the only path taken on grammar-clean output ─
         try:
-            data = json.loads(response)
+            parsed = json.loads(response)
+            if isinstance(parsed, dict):
+                data = parsed
+        except json.JSONDecodeError:
+            data = None
 
-            if not isinstance(data, dict):
+        # ── Step 2: repair over-escaped delimiters, then re-parse ─────────────
+        if data is None:
+            try:
+                repaired = self._deescape_structural_quotes(response)
+                parsed = json.loads(repaired, strict=False)
+                if isinstance(parsed, dict):
+                    data = parsed
+                    self._f._log_debug(
+                        "_parse_docstring_batch_response: recovered via "
+                        "structural de-escape"
+                    )
+            except json.JSONDecodeError:
+                data = None
+
+        # ── Step 3: last resort — extract simple \"key\": \"value\" pairs ──────
+        if data is None:
+            repaired = self._deescape_structural_quotes(response)
+            pairs = re.findall(r'"([^"\\]+)"\s*:\s*"([^"\\]*)"', repaired)
+            if pairs:
+                data = {k: v for k, v in pairs}
                 self._f._log_debug(
-                    f"_parse_docstring_batch_response: top-level JSON value is "
-                    f"{type(data).__name__}, expected dict"
+                    f"_parse_docstring_batch_response: regex fallback extracted "
+                    f"{len(data)} raw pair(s)"
                 )
-                return {}
 
-            # Accept only entries matching expected identifiers; silently drop
-            # hallucinated keys and non-string values.
-            max_chars = self._f.valves.docstring_max_chars
-            result: Dict[str, str] = {}
-            for key, value in data.items():
-                if key in expected_names and isinstance(value, str) and value.strip():
-                    result[key] = value.strip()[:max_chars]
-
-            skipped = len(data) - len(result)
+        if not data:
             self._f._log_debug(
-                f"_parse_docstring_batch_response: accepted {len(result)} / {len(data)} "
-                f"entries ({skipped} skipped — not in expected_names or invalid type)"
-            )
-            return result
-
-        except json.JSONDecodeError as exc:
-            self._f._log_debug(
-                f"_parse_docstring_batch_response: JSON decode error — {exc}. "
-                f"Offending text preview: {response[:300]!r}"
+                f"_parse_docstring_batch_response: unrecoverable response. "
+                f"Preview: {response[:300]!r}"
             )
             return {}
 
-        except Exception as exc:
-            self._f._log_debug(
-                f"_parse_docstring_batch_response: unexpected error — {exc}"
-            )
-            return {}
+        # ── Step 4: reconcile keys and filter to the expected set ─────────────
+        max_chars = self._f.valves.docstring_max_chars
+        reconciled = self._fuzzy_remap_keys(data, expected_names)
+        result: Dict[str, str] = {
+            qid: value.strip()[:max_chars] for qid, value in reconciled.items()
+        }
+
+        skipped = len(data) - len(result)
+        self._f._log_debug(
+            f"_parse_docstring_batch_response: accepted {len(result)} / {len(data)} "
+            f"entries ({skipped} skipped after reconcile)"
+        )
+        return result
 
     async def ensure_docstrings_batch(
         self,
@@ -23997,7 +24113,7 @@ class EnrichmentTasks:
                 temperature=0.0,
                 label=label,
                 response_format={"type": "json_object"},
-                log_raw_response=False,
+                log_raw_response=True,
                 enable_thinking=False,
             )
 
