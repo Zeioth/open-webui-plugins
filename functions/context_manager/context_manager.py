@@ -18689,7 +18689,7 @@ Output only the symbol name.
         self._f._path_index.add(view, project_id)
         return view
 
-    async def rebuild_path_index(self, project_id: str) -> None:
+    async def rebuild_path_index(self, project_id: str, stop_event=None) -> None:
         """
         Reconstruct PathIndex from SymbolIndex for all entry points.
 
@@ -18708,6 +18708,16 @@ Output only the symbol name.
         covers change", independent of whether unrelated parts of the
         codebase changed.
 
+        Cooperative cancellation: when run as the 'path_index' background task,
+        a stop_event is supplied. It is polled once per entry point, so a
+        rebuild in progress when the next turn calls stop_all() bails out at the
+        next loop boundary instead of running to completion. Views already built
+        this pass were persisted incrementally and are reused on the next run, so
+        an interrupted rebuild loses no work — it only defers the remaining entry
+        points. On cancellation the method returns before the centrality tail:
+        that recompute is redundant with invalidate_block_a_cache on the
+        ingestion path and is refreshed on the next full run anyway.
+
         Known limitation, inherited from the existing staleness semantics:
         compute_call_graph_hash only enumerates OUTGOING edges from the
         view's induced nodes, so a brand-new edge pointing INTO one of those
@@ -18718,6 +18728,9 @@ Output only the symbol name.
 
         Args:
             project_id: Current project identifier.
+            stop_event: Optional cooperative-cancellation signal from the task
+                manager; polled once per entry point. None (lazy/inline call)
+                disables the check and the rebuild always runs to completion.
         """
         # ------------------------------------------------------------------
         # Step 1: Get the conversation state and check for active blocks.
@@ -18750,6 +18763,15 @@ Output only the symbol name.
         reused = 0
         rebuilt = 0
         for ep in entry_points:
+            # -- Cooperative cancellation: bail at the loop boundary --------
+            if stop_event is not None and stop_event.is_set():
+                self._f._log_debug(
+                    f"rebuild_path_index: cancelled by stop_event after "
+                    f"{reused} reused + {rebuilt} rebuilt "
+                    f"(of {len(entry_points)} total); remaining deferred"
+                )
+                return
+
             candidates = existing_by_entry.get(ep)
             still_valid = False
             if candidates:
@@ -30464,19 +30486,15 @@ class TaskRegistry:
         return True
 
     async def _bg_path_index(self, project_id: str, stop_event=None) -> None:
-        """Background path-index rebuild, off the critical inlet path.
-
-        Runs from the outlet after a code-state change (e.g. a large silent
-        ingestion), so the next turn finds the path index already built and pays
-        no rebuild cost. Respects the master enable_path_analysis gate.
-
-        Args:
-            project_id: Current project identifier.
-            stop_event: Cooperative-cancellation signal from the task manager.
+        """Background path-index rebuild, off the critical inlet path. Runs from
+        the outlet after a code-state change (e.g. a large silent ingestion), so
+        the next turn finds the index already built. Polls stop_event so a
+        rebuild interrupted by the next turn's stop_all() bails cleanly; work
+        already done this pass persists and is reused. Respects enable_path_analysis.
         """
         if not self._f.valves.enable_path_analysis:
             return
-        await self._f._activation.rebuild_path_index(project_id)
+        await self._f._activation.rebuild_path_index(project_id, stop_event=stop_event)
 
     async def _bg_session_summary(self, project_id: str, stop_event=None) -> None:
         """
