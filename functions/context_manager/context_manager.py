@@ -17957,6 +17957,81 @@ Output only the symbol name.
             if count > 0
         }
 
+    def _audit_seed_types(
+        self,
+        query: str,
+        exact_seeds: List[str],
+        partial_seeds: List[str],
+        tb_seeds: List[Tuple[str, float]],
+        history_boosts: Dict[str, float],
+        inferred_seeds: Optional[Dict[str, float]],
+    ) -> None:
+        """
+        Pure diagnostic tripwire: verify every seed carrier holds only ``str``
+        symbol names and loudly report any that do not.
+
+        This does NOT mutate or drop anything. The downstream type guards in
+        find_blocks / get_qualified_names_for / _register_seeds already stop a
+        malformed seed from crashing the activation build; this audit exists so
+        that protection is not *silent*. If a non-str value (e.g. a whole
+        ``{qid: score}`` dict passed where a bare name is expected) ever reaches
+        here, the log names the exact carrier, position, type and repr, so the
+        producer can be traced to its source instead of being quietly absorbed.
+
+        On the happy path (all seeds are strings) it emits nothing, so it is
+        safe to leave in place permanently as a regression tripwire.
+
+        Args:
+            query:          The query that produced these seeds (for context).
+            exact_seeds:    Verbatim query-word matches.
+            partial_seeds:  Partial / CrossEncoder / fuzzy matches.
+            tb_seeds:       (symbol, score) pairs from traceback frames.
+            history_boosts: {symbol: boost} from recent message history.
+            inferred_seeds: Optional {qid: score} from LLM seed inference.
+        """
+        # ── Local helper: never let the audit itself raise ────────────────────────
+        def _safe_repr(obj) -> str:
+            try:
+                return repr(obj)[:160]
+            except Exception:
+                return f"<unreprable {type(obj).__name__}>"
+
+        # ── Step 1: list carriers — every element must be a bare-name str ─────────
+        for list_name, seeds in (
+            ("exact_seeds", exact_seeds),
+            ("partial_seeds", partial_seeds),
+        ):
+            for i, sym in enumerate(seeds or []):
+                if not isinstance(sym, str):
+                    self._f._log_debug(
+                        f"[SEED-AUDIT] ⚠️ non-str seed in {list_name}[{i}] "
+                        f"(type={type(sym).__name__}, repr={_safe_repr(sym)}) "
+                        f"— query={_safe_repr(query)}"
+                    )
+
+        # ── Step 2: tuple carrier — tb_seeds is [(name, score), ...] ──────────────
+        for i, item in enumerate(tb_seeds or []):
+            name = item[0] if isinstance(item, tuple) and item else item
+            if not isinstance(name, str):
+                self._f._log_debug(
+                    f"[SEED-AUDIT] ⚠️ non-str seed in tb_seeds[{i}] "
+                    f"(type={type(name).__name__}, repr={_safe_repr(item)}) "
+                    f"— query={_safe_repr(query)}"
+                )
+
+        # ── Step 3: dict carriers — keys are the symbol names, must be str ────────
+        for dict_name, mapping in (
+            ("history_boosts", history_boosts),
+            ("inferred_seeds", inferred_seeds),
+        ):
+            for k in (mapping or {}):
+                if not isinstance(k, str):
+                    self._f._log_debug(
+                        f"[SEED-AUDIT] ⚠️ non-str key in {dict_name} "
+                        f"(type={type(k).__name__}, repr={_safe_repr(k)}) "
+                        f"— query={_safe_repr(query)}"
+                    )
+    
     async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
     ) -> Tuple[List[str], List[str], List[Tuple[str, float]], Dict[str, float]]:
@@ -18576,6 +18651,11 @@ Output only the symbol name.
         )
         self._f._log_debug("DIAG bag: <<< _prepare_seed_symbols DONE")
 
+        # ── Tripwire: surface any non-str seed before the guards absorb it ────────
+        self._audit_seed_types(
+            query, exact_seeds, partial_seeds, tb_seeds, history_boosts, inferred_seeds
+        )
+        
         self._f._log_debug(
             f"[PPR] Seeds extracted: exact={len(exact_seeds)}, "
             f"partial={len(partial_seeds)}, "
