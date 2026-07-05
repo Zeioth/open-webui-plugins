@@ -9844,6 +9844,12 @@ class LongTermMemory:
         extraction do, gated by the shared size valve. Both the read side
         (lookups) and the write side (cache store) must apply this so cached
         entries and later lookups share the same semantic key.
+
+        A hard token cap is applied unconditionally at the end: unbalanced
+        fences (odd ``` counts inside a paste) can defeat the fenced-block
+        regex and leave alternating halves behind (observed: a 1.58M-char
+        query "stripped" to 236k), so the invariant — a retrieval query is
+        always embeddable — is enforced by construction, not by the regex.
         """
         if not query:
             return query
@@ -9854,8 +9860,9 @@ class LongTermMemory:
                     f"LTM: stripped code from retrieval query "
                     f"({len(query)} chars → {len(stripped)})"
                 )
-                return stripped
-        return query
+                query = stripped
+        # Hard cap: a semantic retrieval query never needs more than this.
+        return self._f._tokens.truncate_text_to_tokens(query, 2000)
 
     def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
         """Extract forced symbol from query (?symbol:Name). Returns (symbol, cleaned_query)."""
@@ -22764,7 +22771,9 @@ Code context (recent symbols referenced):
         This stub is used both during silent ingestion and in the normal
         message compression flow. It informs the model that the code is
         already indexed and available via /expand, avoiding redundant
-        token consumption.
+        token consumption, and explicitly forbids tool-based file reads —
+        a model with knowledge tools otherwise tries to fetch the (already
+        consumed) attachment and loops on "File not found".
 
         Args:
             symbol_count (int): Number of symbols currently indexed in the SymbolGraph.
@@ -22773,7 +22782,9 @@ Code context (recent symbols referenced):
             str: The stub text, ready for injection into the conversation history.
         """
         return (
-            f"_(The code is internally available; no need to repeat it here.)_\n\n"
+            f"_(The code is internally available; no need to repeat it here. "
+            f"Do not attempt to read any attached file with tools — it is "
+            f"already fully indexed.)_\n\n"
             f"_[{symbol_count} symbols indexed in SymbolGraph. Use /expand <name> to see any implementation.]_"
         )
 
@@ -22788,12 +22799,15 @@ Code context (recent symbols referenced):
 
         This method is called during message assembly (in MessageAssembler)
         and ensures that any user message exceeding lean_user_code_min_tokens
-        is replaced by a compact stub. The stub is stored in ConversationState
-        under compressed_user_messages, keyed by MD5 hash of the original content.
+        is replaced by a compact stub. The user's own prose is preserved on
+        top of the stub: the paste is dropped, but a leading/trailing question
+        ("<paste> dime qué hace X") must survive — otherwise the model's last
+        user message is a bare stub and the actual request only reaches it
+        indirectly via system injections.
 
-        If a stub already exists for a given message, it is reused. If not,
-        a new stub is generated, stored, and the state is marked dirty for
-        persistence in SQLite.
+        The composed stub is stored in ConversationState under
+        compressed_user_messages, keyed by MD5 hash of the original content;
+        an existing entry is reused verbatim.
 
         Args:
             messages (list): The list of conversation messages (dicts).
@@ -22835,8 +22849,16 @@ Code context (recent symbols referenced):
                 new_messages.append({**msg, "content": stub})
                 continue
 
-            # Generate new stub (no truncation needed – stub is naturally short)
+            # Generate new stub, preserving the user's own prose so the
+            # request itself is never swallowed together with the paste.
             stub = self._build_user_stub(symbol_count)
+            prose = self._f._commands._extract_text_for_classification(content)
+            if (
+                prose
+                and prose != "[CODE ONLY — no natural language text]"
+                and len(prose.strip()) >= 3
+            ):
+                stub = f"{prose.strip()}\n\n{stub}"
 
             # Store in state and mark dirty for persistence
             state.compressed_user_messages[content_hash] = stub
@@ -26637,7 +26659,7 @@ class InletOrchestrator:
             return
         try:
             # ── Step 1: Derive the turn from the pre-handling list ──
-            turn = (len(original_messages) + 1) // 2
+            turn = max(1, sum(1 for m in original_messages if m.get("role") == "user"))
 
             # ── Step 2: Schedule the snapshot with explicit kind + turn ──
             self._f._context_dumper.schedule_inlet_snapshot(
@@ -27165,51 +27187,53 @@ class InletOrchestrator:
     async def merge_pasted_files(self, body: dict, messages: list) -> list:
         """Splice attached-file content into the last user message and pre-extract symbols.
 
-        [INSTRUMENTED — DIAG logs at every boundary to locate a hang.]
-        """
-        self._f._log_debug("DIAG merge: ENTER")
+        Process-once guarantee: each attachment's raw content is hashed and
+        recorded in pstate["ingested_file_hashes"] after a successful symbol
+        extraction. When the same file is re-attached on a later turn (the UI
+        re-sends attachments with every request), it is NOT re-read into the
+        message nor re-parsed — a one-line reference is spliced instead, so the
+        downstream turn never carries the multi-MB paste again and the block
+        hash landscape stays stable. The registry lives in volatile pstate: a
+        process restart (or a cleared symbol index) naturally re-ingests.
 
+        After merging, the attachment references are cleared from the body so
+        the model never sees a file_id it might try (and fail) to read via
+        knowledge tools — a failed view_knowledge_file loop pollutes the
+        history with assistant/tool message pairs.
+        """
         # ── Step 1: clear any stale side-channel entry from a prior turn ──
-        pstate = self._f._project_state_manager.get_pstate(self.get_project_id())
+        project_id = self.get_project_id()
+        pstate = self._f._project_state_manager.get_pstate(project_id)
         pstate["merged_file_blocks"] = None
-        self._f._log_debug("DIAG merge: pstate resolved + cleared")
 
         # ── Step 2: collect references from both locations, dedup by id ──
         refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
-        self._f._log_debug(f"DIAG merge: refs collected → {len(refs)} ref(s)")
         if not refs:
-            self._f._log_debug("DIAG merge: no refs, returning")
             return messages
         target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
         if target is None:
-            self._f._log_debug("DIAG merge: no user message target, returning")
             return messages
-        self._f._log_debug("DIAG merge: target user message found")
 
-        # ── Step 3: read, render, and pre-extract each file ──
+        # ── Step 3: read, render, and pre-extract each file (once per content) ──
+        ingested = pstate.setdefault("ingested_file_hashes", {})
+        index_populated = len(self._f._symbol_index.get_all_names(project_id)) >= 20
+
         merged_text: List[str] = []
         merged_file_blocks: List[Dict[str, Any]] = []
         seen_ids: set = set()
-        for _ridx, ref in enumerate(refs):
-            self._f._log_debug(f"DIAG merge: ── ref #{_ridx} START")
+        for ref in refs:
             if not isinstance(ref, dict):
-                self._f._log_debug(f"DIAG merge: ref #{_ridx} not a dict, skip")
                 continue
             finfo = ref.get("file", {}) or {}
             file_id = finfo.get("id") or ref.get("id")
             if not file_id or file_id in seen_ids:
-                self._f._log_debug(f"DIAG merge: ref #{_ridx} no id / dup, skip")
                 continue
             seen_ids.add(file_id)
 
             name = (
                 finfo.get("filename") or ref.get("name") or f"attachment_{file_id[:8]}"
             )
-            self._f._log_debug(
-                f"DIAG merge: ref #{_ridx} name={name!r}, reading from path…"
-            )
             content = self._read_uploaded_file(finfo.get("path"))
-            self._f._log_debug(f"DIAG merge: ref #{_ridx} read {len(content)} chars")
             if not content:
                 self._f._log_debug(
                     f"merge_pasted_files: unreadable '{name}' "
@@ -27217,28 +27241,33 @@ class InletOrchestrator:
                 )
                 continue
 
-            self._f._log_debug(f"DIAG merge: ref #{_ridx} resolving fence…")
-            is_code, fence_lang = await self._resolve_pasted_fence(name, content)
-            self._f._log_debug(
-                f"DIAG merge: ref #{_ridx} fence → is_code={is_code}, "
-                f"lang={fence_lang!r}"
-            )
+            # Process-once short-circuit: identical content already ingested
+            # this session AND the symbol index is still populated → splice a
+            # one-line reference instead of the full paste. The index guard
+            # covers a cleared project (restart / /forget), which must
+            # re-ingest from scratch.
+            raw_md5 = hashlib.md5(content.encode()).hexdigest()[:16]
+            known = ingested.get(raw_md5)
+            if known and index_populated:
+                merged_text.append(
+                    f"**{name}:** _(unchanged — already indexed as "
+                    f"{known.get('symbols', '?')} symbols in the SymbolGraph; "
+                    f"use `/expand <name>` to see any implementation)_"
+                )
+                self._f._log_debug(
+                    f"merge_pasted_files: '{name}' unchanged "
+                    f"(md5={raw_md5}) — skipping re-ingestion, spliced reference"
+                )
+                continue
 
-            self._f._log_debug(f"DIAG merge: ref #{_ridx} formatting…")
+            is_code, fence_lang = await self._resolve_pasted_fence(name, content)
             merged_text.append(
                 self._format_pasted_file(name, content, is_code, fence_lang)
             )
-            self._f._log_debug(f"DIAG merge: ref #{_ridx} formatted")
 
             if is_code:
-                self._f._log_debug(
-                    f"DIAG merge: ref #{_ridx} extracting symbols from raw…"
-                )
                 symbols, lang = await self._extract_symbols_from_raw(
                     content, name, fence_lang
-                )
-                self._f._log_debug(
-                    f"DIAG merge: ref #{_ridx} extracted {len(symbols)} symbol(s)"
                 )
                 if symbols:
                     merged_file_blocks.append(
@@ -27249,14 +27278,20 @@ class InletOrchestrator:
                             "language": lang,
                         }
                     )
-            self._f._log_debug(f"DIAG merge: ── ref #{_ridx} DONE")
+                    # Record AFTER a successful extraction so a failed parse
+                    # never poisons the registry. Ingestion itself completes
+                    # inside this same inlet (silent ingestion indexes before
+                    # returning), so an interrupted OUTLET never leaves a
+                    # registered-but-unindexed file behind.
+                    ingested[raw_md5] = {
+                        "file_path": name,
+                        "symbols": len(symbols),
+                    }
 
         if not merged_text:
-            self._f._log_debug("DIAG merge: no merged_text, returning")
             return messages
 
         # ── Step 4: append after the user's own text (question stays at head) ──
-        self._f._log_debug("DIAG merge: appending to target message…")
         original = (target.get("content", "") or "").rstrip()
         joined = "\n\n".join(merged_text)
         target["content"] = f"{original}\n\n{joined}" if original else joined
@@ -27265,9 +27300,16 @@ class InletOrchestrator:
         if merged_file_blocks:
             pstate["merged_file_blocks"] = merged_file_blocks
 
+        # ── Step 6: clear attachment refs so the model never chases them ──
+        if body.get("files"):
+            body["files"] = []
+        if body.get("metadata", {}).get("files"):
+            body["metadata"]["files"] = []
+
         self._f._log_debug(
             f"merge_pasted_files: merged {len(merged_text)} file(s), "
-            f"pre-extracted symbols for {len(merged_file_blocks)}"
+            f"pre-extracted symbols for {len(merged_file_blocks)}, "
+            f"attachment refs cleared"
         )
         return messages
 
@@ -31878,6 +31920,14 @@ class ProjectStateManager:
         """Store the structural hash of the last successfully saved KV slot."""
         self.get_pstate(project_id)["last_saved_slot_hash"] = hash_val
 
+    def get_last_saved_slot_tokens(self, project_id: str) -> int:
+        """Token count captured by the last successful slot save (0 = none)."""
+        return self.get_pstate(project_id).get("last_saved_slot_tokens", 0)
+
+    def set_last_saved_slot_tokens(self, project_id: str, tokens: int) -> None:
+        """Record the token count reported by llama.cpp for the last slot save."""
+        self.get_pstate(project_id)["last_saved_slot_tokens"] = int(tokens or 0)
+
     def get_slot_restore_attempted(self, project_id: str) -> bool:
         """Return True if a KV slot restore has been attempted for this project."""
         return self.get_pstate(project_id).get("slot_restore_attempted", False)
@@ -31966,6 +32016,18 @@ class ProjectStateManager:
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
 
+        Same-hash re-save semantics
+        ───────────────────────────
+        A save is skipped for an unchanged structural hash UNLESS the current
+        context is at least slot_resave_min_growth times larger than the token
+        count captured by the previous save. This closes the warmup-fossil
+        trap: the hub-tier warmup saves a few thousand tokens early, and a
+        size-blind hash guard would then veto the full main-chat save forever,
+        leaving every restore with a tiny prefix and forcing a cold multi-10k
+        prefill each turn. One large save per structural hash captures all the
+        reusable value (llama.cpp prefix-matching only ever reuses up to the
+        stable Block A prefix), so per-turn re-saves would be pure disk churn.
+
         Slot-contention semantics
         ─────────────────────────
         Under --parallel 1 the server processes one request at a time. If this
@@ -32009,14 +32071,13 @@ class ProjectStateManager:
 
         # --- 2. Token threshold guard (skip oversized KV writes) ---
         _max_ctx = self._f.valves.slot_save_max_context_tokens
-        if _max_ctx > 0:
-            _ctx_tok = self.get_last_total_context_tokens(project_id)
-            if _ctx_tok > _max_ctx:
-                self._f._log_debug(
-                    f"Slot save skipped: context {_ctx_tok} tokens > threshold "
-                    f"{_max_ctx} (avoids large KV write under mutex)"
-                )
-                return False
+        _ctx_tok = self.get_last_total_context_tokens(project_id)
+        if _max_ctx > 0 and _ctx_tok > _max_ctx:
+            self._f._log_debug(
+                f"Slot save skipped: context {_ctx_tok} tokens > threshold "
+                f"{_max_ctx} (avoids large KV write under mutex)"
+            )
+            return False
 
         # --- 3. Get the structural hash from pstate (set by build_block_a) ---
         static_hash = self.get_structure_hash_for_cache(project_id)
@@ -32027,9 +32088,25 @@ class ProjectStateManager:
             else:
                 return False
 
-        # --- 4. Skip if already saved and not forced ---
+        # --- 4. Skip if already saved, not forced, and not materially larger ---
+        # Size-aware: a previous SMALL save (hub-tier warmup) must not veto the
+        # full main-chat save for the same structural hash. Re-save only when
+        # the current context sufficiently outgrows what the .bin captured;
+        # afterwards the guard closes again, so the large KV write happens once
+        # per structural hash, not once per turn.
         if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
-            return False
+            _saved_tok = self.get_last_saved_slot_tokens(project_id)
+            if (
+                _saved_tok > 0
+                and _ctx_tok <= _saved_tok * self._f.valves.slot_resave_min_growth
+            ):
+                return False
+            if _saved_tok > 0:
+                self._f._log_debug(
+                    f"Slot re-save allowed: context {_ctx_tok} tokens outgrew "
+                    f"saved snapshot ({_saved_tok} tokens × "
+                    f"{self._f.valves.slot_resave_min_growth})"
+                )
 
         # --- 5. Optionally wait for the inference slot to drain before POSTing.
         # Only detached callers (Filter.outlet) request this; on-critical-path
@@ -32080,6 +32157,9 @@ class ProjectStateManager:
 
             if ok:
                 self.set_last_saved_slot_hash(project_id, static_hash)
+                self.set_last_saved_slot_tokens(
+                    project_id, int(data.get("n_saved", 0) or 0)
+                )
                 self._f._log_debug(
                     f"✓ Slot saved → {filename} "
                     f"({data.get('n_saved', '?')} tokens, "
@@ -35218,6 +35298,19 @@ class Filter:
             default=0,
             ge=0,
             description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
+        )
+        slot_resave_min_growth: float = Field(
+            default=1.5,
+            ge=1.0,
+            description=(
+                "Re-save the KV slot for an unchanged structural hash only when "
+                "the current context exceeds the previously saved token count by "
+                "this factor. Prevents a small early save (the hub-tier warmup, "
+                "~6.5k tokens) from permanently vetoing the full main-chat save, "
+                "while avoiding a multi-GB KV rewrite every turn: llama.cpp "
+                "prefix-matching only ever reuses up to Block A anyway, so one "
+                "large save per structural hash captures all the value."
+            ),
         )
         slot_operation_timeout: float = Field(
             default=10.0,  # This could be low, be aware of this.
