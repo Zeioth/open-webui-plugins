@@ -9559,7 +9559,9 @@ class LongTermMemory:
 
         Returns a dict with response, query, and timestamp on a hit, or None
         if no valid cached entry is found. Stale entries (code state changed
-        or TTL expired) are deleted on the fly.
+        or TTL expired) are deleted on the fly. The query is sanitized
+        (code stripped past the size valve) before embedding so a pasted
+        file cannot trigger a multi-minute, over-length encode.
 
         Args:
             query: The current user query.
@@ -9569,6 +9571,8 @@ class LongTermMemory:
         Returns:
             Optional[dict]: Cache hit dict or None.
         """
+        query = self._sanitize_retrieval_query(query)
+
         # ------------------------------------------------------------------
         # Region: Early exit — cache disabled or prerequisites missing
         # ------------------------------------------------------------------
@@ -9646,7 +9650,9 @@ class LongTermMemory:
         4. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
         5. Middle zone: fallback to cosine similarity only.
 
-        Restores KV slot after any LLM call.
+        The query is sanitized (code stripped past the size valve) before
+        embedding, so duplicate matching compares the user's words, not a
+        pasted file. Restores KV slot after any LLM call.
 
         Args:
             query (str): The user's current question.
@@ -9655,6 +9661,8 @@ class LongTermMemory:
         Returns:
             Optional[dict]: {'sim': float, 'doc': str} if a duplicate is found, else None.
         """
+        query = self._sanitize_retrieval_query(query)
+
         # ------------------------------------------------------------------
         # Region: Prerequisites check
         # ------------------------------------------------------------------
@@ -9825,6 +9833,29 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Query helpers (parsing, symbol extraction, expansion)
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _sanitize_retrieval_query(self, query: str) -> str:
+        """Return a retrieval-safe version of the query for embedding.
+
+        A code-bearing mega-query (a pasted file) blows past the embedder's
+        max sequence length (observed: 280k tokens vs a 40960 cap), costing
+        minutes of CPU per encode and producing a truncated, semantically
+        useless vector. Strip code the same way classify_intent and seed
+        extraction do, gated by the shared size valve. Both the read side
+        (lookups) and the write side (cache store) must apply this so cached
+        entries and later lookups share the same semantic key.
+        """
+        if not query:
+            return query
+        if len(query) > self._f.valves.seed_extraction_strip_min_chars:
+            stripped = self._f._commands._extract_text_for_classification(query)
+            if stripped and len(stripped.strip()) >= 10:
+                self._f._log_debug(
+                    f"LTM: stripped code from retrieval query "
+                    f"({len(query)} chars → {len(stripped)})"
+                )
+                return stripped
+        return query
 
     def _parse_forced_symbol_query(self, query: str) -> Tuple[Optional[str], str]:
         """Extract forced symbol from query (?symbol:Name). Returns (symbol, cleaned_query)."""
@@ -10103,6 +10134,10 @@ class LongTermMemory:
         """
         Retrieve relevant LTM entries, with multi-query expansion and reranking.
 
+        The query is sanitized (code stripped past the size valve) before
+        expansion and embedding, so a pasted file cannot trigger over-length
+        encodes nor flood the expansion LLM.
+
         Args:
             query: The user query.
             project_id: Current project identifier.
@@ -10113,6 +10148,8 @@ class LongTermMemory:
         Returns:
             List of memory fragment dicts with keys doc, timestamp, meta.
         """
+        query = self._sanitize_retrieval_query(query)
+
         # ------------------------------------------------------------------
         # Region: Early exit if retrieval disabled
         # ------------------------------------------------------------------
@@ -10342,6 +10379,9 @@ class LongTermMemory:
         """
         Retrieve historically relevant messages from ChromaDB LTM.
 
+        The query is sanitized (code stripped past the size valve) before
+        embedding so a pasted file cannot trigger an over-length encode.
+
         Args:
             query: The user query used for semantic similarity search.
             project_id: Current project identifier.
@@ -10351,6 +10391,7 @@ class LongTermMemory:
         Returns:
             list: List of message dicts with role and content keys.
         """
+        query = self._sanitize_retrieval_query(query)
         # ------------------------------------------------------------------
         # Region: Early exit — prerequisites
         # ------------------------------------------------------------------
@@ -10858,6 +10899,7 @@ class LongTermMemory:
         wait: bool = True,
     ) -> None:
         """Store a response in the ChromaDB response cache for future reuse."""
+        query = self._sanitize_retrieval_query(query)
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return
         if not query or not response:
@@ -32624,6 +32666,7 @@ class BackgroundTaskManager:
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._paused = True
+        self._pause_epoch = 0
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
@@ -32800,9 +32843,39 @@ class BackgroundTaskManager:
             self._stop_events.clear()
 
     def set_paused(self, paused: bool) -> None:
-        """Set the paused state. When paused, start() will not launch new tasks."""
+        """Set the paused state. When paused, start() will not launch new tasks.
+
+        Each pause increments _pause_epoch, so a caller that intends to resume
+        later (the outlet) can detect that a newer inlet paused in between and
+        abstain — otherwise a late outlet would un-pause and launch background
+        tasks in the middle of the next turn's inlet, contending for the single
+        llama.cpp slot with the critical path.
+        """
+        if paused:
+            self._pause_epoch += 1
         self._paused = paused
         self._f._log_debug(f"Background tasks {'paused' if paused else 'resumed'}")
+
+    def capture_pause_epoch(self) -> int:
+        """Return the current pause epoch (see set_paused)."""
+        return self._pause_epoch
+
+    def resume_if_epoch_unchanged(self, epoch: int) -> bool:
+        """Resume background tasks only if no pause happened since `epoch`.
+
+        Returns True when resumed (caller may launch tasks), False when a newer
+        inlet paused in between — in that case the paused state is preserved
+        and the caller must skip launching.
+        """
+        if self._pause_epoch != epoch:
+            self._f._log_debug(
+                "Background tasks NOT resumed — a newer inlet paused them "
+                "after this outlet started (skipping bg launch to keep the "
+                "llama.cpp slot free for the active turn)"
+            )
+            return False
+        self.set_paused(False)
+        return True
 
     def is_running(self, name: str) -> bool:
         """
@@ -33786,12 +33859,15 @@ class Filter:
         seed_extraction_strip_min_chars: int = Field(
             default=20000,
             description=(
-                "Query size (in chars) above which code is stripped before seed "
-                "extraction. A code-bearing mega-query (a pasted file) makes "
-                "every symbol in the codebase an exact-match seed, destroying "
-                "activation focus (PPR seeds everything equally). Below this "
-                "size the query passes through untouched so pasted tracebacks "
-                "keep feeding _extract_traceback_seeds."
+                "Query size (in chars) above which code is stripped before any "
+                "semantic consumer uses it: seed extraction, LTM retrieval, "
+                "response-cache lookup/store, and duplicate detection. A "
+                "code-bearing mega-query (a pasted file) seeds every symbol in "
+                "the codebase, blows past the embedder's max sequence length "
+                "(minutes of CPU per encode, truncated useless vectors), and "
+                "muddies duplicate/cache matching. Below this size the query "
+                "passes through untouched so pasted tracebacks keep feeding "
+                "traceback-based activation."
             ),
         )
         code_block_overflow_action: str = Field(
@@ -33836,7 +33912,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -33882,15 +33958,15 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -34146,7 +34222,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
         )
         path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
@@ -34807,15 +34883,15 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
 
@@ -34864,7 +34940,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -34921,7 +34997,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_rebuild_interval: int = Field(default=20)
@@ -35036,11 +35112,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
-            default="llamacpp/Ornith-1.0-35B-MTP-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Mini",
             description="Fallback model for summarization when the primary model is unavailable.",
         )
 
@@ -36715,7 +36791,18 @@ class Filter:
         enrichment for the next turn. Assistant-content processing (indexing,
         LTM store, response cache, continuation) is handled by the next inlet's
         prologue.
+
+        The background relaunch at the tail is guarded by a pause epoch: if a
+        newer inlet paused the tasks while this outlet was running (the user
+        sent the next turn before this one finished), the relaunch is skipped
+        so background LLM calls never contend with the active turn's critical
+        path for the single llama.cpp slot.
         """
+        # Captured before any await: if an inlet pauses between here and the
+        # relaunch at the tail, the epoch comparison detects it and the
+        # relaunch is skipped.
+        _bg_pause_epoch = self._bg_manager.capture_pause_epoch()
+
         self._log_debug("outlet called")
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
@@ -36802,7 +36889,7 @@ class Filter:
         # wait_for_llm_tasks() in the finally above drained every auxiliary call
         # of this turn, so the slot now holds the clean main-chat KV and is idle.
         # The next thing to touch it are the background tasks launched by
-        # set_paused(False) / start() below, which dirty it. Saving here — after
+        # the guarded relaunch below, which dirty it. Saving here — after
         # the drain, before the launch — captures the clean KV so the next turn's
         # slot_restore recovers it instead of a version polluted by raptor /
         # docstrings. Synchronous by design: a detached save races the background
@@ -36867,24 +36954,26 @@ class Filter:
 
         self._pending_warmup_task = None
 
-        self._bg_manager.set_paused(False)
-
-        for task in self._task_registry.get_background_tasks():
-            if task.bg_func is None:
-                continue
-            valve_name = task.valve_bg
-            if valve_name and not getattr(self.valves, valve_name, True):
-                continue
-            if task.name == "lod_adaptive":
-                await self._bg_manager.start(
-                    task.name, task.bg_func, project_id, _last_response
-                )
-            elif task.name == "prefetch":
-                await self._bg_manager.start(
-                    task.name, task.bg_func, project_id, last_activated
-                )
-            else:
-                await self._bg_manager.start(task.name, task.bg_func, project_id)
+        # Guarded relaunch: only resume + launch when no newer inlet paused the
+        # background tasks while this outlet was running. When skipped, the
+        # lazy task variants cover the gap on the next inlet.
+        if self._bg_manager.resume_if_epoch_unchanged(_bg_pause_epoch):
+            for task in self._task_registry.get_background_tasks():
+                if task.bg_func is None:
+                    continue
+                valve_name = task.valve_bg
+                if valve_name and not getattr(self.valves, valve_name, True):
+                    continue
+                if task.name == "lod_adaptive":
+                    await self._bg_manager.start(
+                        task.name, task.bg_func, project_id, _last_response
+                    )
+                elif task.name == "prefetch":
+                    await self._bg_manager.start(
+                        task.name, task.bg_func, project_id, last_activated
+                    )
+                else:
+                    await self._bg_manager.start(task.name, task.bg_func, project_id)
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END",
