@@ -3115,6 +3115,8 @@ class ContextPager:
         if chroma_collection is None or embedder is None:
             return False
 
+        self._f._log_debug(f"DIAG embed: page_out_block START hash={block.hash[:8]}")
+
         # ------------------------------------------------------------------
         # Region: Resolve current query for semantic evaluation
         # ------------------------------------------------------------------
@@ -3458,6 +3460,12 @@ class ContextPager:
             for h, block in state.active_blocks.items():
                 if block.file_path and not block.pinned and not block.obsolete:
                     by_file[block.file_path].append((h, block))
+
+            self._f._log_debug(
+                f"DIAG embed: purge_old_versions START "
+                f"({sum(len(v) for v in by_file.values())} candidate block(s) "
+                f"across {len(by_file)} file(s))"
+            )
 
             purged = 0
             current_query = self._f._project_state_manager.get_last_user_query(
@@ -3990,6 +3998,8 @@ class RaptorCodeIndex:
         if stop_event and stop_event.is_set():
             return 0
 
+        self._f._log_debug(f"DIAG embed: RAPTOR build_layer START level={level}")
+
         # ── Step 1: Gather items + embeddings for this level ──────────────
         if level == 1:
             names = list(symbol_index.get_all_qualified_names(project_id))
@@ -4021,6 +4031,11 @@ class RaptorCodeIndex:
 
         if len(texts) < max(2 * n_clusters, 4):
             return 0
+
+        self._f._log_debug(
+            f"DIAG embed: RAPTOR build_layer level={level} embedding "
+            f"{len(texts)} item(s) in one batched encode"
+        )
 
         # ── Step 2: Semantic embeddings ────────────────────────────────────
         try:
@@ -10724,6 +10739,11 @@ class LongTermMemory:
             )
             return
 
+        self._f._log_debug(
+            f"DIAG embed: _store_single_message START "
+            f"(role={msg.get('role')}, {len(msg.get('content', ''))} chars)"
+        )
+
         # ------------------------------------------------------------------
         # Region: Extract content and metadata
         # ------------------------------------------------------------------
@@ -16226,6 +16246,12 @@ class CodeBlockManager:
         inline pastes (silent ingestion) publish there. This is mandatory because
         the source may contain ``` that would corrupt fence detection.
 
+        The Section 4 indentation scan only runs when Sections 2-3 found no
+        fenced blocks AND the content is within indent_scan_max_lines: it exists
+        for unfenced inline snippets, and running it over a file-scale paste
+        fires one code-likelihood check (potentially a CrossEncoder call) per
+        indented run — thousands of sequential model calls on a large file.
+
         Args:
             content: Raw message content.
             project_id: Project identifier for state lookup.
@@ -16300,6 +16326,11 @@ class CodeBlockManager:
                             f"tree-sitter path extracted {len(blocks)} block(s)"
                         )
                         return self._postprocess_blocks(blocks, spans, content)
+                else:
+                    self._f._log_debug(
+                        "extract_code_blocks: process() result has no .blocks — "
+                        "falling through to regex"
+                    )
             except Exception as e:
                 self._f._log_debug(
                     f"tree-sitter failed ({e}), falling through to regex"
@@ -16339,44 +16370,82 @@ class CodeBlockManager:
             blocks.append({"language": lang, "code": code, "type": "fenced"})
             spans.append((match.start(), match.end()))
 
-        # ── Section 4: Indented blocks (only if no fenced blocks) ─────────
+        # ── Section 4: Indented blocks (only when nothing fenced was found) ──
+        # The indentation scan targets unfenced inline snippets. It is gated on
+        # BOTH conditions the comment always implied:
+        #   1. No fenced block was extracted by Sections 2-3 — otherwise every
+        #      indented run between fences would be re-scanned redundantly.
+        #   2. The content is small enough to plausibly BE a snippet — a
+        #      file-scale paste splits into thousands of blank-line-separated
+        #      runs, each firing _is_likely_code (worst case one CrossEncoder
+        #      call per run: hundreds of seconds of sequential model calls).
+        #      File-scale extraction is owned by merge_pasted_files / silent
+        #      ingestion, never by this scan.
+        run_indent_scan = not blocks
         lines = content.split("\n")
-        line_offsets = [0]
-        for line in lines:
-            line_offsets.append(line_offsets[-1] + len(line) + 1)
-
         total_lines = len(lines)
-        i = 0
-        indented = []
-        while i < total_lines:
-            line = lines[i]
-            if line.startswith(("    ", "\t")):
-                indented.append(line.lstrip(" \t"))
-                i += 1
-            else:
-                if len(indented) >= 3:
-                    code = "\n".join(indented)
-                    if await self._is_likely_code(code) and len(code) <= 200_000:
-                        lang = SignatureExtractor._guess_language(None, code) or "text"
-                        blocks.append(
-                            {"language": lang, "code": code, "type": "indented"}
-                        )
-                        start_offset = line_offsets[i - len(indented)]
-                        end_offset = line_offsets[i] - 1
-                        spans.append((start_offset, end_offset))
-                    indented = []
-                else:
-                    indented = []
-                i += 1
+        if run_indent_scan and total_lines > self._f.valves.indent_scan_max_lines:
+            self._f._log_debug(
+                f"extract_code_blocks: skipping Section-4 indent scan — "
+                f"{total_lines} lines exceeds indent_scan_max_lines "
+                f"({self._f.valves.indent_scan_max_lines}); file-scale extraction "
+                f"is owned by the ingestion paths"
+            )
+            run_indent_scan = False
 
-        if len(indented) >= 3:
-            code = "\n".join(indented)
-            if await self._is_likely_code(code) and len(code) <= 200_000:
-                lang = SignatureExtractor._guess_language(None, code) or "text"
-                blocks.append({"language": lang, "code": code, "type": "indented"})
-                start_offset = line_offsets[total_lines - len(indented)]
-                end_offset = line_offsets[total_lines] - 1
-                spans.append((start_offset, end_offset))
+        if run_indent_scan:
+            _s4_runs_checked = 0
+            _s4_ce_before = getattr(CodeBlockManager, "_ce_fallback_count", 0)
+
+            line_offsets = [0]
+            for line in lines:
+                line_offsets.append(line_offsets[-1] + len(line) + 1)
+
+            i = 0
+            indented = []
+            while i < total_lines:
+                line = lines[i]
+                if line.startswith(("    ", "\t")):
+                    indented.append(line.lstrip(" \t"))
+                    i += 1
+                else:
+                    if len(indented) >= 3:
+                        code = "\n".join(indented)
+                        _s4_runs_checked += 1
+                        if await self._is_likely_code(code) and len(code) <= 200_000:
+                            lang = (
+                                SignatureExtractor._guess_language(None, code) or "text"
+                            )
+                            blocks.append(
+                                {"language": lang, "code": code, "type": "indented"}
+                            )
+                            start_offset = line_offsets[i - len(indented)]
+                            end_offset = line_offsets[i] - 1
+                            spans.append((start_offset, end_offset))
+                        indented = []
+                    else:
+                        indented = []
+                    i += 1
+
+            if len(indented) >= 3:
+                code = "\n".join(indented)
+                _s4_runs_checked += 1
+                if await self._is_likely_code(code) and len(code) <= 200_000:
+                    lang = SignatureExtractor._guess_language(None, code) or "text"
+                    blocks.append({"language": lang, "code": code, "type": "indented"})
+                    start_offset = line_offsets[total_lines - len(indented)]
+                    end_offset = line_offsets[total_lines] - 1
+                    spans.append((start_offset, end_offset))
+
+            if _s4_runs_checked > 20:
+                _s4_ce_used = (
+                    getattr(CodeBlockManager, "_ce_fallback_count", 0) - _s4_ce_before
+                )
+                self._f._log_debug(
+                    f"DIAG embed: Section-4 indent scan checked "
+                    f"{_s4_runs_checked} run(s) over {total_lines} lines, "
+                    f"{_s4_ce_used} CrossEncoder fallback call(s)"
+                )
 
         # ── Section 5: Entire small content as a single block ─────────────
         if (
@@ -16479,6 +16548,17 @@ class CodeBlockManager:
         ce = _get_cross_encoder()
         if ce is None:
             return False
+
+        CodeBlockManager._ce_fallback_count = (
+            getattr(CodeBlockManager, "_ce_fallback_count", 0) + 1
+        )
+        if CodeBlockManager._ce_fallback_count % 100 == 1:
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [CodeAware] DIAG embed: "
+                f"_is_likely_code CE fallback "
+                f"#{CodeBlockManager._ce_fallback_count} "
+                f"(sample head: {sample[:60]!r})"
+            )
 
         pairs = [
             (sample, "This is a fragment of source code."),
@@ -18204,6 +18284,30 @@ Output only the symbol name.
     async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
     ):
+        """Gather every seed vector for the activation graph from one query.
+
+        Returns (exact_seeds, partial_seeds, tb_seeds, history_boosts), each
+        sanitised to its expected shape. Code is stripped from mega-queries
+        before extraction (Step 0) so a pasted file cannot turn the whole
+        codebase into exact-match seeds and erase activation focus.
+        """
+        # ── Step 0: Strip code from mega-queries before seeding ───────────────
+        # A pasted file flowing in as the query makes all_names ∩ query_words
+        # match the whole codebase (observed: exact=648 of 648), which seeds
+        # every node equally and erases activation focus. classify_intent
+        # already solves this with _extract_text_for_classification; reuse it,
+        # gated by size so pasted tracebacks in normal-sized queries still
+        # reach _extract_traceback_seeds intact.
+        if len(query) > self._f.valves.seed_extraction_strip_min_chars:
+            stripped_query = self._f._commands._extract_text_for_classification(query)
+            if stripped_query and len(stripped_query.strip()) >= 10:
+                self._f._log_debug(
+                    f"_prepare_seed_symbols: stripped code from mega-query "
+                    f"({len(query)} chars → {len(stripped_query)}) before "
+                    f"seed extraction"
+                )
+                query = stripped_query
+
         exact_seeds, partial_seeds = await self._extract_query_seeds(query, project_id)
         tb_seeds = (
             self._extract_traceback_seeds(query, project_id)
@@ -19177,6 +19281,10 @@ Output only the symbol name.
         # ------------------------------------------------------------------
         # Step 1: Get the conversation state and check for active blocks.
         # ------------------------------------------------------------------
+        self._f._log_debug(
+            f"DIAG embed: rebuild_path_index START "
+            f"(stop_event={'set' if stop_event else 'none — inline/lazy call'})"
+        )
         state = self._f._conversation_state_manager.get(project_id)
         if not state or not state.active_blocks:
             return
@@ -33662,6 +33770,28 @@ class Filter:
                 "Memory protection against (huge) accidental code pastes. "
                 "If the code has more than n chars, it will be skipped "
                 "with a warning in the logs."
+            ),
+        )
+        indent_scan_max_lines: int = Field(
+            default=2000,
+            description=(
+                "Upper bound (in lines) for the indented-block fallback scan in "
+                "extract_code_blocks. The scan exists for unfenced code snippets "
+                "pasted inline; above this size the content is a file-scale paste "
+                "whose extraction is owned by merge_pasted_files / silent "
+                "ingestion, and scanning it run-by-run triggers thousands of "
+                "CrossEncoder code-likelihood calls."
+            ),
+        )
+        seed_extraction_strip_min_chars: int = Field(
+            default=20000,
+            description=(
+                "Query size (in chars) above which code is stripped before seed "
+                "extraction. A code-bearing mega-query (a pasted file) makes "
+                "every symbol in the codebase an exact-match seed, destroying "
+                "activation focus (PPR seeds everything equally). Below this "
+                "size the query passes through untouched so pasted tracebacks "
+                "keep feeding _extract_traceback_seeds."
             ),
         )
         code_block_overflow_action: str = Field(
