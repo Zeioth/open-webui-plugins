@@ -6533,6 +6533,13 @@ class ContextBuilder:
             inferred_seeds=inferred_seeds,
         )
         self._f._log_debug("DIAG bbb: <<< build_activation_graph DONE")
+        # Materialise the activation set for this turn. The threshold matches
+        # the propagation floor (min_score=0.05 in _get_or_compute_ppr_scores):
+        # everything PPR kept alive enters the set, and the semantic filtering
+        # happens below via the LOD thresholds (lod1/lod2/lod3), which are all
+        # above this floor. Step 6 also mutates this dict (pulled callers), so
+        # it must be the mutable per-turn copy, not a view.
+        activated = dict(ag.get_activated_nodes(threshold=0.05))
         if not activated:
             self._f._log_debug(
                 "build_block_b: no activated nodes, falling back to full context"
@@ -22884,22 +22891,22 @@ Code context (recent symbols referenced):
 
         This stub is used both during silent ingestion and in the normal
         message compression flow. It informs the model that the code is
-        already indexed and available via /expand, avoiding redundant
-        token consumption, and explicitly forbids tool-based file reads —
-        a model with knowledge tools otherwise tries to fetch the (already
-        consumed) attachment and loops on "File not found".
-
-        Args:
-            symbol_count (int): Number of symbols currently indexed in the SymbolGraph.
-
-        Returns:
-            str: The stub text, ready for injection into the conversation history.
+        already indexed and available via /expand, forbids tool-based file
+        reads (a model with knowledge tools otherwise loops on "File not
+        found"), and instructs a one-line acknowledgement: the ingestion
+        banner is truncated out of the list before generation (anti-prefill
+        ramble), so whatever the model generates IS the visible reply of a
+        silent-ingestion turn — this makes that reply deterministic instead
+        of leaving the model to improvise against a bare stub.
         """
         return (
             f"_(The code is internally available; no need to repeat it here. "
             f"Do not attempt to read any attached file with tools — it is "
             f"already fully indexed.)_\n\n"
-            f"_[{symbol_count} symbols indexed in SymbolGraph. Use /expand <name> to see any implementation.]_"
+            f"_[{symbol_count} symbols indexed in SymbolGraph. Use /expand <name> to see any implementation.]_\n\n"
+            f"_(If this message contains no question, reply with a single "
+            f"short line confirming the code is indexed and wait for the "
+            f"next message.)_"
         )
 
     def ensure_compressed_user_messages(
