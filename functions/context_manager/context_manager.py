@@ -19372,7 +19372,7 @@ Output only the symbol name.
         seed_qids = list(set(seed_qids) & set(all_qids))
 
         # ---- Region: Get or compute PPR scores ----
-        code_state_hash = self.compute_code_state_hash(project_id)  # <-- CORREGIDO
+        code_state_hash = self.compute_code_state_hash(project_id)
 
         cached_scores = self._get_or_compute_ppr_scores(
             seed_qids=seed_qids,
@@ -19383,6 +19383,22 @@ Output only the symbol name.
             min_score=0.05,
             alpha=self._f.valves.ppr_alpha,
         )
+
+        # ---- Region: Normalize PPR scores into [0, 1] ----
+        # The PPR power iteration keeps each seed at its initial mass of
+        # 1.0 / n_seeds and only lowers propagated neighbours, so with several
+        # seeds the whole distribution is compressed low (six seeds top out
+        # around 0.167). Nothing then crosses lod2 (0.30) or lod3 (0.50) and
+        # Block B renders empty — the "N symbols, ~0 tokens" turn. Both the
+        # fresh and the cache-hit paths leave _get_or_compute_ppr_scores with
+        # these raw values (the cache deliberately stores the canonical
+        # propagation output), so this is the single point where the scores
+        # enter LOD thresholding and the correct place to map them onto [0, 1].
+        # Deterministic: one raw distribution always yields one normalized
+        # distribution, so the KV-relevant ordering is stable turn to turn.
+        cached_scores = self._normalize_ppr_scores(cached_scores)
+
+        # ---- Region: Build the activation graph ----
 
         # ---- Region: Build the activation graph ----
         if not self._f.valves.enable_multi_seed_activation:
