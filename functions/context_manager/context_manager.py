@@ -5555,13 +5555,22 @@ class ContextBuilder:
         )
 
         # ── Apply token budget ─────────────────────────────────────────────────────
+        # The 6000-token cap only reserves headroom for the multi-phase protocol
+        # when that protocol is actually going to be injected THIS turn — not
+        # merely because the feature is enabled. Gating on enable_multi_phase_
+        # response (the config valve) capped the tier permanently under the usual
+        # enable=True config, even on turns the log reported "Multi-phase: not
+        # needed". The per-turn flag is read without popping it: it is consumed
+        # later by _inject_multi_phase_instructions, which must still see it.
         budget = self._f.valves.hub_bodies_tier_max_tokens
-        if (
-            self._f.valves.enable_multi_phase_response
-            or self._f.valves.force_multi_phase_response
-        ):
+        _mp_forced_this_turn = psm.get_pstate(project_id).get(
+            "force_multi_phase_this_turn", False
+        )
+        if self._f.valves.force_multi_phase_response or _mp_forced_this_turn:
             budget = min(budget, 6000)
-            self._f._log_debug(f"Hub tier: budget capped to 6000 (multi-phase active)")
+            self._f._log_debug(
+                "Hub tier: budget capped to 6000 (multi-phase forced this turn)"
+            )
 
         lines = [
             "## Core Implementation (hub symbols — stable, cached)",
@@ -5603,8 +5612,6 @@ class ContextBuilder:
         tier_text = "\n".join(lines)
 
         # ── Encode the entire concatenated string, not just the rhs ───
-        # Previous code: f"{config_prefix}|" + "|".join(...).encode()
-        # → TypeError: can only concatenate str (not "bytes") to str
         config_prefix = (
             f"n={self._f.valves.hub_bodies_tier_top_n}|"
             f"floor={self._f.valves.hub_bodies_tier_min_centrality}"
@@ -6643,6 +6650,56 @@ class ContextBuilder:
         injected_symbols: Set[str] = set(tier_qids)
 
         # ------------------------------------------------------------------
+        # Step 8.5: LOD-3 sticky bodies — TTL hysteresis for multi-turn reasoning.
+        #
+        # A body rendered at LOD-3 by its own activation is kept rendered for a
+        # few extra turns after that activation drops, so a follow-up that refers
+        # to the same symbol by pronoun ("what does it do" → "what is its purpose"
+        # → "and if I change Y") keeps the concrete body in context instead of
+        # forcing the model to answer from history — the confabulation path. It
+        # also stabilises the Block B prefix: the same bodies in the same
+        # deterministic positions are tokens llama.cpp's prefix matcher reuses,
+        # so the tier stops thrashing the KV cache between turns.
+        #
+        # Symmetric to the LOD-2 entry/exit hysteresis in Step 9: entry is by
+        # merit (score >= lod3), exit is by TTL expiry rather than a lower score
+        # floor. TTL is refreshed to full whenever the symbol re-activates by
+        # merit (Step 15.5). merit_lod3 is captured BEFORE the floor so a body
+        # kept alive only by stickiness cannot masquerade as a fresh merit hit
+        # and refresh its own TTL forever.
+        # ------------------------------------------------------------------
+        _sticky_ttl = self._f.valves.lod3_sticky_turns
+        _sticky_cap = self._f.valves.lod3_sticky_max_symbols
+        _merit_lod3 = {q for q, s in activated.items() if s >= lod3}
+        lod3_sticky: Dict[str, int] = dict(pstate.get("lod3_sticky", {}))
+
+        if _sticky_ttl > 0:
+            # A turn whose activation seeds miss the sticky set entirely is a
+            # focus switch: age the carried-over bodies out twice as fast so they
+            # do not linger once the conversation has clearly moved on. Seed nodes
+            # are already computed for this turn's graph, so this costs nothing.
+            _seeds = set(ag.get_seed_nodes())
+            _decay = 2 if (_seeds and not (_seeds & set(lod3_sticky))) else 1
+            lod3_sticky = {
+                q: ttl - _decay for q, ttl in lod3_sticky.items() if ttl - _decay > 0
+            }
+
+            # Cap: evict lowest remaining TTL first, then lowest activation score.
+            if len(lod3_sticky) > _sticky_cap:
+                _evict = sorted(
+                    lod3_sticky,
+                    key=lambda q: (lod3_sticky[q], activated.get(q, 0.0)),
+                )
+                for q in _evict[: len(lod3_sticky) - _sticky_cap]:
+                    del lod3_sticky[q]
+
+            # Floor: keep every live sticky body at the LOD-3 threshold, pulling
+            # back in any whose PPR score fell below the activation floor (0.05)
+            # and dropped out of `activated` entirely.
+            for q in lod3_sticky:
+                activated[q] = max(activated.get(q, 0.0), lod3)
+
+        # ------------------------------------------------------------------
         # Step 9: LOD-2 hysteresis (entry/exit thresholds).
         # ------------------------------------------------------------------
         lod2_entry = self._f.valves.lod2_threshold
@@ -6820,6 +6877,9 @@ class ContextBuilder:
         _lod1_parts: List[str] = []
         _lod2_parts: List[str] = []
         _lod3_parts: List[str] = []
+        # qids whose full body actually landed in _lod3_parts this turn; only
+        # these (and only if they reached LOD-3 by merit) refresh the sticky TTL.
+        _lod3_emitted: Set[str] = set()
 
         for qid in sorted_nodes:
             if total_tokens >= budget:
@@ -6847,6 +6907,7 @@ class ContextBuilder:
                         tok = self._f._tokens.estimate_code_tokens(body_only)
                         if total_tokens + tok <= budget:
                             _lod3_parts.append(body_only)
+                            _lod3_emitted.add(qid)
                             total_tokens += tok
                             injected_symbols.add(qid)
                     continue
@@ -7024,10 +7085,34 @@ class ContextBuilder:
                         f"### '{qid}'{loc} [activation: {score:.2f}]\n"
                         f"```\n{content_to_inject}\n```\n"
                     )
+                    _lod3_emitted.add(qid)
                     total_tokens += tok
                     injected_symbols.add(qid)
 
                 break  # Only process the first valid block for each qid
+
+        # ------------------------------------------------------------------
+        # Step 15.5: Refresh LOD-3 sticky TTLs for merit hits emitted this turn.
+        #
+        # Only bodies that reached LOD-3 on their own activation (merit) AND were
+        # actually rendered reset their TTL to full. Bodies kept alive purely by
+        # the Step 8.5 sticky floor retain the TTL already decremented at the top
+        # of the turn, so they age out on schedule once the conversation stops
+        # referring to them. The cap is re-enforced after refresh so a burst of
+        # merit hits cannot exceed the bound.
+        # ------------------------------------------------------------------
+        if _sticky_ttl > 0:
+            for qid in _lod3_emitted:
+                if qid in _merit_lod3:
+                    lod3_sticky[qid] = _sticky_ttl
+            if len(lod3_sticky) > _sticky_cap:
+                _evict = sorted(
+                    lod3_sticky,
+                    key=lambda q: (lod3_sticky[q], activated.get(q, 0.0)),
+                )
+                for q in _evict[: len(lod3_sticky) - _sticky_cap]:
+                    del lod3_sticky[q]
+        pstate["lod3_sticky"] = lod3_sticky
 
         # ------------------------------------------------------------------
         # Step 16: RAPTOR cluster summaries injected into LOD-2 tier.
@@ -22891,19 +22976,26 @@ Code context (recent symbols referenced):
 
         This stub is used both during silent ingestion and in the normal
         message compression flow. It informs the model that the code is
-        already indexed and available via /expand, forbids tool-based file
-        reads (a model with knowledge tools otherwise loops on "File not
-        found"), and instructs a one-line acknowledgement: the ingestion
-        banner is truncated out of the list before generation (anti-prefill
-        ramble), so whatever the model generates IS the visible reply of a
-        silent-ingestion turn — this makes that reply deterministic instead
-        of leaving the model to improvise against a bare stub.
+        already indexed, forbids tool-based file reads (a model with knowledge
+        tools otherwise loops on "File not found"), and instructs a one-line
+        acknowledgement: the ingestion banner is truncated out of the list
+        before generation (anti-prefill ramble), so whatever the model generates
+        IS the visible reply of a silent-ingestion turn — this makes that reply
+        deterministic instead of leaving the model to improvise against a bare
+        stub.
+
+        The reference line deliberately avoids the literal word 'expand': this
+        stub becomes part of the user message, and that word was seeding *expand*
+        seed partials and pulling the use-case classifier toward Scaffolding.
+        Same wording as InletOrchestrator._indexed_reference_line so both the
+        merge splice and this stub read identically.
         """
         return (
             f"_(The code is internally available; no need to repeat it here. "
             f"Do not attempt to read any attached file with tools — it is "
             f"already fully indexed.)_\n\n"
-            f"_[{symbol_count} symbols indexed in SymbolGraph. Use /expand <name> to see any implementation.]_\n\n"
+            f"_[{symbol_count} symbols indexed in the SymbolGraph; ask for any "
+            f"implementation by name.]_\n\n"
             f"_(If this message contains no question, reply with a single "
             f"short line confirming the code is indexed and wait for the "
             f"next message.)_"
@@ -26385,6 +26477,19 @@ class InletOrchestrator:
         """Return the current project id from the valves configuration."""
         return self._f.valves.project_id
 
+    def _indexed_reference_line(self, name: str, symbol_count) -> str:
+        """One-line reference for already-indexed content, shared by the merge
+        splice and the silent-ingestion stub so both flows read identically.
+
+        Deliberately avoids the literal word 'expand': the spliced text becomes
+        part of the user query, and that word was both seeding *expand* seed
+        partials every turn and pulling the use-case classifier toward
+        Scaffolding (the 'expand/implementation' vocabulary anchors class E)."""
+        return (
+            f"**{name}:** _(unchanged — {symbol_count} symbols already "
+            f"indexed in the SymbolGraph; ask for any implementation by name)_"
+        )
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Preprocessing (project switch, cache load, slot restore)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -26964,13 +27069,30 @@ class InletOrchestrator:
         response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
 
         # ------------------------------------------------------------------
-        # Region: skip synthetic silent-ingestion acknowledgements
+        # Region: skip silent-ingestion acknowledgements
         #
-        # The silent-ingestion early-return path already indexed the pasted
-        # code and recorded its acknowledgement hash in pstate. Re-indexing is
-        # a no-op, but caching the acknowledgement would let a later identical
-        # paste replay it instead of re-ingesting.
+        # The reply to a silent-ingestion turn is a one-line acknowledgement,
+        # not code. Indexing it creates a junk zero-symbol block that mutates
+        # code_state_hash every turn (observed: code_state 622d→5841→659f with
+        # no new code, n_active_blocks climbing 1→2→4, PPR cache at 1% hits,
+        # path views invalidated, and a spurious Block A freeze on turn 2), so
+        # it is skipped entirely — LTM and response cache included.
+        #
+        # The explicit pending flag set by the silent branch is authoritative:
+        # the model generates its own wording for the ack, so response_hash
+        # never matches the synthetic ack hash recorded at ingestion time, and
+        # the hash guard below alone let the ack through. The processed-hash is
+        # still recorded so a same-turn reentry hits the idempotency guard
+        # rather than reprocessing the ack.
         # ------------------------------------------------------------------
+        if pstate.get("_silent_ack_pending"):
+            pstate["_silent_ack_pending"] = False
+            pstate["_last_processed_assistant_hash"] = response_hash
+            self._f._log_debug(
+                "prev-assistant: silent-ingestion ack — skipping indexing/LTM"
+            )
+            return
+
         if response_hash == pstate.get("_last_silent_ack_hash"):
             self._f._log_debug(
                 "prev-assistant: skipping synthetic silent-ingestion ack"
@@ -27096,7 +27218,7 @@ class InletOrchestrator:
                     )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 8. File handling
+    # 9. File handling
     # ═══════════════════════════════════════════════════════════════════════════
     _EXT_TO_LANG = {
         "py": "python",
@@ -27371,9 +27493,7 @@ class InletOrchestrator:
             known = ingested.get(raw_md5)
             if known and index_populated:
                 merged_text.append(
-                    f"**{name}:** _(unchanged — already indexed as "
-                    f"{known.get('symbols', '?')} symbols in the SymbolGraph; "
-                    f"use `/expand <name>` to see any implementation)_"
+                    self._indexed_reference_line(name, known.get("symbols", "?"))
                 )
                 self._f._log_debug(
                     f"merge_pasted_files: '{name}' unchanged "
@@ -30610,7 +30730,7 @@ class ContextDumper:
             turn_override: Explicit turn number for paths whose message list no
                 longer encodes the turn (handled turns pass the count derived
                 from the original, pre-handling list). None means derive from
-                len(messages).
+                the user-message count.
 
         Returns:
             dict: A complete payload dictionary with all context data and metrics.
@@ -30676,7 +30796,17 @@ class ContextDumper:
         hub_tier_text = pstate.get("hub_tier_text", "") or ""
 
         # ── Turn number for the dump label ───────────────────────────────────
-        turn = turn_override if turn_override is not None else (len(messages) + 1) // 2
+        # Counts user turns, matching dump_handled_turn. The old pair-based
+        # formula (len(messages) + 1) // 2 over-counted whenever builtin tools
+        # injected assistant/tool pairs into the history (they arrive with a
+        # user role in this OpenWebUI), which is why a turn-3 dump was labelled
+        # 5. Disabling Builtin Tools in the model Capabilities restores strict
+        # user/assistant alternation; this count is correct either way.
+        turn = (
+            turn_override
+            if turn_override is not None
+            else max(1, sum(1 for m in messages if m.get("role") == "user"))
+        )
 
         # ── Persistent state metrics ─────────────────────────────────────────
         try:
@@ -30689,17 +30819,6 @@ class ContextDumper:
             n_symbols = len(self._f._symbol_index.get_all_names(project_id))
         except Exception:
             n_symbols = 0
-
-        try:
-            all_names = self._f._symbol_index.get_all_names(project_id)
-            n_with_parent = sum(
-                1
-                for n in all_names
-                if self._f._symbol_index.get_parent_symbol(n, project_id)
-            )
-            n_classes = len(self._f._symbol_index.get_classes(project_id))
-        except Exception:
-            n_with_parent, n_classes = 0, 0
 
         # ── WindowManager metrics (persistent in ConversationState) ──────────
         try:
@@ -31836,6 +31955,7 @@ class ProjectStateManager:
             "last_lod_levels": {},
             "last_activation_scores": {},
             "block_b_qids_this_turn": [],
+            "lod3_sticky": {},
             # -- Token accounting -----------------------------------------
             "last_system_tokens": 0,
             "last_total_context_tokens": 0,
@@ -34503,6 +34623,26 @@ class Filter:
             description="Use CrossEncoder + LLM cascade to filter blocks for LOD‑3 based on semantic relevance.",
         )
 
+        lod3_sticky_turns: int = Field(
+            default=2,
+            ge=0,
+            description=(
+                "Keep LOD3 bodies rendered for this many extra turns after their "
+                "activation drops (0 = current single-turn behaviour). Enables "
+                "multi-turn reasoning over the same symbol without re-activation "
+                "and stabilizes the Block B prefix for KV-cache reuse."
+            ),
+        )
+        lod3_sticky_max_symbols: int = Field(
+            default=4,
+            ge=1,
+            description=(
+                "Cap on simultaneously sticky LOD3 bodies. When exceeded, the "
+                "entry with the lowest remaining TTL (then lowest score) is "
+                "evicted, bounding Block B growth."
+            ),
+        )
+
         # ── 6.3 LOD by use case ───────────────────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
@@ -36943,6 +37083,20 @@ class Filter:
                             messages
                         )
 
+                        # -- record the ack hash so next turn's prologue skips
+                        #    it: the code is already indexed, and caching the ack
+                        #    would let an identical future paste replay it -------
+                        pstate_local["_last_silent_ack_hash"] = hashlib.md5(
+                            response.encode()
+                        ).hexdigest()[:12]
+
+                        # The model generates its own wording for the ack, so the
+                        # hash guard above cannot recognise it next turn. This
+                        # explicit pending flag is the authoritative signal: the
+                        # very next prev-assistant pass skips indexing/LTM for the
+                        # ack regardless of its text.
+                        pstate_local["_silent_ack_pending"] = True
+
                         # -- optional context dump --------------------------------
                         if self.valves.enable_context_dump:
                             try:
@@ -37116,7 +37270,6 @@ class Filter:
             project_id = self._inlet_orch.get_project_id()
             psm = self._project_state_manager
             pstate = psm.get_pstate(project_id)
-            messages = body.get("messages", [])
 
             # ------------------------------------------------------------------
             # 🔥 STATE MANAGEMENT
@@ -37127,15 +37280,17 @@ class Filter:
             #   internally. It runs unconditionally every turn.
             # ------------------------------------------------------------------
             if self.valves.enable_slot_persistence:
-                try:
-                    _est = self._tokens.estimate_tokens(messages)
-                    if _est > 0:
-                        psm.set_last_total_context_tokens(project_id, _est)
-                    # An empty outlet body (this OpenWebUI delivers one) must
-                    # not zero the metric: the authoritative value was already
-                    # written at the end of the inlet, on the final messages.
-                except Exception as _tok_err:
-                    self._log_debug(f"outlet: token estimation failed: {_tok_err}")
+                # last_total_context_tokens is written authoritatively at the end
+                # of the inlet, on the final message list. The outlet body in
+                # this OpenWebUI arrives nearly empty (~the last message, 23-43
+                # tokens observed), NOT fully empty, so the previous `_est > 0`
+                # gate never worked as an empty-body guard: it wrote the ~23-token
+                # count over the real ~51k metric every turn, which permanently
+                # muted the size-aware KV re-save and pinned every restore to the
+                # first snapshot ("same hash, context 23 tokens within 1.5× of
+                # saved snapshot"). The metric is therefore not written from the
+                # outlet at all.
+                pass
                 # The KV save itself is deferred to after wait_for_llm_tasks()
                 # (see the sequential-save block below). It is a critical,
                 # non-deferrable step — it captures the clean main-chat KV before
