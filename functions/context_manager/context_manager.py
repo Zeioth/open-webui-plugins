@@ -6059,6 +6059,12 @@ class ContextBuilder:
         5. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
         6. Middle zone: use intent_vector fallback (original heuristic).
 
+        The explicit-detection regexes run over a code-stripped view of the
+        query: a pasted file contains words like 'skeleton'/'stub'/'scaffold'
+        in its own source, so searching the raw paste always misfires into
+        Scaffolding and degrades the LOD profile to signatures-only for a
+        question that actually needs bodies.
+
         Restores KV slot after any LLM call.
 
         Returns:
@@ -6067,6 +6073,8 @@ class ContextBuilder:
         q = query or ""
 
         # ── Fast path: explicit command prefix ──
+        # Evaluated on the RAW query: a leading /arch etc. must keep working
+        # regardless of what is pasted after it.
         if self._f.valves.lod_intent_explicit_override:
             m = self._UC_COMMAND_RE.match(q)
             if m:
@@ -6083,6 +6091,18 @@ class ContextBuilder:
                     f"via explicit command '/{m.group(1)}'"
                 )
                 return case, dict(self.LOD_PROFILES[case]), case_key.label
+
+        # ── Diet for the explicit-detection regexes ──
+        # Same gate as every other semantic consumer of the query: past the
+        # size valve, the paste itself is what the regexes would match against.
+        if len(q) > self._f.valves.seed_extraction_strip_min_chars:
+            _stripped_q = self._f._commands._extract_text_for_classification(q)
+            if _stripped_q and len(_stripped_q.strip()) >= 10:
+                self._f._log_debug(
+                    f"classify_use_case: stripped code from mega-query "
+                    f"({len(q)} chars → {len(_stripped_q)}) before regex detection"
+                )
+                q = _stripped_q
 
         # ── Regex-based explicit detection ──
         if self._UC_SCAFFOLD_RE.search(q):
@@ -18338,7 +18358,11 @@ Output only the symbol name.
         Returns (exact_seeds, partial_seeds, tb_seeds, history_boosts), each
         sanitised to its expected shape. Code is stripped from mega-queries
         before extraction (Step 0) so a pasted file cannot turn the whole
-        codebase into exact-match seeds and erase activation focus.
+        codebase into exact-match seeds and erase activation focus. Top-level
+        structural lines that survive the generic strip (unindented
+        'class X:' / 'def y(...)' headers between unbalanced fences) are
+        blanked as well — observed seeding 12 parasite classes alongside the
+        one symbol the user actually asked about.
         """
         # ── Step 0: Strip code from mega-queries before seeding ───────────────
         # A pasted file flowing in as the query makes all_names ∩ query_words
@@ -18346,9 +18370,16 @@ Output only the symbol name.
         # every node equally and erases activation focus. classify_intent
         # already solves this with _extract_text_for_classification; reuse it,
         # gated by size so pasted tracebacks in normal-sized queries still
-        # reach _extract_traceback_seeds intact.
+        # reach _extract_traceback_seeds intact. The structural-line pass then
+        # drops unindented declarations the fence/indent strip cannot see.
         if len(query) > self._f.valves.seed_extraction_strip_min_chars:
             stripped_query = self._f._commands._extract_text_for_classification(query)
+            if stripped_query:
+                stripped_query = "\n".join(
+                    l
+                    for l in stripped_query.splitlines()
+                    if not self._f._commands._STRUCTURAL_LINE_START.match(l)
+                )
             if stripped_query and len(stripped_query.strip()) >= 10:
                 self._f._log_debug(
                     f"_prepare_seed_symbols: stripped code from mega-query "
@@ -32183,7 +32214,7 @@ class ProjectStateManager:
     def _find_most_recent_slot_hash(self, project_id: str) -> Optional[str]:
         """
         Scan the slot directory and return the structural hash embedded in the
-        most recently modified slot file for this project.
+        most recently modified slot file for this project AND the current model.
 
         Used as a fallback by ``slot_restore`` when neither
         ``structure_hash_for_cache`` nor ``block_a_cached`` are available in
@@ -32193,10 +32224,12 @@ class ProjectStateManager:
         The slot filename format is:
             slot{slot_id}_{project_slug}_{static_hash16}_{model_hash8}.bin
 
-        The structural hash is always 16 lowercase hex characters, followed by
-        ``_`` and then 8 hex characters for the model hash, then ``.bin``.
-        A regex extracts it unambiguously regardless of underscores in the
-        project slug.
+        The scan is restricted to files whose model-hash suffix matches the
+        model currently configured: a KV snapshot is only loadable by the model
+        that produced it, so picking the newest file regardless of model made a
+        model switch restore a foreign .bin, fail with HTTP 400, and delete a
+        perfectly valid snapshot under a misleading "corrupt file" diagnosis.
+        Foreign-model files are left untouched for when that model returns.
 
         Args:
             project_id: The project identifier used to build the filename prefix.
@@ -32211,12 +32244,16 @@ class ProjectStateManager:
 
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
         prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
+        model_hash = hashlib.md5(
+            get_model_name(self._f.valves.llm_model).encode()
+        ).hexdigest()[:8]
+        suffix = f"_{model_hash}.bin"
 
-        # ── Collect all matching slot files with their mtime ──────────────────────
+        # ── Collect matching slot files (this project, this model) ────────────
         candidates: List[Tuple[float, str]] = []
         try:
             for fname in os.listdir(slot_dir):
-                if fname.startswith(prefix) and fname.endswith(".bin"):
+                if fname.startswith(prefix) and fname.endswith(suffix):
                     fpath = os.path.join(slot_dir, fname)
                     try:
                         candidates.append((os.path.getmtime(fpath), fname))
@@ -32229,11 +32266,11 @@ class ProjectStateManager:
         if not candidates:
             return None
 
-        # ── Pick the most recently modified file ──────────────────────────────────
+        # ── Pick the most recently modified file ──────────────────────────────
         candidates.sort(reverse=True)
         most_recent_fname = candidates[0][1]
 
-        # ── Extract structural hash via regex (16 hex chars before _8hex.bin) ─────
+        # ── Extract structural hash via regex (16 hex chars before _8hex.bin) ─
         match = re.search(r"([0-9a-f]{16})_[0-9a-f]{8}\.bin$", most_recent_fname)
         if not match:
             self._f._log_debug(
@@ -32577,7 +32614,14 @@ class ProjectStateManager:
 
     async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
         """
-        Delete stale slot files, keeping only the current one.
+        Delete stale slot files for the CURRENT model, keeping only the file
+        just saved.
+
+        Cleanup is scoped by the model-hash suffix: slot snapshots from other
+        models are loadable only by those models and would otherwise be purged
+        on every save here, forcing a cold prefill each time the user switches
+        back. One file per (project, model) is retained; a foreign model's
+        files are its own cleanup's responsibility.
 
         Args:
             project_id: The project identifier.
@@ -32588,9 +32632,17 @@ class ProjectStateManager:
             return
         project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
         prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
+        model_hash = hashlib.md5(
+            get_model_name(self._f.valves.llm_model).encode()
+        ).hexdigest()[:8]
+        suffix = f"_{model_hash}.bin"
         try:
             for fname in os.listdir(slot_dir):
-                if fname.startswith(prefix) and fname != keep:
+                if (
+                    fname.startswith(prefix)
+                    and fname.endswith(suffix)
+                    and fname != keep
+                ):
                     os.remove(os.path.join(slot_dir, fname))
                     self._f._log_debug(f"Removed obsolete slot file: {fname}")
         except Exception as e:
