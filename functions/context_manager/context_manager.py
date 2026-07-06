@@ -30836,6 +30836,24 @@ class ContextDumper:
         except Exception:
             n_symbols = 0
 
+        # ── Class membership metrics ────────────────────────────────────────
+        # n_with_parent and n_classes back the "n_symbols_with_parent" and
+        # "n_classes" fields of the return dict, rendered as the "symbols with
+        # class resolved" and "classes detected" lines of the dump. Both must be
+        # bound before the dict is built: otherwise schedule_inlet_snapshot
+        # raises NameError while assembling the payload and the turn's dump is
+        # silently skipped.
+        try:
+            all_names = self._f._symbol_index.get_all_names(project_id)
+            n_with_parent = sum(
+                1
+                for n in all_names
+                if self._f._symbol_index.get_parent_symbol(n, project_id)
+            )
+            n_classes = len(self._f._symbol_index.get_classes(project_id))
+        except Exception:
+            n_with_parent, n_classes = 0, 0
+
         # ── WindowManager metrics (persistent in ConversationState) ──────────
         try:
             state = self._f._conversation_state_manager.get(project_id)
