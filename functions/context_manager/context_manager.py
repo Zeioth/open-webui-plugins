@@ -5472,16 +5472,26 @@ class ContextBuilder:
         Build the Hub-Bodies Tier: full bodies of top-N hubs by centrality,
         ordered by stability (last_modified_turn), truncated by budget.
 
+        Each empty-tier exit logs its exact cause (disabled / no centrality /
+        no resolvable bodies): the ingestion-turn dump showed an empty tier
+        while later turns showed a populated one, and the three causes are
+        indistinguishable without a trace.
+
         Returns:
             Tuple of (tier_text, tier_hash, kept_qids).
             tier_text is empty when the tier is disabled or no hubs qualify.
         """
         if not self._f.valves.enable_hub_bodies_tier:
+            self._f._log_debug("Hub tier: empty — disabled by valve")
             return "", "", []
 
         psm = self._f._project_state_manager
         centrality = psm.get_node_centrality(project_id)
         if not centrality:
+            self._f._log_debug(
+                "Hub tier: empty — no centrality available at build time "
+                "(precompute pending or cleared)"
+            )
             return "", "", []
 
         state = self._f._conversation_state_manager.get(project_id)
@@ -5522,6 +5532,10 @@ class ContextBuilder:
             resolved[qid] = (body, bh, lang)
 
         if not resolved:
+            self._f._log_debug(
+                f"Hub tier: empty — {len(candidates)} candidate(s) by centrality "
+                f"but none resolved a usable body"
+            )
             return "", "", []
 
         # ── Compute per-hub query heat (exponential moving average) ──────────────
@@ -6343,6 +6357,12 @@ class ContextBuilder:
         this turn. It no longer bumps the graph mode (the mode is absolute now),
         because multi-phase is response planning, orthogonal to context depth.
 
+        The global-scope check runs on a code-stripped view of the query: a
+        pasted file carries 'architecture'/'whole project'-style wording in its
+        own strings and docstrings, so scanning the raw paste forced the
+        multi-phase protocol on every paste-bearing turn regardless of what the
+        user actually asked.
+
         Args:
             project_id: Current project identifier.
             query: The user query string (used only for global-scope detection).
@@ -6358,10 +6378,19 @@ class ContextBuilder:
         # ── Global scope still forces multi-phase this turn ──
         # Independent of the (now fixed) call-graph mode: a whole-project
         # question benefits from multi-phase response planning regardless of
-        # how the map is rendered.
+        # how the map is rendered. Detection runs on the user's words, not on
+        # the paste.
+        _scope_query = query or ""
+        if len(_scope_query) > self._f.valves.seed_extraction_strip_min_chars:
+            _stripped_scope = self._f._commands._extract_text_for_classification(
+                _scope_query
+            )
+            if _stripped_scope and len(_stripped_scope.strip()) >= 10:
+                _scope_query = _stripped_scope
+
         if hasattr(
             self._f, "_seed_inferencer"
-        ) and self._f._seed_inferencer.is_global_scope(query):
+        ) and self._f._seed_inferencer.is_global_scope(_scope_query):
             psm.set_force_multi_phase_this_turn(project_id, True)
             self._f._log_debug(
                 "prepare_call_graph_mode: global scope detected -> multi-phase "
@@ -13758,7 +13787,24 @@ class MultiPhasePlanner:
         cot_degraded_to_l1: bool = False,
         is_continuation: bool = False,
     ) -> str:
-        """Build the multi‑phase protocol instructions injected into the system prompt."""
+        """Build the multi‑phase protocol instructions injected into the system prompt.
+
+        The code-task detection scans a code-stripped view of the query: a
+        pasted file contains 'class'/'code'/'function' in its own source, so
+        scanning the raw paste always selected the code-generation protocol
+        even for a one-line question. Both non-continuation headers are
+        CONDITIONAL: the protocol explicitly tells the model to ignore it when
+        the full answer fits in a single part, so the unconditional injection
+        can never inflate short answers or train the model to ignore critical
+        instructions.
+        """
+        # ── Diet: keyword scan runs on the user's words, not the paste ────────
+        _scan_query = user_query or ""
+        if len(_scan_query) > self._f.valves.seed_extraction_strip_min_chars:
+            _stripped = self._f._commands._extract_text_for_classification(_scan_query)
+            if _stripped and len(_stripped.strip()) >= 10:
+                _scan_query = _stripped
+
         _CODE_SIGNALS = {
             "refactor",
             "refactoriza",
@@ -13783,7 +13829,7 @@ class MultiPhasePlanner:
             "reescribe",
             "rewrite",
         }
-        is_code_task = any(sig in user_query.lower() for sig in _CODE_SIGNALS)
+        is_code_task = any(sig in _scan_query.lower() for sig in _CODE_SIGNALS)
 
         part_budget = min(
             self._f.valves.multi_phase_effective_max_tokens,
@@ -13820,8 +13866,12 @@ class MultiPhasePlanner:
         if is_code_task:
             header = (
                 f"## 📋 PROTOCOLO MULTI-FASE — {part_budget} tokens por parte\n\n"
-                "Tu tarea genera más código del que cabe en un mensaje. "
-                "Sigue **exactamente** este protocolo:"
+                f"**Aplica este protocolo SOLO si tu respuesta completa va a "
+                f"superar ~{part_budget} tokens** (generación de ficheros, "
+                "refactors grandes, múltiples clases). Si la respuesta cabe en "
+                "un solo mensaje, responde con normalidad e ignora el resto de "
+                "esta sección.\n\n"
+                "Cuando SÍ aplique, sigue exactamente estas fases:"
             )
             phases = textwrap.dedent(f"""
                     **FASE 1 — Análisis{fase1_suffix}** (~300-400 tokens)
@@ -13859,8 +13909,9 @@ class MultiPhasePlanner:
             )
             header = (
                 f"## 📋 RESPUESTA LARGA — {available_tokens} tokens disponibles\n\n"
-                "Tu respuesta probablemente excede el espacio en un mensaje. "
-                "Divídela en partes lógicas:"
+                "**Solo si tu respuesta no cabe en un mensaje**, divídela en "
+                "partes lógicas; si cabe, responde con normalidad e ignora "
+                "esta sección:"
             )
             phases = textwrap.dedent(f"""
                     **Parte 1 — Resumen y plan** (~300 tokens)
@@ -17955,10 +18006,25 @@ class ActivationEngine:
         """
         Extract seed symbols from the query using exact match, CrossEncoder, and LLM.
 
+        Fast path: when the query IS a known symbol — the whole stripped query
+        matches a qualified id or bare name exactly — return it directly. Every
+        rebuild_path_index pass calls this once per entry point with queries
+        like 'TaskRegistry._lazy_purge'; the generic path burned one
+        CrossEncoder call per entry point (~79 per rebuild) to "disambiguate"
+        a literal that needs no semantics.
+
         Returns:
             A tuple of (exact_matches, partial_matches).
             Both lists are guaranteed to contain only strings.
         """
+        # ---- Region: Literal fast path (query == known symbol) ----
+        _literal = (query or "").strip()
+        if _literal:
+            if _literal in self._f._symbol_index.get_all_qualified_names(project_id):
+                return [_literal], []
+            if _literal in self._f._symbol_index.get_all_names(project_id):
+                return [_literal], []
+
         # ---- Region: Initial setup ----
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
@@ -20185,9 +20251,16 @@ class MetacognitiveReasoningEngine:
         """
         Synchronous SymbolGraph pre-scan.
 
-        Runs gather_evidence() on the raw user message — treating it as
-        if it were a hypothesis — to measure how many known codebase symbols
-        it mentions and whether any call-relation patterns are detectable.
+        Runs gather_evidence() on the user message — treating it as if it
+        were a hypothesis — to measure how many known codebase symbols it
+        mentions and whether any call-relation patterns are detectable.
+
+        Code is stripped from mega-messages first (same gate as every other
+        semantic consumer of the query): scanning a pasted file finds every
+        symbol in the codebase (observed: n_found=648, traceback=True) and
+        pushes the CoT heuristics toward scientific mode for trivial
+        questions. The signal must reflect what the USER wrote, not what
+        they pasted.
 
         This is a reinforcement signal, not a trigger. High count means
         the user is asking about specific indexed code. Low count means
@@ -20216,6 +20289,16 @@ class MetacognitiveReasoningEngine:
 
         if not user_content or not project_id:
             return _empty
+
+        # ── Diet: strip pasted code from mega-messages before scanning ──
+        if len(user_content) > self._f.valves.seed_extraction_strip_min_chars:
+            _stripped = self._f._commands._extract_text_for_classification(user_content)
+            if _stripped and len(_stripped.strip()) >= 10:
+                self._f._log_debug(
+                    f"_compute_signal_vector: stripped code from mega-message "
+                    f"({len(user_content)} chars → {len(_stripped)})"
+                )
+                user_content = _stripped
 
         try:
             evidence = self.gather_evidence(user_content, project_id)
@@ -29329,6 +29412,15 @@ class MessageAssembler:
 
         # ------------------------------------------------------------------
         # Region: multi-phase pre-check — degrade CoT if budget is tight
+        #
+        # The history estimate must be LEAN-AWARE: this pre-check runs before
+        # _compress_code_history_and_lean, so a pasted file still sits raw in
+        # the history here (~hundreds of k tokens) while the multi-phase
+        # injection later sees the stubbed view (~a few k). Measuring the raw
+        # history made the two ends of the same formula disagree (0 here vs
+        # 309k at injection time) and silently degraded every L2/L3 CoT to L1.
+        # Oversized user messages are therefore counted at their stub size —
+        # the same view the injection will see.
         # ------------------------------------------------------------------
         _mp_cot_degraded = False
         _available_mp_pre = self._f.valves.context_window_tokens
@@ -29338,9 +29430,20 @@ class MessageAssembler:
             and prelim_system
         ):
             _prelim_tok = len(self._f.tokenizer.encode(prelim_system))
-            _hist_tok = self._f._tokens.estimate_tokens(
-                [m for m in messages if m.get("role") != "system"]
+            _lean_on = self._f.valves.enable_lean_user_code
+            _lean_min = self._f.valves.lean_user_code_min_tokens
+            _stub_tok = self._f._tokens.estimate_code_tokens(
+                self._f._history_compressor._build_user_stub(0)
             )
+            _hist_tok = 0
+            for _m in messages:
+                if _m.get("role") == "system":
+                    continue
+                _mc = _m.get("content", "") or ""
+                _mt = self._f._tokens.estimate_code_tokens(_mc)
+                if _lean_on and _m.get("role") == "user" and _mt >= _lean_min:
+                    _mt = _stub_tok
+                _hist_tok += _mt
             _available_mp_pre = max(
                 0,
                 self._f.valves.context_window_tokens - _prelim_tok - _hist_tok,
@@ -29354,14 +29457,13 @@ class MessageAssembler:
         ):
             self._f._log_debug(
                 f"🧠 Multi-phase pre-check: {_available_mp_pre} tokens "
-                f"< threshold {self._f.valves.multi_phase_response_threshold}. "
+                f"< threshold {self._f.valves.multi_phase_response_threshold} "
+                f"(prelim≈{_prelim_tok}, hist≈{_hist_tok} lean-aware). "
                 f"Degrading CoT L{cot_level}→1."
             )
             cot_level = 1
             _use_scientific = False
             _mp_cot_degraded = True
-
-        self._last_cot_degraded = _mp_cot_degraded
 
         # ------------------------------------------------------------------
         # Region: Level 1 terminal path — inline prompt, no chain generated
@@ -29902,7 +30004,7 @@ class MessageAssembler:
         self._f._conversation_state_manager.set(project_id, state)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 5. Multi‑phase instructions injection (MIGRADO)
+    # 5. Multi‑phase instructions injection
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _inject_multi_phase_instructions(
@@ -29976,9 +30078,7 @@ class MessageAssembler:
             or force_global_scope
         )
         if force_global_scope and not budget_tight:
-            self._f._log_debug(
-                "Multi‑phase: activated by global‑scope query (full_graph active this turn)."
-            )
+            self._f._log_debug("Multi‑phase: activated by global‑scope query.")
 
         if use_multi_phase:
             _INSTRUCTION_OVERHEAD = 450
@@ -30016,6 +30116,13 @@ class MessageAssembler:
     ) -> List[dict]:
         """
         Assemble final system prompt, inject it, and log token breakdown.
+
+        Also records the turn's context metrics in pstate. Both metrics are
+        written unconditionally (not gated on the debug valve): they feed
+        other subsystems — last_total_context_tokens drives the slot_save
+        growth guard, last_system_tokens the budget heuristics — and were
+        previously starved to 0 when written from the empty outlet body or
+        skipped with debug off, which silently disabled the KV re-save.
         """
         budget = self._f.valves.global_injection_token_budget
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -30096,6 +30203,11 @@ class MessageAssembler:
             else:
                 messages.append({"role": "user", "content": "continue"})
 
+        # ── Persist system-token metric (always, independent of debug) ──
+        if self._f.tokenizer and final_system.strip():
+            total_system_tok = len(self._f.tokenizer.encode(final_system))
+            psm.set_last_system_tokens(project_id, total_system_tok)
+
         # ── Token breakdown log ─────────────────────────────────────────
         if self._f.valves.debug and self._f.tokenizer and final_system.strip():
             static_tok = (
@@ -30113,10 +30225,6 @@ class MessageAssembler:
                 if getattr(self._f, "_original_system_prompt", "")
                 else 0
             )
-            total_system_tok = len(self._f.tokenizer.encode(final_system))
-
-            # ── MIGRADO: usar set_last_system_tokens en lugar de pstate ──
-            psm.set_last_system_tokens(project_id, total_system_tok)
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             self._f._log_debug("─" * 60)
@@ -30160,6 +30268,21 @@ class MessageAssembler:
                     f"{_leaned_msgs} user msg(s) leaned"
                 )
             self._f._log_debug("─" * 60)
+
+        # ── Persist total-context metric for the slot_save growth guard ──
+        # Measured here, on the FINAL message list of the turn (system + leaned
+        # history + user), because the outlet body arrives empty in this
+        # OpenWebUI and overwrote the metric with 0 every turn — permanently
+        # muting the size-aware re-save.
+        try:
+            psm.set_last_total_context_tokens(
+                project_id, self._f._tokens.estimate_tokens(messages)
+            )
+        except Exception as _tok_err:
+            self._f._log_debug(
+                f"_assemble_final_system_and_log: total-token metric failed: "
+                f"{_tok_err}"
+            )
 
         # ── Context dump (evolution tracking) ─────────────────────────
         if self._f.valves.enable_context_dump:
@@ -32131,6 +32254,11 @@ class ProjectStateManager:
                 _saved_tok > 0
                 and _ctx_tok <= _saved_tok * self._f.valves.slot_resave_min_growth
             ):
+                self._f._log_debug(
+                    f"Slot save skipped: same hash, context {_ctx_tok} tokens "
+                    f"within {self._f.valves.slot_resave_min_growth}× of saved "
+                    f"snapshot ({_saved_tok} tokens)"
+                )
                 return False
             if _saved_tok > 0:
                 self._f._log_debug(
@@ -36735,6 +36863,18 @@ class Filter:
                                 f"{_scaffold_err}"
                             )
 
+                        # A silent-ingestion turn never reaches
+                        # _assemble_final_system_and_log, so last_system_tokens
+                        # would otherwise stay at its previous value (0 on a cold
+                        # start) and the next turn's WindowManager would budget
+                        # against a phantom system. The effective system of this
+                        # turn IS the freshly built Block A scaffold.
+                        if self.tokenizer and static_block:
+                            psm.set_last_system_tokens(
+                                project_id,
+                                len(self.tokenizer.encode(static_block)),
+                            )
+
                         # -- optional hub-bodies tier warmup ----------------------
                         if (
                             self.valves.enable_hub_bodies_tier
@@ -36981,9 +37121,12 @@ class Filter:
             # ------------------------------------------------------------------
             if self.valves.enable_slot_persistence:
                 try:
-                    psm.set_last_total_context_tokens(
-                        project_id, self._tokens.estimate_tokens(messages)
-                    )
+                    _est = self._tokens.estimate_tokens(messages)
+                    if _est > 0:
+                        psm.set_last_total_context_tokens(project_id, _est)
+                    # An empty outlet body (this OpenWebUI delivers one) must
+                    # not zero the metric: the authoritative value was already
+                    # written at the end of the inlet, on the final messages.
                 except Exception as _tok_err:
                     self._log_debug(f"outlet: token estimation failed: {_tok_err}")
                 # The KV save itself is deferred to after wait_for_llm_tasks()
