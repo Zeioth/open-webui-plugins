@@ -6125,6 +6125,21 @@ class ContextBuilder:
                 )
                 q = _stripped_q
 
+        # ── Mask indexed symbol names before intent detection ──
+        # The symbol name is the topic of the question, not its intent; verbs
+        # embedded in identifiers (build_*, create_*) skew both the regexes and
+        # the CrossEncoder toward Scaffolding, whose LOD profile then empties
+        # Block B (observed: "purpose of build_block_b" → E, diff=2.88, zero
+        # bodies, model confabulating). n_syms_masked doubles as a deterministic
+        # signal for the reinforcement below: >= 1 means the query is about a
+        # concrete indexed symbol, i.e. pointwise code comprehension.
+        q, _n_syms_masked = self._f._commands._neutralize_symbol_names(q, project_id)
+        if _n_syms_masked:
+            self._f._log_debug(
+                f"classify_use_case: masked {_n_syms_masked} indexed symbol "
+                f"name(s) before intent detection"
+            )
+
         # ── Regex-based explicit detection ──
         if self._UC_SCAFFOLD_RE.search(q):
             case = UseCase.SCAFFOLDING
@@ -6176,13 +6191,28 @@ class ContextBuilder:
 
             if scores is not None and len(scores) >= 5:
                 # ── Heuristic reinforcement ──
+                # explain-intent is routed by whether the query names a concrete
+                # indexed symbol: "explain the architecture" is Architecture,
+                # but "explain <symbol>" is pointwise comprehension of that
+                # symbol's body — Programming. Reinforcing A for the latter
+                # would re-suppress LOD-3 (A's lod3_mult of 2.5 puts the
+                # effective threshold at 1.25, above the normalized score
+                # ceiling of 1.0), recreating the empty-Block-B failure through
+                # a different profile.
                 scores_reinforced = list(scores)
                 h_weight = self._f.valves.heuristic_reinforcement_weight
                 if intent_vector.get("debug", 0) > 0.3:
                     scores_reinforced[3] += h_weight * 0.2  # refactor
                 if intent_vector.get("explain", 0) > 0.4:
-                    scores_reinforced[0] += h_weight * 0.2  # architecture
+                    if _n_syms_masked:
+                        scores_reinforced[2] += h_weight * 0.2  # programming
+                    else:
+                        scores_reinforced[0] += h_weight * 0.2  # architecture
                 if intent_vector.get("modify", 0) > 0.4:
+                    scores_reinforced[2] += h_weight * 0.1  # programming
+                if _n_syms_masked:
+                    # A named indexed symbol is a strong prior for pointwise
+                    # work on that symbol regardless of the intent vector.
                     scores_reinforced[2] += h_weight * 0.1  # programming
 
                 max_score = max(scores_reinforced)
@@ -6212,7 +6242,10 @@ class ContextBuilder:
                         "using LLM"
                     )
                     return await self._classify_use_case_with_llm(
-                        q, scores_reinforced, project_id
+                        q,
+                        scores_reinforced,
+                        project_id,
+                        n_syms_masked=_n_syms_masked,
                     )
                 # else: middle zone → fall through to heuristic
 
@@ -6231,6 +6264,18 @@ class ContextBuilder:
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         if explain_w >= 0.5 and explain_w > modify_w:
+            # Same routing as the CE reinforcement above: high explain intent
+            # plus a named indexed symbol is pointwise comprehension (C), not
+            # system architecture (A) — and A's profile would suppress the very
+            # body the question is about.
+            if _n_syms_masked:
+                case = UseCase.PROGRAMMING
+                self._f._log_debug(
+                    f"classify_use_case: fallback to '{case.label}' via "
+                    f"intent_vector (explain={explain_w:.2f}, "
+                    f"{_n_syms_masked} symbol(s) named)"
+                )
+                return case.value, dict(self.LOD_PROFILES[case.value]), case.label
             case = UseCase.ARCHITECTURE
             self._f._log_debug(
                 f"classify_use_case: fallback to '{case.label}' via intent_vector (explain={explain_w:.2f})"
@@ -6246,6 +6291,7 @@ class ContextBuilder:
         query: str,
         ce_scores: List[float],
         project_id: str,
+        n_syms_masked: int = 0,
     ) -> Tuple[str, dict, str]:
         """
         LLM fallback for use case classification when the CrossEncoder diff
@@ -6256,14 +6302,37 @@ class ContextBuilder:
         (Programming) — the most common use case.
 
         Args:
-            query: The user's message (truncated to 500 chars).
+            query: The user's message (truncated to 500 chars). Arrives with
+                indexed symbol names already masked as 'this symbol' by
+                classify_use_case; the masked view plus the explicit note below
+                is more robust for a small arbiter model than the raw
+                identifier, whose embedded verb caused the original
+                misclassification.
             ce_scores: List of 5 CE scores [Architecture, Planning, Programming,
-                       Refactoring, Scaffolding].
+                       Refactoring, Scaffolding] (heuristically reinforced).
             project_id: Current project identifier, used for slot restoration.
+            n_syms_masked: How many indexed symbol names were masked in the
+                query. When >= 1, the prompt states what 'this symbol' means
+                and gives the pointwise-comprehension criterion (a question
+                about one concrete symbol is Programming, not Architecture),
+                closing the last route by which such questions reached the A
+                profile — whose lod3_mult of 2.5 suppresses every LOD-3 body.
 
         Returns:
             Tuple[str, dict, str]: (use_case_key, lod_profile, human_label)
         """
+        # ── Step 1: build the CE context block and the symbol note ──
+        symbol_note = ""
+        if n_syms_masked:
+            symbol_note = (
+                f"Note: the question names {n_syms_masked} concrete symbol(s) "
+                f"from the indexed codebase; each one appears as 'this symbol' "
+                f"in the text above. A pointwise question about a concrete "
+                f"symbol's behaviour, purpose or usage is Programming, not "
+                f"Architecture. Architecture is reserved for system-level "
+                f"design questions that are not about one specific symbol.\n\n"
+            )
+
         ce_block = (
             f"CrossEncoder scores — "
             f"Architecture: {ce_scores[0]:.2f}, "
@@ -6273,9 +6342,11 @@ class ContextBuilder:
             f"Scaffolding: {ce_scores[4]:.2f}\n\n"
         )
 
+        # ── Step 2: assemble the prompt ──
         prompt = (
             f"{ce_block}"
             f"User question:\n{query[:500]}\n\n"
+            f"{symbol_note}"
             f"Choose the most appropriate use case:\n"
             f"  Architecture — design, structure, high-level system decisions\n"
             f"  Planning     — roadmap, steps, implementation plan\n"
@@ -14358,6 +14429,67 @@ class CommandRouter:
     # 4. Text extraction & intent classification (cascade: Heuristic → CE → LLM)
     # ═══════════════════════════════════════════════════════════════════════
 
+    _SYMBOL_TOKEN_RE = re.compile(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    )
+
+    def _neutralize_symbol_names(self, query: str, project_id: str) -> Tuple[str, int]:
+        """Mask indexed symbol identifiers in a query with a neutral noun so
+        intent classifiers read intent from the prose, not from the symbol name.
+
+        An identifier whose name embeds a verb (build_block_b, create_view,
+        generate_stub) is read by the CrossEncoder as an intent signal rather
+        than the topic it actually is: "what is the purpose of build_block_b"
+        scored Scaffolding (CE diff 2.88) purely on the "build" inside the
+        identifier, and the E profile then suppressed every LOD-3 body. The
+        name is the topic; the intent lives in the surrounding words ("what is
+        the purpose of", "refactor", "add a stub for"), all of which survive.
+
+        Two-stage gate, deliberately conservative:
+          1. Morphology — the token must be unambiguously identifier-shaped:
+             contains "_" or "." or is CamelCase with an interior capital.
+             Plain words are never touched even when they resolve, because the
+             project indexes methods whose bare names collide with ordinary
+             prose (build, get, set, apply, process, seed, ...): masking those
+             would destroy the intent of normal sentences like "can you build
+             a plan to apply the fix".
+          2. Resolution — the token (or its final dotted segment) must resolve
+             against the SymbolGraph, so identifier-shaped tokens that are not
+             project symbols (config.timeout, ObserverPattern) pass through.
+
+        Returns the masked query and the number of masked symbols; callers use
+        the count as a deterministic "the query is about one concrete indexed
+        symbol" signal for their own reinforcement.
+        """
+        # ── Step 1: cheap outs — empty query or empty index ──
+        if not query:
+            return query, 0
+        all_names = self._f._symbol_index.get_all_names(project_id)
+        if not all_names:
+            return query, 0
+        all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
+
+        # ── Step 2: mask identifier-shaped tokens that resolve ──
+        n_masked = 0
+
+        def _identifier_shaped(tok: str) -> bool:
+            if "_" in tok or "." in tok:
+                return True
+            return tok[:1].isalpha() and any(c.isupper() for c in tok[1:])
+
+        def _mask(m: "re.Match") -> str:
+            nonlocal n_masked
+            tok = m.group(0)
+            if not _identifier_shaped(tok):
+                return tok
+            bare = tok.rsplit(".", 1)[-1]
+            if tok in all_qids or tok in all_names or bare in all_names:
+                n_masked += 1
+                return "this symbol"
+            return tok
+
+        return self._SYMBOL_TOKEN_RE.sub(_mask, query), n_masked
+
     def _extract_text_for_classification(self, message: str) -> str:
         """
         Extract only non-code portions of the user message for intent classification.
@@ -14402,6 +14534,27 @@ class CommandRouter:
             dict: Probabilities for explain, modify, debug, refactor.
         """
         classifier_input = self._extract_text_for_classification(user_query)
+
+        # ── Mask indexed symbol names before intent scoring ──
+        # Same contamination as classify_use_case: a verb embedded in an
+        # identifier ("build" in build_block_b) reads as intent to the
+        # CrossEncoder and skews the explain/modify balance for a question
+        # that is *about* that symbol. The resulting intent_vector feeds the
+        # use-case reinforcement, the CFG gate and activation_direction, so it
+        # is cleaned at the source. Masking is morphology-gated (see
+        # _neutralize_symbol_names), so intent keywords in plain prose are
+        # never affected. The keyword reinforcement below still reads the raw
+        # user_query — intent keywords live in prose and are never masked — and
+        # the LLM arbitration path receives the raw query too, so only the
+        # CrossEncoder sees the masked view.
+        classifier_input, _n_syms_masked = self._neutralize_symbol_names(
+            classifier_input, project_id
+        )
+        if _n_syms_masked:
+            self._f._log_debug(
+                f"classify_intent: masked {_n_syms_masked} indexed symbol "
+                f"name(s) before intent scoring"
+            )
 
         self._f._log_debug(
             f"classify_intent: input truncated from {len(user_query.split())} words "
@@ -14448,45 +14601,63 @@ class CommandRouter:
             content_lower = user_query.lower()
             h_weight = self._f.valves.heuristic_reinforcement_weight
 
-            if any(
-                kw in content_lower
-                for kw in (
-                    "fix",
-                    "bug",
-                    "error",
-                    "traceback",
-                    "depura",
-                    "excepción",
-                    "falla",
-                )
-            ):
+            # ── Keyword reinforcement over the RAW query ──
+            # Prose intent keywords never collide with masked symbol names
+            # (see the masking note above), so the raw query is the right
+            # surface here. Each intent's keyword tuple is defined once and
+            # the "no recognised signal → assume modify" check at the end is
+            # derived from all three, so a query carrying a recognised
+            # explain / debug / refactor signal can never also receive the
+            # +modify default by omission. Previously that check used an
+            # arbitrary 5-keyword subset: "qué hace X" was boosted as explain
+            # AND modify at once, "hay un error" as debug AND modify, and
+            # "cual es el proposito" (unaccented, absent from every list)
+            # received only the spurious +modify.
+            _debug_kws = (
+                "fix",
+                "bug",
+                "error",
+                "traceback",
+                "depura",
+                "excepción",
+                "falla",
+            )
+            _refactor_kws = (
+                "refactor",
+                "restructur",
+                "reorganiz",
+                "mueve",
+                "extrae",
+                "divide",
+            )
+            # Unaccented "que hace" / "por que" are deliberately excluded:
+            # both match ordinary non-interrogative prose ("el fix que hace
+            # falta"), unlike the specific phrases below.
+            _explain_kws = (
+                "explica",
+                "describe",
+                "cómo funciona",
+                "como funciona",
+                "qué hace",
+                "por qué",
+                "proposito",
+                "propósito",
+                "purpose",
+                "para qué sirve",
+                "para que sirve",
+                "what does",
+                "how does",
+            )
+
+            if any(kw in content_lower for kw in _debug_kws):
                 scores[2] += h_weight * 0.35
-            if any(
-                kw in content_lower
-                for kw in (
-                    "refactor",
-                    "restructur",
-                    "reorganiz",
-                    "mueve",
-                    "extrae",
-                    "divide",
-                )
-            ):
+            if any(kw in content_lower for kw in _refactor_kws):
                 scores[3] += h_weight * 0.35
-            if any(
-                kw in content_lower
-                for kw in (
-                    "explica",
-                    "describe",
-                    "cómo funciona",
-                    "qué hace",
-                    "por qué",
-                )
-            ):
+            if any(kw in content_lower for kw in _explain_kws):
                 scores[0] += h_weight * 0.25
             if not any(
                 kw in content_lower
-                for kw in ("fix", "bug", "refactor", "explica", "describe")
+                for kw in _debug_kws + _refactor_kws + _explain_kws
             ):
                 scores[1] += h_weight * 0.25
 
