@@ -35343,12 +35343,12 @@ class Filter:
             )
         )
         full_graph_max_tokens: int = Field(
-            default=20000,
+            default=50000,
             ge=1000,
             description="Token budget for full_graph mode.",
         )
         expanded_hubs_max_tokens: int = Field(
-            default=4000,
+            default=50000,
             ge=500,
             description="Token budget for expanded_hubs mode.",
         )
