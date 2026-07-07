@@ -7202,7 +7202,7 @@ class ContextBuilder:
             if len(lod3_sticky) > _sticky_cap:
                 _evict = sorted(
                     lod3_sticky,
-                    key=lambda q: (lod3_sticky[q], activated.get(q, 0.0)),
+                    key=lambda q: (lod3_sticky[q], activated.get(q, 0.0), q),
                 )
                 for q in _evict[: len(lod3_sticky) - _sticky_cap]:
                     del lod3_sticky[q]
