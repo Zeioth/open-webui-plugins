@@ -2585,20 +2585,38 @@ class HubSymbolIndex:
 
     def _build_full_graph_section(self, symbol_index, project_id, valves=None) -> str:
         """
-        Every qualified symbol in the project, alphabetically sorted, each with
-        its direct callers/callees (no centrality score — in full_graph every
-        symbol is shown regardless of rank, so a score column is misleading
-        noise).
+        Every qualified symbol in the project with its direct callers/callees,
+        grouped by class, in a compact edge notation.
 
-        Alphabetical order (not centrality order) is deliberate: centrality
-        ties at 0.0 for every leaf symbol, so centrality-based ordering is not
-        stable across rebuilds and would cause spurious Block A cache misses
-        from pure reordering. Alphabetical order is stable as long as the
-        symbol set is unchanged — exactly what Block A's code_state_hash key
-        already tracks.
+        Compared to the previous flat rendering (one fully-qualified bullet
+        per symbol with worded arrows), four lossless-for-the-project-graph
+        compressions apply, measured at −5,474 tokens (−27%) on a real dump:
 
-        Hard-truncates at full_graph_max_tokens with an explicit notice. Never
-        falls back to a different mode — truncation is the only degradation path.
+          1. Symbols are grouped under a ``### ClassName`` header, so the
+             class prefix is written once per class instead of once per
+             symbol. Alphabetical qid order already places a class's members
+             contiguously, so grouping does not reorder anything — the same
+             KV-stability argument as before holds (order changes only when
+             the symbol set changes).
+          2. Arrow lines drop the words: ``←`` is used-by, ``→`` is calls.
+             The legend lives once in the section header.
+          3. Edge targets inside the current class drop the class prefix.
+          4. ``→`` targets that do not resolve against the SymbolIndex
+             (builtins / stdlib: get, len, join, isinstance, ...) are
+             dropped. They are not nodes of the project graph, so no project
+             edge is lost — a target that DOES resolve (e.g. a project method
+             named ``get``) is kept, ambiguous exactly as before. ``←``
+             callers are project symbols by construction and are never
+             filtered.
+
+        Alphabetical order (not centrality order) remains deliberate:
+        centrality ties at 0.0 for every leaf symbol, so centrality-based
+        ordering is not stable across rebuilds and would cause spurious
+        Block A cache misses from pure reordering.
+
+        Hard-truncates at full_graph_max_tokens with an explicit notice.
+        Never falls back to a different mode — truncation is the only
+        degradation path.
         """
         all_qids = sorted(symbol_index.get_all_qualified_names(project_id))
         if not all_qids:
@@ -2614,10 +2632,9 @@ class HubSymbolIndex:
         # auto-mode symbol-count ceiling entirely. Cap the candidate list
         # itself (not just the rendered text) so an oversized manually-forced
         # project never allocates per-symbol caller/callee sets it will
-        # immediately discard via truncation. ~4 chars/token, ~80 chars/line
-        # average for a symbol-with-edges line ⇒ budget_chars // 80 is a safe
-        # upper bound on how many lines could possibly fit regardless of
-        # actual edge density.
+        # immediately discard via truncation. The 80-chars/line average is
+        # kept from the flat format (the grouped format averages less, so
+        # the bound is strictly safe).
         if budget_chars is not None:
             max_renderable_lines = max(10, budget_chars // 80)
             if len(all_qids) > max_renderable_lines:
@@ -2632,18 +2649,37 @@ class HubSymbolIndex:
             f"Full graph: rendering {len(all_qids)} symbols, budget {max_tokens} tokens."
         )
 
+        # Resolvable-name set for the callee filter, built once per section.
+        project_names = symbol_index.get_all_names(project_id)
+
         lines = [
             f"## Full Call Graph (all {len(all_qids)} symbols, direct edges only)",
-            "_Every indexed symbol with its direct callers/callees. "
+            "_Grouped by class. ← = used by · → = calls (project-resolvable "
+            "targets only) · names without a class prefix belong to the class "
+            "above · (amb) = callers aggregated across same-named methods. "
             "Use `/expand <name>` for full bodies._",
             "",
         ]
         total_chars = sum(len(l) for l in lines)
 
         truncated = False
+        current_class = None
         for idx, qid in enumerate(all_qids):
-            line = self._format_symbol_line_no_score(qid, project_id, symbol_index)
-            if budget_chars is not None and total_chars + len(line) > budget_chars:
+            cls, _, _bare = qid.rpartition(".")
+            chunk_lines = []
+            if cls != current_class:
+                chunk_lines.append(f"### {cls}" if cls else "### (module-level)")
+            chunk_lines.append(
+                self._format_symbol_line_no_score(
+                    qid,
+                    project_id,
+                    symbol_index,
+                    current_class=cls,
+                    project_names=project_names,
+                )
+            )
+            chunk = "\n".join(chunk_lines)
+            if budget_chars is not None and total_chars + len(chunk) > budget_chars:
                 remaining = len(all_qids) - idx
                 lines.append(
                     f"\n_(Truncated to fit {max_tokens}-token budget — "
@@ -2656,8 +2692,9 @@ class HubSymbolIndex:
                     f"omitted {remaining} due to budget {max_tokens} tokens."
                 )
                 break
-            lines.append(line)
-            total_chars += len(line)
+            current_class = cls
+            lines.append(chunk)
+            total_chars += len(chunk)
 
         if not truncated:
             logger.debug(
@@ -2666,20 +2703,32 @@ class HubSymbolIndex:
 
         return "\n".join(lines)
 
-    def _format_symbol_line_no_score(self, qid, project_id, symbol_index) -> str:
+    def _format_symbol_line_no_score(
+        self,
+        qid,
+        project_id,
+        symbol_index,
+        current_class: str = "",
+        project_names: Optional[Set[str]] = None,
+    ) -> str:
         """
-        Same as _format_symbol_line but without the centrality score column.
-        full_graph forces callees on: showing the bidirectional edge set is the
-        whole point of this mode.
+        Compact per-symbol line for the grouped full graph: bare name under
+        its class header, worded arrows replaced by ←/→ (legend in the
+        section header), same-class edge targets unprefixed, and → targets
+        filtered to project-resolvable names only.
 
         Caller attribution caveat: get_edges_in() resolves by bare name —
         a method shared across multiple classes (every __init__, etc.) shows
         the union of callers of ANY same-named method, not specifically this
-        occurrence. Lines affected by this are marked '(ambiguous: shared name)'
-        so the model — and a human reading the dump — doesn't treat the
-        caller list as precise for those symbols.
+        occurrence. Lines affected by this are marked '(amb)' so the model —
+        and a human reading the dump — doesn't treat the caller list as
+        precise for those symbols.
 
-        All callers and callees are shown in full, without truncation.
+        Args:
+            current_class:  Class of the group being rendered; edge targets
+                            with this prefix are shortened to the bare name.
+            project_names:  Resolvable bare-name set for the callee filter.
+                            None (legacy call shape) disables the filter.
         """
         bare_name = qid.rsplit(".", 1)[-1]
         is_ambiguous_name = (
@@ -2689,14 +2738,25 @@ class HubSymbolIndex:
         callers = self._safe_callers(qid, project_id, symbol_index)
         callees = self._safe_callees(qid, project_id, symbol_index)
 
-        parts = [f"- `{qid}`"]
+        def _shorten(name: str) -> str:
+            if current_class and name.startswith(current_class + "."):
+                return name[len(current_class) + 1 :]
+            return name
+
+        # ── Callee filter: keep only project-resolvable targets ──
+        if project_names is not None:
+            callees = {c for c in callees if c.rsplit(".", 1)[-1] in project_names}
+
+        parts = [f"- `{bare_name}`"]
 
         if callers:
-            tag = " (ambiguous: shared name)" if is_ambiguous_name else ""
-            parts.append(f"\n  ← used by{tag}: {', '.join(sorted(callers))}")
+            tag = " (amb)" if is_ambiguous_name else ""
+            shown = sorted(_shorten(c) for c in callers)
+            parts.append(f"\n  ←{tag} {', '.join(shown)}")
 
         if callees:
-            parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
+            shown = sorted(_shorten(c) for c in callees)
+            parts.append(f"\n  → {', '.join(shown)}")
 
         return "".join(parts)
 
@@ -2711,99 +2771,74 @@ class HubSymbolIndex:
         valves=None,
         dirty_qids: Optional[Set[str]] = None,
     ) -> str:
-        """Render the ``## Code Architecture Map`` section: one line per class
-        listing its methods, plus module-level functions if any.  Respects
-        ``architecture_map_max_tokens`` for the overall section budget.
+        """Render the ``## Class Index`` section: one compact line with every
+        class and its method count, plus a module-level function count.
 
-        When dirty_qids is provided (non-None and non-empty), classes are
-        split into two groups before rendering: classes with no member in
-        dirty_qids render first (in their original alphabetical order among
-        themselves), classes with at least one dirty member render after
-        them (also alphabetical among themselves). This keeps the unchanged
-        majority of the section as a stable, contiguous text prefix across
-        turns even when a handful of classes changed — a class containing
-        any dirty member is treated as dirty as a whole, since this section
-        renders one line per class (the per-method position inside that
-        line is not reordered).
+        This replaces the old ``## Code Architecture Map`` (one line per class
+        listing every method name): measured on a real dump, that section was
+        3,825 tokens of pure redundancy — the member names live verbatim in
+        the Project Skeleton (with full signatures and docstrings) and the
+        call relationships in the Full Call Graph. What the section actually
+        contributes is positional: a table of contents at the top of Block A.
+        The compact index keeps exactly that (class names + sizes, ~230
+        tokens) and points to where the detail lives.
 
-        When dirty_qids is None or empty (first build for a project, or
-        nothing changed since the last snapshot), falls back to pure
-        alphabetical order — identical to the original behavior.
+        KV-stability note: the single line changes only when the class set or
+        a method count changes, which is strictly less often than the old
+        per-class lines changed; the dirty_qids parameter is kept for caller
+        compatibility but no longer affects ordering (there are no per-class
+        lines left to reorder — alphabetical order is always used and always
+        stable).
+
+        Respects ``enable_architecture_map`` and ``architecture_map_max_tokens``
+        (the budget is now trivially satisfied; kept as a hard safety cap).
         """
         if valves is not None and not getattr(valves, "enable_architecture_map", True):
             return ""
         max_tokens = (
             getattr(valves, "architecture_map_max_tokens", 3000) if valves else 3000
         )
+        budget_chars = max_tokens * 4 if max_tokens > 0 else None
 
         classes = sorted(symbol_index.get_classes(project_id))
         if not classes:
             return ""
 
-        if dirty_qids:
-
-            def _class_is_dirty(class_name: str) -> bool:
-                members = symbol_index.get_class_members(class_name, project_id)
-                return any(qid in dirty_qids for qid in members)
-
-            stable_classes = [c for c in classes if not _class_is_dirty(c)]
-            dirty_classes = [c for c in classes if _class_is_dirty(c)]
-            ordered_classes = stable_classes + dirty_classes
-        else:
-            ordered_classes = classes
-
-        lines = [
-            "## Code Architecture Map",
-            "_Class → methods. See the hub section below for call relationships "
-            "of the most central symbols. Use `/expand <name>` or "
-            "`/expand Class.method` for full bodies._",
-            "",
-        ]
-        total_chars = sum(len(l) for l in lines)
-        budget_chars = max_tokens * 4 if max_tokens > 0 else None
-        truncated = False
-
-        for class_name in ordered_classes:
+        # ── Step 1: one "Name(count)" entry per class, alphabetical ──
+        entries = []
+        for class_name in classes:
             member_qids = symbol_index.get_class_members(class_name, project_id)
             if not member_qids:
                 continue
-            bare_members = []
-            for qid in member_qids:
-                meta = symbol_index.get_symbol_meta(qid, project_id) or {}
-                bare_members.append(meta.get("name", qid.rsplit(".", 1)[-1]))
-            line = (
-                f"- **{class_name}** ({len(bare_members)} methods): "
-                f"{', '.join(bare_members)}"
-            )
-            if budget_chars is not None and total_chars + len(line) > budget_chars:
-                lines.append(
-                    f"_(Outline truncated to fit budget — {len(classes)} classes total)_"
-                )
-                truncated = True
-                break
-            lines.append(line)
-            total_chars += len(line)
+            entries.append(f"{class_name}({len(member_qids)})")
 
-        if not truncated:
-            top_level = sorted(
-                qid
-                for qid in symbol_index.get_all_qualified_names(project_id)
-                if "." not in qid
-                and (symbol_index.get_symbol_meta(qid, project_id) or {}).get("kind")
-                == "function"
-            )
-            if top_level:
-                if dirty_qids:
-                    stable_top = [q for q in top_level if q not in dirty_qids]
-                    dirty_top = [q for q in top_level if q in dirty_qids]
-                    top_level = stable_top + dirty_top
-                line = f"- **(module-level functions)**: {', '.join(top_level)}"
-                if budget_chars is None or total_chars + len(line) <= budget_chars:
-                    lines.append(line)
+        # ── Step 2: module-level functions as a single trailing count ──
+        top_level = [
+            qid
+            for qid in symbol_index.get_all_qualified_names(project_id)
+            if "." not in qid
+            and (symbol_index.get_symbol_meta(qid, project_id) or {}).get("kind")
+            == "function"
+        ]
+        if top_level:
+            entries.append(f"(module-level: {len(top_level)})")
 
-        if len(lines) <= 3:
+        if not entries:
             return ""
-        return "\n".join(lines)
+
+        # ── Step 3: assemble with the pointer to where the detail lives ──
+        lines = [
+            "## Class Index",
+            "_Class(method count). Full member signatures live in the Project "
+            "Skeleton below; call relationships in the Full Call Graph. Use "
+            "`/expand <name>` or `/expand Class.method` for full bodies._",
+            "",
+            ", ".join(entries),
+        ]
+        text = "\n".join(lines)
+        if budget_chars is not None and len(text) > budget_chars:
+            text = text[:budget_chars]
+        return text
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Hub symbols with bidirectional call graph
@@ -6168,6 +6203,28 @@ class ContextBuilder:
             case = UseCase.PLANNING
             self._f._log_debug(f"classify_use_case: detected '{case.label}' via regex")
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
+
+        # ── Deterministic pointwise-comprehension shortcut ──
+        # "what is the purpose / qué hace <symbol>" is comprehension of that
+        # concrete symbol (C), yet the CrossEncoder maps purpose→plan with
+        # high confidence (observed: 'Planning', diff=0.81, on the already
+        # masked query) and the Planning instruction tail then skews the
+        # generation into roadmap mode. With a named indexed symbol plus an
+        # explain keyword the classification is not genuinely ambiguous, so
+        # it is resolved deterministically before the CE sees it. The
+        # explicit regex detections above still win: a refactor / scaffold /
+        # architecture verb next to the symbol routes to its own profile
+        # before reaching this point.
+        if _n_syms_masked:
+            _q_low = q.lower()
+            if any(kw in _q_low for kw in self._f._commands._EXPLAIN_KWS):
+                case = UseCase.PROGRAMMING
+                self._f._log_debug(
+                    f"classify_use_case: pointwise comprehension of a named "
+                    f"symbol ({_n_syms_masked} masked, explain keyword) → "
+                    f"'{case.label}' (deterministic)"
+                )
+                return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
         # ── CrossEncoder ──
         if (
@@ -14523,6 +14580,27 @@ class CommandRouter:
         re.MULTILINE,
     )
 
+    # Explain-intent keywords, shared by classify_intent's keyword
+    # reinforcement and classify_use_case's deterministic pointwise shortcut
+    # so both read the same definition of "the user is asking what/why".
+    # Unaccented "que hace" / "por que" are deliberately excluded: both match
+    # ordinary non-interrogative prose ("el fix que hace falta").
+    _EXPLAIN_KWS = (
+        "explica",
+        "describe",
+        "cómo funciona",
+        "como funciona",
+        "qué hace",
+        "por qué",
+        "proposito",
+        "propósito",
+        "purpose",
+        "para qué sirve",
+        "para que sirve",
+        "what does",
+        "how does",
+    )
+
     def _extract_text_for_classification(self, message: str) -> str:
         """
         Extract only non-code portions of the user message for intent classification.
@@ -14673,21 +14751,7 @@ class CommandRouter:
             # Unaccented "que hace" / "por que" are deliberately excluded:
             # both match ordinary non-interrogative prose ("el fix que hace
             # falta"), unlike the specific phrases below.
-            _explain_kws = (
-                "explica",
-                "describe",
-                "cómo funciona",
-                "como funciona",
-                "qué hace",
-                "por qué",
-                "proposito",
-                "propósito",
-                "purpose",
-                "para qué sirve",
-                "para que sirve",
-                "what does",
-                "how does",
-            )
+            _explain_kws = self._EXPLAIN_KWS
 
             if any(kw in content_lower for kw in _debug_kws):
                 scores[2] += h_weight * 0.35
@@ -16870,10 +16934,21 @@ class CodeBlockManager:
                 )
 
         # ── Section 5: Entire small content as a single block ─────────────
+        # The likely-code decision runs on a view with the plugin's own
+        # synthetic reference lines removed: the merge splice ("**name:**
+        # _(unchanged — N symbols already indexed in the SymbolGraph...)_")
+        # is dense in underscores and markdown tokens and made a plain
+        # question ride into the index as a GENERAL block (observed: a
+        # 173-char user query indexed as code, code_state_hash mutated,
+        # n_active_blocks bumped, PPR cache key churned). Only the decision
+        # view is stripped — the block, when created, carries the original
+        # content, so spans stay aligned with the message.
+        _s5_view = self._f._commands._REFERENCE_LINE_RE.sub("", content)
         if (
             not blocks
+            and _s5_view.strip()
             and len(content) <= 20_000
-            and await self._is_likely_code(content)
+            and await self._is_likely_code(_s5_view)
         ):
             lang = SignatureExtractor._guess_language(None, content) or "text"
             blocks.append({"language": lang, "code": content, "type": "indented"})
