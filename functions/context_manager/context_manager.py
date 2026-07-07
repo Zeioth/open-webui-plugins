@@ -35157,7 +35157,7 @@ class Filter:
             description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
         )
         hub_bodies_tier_top_n: int = Field(
-            default=24,
+            default=16,
             ge=1,
             le=100,
             description="Number of top hubs to include.",
