@@ -2676,6 +2676,11 @@ class HubSymbolIndex:
                     symbol_index,
                     current_class=cls,
                     project_names=project_names,
+                    amb_callers_cap=(
+                        getattr(valves, "full_graph_amb_callers_cap", 8)
+                        if valves
+                        else 8
+                    ),
                 )
             )
             chunk = "\n".join(chunk_lines)
@@ -2710,6 +2715,7 @@ class HubSymbolIndex:
         symbol_index,
         current_class: str = "",
         project_names: Optional[Set[str]] = None,
+        amb_callers_cap: int = 0,
     ) -> str:
         """
         Compact per-symbol line for the grouped full graph: bare name under
@@ -2751,8 +2757,23 @@ class HubSymbolIndex:
 
         if callers:
             tag = " (amb)" if is_ambiguous_name else ""
-            shown = sorted(_shorten(c) for c in callers)
-            parts.append(f"\n  ←{tag} {', '.join(shown)}")
+            if (
+                is_ambiguous_name
+                and amb_callers_cap > 0
+                and len(callers) > amb_callers_cap
+            ):
+                # The aggregate caller list of a shared name is imprecise by
+                # construction (union across every same-named method); past a
+                # few entries the full list is pure noise — one homonym
+                # carried ~200 callers on one line. The count keeps the
+                # centrality signal without the token cost.
+                parts.append(
+                    f"\n  ←{tag} {len(callers)} callers across same-named "
+                    f"methods (aggregate, imprecise)"
+                )
+            else:
+                shown = sorted(_shorten(c) for c in callers)
+                parts.append(f"\n  ←{tag} {', '.join(shown)}")
 
         if callees:
             shown = sorted(_shorten(c) for c in callees)
@@ -26189,12 +26210,22 @@ class ActiveCodeUpdater:
                 if (
                     n_lines <= _stub_cap
                     and not isinstance(syms, Exception)
-                    and self._is_illustrative_stub_block(blk.content)
+                    and (
+                        len(syms) == 0 or self._is_illustrative_stub_block(blk.content)
+                    )
                 ):
+                    # Zero extracted symbols extends the same gate: a small
+                    # assistant fence with no definitions at all (loose ifs /
+                    # pseudo-snippets quoting invented valves and files —
+                    # observed twice in one reply) contributes nothing to the
+                    # index yet mutates code_state_hash, churns the PPR cache
+                    # key and bumps n_active_blocks. User blocks are never
+                    # filtered; assistant fences with any real symbol still
+                    # index normally.
+                    _reason = "no symbols" if len(syms) == 0 else "illustrative stub"
                     self._f._log_debug(
-                        f"assistant stub block dropped ({n_lines} lines, "
-                        f"{len(syms)} symbol(s)) — illustrative signature, "
-                        f"not indexed"
+                        f"assistant block dropped ({n_lines} lines, "
+                        f"{len(syms)} symbol(s), {_reason}) — not indexed"
                     )
                     continue
                 _kept.append((blk, syms, raw))
@@ -34792,7 +34823,7 @@ class Filter:
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
-            default=65000,
+            default=110000,
             ge=0,
             description=(
                 "Value of llama.cpp's --keep (n_keep): the number of leading "
@@ -34816,11 +34847,11 @@ class Filter:
             description="Hard cap for ALL system injections (Block A + Block B). 0 = disabled.",
         )
         active_context_max_tokens: int = Field(
-            default=15000,
+            default=30000,
             description="Maximum tokens for LOD‑activated code context in Block B.",
         )
         history_max_tokens: int = Field(
-            default=24000,
+            default=60000,
             description="Maximum tokens for conversation history (non‑system messages). 0 = disabled.",
         )
         ltm_retrieval_max_tokens: int = Field(
@@ -35126,9 +35157,9 @@ class Filter:
             description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
         )
         hub_bodies_tier_top_n: int = Field(
-            default=7,
+            default=24,
             ge=1,
-            le=20,
+            le=100,
             description="Number of top hubs to include.",
         )
         symbol_index_max_in_block_a: int = Field(
@@ -35144,12 +35175,12 @@ class Filter:
             description="Minimum centrality score to qualify. 0.0 = no floor.",
         )
         hub_bodies_tier_max_tokens: int = Field(
-            default=10000,
+            default=28000,
             ge=500,
             description="Token budget for the entire tier. Auto‑capped to 6000 if multi‑phase is active.",
         )
         hub_bodies_tier_max_body_tokens: int = Field(
-            default=1500,
+            default=2500,
             ge=200,
             description="Maximum tokens for an individual hub body. Larger hubs go via LoD.",
         )
@@ -35252,7 +35283,7 @@ class Filter:
         )
 
         lod3_sticky_turns: int = Field(
-            default=2,
+            default=4,
             ge=0,
             description=(
                 "Keep LOD3 bodies rendered for this many extra turns after their "
@@ -35262,7 +35293,7 @@ class Filter:
             ),
         )
         lod3_sticky_max_symbols: int = Field(
-            default=4,
+            default=10,
             ge=1,
             description=(
                 "Cap on simultaneously sticky LOD3 bodies. When exceeded, the "
@@ -35346,6 +35377,18 @@ class Filter:
             default=50000,
             ge=1000,
             description="Token budget for full_graph mode.",
+        )
+        full_graph_amb_callers_cap: int = Field(
+            default=8,
+            ge=0,
+            description=(
+                "In the Full Call Graph, ambiguous used-by lines (callers "
+                "aggregated across same-named methods, e.g. get / __init__) "
+                "longer than this many entries collapse to a count summary. "
+                "The aggregate list is imprecise by construction, so beyond "
+                "a few entries it is noise: one observed homonym carried "
+                "~200 callers on a single line. 0 disables the cap."
+            ),
         )
         expanded_hubs_max_tokens: int = Field(
             default=50000,
