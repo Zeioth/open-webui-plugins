@@ -25,7 +25,18 @@ import math
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple, Union, Set, Iterable, Literal
+from typing import (
+    Optional,
+    List,
+    Dict,
+    Any,
+    Tuple,
+    Union,
+    Set,
+    Iterable,
+    Literal,
+    Callable,
+)
 from enum import Enum
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -6486,6 +6497,13 @@ class ContextBuilder:
         """Render a symbol's body without the signature header.
 
         Used when the signature is already present in Block A (skeleton tier).
+
+        The qid in the comment header is backtick-delimited and separated from
+        the suffix by a parenthesis: the previous "# {qid} — body" form let the
+        model fuse the identifier with the suffix and cite hallucinated names
+        (observed: "build_block_b — body" quoted back as "build_block_body" /
+        "build_body" while the real body sat in context). A delimited token
+        cannot be extended into a plausible identifier.
         """
         state = self._f._conversation_state_manager.get(project_id)
         block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
@@ -6494,7 +6512,7 @@ class ContextBuilder:
             if block and not block.obsolete:
                 body = CodeBlockManager.extract_symbol_body(block, qid)
                 if body:
-                    return f"# {qid} — body\n{body}\n"
+                    return f"# `{qid}` (body)\n{body}\n"
         return ""
 
     # ------------------------------------------------------------------
@@ -14656,8 +14674,7 @@ class CommandRouter:
             if any(kw in content_lower for kw in _explain_kws):
                 scores[0] += h_weight * 0.25
             if not any(
-                kw in content_lower
-                for kw in _debug_kws + _refactor_kws + _explain_kws
+                kw in content_lower for kw in _debug_kws + _refactor_kws + _explain_kws
             ):
                 scores[1] += h_weight * 0.25
 
@@ -18777,6 +18794,71 @@ Output only the symbol name.
     # 3. PPR computation with caching (Q2)
     # ======================================================================
 
+    def _compute_seed_weights(
+        self,
+        exact_seeds: List[str],
+        partial_seeds: List[str],
+        tb_seeds: List[Tuple[str, float]],
+        inferred_seeds: Optional[Dict[str, float]],
+        project_id: str,
+    ) -> Dict[str, float]:
+        """Resolve every seed to qualified ids with its evidence-strength weight.
+
+        The PPR personalization previously treated all seeds as equal mass
+        (1/N each), discarding the exact/partial/traceback distinction that
+        _register_seeds already encodes for the lexical graph. With mixed
+        seed quality that uniformity let weak partial matches carry the same
+        restart probability as the symbol the user literally named, which —
+        combined with the min_score prune killing all propagation — produced
+        the degenerate flat distributions observed in production. This helper
+        computes one weight map with the SAME formulas as _register_seeds so
+        the cache-backed PPR path and the lexical graph agree on evidence
+        strength:
+
+            exact:    min(1.0, 0.5 + 0.5 * specificity)
+            partial:  min(0.6, 0.3 + 0.3 * specificity)
+            tb:       the traceback frame's own weight
+            inferred: the inferrer's own score (already qid-keyed)
+
+        Ambiguous names split their weight across their qids; collisions
+        accumulate with the same sum-clamped-to-1.0 rule _register_seeds uses.
+        """
+        weights: Dict[str, float] = {}
+
+        def _add(qid: str, w: float) -> None:
+            weights[qid] = min(1.0, weights.get(qid, 0.0) + w)
+
+        # ── Step 1: lexical seed families (bare names → qids, split shares) ──
+        for names, score_fn in (
+            (exact_seeds, lambda sp: min(1.0, 0.5 + 0.5 * min(sp, 1.0))),
+            (partial_seeds, lambda sp: min(0.6, 0.3 + 0.3 * min(sp, 1.0))),
+        ):
+            for sym in names or []:
+                if not isinstance(sym, str):
+                    continue
+                qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+                if not qids:
+                    continue
+                spec = self._compute_node_specificity(sym, project_id)
+                share = score_fn(spec) / len(qids)
+                for qid in qids:
+                    _add(qid, share)
+
+        # ── Step 2: traceback seeds carry their own frame weight ──
+        for sym, w in tb_seeds or []:
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            if not qids:
+                continue
+            share = max(0.0, min(1.0, float(w))) / len(qids)
+            for qid in qids:
+                _add(qid, share)
+
+        # ── Step 3: inferred seeds are already qid-keyed with a score ──
+        for qid, w in (inferred_seeds or {}).items():
+            _add(qid, max(0.0, min(1.0, float(w))))
+
+        return weights
+
     def _get_or_compute_ppr_scores(
         self,
         seed_qids: List[str],
@@ -18786,6 +18868,7 @@ Output only the symbol name.
         max_steps: int = 20,
         min_score: float = 0.05,
         alpha: float = 0.85,
+        seed_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """
         Return Personalised PageRank scores for a given seed set, reading from
@@ -18826,6 +18909,14 @@ Output only the symbol name.
             max_steps:        Maximum number of power-iteration steps.
             min_score:        Minimum score for a node to appear in the result.
             alpha:            PPR damping factor; restart probability = 1 − alpha.
+            seed_weights:     Optional evidence-strength weight per seed qid
+                              (see _compute_seed_weights). When provided, the
+                              personalization vector is proportional to these
+                              weights instead of uniform, and the weights are
+                              folded into the cache key — the same qid set with
+                              different weights is a different distribution.
+                              When None, behaviour is the historical uniform
+                              1/N personalization.
 
         Returns:
             Dict mapping qualified symbol ids to PPR scores. Values are in
@@ -18837,7 +18928,16 @@ Output only the symbol name.
         psm = self._f._project_state_manager
         structure_hash = psm.get_structure_hash_for_cache(project_id)
         cache_key_hash = structure_hash if structure_hash else code_state_hash
-        seed_frozen = frozenset(seed_qids)
+        if seed_weights:
+            # Weighted personalization: fold the weights into the seed part of
+            # the key (rounded for float stability). The same qid set with
+            # different weights is a different restart distribution and must
+            # not hit the uniform entry — and vice versa.
+            seed_frozen = frozenset(
+                (q, round(seed_weights.get(q, 0.0), 3)) for q in seed_qids
+            )
+        else:
+            seed_frozen = frozenset(seed_qids)
 
         # ── Cache read ────────────────────────────────────────────────────────────
         # Skip caching entirely when the key is empty to avoid false hits between
@@ -18879,6 +18979,16 @@ Output only the symbol name.
                         depth=0,
                         source="seed",
                     )
+        elif seed_weights:
+            # Evidence-weighted personalization: each seed restarts with mass
+            # proportional to its weight (propagate() normalizes by the seed
+            # total internally). A qid missing from the map — possible when a
+            # seed resolved after the map was built — falls back to the
+            # uniform share so it is never silently dropped from the restart
+            # vector.
+            _uniform = 1.0 / len(seed_qids)
+            for _qid in seed_qids:
+                ag.seed([_qid], initial_score=seed_weights.get(_qid, _uniform))
         else:
             init_score = 1.0 / len(seed_qids)
             ag.seed(seed_qids, initial_score=init_score)
@@ -19545,6 +19655,14 @@ Output only the symbol name.
         # ---- Region: Get or compute PPR scores ----
         code_state_hash = self.compute_code_state_hash(project_id)
 
+        # Evidence-strength weights for the restart vector: the symbol the
+        # user literally named restarts with more mass than a partial match
+        # or a traceback frame, mirroring _register_seeds' formulas (see
+        # _compute_seed_weights). Folded into the PPR cache key.
+        seed_weights = self._compute_seed_weights(
+            exact_seeds, partial_seeds, tb_seeds, inferred_seeds, project_id
+        )
+
         cached_scores = self._get_or_compute_ppr_scores(
             seed_qids=seed_qids,
             project_id=project_id,
@@ -19553,6 +19671,7 @@ Output only the symbol name.
             max_steps=effective_steps,
             min_score=0.05,
             alpha=self._f.valves.ppr_alpha,
+            seed_weights=seed_weights,
         )
 
         # ---- Region: Normalize PPR scores into [0, 1] ----
@@ -19569,7 +19688,25 @@ Output only the symbol name.
         # distribution, so the KV-relevant ordering is stable turn to turn.
         cached_scores = self._normalize_ppr_scores(cached_scores)
 
-        # ---- Region: Build the activation graph ----
+        # ---- Region: Pin exact seeds to full activation ----
+        # A symbol the user named literally IS the most relevant node of the
+        # turn, deterministically. Min-max normalization cannot guarantee
+        # that: with several uniform seeds the propagation dies under the
+        # min_score prune, the raw distribution degenerates to identical
+        # values, and the normalizer's flat-distribution branch parks
+        # everything at 0.5 — observed: "purpose of build_block_b" left the
+        # named symbol at 0.500, below the B profile's 0.60 threshold, so the
+        # very symbol the question was about rendered without its body while
+        # sticky carry-overs did. Pinning exact-seed qids to 1.0 also makes
+        # them immune to the sticky cap's lowest-score eviction. Applied
+        # after (never inside) the normalizer so the PPR cache keeps the
+        # canonical raw propagation output.
+        if exact_seeds and cached_scores:
+            for _sym in exact_seeds:
+                for _qid in self._f._symbol_index.get_qualified_names_for(
+                    _sym, project_id
+                ):
+                    cached_scores[_qid] = 1.0
 
         # ---- Region: Build the activation graph ----
         if not self._f.valves.enable_multi_seed_activation:
@@ -25835,6 +25972,7 @@ class ActiveCodeUpdater:
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Extraction & preparation of new blocks
     # ═══════════════════════════════════════════════════════════════════════════
+
     async def _extract_and_prepare_new_blocks(self, content: str, role: str) -> Tuple[
         List["CodeBlock"],
         List[List["CodeSymbol"]],
@@ -25922,6 +26060,40 @@ class ActiveCodeUpdater:
                 )
             symbols_list.append(syms)
 
+        # ── Step 3.5: drop illustrative assistant stub blocks ──
+        # tree-sitter's error recovery happily extracts a symbol from a bare
+        # quoted signature that ast cannot even parse, so a hallucinated
+        # "build_body(" in an assistant reply became a real indexed symbol:
+        # new junk block → code_state_hash mutated → PPR cache miss → the
+        # genuine symbol marked dirty into the skeleton tier. Filtering here,
+        # before duplicate detection and base-block merging, means nothing
+        # downstream ever sees the block. Size-gated by valve: large
+        # stub-only blocks are deliberate scaffolding proposals and index
+        # normally; user blocks are never filtered.
+        _stub_cap = self._f.valves.assistant_stub_block_max_lines
+        if role == "assistant" and _stub_cap > 0 and new_blocks_pending:
+            _kept = []
+            for blk, syms, raw in zip(
+                new_blocks_pending, symbols_list, extracted_blocks
+            ):
+                n_lines = len(blk.content.splitlines())
+                if (
+                    n_lines <= _stub_cap
+                    and not isinstance(syms, Exception)
+                    and self._is_illustrative_stub_block(blk.content)
+                ):
+                    self._f._log_debug(
+                        f"assistant stub block dropped ({n_lines} lines, "
+                        f"{len(syms)} symbol(s)) — illustrative signature, "
+                        f"not indexed"
+                    )
+                    continue
+                _kept.append((blk, syms, raw))
+            if len(_kept) != len(new_blocks_pending):
+                new_blocks_pending = [k[0] for k in _kept]
+                symbols_list = [k[1] for k in _kept]
+                extracted_blocks = [k[2] for k in _kept]
+
         # ── Step 4: map block content → symbols (skip failed extractions) ──
         content_to_syms: Dict[str, List[CodeSymbol]] = {
             blk.content: syms
@@ -25929,6 +26101,133 @@ class ActiveCodeUpdater:
             if not isinstance(syms, Exception)
         }
         return new_blocks_pending, symbols_list, content_to_syms, extracted_blocks
+
+    def _is_illustrative_stub_block(content: str) -> bool:
+        """Return True when every definition in the block is a bodyless stub.
+
+        An assistant reply often quotes a signature to talk ABOUT a symbol —
+        sometimes with a hallucinated name — without proposing any code.
+        Indexing such a block creates a junk symbol that mutates
+        code_state_hash (observed: a quoted "build_body" signature bumped
+        n_active_blocks 3→4, missed the PPR cache and dirtied the real
+        build_block_b into the skeleton tier). A stub is a def/class whose
+        body is at most a docstring plus pass / Ellipsis.
+
+        Two layers, both conservative (uncertainty → False, i.e. index):
+          1. ast — precise when the snippet parses.
+          2. Line heuristic — quoted signatures frequently do NOT parse
+             (a bare multi-line signature raises IndentationError, which is
+             exactly how the observed block slipped through tree-sitter's
+             error recovery into the index). A block that contains a
+             def/class header but no code line indented past the first
+             header is a stub; docstring lines and comments do not count
+             as code.
+        """
+        # ── Step 1: precise ast pass ──
+        try:
+            tree = ast.parse(textwrap.dedent(content))
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            defs = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            if not defs:
+                return False
+
+            def _is_stub(fn) -> bool:
+                body = list(fn.body)
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    body = body[1:]
+                return all(
+                    isinstance(s, ast.Pass)
+                    or (
+                        isinstance(s, ast.Expr)
+                        and isinstance(s.value, ast.Constant)
+                        and s.value.value is Ellipsis
+                    )
+                    for s in body
+                )
+
+            return all(_is_stub(f) for f in defs)
+
+        # ── Step 2: line heuristic for unparseable quoted signatures ──
+        # Indentation cannot separate signature continuations from body (both
+        # sit deeper than the header), so the walk tracks the signature CLOSE
+        # instead: parentheses balanced and the line ending in ":". Lines
+        # consumed while a signature is open are never body; a signature that
+        # never closes (the observed bare multi-line quote) yields no body
+        # lines at all.
+        _tq_double = '"' * 3
+        _tq_single = "'" * 3
+        header_re = re.compile(r"^\s*(?:async\s+def|def|class)\s+\w")
+        seen_header = False
+        in_signature = False
+        paren_depth = 0
+        in_docstring = False
+        saw_code_line = False
+
+        def _sig_closes(depth: int, stripped_line: str) -> Tuple[bool, str]:
+            """Signature closes when parens balance and a ':' appears; the
+            tail after that ':' is inline body ('def f(x): ...')."""
+            if depth > 0 or ":" not in stripped_line:
+                return False, ""
+            return True, stripped_line.rsplit(":", 1)[1].strip()
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            if in_docstring:
+                if (stripped.count(_tq_double) + stripped.count(_tq_single)) % 2:
+                    in_docstring = False
+                continue
+            if in_signature:
+                paren_depth += line.count("(") - line.count(")")
+                closed, tail = _sig_closes(paren_depth, stripped)
+                if closed:
+                    in_signature = False
+                    if (
+                        tail
+                        and tail not in ("...", "pass")
+                        and not tail.startswith(("#", '"', "'"))
+                    ):
+                        saw_code_line = True
+                        break
+                continue
+            if header_re.match(line):
+                seen_header = True
+                in_signature = True
+                paren_depth = line.count("(") - line.count(")")
+                closed, tail = _sig_closes(paren_depth, stripped)
+                if closed:
+                    in_signature = False
+                    if (
+                        tail
+                        and tail not in ("...", "pass")
+                        and not tail.startswith(("#", '"', "'"))
+                    ):
+                        saw_code_line = True
+                        break
+                continue
+            if not seen_header or not stripped or stripped.startswith("#"):
+                continue
+            if (stripped.count(_tq_double) + stripped.count(_tq_single)) % 2:
+                in_docstring = True
+                continue
+            if stripped in ("...", "pass") or stripped.startswith(('"', "'")):
+                continue
+            saw_code_line = True
+            break
+
+        if not seen_header:
+            return False
+        return not saw_code_line
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Duplicate detection
@@ -34597,6 +34896,20 @@ class Filter:
         auto_detect_code_blocks: bool = Field(default=True)
         code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
         track_file_paths: bool = Field(default=True)
+        assistant_stub_block_max_lines: int = Field(
+            default=30,
+            ge=0,
+            description=(
+                "Assistant code blocks up to this many lines whose every "
+                "definition is a bodyless stub (signature plus at most a "
+                "docstring / pass / ...) are treated as illustrative quotes "
+                "and skipped by the indexer. Such snippets - often with "
+                "hallucinated names - otherwise create junk blocks that "
+                "mutate code_state_hash, invalidate the PPR cache and mark "
+                "real symbols dirty. Larger stub-only blocks still index "
+                "(deliberate scaffolding proposals). 0 disables the filter."
+            ),
+        )
         file_path_pattern: str = Field(
             default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b",
         )
