@@ -4207,6 +4207,13 @@ class RaptorCodeIndex:
         Return cluster summary texts most relevant to the query, highest level
         first (L2 subsystems before L1 function groups).
 
+        Hits below the ``raptor_min_similarity`` valve are dropped, so an
+        off-topic query no longer injects the top-k summaries unconditionally.
+        Similarity is cosine, derived from ChromaDB's cosine distance as
+        ``1 - distance`` (the collection is created with hnsw:space=cosine).
+        Per-hit similarities are logged at debug level for calibration.
+        Setting the valve to 0.0 disables the floor (previous behavior).
+
         Args:
             query: The user query.
             project_id: Current project identifier.
@@ -4241,7 +4248,7 @@ class RaptorCodeIndex:
                             {"is_raptor_summary": True},
                         ]
                     },
-                    include=["documents", "metadatas"],
+                    include=["documents", "metadatas", "distances"],
                 )
             )
         except Exception:
@@ -4249,15 +4256,38 @@ class RaptorCodeIndex:
 
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
         if not docs:
+            return []
+
+        # ------------------------------------------------------------------
+        # Similarity floor: drop hits the query is not actually about. A hit
+        # without a distance (exotic Chroma configs) is kept, preserving the
+        # pre-floor behavior for it.
+        # ------------------------------------------------------------------
+        min_sim = float(getattr(self._f.valves, "raptor_min_similarity", 0.0))
+        if len(dists) < len(docs):
+            dists = list(dists) + [None] * (len(docs) - len(dists))
+        kept = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            sim = (1.0 - dist) if isinstance(dist, (int, float)) else None
+            if sim is not None:
+                self._f._log_debug(
+                    f"RAPTOR retrieve: sim={sim:.3f} "
+                    f"level={int((meta or {}).get('raptor_level', 1))} "
+                    f"floor={min_sim:.2f}"
+                )
+            if min_sim > 0.0 and sim is not None and sim < min_sim:
+                continue
+            kept.append((doc, meta or {}))
+        if not kept:
             return []
 
         # ------------------------------------------------------------------
         # Sort by raptor_level desc (subsystems first), keep original order otherwise.
         # ------------------------------------------------------------------
-        paired = list(zip(docs, metas))
-        paired.sort(key=lambda dm: -int(dm[1].get("raptor_level", 1)))
-        return [d for d, _ in paired]
+        kept.sort(key=lambda dm: -int(dm[1].get("raptor_level", 1)))
+        return [d for d, _ in kept]
 
     # ------------------------------------------------------------------
     # Region: Graph & Distance Helpers (for clustering)
@@ -4996,6 +5026,11 @@ class ContextBuilder:
         # --- 3. Resolved call graph mode ---
         mode = psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
 
+        # --- 3b. One-time docstring flush (background coverage completed) ---
+        self._consume_docstring_flush(
+            project_id, pstate_raw, structure_hash, freeze_active, is_continuation
+        )
+
         # --- 4. Build cache key using the effective (possibly frozen) hash ---
         cache_key = f"{effective_hash}__{mode}"
         cached_text = psm.get_block_a_cached(project_id)
@@ -5184,6 +5219,67 @@ class ContextBuilder:
         self._check_block_a_vs_keep(project_id, tokens)
 
         return static_block
+
+    def _consume_docstring_flush(
+        self,
+        project_id: str,
+        pstate_raw: dict,
+        structure_hash: str,
+        freeze_active: bool,
+        is_continuation: bool,
+    ) -> bool:
+        """
+        Consume a pending skeleton docstring flush request, if any.
+
+        The background docstring loop sets skeleton_docstring_flush_pending
+        once coverage completes (or the queue stalls without progress).
+        Consuming it busts the Block A and skeleton-tier caches so the very
+        next render — this turn — embeds the accumulated docstrings, paying
+        exactly one partial prefill from the skeleton's position in the
+        prompt. The request is deferred (flag kept intact) while a Block A
+        freeze window or an AutoContinue continuation is active, since both
+        exist precisely to keep the prefix byte-identical; the flush then
+        fires on the first eligible turn after the window closes.
+
+        Args:
+            project_id: Current project identifier.
+            pstate_raw: The project's raw pstate dict, already fetched by
+                the caller; mutated in place.
+            structure_hash: Current (unfrozen) structure hash, stamped as
+                docstring_flush_done_hash so the same structure never
+                flushes twice.
+            freeze_active: Whether a Block A freeze window is active.
+            is_continuation: Whether this turn is an AutoContinue
+                continuation serving the frozen Block A text.
+
+        Returns:
+            True when the flush was consumed and the caches were busted.
+        """
+        # Region: fast exit — nothing pending
+        if not pstate_raw.get("skeleton_docstring_flush_pending"):
+            return False
+
+        # Region: defer while any prefix-pinning mechanism is active
+        if freeze_active or is_continuation:
+            self._f._log_debug(
+                "Docstring flush: deferred (freeze window or continuation "
+                "active) — flag kept for a later turn"
+            )
+            return False
+
+        # Region: consume — bust Block A and skeleton-tier caches once
+        psm = self._f._project_state_manager
+        pstate_raw["skeleton_docstring_flush_pending"] = False
+        pstate_raw["docstring_flush_done_hash"] = structure_hash
+        pstate_raw["skeleton_tier_cache_key"] = None
+        pstate_raw["skeleton_tier_cached"] = None
+        psm.set_block_a_cache_key(project_id, None)
+        psm.set_block_a_cached(project_id, None)
+        self._f._log_debug(
+            "Docstring flush: consumed — Block A and skeleton tier caches "
+            "busted; this turn re-renders once with full docstring coverage"
+        )
+        return True
 
     def _check_block_a_vs_keep(self, project_id: str, block_a_tokens: int) -> None:
         """
@@ -6621,6 +6717,9 @@ class ContextBuilder:
             slot_free: Whether the LLM slot is free.
             intent_vector: Intent classification results.
             is_continuation: Whether this is a continuation turn.
+            use_case_override: Pre-classified use case key; when provided,
+                classify_use_case is skipped (single classification per turn,
+                threaded down from inlet).
 
         Returns:
             The rendered Block B, or an empty string if no context is needed.
@@ -6970,6 +7069,39 @@ class ContextBuilder:
             activated_scores = activated
 
         # ------------------------------------------------------------------
+        # Step 12.5: Per-turn qid → (symbol, block) resolution index.
+        #
+        # Steps 13 and 15 previously resolved every qid with find_blocks()
+        # plus a linear scan over block.symbols (twice per LOD-2 symbol:
+        # signature and docstring). One pass over the in-memory blocks here
+        # replaces those O(activated × symbols_per_block) scans with O(1)
+        # lookups — the same _qid_index pattern ensure_docstrings_batch
+        # already uses. Insertion order over active_blocks makes the chosen
+        # block deterministic when a qid appears in more than one live block
+        # (the previous code iterated a set of block hashes). Soft-evicted
+        # blocks are absent by construction; Step 15 falls back to
+        # find_blocks + the pager for those and registers the paged-in
+        # block's symbols so subsequent qids from it resolve O(1) as well.
+        # ------------------------------------------------------------------
+        _qid_index: Dict[str, Tuple["CodeSymbol", "CodeBlock"]] = {}
+        for _blk in state.active_blocks.values():
+            if _blk.obsolete:
+                continue
+            for _sym in _blk.symbols:
+                _q = qualify_symbol(_sym)
+                if _q not in _qid_index:
+                    _qid_index[_q] = (_sym, _blk)
+
+        # LOD-3 sticky bodies bypass the per-turn semantic filter in Step 15:
+        # they were admitted by merit on a previous turn, their exit mechanism
+        # is the TTL (already decremented in Step 8.5), and re-scoring them
+        # against vague pronoun follow-ups ("what does it do") is exactly the
+        # query shape the CrossEncoder scores poorly — evicting them mid-TTL
+        # would defeat both the anti-confabulation and the KV-prefix-stability
+        # purpose of the sticky tier. Bounded by lod3_sticky_max_symbols.
+        _sticky_bypass: Set[str] = set(lod3_sticky) if _sticky_ttl > 0 else set()
+
+        # ------------------------------------------------------------------
         # Step 13: Batched LOD-2 docstring pre-resolution.
         # ------------------------------------------------------------------
         # Symbols at LOD-2 are shown with their docstring as the only context
@@ -6986,25 +7118,17 @@ class ContextBuilder:
             if lod2_only_candidates:
                 missing = []
                 for qid in lod2_only_candidates:
-                    has_doc = False
-                    for bh in self._f._symbol_index.find_blocks(qid, project_id):
-                        blk = state.active_blocks.get(bh)
-                        if blk and any(
-                            # qualify_symbol(s) includes file_path so that
-                            # module-level functions produce "module.func"
-                            # rather than bare "func", matching the qualified
-                            # ids in lod2_only_candidates which were built by
-                            # the SymbolIndex using the same convention.
-                            # Using qualify_symbol_name(s.name, s.parent_symbol)
-                            # without file_path would produce bare "func" for
-                            # module-level functions, never matching qid and
-                            # always treating the docstring as missing.
-                            qualify_symbol(s) == qid and s.docstring
-                            for s in blk.symbols
-                        ):
-                            has_doc = True
-                            break
-                    if not has_doc:
+                    # The per-turn qid index resolves each qid to its symbol
+                    # in the first non-obsolete block, using the same
+                    # qualified-id convention (qualify_symbol includes
+                    # file_path, so module-level functions produce
+                    # "module.func" rather than bare "func"). A qid whose
+                    # block is currently soft-evicted misses the index and
+                    # lands in `missing`, where ensure_docstrings_batch
+                    # resolves it from the memory/SQLite cache at zero LLM
+                    # cost — same outcome as the previous per-block scan.
+                    _entry = _qid_index.get(qid)
+                    if not (_entry is not None and _entry[0].docstring):
                         missing.append(qid)
                 if missing:
                     await self._f._enrichment.ensure_docstrings_batch(
@@ -7084,184 +7208,193 @@ class ContextBuilder:
                             injected_symbols.add(qid)
                     continue
 
-            block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
-            for bh in block_hashes:
-                block = state.active_blocks.get(bh)
+            # Region: resolve the (symbol, block) pair for this qid
+            # O(1) via the per-turn index for in-memory blocks. Soft-evicted
+            # blocks miss the index: fall back to find_blocks + pager, then
+            # register the paged-in block's symbols in the index so later
+            # qids belonging to it resolve O(1) too.
+            _entry = _qid_index.get(qid)
+            if _entry is not None:
+                sym_hit, block = _entry
+            else:
+                sym_hit, block = None, None
+                for bh in self._f._symbol_index.find_blocks(qid, project_id):
+                    candidate = state.active_blocks.get(bh)
 
-                # ── Page-in if the block was soft-evicted ─────────────────────────
-                if block is None and self._f._pager is not None:
-                    if self._f._pager.is_paged(bh, project_id):
-                        block = await self._f._pager.page_in_block(
-                            block_hash=bh,
-                            project_id=project_id,
-                            chroma_collection=self._f.memory_collection,
-                            db_conn=self._f._db_conn,
-                        )
-
-                if not block or block.obsolete:
-                    continue
-
-                score = activated_scores.get(qid, 0.0)
-
-                # ── LOD-1: Signatures only ────────────────────────────────────────
-                if _lod_tier(qid) == 1:
-                    sig = next(
-                        (
-                            sym.signature
-                            for sym in block.symbols
-                            if qualify_symbol(sym) == qid
-                        ),
-                        qid,
-                    )
-                    tok = len(sig) // 4 + 2
-                    if total_tokens + tok > budget:
-                        break
-                    loc = f" ({block.file_path})" if block.file_path else ""
-                    _lod1_parts.append(f"- '{sig}'{loc} _(score: {score:.2f})_")
-                    total_tokens += tok
-                    injected_symbols.add(qid)
-
-                # ── LOD-2: Signatures + docstrings (+ optional CFG) ───────────────
-                elif _lod_tier(qid) == 2:
-                    sig = next(
-                        (
-                            sym.signature
-                            for sym in block.symbols
-                            if qualify_symbol(sym) == qid
-                        ),
-                        qid,
-                    )
-                    docstring = next(
-                        (
-                            sym.docstring
-                            for sym in block.symbols
-                            if qualify_symbol(sym) == qid and sym.docstring
-                        ),
-                        "",
-                    )
-
-                    cfg_skeleton = ""
-                    if self._f.valves.enable_cfg_skeletons and (
-                        active_use_case == "D"
-                        or intent_vector.get("debug", 0.0)
-                        >= self._f.valves.cfg_skeleton_debug_intent_threshold
-                    ):
-                        cfg_skeleton = (
-                            self._f._symbol_index.get_cfg(qid, project_id) or ""
-                        )
-
-                    if cfg_skeleton:
-                        self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
-                        text = f"'{sig}'"
-                        if docstring:
-                            text += f": {docstring}"
-                        text += f"\n```python\n{cfg_skeleton}\n```"
-                    else:
-                        text = f"- '{sig}': {docstring}" if docstring else f"- '{sig}'"
-
-                    tok = self._f._tokens.estimate_code_tokens(text)
-                    if total_tokens + tok > budget:
-                        break
-                    loc = f" ({block.file_path})" if block.file_path else ""
-                    _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
-                    total_tokens += tok
-                    injected_symbols.add(qid)
-
-                # ── LOD-3: Full code body ─────────────────────────────────────────
-                else:
-                    # Semantic relevance filter (LOD-3 only)
-                    if self._f.valves.enable_semantic_lod3_filter and slot_free:
-                        include_block = await self._evaluate_lod3_block_relevance(
-                            block=block,
-                            qid=qid,
-                            query=query,
-                            project_id=project_id,
-                        )
-                        if not include_block:
-                            self._f._log_debug(
-                                f"Block B: skipping LOD-3 for {qid} due to low "
-                                f"semantic relevance"
+                    # ── Page-in if the block was soft-evicted ─────────────────
+                    if candidate is None and self._f._pager is not None:
+                        if self._f._pager.is_paged(bh, project_id):
+                            candidate = await self._f._pager.page_in_block(
+                                block_hash=bh,
+                                project_id=project_id,
+                                chroma_collection=self._f.memory_collection,
+                                db_conn=self._f._db_conn,
                             )
-                            continue
 
-                    content_to_inject = CodeBlockManager.extract_symbol_body(block, qid)
+                    if not candidate or candidate.obsolete:
+                        continue
+
+                    block = candidate
+                    for _s in block.symbols:
+                        _q = qualify_symbol(_s)
+                        if _q not in _qid_index:
+                            _qid_index[_q] = (_s, block)
+                    sym_hit = next(
+                        (s for s in block.symbols if qualify_symbol(s) == qid),
+                        None,
+                    )
+                    break
+
+            if block is None or block.obsolete:
+                continue
+
+            score = activated_scores.get(qid, 0.0)
+
+            # ── LOD-1: Signatures only ────────────────────────────────────────
+            if _lod_tier(qid) == 1:
+                sig = sym_hit.signature if sym_hit is not None else qid
+                tok = len(sig) // 4 + 2
+                if total_tokens + tok > budget:
+                    continue
+                loc = f" ({block.file_path})" if block.file_path else ""
+                _lod1_parts.append(f"- '{sig}'{loc} _(score: {score:.2f})_")
+                total_tokens += tok
+                injected_symbols.add(qid)
+
+            # ── LOD-2: Signatures + docstrings (+ optional CFG) ───────────────
+            elif _lod_tier(qid) == 2:
+                sig = sym_hit.signature if sym_hit is not None else qid
+                docstring = (
+                    sym_hit.docstring
+                    if sym_hit is not None and sym_hit.docstring
+                    else ""
+                )
+
+                cfg_skeleton = ""
+                if self._f.valves.enable_cfg_skeletons and (
+                    active_use_case == "D"
+                    or intent_vector.get("debug", 0.0)
+                    >= self._f.valves.cfg_skeleton_debug_intent_threshold
+                ):
+                    cfg_skeleton = (
+                        self._f._symbol_index.get_cfg(qid, project_id) or ""
+                    )
+
+                if cfg_skeleton:
+                    self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
+                    text = f"'{sig}'"
+                    if docstring:
+                        text += f": {docstring}"
+                    text += f"\n```python\n{cfg_skeleton}\n```"
+                else:
+                    text = f"- '{sig}': {docstring}" if docstring else f"- '{sig}'"
+
+                tok = self._f._tokens.estimate_code_tokens(text)
+                if total_tokens + tok > budget:
+                    continue
+                loc = f" ({block.file_path})" if block.file_path else ""
+                _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
+                total_tokens += tok
+                injected_symbols.add(qid)
+
+            # ── LOD-3: Full code body ─────────────────────────────────────────
+            else:
+                # Semantic relevance filter (LOD-3 only). Sticky bodies bypass
+                # it — see the _sticky_bypass rationale in Step 12.5.
+                if (
+                    self._f.valves.enable_semantic_lod3_filter
+                    and slot_free
+                    and qid not in _sticky_bypass
+                ):
+                    include_block = await self._evaluate_lod3_block_relevance(
+                        block=block,
+                        qid=qid,
+                        query=query,
+                        project_id=project_id,
+                    )
+                    if not include_block:
+                        self._f._log_debug(
+                            f"Block B: skipping LOD-3 for {qid} due to low "
+                            f"semantic relevance"
+                        )
+                        continue
+
+                content_to_inject = CodeBlockManager.extract_symbol_body(block, qid)
+                tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
+                _is_oversized = (
+                    self._f.valves.max_code_block_tokens > 0
+                    and tok > self._f.valves.max_code_block_tokens
+                )
+
+                if (
+                    _is_oversized
+                    and self._f.valves.code_block_overflow_action == "warn"
+                ):
+                    content_to_inject = self._f.valves.code_block_warn_message
                     tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
-                    _is_oversized = (
-                        self._f.valves.max_code_block_tokens > 0
-                        and tok > self._f.valves.max_code_block_tokens
-                    )
-
-                    if (
-                        _is_oversized
-                        and self._f.valves.code_block_overflow_action == "warn"
-                    ):
-                        content_to_inject = self._f.valves.code_block_warn_message
-                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
-
-                    elif (
-                        _is_oversized
-                        and self._f.valves.code_block_overflow_action == "summarize"
-                    ):
-                        if block.block_summary:
-                            content_to_inject = (
-                                f"[Summary of {tok}-token block]\n{block.block_summary}"
-                            )
-                        else:
-                            content_to_inject = (
-                                self._f._tokens.truncate_text_to_tokens(
-                                    content_to_inject,
-                                    self._f.valves.max_code_block_tokens,
-                                )
-                                + "\n# ... [truncated — use /expand for full body]"
-                            )
-                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
-
-                    elif (
-                        _is_oversized
-                        and self._f.valves.code_block_overflow_action == "truncate"
-                    ):
-                        content_to_inject = self._f._tokens.truncate_text_to_tokens(
-                            content_to_inject,
-                            self._f.valves.max_code_block_tokens,
-                        )
-                        content_to_inject += (
-                            "\n# ... [truncated — use /expand for full body]"
-                        )
-                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
-
-                    if (
-                        slot_free
-                        and self._f.valves.enable_code_compression
-                        and self._f._llmlingua_compressor
-                        and tok > self._f.valves.code_compression_min_tokens
-                    ):
+                elif (
+                    _is_oversized
+                    and self._f.valves.code_block_overflow_action == "summarize"
+                ):
+                    if block.block_summary:
                         content_to_inject = (
-                            await self._f._history_compressor.compress_code_block(
-                                content_to_inject,
-                                language=(
-                                    block.symbols[0].language
-                                    if block.symbols
-                                    else "unknown"
-                                ),
-                                rate=self._f.valves.code_compression_rate,
-                                query=query,
-                            )
+                            f"[Summary of {tok}-token block]\n{block.block_summary}"
                         )
-                        tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+                    else:
+                        content_to_inject = (
+                            self._f._tokens.truncate_text_to_tokens(
+                                content_to_inject,
+                                self._f.valves.max_code_block_tokens,
+                            )
+                            + "\n# ... [truncated — use /expand for full body]"
+                        )
+                    tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
-                    if total_tokens + tok > budget:
-                        break
-                    loc = f" ({block.file_path})" if block.file_path else ""
-                    _lod3_parts.append(
-                        f"### '{qid}'{loc} [activation: {score:.2f}]\n"
-                        f"```\n{content_to_inject}\n```\n"
+                elif (
+                    _is_oversized
+                    and self._f.valves.code_block_overflow_action == "truncate"
+                ):
+                    content_to_inject = self._f._tokens.truncate_text_to_tokens(
+                        content_to_inject,
+                        self._f.valves.max_code_block_tokens,
                     )
-                    _lod3_emitted.add(qid)
-                    total_tokens += tok
-                    injected_symbols.add(qid)
+                    content_to_inject += (
+                        "\n# ... [truncated — use /expand for full body]"
+                    )
+                    tok = self._f._tokens.estimate_code_tokens(content_to_inject)
 
-                break  # Only process the first valid block for each qid
+                if (
+                    slot_free
+                    and self._f.valves.enable_code_compression
+                    and self._f._llmlingua_compressor
+                    and tok > self._f.valves.code_compression_min_tokens
+                ):
+                    content_to_inject = (
+                        await self._f._history_compressor.compress_code_block(
+                            content_to_inject,
+                            language=(
+                                block.symbols[0].language
+                                if block.symbols
+                                else "unknown"
+                            ),
+                            rate=self._f.valves.code_compression_rate,
+                            query=query,
+                        )
+                    )
+                    tok = self._f._tokens.estimate_code_tokens(content_to_inject)
+
+                if total_tokens + tok > budget:
+                    continue
+                loc = f" ({block.file_path})" if block.file_path else ""
+                _lod3_parts.append(
+                    f"### '{qid}'{loc} [activation: {score:.2f}]\n"
+                    f"```\n{content_to_inject}\n```\n"
+                )
+                _lod3_emitted.add(qid)
+                total_tokens += tok
+                injected_symbols.add(qid)
 
         # ------------------------------------------------------------------
         # Step 15.5: Refresh LOD-3 sticky TTLs for merit hits emitted this turn.
@@ -7380,7 +7513,10 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         if self._f.valves.enable_lod_adaptive:
             lod_map: Dict[str, int] = {}
-            for qid, score in activated.items():
+            # activated_scores, not activated: with the centrality LOD bump
+            # enabled, tiers were rendered from the bumped scores, and the
+            # adaptive-threshold feedback must record what was actually shown.
+            for qid, score in activated_scores.items():
                 if score < lod1:
                     lod_map[qid] = 0
                 elif score < lod2:
@@ -12102,10 +12238,7 @@ class AgenticEvidenceLedger:
             defaults (False, 0.0, []) when the tail is absent or broken.
         """
         control: Dict[str, Any] = {
-            "resolved": False,
-            "confidence": 0.0,
-            "needs": [],
-            "ask": "",
+            "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
         }
 
         # Region: locate and strip the fenced JSON tail
@@ -12152,9 +12285,7 @@ class AgenticEvidenceLedger:
             if not text:
                 continue
             claim = LedgerClaim(
-                step_id=step.id,
-                text=text,
-                qids=qids[:8],
+                step_id=step.id, text=text, qids=qids[:8],
                 confidence=max(0.0, min(1.0, conf)),
             )
             for qid in claim.qids:
@@ -12178,7 +12309,9 @@ class AgenticEvidenceLedger:
 
     def serialize_for(self, step_id: int) -> str:
         """JSON-serialize this step's claims for the cache."""
-        return json.dumps([c.__dict__ for c in self.claims if c.step_id == step_id])
+        return json.dumps(
+            [c.__dict__ for c in self.claims if c.step_id == step_id]
+        )
 
     def claims_for(self, step_id: int) -> List[LedgerClaim]:
         """Claims emitted by one step."""
@@ -12257,15 +12390,9 @@ class AgenticStepCache:
                 "digest, claims_json, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    project_id,
-                    self.step_key(step),
-                    structure_hash,
-                    step.kind,
-                    step.goal,
-                    step.output,
-                    step.digest,
-                    claims_json,
-                    time.time(),
+                    project_id, self.step_key(step), structure_hash,
+                    step.kind, step.goal, step.output, step.digest,
+                    claims_json, time.time(),
                 ),
             )
             self._f._db_conn.commit()
@@ -12373,7 +12500,9 @@ class AgenticToolBroker:
             return f"[{label}: none recorded]"
         lines = [f"### {label}"]
         for ed in edges[: self._MAX_EDGES]:
-            lines.append(f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}")
+            lines.append(
+                f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}"
+            )
         if len(edges) > self._MAX_EDGES:
             lines.append(f"- … {len(edges) - self._MAX_EDGES} more omitted")
         return "\n".join(lines)
@@ -12405,7 +12534,10 @@ class AgenticToolBroker:
                 break
         if not hits:
             return f"[GREP: no matches for {pattern!r}]"
-        return f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n" + "\n".join(hits)
+        return (
+            f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n"
+            + "\n".join(hits)
+        )
 
 
 class AgenticStaticVerifier:
@@ -12551,12 +12683,8 @@ class AgenticStaticVerifier:
         for n, c in enumerate(claims, 1):
             qids = c.valid_qids or c.qids
             if len(qids) >= 2:
-                checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]}
-                )
-                checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]}
-                )
+                checks.append({"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]})
+                checks.append({"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]})
             elif qids:
                 checks.append({"claim": n, "kind": "exists", "src": qids[0]})
         return checks[:12]
@@ -12674,49 +12802,18 @@ class AgenticTestabilityClassifier:
     """
 
     _ALLOWED_MODULES = {
-        "re",
-        "json",
-        "math",
-        "hashlib",
-        "time",
-        "itertools",
-        "functools",
-        "collections",
-        "typing",
-        "dataclasses",
-        "string",
-        "textwrap",
-        "difflib",
-        "bisect",
-        "heapq",
-        "enum",
-        "copy",
+        "re", "json", "math", "hashlib", "time", "itertools", "functools",
+        "collections", "typing", "dataclasses", "string", "textwrap",
+        "difflib", "bisect", "heapq", "enum", "copy",
     }
     _SHALLOW_SELF = {"_f", "valves", "_log_debug", "_tokens", "tokenizer"}
     _IO_NAMES = {
-        "open",
-        "eval",
-        "exec",
-        "__import__",
-        "input",
-        "compile",
+        "open", "eval", "exec", "__import__", "input", "compile",
     }
     _IO_MODULES = {
-        "os",
-        "sys",
-        "subprocess",
-        "shutil",
-        "socket",
-        "requests",
-        "urllib",
-        "http",
-        "aiohttp",
-        "sqlite3",
-        "pathlib",
-        "anyio",
-        "asyncio",
-        "chromadb",
-        "torch",
+        "os", "sys", "subprocess", "shutil", "socket", "requests", "urllib",
+        "http", "aiohttp", "sqlite3", "pathlib", "anyio", "asyncio",
+        "chromadb", "torch",
     }
 
     @classmethod
@@ -12819,20 +12916,14 @@ class AgenticTestabilityClassifier:
                         defined.add(t.id)
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called.add(node.func.id)
-        builtins = (
-            set(dir(__builtins__))
-            if isinstance(__builtins__, dict)
-            else set(dir(__builtins__))
-        )
+        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
         try:
             import builtins as _b
-
             builtins |= set(dir(_b))
         except Exception:
             pass
         free = [
-            n
-            for n in called
+            n for n in called
             if n not in defined
             and n not in imported
             and n not in params
@@ -12868,26 +12959,10 @@ class AgenticSandboxRunner:
     """
 
     _DENYLIST = (
-        "import os",
-        "from os",
-        "import sys",
-        "from sys",
-        "subprocess",
-        "socket",
-        "shutil",
-        "requests",
-        "urllib",
-        "http.client",
-        "ftplib",
-        "smtplib",
-        "ctypes",
-        "pickle",
-        "eval(",
-        "exec(",
-        "__import__",
-        "open(",
-        "pathlib",
-        "os.system",
+        "import os", "from os", "import sys", "from sys", "subprocess",
+        "socket", "shutil", "requests", "urllib", "http.client", "ftplib",
+        "smtplib", "ctypes", "pickle", "eval(", "exec(", "__import__",
+        "open(", "pathlib", "os.system",
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -12911,11 +12986,8 @@ class AgenticSandboxRunner:
         for token in self._DENYLIST:
             if token in lowered:
                 return {
-                    "status": "rejected",
-                    "passed": 0,
-                    "total": 0,
-                    "failures": [],
-                    "detail": f"denylist token: {token}",
+                    "status": "rejected", "passed": 0, "total": 0,
+                    "failures": [], "detail": f"denylist token: {token}",
                 }
 
         # Region: isolated subprocess with rlimits (off the event loop)
@@ -12931,9 +13003,13 @@ class AgenticSandboxRunner:
                 import resource as _res
 
                 _res.setrlimit(_res.RLIMIT_CPU, (timeout, timeout))
-                _res.setrlimit(_res.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+                _res.setrlimit(
+                    _res.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024)
+                )
                 _res.setrlimit(_res.RLIMIT_NOFILE, (32, 32))
-                _res.setrlimit(_res.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
+                _res.setrlimit(
+                    _res.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024)
+                )
 
             with _tf.TemporaryDirectory(prefix="agentic_exec_") as jail:
                 path = _os.path.join(jail, "harness.py")
@@ -12951,19 +13027,13 @@ class AgenticSandboxRunner:
                     )
                 except _sp.TimeoutExpired:
                     return {
-                        "status": "timeout",
-                        "passed": 0,
-                        "total": 0,
-                        "failures": [],
-                        "detail": f"wall timeout {timeout}s",
+                        "status": "timeout", "passed": 0, "total": 0,
+                        "failures": [], "detail": f"wall timeout {timeout}s",
                     }
                 except Exception as e:
                     return {
-                        "status": "error",
-                        "passed": 0,
-                        "total": 0,
-                        "failures": [],
-                        "detail": f"spawn failed: {e}",
+                        "status": "error", "passed": 0, "total": 0,
+                        "failures": [], "detail": f"spawn failed: {e}",
                     }
 
                 # -- parse the runner's JSON line from stdout --------------
@@ -12974,22 +13044,24 @@ class AgenticSandboxRunner:
                             data = json.loads(line)
                             passed = int(data.get("passed", 0))
                             total = int(data.get("total", 0))
-                            status = "pass" if total > 0 and passed == total else "fail"
+                            status = (
+                                "pass"
+                                if total > 0 and passed == total
+                                else "fail"
+                            )
                             return {
                                 "status": status,
                                 "passed": passed,
                                 "total": total,
-                                "failures": [str(x) for x in data.get("failures", [])][
-                                    :5
-                                ],
+                                "failures": [
+                                    str(x) for x in data.get("failures", [])
+                                ][:5],
                                 "detail": "",
                             }
                         except Exception:
                             break
                 return {
-                    "status": "error",
-                    "passed": 0,
-                    "total": 0,
+                    "status": "error", "passed": 0, "total": 0,
                     "failures": [],
                     "detail": (proc.stderr or proc.stdout or "no output")[-500:],
                 }
@@ -13122,7 +13194,9 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
-            step.output = f"(dynamic verification disabled: agentic_exec_mode={mode})"
+            step.output = (
+                f"(dynamic verification disabled: agentic_exec_mode={mode})"
+            )
             step.seconds = time.monotonic() - started
             return
 
@@ -13181,7 +13255,9 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode not in ("subprocess", "docker"):
             step.status = "done"
-            step.output = f"(regression disabled: agentic_exec_mode={mode})"
+            step.output = (
+                f"(regression disabled: agentic_exec_mode={mode})"
+            )
             step.seconds = time.monotonic() - started
             return
 
@@ -13216,7 +13292,8 @@ if __name__ == "__main__":
 
         # Region: re-verify each caller via the shared per-target flow
         report_lines = [
-            f"## Regression over {len(callers)} caller(s) of " f"{', '.join(seeds)}"
+            f"## Regression over {len(callers)} caller(s) of "
+            f"{', '.join(seeds)}"
         ]
         for qid in callers:
             remaining = timeout_s - (time.monotonic() - started)
@@ -13323,11 +13400,9 @@ if __name__ == "__main__":
         timeout_s: float,
     ) -> str:
         """One aligned LLM call producing the tests section ('' on failure)."""
-        prompt = (
-            self._TESTS_CONTRACT.replace("{body}", body[:8000])
-            .replace("{verdict}", verdict)
-            .replace("{reasons}", "; ".join(reasons))
-        )
+        prompt = self._TESTS_CONTRACT.replace("{body}", body[:8000]).replace(
+            "{verdict}", verdict
+        ).replace("{reasons}", "; ".join(reasons))
         try:
             response = await asyncio.wait_for(
                 self._f._llm_orchestrator.call_llm(
@@ -13349,7 +13424,9 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else response).strip()
         return tests if "def test_" in tests else ""
 
-    def _resolve_callee_bodies(self, body: str, self_qid: str, project_id: str) -> str:
+    def _resolve_callee_bodies(
+        self, body: str, self_qid: str, project_id: str
+    ) -> str:
         """
         Extract the bodies of project symbols this symbol calls, so a caller
         that invokes another project function remains executable in the
@@ -13474,12 +13551,8 @@ if __name__ == "__main__":
                 "(project_id, qid, body_hash, tests, result_json, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    project_id,
-                    qid,
-                    body_hash,
-                    tests,
-                    json.dumps(result),
-                    time.time(),
+                    project_id, qid, body_hash, tests,
+                    json.dumps(result), time.time(),
                 ),
             )
             self._f._db_conn.commit()
@@ -13503,19 +13576,19 @@ if __name__ == "__main__":
             project_id: Current project identifier.
         """
         if getattr(self._f.valves, "agentic_exec_mode", "off") not in (
-            "subprocess",
-            "docker",
+            "subprocess", "docker"
         ):
             return
         if not getattr(self._f.valves, "agentic_tdd_inter_turn", False):
             return
-        pseudo = (
-            "__design__"
-            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
-        )
+        pseudo = "__design__" + hashlib.md5(
+            " ".join(step.goal.split()).lower().encode()
+        ).hexdigest()[:16]
         pstate = self._f._project_state_manager.get_pstate(project_id)
         pstate["agentic_tdd_pending"] = {"pseudo": pseudo, "goal": step.goal}
-        self._f._log_debug(f"🤖 TDD: armed inter-turn verification for {pseudo}")
+        self._f._log_debug(
+            f"🤖 TDD: armed inter-turn verification for {pseudo}"
+        )
 
     @staticmethod
     def extract_code_blocks(text: str) -> str:
@@ -13561,8 +13634,7 @@ if __name__ == "__main__":
         pstate["agentic_tdd_pending"] = None
 
         if getattr(self._f.valves, "agentic_exec_mode", "off") not in (
-            "subprocess",
-            "docker",
+            "subprocess", "docker"
         ):
             return
 
@@ -13596,11 +13668,8 @@ if __name__ == "__main__":
         }
         # Persist the run under the pseudo qid too (keeps the harness asset).
         self._cache_put(
-            project_id,
-            pending["pseudo"],
-            cached.get("body_hash", ""),
-            cached["tests"],
-            result,
+            project_id, pending["pseudo"],
+            cached.get("body_hash", ""), cached["tests"], result,
         )
         self._f._log_debug(
             f"🤖 TDD: verified generated code — {result.get('status')} "
@@ -13654,7 +13723,7 @@ if __name__ == "__main__":
             )
         return (
             f"## 🤖 Inter-turn verification\n{head}\n"
-            f"_(Acceptance criteria from an earlier design_tests step for: "
+            f'_(Acceptance criteria from an earlier design_tests step for: '
             f'"{goal}". Treat a failure as authoritative — the tests ran '
             f"against your actual generated code.)_"
         )
@@ -13667,12 +13736,13 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else step.output).strip()
         if "def test_" not in tests:
             return
-        pseudo = (
-            "__design__"
-            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
-        )
+        pseudo = "__design__" + hashlib.md5(
+            " ".join(step.goal.split()).lower().encode()
+        ).hexdigest()[:16]
         self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
-        self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
+        self._f._log_debug(
+            f"🤖 DynamicVerifier: design tests persisted as {pseudo}"
+        )
 
 
 class AgenticPlanner:
@@ -13687,15 +13757,7 @@ class AgenticPlanner:
     turn.
     """
 
-    _VALID_KINDS = (
-        "investigate",
-        "analyze",
-        "hypothesize",
-        "verify",
-        "verify_dynamic",
-        "verify_regression",
-        "design_tests",
-    )
+    _VALID_KINDS = ("investigate", "analyze", "hypothesize", "verify", "verify_dynamic", "verify_regression", "design_tests")
 
     _CONTRACT = (
         "You are the planner of an agentic pipeline that will answer a "
@@ -13932,8 +13994,9 @@ class AgenticStepExecutor:
         )
         instruction = template.format(sid=step.id, goal=step.goal)
         if step.symbols:
-            instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
-                step.symbols
+            instruction += (
+                "\nFocus symbols suggested by the planner: "
+                + ", ".join(step.symbols)
             )
         instruction += self._CLAIMS_CONTRACT
         if workspace:
@@ -14027,8 +14090,7 @@ class AgenticStepExecutor:
             )
             prompt = (
                 f"{prompt}\n\n[Your investigation so far]\n{response}"
-                f"\n\n## Tool results\n"
-                + "\n\n".join(results)
+                f"\n\n## Tool results\n" + "\n\n".join(results)
                 + "\n\nContinue this step using the tool results. You may "
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
@@ -14082,19 +14144,22 @@ class AgenticSynthesisComposer:
         ]
 
         header = (
-            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — " f"{len(done)} done"
+            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — "
+            f"{len(done)} done"
         )
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
             header += f"; {total} claims, {ok} with valid citations"
-            refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
+            refuted = sum(
+                1 for c in ledger.claims if c.verification == "refuted"
+            )
             if refuted:
                 header += f", {refuted} REFUTED"
         header += ")"
 
         lines = [
             header,
-            f"_Pre-computed by the agentic pipeline (plan: {plan.source}) "
+            f'_Pre-computed by the agentic pipeline (plan: {plan.source}) '
             f'for the question: "{question}". Synthesize these notes into '
             f"your answer; verify claims against the code context above._",
             "",
@@ -14114,7 +14179,11 @@ class AgenticSynthesisComposer:
                             f"({c.verification_detail})"
                         )
                     elif c.verification == "confirmed":
-                        cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
+                        cited = (
+                            f" [{', '.join(c.valid_qids)}]"
+                            if c.valid_qids
+                            else ""
+                        )
                         lines.append(
                             f"- {badge}✓✓ {c.text}{cited} — verified: "
                             f"{c.verification_detail}"
@@ -14187,7 +14256,7 @@ class AgenticOrchestrator:
         content = user_content.strip()
         if not content.startswith("/agent"):
             return None, ""
-        rest = content[len("/agent") :].strip()
+        rest = content[len("/agent"):].strip()
         if not rest:
             return "help", ""
         first, _, tail = rest.partition(" ")
@@ -14199,58 +14268,17 @@ class AgenticOrchestrator:
     # ── Auto-trigger heuristic (Fase 3) ─────────────────────────────────
 
     _IMPERATIVE_VERBS = (
-        "analiza",
-        "implementa",
-        "revisa",
-        "propon",
-        "proponme",
-        "corrige",
-        "añade",
-        "considera",
-        "compara",
-        "mide",
-        "verifica",
-        "explica",
-        "dime",
-        "dame",
-        "busca",
-        "refactoriza",
-        "optimiza",
-        "documenta",
-        "diseña",
-        "arregla",
-        "investiga",
-        "lista",
-        "implement",
-        "analyze",
-        "review",
-        "propose",
-        "fix",
-        "add",
-        "consider",
-        "compare",
-        "measure",
-        "verify",
-        "explain",
-        "find",
-        "refactor",
-        "optimize",
-        "document",
-        "design",
-        "investigate",
-        "list",
+        "analiza", "implementa", "revisa", "propon", "proponme", "corrige",
+        "añade", "considera", "compara", "mide", "verifica", "explica",
+        "dime", "dame", "busca", "refactoriza", "optimiza", "documenta",
+        "diseña", "arregla", "investiga", "lista", "implement", "analyze",
+        "review", "propose", "fix", "add", "consider", "compare", "measure",
+        "verify", "explain", "find", "refactor", "optimize", "document",
+        "design", "investigate", "list",
     )
     _COORDINATORS = (
-        " y también",
-        " y tambien",
-        " además",
-        " ademas",
-        " luego ",
-        " después",
-        " despues",
-        " and also",
-        " then ",
-        "; ",
+        " y también", " y tambien", " además", " ademas", " luego ",
+        " después", " despues", " and also", " then ", "; ",
     )
 
     @staticmethod
@@ -14400,17 +14428,17 @@ class AgenticOrchestrator:
         if mode == "plan":
             aligned_prefix = self._aligned_prefix(prelim_system)
             plan = await self._planner.plan(question, aligned_prefix, slot_free)
-            steps_txt = "\n".join(f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps)
-            note = (
-                ""
-                if plan.source == "planner_llm"
-                else (f" (fallback plan: {plan.rationale})")
+            steps_txt = "\n".join(
+                f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps
+            )
+            note = "" if plan.source == "planner_llm" else (
+                f" (fallback plan: {plan.rationale})"
             )
             dynamic_injections.append(
                 (
                     "high",
                     "## 🤖 Agentic plan (dry run — not executed)\n"
-                    f"The user asked to preview the agentic plan for: "
+                    f'The user asked to preview the agentic plan for: '
                     f'"{question}"{note}\n'
                     "Present this plan clearly and tell them they can run "
                     f"it with `/agent {question}`:\n{steps_txt}",
@@ -14626,17 +14654,11 @@ class AgenticOrchestrator:
             )
             workspace = self._render_workspace(plan.steps)
             await self._executor.run(
-                step,
-                aligned_prefix,
-                workspace,
-                remaining,
-                project_id=project_id,
-                broker=self._broker,
+                step, aligned_prefix, workspace, remaining,
+                project_id=project_id, broker=self._broker,
             )
             control: Dict[str, Any] = {
-                "resolved": False,
-                "confidence": 0.0,
-                "needs": [],
+                "resolved": False, "confidence": 0.0, "needs": []
             }
             if step.status == "done":
                 control = self._ledger.extract_and_validate(step, project_id)
@@ -14646,9 +14668,7 @@ class AgenticOrchestrator:
                     self._dyn.arm_tdd_verification(step, project_id)
                 if use_cache:
                     self._cache.put(
-                        project_id,
-                        structure_hash,
-                        step,
+                        project_id, structure_hash, step,
                         self._ledger.serialize_for(step.id),
                     )
             self._f._log_debug(
@@ -14681,7 +14701,7 @@ class AgenticOrchestrator:
                 >= self._f.valves.agentic_early_exit_confidence
             ):
                 skipped_ids = []
-                for later in plan.steps[idx + 1 :]:
+                for later in plan.steps[idx + 1:]:
                     if later.status == "pending" and later.kind != "verify":
                         later.status = "skipped"
                         later.skip_reason = "early-exit"
@@ -28326,6 +28346,14 @@ class EnrichmentTasks:
         # unfinished queue and the loop re-runs next turn to finish the job.
         # When stopped by signal, _run_task already marks not_completed, so
         # this is only decisive on the clean-exit path.
+        #
+        # Flush-once policy: LLM-generated docstrings are deliberately kept
+        # out of the skeleton tier's cache key, so they never surface in
+        # Block A on their own. On the clean-exit path this region requests
+        # a single skeleton re-render — when coverage reaches 100%, or when
+        # the queue converges without progress (two clean runs that resolved
+        # nothing new: permanent per-symbol failures should not hold the
+        # accumulated coverage hostage forever).
         remaining = _count_pending()
         if remaining > 0 and not stopped:
             task_def = self._f._task_registry.get_task_definition("docstrings")
@@ -28335,12 +28363,73 @@ class EnrichmentTasks:
                 f"bg_docstring: finished with {remaining} symbol(s) still "
                 f"pending — task kept not-completed so it re-runs next turn"
             )
-        else:
+            if total_docstrings == 0:
+                stalls = int(pstate.get("docstring_bg_stall_runs", 0)) + 1
+                pstate["docstring_bg_stall_runs"] = stalls
+                if stalls >= 2:
+                    self._request_skeleton_docstring_flush(project_id, "stalled")
+            else:
+                pstate["docstring_bg_stall_runs"] = 0
+        elif not stopped:
+            pstate["docstring_bg_stall_runs"] = 0
+            self._request_skeleton_docstring_flush(project_id, "complete")
             self._f._log_debug("bg_docstring: finished")
+        else:
+            self._f._log_debug("bg_docstring: finished (stopped by signal)")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Helper methods for background docstring (unchanged)
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _request_skeleton_docstring_flush(
+        self,
+        project_id: str,
+        reason: str,
+    ) -> None:
+        """
+        Request a one-time skeleton re-render so accumulated LLM-generated
+        docstrings become visible in Block A.
+
+        The skeleton tier is cached by structure_hash, which deliberately
+        ignores docstrings, so background-generated docstrings never reach
+        Block A in a read-only session. This sets a pstate flag consumed by
+        build_block_a at the start of a later turn, busting the Block A and
+        skeleton-tier caches exactly once. Guards make the request
+        idempotent: skipped when docstrings are not rendered into the
+        skeleton at all, when a request is already pending, or when a flush
+        already ran for the current structure_hash (so a converged-but-
+        incomplete queue re-running every turn cannot flush repeatedly).
+
+        Args:
+            project_id: Current project identifier.
+            reason: Short label for the log line ("complete" | "stalled").
+        """
+        # Region: valve gates — feature must be meaningful and enabled
+        valves = self._f.valves
+        if not (
+            valves.skeleton_include_docstrings
+            and valves.docstring_flush_on_complete
+        ):
+            return
+
+        # Region: idempotence guards (pending flag, per-structure done marker)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        if pstate.get("skeleton_docstring_flush_pending"):
+            return
+        current_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        if current_hash and pstate.get("docstring_flush_done_hash") == current_hash:
+            self._f._log_debug(
+                "bg_docstring: flush already performed for this structure "
+                "hash — skipping"
+            )
+            return
+
+        # Region: raise the flag for build_block_a to consume
+        pstate["skeleton_docstring_flush_pending"] = True
+        self._f._log_debug(
+            f"bg_docstring: skeleton docstring flush requested ({reason}) — "
+            "Block A will re-render once on a later turn"
+        )
 
     async def cancel_docstring_tasks(self) -> None:
         """
@@ -35564,6 +35653,9 @@ class ProjectStateManager:
             "skeleton_tier_qids": [],
             "agentic_tdd_pending": None,
             "agentic_tdd_last_verdict": None,
+            "skeleton_docstring_flush_pending": False,
+            "docstring_flush_done_hash": None,
+            "docstring_bg_stall_runs": 0,
             # -- Centrality and lightweight context -----------------------
             "node_centrality": {},
             "node_centrality_structure_hash": None,
@@ -39233,6 +39325,18 @@ class Filter:
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
+        raptor_min_similarity: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Cosine-similarity floor for RAPTOR cluster summaries injected "
+                "into Block B. Hits below the floor are dropped, so off-topic "
+                "queries stop receiving top-k summaries unconditionally. 0.0 "
+                "disables the floor (previous behavior). Calibrate from the "
+                "per-hit 'RAPTOR retrieve: sim=' debug lines."
+            ),
+        )
         raptor_rebuild_interval: int = Field(default=20)
         raptor_use_call_graph_proximity: bool = Field(
             default=True,
@@ -39552,6 +39656,17 @@ class Filter:
         skeleton_include_docstrings: bool = Field(
             default=True,
             description="Include one‑line docstrings in the skeleton tier.",
+        )
+        docstring_flush_on_complete: bool = Field(
+            default=True,
+            description=(
+                "Re-render the skeleton tier ONCE when background docstring "
+                "generation reaches full coverage (or the queue stalls), so "
+                "LLM-generated docstrings become visible in Block A. Costs a "
+                "single partial prefill from the skeleton's position; when "
+                "off, generated docstrings only surface after the next "
+                "structural edit."
+            ),
         )
         emergency_max_turns: int = Field(
             default=4,
