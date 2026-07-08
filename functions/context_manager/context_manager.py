@@ -7307,7 +7307,9 @@ class ContextBuilder:
                     or intent_vector.get("debug", 0.0)
                     >= self._f.valves.cfg_skeleton_debug_intent_threshold
                 ):
-                    cfg_skeleton = self._f._symbol_index.get_cfg(qid, project_id) or ""
+                    cfg_skeleton = (
+                        self._f._symbol_index.get_cfg(qid, project_id) or ""
+                    )
 
                 if cfg_skeleton:
                     self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
@@ -12307,10 +12309,7 @@ class AgenticEvidenceLedger:
             defaults (False, 0.0, []) when the tail is absent or broken.
         """
         control: Dict[str, Any] = {
-            "resolved": False,
-            "confidence": 0.0,
-            "needs": [],
-            "ask": "",
+            "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
         }
 
         # Region: locate and strip the fenced JSON tail
@@ -12357,9 +12356,7 @@ class AgenticEvidenceLedger:
             if not text:
                 continue
             claim = LedgerClaim(
-                step_id=step.id,
-                text=text,
-                qids=qids[:8],
+                step_id=step.id, text=text, qids=qids[:8],
                 confidence=max(0.0, min(1.0, conf)),
             )
             for qid in claim.qids:
@@ -12383,7 +12380,9 @@ class AgenticEvidenceLedger:
 
     def serialize_for(self, step_id: int) -> str:
         """JSON-serialize this step's claims for the cache."""
-        return json.dumps([c.__dict__ for c in self.claims if c.step_id == step_id])
+        return json.dumps(
+            [c.__dict__ for c in self.claims if c.step_id == step_id]
+        )
 
     def claims_for(self, step_id: int) -> List[LedgerClaim]:
         """Claims emitted by one step."""
@@ -12472,15 +12471,9 @@ class AgenticStepCache:
         if self._f._db_conn is None or not structure_hash:
             return
         row = (
-            project_id,
-            self.step_key(step),
-            structure_hash,
-            step.kind,
-            step.goal,
-            step.output,
-            step.digest,
-            claims_json,
-            time.time(),
+            project_id, self.step_key(step), structure_hash,
+            step.kind, step.goal, step.output, step.digest,
+            claims_json, time.time(),
         )
 
         def _write(row: tuple = row) -> None:
@@ -12599,7 +12592,9 @@ class AgenticToolBroker:
             return f"[{label}: none recorded]"
         lines = [f"### {label}"]
         for ed in edges[: self._MAX_EDGES]:
-            lines.append(f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}")
+            lines.append(
+                f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}"
+            )
         if len(edges) > self._MAX_EDGES:
             lines.append(f"- … {len(edges) - self._MAX_EDGES} more omitted")
         return "\n".join(lines)
@@ -12636,7 +12631,10 @@ class AgenticToolBroker:
                 break
         if not hits:
             return f"[GREP: no matches for {pattern!r}]"
-        return f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n" + "\n".join(hits)
+        return (
+            f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n"
+            + "\n".join(hits)
+        )
 
 
 class AgenticStaticVerifier:
@@ -12782,12 +12780,8 @@ class AgenticStaticVerifier:
         for n, c in enumerate(claims, 1):
             qids = c.valid_qids or c.qids
             if len(qids) >= 2:
-                checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]}
-                )
-                checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]}
-                )
+                checks.append({"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]})
+                checks.append({"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]})
             elif qids:
                 checks.append({"claim": n, "kind": "exists", "src": qids[0]})
         return checks[:12]
@@ -12905,49 +12899,18 @@ class AgenticTestabilityClassifier:
     """
 
     _ALLOWED_MODULES = {
-        "re",
-        "json",
-        "math",
-        "hashlib",
-        "time",
-        "itertools",
-        "functools",
-        "collections",
-        "typing",
-        "dataclasses",
-        "string",
-        "textwrap",
-        "difflib",
-        "bisect",
-        "heapq",
-        "enum",
-        "copy",
+        "re", "json", "math", "hashlib", "time", "itertools", "functools",
+        "collections", "typing", "dataclasses", "string", "textwrap",
+        "difflib", "bisect", "heapq", "enum", "copy",
     }
     _SHALLOW_SELF = {"_f", "valves", "_log_debug", "_tokens", "tokenizer"}
     _IO_NAMES = {
-        "open",
-        "eval",
-        "exec",
-        "__import__",
-        "input",
-        "compile",
+        "open", "eval", "exec", "__import__", "input", "compile",
     }
     _IO_MODULES = {
-        "os",
-        "sys",
-        "subprocess",
-        "shutil",
-        "socket",
-        "requests",
-        "urllib",
-        "http",
-        "aiohttp",
-        "sqlite3",
-        "pathlib",
-        "anyio",
-        "asyncio",
-        "chromadb",
-        "torch",
+        "os", "sys", "subprocess", "shutil", "socket", "requests", "urllib",
+        "http", "aiohttp", "sqlite3", "pathlib", "anyio", "asyncio",
+        "chromadb", "torch",
     }
 
     @classmethod
@@ -13050,20 +13013,14 @@ class AgenticTestabilityClassifier:
                         defined.add(t.id)
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called.add(node.func.id)
-        builtins = (
-            set(dir(__builtins__))
-            if isinstance(__builtins__, dict)
-            else set(dir(__builtins__))
-        )
+        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
         try:
             import builtins as _b
-
             builtins |= set(dir(_b))
         except Exception:
             pass
         free = [
-            n
-            for n in called
+            n for n in called
             if n not in defined
             and n not in imported
             and n not in params
@@ -13099,26 +13056,10 @@ class AgenticSandboxRunner:
     """
 
     _DENYLIST = (
-        "import os",
-        "from os",
-        "import sys",
-        "from sys",
-        "subprocess",
-        "socket",
-        "shutil",
-        "requests",
-        "urllib",
-        "http.client",
-        "ftplib",
-        "smtplib",
-        "ctypes",
-        "pickle",
-        "eval(",
-        "exec(",
-        "__import__",
-        "open(",
-        "pathlib",
-        "os.system",
+        "import os", "from os", "import sys", "from sys", "subprocess",
+        "socket", "shutil", "requests", "urllib", "http.client", "ftplib",
+        "smtplib", "ctypes", "pickle", "eval(", "exec(", "__import__",
+        "open(", "pathlib", "os.system",
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -13144,10 +13085,7 @@ class AgenticSandboxRunner:
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             return {
-                "status": "error",
-                "passed": 0,
-                "total": 0,
-                "failures": [],
+                "status": "error", "passed": 0, "total": 0, "failures": [],
                 "detail": (
                     f"agentic_exec_mode='{mode}' has no runner in this build "
                     f"— no harness was executed; use 'subprocess'"
@@ -13159,11 +13097,8 @@ class AgenticSandboxRunner:
         for token in self._DENYLIST:
             if token in lowered:
                 return {
-                    "status": "rejected",
-                    "passed": 0,
-                    "total": 0,
-                    "failures": [],
-                    "detail": f"denylist token: {token}",
+                    "status": "rejected", "passed": 0, "total": 0,
+                    "failures": [], "detail": f"denylist token: {token}",
                 }
 
         # Region: prepend the rlimit prelude AFTER the tripwire, so the
@@ -13207,19 +13142,13 @@ class AgenticSandboxRunner:
                     )
                 except _sp.TimeoutExpired:
                     return {
-                        "status": "timeout",
-                        "passed": 0,
-                        "total": 0,
-                        "failures": [],
-                        "detail": f"wall timeout {timeout}s",
+                        "status": "timeout", "passed": 0, "total": 0,
+                        "failures": [], "detail": f"wall timeout {timeout}s",
                     }
                 except Exception as e:
                     return {
-                        "status": "error",
-                        "passed": 0,
-                        "total": 0,
-                        "failures": [],
-                        "detail": f"spawn failed: {e}",
+                        "status": "error", "passed": 0, "total": 0,
+                        "failures": [], "detail": f"spawn failed: {e}",
                     }
 
                 # -- parse the runner's JSON line from stdout --------------
@@ -13230,22 +13159,24 @@ class AgenticSandboxRunner:
                             data = json.loads(line)
                             passed = int(data.get("passed", 0))
                             total = int(data.get("total", 0))
-                            status = "pass" if total > 0 and passed == total else "fail"
+                            status = (
+                                "pass"
+                                if total > 0 and passed == total
+                                else "fail"
+                            )
                             return {
                                 "status": status,
                                 "passed": passed,
                                 "total": total,
-                                "failures": [str(x) for x in data.get("failures", [])][
-                                    :5
-                                ],
+                                "failures": [
+                                    str(x) for x in data.get("failures", [])
+                                ][:5],
                                 "detail": "",
                             }
                         except Exception:
                             break
                 return {
-                    "status": "error",
-                    "passed": 0,
-                    "total": 0,
+                    "status": "error", "passed": 0, "total": 0,
                     "failures": [],
                     "detail": (proc.stderr or proc.stdout or "no output")[-500:],
                 }
@@ -13378,7 +13309,9 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
-            step.output = f"(dynamic verification disabled: agentic_exec_mode={mode})"
+            step.output = (
+                f"(dynamic verification disabled: agentic_exec_mode={mode})"
+            )
             step.seconds = time.monotonic() - started
             return
 
@@ -13437,7 +13370,9 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
-            step.output = f"(regression disabled: agentic_exec_mode={mode})"
+            step.output = (
+                f"(regression disabled: agentic_exec_mode={mode})"
+            )
             step.seconds = time.monotonic() - started
             return
 
@@ -13472,7 +13407,8 @@ if __name__ == "__main__":
 
         # Region: re-verify each caller via the shared per-target flow
         report_lines = [
-            f"## Regression over {len(callers)} caller(s) of " f"{', '.join(seeds)}"
+            f"## Regression over {len(callers)} caller(s) of "
+            f"{', '.join(seeds)}"
         ]
         for qid in callers:
             remaining = timeout_s - (time.monotonic() - started)
@@ -13579,11 +13515,9 @@ if __name__ == "__main__":
         timeout_s: float,
     ) -> str:
         """One aligned LLM call producing the tests section ('' on failure)."""
-        prompt = (
-            self._TESTS_CONTRACT.replace("{body}", body[:8000])
-            .replace("{verdict}", verdict)
-            .replace("{reasons}", "; ".join(reasons))
-        )
+        prompt = self._TESTS_CONTRACT.replace("{body}", body[:8000]).replace(
+            "{verdict}", verdict
+        ).replace("{reasons}", "; ".join(reasons))
         try:
             response = await asyncio.wait_for(
                 self._f._llm_orchestrator.call_llm(
@@ -13605,7 +13539,9 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else response).strip()
         return tests if "def test_" in tests else ""
 
-    def _resolve_callee_bodies(self, body: str, self_qid: str, project_id: str) -> str:
+    def _resolve_callee_bodies(
+        self, body: str, self_qid: str, project_id: str
+    ) -> str:
         """
         Extract the bodies of project symbols this symbol calls, so a caller
         that invokes another project function remains executable in the
@@ -13696,7 +13632,9 @@ if __name__ == "__main__":
             base += f" — {result['detail'][:160]}"
         return base
 
-    async def _cache_get(self, project_id: str, qid: str) -> Optional[Dict[str, str]]:
+    async def _cache_get(
+        self, project_id: str, qid: str
+    ) -> Optional[Dict[str, str]]:
         """Row from agentic_harnesses or None (serialized via _db_read)."""
         if self._f._db_conn is None:
             return None
@@ -13733,12 +13671,8 @@ if __name__ == "__main__":
         if self._f._db_conn is None:
             return
         row = (
-            project_id,
-            qid,
-            body_hash,
-            tests,
-            json.dumps(result),
-            time.time(),
+            project_id, qid, body_hash, tests,
+            json.dumps(result), time.time(),
         )
 
         def _write(row: tuple = row) -> None:
@@ -13775,13 +13709,14 @@ if __name__ == "__main__":
             return
         if not getattr(self._f.valves, "agentic_tdd_inter_turn", False):
             return
-        pseudo = (
-            "__design__"
-            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
-        )
+        pseudo = "__design__" + hashlib.md5(
+            " ".join(step.goal.split()).lower().encode()
+        ).hexdigest()[:16]
         pstate = self._f._project_state_manager.get_pstate(project_id)
         pstate["agentic_tdd_pending"] = {"pseudo": pseudo, "goal": step.goal}
-        self._f._log_debug(f"🤖 TDD: armed inter-turn verification for {pseudo}")
+        self._f._log_debug(
+            f"🤖 TDD: armed inter-turn verification for {pseudo}"
+        )
 
     @staticmethod
     def extract_code_blocks(text: str) -> str:
@@ -13859,11 +13794,8 @@ if __name__ == "__main__":
         }
         # Persist the run under the pseudo qid too (keeps the harness asset).
         await self._cache_put(
-            project_id,
-            pending["pseudo"],
-            cached.get("body_hash", ""),
-            cached["tests"],
-            result,
+            project_id, pending["pseudo"],
+            cached.get("body_hash", ""), cached["tests"], result,
         )
         self._f._log_debug(
             f"🤖 TDD: verified generated code — {result.get('status')} "
@@ -13917,12 +13849,14 @@ if __name__ == "__main__":
             )
         return (
             f"## 🤖 Inter-turn verification\n{head}\n"
-            f"_(Acceptance criteria from an earlier design_tests step for: "
+            f'_(Acceptance criteria from an earlier design_tests step for: '
             f'"{goal}". Treat a failure as authoritative — the tests ran '
             f"against your actual generated code.)_"
         )
 
-    async def persist_design_tests(self, step: AgenticStep, project_id: str) -> None:
+    async def persist_design_tests(
+        self, step: AgenticStep, project_id: str
+    ) -> None:
         """Persist a design_tests step's harness under a goal-keyed pseudo
         qid so the Fase 6 inter-turn loop can pick it up after the main
         call generates the implementation."""
@@ -13930,12 +13864,15 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else step.output).strip()
         if "def test_" not in tests:
             return
-        pseudo = (
-            "__design__"
-            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
+        pseudo = "__design__" + hashlib.md5(
+            " ".join(step.goal.split()).lower().encode()
+        ).hexdigest()[:16]
+        await self._cache_put(
+            project_id, pseudo, "", tests, {"status": "pending"}
         )
-        await self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
-        self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
+        self._f._log_debug(
+            f"🤖 DynamicVerifier: design tests persisted as {pseudo}"
+        )
 
 
 class AgenticPlanner:
@@ -13950,15 +13887,7 @@ class AgenticPlanner:
     turn.
     """
 
-    _VALID_KINDS = (
-        "investigate",
-        "analyze",
-        "hypothesize",
-        "verify",
-        "verify_dynamic",
-        "verify_regression",
-        "design_tests",
-    )
+    _VALID_KINDS = ("investigate", "analyze", "hypothesize", "verify", "verify_dynamic", "verify_regression", "design_tests")
 
     _CONTRACT = (
         "You are the planner of an agentic pipeline that will answer a "
@@ -14195,8 +14124,9 @@ class AgenticStepExecutor:
         )
         instruction = template.format(sid=step.id, goal=step.goal)
         if step.symbols:
-            instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
-                step.symbols
+            instruction += (
+                "\nFocus symbols suggested by the planner: "
+                + ", ".join(step.symbols)
             )
         instruction += self._CLAIMS_CONTRACT
         if workspace:
@@ -14290,8 +14220,7 @@ class AgenticStepExecutor:
             )
             prompt = (
                 f"{prompt}\n\n[Your investigation so far]\n{response}"
-                f"\n\n## Tool results\n"
-                + "\n\n".join(results)
+                f"\n\n## Tool results\n" + "\n\n".join(results)
                 + "\n\nContinue this step using the tool results. You may "
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
@@ -14354,19 +14283,22 @@ class AgenticSynthesisComposer:
         ]
 
         header = (
-            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — " f"{len(done)} done"
+            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — "
+            f"{len(done)} done"
         )
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
             header += f"; {total} claims, {ok} with valid citations"
-            refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
+            refuted = sum(
+                1 for c in ledger.claims if c.verification == "refuted"
+            )
             if refuted:
                 header += f", {refuted} REFUTED"
         header += ")"
 
         lines = [
             header,
-            f"_Pre-computed by the agentic pipeline (plan: {plan.source}) "
+            f'_Pre-computed by the agentic pipeline (plan: {plan.source}) '
             f'for the question: "{question}". Synthesize these notes into '
             f"your answer; verify claims against the code context above._",
             "",
@@ -14386,7 +14318,11 @@ class AgenticSynthesisComposer:
                             f"({c.verification_detail})"
                         )
                     elif c.verification == "confirmed":
-                        cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
+                        cited = (
+                            f" [{', '.join(c.valid_qids)}]"
+                            if c.valid_qids
+                            else ""
+                        )
                         lines.append(
                             f"- {badge}✓✓ {c.text}{cited} — verified: "
                             f"{c.verification_detail}"
@@ -14459,7 +14395,7 @@ class AgenticOrchestrator:
         content = user_content.strip()
         if not content.startswith("/agent"):
             return None, ""
-        rest = content[len("/agent") :].strip()
+        rest = content[len("/agent"):].strip()
         if not rest:
             return "help", ""
         first, _, tail = rest.partition(" ")
@@ -14471,58 +14407,17 @@ class AgenticOrchestrator:
     # ── Auto-trigger heuristic (Fase 3) ─────────────────────────────────
 
     _IMPERATIVE_VERBS = (
-        "analiza",
-        "implementa",
-        "revisa",
-        "propon",
-        "proponme",
-        "corrige",
-        "añade",
-        "considera",
-        "compara",
-        "mide",
-        "verifica",
-        "explica",
-        "dime",
-        "dame",
-        "busca",
-        "refactoriza",
-        "optimiza",
-        "documenta",
-        "diseña",
-        "arregla",
-        "investiga",
-        "lista",
-        "implement",
-        "analyze",
-        "review",
-        "propose",
-        "fix",
-        "add",
-        "consider",
-        "compare",
-        "measure",
-        "verify",
-        "explain",
-        "find",
-        "refactor",
-        "optimize",
-        "document",
-        "design",
-        "investigate",
-        "list",
+        "analiza", "implementa", "revisa", "propon", "proponme", "corrige",
+        "añade", "considera", "compara", "mide", "verifica", "explica",
+        "dime", "dame", "busca", "refactoriza", "optimiza", "documenta",
+        "diseña", "arregla", "investiga", "lista", "implement", "analyze",
+        "review", "propose", "fix", "add", "consider", "compare", "measure",
+        "verify", "explain", "find", "refactor", "optimize", "document",
+        "design", "investigate", "list",
     )
     _COORDINATORS = (
-        " y también",
-        " y tambien",
-        " además",
-        " ademas",
-        " luego ",
-        " después",
-        " despues",
-        " and also",
-        " then ",
-        "; ",
+        " y también", " y tambien", " además", " ademas", " luego ",
+        " después", " despues", " and also", " then ", "; ",
     )
 
     @staticmethod
@@ -14598,6 +14493,215 @@ class AgenticOrchestrator:
             return self._f._tokens.truncate_text_to_tokens(prelim_system, cap)
         return prelim_system[: cap * 4]
 
+    def _should_reinforce_step(
+        self, step: AgenticStep, control: Dict[str, Any], project_id: str
+    ) -> Tuple[bool, str]:
+        """
+        Cheap difficulty gate for the metacognitive reinforcement (Fase 8).
+
+        No LLM call: both signals were already produced by the step itself.
+          - Primary: the ledger flagged fabricated identifiers
+            (invalid_qids) — the step asserted structure the SymbolIndex
+            does not know, the cleanest "this needs falsification" signal.
+          - Secondary: the step emitted claims but ended unresolved below
+            agentic_metacog_confidence_floor.
+
+        Verify-family and design_tests steps never escalate (they have
+        their own verification machinery). Steps without claims never
+        escalate on confidence alone: an empty claim set scores 0 by
+        construction and would escalate everything.
+
+        Returns:
+            (escalate, reason) — reason is a short log token.
+        """
+        if step.kind not in ("investigate", "analyze", "hypothesize"):
+            return False, ""
+        step_claims = [c for c in self._ledger.claims if c.step_id == step.id]
+        if not step_claims:
+            return False, ""
+        n_invalid = sum(1 for c in step_claims if c.invalid_qids)
+        if n_invalid:
+            return True, f"invalid_qids:{n_invalid}"
+        floor = self._f.valves.agentic_metacog_confidence_floor
+        if not control.get("resolved") and control.get("confidence", 0.0) < floor:
+            return True, f"low_confidence:{control.get('confidence', 0.0):.2f}"
+        return False, ""
+
+    async def _reinforce_step(
+        self, step: AgenticStep, remaining: float, project_id: str
+    ) -> None:
+        """
+        Escalate a difficult step's claims to the metacognitive engine.
+
+        The step's ledger claims become rival hypotheses (text + claim
+        confidence as prior) for compete_hypotheses under static
+        falsification; the surviving verdict annotates step.output BEFORE
+        the digest/cache are computed, so both the synthesis workspace and
+        future cache hits carry the reinforced result.
+
+        Budget: bounded to half the remaining pipeline budget (15s reserve,
+        20s floor) via wait_for — a timeout keeps the original output.
+
+        KV: compete_hypotheses' internal calls use their own prompts and
+        dirty the single slot, so the pre-aligned launchpad guard is reset
+        and re-fired afterwards — the next aligned step pays only the
+        Block B divergence again instead of the full prefix.
+        """
+        # Region: hypotheses from claims (prior = claim confidence)
+        claims = [c for c in self._ledger.claims if c.step_id == step.id][:4]
+        if not claims:
+            return
+        hypotheses = [
+            (c.text, max(0.05, min(0.95, float(c.confidence or 0.5))))
+            for c in claims
+        ]
+
+        # Region: deadline carved from the shared pipeline budget
+        deadline = max(20.0, min(remaining * 0.5, remaining - 15.0))
+        await self._f._emit_status(
+            f"🤖 Agentic step {step.id}: metacognitive reinforcement "
+            f"({len(hypotheses)} rival claims, ≤{deadline:.0f}s)"
+        )
+        t0 = time.monotonic()
+        try:
+            best, score, _evidence, peer = await asyncio.wait_for(
+                self._f._meta_reasoning.compete_hypotheses(
+                    hypotheses,
+                    project_id,
+                    max_iters=self._f.valves.agentic_metacog_max_iters,
+                    label="agentic_reinforce",
+                ),
+                timeout=deadline,
+            )
+        except asyncio.TimeoutError:
+            self._f._log_debug(
+                f"🤖 Agentic reinforcement: step {step.id} timed out after "
+                f"{deadline:.0f}s — keeping the original output"
+            )
+            return
+        except Exception as exc:
+            self._f._log_debug(
+                f"🤖 Agentic reinforcement: step {step.id} failed "
+                f"({type(exc).__name__}: {exc}) — keeping the original output"
+            )
+            return
+
+        # Region: annotate the step (digest/cache pick this up downstream)
+        lines = [
+            "",
+            "",
+            "### Metacognitive reinforcement (static falsification)",
+            f"Surviving claim (score {score:.2f}): {best}",
+        ]
+        if peer is not None and getattr(peer, "verdict", ""):
+            lines.append(f"Peer review: {peer.verdict}")
+        step.output = (step.output or "") + "\n".join(lines)
+        self._f._log_debug(
+            f"🤖 Agentic reinforcement: step {step.id} reinforced in "
+            f"{time.monotonic() - t0:.1f}s (score {score:.2f})"
+        )
+
+        # Region: re-arm the pre-aligned launchpad (competition dirtied it)
+        if self._f.valves.enable_slot_persistence and project_id:
+            pstate = self._f._project_state_manager.get_pstate(project_id)
+            stale = [
+                k
+                for k in list(pstate.keys())
+                if k.startswith("_slot_cont_attempted_pre_aligned_")
+                or k.startswith("_slot_cont_succeeded_pre_aligned_")
+            ]
+            for k in stale:
+                del pstate[k]
+            await self._f._project_state_manager.slot_restore_for_continuity(
+                project_id, authoritative=True, purpose="pre_aligned"
+            )
+
+    async def _generative_evaluation(
+        self,
+        plan: AgenticPlan,
+        question: str,
+        aligned_prefix: str,
+        remaining: float,
+        project_id: str,
+    ) -> Tuple[str, List[AgenticStep]]:
+        """
+        Ask the IMPROVEMENT question over the finished workspace (Fase 9).
+
+        The epistemic axis (is this correct?) already ran — the verify step
+        checked the claims. This is the other axis: is there a better
+        angle nobody explored? One aligned JSON-contract call proposes up
+        to 2 follow-up steps (investigate/analyze only — a wave must never
+        recursively replan). Parse-or-nothing: any failure returns an
+        empty wave and the pipeline proceeds to synthesis unchanged.
+
+        Returns:
+            (angle, wave_steps) — both empty when no improvement is found.
+        """
+        # Region: compact workspace digest for the evaluator
+        workspace = self._render_workspace(plan.steps)
+        workspace = self._f._tokens.truncate_text_to_tokens(workspace, 1200)
+
+        prompt = (
+            f"Original request:\n{question}\n\n"
+            f"Workspace after execution (correctness already verified):\n"
+            f"{workspace}\n\n"
+            "Correctness is NOT your job. Answer the improvement question "
+            "only: is there a materially better angle, a simpler solution, "
+            "or an unexplored option that the steps above missed?\n"
+            "If yes, propose at most 2 follow-up steps.\n"
+            'Output ONLY a JSON object: {"improvement_found": true|false, '
+            '"angle": "one sentence", "steps": [{"kind": '
+            '"investigate"|"analyze", "goal": "..."}]}. '
+            "No markdown fences, no prose."
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._f._llm_orchestrator.call_llm(
+                    prompt=prompt,
+                    system_prompt=aligned_prefix,
+                    model_override=self._f.valves.cot_model_level2,
+                    max_tokens=400,
+                    temperature=0.2,
+                    label="agentic_generative_eval",
+                    response_format={"type": "json_object"},
+                    enable_thinking=False,
+                ),
+                timeout=max(20.0, min(remaining * 0.3, 120.0)),
+            )
+        except Exception:
+            return "", []
+        if not response:
+            return "", []
+
+        # Region: parse-or-nothing
+        cleaned = response.replace("```json", "").replace("```", "").strip()
+        try:
+            data = json.loads(cleaned)
+            assert isinstance(data, dict)
+        except Exception:
+            return "", []
+        if not data.get("improvement_found"):
+            return "", []
+        angle = str(data.get("angle", "") or "").strip()
+        wave: List[AgenticStep] = []
+        next_id = max((s.id for s in plan.steps), default=0) + 1
+        for raw in (data.get("steps") or [])[:2]:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind", "investigate")).strip().lower()
+            if kind not in ("investigate", "analyze"):
+                kind = "investigate"
+            goal = str(raw.get("goal", "") or "").strip()
+            if not goal:
+                continue
+            wave.append(
+                AgenticStep(id=next_id, goal="Improve: " + goal, kind=kind)
+            )
+            next_id += 1
+        if not wave:
+            return "", []
+        return angle, wave
+
     def _digest(self, text: str) -> str:
         """
         Compress a step output for the workspace.
@@ -14671,18 +14775,22 @@ class AgenticOrchestrator:
         # Region: dry run — plan with the planner, present, do not execute
         if mode == "plan":
             aligned_prefix = self._aligned_prefix(prelim_system)
+            if self._f.valves.enable_slot_persistence and project_id:
+                await self._f._project_state_manager.slot_restore_for_continuity(
+                    project_id, authoritative=True, purpose="pre_aligned"
+                )
             plan = await self._planner.plan(question, aligned_prefix, slot_free)
-            steps_txt = "\n".join(f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps)
-            note = (
-                ""
-                if plan.source == "planner_llm"
-                else (f" (fallback plan: {plan.rationale})")
+            steps_txt = "\n".join(
+                f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps
+            )
+            note = "" if plan.source == "planner_llm" else (
+                f" (fallback plan: {plan.rationale})"
             )
             dynamic_injections.append(
                 (
                     "high",
                     "## 🤖 Agentic plan (dry run — not executed)\n"
-                    f"The user asked to preview the agentic plan for: "
+                    f'The user asked to preview the agentic plan for: '
                     f'"{question}"{note}\n'
                     "Present this plan clearly and tell them they can run "
                     f"it with `/agent {question}`:\n{steps_txt}",
@@ -14808,6 +14916,15 @@ class AgenticOrchestrator:
         aligned_prefix = self._aligned_prefix(prelim_system)
         budget = float(self._f.valves.agentic_max_seconds)
         started = time.monotonic()
+        # Pre-aligned launchpad: earlier non-aligned auxiliaries (intent
+        # classifiers, cot_config) leave the slot on their own small
+        # prompts; without this, the FIRST aligned call below re-prefills
+        # the whole system prefix. Restoring the .bin first means every
+        # pipeline call only pays the Block B divergence.
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(
+                project_id, authoritative=True, purpose="pre_aligned"
+            )
         await self._f._emit_status("🤖 Agentic: planning…")
         plan = await self._planner.plan(question, aligned_prefix, slot_free)
         self._f._log_debug(
@@ -14941,30 +15058,58 @@ class AgenticOrchestrator:
             )
             workspace = self._render_workspace(plan.steps)
             await self._executor.run(
-                step,
-                aligned_prefix,
-                workspace,
-                remaining,
-                project_id=project_id,
-                broker=self._broker,
+                step, aligned_prefix, workspace, remaining,
+                project_id=project_id, broker=self._broker,
             )
             control: Dict[str, Any] = {
-                "resolved": False,
-                "confidence": 0.0,
-                "needs": [],
-                "ask": "",
+                "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
             }
             if step.status == "done":
                 control = self._ledger.extract_and_validate(step, project_id)
+
+                # -- metacognitive reinforcement gate (Fase 8) ----------
+                # Runs BEFORE digest/cache so both carry the reinforced
+                # output. Shadow mode logs the decision without paying.
+                _mc_mode = self._f.valves.agentic_metacog_reinforce
+                if _mc_mode in ("shadow", "on"):
+                    _esc, _why = self._should_reinforce_step(
+                        step, control, project_id
+                    )
+                    if _esc and _mc_mode == "shadow":
+                        self._f._log_debug(
+                            f"🤖 [METACOG-SHADOW] step {step.id} "
+                            f"({step.kind}) would escalate ({_why}) — "
+                            f"continuing without reinforcement"
+                        )
+                    elif _esc:
+                        _rem_now = budget - (time.monotonic() - started)
+                        if (
+                            _rem_now
+                            >= self._f.valves.agentic_metacog_min_remaining_s
+                        ):
+                            self._f._log_debug(
+                                f"🤖 Agentic: step {step.id} escalates to "
+                                f"metacognitive reinforcement ({_why})"
+                            )
+                            await self._reinforce_step(
+                                step, _rem_now, project_id
+                            )
+                        else:
+                            self._f._log_debug(
+                                f"🤖 Agentic: step {step.id} qualifies for "
+                                f"reinforcement ({_why}) but only "
+                                f"{_rem_now:.0f}s remain (< "
+                                f"{self._f.valves.agentic_metacog_min_remaining_s}s) "
+                                f"— skipped"
+                            )
+
                 step.digest = self._digest(step.output)
                 if step.kind == "design_tests":
                     await self._dyn.persist_design_tests(step, project_id)
                     self._dyn.arm_tdd_verification(step, project_id)
                 if use_cache:
                     await self._cache.put(
-                        project_id,
-                        structure_hash,
-                        step,
+                        project_id, structure_hash, step,
                         self._ledger.serialize_for(step.id),
                     )
             self._f._log_debug(
@@ -14997,7 +15142,7 @@ class AgenticOrchestrator:
                 >= self._f.valves.agentic_early_exit_confidence
             ):
                 skipped_ids = []
-                for later in plan.steps[idx + 1 :]:
+                for later in plan.steps[idx + 1:]:
                     if later.status == "pending" and later.kind != "verify":
                         later.status = "skipped"
                         later.skip_reason = "early-exit"
@@ -15053,6 +15198,72 @@ class AgenticOrchestrator:
                 return
 
             idx += 1
+
+        # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
+        # The epistemic axis (is it correct?) closed with the verify step;
+        # this is the generative axis (is there something better?). Each
+        # approved wave appends executor-only follow-up steps — no control
+        # signals, so a wave can never recursively replan — and the next
+        # round only runs while replans and budget remain.
+        _ge_mode = self._f.valves.agentic_generative_eval
+        _replans_used = 0
+        while (
+            _ge_mode in ("shadow", "on")
+            and _replans_used < self._f.valves.agentic_max_replans
+        ):
+            _rem_now = budget - (time.monotonic() - started)
+            if _rem_now < self._f.valves.agentic_replan_min_remaining_s:
+                self._f._log_debug(
+                    f"🤖 Agentic: generative evaluation skipped — "
+                    f"{_rem_now:.0f}s remain (< "
+                    f"{self._f.valves.agentic_replan_min_remaining_s}s)"
+                )
+                break
+            _angle, _wave = await self._generative_evaluation(
+                plan, question, aligned_prefix, _rem_now, project_id
+            )
+            if not _wave:
+                break
+            if _ge_mode == "shadow":
+                self._f._log_debug(
+                    f"🤖 [REPLAN-SHADOW] would replan (angle: {_angle[:80]}) "
+                    f"with {len(_wave)} step(s): "
+                    + "; ".join(s.goal[:60] for s in _wave)
+                )
+                break
+            _replans_used += 1
+            self._f._log_debug(
+                f"🤖 Agentic: re-plan wave {_replans_used}/"
+                f"{self._f.valves.agentic_max_replans} (angle: {_angle[:80]})"
+            )
+            for wstep in _wave:
+                plan.steps.append(wstep)
+                _rem_now = budget - (time.monotonic() - started)
+                if _rem_now <= 0:
+                    wstep.status = "skipped"
+                    wstep.skip_reason = "budget"
+                    continue
+                await self._f._emit_status(
+                    f"🤖 Agentic wave step {wstep.id} ({wstep.kind}): "
+                    f"{wstep.goal[:60]}"
+                )
+                workspace = self._render_workspace(plan.steps)
+                await self._executor.run(
+                    wstep, aligned_prefix, workspace, _rem_now,
+                    project_id=project_id, broker=self._broker,
+                )
+                if wstep.status == "done":
+                    self._ledger.extract_and_validate(wstep, project_id)
+                    wstep.digest = self._digest(wstep.output)
+                    if use_cache and structure_hash:
+                        await self._cache.put(
+                            project_id, structure_hash, wstep,
+                            self._ledger.serialize_for(wstep.id),
+                        )
+                self._f._log_debug(
+                    f"🤖 Agentic wave step {wstep.id} ({wstep.kind}): "
+                    f"{wstep.status} in {wstep.seconds:.1f}s"
+                )
 
         # Region: inject synthesis workspace for the main call
         dynamic_injections.append(
@@ -16647,6 +16858,21 @@ class ReasoningEngine:
                 f"Context:\n{enriched_context}\n\n"
                 f"Question:\n{question}\n\n"
                 "Think step by step and provide your reasoning:"
+            )
+
+        # ------------------------------------------------------------------
+        # Region: Pre-aligned launchpad
+        # The cot_config LLM call (its own small prompt) runs right before
+        # this one and leaves the slot on an unrelated 3-figure-token
+        # context, so the aligned call below would re-prefill the ENTIRE
+        # system prefix from scratch (~70k+ tokens, measured 324-537s).
+        # One authoritative restore re-establishes the .bin first: the
+        # aligned call then shares A+tier with it and only prefills the
+        # Block B divergence.
+        # ------------------------------------------------------------------
+        if aligned and self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(
+                project_id, authoritative=True, purpose="pre_aligned"
             )
 
         # ------------------------------------------------------------------
@@ -28710,7 +28936,8 @@ class EnrichmentTasks:
         # Region: valve gates — feature must be meaningful and enabled
         valves = self._f.valves
         if not (
-            valves.skeleton_include_docstrings and valves.docstring_flush_on_complete
+            valves.skeleton_include_docstrings
+            and valves.docstring_flush_on_complete
         ):
             return
 
@@ -33617,15 +33844,26 @@ class MessageAssembler:
         # decomposition, high reasoning levels, or the imperative
         # multi-clause shape the '?'-based heuristic cannot see.
         # ------------------------------------------------------------------
+        _trigger_mode = self._f.valves.agentic_trigger
         if (
             self._f.valves.enable_agentic_pipeline
-            and self._f.valves.agentic_trigger in ("auto", "shadow")
+            and _trigger_mode in ("auto", "shadow", "always")
             and not is_continuation
             and not _is_arch
             and slot_free
         ):
             _agentic_reason = ""
-            if len(sub_questions) >= 2:
+            if (
+                _trigger_mode == "always"
+                and is_code_session
+                and len((user_content or "").strip()) >= 20
+            ):
+                # Cloud-style default: every substantive code-session turn
+                # goes through the pipeline. Trivial acknowledgements
+                # (< 20 chars) and non-code chatter fall through to the
+                # detection chain below, and from there to normal CoT.
+                _agentic_reason = "always"
+            elif len(sub_questions) >= 2:
                 _agentic_reason = "decompose"
             elif cot_level >= 3 or _go_scientific:
                 _agentic_reason = "level3_or_scientific"
@@ -34273,7 +34511,9 @@ class MessageAssembler:
                 else 0
             )
             hub_tier_tokens = (
-                len(self._f.tokenizer.encode(hub_tier_text)) if hub_tier_text else 0
+                len(self._f.tokenizer.encode(hub_tier_text))
+                if hub_tier_text
+                else 0
             )
             dyn_budget = max(
                 0,
@@ -34366,7 +34606,9 @@ class MessageAssembler:
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             tier_tok = (
-                len(self._f.tokenizer.encode(hub_tier_text)) if hub_tier_text else 0
+                len(self._f.tokenizer.encode(hub_tier_text))
+                if hub_tier_text
+                else 0
             )
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
@@ -36738,7 +36980,10 @@ class ProjectStateManager:
             return False
 
     async def slot_restore_for_continuity(
-        self, project_id: str, authoritative: bool = False
+        self,
+        project_id: str,
+        authoritative: bool = False,
+        purpose: str = "pre_main",
     ) -> bool:
         """
         Track slot dirt from auxiliary LLM calls and restore ONCE before the
@@ -36804,8 +37049,20 @@ class ProjectStateManager:
             pstate["_slot_cont_aligned_hot"] = False
             return False
 
-        # --- 3. Authoritative decision: what best serves the main call? ---
+        # --- 3. Authoritative decision ---
+        # purpose='pre_main': serve the imminent MAIN call (system + full
+        # chat history), where a deep .bin can beat an aligned prefill.
+        # purpose='pre_aligned': serve the FIRST prefix-aligned auxiliary
+        # call of the turn (system only). If the slot is already aligned-
+        # hot it is strictly the best state for that call — the history
+        # depth heuristic below does not apply.
         if pstate.get("_slot_cont_aligned_hot"):
+            if purpose != "pre_main":
+                self._f._log_debug(
+                    f"slot_restore_for_continuity[{purpose}]: slot already "
+                    f"aligned-hot — restore skipped"
+                )
+                return False
             saved_tok = self.get_last_saved_slot_tokens(project_id)
             system_tok = self.get_last_system_tokens(project_id)
             if system_tok > 0 and saved_tok <= system_tok:
@@ -36841,11 +37098,12 @@ class ProjectStateManager:
 
         filename = self._slot_filename(project_id, static_hash)
 
-        # ── Per-filename attempt guard ────────────────────────────────
-        # Idempotence belt for the authoritative call: a repeated attempt for
-        # the same filename within one turn (should not happen) is a no-op.
-        _attempt_key = f"_slot_cont_attempted_{filename}"
-        _success_key = f"_slot_cont_succeeded_{filename}"
+        # ── Per-(purpose, filename) attempt guard ─────────────────────
+        # Idempotence belt: each purpose gets its own one-shot per turn,
+        # so the pre-aligned launchpad restore never consumes the
+        # pre-main authoritative attempt (and vice versa).
+        _attempt_key = f"_slot_cont_attempted_{purpose}_{filename}"
+        _success_key = f"_slot_cont_succeeded_{purpose}_{filename}"
 
         if pstate.get(_attempt_key):
             # Already attempted (succeeded or failed) for this filename this turn
@@ -38413,7 +38671,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -38489,15 +38747,15 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -38767,7 +39025,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
@@ -39250,7 +39508,7 @@ class Filter:
             ),
         )
         agentic_step_max_tokens: int = Field(
-            default=1000,
+            default=700,
             ge=100,
             description="Generation cap per agentic step.",
         )
@@ -39263,12 +39521,12 @@ class Filter:
             ),
         )
         agentic_max_seconds: int = Field(
-            default=900,
+            default=180,
             ge=10,
             description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
         )
         agentic_max_steps: int = Field(
-            default=20,
+            default=4,
             ge=2,
             le=8,
             description="Maximum steps the planner may emit.",
@@ -39288,7 +39546,7 @@ class Filter:
             ),
         )
         agentic_trigger: str = Field(
-            default="shadow",
+            default="command",
             description=(
                 "'command' = the pipeline only runs via /agent. 'auto' = it "
                 "also fires when detection finds real decomposition, level "
@@ -39297,11 +39555,18 @@ class Filter:
                 "evaluate the same detection on every eligible turn and log "
                 "'would fire' WITHOUT running the pipeline — calibrate the "
                 "heuristic on real traffic (grep the log for [SHADOW]) "
-                "before enabling 'auto'."
+                "before enabling 'auto'. 'always' = cloud-style: fire on "
+                "EVERY substantive code-session turn (>= 20 chars, not a "
+                "continuation, not an architecture query — those keep their "
+                "specialized reasoning path); shorter or non-code turns fall "
+                "back to the 'auto' detections, then to normal CoT. Budget "
+                "it with agentic_max_steps / agentic_max_seconds / "
+                "agentic_early_exit_confidence, and mind the aux-call cost: "
+                "with a single --parallel 1 slot the pipeline runs serially."
             ),
         )
         agentic_tool_rounds_max: int = Field(
-            default=3,
+            default=2,
             ge=0,
             le=4,
             description=(
@@ -39317,6 +39582,86 @@ class Filter:
             description=(
                 "A step declaring resolved=true with confidence at or above "
                 "this floor skips the remaining reasoning steps ('verify' steps are never skipped)."
+            ),
+        )
+        agentic_metacog_reinforce: str = Field(
+            default="shadow",
+            description=(
+                "Per-step metacognitive reinforcement (Fase 8). A reasoning "
+                "step whose ledger claims cite fabricated identifiers "
+                "(invalid_qids) or that ends unresolved below "
+                "agentic_metacog_confidence_floor escalates its claims to "
+                "MetacognitiveReasoningEngine.compete_hypotheses as rival "
+                "hypotheses under static falsification; the surviving "
+                "verdict annotates the step before synthesis. 'off' = "
+                "never. 'shadow' (default) = evaluate the gate and log "
+                "'would escalate' WITHOUT running the competition — "
+                "calibrate on real traffic first (grep [METACOG-SHADOW]). "
+                "'on' = run it, bounded by half the remaining pipeline "
+                "budget. The competition dirties the KV slot with its own "
+                "prompts, so the pre-aligned launchpad re-fires afterwards."
+            ),
+        )
+        agentic_metacog_confidence_floor: float = Field(
+            default=0.55,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Secondary escalation signal: a step with claims that ends "
+                "unresolved below this confidence escalates (the primary "
+                "signal, fabricated identifiers, escalates regardless)."
+            ),
+        )
+        agentic_metacog_max_iters: int = Field(
+            default=1,
+            ge=1,
+            le=3,
+            description=(
+                "compete_hypotheses iterations when reinforcing a step. "
+                "1 (default) = one falsification pass — the in-pipeline "
+                "budget rarely affords the full 3-iteration loop."
+            ),
+        )
+        agentic_metacog_min_remaining_s: int = Field(
+            default=60,
+            ge=0,
+            description=(
+                "Reinforcement is skipped (with a log line) when less than "
+                "this many seconds of pipeline budget remain."
+            ),
+        )
+        agentic_generative_eval: str = Field(
+            default="shadow",
+            description=(
+                "Generative evaluation between execution and synthesis "
+                "(Fase 9, Nivel-2 iteration). One aligned call asks the "
+                "IMPROVEMENT question — correctness is the verify step's "
+                "job — and may propose up to 2 follow-up steps. 'off' = "
+                "never. 'shadow' (default) = run the evaluation and log "
+                "'would replan' WITHOUT executing the wave (grep "
+                "[REPLAN-SHADOW]). 'on' = append and execute the wave "
+                "(executor-only: investigate/analyze, no control signals — "
+                "a wave must not recursively replan), capped by "
+                "agentic_max_replans and the budget floor."
+            ),
+        )
+        agentic_max_replans: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description=(
+                "Hard cap on generative re-plan waves per pipeline run. "
+                "The Nivel-2 loop without a cap is exactly how an agent "
+                "spins forever on a single --parallel 1 slot."
+            ),
+        )
+        agentic_replan_min_remaining_s: int = Field(
+            default=90,
+            ge=0,
+            description=(
+                "The generative evaluation (shadow included) is skipped "
+                "when less than this many seconds of budget remain — a "
+                "wave needs room to actually run."
             ),
         )
         agentic_auto_verify: bool = Field(
@@ -39627,15 +39972,15 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
         cot_prefix_aligned: bool = Field(
@@ -39695,7 +40040,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -39752,7 +40097,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_min_similarity: float = Field(
@@ -39879,11 +40224,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Fallback model for summarization when the primary model is unavailable.",
         )
 
@@ -41593,7 +41938,9 @@ class Filter:
             # prefill, restoring the .bin, or doing nothing (see the
             # docstring). Mid-turn calls only mark dirt and never POST.
             if not slot_busy and self.valves.enable_slot_persistence:
-                await psm.slot_restore_for_continuity(project_id, authoritative=True)
+                await psm.slot_restore_for_continuity(
+                    project_id, authoritative=True
+                )
 
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
