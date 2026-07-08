@@ -125,6 +125,14 @@ import tempfile
 # Globals
 # ---------------------------------------------------------------------------
 
+# LTM "never expires" sentinel: 2100-01-01 UTC. Chroma metadata must be
+# str/int/float/bool (None is rejected on upsert), and OMITTING expires_at
+# would exclude the entry from every retrieval filter that uses
+# {"expires_at": {"$gt": now}} — in Chroma a missing key never matches any
+# operator. A finite far-future timestamp passes retrieval forever and never
+# enters the purge window.
+_LTM_NO_EXPIRY: float = 4102444800.0
+
 # Edge types and base weights
 EDGE_WEIGHTS: Dict[str, float] = {
     "calls": 1.0,  # A function/method calls another
@@ -5311,6 +5319,29 @@ class ContextBuilder:
                 f"hubs_only, shrink the hub-bodies / skeleton tier, or raise "
                 f"--keep to at least {block_a_tokens} (recommended)."
             )
+            return
+
+        # Soft check at the A+tier level: since the hub-bodies tier ships in
+        # the FINAL prompt right after Block A, the full stable prefix that
+        # deserves --keep protection is A+tier. Overrunning it does not break
+        # Block A itself (the hard floor above), but a context shift will
+        # evict the tier's tail and the next turn re-prefills it.
+        _tier_text = (
+            self._f._project_state_manager.get_pstate(project_id).get(
+                "hub_tier_text", ""
+            )
+            or ""
+        )
+        if _tier_text and self._f.tokenizer:
+            _tier_tokens = len(self._f.tokenizer.encode(_tier_text))
+            if block_a_tokens + _tier_tokens > keep:
+                self._f._log_debug(
+                    f"Block A + hub tier ({block_a_tokens}+{_tier_tokens} tokens) "
+                    f"exceeds llama.cpp --keep ({keep}) for project "
+                    f"'{project_id}'. Block A itself is safe, but a context "
+                    f"shift will evict the tier's tail; consider raising --keep "
+                    f"to {block_a_tokens + _tier_tokens} or shrinking the tier."
+                )
 
     async def invalidate_block_a_cache(
         self, project_id: str, reason: str = "", recompute_centrality: bool = False
@@ -11149,7 +11180,7 @@ class LongTermMemory:
             expires_at = (
                 now + (self._f.valves.long_term_memory_expiration_days * 86400)
                 if self._f.valves.long_term_memory_expiration_days > 0
-                else None
+                else _LTM_NO_EXPIRY
             )
 
             code_symbols_str = ""
@@ -11324,7 +11355,7 @@ class LongTermMemory:
         expires_at = (
             now + (self._f.valves.long_term_memory_expiration_days * 86400)
             if self._f.valves.long_term_memory_expiration_days > 0
-            else None
+            else _LTM_NO_EXPIRY
         )
 
         code_symbols_str = ""
@@ -11560,6 +11591,16 @@ class LongTermMemory:
         Summary entries (session, turn, RAPTOR, hierarchical) are exempt from
         expiration regardless of their ``expires_at`` value, consistent with
         the exemption applied in ``retrieve_memories_unified``.
+
+        The exemption is applied CLIENT-SIDE, not in the where-filter: Chroma
+        operators only match documents that HAVE the metadata key, so a
+        ``{"is_session_summary": {"$ne": True}}`` clause silently excludes
+        every regular message (which never carries the flag) — the old filter
+        matched nothing, ever, and the purge was a guaranteed no-op while the
+        collection grew unbounded. Candidates are now selected on the
+        ``expires_at`` window alone and summaries are filtered out in Python,
+        which is correct for both legacy documents (no flags) and current
+        ones (flags set True on summaries only).
         """
         # ------------------------------------------------------------------
         # Region: Compute expiration cutoff
@@ -11567,7 +11608,7 @@ class LongTermMemory:
         now = time.time()
 
         # ------------------------------------------------------------------
-        # Region: Query ChromaDB for expired non-summary entries
+        # Region: Query ChromaDB for candidates in the expiry window
         # ------------------------------------------------------------------
         try:
             results = self._f.memory_collection.get(
@@ -11575,29 +11616,47 @@ class LongTermMemory:
                     "$and": [
                         {"expires_at": {"$gt": 0}},
                         {"expires_at": {"$lt": now}},
-                        {"is_session_summary": {"$ne": True}},
-                        {"is_turn_summary": {"$ne": True}},
-                        {"is_raptor_summary": {"$ne": True}},
-                        {"is_hierarchical_summary": {"$ne": True}},
                     ]
                 },
-                include=[],
+                include=["metadatas"],
             )
         except Exception as e:
             self._f._log_debug(f"LTM _do_purge: ChromaDB query failed: {e}")
             return
 
         # ------------------------------------------------------------------
-        # Region: Delete expired entries
+        # Region: Client-side summary exemption
         # ------------------------------------------------------------------
-        ids_to_delete: List[str] = results.get("ids", []) if results else []
+        candidate_ids: List[str] = results.get("ids", []) if results else []
+        candidate_metas: List[dict] = (
+            results.get("metadatas", []) if results else []
+        ) or []
+
+        _SUMMARY_FLAGS = (
+            "is_session_summary",
+            "is_turn_summary",
+            "is_raptor_summary",
+            "is_hierarchical_summary",
+        )
+        ids_to_delete: List[str] = []
+        for idx, doc_id in enumerate(candidate_ids):
+            meta = candidate_metas[idx] if idx < len(candidate_metas) else {}
+            meta = meta or {}
+            if any(meta.get(flag) is True for flag in _SUMMARY_FLAGS):
+                continue
+            ids_to_delete.append(doc_id)
+
         if not ids_to_delete:
             return
 
+        # ------------------------------------------------------------------
+        # Region: Delete expired entries
+        # ------------------------------------------------------------------
         try:
             self._f.memory_collection.delete(ids=ids_to_delete)
             self._f._log_debug(
-                f"LTM purge: deleted {len(ids_to_delete)} expired entries"
+                f"LTM purge: deleted {len(ids_to_delete)} expired entries "
+                f"({len(candidate_ids) - len(ids_to_delete)} summaries exempt)"
             )
         except Exception as e:
             self._f._log_debug(f"LTM _do_purge: ChromaDB delete failed: {e}")
@@ -11870,6 +11929,11 @@ class LLMOrchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=self._f.valves.llm_request_timeout,
+                        sock_read=(
+                            self._f.valves.llm_sock_read_timeout
+                            if self._f.valves.llm_sock_read_timeout > 0
+                            else None
+                        ),
                         endpoint_type=ep_type,
                         response_format=response_format,
                         enable_thinking=enable_thinking,
@@ -14239,6 +14303,15 @@ class AgenticStepExecutor:
         if response:
             step.output = response
             step.status = "done"
+            # The slot now holds this turn's aligned system prefix — a
+            # strictly better starting point for the main call than the
+            # previous turn's .bin, unless history depth says otherwise
+            # (the authoritative restore at the end of the inlet decides;
+            # any later non-aligned auxiliary call clears this flag).
+            if project_id:
+                self._f._project_state_manager.get_pstate(project_id)[
+                    "_slot_cont_aligned_hot"
+                ] = True
         else:
             step.output = "(empty response)"
             step.status = "failed"
@@ -16596,6 +16669,13 @@ class ReasoningEngine:
         # ------------------------------------------------------------------
         if self._f.valves.enable_slot_persistence and project_id and not aligned:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
+        elif self._f.valves.enable_slot_persistence and project_id and aligned:
+            # The slot now holds this turn's aligned system prefix; record it
+            # so the authoritative end-of-inlet decision can keep it instead
+            # of blindly restoring the previous turn's .bin over it.
+            self._f._project_state_manager.get_pstate(project_id)[
+                "_slot_cont_aligned_hot"
+            ] = True
 
         # ------------------------------------------------------------------
         # Region: Format and return
@@ -36657,26 +36737,57 @@ class ProjectStateManager:
             self._f._log_debug(f"Slot restore error: {e}")
             return False
 
-    async def slot_restore_for_continuity(self, project_id: str) -> bool:
+    async def slot_restore_for_continuity(
+        self, project_id: str, authoritative: bool = False
+    ) -> bool:
         """
-        Restore KV cache after auxiliary LLM calls (CoT, contradiction, etc.)
-        have dirtied the slot due to the SWA architecture.
+        Track slot dirt from auxiliary LLM calls and restore ONCE before the
+        main inference.
 
-        Called at the end of every auxiliary LLM call when
-        ``enable_slot_persistence=True``.
+        Two modes:
 
-        Timeout semantics — see slot_save() for the full rationale. This
-        call sits between every auxiliary LLM call and the next within a
-        single turn; an unbounded stall here compounds across however many
-        auxiliary calls that turn makes, which is exactly the kind of
-        cascading delay the backstop exists for once the structural fix
-        (stop_all() no longer orphaning generations) is in place.
+        * ``authoritative=False`` (every per-call site after an auxiliary,
+          non-aligned LLM call): record that the slot no longer holds a
+          useful prefix (``_slot_cont_dirtied``) and clear the aligned-hot
+          flag, WITHOUT touching the server. Mid-turn restores were pure
+          cost: they only ever help the request that follows, consecutive
+          small auxiliary prompts share nothing with the .bin, and each
+          restore destroyed whatever mutual KV reuse those prompts had. The
+          old once-per-turn guard had already collapsed them to a single
+          early restore — which then left the END-of-inlet restore (the only
+          one positioned to matter, right before the main call) as a
+          guaranteed no-op, so the main inference saw whatever the LAST
+          auxiliary call left in the slot.
+
+        * ``authoritative=True`` (one call, end of inlet, after all auxiliary
+          work): decide what state serves the imminent main call best.
+          - Slot untouched this turn → skip (it still holds the state the
+            early ``slot_restore`` established, or last turn's main-call KV).
+          - Aligned-hot (the last LLM work was prefix-aligned: agentic
+            pipeline / aligned CoT) → the slot holds THIS turn's system
+            prefix. Restore the .bin over it only when the .bin is deeper:
+            the saved snapshot covers last turn's system PLUS chat history,
+            and with --cache-reuse the history chunks survive the
+            B_prev→B_now divergence, so once the conversation outgrows the
+            system block the .bin wins; early in a session the aligned
+            prefill wins. ``last_saved_slot_tokens`` vs
+            ``last_system_tokens`` decides in one comparison.
+          - Dirtied and not aligned-hot → the slot holds an unrelated
+            auxiliary prompt; restore the .bin.
+
+        The per-turn flags live under the ``_slot_cont_`` prefix, so the
+        existing inlet-prologue sweep clears them automatically.
+
+        Timeout semantics — see slot_save() for the full rationale.
 
         Args:
             project_id: The project identifier.
+            authoritative: False = mark dirty only; True = perform the
+                single pre-main restore decision described above.
 
         Returns:
-            True if the slot was restored successfully, False otherwise.
+            True if the slot was restored successfully, False otherwise
+            (including every mark-only and skip path).
         """
         if not self._f.valves.enable_slot_persistence:
             self._f._log_debug(
@@ -36687,7 +36798,36 @@ class ProjectStateManager:
         # --- 1. Resolve per-project state ---
         pstate = self.get_pstate(project_id)
 
-        # --- 2. Get the structural hash ---
+        # --- 2. Non-authoritative: mark and return, never touch the server ---
+        if not authoritative:
+            pstate["_slot_cont_dirtied"] = True
+            pstate["_slot_cont_aligned_hot"] = False
+            return False
+
+        # --- 3. Authoritative decision: what best serves the main call? ---
+        if pstate.get("_slot_cont_aligned_hot"):
+            saved_tok = self.get_last_saved_slot_tokens(project_id)
+            system_tok = self.get_last_system_tokens(project_id)
+            if system_tok > 0 and saved_tok <= system_tok:
+                self._f._log_debug(
+                    f"slot_restore_for_continuity: aligned prefill "
+                    f"(~{system_tok} system tokens) is at least as deep as "
+                    f"the saved slot ({saved_tok} tokens) — restore skipped"
+                )
+                return False
+            self._f._log_debug(
+                f"slot_restore_for_continuity: saved slot ({saved_tok} tokens, "
+                f"includes history) beats the aligned system-only prefill "
+                f"(~{system_tok} tokens) — restoring"
+            )
+        elif not pstate.get("_slot_cont_dirtied"):
+            self._f._log_debug(
+                "slot_restore_for_continuity: slot untouched by non-aligned "
+                "auxiliary calls this turn — restore skipped"
+            )
+            return False
+
+        # --- 4. Get the structural hash ---
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             cached = self.get_block_a_cached(project_id)
@@ -36702,14 +36842,13 @@ class ProjectStateManager:
         filename = self._slot_filename(project_id, static_hash)
 
         # ── Per-filename attempt guard ────────────────────────────────
-        # Track attempt and outcome keyed by the slot filename so that:
-        #   - Multiple auxiliary calls in the same turn do not re-attempt.
-        #   - A code change that yields a new filename gets a fresh attempt.
+        # Idempotence belt for the authoritative call: a repeated attempt for
+        # the same filename within one turn (should not happen) is a no-op.
         _attempt_key = f"_slot_cont_attempted_{filename}"
         _success_key = f"_slot_cont_succeeded_{filename}"
 
         if pstate.get(_attempt_key):
-            # Already attempted (succeeded or failed) for this filename this session
+            # Already attempted (succeeded or failed) for this filename this turn
             return pstate.get(_success_key, False)
 
         # Mark attempted before any await so concurrent calls (if any) also see it
@@ -38149,7 +38288,7 @@ class Filter:
 
         # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
-            default=458752,
+            default=393216,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
@@ -38274,7 +38413,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -38312,6 +38451,21 @@ class Filter:
             default=900,
             description="HTTP timeout in seconds for individual LLM requests before the connection is dropped.",
         )
+        llm_sock_read_timeout: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Mid-stream stall detector: seconds without a single token "
+                "arriving before the streaming read aborts (retryable). "
+                "Distinct from llm_request_timeout, which bounds the WHOLE "
+                "call — a healthy long generation keeps emitting tokens and "
+                "never trips this, while a stalled server (GPU idle, no "
+                "tokens, forever) is cut in this many seconds instead of "
+                "holding the --parallel 1 slot for the full request "
+                "timeout. 0 disables the detector (falls back to "
+                "llm_request_timeout)."
+            ),
+        )
         llm_per_call_timeout: int = Field(
             default=900,
             ge=1,
@@ -38335,15 +38489,15 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -38613,7 +38767,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
@@ -39096,7 +39250,7 @@ class Filter:
             ),
         )
         agentic_step_max_tokens: int = Field(
-            default=1500,
+            default=700,
             ge=100,
             description="Generation cap per agentic step.",
         )
@@ -39109,7 +39263,7 @@ class Filter:
             ),
         )
         agentic_max_seconds: int = Field(
-            default=0,
+            default=180,
             ge=10,
             description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
         )
@@ -39134,7 +39288,7 @@ class Filter:
             ),
         )
         agentic_trigger: str = Field(
-            default="auto",
+            default="command",
             description=(
                 "'command' = the pipeline only runs via /agent. 'auto' = it "
                 "also fires when detection finds real decomposition, level "
@@ -39147,7 +39301,7 @@ class Filter:
             ),
         )
         agentic_tool_rounds_max: int = Field(
-            default=3,
+            default=2,
             ge=0,
             le=4,
             description=(
@@ -39473,15 +39627,15 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
         cot_prefix_aligned: bool = Field(
@@ -39541,7 +39695,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -39598,7 +39752,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_min_similarity: float = Field(
@@ -39725,11 +39879,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
             description="Fallback model for summarization when the primary model is unavailable.",
         )
 
@@ -41433,8 +41587,13 @@ class Filter:
             # 🚀 RESOURCE OPTIMISATION
             #   KV cache — restore stable prefix after all auxiliary LLM work
             # ----------------------------------------------------------------
+            # The ONLY restore positioned to matter: it runs after every
+            # auxiliary call and immediately before the main inference.
+            # authoritative=True lets it decide between keeping an aligned
+            # prefill, restoring the .bin, or doing nothing (see the
+            # docstring). Mid-turn calls only mark dirt and never POST.
             if not slot_busy and self.valves.enable_slot_persistence:
-                await psm.slot_restore_for_continuity(project_id)
+                await psm.slot_restore_for_continuity(project_id, authoritative=True)
 
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
