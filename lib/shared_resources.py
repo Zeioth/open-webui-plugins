@@ -357,6 +357,7 @@ class SQLiteCache:
 # 3.1 aiohttp ClientSession with connection pool (shared)
 # ---------------------------------------------------------------------------
 _HTTP_SESSION: Optional[Any] = None
+_ORPHANED_HTTP_SESSIONS: List[Any] = []
 _HTTP_TIMEOUT_SECONDS: int = 120
 _HTTP_SESSION_LOCK: Optional[asyncio.Lock] = None
 
@@ -394,7 +395,13 @@ async def get_http_session(timeout_seconds: int = 120):
         )
         if needs_recreate:
             if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
-                await _HTTP_SESSION.close()
+                # Do NOT close: another coroutine may be mid-stream on this
+                # session, and close() aborts its connection (the failure
+                # then hides behind the caller's retry). Orphan it instead
+                # and let in-flight requests drain; close_http_session()
+                # sweeps orphans on shutdown. Bounded leak: one session per
+                # distinct timeout upgrade in the process lifetime.
+                _ORPHANED_HTTP_SESSIONS.append(_HTTP_SESSION)
             connector = aiohttp.TCPConnector(
                 limit=30,
                 limit_per_host=10,
@@ -411,12 +418,16 @@ async def get_http_session(timeout_seconds: int = 120):
 
 
 async def close_http_session():
-    """Close the shared session. Call on process shutdown if needed."""
+    """Close the shared session and any orphaned predecessors."""
     global _HTTP_SESSION
     async with _get_http_lock():
         if _HTTP_SESSION and not _HTTP_SESSION.closed:
             await _HTTP_SESSION.close()
             _HTTP_SESSION = None
+        while _ORPHANED_HTTP_SESSIONS:
+            old = _ORPHANED_HTTP_SESSIONS.pop()
+            if old and not old.closed:
+                await old.close()
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +518,27 @@ def _redact(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_redact(v) for v in obj]
     return obj
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
+
+
+def _strip_think_blocks(content: str) -> str:
+    """
+    Remove well-formed <think>…</think> blocks from a response.
+
+    Servers running without a separated reasoning format ship the chain
+    of thought inline in `content`; no downstream consumer of this module
+    wants the raw tags. Only well-formed pairs are removed: an unclosed
+    <think> means generation was truncated mid-reasoning, and stripping
+    to the end would return an empty answer and trigger pointless
+    retries — the truncation warning already covers that case. When
+    stripping would leave nothing, the original text is returned intact.
+    """
+    if "<think>" not in content:
+        return content
+    stripped = _THINK_BLOCK_RE.sub("", content).strip()
+    return stripped if stripped else content
 
 
 def _is_retryable(exc: BaseException, retry_on_empty: bool) -> bool:
@@ -615,8 +647,19 @@ def _build_request(
         if response_format is not None:
             payload["response_format"] = response_format
         if not enable_thinking and backend == "llamacpp":
-            payload["thinking"] = False
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            if endpoint_type == "chat":
+                payload["thinking"] = False
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+            else:
+                # /v1/completions applies no chat template, so neither
+                # `thinking` nor `chat_template_kwargs` has any effect —
+                # the request would silently think anyway. Warn instead
+                # of pretending the opt-out was honored.
+                _logger.warning(
+                    "enable_thinking=False cannot be honored on the "
+                    "completion endpoint (no chat template); the model "
+                    "may still emit reasoning. Use endpoint_type='chat'."
+                )
         payload["stream"] = stream
 
     if extra_body:
@@ -707,6 +750,7 @@ async def _consume_stream(
         LLMEmptyResponseError: the stream closed without any content.
     """
     chunks: List[str] = []
+    reasoning_chunks: List[str] = []
     finish_reason: Optional[str] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
@@ -731,6 +775,14 @@ async def _consume_stream(
             continue
 
         # ── Step 3: accumulate the incremental content + bookkeeping ──
+        # Thinking deltas (reasoning_content) go to a SEPARATE buffer. During
+        # the whole thinking phase every delta has empty `content` and only
+        # `reasoning_content`, so appending reasoning inline whenever content
+        # is momentarily empty concatenates the entire chain-of-thought in
+        # front of the answer — unmarked, budget-eating, and different from
+        # the non-streaming path, whose reasoning fallback fires only when
+        # the WHOLE response carried no content. The streaming path mirrors
+        # that rescue below instead of interleaving per delta.
         if backend == "ollama":
             chunks.append(event.get("response", "") or "")
             if event.get("done"):
@@ -749,10 +801,9 @@ async def _consume_stream(
                     piece = delta.get("content", "")
                     if piece:
                         chunks.append(piece)
-                    else:
-                        reasoning = delta.get("reasoning_content", "")
-                        if reasoning:
-                            chunks.append(reasoning)
+                    reasoning = delta.get("reasoning_content", "")
+                    if reasoning:
+                        reasoning_chunks.append(reasoning)
                 if choice0.get("finish_reason"):
                     finish_reason = choice0["finish_reason"]
             usage = event.get("usage") or {}
@@ -761,6 +812,11 @@ async def _consume_stream(
                 completion_tokens = usage.get("completion_tokens", completion_tokens)
 
     content = "".join(chunks)
+    if not content and reasoning_chunks:
+        # Mirror of the non-streaming rescue: some reasoning models put the
+        # entire answer in reasoning_content — fall back to it rather than
+        # failing, but ONLY when no regular content arrived at all.
+        content = "".join(reasoning_chunks).strip()
     if not content:
         raise LLMEmptyResponseError("Empty content")
     return content, finish_reason, prompt_tokens, completion_tokens
@@ -1033,6 +1089,8 @@ async def call_llm(
                     "LLM call succeeded on attempt %d/%d (label=%s).",
                     attempt, max_retries, tag,
                 )
+
+            content = _strip_think_blocks(content)
 
             result = LLMResult(
                 content=content.strip(),
