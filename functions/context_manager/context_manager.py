@@ -38149,7 +38149,7 @@ class Filter:
 
         # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
-            default=393216,
+            default=458752,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
@@ -38274,7 +38274,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -38335,15 +38335,15 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         session_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used to generate autobiographical session summaries stored in long-term memory.",
         )
         natural_language_forget_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used to classify natural-language forget, pin, and obsolete intents.",
         )
 
@@ -38613,7 +38613,7 @@ class Filter:
         path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
         path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
         )
         path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
@@ -39473,15 +39473,15 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used for CoT level 1 (inline reasoning prompt).",
         )
         cot_model_level2: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
         cot_prefix_aligned: bool = Field(
@@ -39541,7 +39541,7 @@ class Filter:
             description="Detect if the last user message contradicts the conversation history.",
         )
         contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -39598,7 +39598,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_min_similarity: float = Field(
@@ -39725,11 +39725,11 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Model used for all general-purpose summarization tasks.",
         )
         summary_fallback_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Mini",
+            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-I-Mini",
             description="Fallback model for summarization when the primary model is unavailable.",
         )
 
