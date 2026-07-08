@@ -7276,9 +7276,7 @@ class ContextBuilder:
                     or intent_vector.get("debug", 0.0)
                     >= self._f.valves.cfg_skeleton_debug_intent_threshold
                 ):
-                    cfg_skeleton = (
-                        self._f._symbol_index.get_cfg(qid, project_id) or ""
-                    )
+                    cfg_skeleton = self._f._symbol_index.get_cfg(qid, project_id) or ""
 
                 if cfg_skeleton:
                     self._f._log_debug(f"💉 CFG injected for '{qid}' (LOD2)")
@@ -12245,7 +12243,10 @@ class AgenticEvidenceLedger:
             defaults (False, 0.0, []) when the tail is absent or broken.
         """
         control: Dict[str, Any] = {
-            "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
+            "resolved": False,
+            "confidence": 0.0,
+            "needs": [],
+            "ask": "",
         }
 
         # Region: locate and strip the fenced JSON tail
@@ -12292,7 +12293,9 @@ class AgenticEvidenceLedger:
             if not text:
                 continue
             claim = LedgerClaim(
-                step_id=step.id, text=text, qids=qids[:8],
+                step_id=step.id,
+                text=text,
+                qids=qids[:8],
                 confidence=max(0.0, min(1.0, conf)),
             )
             for qid in claim.qids:
@@ -12316,9 +12319,7 @@ class AgenticEvidenceLedger:
 
     def serialize_for(self, step_id: int) -> str:
         """JSON-serialize this step's claims for the cache."""
-        return json.dumps(
-            [c.__dict__ for c in self.claims if c.step_id == step_id]
-        )
+        return json.dumps([c.__dict__ for c in self.claims if c.step_id == step_id])
 
     def claims_for(self, step_id: int) -> List[LedgerClaim]:
         """Claims emitted by one step."""
@@ -12407,9 +12408,15 @@ class AgenticStepCache:
         if self._f._db_conn is None or not structure_hash:
             return
         row = (
-            project_id, self.step_key(step), structure_hash,
-            step.kind, step.goal, step.output, step.digest,
-            claims_json, time.time(),
+            project_id,
+            self.step_key(step),
+            structure_hash,
+            step.kind,
+            step.goal,
+            step.output,
+            step.digest,
+            claims_json,
+            time.time(),
         )
 
         def _write(row: tuple = row) -> None:
@@ -12528,9 +12535,7 @@ class AgenticToolBroker:
             return f"[{label}: none recorded]"
         lines = [f"### {label}"]
         for ed in edges[: self._MAX_EDGES]:
-            lines.append(
-                f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}"
-            )
+            lines.append(f"- {getattr(ed, 'src', '?')} → {getattr(ed, 'dst', '?')}")
         if len(edges) > self._MAX_EDGES:
             lines.append(f"- … {len(edges) - self._MAX_EDGES} more omitted")
         return "\n".join(lines)
@@ -12567,10 +12572,7 @@ class AgenticToolBroker:
                 break
         if not hits:
             return f"[GREP: no matches for {pattern!r}]"
-        return (
-            f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n"
-            + "\n".join(hits)
-        )
+        return f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n" + "\n".join(hits)
 
 
 class AgenticStaticVerifier:
@@ -12716,8 +12718,12 @@ class AgenticStaticVerifier:
         for n, c in enumerate(claims, 1):
             qids = c.valid_qids or c.qids
             if len(qids) >= 2:
-                checks.append({"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]})
-                checks.append({"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]})
+                checks.append(
+                    {"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]}
+                )
+                checks.append(
+                    {"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]}
+                )
             elif qids:
                 checks.append({"claim": n, "kind": "exists", "src": qids[0]})
         return checks[:12]
@@ -12835,18 +12841,49 @@ class AgenticTestabilityClassifier:
     """
 
     _ALLOWED_MODULES = {
-        "re", "json", "math", "hashlib", "time", "itertools", "functools",
-        "collections", "typing", "dataclasses", "string", "textwrap",
-        "difflib", "bisect", "heapq", "enum", "copy",
+        "re",
+        "json",
+        "math",
+        "hashlib",
+        "time",
+        "itertools",
+        "functools",
+        "collections",
+        "typing",
+        "dataclasses",
+        "string",
+        "textwrap",
+        "difflib",
+        "bisect",
+        "heapq",
+        "enum",
+        "copy",
     }
     _SHALLOW_SELF = {"_f", "valves", "_log_debug", "_tokens", "tokenizer"}
     _IO_NAMES = {
-        "open", "eval", "exec", "__import__", "input", "compile",
+        "open",
+        "eval",
+        "exec",
+        "__import__",
+        "input",
+        "compile",
     }
     _IO_MODULES = {
-        "os", "sys", "subprocess", "shutil", "socket", "requests", "urllib",
-        "http", "aiohttp", "sqlite3", "pathlib", "anyio", "asyncio",
-        "chromadb", "torch",
+        "os",
+        "sys",
+        "subprocess",
+        "shutil",
+        "socket",
+        "requests",
+        "urllib",
+        "http",
+        "aiohttp",
+        "sqlite3",
+        "pathlib",
+        "anyio",
+        "asyncio",
+        "chromadb",
+        "torch",
     }
 
     @classmethod
@@ -12949,14 +12986,20 @@ class AgenticTestabilityClassifier:
                         defined.add(t.id)
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called.add(node.func.id)
-        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+        builtins = (
+            set(dir(__builtins__))
+            if isinstance(__builtins__, dict)
+            else set(dir(__builtins__))
+        )
         try:
             import builtins as _b
+
             builtins |= set(dir(_b))
         except Exception:
             pass
         free = [
-            n for n in called
+            n
+            for n in called
             if n not in defined
             and n not in imported
             and n not in params
@@ -12992,10 +13035,26 @@ class AgenticSandboxRunner:
     """
 
     _DENYLIST = (
-        "import os", "from os", "import sys", "from sys", "subprocess",
-        "socket", "shutil", "requests", "urllib", "http.client", "ftplib",
-        "smtplib", "ctypes", "pickle", "eval(", "exec(", "__import__",
-        "open(", "pathlib", "os.system",
+        "import os",
+        "from os",
+        "import sys",
+        "from sys",
+        "subprocess",
+        "socket",
+        "shutil",
+        "requests",
+        "urllib",
+        "http.client",
+        "ftplib",
+        "smtplib",
+        "ctypes",
+        "pickle",
+        "eval(",
+        "exec(",
+        "__import__",
+        "open(",
+        "pathlib",
+        "os.system",
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -13021,7 +13080,10 @@ class AgenticSandboxRunner:
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             return {
-                "status": "error", "passed": 0, "total": 0, "failures": [],
+                "status": "error",
+                "passed": 0,
+                "total": 0,
+                "failures": [],
                 "detail": (
                     f"agentic_exec_mode='{mode}' has no runner in this build "
                     f"— no harness was executed; use 'subprocess'"
@@ -13033,8 +13095,11 @@ class AgenticSandboxRunner:
         for token in self._DENYLIST:
             if token in lowered:
                 return {
-                    "status": "rejected", "passed": 0, "total": 0,
-                    "failures": [], "detail": f"denylist token: {token}",
+                    "status": "rejected",
+                    "passed": 0,
+                    "total": 0,
+                    "failures": [],
+                    "detail": f"denylist token: {token}",
                 }
 
         # Region: prepend the rlimit prelude AFTER the tripwire, so the
@@ -13078,13 +13143,19 @@ class AgenticSandboxRunner:
                     )
                 except _sp.TimeoutExpired:
                     return {
-                        "status": "timeout", "passed": 0, "total": 0,
-                        "failures": [], "detail": f"wall timeout {timeout}s",
+                        "status": "timeout",
+                        "passed": 0,
+                        "total": 0,
+                        "failures": [],
+                        "detail": f"wall timeout {timeout}s",
                     }
                 except Exception as e:
                     return {
-                        "status": "error", "passed": 0, "total": 0,
-                        "failures": [], "detail": f"spawn failed: {e}",
+                        "status": "error",
+                        "passed": 0,
+                        "total": 0,
+                        "failures": [],
+                        "detail": f"spawn failed: {e}",
                     }
 
                 # -- parse the runner's JSON line from stdout --------------
@@ -13095,24 +13166,22 @@ class AgenticSandboxRunner:
                             data = json.loads(line)
                             passed = int(data.get("passed", 0))
                             total = int(data.get("total", 0))
-                            status = (
-                                "pass"
-                                if total > 0 and passed == total
-                                else "fail"
-                            )
+                            status = "pass" if total > 0 and passed == total else "fail"
                             return {
                                 "status": status,
                                 "passed": passed,
                                 "total": total,
-                                "failures": [
-                                    str(x) for x in data.get("failures", [])
-                                ][:5],
+                                "failures": [str(x) for x in data.get("failures", [])][
+                                    :5
+                                ],
                                 "detail": "",
                             }
                         except Exception:
                             break
                 return {
-                    "status": "error", "passed": 0, "total": 0,
+                    "status": "error",
+                    "passed": 0,
+                    "total": 0,
                     "failures": [],
                     "detail": (proc.stderr or proc.stdout or "no output")[-500:],
                 }
@@ -13245,9 +13314,7 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
-            step.output = (
-                f"(dynamic verification disabled: agentic_exec_mode={mode})"
-            )
+            step.output = f"(dynamic verification disabled: agentic_exec_mode={mode})"
             step.seconds = time.monotonic() - started
             return
 
@@ -13306,9 +13373,7 @@ if __name__ == "__main__":
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
-            step.output = (
-                f"(regression disabled: agentic_exec_mode={mode})"
-            )
+            step.output = f"(regression disabled: agentic_exec_mode={mode})"
             step.seconds = time.monotonic() - started
             return
 
@@ -13343,8 +13408,7 @@ if __name__ == "__main__":
 
         # Region: re-verify each caller via the shared per-target flow
         report_lines = [
-            f"## Regression over {len(callers)} caller(s) of "
-            f"{', '.join(seeds)}"
+            f"## Regression over {len(callers)} caller(s) of " f"{', '.join(seeds)}"
         ]
         for qid in callers:
             remaining = timeout_s - (time.monotonic() - started)
@@ -13451,9 +13515,11 @@ if __name__ == "__main__":
         timeout_s: float,
     ) -> str:
         """One aligned LLM call producing the tests section ('' on failure)."""
-        prompt = self._TESTS_CONTRACT.replace("{body}", body[:8000]).replace(
-            "{verdict}", verdict
-        ).replace("{reasons}", "; ".join(reasons))
+        prompt = (
+            self._TESTS_CONTRACT.replace("{body}", body[:8000])
+            .replace("{verdict}", verdict)
+            .replace("{reasons}", "; ".join(reasons))
+        )
         try:
             response = await asyncio.wait_for(
                 self._f._llm_orchestrator.call_llm(
@@ -13475,9 +13541,7 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else response).strip()
         return tests if "def test_" in tests else ""
 
-    def _resolve_callee_bodies(
-        self, body: str, self_qid: str, project_id: str
-    ) -> str:
+    def _resolve_callee_bodies(self, body: str, self_qid: str, project_id: str) -> str:
         """
         Extract the bodies of project symbols this symbol calls, so a caller
         that invokes another project function remains executable in the
@@ -13568,9 +13632,7 @@ if __name__ == "__main__":
             base += f" — {result['detail'][:160]}"
         return base
 
-    async def _cache_get(
-        self, project_id: str, qid: str
-    ) -> Optional[Dict[str, str]]:
+    async def _cache_get(self, project_id: str, qid: str) -> Optional[Dict[str, str]]:
         """Row from agentic_harnesses or None (serialized via _db_read)."""
         if self._f._db_conn is None:
             return None
@@ -13607,8 +13669,12 @@ if __name__ == "__main__":
         if self._f._db_conn is None:
             return
         row = (
-            project_id, qid, body_hash, tests,
-            json.dumps(result), time.time(),
+            project_id,
+            qid,
+            body_hash,
+            tests,
+            json.dumps(result),
+            time.time(),
         )
 
         def _write(row: tuple = row) -> None:
@@ -13645,14 +13711,13 @@ if __name__ == "__main__":
             return
         if not getattr(self._f.valves, "agentic_tdd_inter_turn", False):
             return
-        pseudo = "__design__" + hashlib.md5(
-            " ".join(step.goal.split()).lower().encode()
-        ).hexdigest()[:16]
+        pseudo = (
+            "__design__"
+            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
+        )
         pstate = self._f._project_state_manager.get_pstate(project_id)
         pstate["agentic_tdd_pending"] = {"pseudo": pseudo, "goal": step.goal}
-        self._f._log_debug(
-            f"🤖 TDD: armed inter-turn verification for {pseudo}"
-        )
+        self._f._log_debug(f"🤖 TDD: armed inter-turn verification for {pseudo}")
 
     @staticmethod
     def extract_code_blocks(text: str) -> str:
@@ -13730,8 +13795,11 @@ if __name__ == "__main__":
         }
         # Persist the run under the pseudo qid too (keeps the harness asset).
         await self._cache_put(
-            project_id, pending["pseudo"],
-            cached.get("body_hash", ""), cached["tests"], result,
+            project_id,
+            pending["pseudo"],
+            cached.get("body_hash", ""),
+            cached["tests"],
+            result,
         )
         self._f._log_debug(
             f"🤖 TDD: verified generated code — {result.get('status')} "
@@ -13785,14 +13853,12 @@ if __name__ == "__main__":
             )
         return (
             f"## 🤖 Inter-turn verification\n{head}\n"
-            f'_(Acceptance criteria from an earlier design_tests step for: '
+            f"_(Acceptance criteria from an earlier design_tests step for: "
             f'"{goal}". Treat a failure as authoritative — the tests ran '
             f"against your actual generated code.)_"
         )
 
-    async def persist_design_tests(
-        self, step: AgenticStep, project_id: str
-    ) -> None:
+    async def persist_design_tests(self, step: AgenticStep, project_id: str) -> None:
         """Persist a design_tests step's harness under a goal-keyed pseudo
         qid so the Fase 6 inter-turn loop can pick it up after the main
         call generates the implementation."""
@@ -13800,15 +13866,12 @@ if __name__ == "__main__":
         tests = (m.group(1) if m else step.output).strip()
         if "def test_" not in tests:
             return
-        pseudo = "__design__" + hashlib.md5(
-            " ".join(step.goal.split()).lower().encode()
-        ).hexdigest()[:16]
-        await self._cache_put(
-            project_id, pseudo, "", tests, {"status": "pending"}
+        pseudo = (
+            "__design__"
+            + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
         )
-        self._f._log_debug(
-            f"🤖 DynamicVerifier: design tests persisted as {pseudo}"
-        )
+        await self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
+        self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
 
 
 class AgenticPlanner:
@@ -13823,7 +13886,15 @@ class AgenticPlanner:
     turn.
     """
 
-    _VALID_KINDS = ("investigate", "analyze", "hypothesize", "verify", "verify_dynamic", "verify_regression", "design_tests")
+    _VALID_KINDS = (
+        "investigate",
+        "analyze",
+        "hypothesize",
+        "verify",
+        "verify_dynamic",
+        "verify_regression",
+        "design_tests",
+    )
 
     _CONTRACT = (
         "You are the planner of an agentic pipeline that will answer a "
@@ -14060,9 +14131,8 @@ class AgenticStepExecutor:
         )
         instruction = template.format(sid=step.id, goal=step.goal)
         if step.symbols:
-            instruction += (
-                "\nFocus symbols suggested by the planner: "
-                + ", ".join(step.symbols)
+            instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
+                step.symbols
             )
         instruction += self._CLAIMS_CONTRACT
         if workspace:
@@ -14156,7 +14226,8 @@ class AgenticStepExecutor:
             )
             prompt = (
                 f"{prompt}\n\n[Your investigation so far]\n{response}"
-                f"\n\n## Tool results\n" + "\n\n".join(results)
+                f"\n\n## Tool results\n"
+                + "\n\n".join(results)
                 + "\n\nContinue this step using the tool results. You may "
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
@@ -14210,22 +14281,19 @@ class AgenticSynthesisComposer:
         ]
 
         header = (
-            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — "
-            f"{len(done)} done"
+            f"## 🤖 Agentic workspace ({len(plan.steps)} steps — " f"{len(done)} done"
         )
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
             header += f"; {total} claims, {ok} with valid citations"
-            refuted = sum(
-                1 for c in ledger.claims if c.verification == "refuted"
-            )
+            refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
             if refuted:
                 header += f", {refuted} REFUTED"
         header += ")"
 
         lines = [
             header,
-            f'_Pre-computed by the agentic pipeline (plan: {plan.source}) '
+            f"_Pre-computed by the agentic pipeline (plan: {plan.source}) "
             f'for the question: "{question}". Synthesize these notes into '
             f"your answer; verify claims against the code context above._",
             "",
@@ -14245,11 +14313,7 @@ class AgenticSynthesisComposer:
                             f"({c.verification_detail})"
                         )
                     elif c.verification == "confirmed":
-                        cited = (
-                            f" [{', '.join(c.valid_qids)}]"
-                            if c.valid_qids
-                            else ""
-                        )
+                        cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
                         lines.append(
                             f"- {badge}✓✓ {c.text}{cited} — verified: "
                             f"{c.verification_detail}"
@@ -14322,7 +14386,7 @@ class AgenticOrchestrator:
         content = user_content.strip()
         if not content.startswith("/agent"):
             return None, ""
-        rest = content[len("/agent"):].strip()
+        rest = content[len("/agent") :].strip()
         if not rest:
             return "help", ""
         first, _, tail = rest.partition(" ")
@@ -14334,17 +14398,58 @@ class AgenticOrchestrator:
     # ── Auto-trigger heuristic (Fase 3) ─────────────────────────────────
 
     _IMPERATIVE_VERBS = (
-        "analiza", "implementa", "revisa", "propon", "proponme", "corrige",
-        "añade", "considera", "compara", "mide", "verifica", "explica",
-        "dime", "dame", "busca", "refactoriza", "optimiza", "documenta",
-        "diseña", "arregla", "investiga", "lista", "implement", "analyze",
-        "review", "propose", "fix", "add", "consider", "compare", "measure",
-        "verify", "explain", "find", "refactor", "optimize", "document",
-        "design", "investigate", "list",
+        "analiza",
+        "implementa",
+        "revisa",
+        "propon",
+        "proponme",
+        "corrige",
+        "añade",
+        "considera",
+        "compara",
+        "mide",
+        "verifica",
+        "explica",
+        "dime",
+        "dame",
+        "busca",
+        "refactoriza",
+        "optimiza",
+        "documenta",
+        "diseña",
+        "arregla",
+        "investiga",
+        "lista",
+        "implement",
+        "analyze",
+        "review",
+        "propose",
+        "fix",
+        "add",
+        "consider",
+        "compare",
+        "measure",
+        "verify",
+        "explain",
+        "find",
+        "refactor",
+        "optimize",
+        "document",
+        "design",
+        "investigate",
+        "list",
     )
     _COORDINATORS = (
-        " y también", " y tambien", " además", " ademas", " luego ",
-        " después", " despues", " and also", " then ", "; ",
+        " y también",
+        " y tambien",
+        " además",
+        " ademas",
+        " luego ",
+        " después",
+        " despues",
+        " and also",
+        " then ",
+        "; ",
     )
 
     @staticmethod
@@ -14494,17 +14599,17 @@ class AgenticOrchestrator:
         if mode == "plan":
             aligned_prefix = self._aligned_prefix(prelim_system)
             plan = await self._planner.plan(question, aligned_prefix, slot_free)
-            steps_txt = "\n".join(
-                f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps
-            )
-            note = "" if plan.source == "planner_llm" else (
-                f" (fallback plan: {plan.rationale})"
+            steps_txt = "\n".join(f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps)
+            note = (
+                ""
+                if plan.source == "planner_llm"
+                else (f" (fallback plan: {plan.rationale})")
             )
             dynamic_injections.append(
                 (
                     "high",
                     "## 🤖 Agentic plan (dry run — not executed)\n"
-                    f'The user asked to preview the agentic plan for: '
+                    f"The user asked to preview the agentic plan for: "
                     f'"{question}"{note}\n'
                     "Present this plan clearly and tell them they can run "
                     f"it with `/agent {question}`:\n{steps_txt}",
@@ -14763,11 +14868,18 @@ class AgenticOrchestrator:
             )
             workspace = self._render_workspace(plan.steps)
             await self._executor.run(
-                step, aligned_prefix, workspace, remaining,
-                project_id=project_id, broker=self._broker,
+                step,
+                aligned_prefix,
+                workspace,
+                remaining,
+                project_id=project_id,
+                broker=self._broker,
             )
             control: Dict[str, Any] = {
-                "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
+                "resolved": False,
+                "confidence": 0.0,
+                "needs": [],
+                "ask": "",
             }
             if step.status == "done":
                 control = self._ledger.extract_and_validate(step, project_id)
@@ -14777,7 +14889,9 @@ class AgenticOrchestrator:
                     self._dyn.arm_tdd_verification(step, project_id)
                 if use_cache:
                     await self._cache.put(
-                        project_id, structure_hash, step,
+                        project_id,
+                        structure_hash,
+                        step,
                         self._ledger.serialize_for(step.id),
                     )
             self._f._log_debug(
@@ -14810,7 +14924,7 @@ class AgenticOrchestrator:
                 >= self._f.valves.agentic_early_exit_confidence
             ):
                 skipped_ids = []
-                for later in plan.steps[idx + 1:]:
+                for later in plan.steps[idx + 1 :]:
                     if later.status == "pending" and later.kind != "verify":
                         later.status = "skipped"
                         later.skip_reason = "early-exit"
@@ -28516,8 +28630,7 @@ class EnrichmentTasks:
         # Region: valve gates — feature must be meaningful and enabled
         valves = self._f.valves
         if not (
-            valves.skeleton_include_docstrings
-            and valves.docstring_flush_on_complete
+            valves.skeleton_include_docstrings and valves.docstring_flush_on_complete
         ):
             return
 
@@ -34080,9 +34193,7 @@ class MessageAssembler:
                 else 0
             )
             hub_tier_tokens = (
-                len(self._f.tokenizer.encode(hub_tier_text))
-                if hub_tier_text
-                else 0
+                len(self._f.tokenizer.encode(hub_tier_text)) if hub_tier_text else 0
             )
             dyn_budget = max(
                 0,
@@ -34175,9 +34286,7 @@ class MessageAssembler:
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
             tier_tok = (
-                len(self._f.tokenizer.encode(hub_tier_text))
-                if hub_tier_text
-                else 0
+                len(self._f.tokenizer.encode(hub_tier_text)) if hub_tier_text else 0
             )
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
@@ -38987,7 +39096,7 @@ class Filter:
             ),
         )
         agentic_step_max_tokens: int = Field(
-            default=700,
+            default=1500,
             ge=100,
             description="Generation cap per agentic step.",
         )
@@ -39000,7 +39109,7 @@ class Filter:
             ),
         )
         agentic_max_seconds: int = Field(
-            default=180,
+            default=0,
             ge=10,
             description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
         )
@@ -39025,7 +39134,7 @@ class Filter:
             ),
         )
         agentic_trigger: str = Field(
-            default="command",
+            default="auto",
             description=(
                 "'command' = the pipeline only runs via /agent. 'auto' = it "
                 "also fires when detection finds real decomposition, level "
@@ -39038,7 +39147,7 @@ class Filter:
             ),
         )
         agentic_tool_rounds_max: int = Field(
-            default=2,
+            default=3,
             ge=0,
             le=4,
             description=(
