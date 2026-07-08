@@ -4993,8 +4993,10 @@ class ContextBuilder:
             effective_hash = structure_hash
         psm.set_structure_hash_for_cache(project_id, effective_hash)
 
-        # --- 3. Resolved call graph mode ---
-        mode = psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
+        # --- 3b. One-time docstring flush (background coverage completed) ---
+        self._consume_docstring_flush(
+            project_id, pstate_raw, structure_hash, freeze_active, is_continuation
+        )
 
         # --- 4. Build cache key using the effective (possibly frozen) hash ---
         cache_key = f"{effective_hash}__{mode}"
@@ -5184,6 +5186,67 @@ class ContextBuilder:
         self._check_block_a_vs_keep(project_id, tokens)
 
         return static_block
+
+    def _consume_docstring_flush(
+        self,
+        project_id: str,
+        pstate_raw: dict,
+        structure_hash: str,
+        freeze_active: bool,
+        is_continuation: bool,
+    ) -> bool:
+        """
+        Consume a pending skeleton docstring flush request, if any.
+
+        The background docstring loop sets skeleton_docstring_flush_pending
+        once coverage completes (or the queue stalls without progress).
+        Consuming it busts the Block A and skeleton-tier caches so the very
+        next render — this turn — embeds the accumulated docstrings, paying
+        exactly one partial prefill from the skeleton's position in the
+        prompt. The request is deferred (flag kept intact) while a Block A
+        freeze window or an AutoContinue continuation is active, since both
+        exist precisely to keep the prefix byte-identical; the flush then
+        fires on the first eligible turn after the window closes.
+
+        Args:
+            project_id: Current project identifier.
+            pstate_raw: The project's raw pstate dict, already fetched by
+                the caller; mutated in place.
+            structure_hash: Current (unfrozen) structure hash, stamped as
+                docstring_flush_done_hash so the same structure never
+                flushes twice.
+            freeze_active: Whether a Block A freeze window is active.
+            is_continuation: Whether this turn is an AutoContinue
+                continuation serving the frozen Block A text.
+
+        Returns:
+            True when the flush was consumed and the caches were busted.
+        """
+        # Region: fast exit — nothing pending
+        if not pstate_raw.get("skeleton_docstring_flush_pending"):
+            return False
+
+        # Region: defer while any prefix-pinning mechanism is active
+        if freeze_active or is_continuation:
+            self._f._log_debug(
+                "Docstring flush: deferred (freeze window or continuation "
+                "active) — flag kept for a later turn"
+            )
+            return False
+
+        # Region: consume — bust Block A and skeleton-tier caches once
+        psm = self._f._project_state_manager
+        pstate_raw["skeleton_docstring_flush_pending"] = False
+        pstate_raw["docstring_flush_done_hash"] = structure_hash
+        pstate_raw["skeleton_tier_cache_key"] = None
+        pstate_raw["skeleton_tier_cached"] = None
+        psm.set_block_a_cache_key(project_id, None)
+        psm.set_block_a_cached(project_id, None)
+        self._f._log_debug(
+            "Docstring flush: consumed — Block A and skeleton tier caches "
+            "busted; this turn re-renders once with full docstring coverage"
+        )
+        return True
 
     def _check_block_a_vs_keep(self, project_id: str, block_a_tokens: int) -> None:
         """
@@ -25444,6 +25507,14 @@ class EnrichmentTasks:
         # unfinished queue and the loop re-runs next turn to finish the job.
         # When stopped by signal, _run_task already marks not_completed, so
         # this is only decisive on the clean-exit path.
+        #
+        # Flush-once policy: LLM-generated docstrings are deliberately kept
+        # out of the skeleton tier's cache key, so they never surface in
+        # Block A on their own. On the clean-exit path this region requests
+        # a single skeleton re-render — when coverage reaches 100%, or when
+        # the queue converges without progress (two clean runs that resolved
+        # nothing new: permanent per-symbol failures should not hold the
+        # accumulated coverage hostage forever).
         remaining = _count_pending()
         if remaining > 0 and not stopped:
             task_def = self._f._task_registry.get_task_definition("docstrings")
@@ -25453,12 +25524,72 @@ class EnrichmentTasks:
                 f"bg_docstring: finished with {remaining} symbol(s) still "
                 f"pending — task kept not-completed so it re-runs next turn"
             )
-        else:
+            if total_docstrings == 0:
+                stalls = int(pstate.get("docstring_bg_stall_runs", 0)) + 1
+                pstate["docstring_bg_stall_runs"] = stalls
+                if stalls >= 2:
+                    self._request_skeleton_docstring_flush(project_id, "stalled")
+            else:
+                pstate["docstring_bg_stall_runs"] = 0
+        elif not stopped:
+            pstate["docstring_bg_stall_runs"] = 0
+            self._request_skeleton_docstring_flush(project_id, "complete")
             self._f._log_debug("bg_docstring: finished")
+        else:
+            self._f._log_debug("bg_docstring: finished (stopped by signal)")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Helper methods for background docstring (unchanged)
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _request_skeleton_docstring_flush(
+        self,
+        project_id: str,
+        reason: str,
+    ) -> None:
+        """
+        Request a one-time skeleton re-render so accumulated LLM-generated
+        docstrings become visible in Block A.
+
+        The skeleton tier is cached by structure_hash, which deliberately
+        ignores docstrings, so background-generated docstrings never reach
+        Block A in a read-only session. This sets a pstate flag consumed by
+        build_block_a at the start of a later turn, busting the Block A and
+        skeleton-tier caches exactly once. Guards make the request
+        idempotent: skipped when docstrings are not rendered into the
+        skeleton at all, when a request is already pending, or when a flush
+        already ran for the current structure_hash (so a converged-but-
+        incomplete queue re-running every turn cannot flush repeatedly).
+
+        Args:
+            project_id: Current project identifier.
+            reason: Short label for the log line ("complete" | "stalled").
+        """
+        # Region: valve gates — feature must be meaningful and enabled
+        valves = self._f.valves
+        if not (
+            valves.skeleton_include_docstrings and valves.docstring_flush_on_complete
+        ):
+            return
+
+        # Region: idempotence guards (pending flag, per-structure done marker)
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        if pstate.get("skeleton_docstring_flush_pending"):
+            return
+        current_hash = self._f._symbol_index.compute_structure_hash(project_id)
+        if current_hash and pstate.get("docstring_flush_done_hash") == current_hash:
+            self._f._log_debug(
+                "bg_docstring: flush already performed for this structure "
+                "hash — skipping"
+            )
+            return
+
+        # Region: raise the flag for build_block_a to consume
+        pstate["skeleton_docstring_flush_pending"] = True
+        self._f._log_debug(
+            f"bg_docstring: skeleton docstring flush requested ({reason}) — "
+            "Block A will re-render once on a later turn"
+        )
 
     async def cancel_docstring_tasks(self) -> None:
         """
@@ -32582,6 +32713,9 @@ class ProjectStateManager:
             "skeleton_rendered_this_turn": False,
             "skeleton_render_mode": None,
             "skeleton_tier_qids": [],
+            "skeleton_docstring_flush_pending": False,
+            "docstring_flush_done_hash": None,
+            "docstring_bg_stall_runs": 0,
             # -- Centrality and lightweight context -----------------------
             "node_centrality": {},
             "node_centrality_structure_hash": None,
@@ -36397,6 +36531,17 @@ class Filter:
         skeleton_include_docstrings: bool = Field(
             default=True,
             description="Include one‑line docstrings in the skeleton tier.",
+        )
+        docstring_flush_on_complete: bool = Field(
+            default=True,
+            description=(
+                "Re-render the skeleton tier ONCE when background docstring "
+                "generation reaches full coverage (or the queue stalls), so "
+                "LLM-generated docstrings become visible in Block A. Costs a "
+                "single partial prefill from the skeleton's position; when "
+                "off, generated docstrings only surface after the next "
+                "structural edit."
+            ),
         )
         emergency_max_turns: int = Field(
             default=4,
