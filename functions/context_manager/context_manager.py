@@ -11797,8 +11797,15 @@ class LLMOrchestrator:
         ):
             return None
 
+        # Region: global thinking kill switch — coerce before dedup and cache
+        # key computation, so deduplicated consumers and cached responses are
+        # always coherent with the effective (post-coercion) flag.
+        if not self._f.valves.llm_enable_thinking:
+            enable_thinking = False
+
         dedup_key = hashlib.md5(
-            f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}".encode()
+            f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
+            f"|{response_format}|{enable_thinking}".encode()
         ).hexdigest()
         async with self._f._pending_llm_lock:
             if dedup_key in self._f._pending_llm:
@@ -12349,23 +12356,30 @@ class AgenticStepCache:
         norm = " ".join(step.goal.split()).lower()
         return hashlib.md5(f"{step.kind}\x1f{norm}".encode()).hexdigest()
 
-    def get(
+    async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
     ) -> Optional[Dict[str, str]]:
         """
         Return {"output", "digest", "claims_json"} on a hit, else None.
 
         A row written under a different structure_hash is a miss (stale).
+        The SELECT runs through StateStore._db_read so it is serialized with
+        the writer worker under _db_global_lock — the same discipline every
+        other _db_conn consumer follows — instead of touching the shared
+        connection from the event-loop thread mid-write.
         """
         if self._f._db_conn is None or not structure_hash:
             return None
+        step_key = self.step_key(step)
         try:
-            cur = self._f._db_conn.execute(
-                "SELECT structure_hash, output, digest, claims_json "
-                "FROM agentic_step_cache WHERE project_id = ? AND step_key = ?",
-                (project_id, self.step_key(step)),
+            row = await self._f._state_store._db_read(
+                lambda: self._f._db_conn.execute(
+                    "SELECT structure_hash, output, digest, claims_json "
+                    "FROM agentic_step_cache "
+                    "WHERE project_id = ? AND step_key = ?",
+                    (project_id, step_key),
+                ).fetchone()
             )
-            row = cur.fetchone()
         except Exception as e:
             self._f._log_debug(f"🤖 StepCache: read failed — {e}")
             return None
@@ -12373,29 +12387,43 @@ class AgenticStepCache:
             return None
         return {"output": row[1], "digest": row[2], "claims_json": row[3]}
 
-    def put(
+    async def put(
         self,
         project_id: str,
         structure_hash: str,
         step: AgenticStep,
         claims_json: str,
     ) -> None:
-        """Upsert a completed step (self-cleaning: replaces stale rows)."""
+        """
+        Upsert a completed step (self-cleaning: replaces stale rows).
+
+        The write is enqueued to the StateStore writer worker instead of
+        executed directly: a direct execute+commit from the event-loop
+        thread could commit the worker's half-built implicit transaction
+        (e.g. a docstring executemany batch) and blocks the loop on the
+        commit fsync. Enqueued semantics are eventual — a read racing this
+        write may miss, which for a cache degrades to a benign re-compute.
+        """
         if self._f._db_conn is None or not structure_hash:
             return
-        try:
+        row = (
+            project_id, self.step_key(step), structure_hash,
+            step.kind, step.goal, step.output, step.digest,
+            claims_json, time.time(),
+        )
+
+        def _write(row: tuple = row) -> None:
             self._f._db_conn.execute(
                 "INSERT OR REPLACE INTO agentic_step_cache "
                 "(project_id, step_key, structure_hash, kind, goal, output, "
                 "digest, claims_json, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    project_id, self.step_key(step), structure_hash,
-                    step.kind, step.goal, step.output, step.digest,
-                    claims_json, time.time(),
-                ),
+                row,
             )
             self._f._db_conn.commit()
+
+        try:
+            await self._f._state_store._db_enqueue(_write)
         except Exception as e:
             self._f._log_debug(f"🤖 StepCache: write failed — {e}")
 
@@ -12509,7 +12537,12 @@ class AgenticToolBroker:
 
     def _grep(self, pattern: str, project_id: str) -> str:
         """Capped scan over live block contents (the Section-4 lesson:
-        every free-text scan gets a hard budget)."""
+        every free-text scan gets a hard budget). The pattern itself is
+        LLM-authored, so it is length-capped before compilation — long
+        nested-quantifier expressions are where catastrophic
+        backtracking hides."""
+        if len(pattern) > 200:
+            return "[GREP: pattern longer than 200 chars — refine it]"
         try:
             rx = re.compile(pattern)
         except re.error:
@@ -12981,6 +13014,20 @@ class AgenticSandboxRunner:
              "passed": int, "total": int, "failures": [str],
              "detail": str}
         """
+        # Region: honest mode gate — 'docker' is a reserved valve value with
+        # no runner implementation yet. Refusing here (single point of
+        # truth) beats silently executing in the plain subprocess while the
+        # operator believes the hardened container is in use.
+        mode = getattr(self._f.valves, "agentic_exec_mode", "off")
+        if mode != "subprocess":
+            return {
+                "status": "error", "passed": 0, "total": 0, "failures": [],
+                "detail": (
+                    f"agentic_exec_mode='{mode}' has no runner in this build "
+                    f"— no harness was executed; use 'subprocess'"
+                ),
+            }
+
         # Region: tripwire — reject before ever executing
         lowered = harness_code.lower()
         for token in self._DENYLIST:
@@ -12990,26 +13037,31 @@ class AgenticSandboxRunner:
                     "failures": [], "detail": f"denylist token: {token}",
                 }
 
-        # Region: isolated subprocess with rlimits (off the event loop)
+        # Region: prepend the rlimit prelude AFTER the tripwire, so the
+        # denylist only ever sees the untrusted harness text. Setting the
+        # limits inside the child (line 1, before any test code) replaces
+        # preexec_fn, which the subprocess docs flag as unsafe in threaded
+        # processes — it runs between fork and exec and can deadlock on a
+        # lock another thread held at fork time, and this process (OpenWebUI
+        # + anyio workers) is heavily threaded. Negligible startup CPU runs
+        # before the caps apply, which is equivalent in practice.
+        timeout = max(1, int(self._f.valves.agentic_exec_timeout_s))
+        prelude = (
+            "import resource as _res\n"
+            f"_res.setrlimit(_res.RLIMIT_CPU, ({timeout}, {timeout}))\n"
+            "_res.setrlimit(_res.RLIMIT_AS, (536870912, 536870912))\n"
+            "_res.setrlimit(_res.RLIMIT_NOFILE, (32, 32))\n"
+            "_res.setrlimit(_res.RLIMIT_FSIZE, (8388608, 8388608))\n"
+            "del _res\n"
+        )
+        harness_code = prelude + harness_code
+
+        # Region: isolated subprocess (off the event loop)
         def _run_blocking() -> Dict[str, Any]:
             import os as _os
             import subprocess as _sp
             import sys as _sys
             import tempfile as _tf
-
-            timeout = max(1, int(self._f.valves.agentic_exec_timeout_s))
-
-            def _limits() -> None:
-                import resource as _res
-
-                _res.setrlimit(_res.RLIMIT_CPU, (timeout, timeout))
-                _res.setrlimit(
-                    _res.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024)
-                )
-                _res.setrlimit(_res.RLIMIT_NOFILE, (32, 32))
-                _res.setrlimit(
-                    _res.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024)
-                )
 
             with _tf.TemporaryDirectory(prefix="agentic_exec_") as jail:
                 path = _os.path.join(jail, "harness.py")
@@ -13023,7 +13075,6 @@ class AgenticSandboxRunner:
                         timeout=timeout,
                         capture_output=True,
                         text=True,
-                        preexec_fn=_limits,
                     )
                 except _sp.TimeoutExpired:
                     return {
@@ -13253,7 +13304,7 @@ if __name__ == "__main__":
         """
         started = time.monotonic()
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
-        if mode not in ("subprocess", "docker"):
+        if mode != "subprocess":
             step.status = "done"
             step.output = (
                 f"(regression disabled: agentic_exec_mode={mode})"
@@ -13353,7 +13404,7 @@ if __name__ == "__main__":
             )
 
         body_hash = hashlib.md5(body.encode()).hexdigest()
-        cached = self._cache_get(project_id, qid)
+        cached = await self._cache_get(project_id, qid)
 
         # -- unchanged body with a stored result: reuse outright ----------
         if cached and cached["body_hash"] == body_hash and cached["result_json"]:
@@ -13378,7 +13429,7 @@ if __name__ == "__main__":
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
         harness = self._compose(body, tests, callee_src)
         result = await self._runner.run(harness)
-        self._cache_put(project_id, qid, body_hash, tests, result)
+        await self._cache_put(project_id, qid, body_hash, tests, result)
         if result["status"] in ("pass", "fail"):
             self._append_evidence(ledger, step_id, qid, result, cached=False)
         return self._format_line(qid, verdict, result, source)
@@ -13517,24 +13568,28 @@ if __name__ == "__main__":
             base += f" — {result['detail'][:160]}"
         return base
 
-    def _cache_get(self, project_id: str, qid: str) -> Optional[Dict[str, str]]:
-        """Row from agentic_harnesses or None."""
+    async def _cache_get(
+        self, project_id: str, qid: str
+    ) -> Optional[Dict[str, str]]:
+        """Row from agentic_harnesses or None (serialized via _db_read)."""
         if self._f._db_conn is None:
             return None
         try:
-            cur = self._f._db_conn.execute(
-                "SELECT body_hash, tests, result_json FROM agentic_harnesses "
-                "WHERE project_id = ? AND qid = ?",
-                (project_id, qid),
+            row = await self._f._state_store._db_read(
+                lambda: self._f._db_conn.execute(
+                    "SELECT body_hash, tests, result_json "
+                    "FROM agentic_harnesses "
+                    "WHERE project_id = ? AND qid = ?",
+                    (project_id, qid),
+                ).fetchone()
             )
-            row = cur.fetchone()
         except Exception:
             return None
         if not row:
             return None
         return {"body_hash": row[0], "tests": row[1], "result_json": row[2]}
 
-    def _cache_put(
+    async def _cache_put(
         self,
         project_id: str,
         qid: str,
@@ -13542,20 +13597,31 @@ if __name__ == "__main__":
         tests: str,
         result: Dict[str, Any],
     ) -> None:
-        """Upsert harness tests + latest result for a qid."""
+        """
+        Upsert harness tests + latest result for a qid.
+
+        Enqueued to the writer worker (see AgenticStepCache.put for the
+        rationale). Eventual write semantics: a same-run re-read that races
+        the queue misses and re-elicits once — benign for a cache.
+        """
         if self._f._db_conn is None:
             return
-        try:
+        row = (
+            project_id, qid, body_hash, tests,
+            json.dumps(result), time.time(),
+        )
+
+        def _write(row: tuple = row) -> None:
             self._f._db_conn.execute(
                 "INSERT OR REPLACE INTO agentic_harnesses "
                 "(project_id, qid, body_hash, tests, result_json, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    project_id, qid, body_hash, tests,
-                    json.dumps(result), time.time(),
-                ),
+                row,
             )
             self._f._db_conn.commit()
+
+        try:
+            await self._f._state_store._db_enqueue(_write)
         except Exception as e:
             self._f._log_debug(f"🤖 DynamicVerifier: cache write failed — {e}")
 
@@ -13575,9 +13641,7 @@ if __name__ == "__main__":
             step: The completed design_tests step.
             project_id: Current project identifier.
         """
-        if getattr(self._f.valves, "agentic_exec_mode", "off") not in (
-            "subprocess", "docker"
-        ):
+        if getattr(self._f.valves, "agentic_exec_mode", "off") != "subprocess":
             return
         if not getattr(self._f.valves, "agentic_tdd_inter_turn", False):
             return
@@ -13633,13 +13697,11 @@ if __name__ == "__main__":
         # Clear up front: this job fires at most once regardless of outcome.
         pstate["agentic_tdd_pending"] = None
 
-        if getattr(self._f.valves, "agentic_exec_mode", "off") not in (
-            "subprocess", "docker"
-        ):
+        if getattr(self._f.valves, "agentic_exec_mode", "off") != "subprocess":
             return
 
         # Region: load the armed tests and the response that should implement them
-        cached = self._cache_get(project_id, pending["pseudo"])
+        cached = await self._cache_get(project_id, pending["pseudo"])
         if not cached or "def test_" not in (cached.get("tests") or ""):
             return
         response = self._f._project_state_manager.get_last_assistant_response(
@@ -13667,7 +13729,7 @@ if __name__ == "__main__":
             "detail": result.get("detail", ""),
         }
         # Persist the run under the pseudo qid too (keeps the harness asset).
-        self._cache_put(
+        await self._cache_put(
             project_id, pending["pseudo"],
             cached.get("body_hash", ""), cached["tests"], result,
         )
@@ -13728,7 +13790,9 @@ if __name__ == "__main__":
             f"against your actual generated code.)_"
         )
 
-    def persist_design_tests(self, step: AgenticStep, project_id: str) -> None:
+    async def persist_design_tests(
+        self, step: AgenticStep, project_id: str
+    ) -> None:
         """Persist a design_tests step's harness under a goal-keyed pseudo
         qid so the Fase 6 inter-turn loop can pick it up after the main
         call generates the implementation."""
@@ -13739,7 +13803,9 @@ if __name__ == "__main__":
         pseudo = "__design__" + hashlib.md5(
             " ".join(step.goal.split()).lower().encode()
         ).hexdigest()[:16]
-        self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
+        await self._cache_put(
+            project_id, pseudo, "", tests, {"status": "pending"}
+        )
         self._f._log_debug(
             f"🤖 DynamicVerifier: design tests persisted as {pseudo}"
         )
@@ -14517,6 +14583,49 @@ class AgenticOrchestrator:
             )
             return
 
+        # Region: fail-open boundary — the pipeline is an enhancement layer
+        # and must never veto the base answer. Any internal failure degrades
+        # this turn to a normal single-pass response instead of propagating
+        # into the inlet (which has no except clause and would abort the
+        # request). CancelledError is BaseException and still propagates.
+        try:
+            await self._run_pipeline_inner(
+                question=question,
+                prelim_system=prelim_system,
+                project_id=project_id,
+                slot_free=slot_free,
+                dynamic_injections=dynamic_injections,
+                trigger=trigger,
+            )
+        except Exception as exc:
+            self._f._log_debug(
+                f"🤖 Agentic: pipeline crashed ({type(exc).__name__}: {exc}) "
+                f"— degrading to a normal single-pass turn (trigger={trigger})"
+            )
+            dynamic_injections.append(
+                (
+                    "low",
+                    "**Note:** the agentic pipeline hit an internal error and "
+                    "was skipped this turn; this is a normal single-pass "
+                    "answer.",
+                )
+            )
+
+    async def _run_pipeline_inner(
+        self,
+        question: str,
+        prelim_system: str,
+        project_id: str,
+        slot_free: bool,
+        dynamic_injections: List[Tuple[str, str]],
+        trigger: str = "command",
+    ) -> None:
+        """
+        Plan and execute the pipeline body (see run_pipeline for semantics).
+
+        Runs only behind run_pipeline's slot gate and fail-open boundary, so
+        it may assume a free slot and raise freely on internal errors.
+        """
         # Region: plan under the same wall-clock budget as execution
         aligned_prefix = self._aligned_prefix(prelim_system)
         budget = float(self._f.valves.agentic_max_seconds)
@@ -14635,7 +14744,7 @@ class AgenticOrchestrator:
 
             # -- cache lookup (invalidated by structure_hash mismatch) -----
             if use_cache:
-                hit = self._cache.get(project_id, structure_hash, step)
+                hit = await self._cache.get(project_id, structure_hash, step)
                 if hit is not None:
                     step.output = hit["output"]
                     step.digest = hit["digest"]
@@ -14658,16 +14767,16 @@ class AgenticOrchestrator:
                 project_id=project_id, broker=self._broker,
             )
             control: Dict[str, Any] = {
-                "resolved": False, "confidence": 0.0, "needs": []
+                "resolved": False, "confidence": 0.0, "needs": [], "ask": ""
             }
             if step.status == "done":
                 control = self._ledger.extract_and_validate(step, project_id)
                 step.digest = self._digest(step.output)
                 if step.kind == "design_tests":
-                    self._dyn.persist_design_tests(step, project_id)
+                    await self._dyn.persist_design_tests(step, project_id)
                     self._dyn.arm_tdd_verification(step, project_id)
                 if use_cache:
-                    self._cache.put(
+                    await self._cache.put(
                         project_id, structure_hash, step,
                         self._ledger.serialize_for(step.id),
                     )
@@ -33317,7 +33426,7 @@ class MessageAssembler:
         # ------------------------------------------------------------------
         if (
             self._f.valves.enable_agentic_pipeline
-            and self._f.valves.agentic_trigger == "auto"
+            and self._f.valves.agentic_trigger in ("auto", "shadow")
             and not is_continuation
             and not _is_arch
             and slot_free
@@ -33329,7 +33438,16 @@ class MessageAssembler:
                 _agentic_reason = "level3_or_scientific"
             elif AgenticOrchestrator._looks_multiclause_imperative(user_content):
                 _agentic_reason = "imperative_multiclause"
-            if _agentic_reason:
+            if _agentic_reason and self._f.valves.agentic_trigger == "shadow":
+                # Shadow mode: record the decision the heuristic WOULD have
+                # taken on real traffic without paying the pipeline cost, so
+                # the trigger can be calibrated against production logs
+                # before 'auto' is enabled. The normal CoT path continues.
+                self._f._log_debug(
+                    f"🤖 Agentic auto-trigger [SHADOW]: would fire "
+                    f"({_agentic_reason}) — continuing with the normal path"
+                )
+            elif _agentic_reason:
                 self._f._log_debug(
                     f"🤖 Agentic auto-trigger: {_agentic_reason} → pipeline"
                 )
@@ -33936,6 +34054,15 @@ class MessageAssembler:
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
 
+        # Hub-bodies tier: read back from pstate, where build() persists it
+        # each turn (the dumper already reads it the same way). It must be
+        # part of the FINAL system prompt, not only the preliminary one —
+        # otherwise the main model never sees the hub bodies, the warmup
+        # prefills a prefix the real request never sends, and the aligned
+        # prefix of every auxiliary call diverges from the main call right
+        # after Block A whenever the tier is non-empty.
+        hub_tier_text = pstate.get("hub_tier_text", "") or ""
+
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
             selected_dynamic: List[str] = []
@@ -33952,7 +34079,15 @@ class MessageAssembler:
                 if getattr(self._f, "_original_system_prompt", "")
                 else 0
             )
-            dyn_budget = max(0, budget - static_tokens - user_prompt_tokens)
+            hub_tier_tokens = (
+                len(self._f.tokenizer.encode(hub_tier_text))
+                if hub_tier_text
+                else 0
+            )
+            dyn_budget = max(
+                0,
+                budget - static_tokens - hub_tier_tokens - user_prompt_tokens,
+            )
 
             for prio, text in dynamic_injections:
                 if not text:
@@ -33970,9 +34105,15 @@ class MessageAssembler:
         else:
             dynamic_block = "\n\n".join(t for _, t in dynamic_injections if t)
 
-        separator = "\n\n---\n\n" if static_block and dynamic_block else ""
-
-        codeaware_block = static_block + separator + dynamic_block
+        # Same part ordering and joiner as _assemble_prelim_system, so the
+        # final prompt is byte-consistent with the preliminary one through
+        # (Block A + tier) and the aligned-prefix invariant of auxiliary
+        # calls holds past Block A again.
+        separator = "\n\n---\n\n"
+        codeaware_parts = [
+            p for p in [static_block, hub_tier_text, dynamic_block] if p.strip()
+        ]
+        codeaware_block = separator.join(codeaware_parts)
         base_content = getattr(self._f, "_original_system_prompt", "") or ""
 
         final_system_parts = []
@@ -34033,9 +34174,15 @@ class MessageAssembler:
             )
 
             prefix_hash = pstate.get("last_static_prefix_hash", "N/A")
+            tier_tok = (
+                len(self._f.tokenizer.encode(hub_tier_text))
+                if hub_tier_text
+                else 0
+            )
             self._f._log_debug("─" * 60)
             self._f._log_debug("TOKEN BREAKDOWN — system prompt")
             self._f._log_debug(f"  BLOCK A (static, cacheable):  ~{static_tok} tokens")
+            self._f._log_debug(f"  HUB TIER (stable bodies):     ~{tier_tok} tokens")
             self._f._log_debug(f"  BLOCK B (dynamic, per-query): ~{dynamic_tok} tokens")
             self._f._log_debug(
                 f"  User instructions (tail):      ~{base_tok} tokens (LAST)"
@@ -38025,6 +38172,21 @@ class Filter:
             default="chat",
             description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
         )
+        llm_enable_thinking: bool = Field(
+            default=True,
+            description=(
+                "Global kill switch for reasoning/thinking on auxiliary LLM "
+                "calls. When False, every call_llm() invocation is coerced to "
+                "enable_thinking=False regardless of what the call site "
+                "requested — including CoT generation, agentic steps, "
+                "hypothesis competition and every other consumer. The "
+                "coercion happens before the response-cache key is computed, "
+                "so cached thinking-on responses are never served while the "
+                "switch is off (and vice versa). Affects only auxiliary "
+                "calls made by this filter; the main user-visible inference "
+                "is issued by OpenWebUI and is not routed through call_llm()."
+            ),
+        )
         llm_semaphore_concurrency: int = Field(
             default=1,
             ge=1,
@@ -38868,7 +39030,11 @@ class Filter:
                 "'command' = the pipeline only runs via /agent. 'auto' = it "
                 "also fires when detection finds real decomposition, level "
                 ">= 3 / scientific reasoning, or an imperative multi-clause "
-                "prompt (the shape the '?' heuristic cannot see)."
+                "prompt (the shape the '?' heuristic cannot see). 'shadow' = "
+                "evaluate the same detection on every eligible turn and log "
+                "'would fire' WITHOUT running the pipeline — calibrate the "
+                "heuristic on real traffic (grep the log for [SHADOW]) "
+                "before enabling 'auto'."
             ),
         )
         agentic_tool_rounds_max: int = Field(
@@ -38913,11 +39079,10 @@ class Filter:
                 "tmpdir jail, empty environment, wall timeout and POSIX "
                 "rlimits, behind a denylist tripwire (a handrail, not a "
                 "sandbox: fits the declared threat model — your own code, "
-                "runaway protection — not adversarial input). 'docker' = the "
-                "same harness runs in a throwaway "
-                "`--network none --read-only --memory 512m --pids-limit 64` "
-                "container (agentic_docker_image), the hardened option for "
-                "continuous use; requires a reachable Docker daemon."
+                "runaway protection — not adversarial input). 'docker' is a "
+                "RESERVED value with no runner implemented yet: selecting it "
+                "makes every execution path refuse loudly instead of "
+                "silently downgrading to the subprocess handrail."
             ),
         )
         agentic_exec_timeout_s: int = Field(
@@ -38950,9 +39115,10 @@ class Filter:
         agentic_docker_image: str = Field(
             default="python:3.12-slim",
             description=(
-                "Image used when agentic_exec_mode='docker'. Run throwaway "
-                "with --network none --read-only --memory 512m --pids-limit "
-                "64 and the harness mounted read-only."
+                "RESERVED alongside agentic_exec_mode='docker' (not "
+                "implemented yet): image the future container runner will "
+                "use, throwaway with --network none --read-only "
+                "--memory 512m --pids-limit 64."
             ),
         )
         agentic_regression_max_callers: int = Field(
@@ -38970,8 +39136,9 @@ class Filter:
             description=(
                 "Fase 7: allow a step to end the pipeline early with a "
                 "clarifying question surfaced as the turn's answer "
-                "(stateless — the user's reply is a fresh turn). Off by "
-                "default so the pipeline never stalls unexpectedly."
+                "(stateless — the user's reply is a fresh turn; no plan "
+                "is persisted). Gated by a minimum question length so a "
+                "stray token cannot hijack the turn."
             ),
         )
         scientific_hypotheses_count: int = Field(
