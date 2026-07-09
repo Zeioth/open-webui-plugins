@@ -12448,9 +12448,7 @@ class AgenticStepCache:
         """
         norm = " ".join(step.goal.split()).lower()
         mode = getattr(self._f.valves, "agentic_metacog_reinforce", "off")
-        return hashlib.md5(
-            f"{step.kind}\x1f{norm}\x1f{mode}".encode()
-        ).hexdigest()
+        return hashlib.md5(f"{step.kind}\x1f{norm}\x1f{mode}".encode()).hexdigest()
 
     async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
@@ -17975,29 +17973,6 @@ class CommandRouter:
     _STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'')
     _LINE_COMMENT_RE = re.compile(r"(#|//).*")
 
-    # ── Intent keywords ──────────────────────────────────────────────────
-    INTENT_KEYWORDS = {
-        "forget",
-        "olvida",
-        "olvid",
-        "remember",
-        "recuerda",
-        "pin",
-        "fija",
-        "guarda",
-        "obsolete",
-        "obsoleto",
-        "deprecated",
-        "ya no",
-        "remove",
-        "elimina",
-        "borra",
-        "quita",
-        "keep",
-        "mantén",
-        "conserva",
-    }
-
     _FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
     _INDENTED_CODE_RE = re.compile(r"(?m)^(?:    |\t).+$")
     _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
@@ -19766,6 +19741,26 @@ class CommandRouter:
                 "enumera ",
                 "lista ",
                 "compara ",
+                # Spanish — requests / imperatives (investigate / iterate)
+                # These were missing and are common openers for real
+                # questions ("busca mejoras en X", "itera sobre tu
+                # respuesta"): without them _has_request_lead returned False,
+                # so a message that re-attaches an already-indexed paste (a
+                # one-line reference plus the question) was misread as
+                # code-only and diverted into silent ingestion, which returns
+                # before the agentic gate is ever reached.
+                "busca ",
+                "buscar ",
+                "encuentra ",
+                "identifica ",
+                "itera ",
+                "iterar ",
+                "propon ",
+                "propón ",
+                "sugiere ",
+                "investiga ",
+                "evalua ",
+                "evalúa ",
                 # Spanish — requests / imperatives (code action)
                 "arregla ",
                 "corrige ",
@@ -19954,6 +19949,29 @@ class CommandRouter:
         # ── Step 0: guard clauses & line inventory ────────────────────────────
         if not content or len(content.strip()) < 20:
             return False
+
+        # A re-attached, already-indexed paste is spliced down to a one-line
+        # reference (_indexed_reference_line) that still reads as technical
+        # prose ('… symbols already indexed in the SymbolGraph …'). Dropping
+        # those reference lines before classification means the verdict rests
+        # on the ACTUAL user text, not on the residual reference — a
+        # mechanism that does not depend on the imperative-lead dictionary
+        # staying exhaustive (the fragile path that let 'busca'/'itera'
+        # through as code-only).
+        _ref_markers = ("symbols already", "indexed in the symbolgraph")
+        _kept = [
+            ln
+            for ln in content.splitlines()
+            if not any(mk in ln.lower() for mk in _ref_markers)
+        ]
+        _deref = "\n".join(_kept).strip()
+        if _deref and _deref != content.strip():
+            # If what remains after removing references is short prose (a bare
+            # question like 'busca mejoras en build_block_b'), it is not
+            # code-only regardless of what the classifier would say.
+            if len(_deref) < 200 and "```" not in _deref:
+                return False
+            content = _deref
 
         stripped = content.strip()
         estimated_tokens = self._f._tokens.estimate_code_tokens(content)
@@ -33719,9 +33737,9 @@ class MessageAssembler:
         # planner / per-step / synthesis prompts downstream — the exact
         # 'consumer without a diet' failure. 2000 chars is ample for a
         # question; the code itself reaches the pipeline through Block A/B.
-        _agentic_question = (
-            (user_question or "").strip() or user_content.strip()
-        )[:2000]
+        _agentic_question = ((user_question or "").strip() or user_content.strip())[
+            :2000
+        ]
         if self._f.valves.enable_agentic_pipeline and _always_mode in (
             "always",
             "shadow",
@@ -38773,28 +38791,6 @@ class Filter:
     """
 
     # ── Class constants ────────────────────────────────────────────────────
-
-    INTENT_KEYWORDS = {
-        "forget",
-        "olvida",
-        "olvid",
-        "remember",
-        "recuerda",
-        "pin",
-        "fija",
-        "guarda",
-        "obsolete",
-        "obsoleto",
-        "deprecated",
-        "ya no",
-        "remove",
-        "elimina",
-        "borra",
-        "quita",
-        "keep",
-        "mantén",
-        "conserva",
-    }
 
     _COT_NEGATION_PREFIXES: frozenset = frozenset(
         {
