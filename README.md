@@ -61,23 +61,8 @@ As you can see, even if M grows by a factor of one trillion, the search cost onl
 
 The average cost of each turn is **[constant]**. In order to be mathematically precise, we say it's **[linear]** because a chat session is technically infinite, and given the initial prompt we will iterate n times. But in practice our system has **[constant]** complexity. This is the best we can do. And no new technology or techniques can improve it as far as we know, as this is unavoidable in an interactive chat.
 
-## Cascade hueristics
-All hueristic systems reinforce each other
-```
-Use case detection
-       ↓
-Hueristics (keywords + use case)
-       ↓
-CrossEncoder (scores)
-       ↓
-¿Trust high enough?
-       ↓
-    SÍ → Use Cross Encoder
-       ↓
-    NO → LLM with context from Cross Encoder
-       ↓
-LLM fail → Infere = True (conservative)
-```
+## Fully agentic
+TODO
 
 ## Fully compliant with the scientific method
 With metacognitive & scientific method skills.
