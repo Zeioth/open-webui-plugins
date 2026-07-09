@@ -6319,9 +6319,7 @@ class ContextBuilder:
             if _uc not in ("A", "B", "C", "D", "E"):
                 _uc = "C"
             _case_key = UseCase(_uc)
-            self._f._log_debug(
-                f"classify_use_case [unified]: '{_case_key.label}'"
-            )
+            self._f._log_debug(f"classify_use_case [unified]: '{_case_key.label}'")
             return _uc, dict(self.LOD_PROFILES[_uc]), _case_key.label
 
         # ── Diet for the explicit-detection regexes ──
@@ -12297,6 +12295,8 @@ class LedgerClaim:
     evidence_type: str = "reasoning"
     verification: str = ""  # "" | confirmed | refuted | unsupported | unverifiable
     verification_detail: str = ""
+    dynamic_validation: str = ""  # "" | passed | refuted — set by verify_dynamic
+    invalid_relations: List[str] = field(default_factory=list)
 
 
 class AgenticEvidenceLedger:
@@ -12402,6 +12402,8 @@ class AgenticEvidenceLedger:
                     claim.valid_qids.append(qid)
                 else:
                     claim.invalid_qids.append(qid)
+            # #9: validate asserted call relations, not just symbol existence.
+            claim.invalid_relations = self._validate_call_relations(text, project_id)
             self.claims.append(claim)
         return control
 
@@ -12437,6 +12439,148 @@ class AgenticEvidenceLedger:
         except Exception:
             return False
 
+    # ── Structural-vs-noise classification of unresolved qids (P2/P9) ─────
+
+    _PY_KEYWORDS = frozenset(
+        {
+            "self",
+            "cls",
+            "None",
+            "True",
+            "False",
+            "and",
+            "or",
+            "not",
+            "in",
+            "is",
+            "if",
+            "else",
+            "elif",
+            "for",
+            "while",
+            "return",
+            "yield",
+            "def",
+            "class",
+            "import",
+            "from",
+            "as",
+            "with",
+            "try",
+            "except",
+            "finally",
+            "raise",
+            "lambda",
+            "pass",
+            "break",
+            "continue",
+            "global",
+            "nonlocal",
+            "assert",
+            "del",
+            "async",
+            "await",
+        }
+    )
+
+    def _is_structural_qid(self, qid: str) -> bool:
+        """
+        Decide whether an unresolved qid is a *structural* fabrication worth
+        escalating, or mere *noise* that should not trip the difficulty gate.
+
+        The SymbolIndex only knows project symbols, so any local variable,
+        stdlib/builtin name, or third-party identifier a step mentions comes
+        back "unresolved" — but none of those is the fabricated-structure
+        signal the gate is meant to catch. A structural qid is one that
+        *claims to be a project symbol*: a qualified name (Class.method) or a
+        CamelCase/dotted identifier. Noise is a bare lowercase snake_case
+        token (the shape of a local variable), a Python keyword/builtin, or a
+        dunder. No LLM, no project import scan — purely the shape of the name.
+
+        Args:
+            qid: The unresolved identifier.
+
+        Returns:
+            True if it looks like a fabricated project symbol (escalate),
+            False if it looks like ordinary noise (ignore).
+        """
+        name = (qid or "").strip()
+        if not name:
+            return False
+        # Qualified (Class.method / module.attr) → a claim about project
+        # structure. This is the strongest structural signal.
+        if "." in name:
+            return True
+        # Python keyword / builtin / obvious local → noise.
+        if name in self._PY_KEYWORDS:
+            return False
+        try:
+            import builtins as _b
+
+            if name in dir(_b):
+                return False
+        except Exception:
+            pass
+        # A dunder is a protocol method, not a fabricated project symbol.
+        if name.startswith("__") and name.endswith("__"):
+            return False
+        # CamelCase or has an internal uppercase → looks like a Class or a
+        # deliberate symbol name → structural.
+        if any(c.isupper() for c in name):
+            return True
+        # Bare all-lowercase snake_case single token → the shape of a local
+        # variable → noise.
+        return False
+
+    def _structural_invalid_qids(self, claim: "LedgerClaim") -> List[str]:
+        """Return only the invalid_qids that look like structural fabrications."""
+        return [q for q in claim.invalid_qids if self._is_structural_qid(q)]
+
+    # ── Call-relation validation (#9) ────────────────────────────────────
+
+    _CALL_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
+
+    def _validate_call_relations(self, text: str, project_id: str) -> List[str]:
+        """
+        Verify 'A calls B' relations asserted in a claim against the
+        SymbolIndex edges, returning the ones that are FALSE.
+
+        Existence validation (qids) catches fabricated symbols; this catches
+        a fabricated *relation* between two real symbols — a claim that "A
+        calls B" when no such edge exists is a subtler hallucination the qid
+        check passes clean. Only relations where BOTH ends are known symbols
+        are checked; a relation touching an unknown symbol is already covered
+        by the invalid_qids path. Mirrors the logic gather_evidence uses for
+        call_relations_valid, kept here so per-step validation gets it too.
+
+        Args:
+            text: The claim text.
+            project_id: Current project identifier.
+
+        Returns:
+            List of "A_calls_B" keys whose edge does NOT exist.
+        """
+        invalid: List[str] = []
+        try:
+            for caller, callee in self._CALL_RELATION_RE.findall(text or ""):
+                if not self._qid_exists(caller, project_id):
+                    continue
+                if not self._qid_exists(callee, project_id):
+                    continue
+                caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
+                verified = any(
+                    e.dst == callee and e.type in ("calls", "reads", "writes")
+                    for e in caller_edges
+                )
+                if not verified:
+                    invalid.append(f"{caller}_calls_{callee}")
+        except Exception:
+            return invalid
+        return invalid
+
 
 class AgenticStepCache:
     """
@@ -12465,9 +12609,7 @@ class AgenticStepCache:
         """
         norm = " ".join(step.goal.split()).lower()
         mode = getattr(self._f.valves, "agentic_metacog_reinforce", "off")
-        return hashlib.md5(
-            f"{step.kind}\x1f{norm}\x1f{mode}".encode()
-        ).hexdigest()
+        return hashlib.md5(f"{step.kind}\x1f{norm}\x1f{mode}".encode()).hexdigest()
 
     async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
@@ -13716,6 +13858,17 @@ if __name__ == "__main__":
             + ("; " + result["failures"][0] if result.get("failures") else "")
             + (" [cached]" if cached else "")
         )
+        _dyn_verdict = "passed" if status == "pass" else "refuted"
+
+        # NUEVO-1: propagate the dynamic verdict onto every EXISTING claim
+        # that cites this qid, so triangulation and the generative axis can
+        # read dynamic_validation off the original claim instead of joining
+        # it on-the-fly to the separate ⚗ claim below. A claim validated by
+        # real execution should carry that fact on itself.
+        for _c in ledger.claims:
+            if _c.evidence_type != "dynamic" and qid in _c.qids:
+                _c.dynamic_validation = _dyn_verdict
+
         claim = LedgerClaim(
             step_id=step_id,
             text=f"dynamic test of {qid}: {detail}",
@@ -13725,6 +13878,7 @@ if __name__ == "__main__":
             evidence_type="dynamic",
             verification="confirmed" if status == "pass" else "refuted",
             verification_detail=detail[:300],
+            dynamic_validation=_dyn_verdict,
         )
         ledger.claims.append(claim)
 
@@ -13828,7 +13982,11 @@ if __name__ == "__main__":
             + hashlib.md5(" ".join(step.goal.split()).lower().encode()).hexdigest()[:16]
         )
         pstate = self._f._project_state_manager.get_pstate(project_id)
-        pstate["agentic_tdd_pending"] = {"pseudo": pseudo, "goal": step.goal}
+        pstate["agentic_tdd_pending"] = {
+            "pseudo": pseudo,
+            "goal": step.goal,
+            "armed_at": time.monotonic(),
+        }
         self._f._log_debug(f"🤖 TDD: armed inter-turn verification for {pseudo}")
 
     @staticmethod
@@ -13890,6 +14048,7 @@ if __name__ == "__main__":
                 "goal": pending["goal"],
                 "status": "no_code",
                 "detail": "no code block found in the previous response",
+                "armed_at": pending.get("armed_at"),
             }
             self._f._log_debug("🤖 TDD: no code in previous response — recorded")
             return
@@ -13904,6 +14063,7 @@ if __name__ == "__main__":
             "total": result.get("total", 0),
             "failures": result.get("failures", []),
             "detail": result.get("detail", ""),
+            "armed_at": pending.get("armed_at"),
         }
         # Persist the run under the pseudo qid too (keeps the harness asset).
         await self._cache_put(
@@ -13938,6 +14098,21 @@ if __name__ == "__main__":
         if not verdict:
             return ""
         pstate["agentic_tdd_last_verdict"] = None
+
+        # P10: discard a stale verdict. A verdict armed long ago (the user
+        # moved on without continuing) must not surface in an unrelated later
+        # turn. The armed_at stamp is copied from the pending job; a missing
+        # stamp (legacy verdict) or ttl=0 disables the check.
+        _ttl = getattr(self._f.valves, "agentic_tdd_ttl_seconds", 0.0)
+        _armed_at = verdict.get("armed_at")
+        if _ttl > 0 and _armed_at is not None:
+            _age = time.monotonic() - _armed_at
+            if _age > _ttl:
+                self._f._log_debug(
+                    f"🤖 TDD: verdict expired ({_age:.0f}s > {_ttl:.0f}s TTL) "
+                    "— discarded, not injected"
+                )
+                return ""
 
         status = verdict.get("status", "error")
         goal = str(verdict.get("goal", ""))[:120]
@@ -14033,6 +14208,7 @@ class AgenticPlanner:
         "other steps).\n"
         "- symbols lists exact qualified names from the context that the "
         "step should focus on (may be empty).\n\n"
+        "{seed_hint}"
         "Question:\n{question}"
     )
 
@@ -14040,7 +14216,11 @@ class AgenticPlanner:
         self._f = filter_ref
 
     async def plan(
-        self, question: str, aligned_prefix: str, slot_free: bool
+        self,
+        question: str,
+        aligned_prefix: str,
+        slot_free: bool,
+        project_id: str = "",
     ) -> AgenticPlan:
         """
         Build a plan for the question.
@@ -14051,6 +14231,7 @@ class AgenticPlanner:
                 prefix invariant, same as step calls).
             slot_free: When False the LLM call is skipped and the fixed
                 plan is returned immediately.
+            project_id: Current project (for the #2 seed/intent enrichment).
 
         Returns:
             An AgenticPlan; source is "planner_llm" on success, otherwise
@@ -14070,8 +14251,16 @@ class AgenticPlanner:
         # planner prompt with a full paste (see the gate cap in
         # _detect_and_generate_cot).
         question = (question or "")[:2000]
-        prompt = self._CONTRACT.replace("{max_steps}", str(max_steps)).replace(
-            "{question}", question
+        # #2: enrich the planner with the PPR seed symbols and the turn
+        # intent already computed in the inlet — zero extra LLM cost. The
+        # planner otherwise saw only the question + aligned prefix; the
+        # relevant symbols and whether this is debug/refactor/explain sharpen
+        # the step breakdown. Best-effort: any failure yields an empty hint.
+        seed_hint = await self._build_seed_hint(question, project_id)
+        prompt = (
+            self._CONTRACT.replace("{max_steps}", str(max_steps))
+            .replace("{seed_hint}", seed_hint)
+            .replace("{question}", question)
         )
         try:
             response = await self._f._llm_orchestrator.call_llm(
@@ -14095,6 +14284,55 @@ class AgenticPlanner:
             fp.rationale = "planner output unparseable"
             return fp
         return AgenticPlan(steps=steps, source="planner_llm", rationale="")
+
+    async def _build_seed_hint(self, question: str, project_id: str) -> str:
+        """
+        Build the '#2' planner hint: the PPR seed symbols relevant to the
+        question plus the classified turn intent.
+
+        Both come free from work the inlet already did — _extract_query_seeds
+        resolves query tokens against the SymbolIndex, and the unified
+        classifier cached the intent. The hint orients the step breakdown
+        (which symbols matter, whether this is debugging vs explaining)
+        without a second classification. Best-effort: on any failure or empty
+        project it returns "" so the contract is unchanged.
+
+        Args:
+            question: The (capped) planner question.
+            project_id: Current project identifier.
+
+        Returns:
+            A short markdown hint block ending in a blank line, or "".
+        """
+        if not project_id:
+            return ""
+        parts: List[str] = []
+        try:
+            seeds, _fuzzy = await self._f._activation._extract_query_seeds(
+                question, project_id
+            )
+            seeds = [s for s in (seeds or []) if s][:8]
+            if seeds:
+                parts.append("Relevant symbols: " + ", ".join(seeds))
+        except Exception:
+            pass
+        try:
+            _cls = self._f._project_state_manager.get_pstate(project_id).get(
+                "turn_classification"
+            )
+            if _cls:
+                _intent = str(_cls.get("intent", "")).strip()
+                if _intent:
+                    parts.append(f"Turn intent: {_intent}")
+        except Exception:
+            pass
+        if not parts:
+            return ""
+        return (
+            "Planning hints (from prior analysis this turn):\n- "
+            + "\n- ".join(parts)
+            + "\n\n"
+        )
 
     def _parse(
         self, response: str, question: str, max_steps: int
@@ -14440,8 +14678,16 @@ class AgenticSynthesisComposer:
                         )
                     elif c.verification == "confirmed":
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
+                        # NUEVO-1: a claim also validated by real execution
+                        # carries dynamic_validation — surface the strongest
+                        # triangulated guarantee (static confirm + dynamic pass).
+                        _dyn = (
+                            " ⚗ (dynamically verified)"
+                            if c.dynamic_validation == "passed"
+                            else ""
+                        )
                         lines.append(
-                            f"- {badge}✓✓ {c.text}{cited} — verified: "
+                            f"- {badge}✓✓ {c.text}{cited}{_dyn} — verified: "
                             f"{c.verification_detail}"
                         )
                     elif c.invalid_qids:
@@ -14449,6 +14695,12 @@ class AgenticSynthesisComposer:
                             f"- ⚠ {c.text} (cites unknown symbol(s): "
                             f"{', '.join(c.invalid_qids)} — treat as "
                             f"unverified)"
+                        )
+                    elif c.invalid_relations:
+                        lines.append(
+                            f"- ⚠ {c.text} (asserts call relation(s) with no "
+                            f"edge: {', '.join(c.invalid_relations)} — treat "
+                            f"as unverified)"
                         )
                     else:
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
@@ -14521,100 +14773,6 @@ class AgenticOrchestrator:
             return ("plan", tail) if tail else ("help", "")
         return "run", rest
 
-    # ── Auto-trigger heuristic (Fase 3) ─────────────────────────────────
-
-    _IMPERATIVE_VERBS = (
-        "analiza",
-        "implementa",
-        "revisa",
-        "propon",
-        "proponme",
-        "corrige",
-        "añade",
-        "considera",
-        "compara",
-        "mide",
-        "verifica",
-        "explica",
-        "dime",
-        "dame",
-        "busca",
-        "refactoriza",
-        "optimiza",
-        "documenta",
-        "diseña",
-        "arregla",
-        "investiga",
-        "lista",
-        "implement",
-        "analyze",
-        "review",
-        "propose",
-        "fix",
-        "add",
-        "consider",
-        "compare",
-        "measure",
-        "verify",
-        "explain",
-        "find",
-        "refactor",
-        "optimize",
-        "document",
-        "design",
-        "investigate",
-        "list",
-    )
-    _COORDINATORS = (
-        " y también",
-        " y tambien",
-        " además",
-        " ademas",
-        " luego ",
-        " después",
-        " despues",
-        " and also",
-        " then ",
-        "; ",
-    )
-
-    @staticmethod
-    def _looks_multiclause_imperative(text: str) -> bool:
-        """
-        Detect the imperative, multi-clause prompts the '?'-based
-        decomposition heuristic is blind to (kill-chain gate G2).
-
-        Conservative by design: fires only on ≥2 bullet/numbered lines, or
-        on a coordinator ("y también", "; ", "and also", …) combined with
-        ≥2 distinct action verbs. Bounded: messages under 80 chars are too
-        simple, over 20k chars are pastes/ingestion turns, and only the
-        first 2000 chars are scanned.
-
-        Args:
-            text: The raw user message.
-
-        Returns:
-            True when the message looks like decomposable imperative work.
-        """
-        t = (text or "").strip()
-        if len(t) < 80 or len(t) > 20000:
-            return False
-        sample = t[:2000].lower()
-        bullets = sum(
-            1
-            for ln in sample.splitlines()
-            if re.match(r"\s*(?:[-*•]|\d+[.)])\s+\S", ln)
-        )
-        if bullets >= 2:
-            return True
-        verbs = sum(
-            1
-            for v in AgenticOrchestrator._IMPERATIVE_VERBS
-            if re.search(rf"\b{v}\b", sample)
-        )
-        has_coord = any(c in sample for c in AgenticOrchestrator._COORDINATORS)
-        return has_coord and verbs >= 2
-
     # ── Plan construction (Fase 1: fixed) ────────────────────────────────
 
     @staticmethod
@@ -14677,13 +14835,295 @@ class AgenticOrchestrator:
         step_claims = [c for c in self._ledger.claims if c.step_id == step.id]
         if not step_claims:
             return False, ""
-        n_invalid = sum(1 for c in step_claims if c.invalid_qids)
+        # P2/P9: count only STRUCTURAL invalid qids (fabricated project
+        # symbols), not noise (local variables, stdlib/builtins, third-party
+        # names). A step that merely mentions a local variable the index
+        # never knew must not trip the whole falsification cycle.
+        # #9: a fabricated call relation (A calls B, no such edge) is also a
+        # structural falsification signal — count it the same way.
+        n_invalid = sum(
+            1
+            for c in step_claims
+            if self._ledger._structural_invalid_qids(c) or c.invalid_relations
+        )
         if n_invalid:
             return True, f"invalid_qids:{n_invalid}"
         floor = self._f.valves.agentic_metacog_confidence_floor
         if not control.get("resolved") and control.get("confidence", 0.0) < floor:
             return True, f"low_confidence:{control.get('confidence', 0.0):.2f}"
         return False, ""
+
+    def _detect_cross_step_contradiction(self) -> Optional[str]:
+        """
+        Scan the ledger for two steps that reached CONTRADICTORY verdicts on
+        the same symbol with high confidence (P4).
+
+        Each step is validated in isolation, so nothing catches step 2
+        concluding a symbol is fine while step 5 concludes it is the bug.
+        This is a light, no-LLM scan: group high-confidence claims by the
+        symbols they cite, and flag a symbol carrying both a 'confirmed'/
+        positive claim and a 'refuted' one from different steps. A shared
+        contradiction over the same symbol is the strongest cheap signal an
+        internally inconsistent workspace is about to be synthesized.
+
+        Returns:
+            A short description of the first contradiction found, or None.
+        """
+        min_conf = self._f.valves.agentic_coherence_min_confidence
+        # symbol -> {"confirmed": {step_ids}, "refuted": {step_ids}}
+        by_symbol: Dict[str, Dict[str, set]] = {}
+        for c in self._ledger.claims:
+            if c.confidence < min_conf:
+                continue
+            if c.verification == "confirmed" or c.dynamic_validation == "passed":
+                pole = "confirmed"
+            elif c.verification == "refuted" or c.dynamic_validation == "refuted":
+                pole = "refuted"
+            else:
+                continue
+            for qid in c.valid_qids:
+                slot = by_symbol.setdefault(qid, {"confirmed": set(), "refuted": set()})
+                slot[pole].add(c.step_id)
+        for qid, poles in by_symbol.items():
+            # Contradiction requires the two poles to come from DIFFERENT
+            # steps — a single step confirming and refuting the same symbol
+            # is a within-step nuance the reinforcement axis already handles.
+            confirming = poles["confirmed"]
+            refuting = poles["refuted"]
+            if (
+                confirming
+                and refuting
+                and (confirming | refuting) - (confirming & refuting)
+            ):
+                if confirming - refuting and refuting - confirming:
+                    return (
+                        f"symbol {qid}: step(s) {sorted(confirming)} confirm, "
+                        f"step(s) {sorted(refuting)} refute"
+                    )
+        return None
+
+    def _verify_dynamic_needed(self, question: str, project_id: str) -> bool:
+        """
+        Decide whether a planned verify_dynamic step is worth its cost (#10).
+
+        verify_dynamic runs real tests in a sandbox — expensive relative to
+        static verify. It is needed when the turn is genuinely about runtime
+        behaviour: the classified intent is debugging (one-hot debug score
+        over the floor) or the user asked explicitly with '!test'. Otherwise
+        static verification suffices. No LLM: reads the cached classification
+        and scans the question.
+
+        Args:
+            question: The pipeline question.
+            project_id: Current project identifier.
+
+        Returns:
+            True if verify_dynamic should run.
+        """
+        if "!test" in (question or "").lower():
+            return True
+        try:
+            _cls = self._f._project_state_manager.get_pstate(project_id).get(
+                "turn_classification"
+            )
+            if _cls and str(_cls.get("intent", "")) == "debug":
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _maybe_compete_hypothesize(
+        self,
+        step: AgenticStep,
+        remaining: float,
+        project_id: str,
+        status_prefix: str = "",
+    ) -> bool:
+        """
+        Proactively run the hypothesis competition on a hypothesize step
+        (0030): its claims are rival root causes, which is exactly what
+        compete_hypotheses weighs.
+
+        This is the reactive→proactive shift. The per-claim reinforcement
+        gate waits for a fabricated identifier; this fires because the step's
+        purpose is to weigh rivals — when it enumerated >= 2 hypotheses or the
+        turn intent is debugging. The surviving verdict (with scope) is
+        appended to the step output before digest/cache, so synthesis sees
+        the competed result. The competition dirties the KV slot, so the
+        caller re-fires the launchpad afterwards (same discipline as
+        _reinforce_step).
+
+        Args:
+            step: The hypothesize step just executed.
+            remaining: Seconds left in the pipeline budget.
+            project_id: Current project identifier.
+            status_prefix: UI status prefix.
+
+        Returns:
+            True if a competition ran (slot dirtied), False otherwise.
+        """
+        mode = self._f.valves.agentic_hypothesize_compete
+        if mode == "off" or step.kind != "hypothesize":
+            return False
+
+        # Region: gather rival hypotheses from this step's claims
+        claims = self._ledger.claims_for(step.id)
+        hyps: List[Tuple[str, float]] = [
+            (c.text, max(0.0, min(1.0, c.confidence)))
+            for c in claims
+            if c.text and c.evidence_type != "dynamic"
+        ]
+        n_found = len(hyps)
+
+        # Region: proactive trigger — rivals present OR debugging intent
+        _intent_debug = False
+        try:
+            _cls = self._f._project_state_manager.get_pstate(project_id).get(
+                "turn_classification"
+            )
+            if _cls:
+                _intent_debug = str(_cls.get("intent", "")) == "debug"
+        except Exception:
+            _intent_debug = False
+        should = n_found >= 2 or (_intent_debug and n_found >= 1)
+        if not should:
+            return False
+
+        if mode == "shadow":
+            self._f._log_debug(
+                f"🤖 [COMPETE-SHADOW] step {step.id} (hypothesize) would "
+                f"compete {n_found} rival hypotheses "
+                f"(debug_intent={_intent_debug}) — not running"
+            )
+            return False
+
+        if remaining < self._f.valves.agentic_metacog_min_remaining_s:
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} hypothesize qualifies for "
+                f"competition ({n_found} rivals) but only {remaining:.0f}s "
+                f"remain — skipped"
+            )
+            return False
+
+        # Region: run the competition
+        await self._f._emit_status(f"{status_prefix}: competing {n_found} hypotheses")
+        self._f._log_debug(
+            f"🤖 Agentic: step {step.id} competes {n_found} rival "
+            f"hypotheses (debug_intent={_intent_debug})"
+        )
+        try:
+            best, score, _evidence, peer = (
+                await self._f._meta_reasoning.compete_hypotheses(
+                    hyps,
+                    project_id,
+                    max_iters=self._f.valves.agentic_metacog_max_iters,
+                    label=f"agentic_hypothesize_step_{step.id}",
+                )
+            )
+        except Exception as e:
+            self._f._log_debug(f"🤖 Agentic: competition failed ({e})")
+            return True
+        if best:
+            _peer = ""
+            if peer is not None and getattr(peer, "verdict", ""):
+                _peer = f" (peer review: {peer.verdict})"
+            step.output = (
+                step.output or ""
+            ) + f"\n\n**Competed verdict** (score {score:.2f}{_peer}): {best}"
+        return True
+
+    async def _maybe_verify_dynamic_on_gate(
+        self,
+        step: AgenticStep,
+        remaining: float,
+        project_id: str,
+        status_prefix: str = "",
+    ) -> bool:
+        """
+        Let the difficulty gate trigger an ad-hoc verify_dynamic for an
+        escalated step with behavioral claims (NUEVO-2/P3).
+
+        Static falsification can pass a claim the running code contradicts.
+        When a step escalated and its claims are about execution/behaviour
+        (not pure structure), a real test harness is the stronger evidence.
+        This reuses run_dynamic_step against the SAME step — its valid
+        citations become the dynamic targets — so no synthetic step is
+        needed. Requires subprocess exec mode; dirties the KV slot, so the
+        caller re-fires the launchpad.
+
+        Args:
+            step: The escalated step.
+            remaining: Seconds left in the budget.
+            project_id: Current project identifier.
+            status_prefix: UI status prefix.
+
+        Returns:
+            True if a dynamic verification ran (slot dirtied), else False.
+        """
+        mode = self._f.valves.agentic_gate_verify_dynamic
+        if mode == "off":
+            return False
+        if getattr(self._f.valves, "agentic_exec_mode", "off") != "subprocess":
+            return False
+
+        # Region: behavioral-claim heuristic (no LLM) — a claim is behavioral
+        # when it talks about what the code DOES at runtime, not just what
+        # exists. Cheap keyword scan over this step's claim texts.
+        _behavioral_terms = (
+            "return",
+            "returns",
+            "raise",
+            "raises",
+            "when called",
+            "produces",
+            "yields",
+            "computes",
+            "output",
+            "behavi",
+            "at runtime",
+            "executes",
+            "loop",
+            "recursion",
+            "mutates",
+            "side effect",
+        )
+        claims = self._ledger.claims_for(step.id)
+        has_behavioral = any(
+            any(t in (c.text or "").lower() for t in _behavioral_terms) for c in claims
+        )
+        has_targets = any(c.valid_qids for c in claims)
+        if not (has_behavioral and has_targets):
+            return False
+
+        if mode == "shadow":
+            self._f._log_debug(
+                f"🤖 [DYNGATE-SHADOW] step {step.id} would run dynamic "
+                "verification (behavioral claims, static-only today)"
+            )
+            return False
+
+        if remaining < self._f.valves.agentic_metacog_min_remaining_s:
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} qualifies for gate-triggered "
+                f"dynamic verification but only {remaining:.0f}s remain — "
+                "skipped"
+            )
+            return False
+
+        await self._f._emit_status(
+            f"{status_prefix}: gate-triggered dynamic verification"
+        )
+        self._f._log_debug(
+            f"🤖 Agentic: step {step.id} gate-triggers dynamic verification "
+            "(behavioral claims)"
+        )
+        try:
+            await self._dyn.run_dynamic_step(
+                step, self._ledger, project_id, "", remaining
+            )
+        except Exception as e:
+            self._f._log_debug(f"🤖 Agentic: gate dynamic verify failed ({e})")
+        return True
 
     async def _reinforce_step(
         self,
@@ -14899,6 +15339,39 @@ class AgenticOrchestrator:
             next_id += 1
         if not wave:
             return "", []
+
+        # P1: subject the proposed improvement to a structural test. A real
+        # improvement should be distinguishable from the current approach by
+        # some experiment; if find_experimentum_crucis finds none, the
+        # "improvement" is likely stylistic and the wave is dropped (in 'on').
+        _rigor = self._f.valves.agentic_generative_rigor
+        if _rigor in ("shadow", "on") and angle:
+            _crucis = None
+            try:
+                _crucis = await self._f._meta_reasoning.find_experimentum_crucis(
+                    f"current approach: {question}",
+                    f"proposed improvement: {angle}",
+                    project_id,
+                )
+            except Exception:
+                _crucis = None
+            if not _crucis:
+                if _rigor == "shadow":
+                    self._f._log_debug(
+                        "🤖 [RIGOR-SHADOW] improvement lacks a distinguishing "
+                        f"experiment (angle: {angle[:80]}) — would drop"
+                    )
+                else:
+                    self._f._log_debug(
+                        "🤖 Agentic: generative improvement dropped — no "
+                        f"distinguishing experiment (angle: {angle[:80]})"
+                    )
+                    return "", []
+            elif _rigor == "shadow":
+                self._f._log_debug(
+                    "🤖 [RIGOR-SHADOW] improvement has a distinguishing "
+                    f"experiment — would keep (angle: {angle[:80]})"
+                )
         return angle, wave
 
     def _digest(self, text: str) -> str:
@@ -14983,7 +15456,9 @@ class AgenticOrchestrator:
                 await self._f._project_state_manager.slot_restore_for_continuity(
                     project_id, authoritative=True, purpose="pre_aligned"
                 )
-            plan = await self._planner.plan(question, aligned_prefix, slot_free)
+            plan = await self._planner.plan(
+                question, aligned_prefix, slot_free, project_id
+            )
             steps_txt = "\n".join(f"{s.id}. {s.kind} — {s.goal}" for s in plan.steps)
             note = (
                 ""
@@ -15136,6 +15611,27 @@ class AgenticOrchestrator:
         aligned_prefix = self._aligned_prefix(prelim_system)
         budget = float(self._f.valves.agentic_max_seconds)
         started = time.monotonic()
+
+        # #11: the ledger accumulated across runs within a process. Reset it
+        # per run for deterministic behaviour, then optionally restore a
+        # persisted snapshot so a multi-turn line of reasoning can resume.
+        # The snapshot lives in pstate (per-project); restore only when the
+        # valve is on and this turn continues the same project.
+        self._ledger.claims = []
+        if self._f.valves.agentic_ledger_persist:
+            try:
+                _snap = self._f._project_state_manager.get_pstate(project_id).get(
+                    "agentic_ledger_snapshot"
+                )
+                if _snap:
+                    for _d in _snap:
+                        self._ledger.claims.append(LedgerClaim(**_d))
+                    self._f._log_debug(
+                        f"🤖 Agentic: restored {len(_snap)} ledger claim(s) "
+                        "from the previous turn"
+                    )
+            except Exception:
+                self._ledger.claims = []
         # Pre-aligned launchpad: earlier non-aligned auxiliaries (intent
         # classifiers, cot_config) leave the slot on their own small
         # prompts; without this, the FIRST aligned call below re-prefills
@@ -15146,7 +15642,7 @@ class AgenticOrchestrator:
                 project_id, authoritative=True, purpose="pre_aligned"
             )
         await self._f._emit_status("🤖 Agentic: planning…")
-        plan = await self._planner.plan(question, aligned_prefix, slot_free)
+        plan = await self._planner.plan(question, aligned_prefix, slot_free, project_id)
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
             f"source={plan.source}, trigger={trigger})"
@@ -15201,6 +15697,32 @@ class AgenticOrchestrator:
             # Never step-cached (harness/result caching lives inside the
             # verifier, keyed by qid and body_hash respectively).
             if step.kind == "verify_dynamic":
+                # #10: verify_dynamic executes tests in a sandbox — expensive.
+                # Gate it on need: run only when the turn intent is debugging
+                # or the user asked with '!test'. Otherwise skip to static
+                # verify. 'shadow' logs the decision without skipping.
+                _vdg = self._f.valves.agentic_verify_dynamic_gated
+                if _vdg in ("shadow", "on"):
+                    _needed = self._verify_dynamic_needed(question, project_id)
+                    if not _needed and _vdg == "shadow":
+                        self._f._log_debug(
+                            f"🤖 [DYNGROUND-SHADOW] step {step.id} "
+                            "verify_dynamic would skip (not debug intent, no "
+                            "!test) — running anyway"
+                        )
+                    elif not _needed:
+                        step.status = "skipped"
+                        step.skip_reason = "verify_dynamic not needed (#10)"
+                        step.output = (
+                            "(verify_dynamic skipped: not a debugging turn and "
+                            "no explicit !test — static verify used instead)"
+                        )
+                        self._f._log_debug(
+                            f"🤖 Agentic step {step.id} (verify_dynamic): "
+                            "skipped — gated on need (#10)"
+                        )
+                        idx += 1
+                        continue
                 await self._f._emit_status(
                     f"🤖 Agentic step {step.id}/{len(plan.steps)} "
                     f"(verify_dynamic): executing test harnesses"
@@ -15294,6 +15816,25 @@ class AgenticOrchestrator:
             if step.status == "done":
                 control = self._ledger.extract_and_validate(step, project_id)
 
+                # -- 0030: proactive hypothesis competition ------------
+                # A hypothesize step enumerated rival root causes; compete
+                # them BEFORE the reactive gate, because weighing rivals is
+                # the step's purpose, not a reaction to a fabricated id.
+                # Runs before digest/cache so both carry the competed output.
+                _rem_compete = budget - (time.monotonic() - started)
+                _slot_dirtied = await self._maybe_compete_hypothesize(
+                    step,
+                    _rem_compete,
+                    project_id,
+                    status_prefix=(
+                        f"🤖 Agentic step {step.id}/{len(plan.steps)} " f"(hypothesize)"
+                    ),
+                )
+                if _slot_dirtied and self._f.valves.enable_slot_persistence:
+                    await self._f._project_state_manager.slot_restore_for_continuity(
+                        project_id, authoritative=True, purpose="pre_aligned"
+                    )
+
                 # -- metacognitive reinforcement gate (Fase 8) ----------
                 # Runs BEFORE digest/cache so both carry the reinforced
                 # output. Shadow mode logs the decision without paying.
@@ -15322,6 +15863,26 @@ class AgenticOrchestrator:
                                     f"{len(plan.steps)} ({step.kind})"
                                 ),
                             )
+                            # NUEVO-2/P3: after static reinforcement, the gate
+                            # may also run a real test harness for behavioral
+                            # claims — static evidence can pass what the
+                            # running code refutes.
+                            _rem_dyn = budget - (time.monotonic() - started)
+                            _dyn_dirtied = await self._maybe_verify_dynamic_on_gate(
+                                step,
+                                _rem_dyn,
+                                project_id,
+                                status_prefix=(
+                                    f"🤖 Agentic step {step.id}/"
+                                    f"{len(plan.steps)} ({step.kind})"
+                                ),
+                            )
+                            if _dyn_dirtied and self._f.valves.enable_slot_persistence:
+                                await self._f._project_state_manager.slot_restore_for_continuity(
+                                    project_id,
+                                    authoritative=True,
+                                    purpose="pre_aligned",
+                                )
                         else:
                             self._f._log_debug(
                                 f"🤖 Agentic: step {step.id} qualifies for "
@@ -15438,6 +15999,29 @@ class AgenticOrchestrator:
         _ge_mode = self._f.valves.agentic_generative_eval
         _mc_gate_mode = self._f.valves.agentic_metacog_reinforce
         _replans_used = 0
+
+        # P4: cross-step coherence check. Two steps reaching opposite verdicts
+        # on the same symbol means the workspace is internally inconsistent —
+        # asking "is there something better?" over it is premature. Detect
+        # the contradiction before the generative wave; in 'on' mode, skip
+        # the wave (the inconsistency, not a missing improvement, is what to
+        # fix), in 'shadow' just log it.
+        _coh_mode = self._f.valves.agentic_coherence_check
+        if _coh_mode in ("shadow", "on"):
+            _contradiction = self._detect_cross_step_contradiction()
+            if _contradiction:
+                if _coh_mode == "shadow":
+                    self._f._log_debug(
+                        f"🤖 [COHERENCE] would abort generative wave — "
+                        f"contradiction: {_contradiction}"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"🤖 Agentic: generative evaluation skipped — "
+                        f"cross-step contradiction ({_contradiction})"
+                    )
+                    _ge_mode = "off"
+
         if _ge_mode in ("shadow", "on") and any(
             s.skip_reason == "early-exit" for s in plan.steps
         ):
@@ -15583,6 +16167,19 @@ class AgenticOrchestrator:
             f"({bad} with invalid citations) in "
             f"{time.monotonic() - started:.1f}s (trigger={trigger})"
         )
+
+        # #11: persist the ledger so a continuing turn can resume the line of
+        # reasoning. Stored in pstate (per-project); a project switch gets a
+        # clean pstate and never sees another project's snapshot. Capped to
+        # keep pstate small.
+        if self._f.valves.agentic_ledger_persist:
+            try:
+                _cap = max(0, self._f.valves.agentic_ledger_snapshot_max)
+                self._f._project_state_manager.get_pstate(project_id)[
+                    "agentic_ledger_snapshot"
+                ] = [c.__dict__ for c in self._ledger.claims[:_cap]]
+            except Exception:
+                pass
 
 
 class ReasoningEngine:
@@ -15862,8 +16459,7 @@ class ReasoningEngine:
         if _cls is not None:
             if _cls.get("negates_reasoning"):
                 self._f._log_debug(
-                    "detect_cot_configuration [unified]: user negates "
-                    "reasoning → L0"
+                    "detect_cot_configuration [unified]: user negates " "reasoning → L0"
                 )
                 return {
                     "level": 0,
@@ -17822,23 +18418,39 @@ class MultiPhasePlanner:
         _cached = None
         if project_id:
             try:
-                _cached = self._f._project_state_manager.get_pstate(
-                    project_id
-                ).get("turn_classification")
+                _cached = self._f._project_state_manager.get_pstate(project_id).get(
+                    "turn_classification"
+                )
             except Exception:
                 _cached = None
         if _cached is not None:
             is_code_task = bool(_cached.get("is_code_session", True))
         else:
             _fallback_signals = {
-                "refactor", "refactoriza", "implement", "implementa",
-                "escribe", "write", "genera", "generate", "crea", "create",
-                "código", "code", "clase", "class", "función", "function",
-                "método", "method", "módulo", "module", "reescribe", "rewrite",
+                "refactor",
+                "refactoriza",
+                "implement",
+                "implementa",
+                "escribe",
+                "write",
+                "genera",
+                "generate",
+                "crea",
+                "create",
+                "código",
+                "code",
+                "clase",
+                "class",
+                "función",
+                "function",
+                "método",
+                "method",
+                "módulo",
+                "module",
+                "reescribe",
+                "rewrite",
             }
-            is_code_task = any(
-                sig in _scan_query.lower() for sig in _fallback_signals
-            )
+            is_code_task = any(sig in _scan_query.lower() for sig in _fallback_signals)
 
         part_budget = min(
             self._f.valves.multi_phase_effective_max_tokens,
@@ -18489,7 +19101,10 @@ class CommandRouter:
                 if isinstance(data.get("is_code_session"), bool):
                     result["is_code_session"] = data["is_code_session"]
                 if str(data.get("intent", "")).lower() in (
-                    "explain", "modify", "debug", "refactor"
+                    "explain",
+                    "modify",
+                    "debug",
+                    "refactor",
                 ):
                     result["intent"] = str(data["intent"]).lower()
                 if str(data.get("use_case", "")).upper() in ("A", "B", "C", "D", "E"):
@@ -18592,9 +19207,7 @@ class CommandRouter:
                 vector[_intent] = 1.0
             else:
                 vector["explain"] = 1.0
-            self._f._log_debug(
-                f"classify_intent [unified]: {_intent} (one-hot)"
-            )
+            self._f._log_debug(f"classify_intent [unified]: {_intent} (one-hot)")
             return vector
 
         classifier_input = self._extract_text_for_classification(user_query)
@@ -20234,9 +20847,7 @@ class CommandRouter:
         # returns both, and either being "not a bare paste" settles it.
         cls = await self._classify_turn_cached_for(query, project_id)
         if cls is not None:
-            return bool(cls.get("is_code_only")) and not bool(
-                cls.get("has_request")
-            )
+            return bool(cls.get("is_code_only")) and not bool(cls.get("has_request"))
         # Fallback only if the unified classifier is somehow unavailable.
         return await self._is_code_only_with_llm(query, None, project_id)
 
@@ -20248,9 +20859,7 @@ class CommandRouter:
         try:
             return await self.classify_turn(query, project_id)
         except Exception as exc:
-            self._f._log_debug(
-                f"_classify_turn_cached_for: unavailable ({exc})"
-            )
+            self._f._log_debug(f"_classify_turn_cached_for: unavailable ({exc})")
             return None
 
     async def _is_code_only_with_llm(
@@ -31264,9 +31873,7 @@ class InletOrchestrator:
             )
             if _cls is not None:
                 _sess = bool(_cls.get("is_code_session"))
-                self._f._log_debug(
-                    f"classify_session [unified]: {_sess}"
-                )
+                self._f._log_debug(f"classify_session [unified]: {_sess}")
                 self._cache_session_result(cache_key, _sess)
                 return _sess
 
@@ -33894,52 +34501,54 @@ class MessageAssembler:
         # pipeline. The question passed to the pipeline falls back to
         # user_content when the stripped form came back empty.
         # ------------------------------------------------------------------
-        _always_mode = self._f.valves.agentic_trigger
-        # Cap the pipeline question at the gate: user_question has code
-        # spans stripped, but the fallback is raw user_content, which can
-        # be a 1.5MB paste. An uncapped value would run the architecture
-        # regex and len() over the whole blob here and inflate the
-        # planner / per-step / synthesis prompts downstream — the exact
-        # 'consumer without a diet' failure. 2000 chars is ample for a
-        # question; the code itself reaches the pipeline through Block A/B.
-        _agentic_question = (
-            (user_question or "").strip() or user_content.strip()
-        )[:2000]
-        if self._f.valves.enable_agentic_pipeline and _always_mode in (
-            "always",
-            "shadow",
-        ):
+        # ------------------------------------------------------------------
+        # Region: agentic pipeline gate — the single entry point
+        # The pipeline is the de-facto reasoning path. This gate fires for
+        # every code turn; the fast path (non-code chatter, continuations)
+        # falls through to the direct answer below. There is no
+        # agentic_trigger valve any more and no length threshold: a short
+        # code question is still a code question. is_code_session is read
+        # from the unified per-turn classifier (already cached, no extra
+        # call).
+        #
+        # The pipeline question is capped at 2000 chars here: user_question
+        # has code spans stripped, but the fallback is raw user_content,
+        # which can be a 1.5MB paste. An uncapped value would run the
+        # architecture regex and len() over the whole blob and inflate the
+        # planner / per-step / synthesis prompts downstream. The code itself
+        # reaches the pipeline through Block A/B.
+        #
+        # A silent non-fire is a defect, so every blocking condition names
+        # itself in the log.
+        # ------------------------------------------------------------------
+        _agentic_question = ((user_question or "").strip() or user_content.strip())[
+            :2000
+        ]
+        if self._f.valves.enable_agentic_pipeline:
             _block_reason = ""
             if is_continuation:
-                _block_reason = "continuation turn"
+                _block_reason = "continuation turn (fast path)"
             elif not slot_free:
                 _block_reason = "slot busy"
-            elif not is_code_session and not (
-                self._f.valves.agentic_always_ignore_code_session
-            ):
-                _block_reason = "not a code session"
-            elif len(_agentic_question) < self._f.valves.agentic_always_min_chars:
-                _block_reason = (
-                    f"message too short ({len(_agentic_question)} < "
-                    f"{self._f.valves.agentic_always_min_chars} chars)"
-                )
+            elif not is_code_session:
+                _block_reason = "non-code turn (fast path)"
+            elif not _agentic_question:
+                _block_reason = "empty question"
             elif self._f._reasoning.is_architecture_query(_agentic_question):
                 _block_reason = "architecture query (keeps specialized path)"
 
             if _block_reason:
+                self._f._log_debug(f"🤖 Agentic pipeline did NOT fire: {_block_reason}")
                 self._f._log_debug(
-                    f"🤖 Agentic 'always' did NOT fire: {_block_reason} "
-                    f"(mode={_always_mode})"
-                )
-            elif _always_mode == "shadow":
-                self._f._log_debug(
-                    "🤖 [SHADOW] agentic 'always' would fire on this turn "
-                    "(pre-detection) — continuing with the normal path"
+                    f"[TURN-PATH] is_code_session={is_code_session} → "
+                    f"fast-path ({_block_reason})"
                 )
             else:
                 self._f._log_debug(
-                    "🤖 Agentic auto-trigger: always (pre-detection "
-                    "short-circuit — CoT detection skipped)"
+                    "🤖 Agentic pipeline: firing (code turn, detection skipped)"
+                )
+                self._f._log_debug(
+                    f"[TURN-PATH] is_code_session={is_code_session} → pipeline"
                 )
                 await self._f._agentic.run_pipeline(
                     question=_agentic_question,
@@ -33947,9 +34556,14 @@ class MessageAssembler:
                     project_id=project_id,
                     slot_free=slot_free,
                     dynamic_injections=dynamic_injections,
-                    trigger="always",
+                    trigger="code_turn",
                 )
                 return
+        else:
+            self._f._log_debug(
+                f"[TURN-PATH] is_code_session={is_code_session} → CoT "
+                "(pipeline disabled)"
+            )
 
         # ------------------------------------------------------------------
         # Region: short-circuit 1 — enforce_scientific_method forces L3
@@ -34375,59 +34989,15 @@ class MessageAssembler:
         _go_scientific = _use_scientific or cot_level >= 3
         reasoning = None
 
-        # ------------------------------------------------------------------
-        # Region: agentic auto-trigger (Fase 3) — route eligible turns to
-        # the pipeline instead of the advisory CoT paths. Fires on real
-        # decomposition, high reasoning levels, or the imperative
-        # multi-clause shape the '?'-based heuristic cannot see.
-        # ------------------------------------------------------------------
-        _trigger_mode = self._f.valves.agentic_trigger
-        if (
-            self._f.valves.enable_agentic_pipeline
-            and _trigger_mode in ("auto", "shadow", "always")
-            and not is_continuation
-            and not _is_arch
-            and slot_free
-        ):
-            _agentic_reason = ""
-            if (
-                _trigger_mode == "always"
-                and is_code_session
-                and len((user_content or "").strip()) >= 20
-            ):
-                # Cloud-style default: every substantive code-session turn
-                # goes through the pipeline. Trivial acknowledgements
-                # (< 20 chars) and non-code chatter fall through to the
-                # detection chain below, and from there to normal CoT.
-                _agentic_reason = "always"
-            elif len(sub_questions) >= 2:
-                _agentic_reason = "decompose"
-            elif cot_level >= 3 or _go_scientific:
-                _agentic_reason = "level3_or_scientific"
-            elif AgenticOrchestrator._looks_multiclause_imperative(user_content):
-                _agentic_reason = "imperative_multiclause"
-            if _agentic_reason and self._f.valves.agentic_trigger == "shadow":
-                # Shadow mode: record the decision the heuristic WOULD have
-                # taken on real traffic without paying the pipeline cost, so
-                # the trigger can be calibrated against production logs
-                # before 'auto' is enabled. The normal CoT path continues.
-                self._f._log_debug(
-                    f"🤖 Agentic auto-trigger [SHADOW]: would fire "
-                    f"({_agentic_reason}) — continuing with the normal path"
-                )
-            elif _agentic_reason:
-                self._f._log_debug(
-                    f"🤖 Agentic auto-trigger: {_agentic_reason} → pipeline"
-                )
-                await self._f._agentic.run_pipeline(
-                    question=user_content,
-                    prelim_system=prelim_system,
-                    project_id=project_id,
-                    slot_free=slot_free,
-                    dynamic_injections=dynamic_injections,
-                    trigger=_agentic_reason,
-                )
-                return
+        # The post-detection agentic trigger block was removed here. With the
+        # pipeline as the de-facto path, the early short-circuit (before the
+        # detection cascade) already routes every substantive code-session
+        # turn to run_pipeline; this block only ever fired for turns the
+        # short-circuit let through, and its decompose / level3 / imperative
+        # conditions plus _looks_multiclause_imperative (a keyword-and-
+        # coordinator heuristic) are exactly the fragile gating the LLM
+        # migration retired. What remains below is the advisory CoT path used
+        # only when the pipeline is disabled entirely.
 
         if (
             self._f.valves.enable_focal_reasoning
@@ -36765,6 +37335,7 @@ class ProjectStateManager:
             "skeleton_tier_qids": [],
             "agentic_tdd_pending": None,
             "agentic_tdd_last_verdict": None,
+            "agentic_ledger_snapshot": None,
             "skeleton_docstring_flush_pending": False,
             "docstring_flush_done_hash": None,
             "docstring_bg_stall_runs": 0,
@@ -40098,51 +40669,6 @@ class Filter:
                 "neighbouring turns become free."
             ),
         )
-        agentic_trigger: str = Field(
-            default="command",
-            description=(
-                "'command' = the pipeline only runs via /agent. 'auto' = it "
-                "also fires when detection finds real decomposition, level "
-                ">= 3 / scientific reasoning, or an imperative multi-clause "
-                "prompt (the shape the '?' heuristic cannot see). 'shadow' = "
-                "evaluate the same detection on every eligible turn and log "
-                "'would fire' WITHOUT running the pipeline — calibrate the "
-                "heuristic on real traffic (grep the log for [SHADOW]) "
-                "before enabling 'auto'. 'always' = cloud-style: fire on "
-                "EVERY substantive code-session turn (>= 20 chars, not a "
-                "continuation, not an architecture query — those keep their "
-                "specialized reasoning path); shorter or non-code turns fall "
-                "back to the 'auto' detections, then to normal CoT. Budget "
-                "it with agentic_max_steps / agentic_max_seconds / "
-                "agentic_early_exit_confidence, and mind the aux-call cost: "
-                "with a single --parallel 1 slot the pipeline runs serially."
-            ),
-        )
-        agentic_always_min_chars: int = Field(
-            default=12,
-            ge=0,
-            description=(
-                "Minimum message length (raw user_content, code included) for "
-                "agentic_trigger='always' to fire. Below this the turn is a "
-                "trivial acknowledgement and falls through to the fast CoT "
-                "path. Lowered from the original hard-coded 20 because real "
-                "dev questions ('¿qué hace build_block_b?') sit right at that "
-                "boundary and were silently routed to CoT."
-            ),
-        )
-        agentic_always_ignore_code_session: bool = Field(
-            default=False,
-            description=(
-                "When True, agentic_trigger='always' fires even on turns the "
-                "session classifier did NOT mark as code-aware. The classifier "
-                "keys on the CURRENT message, so a short follow-up in an "
-                "ongoing code project ('y ahora optimízalo') can score "
-                "non-code and skip the pipeline. Enable this if the log shows "
-                "'always did NOT fire: not a code session' on turns that are "
-                "clearly about code — it trades a few spurious pipeline runs "
-                "on genuinely non-code turns for never missing a code one."
-            ),
-        )
         agentic_tool_rounds_max: int = Field(
             default=2,
             ge=0,
@@ -40167,17 +40693,103 @@ class Filter:
             description=(
                 "Per-step metacognitive reinforcement (Fase 8). A reasoning "
                 "step whose ledger claims cite fabricated identifiers "
-                "(invalid_qids) or that ends unresolved below "
-                "agentic_metacog_confidence_floor escalates its claims to "
-                "MetacognitiveReasoningEngine.compete_hypotheses as rival "
-                "hypotheses under static falsification; the surviving "
-                "verdict annotates the step before synthesis. 'off' = "
-                "never. 'shadow' (default) = evaluate the gate and log "
-                "'would escalate' WITHOUT running the competition — "
-                "calibrate on real traffic first (grep [METACOG-SHADOW]). "
-                "'on' = run it, bounded by half the remaining pipeline "
-                "budget. The competition dirties the KV slot with its own "
-                "prompts, so the pre-aligned launchpad re-fires afterwards."
+                "(structural invalid_qids or a fabricated call relation) or "
+                "that ends unresolved below agentic_metacog_confidence_floor "
+                "escalates to PER-CLAIM falsification: each claim gets a "
+                "design_critical_experiment + gather_evidence + is_falsified "
+                "pass, and refuted claims are marked before synthesis. This "
+                "is complementary to — not the same as — the hypothesis "
+                "COMPETITION wired to the hypothesize step "
+                "(agentic_hypothesize_compete): falsification validates "
+                "independent facts, competition crowns one survivor among "
+                "rivals. 'off' = never. 'shadow' (default) = evaluate the "
+                "gate and log 'would escalate' WITHOUT running it (grep "
+                "[METACOG-SHADOW]). 'on' = run it, bounded by half the "
+                "remaining budget. It dirties the KV slot, so the pre-aligned "
+                "launchpad re-fires afterwards."
+            ),
+        )
+        agentic_verify_dynamic_gated: str = Field(
+            default="shadow",
+            description=(
+                "#10: gate the (expensive, sandbox-executing) verify_dynamic "
+                "step on need. A planned verify_dynamic runs only when the "
+                "turn intent is debugging (intent['debug'] > "
+                "agentic_verify_dynamic_debug_floor) or the user asked "
+                "explicitly with '!test' in the message; otherwise it is "
+                "skipped in favour of static verify. 'off' = always run "
+                "planned verify_dynamic (prior behaviour). 'shadow' (default) "
+                "= log '[DYNGROUND-SHADOW] would skip' WITHOUT skipping, to "
+                "see how often it would fire. 'on' = actually skip when the "
+                "need condition is not met."
+            ),
+        )
+        agentic_verify_dynamic_debug_floor: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Debug-intent threshold above which a planned verify_dynamic "
+                "is considered needed (#10). Below it, and without an explicit "
+                "'!test', the step is skipped when agentic_verify_dynamic_"
+                "gated='on'."
+            ),
+        )
+        agentic_ledger_persist: bool = Field(
+            default=False,
+            description=(
+                "#11: persist the agentic evidence ledger between turns. At "
+                "the end of a pipeline run the claims are snapshotted into "
+                "pstate (per-project); a continuing turn restores them so a "
+                "multi-turn line of reasoning can resume instead of starting "
+                "the ledger empty. Off by default — it adds cross-turn state, "
+                "and a stale snapshot could bias a fresh question; enable when "
+                "you want long debugging threads to accumulate evidence. A "
+                "project switch gets a clean pstate and never inherits another "
+                "project's snapshot."
+            ),
+        )
+        agentic_ledger_snapshot_max: int = Field(
+            default=40,
+            ge=0,
+            description=(
+                "Maximum ledger claims kept in the #11 snapshot, to bound the "
+                "pstate size. Older claims beyond this are dropped."
+            ),
+        )
+        agentic_gate_verify_dynamic: str = Field(
+            default="shadow",
+            description=(
+                "NUEVO-2/P3: let the difficulty gate trigger an ad-hoc "
+                "verify_dynamic for an escalated step whose claims are "
+                "behavioral (execution/logic), even when the plan scheduled "
+                "no verify_dynamic. Static falsification against the "
+                "SymbolIndex can pass a claim the running code contradicts; "
+                "this closes that gap for the claims that most need it. "
+                "Requires agentic_exec_mode='subprocess'. 'off' = never. "
+                "'shadow' (default) = log '[DYNGATE-SHADOW] would run dynamic "
+                "verification' WITHOUT running it. 'on' = run it (bounded by "
+                "the remaining budget); it dirties the KV slot, so the "
+                "launchpad re-fires afterwards."
+            ),
+        )
+        agentic_hypothesize_compete: str = Field(
+            default="shadow",
+            description=(
+                "0030: run the full hypothesis COMPETITION "
+                "(compete_hypotheses) on a hypothesize step PROACTIVELY, when "
+                "the step enumerated rival root causes (>= 2 hypotheses) or "
+                "the turn intent is debugging. Unlike the reactive per-claim "
+                "reinforcement, this fires because the step's PURPOSE is to "
+                "weigh rivals — it does not wait for a fabricated identifier. "
+                "The claims of the hypothesize step become the rival "
+                "hypotheses; the surviving verdict (with its scope and peer "
+                "review) annotates the step output before synthesis. 'off' = "
+                "never (hypothesize runs as a plain generative step). "
+                "'shadow' (default) = log '[COMPETE-SHADOW] would compete' "
+                "with the hypothesis count WITHOUT running it, to calibrate "
+                "first. 'on' = run it, bounded by the remaining budget; it "
+                "dirties the KV slot, so the launchpad re-fires afterwards."
             ),
         )
         agentic_metacog_confidence_floor: float = Field(
@@ -40206,6 +40818,47 @@ class Filter:
             description=(
                 "Reinforcement is skipped (with a log line) when less than "
                 "this many seconds of pipeline budget remain."
+            ),
+        )
+        agentic_coherence_check: str = Field(
+            default="shadow",
+            description=(
+                "P4: cross-step coherence check before the generative "
+                "evaluation (Fase 9). A light, no-LLM scan for two steps that "
+                "reached CONTRADICTORY verdicts on the same symbol with high "
+                "confidence (one confirmed, one refuted). 'off' = never. "
+                "'shadow' (default) = detect and log '[COHERENCE] would abort' "
+                "WITHOUT acting, to calibrate before enabling. 'on' = abort "
+                "the generative wave on a detected contradiction and force a "
+                "full re-plan instead of asking 'is there something better?' "
+                "over an internally inconsistent workspace."
+            ),
+        )
+        agentic_coherence_min_confidence: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum confidence BOTH contradicting claims must carry for "
+                "the P4 coherence check to treat them as a real contradiction "
+                "rather than low-confidence noise."
+            ),
+        )
+        agentic_generative_rigor: str = Field(
+            default="shadow",
+            description=(
+                "P1: subject a proposed generative improvement to a structural "
+                "test before accepting it. Today the evaluator's "
+                "'improvement_found' is a bare model judgement — a false "
+                "positive spins a re-plan wave on a stylistic preference. When "
+                "on, the proposed angle and the current approach are treated "
+                "as two hypotheses and find_experimentum_crucis looks for an "
+                "experiment that distinguishes them; if none exists the "
+                "'improvement' is deemed stylistic and the wave is dropped. "
+                "'off' = accept improvements as before. 'shadow' (default) = "
+                "log '[RIGOR-SHADOW] improvement has/ lacks a distinguishing "
+                "experiment' WITHOUT changing the decision, to calibrate. "
+                "'on' = drop improvements with no distinguishing experiment."
             ),
         )
         agentic_generative_eval: str = Field(
@@ -40287,6 +40940,17 @@ class Filter:
             default=800,
             ge=200,
             description="Generation cap for LLM-written test sections.",
+        )
+        agentic_tdd_ttl_seconds: float = Field(
+            default=1800.0,
+            ge=0.0,
+            description=(
+                "Fase 6 / P10: an armed inter-turn TDD verdict is discarded if "
+                "not consumed within this many seconds, or if the next turn is "
+                "a different project. Prevents a stale 'you have pending tests' "
+                "injection from leaking into an unrelated later conversation. "
+                "0 disables expiry (legacy behaviour)."
+            ),
         )
         agentic_tdd_inter_turn: bool = Field(
             default=True,
@@ -42271,6 +42935,10 @@ class Filter:
                         # merged_file_blocks (populated above for both paths).
                         _msg_to_index = last_user_msg
                         self._is_silent_ingestion = True
+                        self._log_debug(
+                            "[TURN-PATH] is_code_session=True → silent-ingestion "
+                            "(code-only paste indexed, no reasoning)"
+                        )
                         try:
                             await self._update_active_code(_msg_to_index, project_id)
                         finally:
