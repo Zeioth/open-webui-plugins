@@ -7521,6 +7521,7 @@ Output only "YES" or "NO".
             max_tokens=5,
             temperature=0.0,
             label="lod3_relevance_llm",
+            enable_thinking=False,
         )
 
         if self._f.valves.enable_slot_persistence and project_id:
@@ -10153,6 +10154,7 @@ class LongTermMemory:
             max_tokens=0,
             temperature=0.4,
             label="multi_query_expand",
+            enable_thinking=False,
         )
 
         self._f._log_debug(f"Multi-query raw response: {response}")
@@ -11549,8 +11551,19 @@ class LLMOrchestrator:
         # Region: global thinking kill switch — coerce before dedup and cache
         # key computation, so deduplicated consumers and cached responses are
         # always coherent with the effective (post-coercion) flag.
-        if not self._f.valves.llm_enable_thinking:
+        # Three states: 'on' forces thinking everywhere, 'off' disables it
+        # everywhere, 'auto' honours the call site's own enable_thinking
+        # recommendation (reasoning calls default True; structured/JSON
+        # contracts pass False).
+        _think_mode = (
+            str(getattr(self._f.valves, "llm_thinking_mode", "auto"))
+            .strip()
+            .lower()
+        )
+        if _think_mode in ("off", "false", "0", "no"):
             enable_thinking = False
+        elif _think_mode in ("on", "true", "1", "yes"):
+            enable_thinking = True
 
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
@@ -14213,6 +14226,7 @@ class AgenticStepExecutor:
                         max_tokens=self._f.valves.agentic_step_max_tokens,
                         temperature=0.3,
                         label="agentic_step",
+                        enable_thinking=False,
                     ),
                     timeout=remaining,
                 )
@@ -22271,6 +22285,7 @@ Output only the symbol name.
             max_tokens=10,
             temperature=0.0,
             label="seed_disambiguate_llm",
+            enable_thinking=False,
         )
         if self._f.valves.enable_slot_persistence and project_id:
             await self._f._project_state_manager.slot_restore_for_continuity(project_id)
@@ -27537,6 +27552,7 @@ Code context (recent symbols referenced):
             max_tokens=self._f.valves.oversized_summary_max_tokens,
             temperature=0.2,
             label="block_summary",
+            enable_thinking=False,
         )
         if summary:
             block.block_summary = summary.strip()
@@ -27740,6 +27756,7 @@ class EnrichmentTasks:
             max_tokens=self._f.valves.session_summary_max_tokens,
             temperature=0.2,
             label="session_summary",
+            enable_thinking=False,
         )
         if not summary:
             return False
@@ -38594,19 +38611,29 @@ class Filter:
             default="chat",
             description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
         )
-        llm_enable_thinking: bool = Field(
-            default=True,
+        llm_thinking_mode: str = Field(
+            default="auto",
             description=(
-                "Global kill switch for reasoning/thinking on auxiliary LLM "
-                "calls. When False, every call_llm() invocation is coerced to "
-                "enable_thinking=False regardless of what the call site "
-                "requested — including CoT generation, agentic steps, "
-                "hypothesis competition and every other consumer. The "
-                "coercion happens before the response-cache key is computed, "
-                "so cached thinking-on responses are never served while the "
-                "switch is off (and vice versa). Affects only auxiliary "
-                "calls made by this filter; the main user-visible inference "
-                "is issued by OpenWebUI and is not routed through call_llm()."
+                "Global three-state kill switch for reasoning/thinking on "
+                "auxiliary LLM calls. 'on' (synonyms: true/1/yes): every "
+                "call_llm() invocation thinks, regardless of the call site — "
+                "note this forces thinking even on JSON-contract calls, "
+                "which can hurt structured parsing and eat token caps. "
+                "'off' (synonyms: false/0/no): no auxiliary call thinks. "
+                "'auto' (default): each call site's own recommendation is "
+                "honoured — reasoning-heavy calls (CoT chains, hypothesis "
+                "competition, peer review, experimentum crucis) think, "
+                "while structured/JSON-contract calls (classifiers, "
+                "planner, step executor, verifiers, summaries, docstrings) "
+                "pass enable_thinking=False and do not. The coercion "
+                "happens centrally in call_llm() before dedup and the "
+                "response-cache key, so cached thinking-on responses are "
+                "never served while the effective mode differs (and vice "
+                "versa). Affects only auxiliary calls made by this filter; "
+                "the main user-visible inference is issued by OpenWebUI "
+                "and is not routed through call_llm(). Replaces the old "
+                "boolean llm_enable_thinking valve (True→'on', "
+                "False→'off')."
             ),
         )
         # ── 2.2 Timeouts & retries ────────────────────────────────────────────
