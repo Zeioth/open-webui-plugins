@@ -12433,11 +12433,24 @@ class AgenticStepCache:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
-    @staticmethod
-    def step_key(step: AgenticStep) -> str:
-        """Stable key from kind + whitespace/case-normalized goal."""
+    def step_key(self, step: AgenticStep) -> str:
+        """
+        Stable key from kind + whitespace/case-normalized goal, scoped by
+        the reinforcement mode.
+
+        A cached step carries its reinforcement annotation in `output` and
+        any refuted verdicts in `claims_json`. Without the mode in the key,
+        turning agentic_metacog_reinforce OFF would still serve a prior
+        turn's reinforced output and its ✗ REFUTED claims from cache — the
+        visible result would contradict the valve. Folding the mode in makes
+        a valve change a cache miss for that step, so the cache always
+        reflects the current setting.
+        """
         norm = " ".join(step.goal.split()).lower()
-        return hashlib.md5(f"{step.kind}\x1f{norm}".encode()).hexdigest()
+        mode = getattr(self._f.valves, "agentic_metacog_reinforce", "off")
+        return hashlib.md5(
+            f"{step.kind}\x1f{norm}\x1f{mode}".encode()
+        ).hexdigest()
 
     async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
@@ -14035,6 +14048,11 @@ class AgenticPlanner:
 
         # Region: single JSON-contract call (prefix-aligned)
         max_steps = max(2, self._f.valves.agentic_max_steps)
+        # Defensive cap: {question} is substituted raw into the contract;
+        # a caller that bypasses the gate must not be able to inflate the
+        # planner prompt with a full paste (see the gate cap in
+        # _detect_and_generate_cot).
+        question = (question or "")[:2000]
         prompt = self._CONTRACT.replace("{max_steps}", str(max_steps)).replace(
             "{question}", question
         )
@@ -14685,8 +14703,20 @@ class AgenticOrchestrator:
         claims = [c for c in self._ledger.claims if c.step_id == step.id][:4]
         if not claims:
             return 0
-        deadline = max(20.0, min(remaining * 0.5, remaining - 15.0))
-        per_claim = max(8.0, deadline / len(claims))
+        # Budget: bounded to half the remaining pipeline budget, but never
+        # more than what actually remains. The floor is the SMALLER of 20s
+        # and the remaining budget — a plain max(20, …) would force a 20s
+        # deadline even when only 5s are left (min_remaining_s has ge=0, so
+        # an operator can lower the upstream guard below 20), overrunning
+        # the pipeline; a per-claim slice below ~4s is not worth attempting.
+        deadline = min(remaining, max(20.0, min(remaining * 0.5, remaining - 15.0)))
+        if deadline < 12.0:
+            self._f._log_debug(
+                f"🤖 Agentic reinforcement: step {step.id} skipped — only "
+                f"{remaining:.0f}s remain, too little to falsify safely"
+            )
+            return 0
+        per_claim = max(4.0, deadline / len(claims))
         _prefix = status_prefix or f"🤖 Agentic step {step.id}"
         await self._f._emit_status(
             f"{_prefix} · metacog: static falsification of "
@@ -14820,7 +14850,7 @@ class AgenticOrchestrator:
                     response_format={"type": "json_object"},
                     enable_thinking=False,
                 ),
-                timeout=max(20.0, min(remaining * 0.3, 120.0)),
+                timeout=min(remaining, max(20.0, min(remaining * 0.3, 120.0))),
             )
         except Exception:
             return "", []
@@ -14906,6 +14936,11 @@ class AgenticOrchestrator:
             turn. False when the message is not an /agent command.
         """
         mode, question = self.parse_command(user_content)
+        # Cap immediately: the 'plan' preview path below uses question in
+        # injected text and calls the planner directly, bypassing the
+        # run_pipeline frontier cap; parse_command returns the raw post-
+        # '/agent' text, which may embed a large paste.
+        question = (question or "")[:2000]
         if mode is None:
             return False
 
@@ -15025,6 +15060,17 @@ class AgenticOrchestrator:
                 )
             )
             return
+
+        # Region: cap the question at the single pipeline frontier
+        # Both callers reach the pipeline here — the 'always' gate (already
+        # capped) and the /agent command (NOT capped: parse_command returns
+        # the raw text after '/agent', which may embed a large paste). An
+        # uncapped question flows into build_fixed_plan step goals, the
+        # per-step prompts, and the synthesis composer's injected workspace
+        # ('for the question: "{question}"'), none of which are behind the
+        # gate cap. Capping here — the one path both routes share — protects
+        # all of them; the gate/planner caps become belt-and-suspenders.
+        question = (question or "")[:2000]
 
         # Region: fail-open boundary — the pipeline is an enhancement layer
         # and must never veto the base answer. Any internal failure degrades
@@ -33655,18 +33701,54 @@ class MessageAssembler:
         # here; heuristic-positive turns keep the specialized path (the
         # later trigger block remains as their fallback). 'shadow' logs
         # the would-fire decision for calibration without executing.
+        #
+        # A silent non-fire is itself a defect (an 'always' that quietly
+        # routes to CoT is undebuggable), so every gate condition names
+        # itself when it blocks. The length threshold reads user_content
+        # (the raw message), NOT user_question: the latter has code spans
+        # stripped and collapses below the threshold when the question is
+        # embedded in a paste, which is exactly a case that SHOULD run the
+        # pipeline. The question passed to the pipeline falls back to
+        # user_content when the stripped form came back empty.
         # ------------------------------------------------------------------
         _always_mode = self._f.valves.agentic_trigger
-        if (
-            self._f.valves.enable_agentic_pipeline
-            and _always_mode in ("always", "shadow")
-            and not is_continuation
-            and slot_free
-            and is_code_session
-            and len((user_question or "").strip()) >= 20
-            and not self._f._reasoning.is_architecture_query(user_question or "")
+        # Cap the pipeline question at the gate: user_question has code
+        # spans stripped, but the fallback is raw user_content, which can
+        # be a 1.5MB paste. An uncapped value would run the architecture
+        # regex and len() over the whole blob here and inflate the
+        # planner / per-step / synthesis prompts downstream — the exact
+        # 'consumer without a diet' failure. 2000 chars is ample for a
+        # question; the code itself reaches the pipeline through Block A/B.
+        _agentic_question = (
+            (user_question or "").strip() or user_content.strip()
+        )[:2000]
+        if self._f.valves.enable_agentic_pipeline and _always_mode in (
+            "always",
+            "shadow",
         ):
-            if _always_mode == "shadow":
+            _block_reason = ""
+            if is_continuation:
+                _block_reason = "continuation turn"
+            elif not slot_free:
+                _block_reason = "slot busy"
+            elif not is_code_session and not (
+                self._f.valves.agentic_always_ignore_code_session
+            ):
+                _block_reason = "not a code session"
+            elif len(_agentic_question) < self._f.valves.agentic_always_min_chars:
+                _block_reason = (
+                    f"message too short ({len(_agentic_question)} < "
+                    f"{self._f.valves.agentic_always_min_chars} chars)"
+                )
+            elif self._f._reasoning.is_architecture_query(_agentic_question):
+                _block_reason = "architecture query (keeps specialized path)"
+
+            if _block_reason:
+                self._f._log_debug(
+                    f"🤖 Agentic 'always' did NOT fire: {_block_reason} "
+                    f"(mode={_always_mode})"
+                )
+            elif _always_mode == "shadow":
                 self._f._log_debug(
                     "🤖 [SHADOW] agentic 'always' would fire on this turn "
                     "(pre-detection) — continuing with the normal path"
@@ -33677,7 +33759,7 @@ class MessageAssembler:
                     "short-circuit — CoT detection skipped)"
                 )
                 await self._f._agentic.run_pipeline(
-                    question=user_question,
+                    question=_agentic_question,
                     prelim_system=prelim_system,
                     project_id=project_id,
                     slot_free=slot_free,
@@ -39872,6 +39954,31 @@ class Filter:
                 "it with agentic_max_steps / agentic_max_seconds / "
                 "agentic_early_exit_confidence, and mind the aux-call cost: "
                 "with a single --parallel 1 slot the pipeline runs serially."
+            ),
+        )
+        agentic_always_min_chars: int = Field(
+            default=12,
+            ge=0,
+            description=(
+                "Minimum message length (raw user_content, code included) for "
+                "agentic_trigger='always' to fire. Below this the turn is a "
+                "trivial acknowledgement and falls through to the fast CoT "
+                "path. Lowered from the original hard-coded 20 because real "
+                "dev questions ('¿qué hace build_block_b?') sit right at that "
+                "boundary and were silently routed to CoT."
+            ),
+        )
+        agentic_always_ignore_code_session: bool = Field(
+            default=False,
+            description=(
+                "When True, agentic_trigger='always' fires even on turns the "
+                "session classifier did NOT mark as code-aware. The classifier "
+                "keys on the CURRENT message, so a short follow-up in an "
+                "ongoing code project ('y ahora optimízalo') can score "
+                "non-code and skip the pipeline. Enable this if the log shows "
+                "'always did NOT fire: not a code session' on turns that are "
+                "clearly about code — it trades a few spurious pipeline runs "
+                "on genuinely non-code turns for never missing a code one."
             ),
         )
         agentic_tool_rounds_max: int = Field(
