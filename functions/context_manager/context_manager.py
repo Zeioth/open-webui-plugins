@@ -16,7 +16,6 @@ import anyio
 import hashlib
 import sqlite3
 import ast
-import contextvars
 import json
 import asyncio
 import threading
@@ -31,7 +30,6 @@ from typing import (
     Dict,
     Any,
     Tuple,
-    Union,
     Set,
     Iterable,
     Literal,
@@ -83,22 +81,12 @@ except ImportError:
 
 try:
     from tree_sitter_language_pack import (
-        get_language,
         detect_language_from_extension,
-        process,
-        ProcessConfig,
     )
 
     HAS_TREE_SITTER = True
 except ImportError:
     HAS_TREE_SITTER = False
-
-try:
-    import tree_sitter
-
-    HAS_TREE_SITTER_CORE = True
-except ImportError:
-    HAS_TREE_SITTER_CORE = False
 
 import sys
 
@@ -109,18 +97,13 @@ from shared_resources import (
     get_embedder as _shared_get_embedder,
     get_chroma_client as _shared_get_chroma_client,
     AsyncLRUCache as _AsyncLRUCache,
-    get_http_session as _shared_get_http_session,
     call_llm as _shared_call_llm,
-    unload_all_models as _shared_unload_all_models,
     get_conversation_compressor as _shared_get_conversation_compressor,
     get_model_name,
     get_model_backend,
 )
 
 _db_global_lock = threading.Lock()
-import fcntl
-import tempfile
-
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
@@ -225,7 +208,6 @@ class ScoredHypothesis:
     design: "ExperimentDesign"
     falsified: bool
     falsification_reason: Optional[str]
-    scope: Optional[str] = None
     predictions_verified: int = 0
     predictions_total: int = 0
     coverage_score: float = 0.0
@@ -1127,24 +1109,6 @@ class SymbolIndex:
             if key.startswith(prefix)
         }
 
-    def get_all_edges_in(self, project_id: str) -> Dict[str, List["Edge"]]:
-        prefix = f"{project_id}:"
-        inverted: Dict[str, List["Edge"]] = defaultdict(list)
-        for key, edges in self._edges_out.items():
-            if not key.startswith(prefix):
-                continue
-            for e in edges:
-                inverted[e.dst].append(
-                    Edge(
-                        src=e.dst,
-                        dst=e.src,
-                        type=e.type,
-                        weight=e.weight,
-                        confidence=e.confidence,
-                    )
-                )
-        return dict(inverted)
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 5. Centrality (PageRank)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1246,38 +1210,6 @@ class SymbolIndex:
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. Skeleton & signature hashes
     # ═══════════════════════════════════════════════════════════════════════════
-
-    def compute_signature_hash(self, project_id: str) -> str:
-        """Stable hash of all symbol signatures (not bodies).  Changes only
-        when symbols are added/removed/renamed or a signature changes."""
-        qids = sorted(self.get_all_qualified_names(project_id))
-        if not qids:
-            return ""
-        parts = []
-        for qid in qids:
-            meta = self._symbol_meta.get((project_id, qid), {})
-            name = meta.get("name", qid)
-            sig = meta.get("signature") or name
-            parent = meta.get("parent_symbol", "")
-            parts.append(f"{parent}\x1f{name}\x1f{sig}")
-        blob = "\x1e".join(parts)
-        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
-
-    def compute_skeleton_hash(self, project_id: str) -> str:
-        """Stable hash of the skeleton tier (signatures + docstrings)."""
-        qids = sorted(self.get_all_qualified_names(project_id))
-        if not qids:
-            return ""
-        parts = []
-        for qid in qids:
-            meta = self._symbol_meta.get((project_id, qid), {})
-            name = meta.get("name", qid)
-            sig = meta.get("signature") or name
-            parent = meta.get("parent_symbol", "")
-            doc = meta.get("docstring", "")
-            parts.append(f"{parent}\x1f{name}\x1f{sig}\x1f{doc}")
-        blob = "\x1e".join(parts)
-        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     def compute_structure_hash(self, project_id: str) -> str:
         """
@@ -1390,21 +1322,6 @@ class SymbolIndex:
         self._symbol_meta.clear()
 
     # ── Internal helpers (iteration) ─────────────────────────────────────
-
-    def _iter_names(self, project_id: str):
-        return iter(self.get_all_qualified_names(project_id))
-
-    def _iter_out_edges(self, project_id: str, name: str):
-        key = f"{project_id}:{name}"
-        for edge in self._edges_out.get(key, []):
-            yield edge.dst
-
-    def _symbol_line_start(self, name_or_qid: str, project_id: str) -> int:
-        meta = self._resolve_meta(name_or_qid, project_id)
-        if meta is None:
-            return 999999
-        val = meta.get("line_start")
-        return val if val is not None else 999999
 
 
 class ConversationState(BaseModel):
@@ -2014,8 +1931,6 @@ class ActivationGraph:
     # 1. Constants & initialization
     # ═══════════════════════════════════════════════════════════════════════════
 
-    DECAY_BASE: float = 0.7
-
     def __init__(self):
         self._activations: Dict[str, ActivationState] = {}
 
@@ -2242,14 +2157,6 @@ class CodePathView(BaseModel):
             or self.call_graph_hash != current_call_graph
         )
 
-    def top_symbols(self, n: int = 10) -> List[str]:
-        """Return the *n* symbols with the highest activation score in this view."""
-        return sorted(
-            self.induced_nodes.keys(),
-            key=lambda s: self.induced_nodes[s],
-            reverse=True,
-        )[:n]
-
 
 # ---------------------------------------------------------------------------
 # StaticEvidence – deterministic proof from the SymbolGraph
@@ -2433,10 +2340,6 @@ class HubSymbolIndex:
             return []
         ranked = sorted(centrality.items(), key=lambda kv: (-kv[1], kv[0]))
         return [name for name, _ in ranked[:top_n]]
-
-    def is_hub(self, symbol_name: str, centrality: dict, top_n: int) -> bool:
-        """True if *symbol_name* would appear in Block A for the given *top_n*."""
-        return symbol_name in set(self.get_hub_names(centrality, top_n))
 
     def build(
         self,
@@ -4348,84 +4251,6 @@ class RaptorCodeIndex:
                     queue.append((nb, depth + 1))
         return visited
 
-    def _graph_distance(
-        self,
-        sym_a: str,
-        sym_b: str,
-        adj: dict,
-        max_depth: int = 3,
-    ) -> float:
-        """
-        Normalised call-graph distance in [0, 1].
-
-        0.0 = same symbol or direct call.
-        1.0 = unreachable within max_depth.
-
-        Args:
-            sym_a: First symbol.
-            sym_b: Second symbol.
-            adj: Undirected adjacency dict.
-            max_depth: Maximum depth to consider.
-
-        Returns:
-            Normalised distance.
-        """
-        if sym_a == sym_b:
-            return 0.0
-
-        from collections import deque
-
-        visited = {sym_a}
-        queue = deque([(sym_a, 0)])
-        while queue:
-            node, depth = queue.popleft()
-            if depth >= max_depth:
-                continue
-            for nb in adj.get(node, ()):
-                if nb == sym_b:
-                    return (depth + 1) / (max_depth + 1)
-                if nb not in visited:
-                    visited.add(nb)
-                    queue.append((nb, depth + 1))
-        return 1.0
-
-    def _combined_distance(
-        self,
-        emb_a,
-        emb_b,
-        sym_a: str,
-        sym_b: str,
-        edges_out: dict,
-        graph_weight: float,
-    ) -> float:
-        """
-        Combined clustering metric (used for validation).
-
-        combined = (1 - graph_weight) * cosine_distance + graph_weight * graph_distance
-        Lower = more similar.
-
-        Args:
-            emb_a: Embedding of symbol A.
-            emb_b: Embedding of symbol B.
-            sym_a: Name of symbol A.
-            sym_b: Name of symbol B.
-            edges_out: Call graph edges.
-            graph_weight: Weight for graph distance.
-
-        Returns:
-            Combined distance.
-        """
-        import numpy as np
-
-        a = np.asarray(emb_a, dtype=np.float32)
-        b = np.asarray(emb_b, dtype=np.float32)
-        cosine_dist = 1.0 - float(
-            np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
-        )
-        adj = self._build_adjacency(edges_out)
-        graph_dist = self._graph_distance(sym_a, sym_b, adj, max_depth=3)
-        return (1.0 - graph_weight) * cosine_dist + graph_weight * graph_dist
-
     def _build_graph_features(self, names: list, edges_out: dict):
         """
         Build a graph-position feature matrix.
@@ -6229,36 +6054,9 @@ class ContextBuilder:
     # 2.6 — Docstring provider
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _make_docstring_provider(self, project_id: str):
-        """Return f(symbol_name, parent_class='') -> one-line docstring or ''."""
-        if not self._f.valves.skeleton_include_docstrings:
-            return lambda _name, _parent="": ""
-
-        def _provider(symbol_name: str, parent_class: str = "") -> str:
-            qid = qualify_symbol_name(symbol_name, parent_class)
-            return self._f._symbol_index.get_docstring(qid, project_id) or ""
-
-        return _provider
-
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Use case classification (cascade: Heuristic → CE → LLM)
     # ═══════════════════════════════════════════════════════════════════════
-
-    def get_effective_context_budget(self, project_id: str) -> int:
-        """
-        Tokens available for history + user message after Block A + Block B.
-        """
-        window = self._f.valves.context_window_tokens
-        used = self._f._project_state_manager.get_last_system_tokens(project_id)
-
-        reserve = self._f.valves.response_reserve_tokens
-        budget = max(0, window - used - reserve)
-
-        self._f._log_debug(
-            f"get_effective_context_budget: window={window}, used_system={used}, "
-            f"reserve={reserve} → {budget} tokens available for history + user message"
-        )
-        return budget
 
     async def classify_use_case(
         self, query: str, intent_vector: dict, project_id: str
@@ -7789,9 +7587,6 @@ class SignatureExtractor:
         "hpp": "cpp",
     }
 
-    _parser_cache: Dict[str, Any] = {}
-    _parser_cache_lock = threading.Lock()
-
     # ── extraction cache ──────────────────────────────────────────────
     _extraction_cache: Dict[str, Tuple[List["CodeSymbol"], float]] = {}
     _EXTRACTION_CACHE_MAXSIZE: int = 128
@@ -8267,40 +8062,6 @@ class SignatureExtractor:
         return {k: list(v) for k, v in call_map.items()}
 
     @staticmethod
-    def _parse_sync(code_bytes: bytes, lang: str):
-        """
-        Parse source-code bytes synchronously with a fresh tree-sitter parser.
-
-        Creates a new parser instance on every call. This avoids thread-safety
-        issues: tree-sitter Parser is not Send/Sync and cannot be shared across
-        threads [2†L11]. Creating a parser is cheap compared to parsing.
-
-        Supports both old API (set_language) and new API (language in constructor).
-        See: https://tree-sitter.github.io/tree-sitter/ [3†L19-L22]
-
-        Returns the root ``tree_sitter.Node`` of the concrete syntax tree.
-        """
-        from tree_sitter import Parser as TSParser
-        from tree_sitter_language_pack import get_language
-
-        lang_obj = get_language(lang)
-
-        # New API (py-tree-sitter >= 0.23.0): language passed to constructor.
-        try:
-            parser = TSParser(lang_obj)
-        except TypeError:
-            # Old API (py-tree-sitter < 0.23.0): use set_language().
-            parser = TSParser()
-            if hasattr(parser, "set_language"):
-                parser.set_language(lang_obj)
-            else:
-                raise RuntimeError(
-                    f"Unsupported tree-sitter version: cannot set language '{lang}'"
-                )
-
-        return parser.parse(code_bytes)
-
-    @staticmethod
     def enrich_symbols_with_parent_info(
         symbols: List["CodeSymbol"], full_code: str
     ) -> List["CodeSymbol"]:
@@ -8379,87 +8140,6 @@ class SignatureExtractor:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Symbol extraction from tree-sitter
     # ═══════════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _extract_symbols_from_tree(
-        tree, lang: str, code: str, file_path: Optional[str]
-    ) -> List["CodeSymbol"]:
-        """
-        Extract symbols using tree-sitter-language-pack's built-in queries.
-
-        Args:
-            tree: The tree-sitter parse tree (unused, kept for signature compatibility).
-            lang: The programming language.
-            code: The source code.
-            file_path: Optional file path.
-
-        Returns:
-            List[CodeSymbol]: Extracted symbols with line ranges.
-        """
-        if not HAS_TREE_SITTER:
-            return []
-
-        try:
-            from tree_sitter_language_pack import process, ProcessConfig
-
-            config = ProcessConfig()
-            config.language = lang
-            # Enable symbol extraction in the config
-            # (The exact property name may vary; check the library docs)
-            config.extract_symbols = True
-            result = process(code, config)
-
-            symbols = []
-            if hasattr(result, "symbols"):
-                for sym in result.symbols:
-                    # Convert to CodeSymbol
-                    # Assuming sym has: name, kind, signature, line_start, line_end, parent
-                    code_sym = CodeSymbol(
-                        name=sym.name,
-                        kind=sym.kind,  # 'function', 'class', 'method'
-                        signature=sym.signature or sym.name,
-                        file_path=file_path,
-                        line_start=sym.line_start + 1,  # if 0-indexed
-                        line_end=sym.line_end + 1,
-                        language=lang,
-                        parent_symbol=sym.parent or "",
-                    )
-                    symbols.append(code_sym)
-            return symbols
-        except Exception as e:
-            logger.warning(f"tree-sitter symbol extraction via process() failed: {e}")
-            return []
-
-    @staticmethod
-    def _extract_calls_from_tree(tree, lang: str, code: str) -> Dict[str, List[str]]:
-        """
-        Extract call relationships using tree-sitter-language-pack's built-in queries.
-
-        Returns:
-            Dict[str, List[str]]: {caller_qualified_id: [callee_name, ...]}
-        """
-        if not HAS_TREE_SITTER:
-            return {}
-
-        try:
-            from tree_sitter_language_pack import process, ProcessConfig
-
-            config = ProcessConfig()
-            config.language = lang
-            config.extract_calls = True
-            result = process(code, config)
-
-            call_map: Dict[str, Set[str]] = defaultdict(set)
-            if hasattr(result, "calls"):
-                for call in result.calls:
-                    # call should have: caller, callee, line
-                    # caller can be qualified (Class.method) or bare
-                    if call.caller:
-                        call_map[call.caller].add(call.callee)
-            return {k: list(v) for k, v in call_map.items()}
-        except Exception as e:
-            logger.warning(f"tree-sitter call extraction via process() failed: {e}")
-            return {}
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Call extraction from tree-sitter
@@ -11697,27 +11377,6 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
     # 7. Project purge
     # ═══════════════════════════════════════════════════════════════════════════
-
-    def purge_project(self, project_id: str) -> int:
-        """
-        Delete all ChromaDB documents for a project.
-
-        Returns the number of documents deleted.
-        """
-        try:
-            existing = self._f.memory_collection.get(
-                where={"project_id": {"$eq": project_id}}
-            )
-            ids_to_delete: List[str] = existing.get("ids", [])
-            if ids_to_delete:
-                self._f.memory_collection.delete(ids=ids_to_delete)
-                self._f._log_debug(
-                    f"LTM: purged {len(ids_to_delete)} documents for project '{project_id}'"
-                )
-            return len(ids_to_delete)
-        except Exception as e:
-            self._f._log_debug(f"LTM: purge_project failed for '{project_id}': {e}")
-            return 0
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Embedding model validation
@@ -16187,9 +15846,9 @@ class ReasoningEngine:
     reasoning chains using the LLM.
 
     Provides:
-    * ``detect_cot_level(query)`` — returns 0‑3 (inconclusive → deep
-      scientific reasoning) using either a CrossEncoder classifier or a
-      keyword‑based heuristic.
+    * ``detect_cot_configuration(user_content)`` — returns the reasoning
+      configuration (level 0-3 plus scientific/decompose flags) using a
+      CrossEncoder classifier with LLM arbitration.
     * ``generate_cot_reasoning(question, context)`` — produces a step‑by‑step
       reasoning block (Level 2).
     * ``generate_architecture_reasoning(question, skeleton, project_id)`` —
@@ -17060,279 +16719,6 @@ class ReasoningEngine:
             sc[0] = min(1.0, sc[0] + 0.10)
 
         return lv, sc
-
-    async def detect_cot_level(
-        self,
-        user_content: str,
-        is_code_session: bool,
-        state: dict,
-        is_continuation: bool = False,
-    ) -> int:
-        """
-        Backward-compatible wrapper around detect_cot_configuration().
-
-        Returns the level int only. For full feature detection
-        (use_scientific, decompose), call detect_cot_configuration()
-        directly with a pre-computed signal_vector.
-        """
-        config = await self.detect_cot_configuration(
-            user_content=user_content,
-            is_code_session=is_code_session,
-            state=state,
-            signal_vector=None,
-            is_continuation=is_continuation,
-            project_id="",
-        )
-        return config["level"]
-
-    async def _classify_with_crossencoder_and_llm(
-        self,
-        user_content: str,
-        is_code_session: bool,
-        crossencoder_scores: Optional[List[float]] = None,
-        project_id: str = "",
-    ) -> int:
-        """
-        Use the LLM to classify the CoT level, optionally informed by CrossEncoder scores.
-
-        Called when the CrossEncoder is unavailable or when its top-two scores
-        are within the uncertainty band.  Returns the reasoning depth (0–3) as
-        an integer.
-
-        Args:
-            user_content: The user's message content.
-            is_code_session: Whether the current session is code-aware.
-            crossencoder_scores: Optional list of four CE scores [L0,L1,L2,L3],
-                or None when the CE is unavailable.
-            project_id: Current project identifier for slot restoration.
-
-        Returns:
-            int: Reasoning depth — 0 (no CoT), 1 (simple), 2 (complex), 3 (deep).
-            Defaults to 2 on LLM failure (safest assumption for code queries).
-        """
-        # ------------------------------------------------------------------
-        # Region: build prompt — with CE context when available
-        # ------------------------------------------------------------------
-        if crossencoder_scores is not None:
-            max_score = max(crossencoder_scores)
-            best_level = int(np.argmax(crossencoder_scores))
-            second_max = (
-                sorted(crossencoder_scores, reverse=True)[1]
-                if len(crossencoder_scores) > 1
-                else 0
-            )
-            diff = max_score - second_max
-            confidence = "high" if diff > 0.5 else "medium" if diff > 0.3 else "low"
-
-            ce_summary = (
-                f"The CrossEncoder has analyzed the question and provides the "
-                f"following scores:\n"
-                f"- Level 0 (Trivial): {crossencoder_scores[0]:.2f}\n"
-                f"- Level 1 (Moderate): {crossencoder_scores[1]:.2f}\n"
-                f"- Level 2 (Complex): {crossencoder_scores[2]:.2f}\n"
-                f"- Level 3 (Deep): {crossencoder_scores[3]:.2f}\n\n"
-                f"The highest score is Level {best_level} "
-                f"(score: {max_score:.2f}), with {confidence} confidence."
-            )
-
-            prompt = (
-                f"{ce_summary}\n\n"
-                "Now, independently analyze the user's question and determine "
-                "the appropriate reasoning level.\n\n"
-                f"User question:\n{user_content[:500]}\n\n"
-                "Level definitions:\n"
-                "- Level 0: Simple fact, definition, or direct command. "
-                "No reasoning needed.\n"
-                "- Level 1: Requires some logical reasoning but the answer "
-                "is straightforward.\n"
-                "- Level 2: Requires step-by-step reasoning, analysis of "
-                "multiple steps or dependencies.\n"
-                "- Level 3: Requires deep, open-ended, or system-wide analysis, "
-                "scientific reasoning, or impact evaluation.\n\n"
-                "Output only the number (0, 1, 2, or 3) that best represents "
-                "the reasoning complexity required."
-            )
-        else:
-            prompt = (
-                "Classify the following user question into one of four levels "
-                "of reasoning complexity:\n\n"
-                "Level 0: Simple fact, definition, or direct command. "
-                "No reasoning needed.\n"
-                "Level 1: Requires some logical reasoning but the answer "
-                "is straightforward.\n"
-                "Level 2: Requires step-by-step reasoning, analysis of multiple "
-                "steps or dependencies.\n"
-                "Level 3: Requires deep, open-ended, or system-wide analysis, "
-                "scientific reasoning, or impact evaluation.\n\n"
-                f"User question:\n{user_content[:500]}\n\n"
-                "Output only the number (0, 1, 2, or 3):"
-            )
-
-        # ------------------------------------------------------------------
-        # Region: call LLM
-        # ------------------------------------------------------------------
-        label = "cot_llm_with_ce" if crossencoder_scores is not None else "cot_llm_pure"
-
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt="You are a classifier. Output only a single number from 0 to 3.",
-            model_override=self._f.valves.summarization_model,
-            max_tokens=5,
-            temperature=0.0,
-            label=label,
-        )
-
-        # ------------------------------------------------------------------
-        # Region: Restore slot after auxiliary LLM call
-        # ------------------------------------------------------------------
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
-        # ------------------------------------------------------------------
-        # Region: parse response and return level
-        # ------------------------------------------------------------------
-        if response and response.strip().isdigit():
-            level = int(response.strip())
-            if 0 <= level <= 3:
-                return level
-
-        # -- default: level 2 (complex) is the safest fallback for code queries
-        self._f._log_debug(
-            "CoT detection: LLM returned invalid response, defaulting to level 2."
-        )
-        return 2
-
-    async def _detect_cot_level_via_llm(
-        self,
-        user_content: str,
-        is_code_session: bool,
-        state: dict,
-        is_continuation: bool = False,
-    ) -> int:
-        """
-        Determine CoT depth using a hybrid approach.
-
-        1. CrossEncoder provides an initial assessment.
-        2. If enabled, heuristic reinforces the CrossEncoder scores (adds bonus based on keywords).
-        3. If confident, use the reinforced (or raw) CrossEncoder.
-        4. If uncertain, use LLM with CrossEncoder context.
-        5. If CrossEncoder unavailable, use LLM alone (pure).
-        6. If LLM fails, default to level 2 (complex) as a safe assumption.
-
-        The heuristic reinforcement can be toggled via the
-        enable_cot_heuristic_reinforcement valve for A/B testing.
-
-        Args:
-            user_content (str): The user's message content.
-            is_code_session (bool): Whether the session is code-aware.
-            state (dict): The conversation state (unused, kept for API consistency).
-            is_continuation (bool): Whether this is a continuation turn.
-
-        Returns:
-            int: 0 (no CoT), 1 (simple), 2 (complex), or 3 (deep).
-        """
-        session_type = "code" if is_code_session else "general"
-        intent_hint = ""
-        if (
-            hasattr(self._f, "_user_intent_full_code")
-            and self._f._user_intent_full_code is not None
-        ):
-            intent_hint = (
-                "The user likely needs the full code."
-                if self._f._user_intent_full_code
-                else "The user likely needs only a summary of the code."
-            )
-
-        # ── Enrich query with context tags ──
-        context_parts = []
-        if "```" in user_content or any(
-            kw in user_content
-            for kw in ("def ", "class ", "import ", "from ", "function ")
-        ):
-            context_parts.append("[CODE]")
-        if "traceback" in user_content.lower() or 'File "' in user_content:
-            context_parts.append("[TRACEBACK]")
-        if is_continuation:
-            context_parts.append("[CONTINUATION]")
-        context_prefix = " ".join(context_parts)
-        base_query = f"[Session: {session_type}] {intent_hint} {user_content[:500]}"
-        query = f"{context_prefix} {base_query}" if context_parts else base_query
-
-        # ── Build pairs with improved level descriptions ──
-        pairs = [
-            (
-                query,
-                "The user asks a trivial question about code: a simple fact, a definition, or a direct command that does not require reasoning or analysis.",
-            ),
-            (
-                query,
-                "The user asks a moderately complex question about code that requires some logical reasoning, but the answer is straightforward and does not require deep analysis.",
-            ),
-            (
-                query,
-                "The user asks a complex question about code that involves multiple steps, dependencies, architectural decisions, or debugging that requires step-by-step reasoning.",
-            ),
-            (
-                query,
-                "The user asks a deep, open-ended, or system-wide question about code that requires exhaustive analysis, impact evaluation, scientific reasoning, or multi-hypothesis validation.",
-            ),
-        ]
-        scores = await self._f._commands._predict_cross_encoder(pairs)
-
-        # ── CrossEncoder available ──
-        if scores is not None:
-            # ── Apply heuristic reinforcement if enabled ──
-            if self._f.valves.enable_cot_heuristic_reinforcement:
-                scores_for_decision = (
-                    self._reinforce_cot_level_detection_with_heuristic(
-                        user_content, scores
-                    )
-                )
-                reinforcement_status = "with heuristic reinforcement"
-            else:
-                scores_for_decision = scores
-                reinforcement_status = "without heuristic reinforcement"
-
-            # If cascade is disabled, use LLM alone (without CE context)
-            if not self._f.valves.enable_cot_cascade:
-                self._f._log_debug(f"CoT detection: Cascade disabled, using LLM alone.")
-                return await self._classify_with_crossencoder_and_llm(
-                    user_content, is_code_session, crossencoder_scores=None
-                )
-
-            # Check confidence threshold on the chosen scores
-            max_score = max(scores_for_decision)
-            second_max = (
-                sorted(scores_for_decision, reverse=True)[1]
-                if len(scores_for_decision) > 1
-                else 0
-            )
-            diff = max_score - second_max
-            threshold = self._f.valves.cot_cascade_uncertainty_threshold
-
-            # If CrossEncoder is confident, use it directly
-            if diff >= threshold:
-                best_level = int(np.argmax(scores_for_decision))
-                self._f._log_debug(
-                    f"CoT detection: CrossEncoder confident {reinforcement_status} "
-                    f"(diff={diff:.2f} >= {threshold:.2f}), using level {best_level}"
-                )
-                return best_level
-
-            # CrossEncoder uncertain → LLM with CE context
-            self._f._log_debug(
-                f"CoT detection: CrossEncoder uncertain {reinforcement_status} "
-                f"(diff={diff:.2f} < {threshold:.2f}), using LLM with CrossEncoder context"
-            )
-            return await self._classify_with_crossencoder_and_llm(
-                user_content, is_code_session, crossencoder_scores=scores
-            )
-
-        # ── CrossEncoder unavailable → LLM alone (pure) ──
-        self._f._log_debug("CoT detection: CrossEncoder unavailable, using LLM alone.")
-        return await self._classify_with_crossencoder_and_llm(
-            user_content, is_code_session, crossencoder_scores=None
-        )
 
     def _detect_cot_level_heuristic(
         self, user_content: str, is_code_session: bool, state: dict
@@ -18630,24 +18016,9 @@ class CommandRouter:
     # calls, closing brackets, typed attributes...) rather than starting a
     # new construct. Without this, normally-formatted code (Field(...) calls,
     # multi-line regex, dataclass-style fields) gets misread as "prose".
-    _CONTINUATION_OR_LITERAL = re.compile(
-        r"^\s*(?:"
-        r"[\)\]\}]|"
-        r"[\"'`]|"
-        r"[,\.]|"
-        r"\*\*?\w|"
-        r"-?\d|"
-        r"[\w.\[\]]+\s*[:=\(\[{]"
-        r")"
-    )
     # Noise-stripping patterns: blanked out (newlines preserved) before
     # checking for a real '?' question, so docstrings and regex literals
     # (`(?:...)`, `\?`) never get mistaken for an explicit user question.
-    _TRIPLE_QUOTE_RE = re.compile(r'("""|\'\'\')([\s\S]*?)\1')
-    _BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
-    _STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'')
-    _LINE_COMMENT_RE = re.compile(r"(#|//).*")
-
     _FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
     _INDENTED_CODE_RE = re.compile(r"(?m)^(?:    |\t).+$")
     _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
@@ -18722,13 +18093,6 @@ class CommandRouter:
                 half = budget // 2
                 out.append((dec(ai[:half]), dec(bi[:half])))
         return out
-
-    @staticmethod
-    def _normalize_cross_encoder_score(raw_score: float) -> float:
-        """
-        Convert a raw CrossEncoder logit to a probability in [0,1] via sigmoid.
-        """
-        return 1.0 / (1.0 + math.exp(-raw_score))
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Contradiction detection (cascade: Heuristic → CE → LLM)
@@ -20962,28 +20326,6 @@ class CommandRouter:
             return True
         return False
 
-    @classmethod
-    def _strip_code_noise(cls, text: str) -> str:
-        """
-        Blank out triple-quoted strings, block/line comments, and quoted
-        string literals while preserving every line break, so line counts
-        stay aligned with the original text and any leftover '?' reflects
-        real prose — never regex syntax, docstring text, or string content.
-        """
-
-        def _blank(m: "re.Match") -> str:
-            return "\n".join(" " * len(part) for part in m.group(0).split("\n"))
-
-        text = cls._TRIPLE_QUOTE_RE.sub(_blank, text)
-        text = cls._BLOCK_COMMENT_RE.sub(_blank, text)
-        text = cls._STRING_RE.sub(_blank, text)
-        text = cls._LINE_COMMENT_RE.sub(_blank, text)
-        return text
-
-    @staticmethod
-    def _blank(m: "re.Match") -> str:
-        return "\n".join(" " * len(part) for part in m.group(0).split("\n"))
-
 
 class CodeBlockManager:
     """
@@ -21090,87 +20432,6 @@ class CodeBlockManager:
             for i in range(start, min(end, len(chars))):
                 chars[i] = " "
         return "".join(chars)
-
-    async def _extract_full_document_symbols(
-        self,
-        content: str,
-        file_path: Optional[str],
-        project_id: Optional[str] = None,
-    ) -> Tuple[List["CodeSymbol"], str]:
-        """
-        Parse the entire document once to preserve nested class context.
-
-        This is the key method that enables parent_symbol resolution. Unlike
-        chunked parsing, this parses the whole document so that methods know
-        which class they belong to, even when later split into separate blocks.
-
-        Args:
-            content (str): The full document source code.
-            file_path (Optional[str]): Optional file path for language detection.
-            project_id (Optional[str]): The project ID for per-project state.
-                                        If None, uses self._f.valves.project_id.
-
-        Returns:
-            Tuple[List[CodeSymbol], str]: A tuple of (symbols_list, detected_language).
-                                          symbols_list may be empty if language
-                                          detection fails or tree-sitter is unavailable.
-        """
-        # --- 1. Resolve project state ---
-        if project_id is None:
-            project_id = self._f.valves.project_id
-        pstate = self._f._project_state_manager.get_pstate(project_id)
-
-        # --- 2. Detect language ---
-        lang = pstate.get("ingested_lang") or SignatureExtractor._guess_language(
-            file_path, content
-        )
-        if lang == "unknown":
-            return [], lang
-
-        # --- 3. Extract symbols ---
-        symbols = await SignatureExtractor.extract_async(
-            content, file_path, language=lang
-        )
-
-        # --- 4. Enrich with parent symbol info ---
-        if symbols:
-            symbols = SignatureExtractor.enrich_symbols_with_parent_info(
-                symbols, content
-            )
-
-        return symbols, lang
-
-    def _assign_symbols_to_span(
-        self,
-        full_doc_symbols: List["CodeSymbol"],
-        chunk_start_line: int,
-        chunk_end_line: int,
-    ) -> List["CodeSymbol"]:
-        """
-        Filter symbols to those whose definition falls within a line range.
-
-        Used when splitting a document into chunks: we pre-parse the whole
-        document (so class context is preserved), then assign each symbol to
-        the chunk that contains its definition line.
-
-        Args:
-            full_doc_symbols: Symbols extracted from the full document.
-            chunk_start_line: Start line of the chunk (1-indexed).
-            chunk_end_line: End line of the chunk (1-indexed).
-
-        Returns:
-            A subset of symbols whose line_start falls within the chunk range.
-        """
-        # --- 1. Filter symbols by line range ---
-        # Since both symbol line numbers and chunk boundaries are in document
-        # coordinates, direct comparison is sufficient. No offset arithmetic
-        # is needed.
-        return [
-            s
-            for s in full_doc_symbols
-            if s.line_start is not None
-            and chunk_start_line <= s.line_start <= chunk_end_line
-        ]
 
     @staticmethod
     def _strip_fence_markers(block: str) -> str:
@@ -22467,9 +21728,9 @@ class ActivationEngine:
       from the current ``SymbolIndex`` after code changes.
     * ``resolve_dangling_edges(project_id)`` — upgrades provisional cross‑chunk
       call edges when the referenced symbol is later defined.
-    * ``speculative_prefetch(project_id, last_activated)`` — pre‑builds
+    * ``speculative_prefetch_background(project_id, last_activated)`` — pre-builds
       ``CodePathView`` objects for symbols likely to be needed in the next
-      request.
+      request, as a cancellable background task.
     * ``compute_code_state_hash(project_id)`` — returns a hash of the active
       blocks, used to detect KV‑cache invalidations and staleness.
     * ``invalidate_lightweight_cache(project_id)`` — clears cached context
@@ -23197,82 +22458,6 @@ Output only the symbol name.
 
         specificity = math.log(total / n_blocks) + 1.0
         return max(0.1, min(3.0, specificity))
-
-    def _audit_seed_types(
-        self,
-        query: str,
-        exact_seeds: List[str],
-        partial_seeds: List[str],
-        tb_seeds: List[Tuple[str, float]],
-        history_boosts: Dict[str, float],
-        inferred_seeds: Optional[Dict[str, float]],
-    ) -> None:
-        """
-        Pure diagnostic tripwire: verify every seed carrier holds only ``str``
-        symbol names and loudly report any that do not.
-
-        This does NOT mutate or drop anything. The downstream type guards in
-        find_blocks / get_qualified_names_for / _register_seeds already stop a
-        malformed seed from crashing the activation build; this audit exists so
-        that protection is not *silent*. If a non-str value (e.g. a whole
-        ``{qid: score}`` dict passed where a bare name is expected) ever reaches
-        here, the log names the exact carrier, position, type and repr, so the
-        producer can be traced to its source instead of being quietly absorbed.
-
-        On the happy path (all seeds are strings) it emits nothing, so it is
-        safe to leave in place permanently as a regression tripwire.
-
-        Args:
-            query:          The query that produced these seeds (for context).
-            exact_seeds:    Verbatim query-word matches.
-            partial_seeds:  Partial / CrossEncoder / fuzzy matches.
-            tb_seeds:       (symbol, score) pairs from traceback frames.
-            history_boosts: {symbol: boost} from recent message history.
-            inferred_seeds: Optional {qid: score} from LLM seed inference.
-        """
-
-        # ── Local helper: never let the audit itself raise ────────────────────────
-        def _safe_repr(obj) -> str:
-            try:
-                return repr(obj)[:160]
-            except Exception:
-                return f"<unreprable {type(obj).__name__}>"
-
-        # ── Step 1: list carriers — every element must be a bare-name str ─────────
-        for list_name, seeds in (
-            ("exact_seeds", exact_seeds),
-            ("partial_seeds", partial_seeds),
-        ):
-            for i, sym in enumerate(seeds or []):
-                if not isinstance(sym, str):
-                    self._f._log_debug(
-                        f"[SEED-AUDIT] ⚠️ non-str seed in {list_name}[{i}] "
-                        f"(type={type(sym).__name__}, repr={_safe_repr(sym)}) "
-                        f"— query={_safe_repr(query)}"
-                    )
-
-        # ── Step 2: tuple carrier — tb_seeds is [(name, score), ...] ──────────────
-        for i, item in enumerate(tb_seeds or []):
-            name = item[0] if isinstance(item, tuple) and item else item
-            if not isinstance(name, str):
-                self._f._log_debug(
-                    f"[SEED-AUDIT] ⚠️ non-str seed in tb_seeds[{i}] "
-                    f"(type={type(name).__name__}, repr={_safe_repr(item)}) "
-                    f"— query={_safe_repr(query)}"
-                )
-
-        # ── Step 3: dict carriers — keys are the symbol names, must be str ────────
-        for dict_name, mapping in (
-            ("history_boosts", history_boosts),
-            ("inferred_seeds", inferred_seeds),
-        ):
-            for k in mapping or {}:
-                if not isinstance(k, str):
-                    self._f._log_debug(
-                        f"[SEED-AUDIT] ⚠️ non-str key in {dict_name} "
-                        f"(type={type(k).__name__}, repr={_safe_repr(k)}) "
-                        f"— query={_safe_repr(query)}"
-                    )
 
     async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
@@ -24548,54 +23733,6 @@ Output only the symbol name.
     # 7. Speculative prefetch
     # ======================================================================
 
-    async def speculative_prefetch(
-        self,
-        project_id: str,
-        last_activated: dict,
-    ) -> None:
-        """
-        Pre‑build CodePathViews for symbols likely to be relevant in the next query.
-
-        Prediction: high‑confidence direct callees of the top‑N activated symbols.
-        """
-        if not self._f.valves.enable_speculative_prefetch:
-            return
-        if not last_activated:
-            return
-
-        top_syms = sorted(last_activated, key=last_activated.get, reverse=True)[:3]
-
-        prefetch_candidates: Set[str] = set()
-        for sym in top_syms:
-            for edge in self._f._symbol_index.get_edges_out(sym, project_id):
-                if (
-                    edge.type == "calls"
-                    and edge.effective_weight() >= 0.7
-                    and edge.dst not in last_activated
-                ):
-                    prefetch_candidates.add(edge.dst)
-
-        if not prefetch_candidates:
-            return
-
-        candidates = list(prefetch_candidates)[
-            : self._f.valves.speculative_prefetch_max
-        ]
-        self._f._log_debug(
-            f"Speculative prefetch: pre-building {len(candidates)} CodePathView(s) "
-            f"for next likely query"
-        )
-
-        edges_out = self._f._symbol_index.get_all_edges_out(project_id)
-        for sym_name in candidates:
-            if not self._f._symbol_index.find_blocks(sym_name, project_id):
-                continue
-            qids = self._f._symbol_index.get_qualified_names_for(sym_name, project_id)
-            ag = ActivationGraph()
-            ag.seed(list(qids), initial_score=1.0)
-            ag.propagate(edges_out, max_steps=2, min_score=0.1)
-            await self._build_view_from_activation(sym_name, ag, project_id)
-
     async def speculative_prefetch_background(
         self,
         project_id: str,
@@ -24603,8 +23740,8 @@ Output only the symbol name.
         stop_event: asyncio.Event = None,
     ) -> None:
         """
-        Background version of speculative_prefetch that accepts a stop_event.
-        Pre‑builds CodePathViews for symbols likely to be relevant in the next query.
+        Speculatively pre-builds CodePathViews for symbols likely to be
+        relevant in the next query, as a cancellable background task.
 
         Args:
             project_id (str): The current project identifier.
@@ -24792,19 +23929,6 @@ Output only the symbol name.
     # ======================================================================
     # 10. Static evidence (for scientific CoT)
     # ======================================================================
-
-    def _gather_static_evidence(
-        self, hypothesis_text: str, project_id: str
-    ) -> "StaticEvidence":
-        """
-        Delegated to MetacognitiveReasoningEngine.gather_evidence().
-
-        Kept here for backward compatibility — existing call sites in
-        ReasoningEngine continue to work unchanged until Fase 3 converts
-        generate_scientific_reasoning_L3 into a thin wrapper that calls
-        compete_hypotheses() directly.
-        """
-        return self._f._meta_reasoning.gather_evidence(hypothesis_text, project_id)
 
 
 class MetacognitiveReasoningEngine:
@@ -30040,299 +29164,6 @@ class EnrichmentTasks:
                 break
             await asyncio.sleep(0.05)
 
-    def _get_optimal_snippet(
-        self,
-        sym: "CodeSymbol",
-        block: "CodeBlock",
-        project_id: str,
-        max_chars: int = 3000,
-        context_lines: int = 5,
-    ) -> str:
-        """
-        Extract an optimal snippet for docstring generation, adaptive to symbol type
-        and block size.
-
-        For classes: returns the class skeleton (method signatures + section comments).
-        For functions/methods: extracts the function body with surrounding context.
-
-        The snippet length is adaptive:
-        - If the block is small (< 2000 chars), return the whole block (capped to max_chars).
-        - Otherwise, extract the symbol's region plus `context_lines` above and below.
-        - For classes, use the existing `_build_class_skeleton` method.
-
-        The extraction uses tree-sitter precise line ranges, so there is no risk
-        of accidentally including content from other functions.
-
-        Args:
-            sym (CodeSymbol): The symbol to document.
-            block (CodeBlock): The code block containing the symbol.
-            project_id (str): The current project identifier.
-            max_chars (int): Maximum characters for the snippet.
-            context_lines (int): Number of extra lines to include around the symbol.
-
-        Returns:
-            str: The extracted snippet, truncated to max_chars if necessary.
-        """
-        # ── REGION 1: Small block → return everything ──
-        if len(block.content) < 2000:
-            return block.content[:max_chars]
-
-        # ── REGION 2: Classes → use the existing skeleton builder ──
-        if sym.kind == "class":
-            members_qids = self._f._symbol_index.get_class_members(sym.name, project_id)
-            members_meta = []
-            for qid in members_qids:
-                meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
-                if meta:
-                    members_meta.append(
-                        {
-                            "qid": qid,
-                            "signature": meta.get("signature", qid),
-                            "line_start": meta.get("line_start"),
-                        }
-                    )
-            section_headers = self._extract_section_comments(block, sym)
-            snippet = self._build_class_skeleton(
-                class_name=sym.name,
-                members_meta=members_meta,
-                section_headers=section_headers,
-                block=block,
-                line_start=sym.line_start or 1,
-                line_end=sym.line_end or len(block.content.splitlines()),
-            )
-            return snippet[:max_chars]
-
-        # ── REGION 3: Functions/methods → extract region + context ──
-        lines = block.content.split("\n")
-        start_idx = max(0, (sym.line_start or 1) - 1 - context_lines)
-        end_idx = min(len(lines), (sym.line_end or sym.line_start or 1) + context_lines)
-        snippet = "\n".join(lines[start_idx:end_idx])
-
-        # ── REGION 4: If too long, truncate intelligently ──
-        if len(snippet) > max_chars:
-            # Keep the signature (first few lines) and the end of the body
-            sig_end = min(5, len(lines[start_idx:]))
-            head = "\n".join(lines[start_idx : start_idx + sig_end])
-            tail = "\n".join(lines[max(start_idx, end_idx - 8) : end_idx])
-            snippet = f"{head}\n...\n{tail}"
-
-        return snippet
-
-    async def _background_docstring(
-        self,
-        sym: "CodeSymbol",
-        block: "CodeBlock",
-        project_id: str,
-    ) -> None:
-        """
-        Generate a one-line docstring for a symbol in the background.
-
-        Extracts a code snippet for the symbol, calls the LLM to generate a
-        concise docstring, and persists the result both in the SymbolIndex and
-        in SQLite. Uses 4000 characters of context for every symbol because the
-        cost is paid once and the quality benefit is permanent.
-
-        Args:
-            sym:        The symbol to document.
-            block:      The code block that contains the symbol.
-            project_id: The current project identifier.
-        """
-        # Region: capture symbol identity before any async suspension point
-        name = sym.name
-        kind = sym.kind
-        signature = sym.signature
-        line_start = sym.line_start
-        block_hash = block.hash
-
-        # Region: verify the block still exists in active state
-        state = self._f._conversation_state_manager.get(project_id)
-        target_block = state.active_blocks.get(block_hash)
-        if target_block is None:
-            self._f._log_debug(
-                f"Background docstring: block {block_hash} not found, "
-                f"skipping '{name}'"
-            )
-            return
-
-        # Region: extract a high-quality code snippet for the LLM prompt
-        snippet = self._get_optimal_snippet(
-            sym=sym,
-            block=target_block,
-            project_id=project_id,
-            max_chars=4000,
-            context_lines=5,
-        )
-
-        # Region: build a kind-specific prompt for higher accuracy
-        if kind == "class":
-            prompt = (
-                f"In one sentence, describe the single responsibility of this "
-                f"class based on its method names and structure:\n\n"
-                f"```\n{snippet}\n```"
-            )
-        else:
-            prompt = (
-                f"Summarize in one short sentence what this code does:\n\n"
-                f"```\n{signature}\n{snippet}\n```"
-            )
-
-        # Region: call the LLM to generate the docstring
-        docstring_text = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a code summarization assistant. "
-                "Output only one concise sentence."
-            ),
-            model_override=self._f.valves.llm_model,
-            max_tokens=500,
-            temperature=0.1,
-            label="bg_docstring",
-        )
-
-        if not docstring_text or not docstring_text.strip():
-            return
-
-        # Region: clean and validate the raw LLM output
-        docstring = self._clean_single_docstring(docstring_text, name)
-        if not docstring:
-            self._f._log_debug(
-                f"Background docstring: no valid docstring extracted for '{name}'"
-            )
-            return
-
-        # Region: persist the docstring under the project lock
-        lock = await self._f._state_store.get_project_lock(project_id)
-        async with lock:
-            state = self._f._conversation_state_manager.get(project_id)
-            block = state.active_blocks.get(block_hash)
-            if block:
-                for s in block.symbols:
-                    if s.name == name and s.line_start == line_start:
-                        s.docstring = docstring
-                        # qualify_symbol includes file_path so that module-level
-                        # functions resolve to "module.func" rather than bare
-                        # "func", matching the qualified ids used by the SymbolIndex.
-                        qid = qualify_symbol(s)
-                        self._f._symbol_index.update_docstring(
-                            qid, project_id, docstring
-                        )
-                        await self._f._state_store._db_enqueue(
-                            lambda q=qid, d=docstring, pid=project_id: (
-                                self._f._db_conn.execute(
-                                    "INSERT OR REPLACE INTO symbol_docstrings "
-                                    "(project_id, symbol_name, docstring, updated_at) "
-                                    "VALUES (?,?,?,?)",
-                                    (pid, q, d, time.time()),
-                                )
-                            )
-                        )
-                        break
-                self._f._conversation_state_manager.set(project_id, state)
-            else:
-                self._f._log_debug(
-                    f"Background docstring: block {block_hash} disappeared, "
-                    f"skipping '{name}'"
-                )
-
-    def _clean_single_docstring(
-        self, raw_response: str, symbol_name: str
-    ) -> Optional[str]:
-        """Parse the LLM response to extract a single docstring sentence."""
-        _BAD_PATTERNS = re.compile(
-            r"(?:Analyze\s+the\s+Request|Task:|Step:|Goal:|Purpose:|Reasoning:)"
-        )
-        _DOCSTRING_LINE_RE = re.compile(r"^\s*[-*]?\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$")
-
-        lines = raw_response.strip().splitlines()
-        docstring = None
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _BAD_PATTERNS.search(stripped):
-                continue
-            m = _DOCSTRING_LINE_RE.match(stripped)
-            if m:
-                desc = m.group(2).strip()
-                if desc and len(desc) > 5:
-                    docstring = desc
-                    break
-            if (stripped[0].isupper() or stripped[0].isalpha()) and len(stripped) > 10:
-                if not re.match(r"^\d+\.\s+", stripped) and "**" not in stripped:
-                    docstring = stripped
-                    break
-
-        if not docstring:
-            for line in reversed(lines):
-                stripped = line.strip()
-                if (
-                    stripped
-                    and not _BAD_PATTERNS.search(stripped)
-                    and len(stripped) > 10
-                    and "**" not in stripped
-                ):
-                    docstring = stripped[:200]
-                    break
-
-        if docstring:
-            docstring = re.sub(r"^\s*[A-Za-z_][\w.]*\s*:\s*", "", docstring, count=1)
-            docstring = re.split(r"[.!?]\s", docstring, maxsplit=1)[0] + "."
-            docstring = docstring[:200]
-
-        return docstring
-
-    def _extract_section_comments(
-        self, block: "CodeBlock", class_sym: "CodeSymbol"
-    ) -> List[Tuple[int, str]]:
-        """Extract section header comments from within a class body."""
-        SECTION_RE = re.compile(
-            r"^\s*#\s*[─━=\-]{2,}.*[─━=\-]{0,}\s*$|^\s*#\s*[─━=\-\s]*\w+[─━=\-\s]*$"
-        )
-        lines = block.content.split("\n")
-        start = (class_sym.line_start or 1) - 1
-        end = class_sym.line_end or len(lines)
-        result = []
-        for i, line in enumerate(lines[start:end], start=start):
-            if SECTION_RE.match(line):
-                result.append((i + 1, line.strip()))
-        return result
-
-    def _build_class_skeleton(
-        self,
-        class_name: str,
-        members_meta: List[Dict],
-        section_headers: List[Tuple[int, str]],
-        block: "CodeBlock",
-        line_start: int,
-        line_end: int,
-    ) -> str:
-        """Build a structural skeleton for a class."""
-        method_lines = {}
-        for m in members_meta:
-            if m.get("line_start"):
-                method_lines[m["line_start"]] = m.get("signature", m.get("qid", ""))
-
-        header_lines = {h[0] for h in section_headers}
-        lines = block.content.split("\n")
-        start_idx = max(0, line_start - 1)
-        end_idx = min(len(lines), line_end)
-
-        buf = [f"class {class_name}:"]
-        for i in range(start_idx, end_idx):
-            line_num = i + 1
-            line = lines[i].rstrip()
-            if line_num in header_lines:
-                buf.append("    " + line.strip())
-            elif line_num in method_lines:
-                buf.append("    " + method_lines[line_num])
-
-        if len(buf) == 1:
-            buf.append("    ...")
-
-        skeleton = "\n".join(buf)
-        return skeleton[:800]
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 9. Q6: Docstring migration on symbol rename
     # ═══════════════════════════════════════════════════════════════════════════
@@ -32120,33 +30951,6 @@ class InletOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     # ── E2: continuation detection ──────────────────────────────────────────
-    _CONTINUATION_RE = re.compile(
-        r"^(ok|okay|sí|si|yes|yep|yeah|continúa|continua|continue|"
-        r"go on|adelante|sigue|prosigue|hazlo|hazla|genéralo|generate it|"
-        r"implementa|implement|de acuerdo|sounds good|great|perfecto|"
-        r"bien|vale|listo|done|proceed)\W*$",
-        re.IGNORECASE | re.UNICODE,
-    )
-
-    def _is_continuation_message(
-        self, message: str, classifier_confidence: float
-    ) -> bool:
-        """E2: detect short continuations with no intent signal.
-
-        Criteria:
-        - No code blocks (pasted code always carries intent)
-        - Fewer than 15 words in non-code portions
-        - Classifier confidence below 0.80 (if classifier is certain, trust it)
-        """
-        if "```" in message:
-            return False
-        text_only = re.sub(r"```.*?```", "", message, flags=re.DOTALL).strip()
-        if len(text_only.split()) > 15:
-            return False
-        if classifier_confidence >= 0.80:
-            return False
-        return True
-
     async def classify_intent_with_continuation(
         self,
         user_query: str,
@@ -33193,8 +31997,8 @@ class SystemPromptBuilder:
         self, norm: str, window_excerpts: list, ce_score: float, project_id: str
     ) -> bool:
         """
-        LLM fallback for LTM deduplication when the CrossEncoder diff falls
-        below ltm_dedup_llm_threshold.
+        LLM fallback for LTM deduplication when the CrossEncoder score is
+        inconclusive.
 
         Uses response_format={"type":"json_object"} and enable_thinking=False
         for a clean structured answer. Default on failure is False (unique) to
@@ -37686,15 +36490,15 @@ class ProjectStateManager:
     # 3 — KVCache persistence
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def slot_save(self, project_id: str, force: bool = False) -> bool:
+    async def slot_save(
+        self, project_id: str, force: bool = False, wait_slot_free: bool = False
+    ) -> bool:
         """
         Save the KV slot after a turn.
 
-        force=True ignores the static-hash guard (used by callers whose
-        reusable prefix grew while Block A's structural hash did not: a
-        history-frontier advance via WindowManager._on_frontier_advance, and
-        the ingestion warmup in _warmup_tier_prefill). The token-threshold
-        guard (P5) is always respected.
+        force=True ignores the static-hash guard (used after monotonic
+        compaction, when the history prefix changed but Block A did not).
+        The token-threshold guard (P5) is always respected.
 
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
@@ -37713,28 +36517,35 @@ class ProjectStateManager:
 
         Slot-contention semantics
         ─────────────────────────
-        Under --parallel 1 the server processes one request at a time, and this
-        save is always awaited — there is no detached background variant. A
-        detached save would race the caller's later work and could be truncated
-        mid-write, producing a corrupt .bin that hangs the next restore. Two
-        call contexts follow from that, and neither ever blocks waiting for the
-        slot to drain (an unbounded wait could hang the whole request):
+        Under --parallel 1 the server processes one request at a time. If this
+        save POSTs while a prefill/generation is still in flight (e.g. the ~43k-
+        token Block A prefill right after a large ingestion), it queues behind
+        that work and burns the whole slot_operation_timeout for nothing.
 
-        • On the critical path (inlet: _warmup_tier_prefill, reason_per_focus,
-          and _on_frontier_advance via WindowManager._persist) the slot may
-          still be busy with an in-flight prefill/generation. The POST fires
-          immediately and slot_operation_timeout bounds it, absorbing the
-          contention; a save that loses the race is simply skipped this turn.
+        wait_slot_free controls how that is handled, and the default is the SAFE
+        one:
 
-        • In Filter.outlet the save runs AFTER wait_for_llm_tasks() has drained
-          every auxiliary call of the turn, so the slot is idle and holds the
-          clean main-chat KV. It completes in milliseconds and captures that
-          clean state before the background tasks (raptor / docstrings) are
-          relaunched and dirty it.
+        • wait_slot_free=False (default): do NOT block waiting for the slot.
+          The save POSTs immediately; the HTTP call is bounded by
+          slot_operation_timeout, which absorbs the contention. Correct for
+          callers ON THE CRITICAL PATH (inlet: WindowManager._persist and the
+          build_block_a saves) where an unbounded wait could hang the whole
+          request behind an in-flight generation.
+
+        • wait_slot_free=True: first wait (unbounded) for the inference slot to
+          drain via the shared LLM semaphore, then POST into an idle server so
+          the save completes cleanly in milliseconds. Only safe for a DETACHED
+          caller that nothing awaits — currently just Filter.outlet, which fires
+          this as a background task. The wait is best-effort: the semaphore is
+          released before the POST, so another task could momentarily re-take
+          the slot; slot_operation_timeout remains the backstop either way.
 
         Args:
             project_id: The project identifier.
             force: Whether to force save even if the hash hasn't changed.
+            wait_slot_free: Whether to wait for the inference slot to drain
+                before POSTing. Only pass True from a detached (non-awaited)
+                caller; see semantics above.
 
         Returns:
             bool: True if the slot was saved successfully.
@@ -37789,7 +36600,19 @@ class ProjectStateManager:
                     f"{self._f.valves.slot_resave_min_growth})"
                 )
 
-        # --- 5. Build filename and call llama.cpp API ---
+        # --- 5. Optionally wait for the inference slot to drain before POSTing.
+        # Only detached callers (Filter.outlet) request this; on-critical-path
+        # callers pass wait_slot_free=False and rely on slot_operation_timeout
+        # to bound the POST instead of risking an unbounded wait.
+        if wait_slot_free:
+            try:
+                await self._f._llm_orchestrator.wait_for_slot()
+            except Exception as _wait_err:
+                self._f._log_debug(
+                    f"Slot save: slot-wait error (non-fatal): {_wait_err}"
+                )
+
+        # --- 6. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -37815,7 +36638,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
+        # --- 7. Execute, bounded only if slot_operation_timeout > 0 ---
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -38762,18 +37585,6 @@ class BackgroundTaskManager:
             return False
         self.set_paused(False)
         return True
-
-    def is_running(self, name: str) -> bool:
-        """
-        Check whether a specific background task is currently running.
-
-        Args:
-            name: The task name to check.
-
-        Returns:
-            bool: True if a task of this name is registered and not yet done.
-        """
-        return name in self._tasks and not self._tasks[name].done()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Internal methods
@@ -39798,17 +38609,6 @@ class Filter:
                 "is issued by OpenWebUI and is not routed through call_llm()."
             ),
         )
-        llm_semaphore_concurrency: int = Field(
-            default=1,
-            ge=1,
-            le=8,
-            description=(
-                "Concurrent LLM requests. Keep at 1 for llama.cpp --parallel 1. "
-                "Set to 2+ only if your backend exposes per-call slot isolation "
-                "(vLLM, OpenAI API, or llama.cpp with --parallel N AND "
-                "enable_slot_persistence=False)."
-            ),
-        )
         # ── 2.2 Timeouts & retries ────────────────────────────────────────────
         llm_request_timeout: int = Field(
             default=900,
@@ -39834,12 +38634,6 @@ class Filter:
             ge=1,
             description="Per-call timeout in seconds passed to the HTTP session.",
         )
-        llm_retry_total_timeout: int = Field(
-            default=950,
-            ge=10,
-            description="Total deadline in seconds for a single LLM call including all retries.",
-        )
-
         # ── 2.3 LLM response cache ────────────────────────────────────────────
         LLM_CACHE_TTL: int = Field(
             default=300,
@@ -39855,15 +38649,6 @@ class Filter:
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
-        session_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
-            description="Model used to generate autobiographical session summaries stored in long-term memory.",
-        )
-        natural_language_forget_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
-            description="Model used to classify natural-language forget, pin, and obsolete intents.",
-        )
-
         # ── 2.5 Multi‑phase response ──────────────────────────────────────────
         enable_multi_phase_response: bool = Field(default=True)
         force_multi_phase_response: bool = Field(
@@ -39920,7 +38705,6 @@ class Filter:
         exclude_filter_internals: bool = Field(default=True)
 
         # ── 3.2 Call‑graph & data flow ────────────────────────────────────────
-        enable_call_graph_extraction: bool = Field(default=True)
         enable_data_flow_analysis: bool = Field(default=True)
 
         # ── 3.3 Docstrings & CFG generation ──────────────────────────────────
@@ -40070,11 +38854,6 @@ class Filter:
             default="",
             description="Model for seed inference. Empty = use llm_model.",
         )
-        seed_inference_min_lexical: int = Field(
-            default=2,
-            ge=0,
-            description="In 'auto' mode: infer if the query names fewer than N symbols literally.",
-        )
         seed_inference_min_chars: int = Field(
             default=15,
             ge=0,
@@ -40127,12 +38906,7 @@ class Filter:
             le=1.0,
             description="Minimum activation score for a node to be considered active.",
         )
-        path_relevance_high_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
-        path_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
-        )
-        path_summary_max_tokens: int = Field(default=80)
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
 
         # ── 6.2 LOD thresholds ────────────────────────────────────────────────
@@ -40275,30 +39049,6 @@ class Filter:
         )
 
         # ── 7.2 Session & code‑only detection ────────────────────────────────
-        code_only_ce_threshold: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for code‑only detection.",
-        )
-        code_only_llm_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for code‑only detection.",
-        )
-        code_only_prose_min_words: int = Field(
-            default=3,
-            description=(
-                "Minimum word count for a prose line to count as user-typed "
-                "prose in is_code_only_message. A line at or above this defers "
-                "the structural code-only short-circuits to the CrossEncoder/LLM, "
-                "so a markerless declarative ('esto no me cuadra') is judged "
-                "semantically instead of being swallowed as code. Lower = catches "
-                "shorter statements at the cost of more CrossEncoder calls on "
-                "file-noise fragments (which the CrossEncoder then filters out)."
-            ),
-        )
         keep_full_code_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -40313,18 +39063,6 @@ class Filter:
         )
 
         # ── 7.3 Seed & inference gate ─────────────────────────────────────────
-        seed_extract_ce_threshold: float = Field(
-            default=0.20,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for seed extraction.",
-        )
-        seed_extract_llm_threshold: float = Field(
-            default=0.10,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for seed extraction.",
-        )
         seed_infer_ce_threshold: float = Field(
             default=0.25,
             ge=0.0,
@@ -40339,18 +39077,6 @@ class Filter:
         )
 
         # ── 7.4 Memory (LTM & code history) ──────────────────────────────────
-        ltm_dedup_ce_threshold: float = Field(
-            default=0.40,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for LTM deduplication.",
-        )
-        ltm_dedup_llm_threshold: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for LTM deduplication.",
-        )
         code_history_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -40695,25 +39421,13 @@ class Filter:
             description=(
                 "#10: gate the (expensive, sandbox-executing) verify_dynamic "
                 "step on need. A planned verify_dynamic runs only when the "
-                "turn intent is debugging (intent['debug'] > "
-                "agentic_verify_dynamic_debug_floor) or the user asked "
+                "turn intent is debugging or the user asked "
                 "explicitly with '!test' in the message; otherwise it is "
                 "skipped in favour of static verify. 'off' = always run "
                 "planned verify_dynamic (prior behaviour). 'shadow' (default) "
                 "= log '[DYNGROUND-SHADOW] would skip' WITHOUT skipping, to "
                 "see how often it would fire. 'on' = actually skip when the "
                 "need condition is not met."
-            ),
-        )
-        agentic_verify_dynamic_debug_floor: float = Field(
-            default=0.7,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Debug-intent threshold above which a planned verify_dynamic "
-                "is considered needed (#10). Below it, and without an explicit "
-                "'!test', the step is skipped when agentic_verify_dynamic_"
-                "gated='on'."
             ),
         )
         agentic_ledger_persist: bool = Field(
@@ -40941,15 +39655,6 @@ class Filter:
                 "background task (no LLM call, slot-free), and surface the "
                 "verdict at the top of the following turn. Requires "
                 "agentic_exec_mode in ('subprocess', 'docker')."
-            ),
-        )
-        agentic_docker_image: str = Field(
-            default="python:3.12-slim",
-            description=(
-                "RESERVED alongside agentic_exec_mode='docker' (not "
-                "implemented yet): image the future container runner will "
-                "use, throwaway with --network none --read-only "
-                "--memory 512m --pids-limit 64."
             ),
         )
         agentic_regression_max_callers: int = Field(
@@ -41194,10 +39899,6 @@ class Filter:
         )
 
         # ── 8.12 Generation models ───────────────────────────────────────────
-        cot_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
-            description="Model used for CoT level 1 (inline reasoning prompt).",
-        )
         cot_model_level2: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
@@ -41229,15 +39930,6 @@ class Filter:
             le=2000,
             description="Token budget for the architecture reasoning chain.",
         )
-        enable_skeleton_ltm: bool = Field(
-            default=True,
-            description="Store the generated skeleton in LTM for future sessions.",
-        )
-        skeleton_ltm_expiration_days: int = Field(
-            default=14,
-            ge=0,
-            description="How long to keep skeleton snapshots in LTM. 0 = never expire.",
-        )
         enable_scientific_arch_reasoning: bool = Field(
             default=True,
             description="At CoT level 3, use multi‑hypothesis scientific reasoning on the skeleton.",
@@ -41261,9 +39953,6 @@ class Filter:
         enable_contradiction_detection: bool = Field(
             default=True,
             description="Detect if the last user message contradicts the conversation history.",
-        )
-        contradiction_detection_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
         )
         contradiction_inject_warning: bool = Field(
             default=True,
@@ -41335,7 +40024,6 @@ class Filter:
                 "per-hit 'RAPTOR retrieve: sim=' debug lines."
             ),
         )
-        raptor_rebuild_interval: int = Field(default=20)
         raptor_use_call_graph_proximity: bool = Field(
             default=True,
             description="Weight call‑graph distance alongside semantic similarity when clustering.",
@@ -41437,10 +40125,6 @@ class Filter:
         )
 
         # ── 10.4 Conversation summaries ───────────────────────────────────────
-        summarize_old_messages: bool = Field(
-            default=True,
-            description="Summarise conversation messages trimmed from history before discarding.",
-        )
         max_conversation_summaries: int = Field(
             default=3,
             ge=0,
@@ -41450,11 +40134,6 @@ class Filter:
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
             description="Model used for all general-purpose summarization tasks.",
         )
-        summary_fallback_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
-            description="Fallback model for summarization when the primary model is unavailable.",
-        )
-
         # ═════════════════════════════════════════════════════════════════════════
         # 11. SESSION & STATE
         # ═════════════════════════════════════════════════════════════════════════
@@ -41513,7 +40192,6 @@ class Filter:
         enable_feedback_tracking: bool = Field(default=True)
         feedback_history_limit: int = Field(default=10)
         inject_feedback_context: bool = Field(default=True)
-        feedback_importance_penalty_for_failure: float = Field(default=2.0)
         preserve_error_context: bool = Field(default=True)
 
         # ── 11.4 Response & duplicate cache ──────────────────────────────────
@@ -41531,7 +40209,6 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
 
         # ── 12.1 KV cache (slots) ─────────────────────────────────────────────
-        enable_kv_cache_stability: bool = Field(default=True)
         enable_slot_persistence: bool = Field(default=True)
         slot_save_path: str = Field(default="/kvcache")
         warmup_prefill_wait_timeout: float = Field(
@@ -41700,12 +40377,6 @@ class Filter:
             le=0.5,
             description="PPR activation score below which a block is eligible for paging.",
         )
-        block_paging_max_concurrent_embeddings: int = Field(
-            default=2,
-            ge=1,
-            le=16,
-            description="Max concurrent background embedding tasks during page‑out.",
-        )
         purge_old_code_versions_enabled: bool = Field(
             default=True,
             description="Move code versions beyond the N most recent per file to cold storage.",
@@ -41845,8 +40516,6 @@ class Filter:
 
         # ── 14.3 Weighting & decay ────────────────────────────────────────────
         raw_file_priority_boost: float = Field(default=2.0)
-        importance_mention_boost: float = Field(default=0.2)
-        importance_recency_half_life_hours: float = Field(default=2.0)
         block_expiration_hours: float = Field(default=24.0)
         proposed_change_retention_turns: int = Field(default=20)
         error_retention_turns: int = Field(default=15)
@@ -41854,10 +40523,6 @@ class Filter:
         active_code_timeout_minutes: int = Field(default=45)
         recent_activity_window_minutes: int = Field(default=15)
         max_change_summaries: int = Field(default=1000)
-        frequency_weight_factor: float = Field(default=0.3)
-        min_mentions_for_boost: int = Field(default=3)
-        frequency_decay_hours: float = Field(default=12.0)
-
         # ═════════════════════════════════════════════════════════════════════════
         # 15. LAZY + BACKGROUND TASKS
         # ═════════════════════════════════════════════════════════════════════════
@@ -43302,8 +41967,8 @@ class Filter:
         # slot_restore recovers it instead of a version polluted by raptor /
         # docstrings. Synchronous by design: a detached save races the background
         # tasks and can be truncated mid-write, producing the corrupt .bin that
-        # hangs the next restore. The slot is idle here, so the save completes
-        # cleanly with no need to wait for it to drain.
+        # hangs the next restore. The slot is idle here, so no wait_slot_free is
+        # needed.
         if self.valves.enable_slot_persistence:
             try:
                 await self._project_state_manager.slot_save(project_id)
