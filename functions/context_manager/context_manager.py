@@ -6307,6 +6307,23 @@ class ContextBuilder:
                 )
                 return case, dict(self.LOD_PROFILES[case]), case_key.label
 
+        # ── Unified turn classifier shortcut ──────────────────────────────
+        # No explicit /command prefix (that closed set stays a regex above).
+        # The use-case dimension comes from the single per-turn classification
+        # shared across the inlet; it returns A-E directly, matching UseCase's
+        # values. The CrossEncoder + intent_vector cascade below stays only as
+        # the fallback when the unified classifier is unavailable.
+        _cls = await self._f._commands._classify_turn_cached_for(q, project_id)
+        if _cls is not None:
+            _uc = str(_cls.get("use_case", "C")).upper()
+            if _uc not in ("A", "B", "C", "D", "E"):
+                _uc = "C"
+            _case_key = UseCase(_uc)
+            self._f._log_debug(
+                f"classify_use_case [unified]: '{_case_key.label}'"
+            )
+            return _uc, dict(self.LOD_PROFILES[_uc]), _case_key.label
+
         # ── Diet for the explicit-detection regexes ──
         # Same gate as every other semantic consumer of the query: past the
         # size valve, the paste itself is what the regexes would match against.
@@ -12448,7 +12465,9 @@ class AgenticStepCache:
         """
         norm = " ".join(step.goal.split()).lower()
         mode = getattr(self._f.valves, "agentic_metacog_reinforce", "off")
-        return hashlib.md5(f"{step.kind}\x1f{norm}\x1f{mode}".encode()).hexdigest()
+        return hashlib.md5(
+            f"{step.kind}\x1f{norm}\x1f{mode}".encode()
+        ).hexdigest()
 
     async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
@@ -15830,6 +15849,46 @@ class ReasoningEngine:
                 "rationale": "empty content",
             }
 
+        # ── Unified turn classifier shortcut ──────────────────────────────
+        # The reasoning depth and the negation signal both come from the
+        # single per-turn classification shared across the inlet. The
+        # CrossEncoder cascade below stays only as the unavailable-fallback.
+        # negates_reasoning is the structural signal the _COT_NEGATION_PREFIXES
+        # dictionary tried to catch by prefix matching ('sin entrar en
+        # detalle') — a logical-structure judgement the LLM reads directly.
+        _cls = await self._f._commands._classify_turn_cached_for(
+            user_content, project_id
+        )
+        if _cls is not None:
+            if _cls.get("negates_reasoning"):
+                self._f._log_debug(
+                    "detect_cot_configuration [unified]: user negates "
+                    "reasoning → L0"
+                )
+                return {
+                    "level": 0,
+                    "use_scientific": False,
+                    "decompose": False,
+                    "source": "unified",
+                    "rationale": "user explicitly negated reasoning",
+                }
+            _lvl = int(_cls.get("cot_level", 1))
+            if _lvl not in (1, 2, 3):
+                _lvl = 1
+            _use_sci = _lvl == 3
+            _multi = bool(_cls.get("multiclause"))
+            self._f._log_debug(
+                f"detect_cot_configuration [unified]: L{_lvl} "
+                f"scientific={_use_sci} decompose={_multi}"
+            )
+            return {
+                "level": _lvl,
+                "use_scientific": _use_sci,
+                "decompose": _multi,
+                "source": "unified",
+                "rationale": f"unified classifier: L{_lvl}",
+            }
+
         # ── STAGE 1: Heuristic ─────────────────────────────────────────────
         heuristic_level = self._detect_cot_level_heuristic(
             user_content, is_code_session, state
@@ -17732,6 +17791,7 @@ class MultiPhasePlanner:
         user_query: str,
         cot_degraded_to_l1: bool = False,
         is_continuation: bool = False,
+        project_id: str = "",
     ) -> str:
         """Build the multi‑phase protocol instructions injected into the system prompt.
 
@@ -17751,31 +17811,34 @@ class MultiPhasePlanner:
             if _stripped and len(_stripped.strip()) >= 10:
                 _scan_query = _stripped
 
-        _CODE_SIGNALS = {
-            "refactor",
-            "refactoriza",
-            "implement",
-            "implementa",
-            "escribe",
-            "write",
-            "genera",
-            "generate",
-            "crea",
-            "create",
-            "código",
-            "code",
-            "clase",
-            "class",
-            "función",
-            "function",
-            "método",
-            "method",
-            "módulo",
-            "module",
-            "reescribe",
-            "rewrite",
-        }
-        is_code_task = any(sig in _scan_query.lower() for sig in _CODE_SIGNALS)
+        # is_code_task now reads the unified per-turn classification cached
+        # earlier in this inlet (is_code_session) instead of a keyword table.
+        # This is a synchronous cache read — the classifier already ran for
+        # this turn, so no extra LLM call is spent here. Falls back to a code-
+        # signal keyword scan only if the cache is somehow absent (e.g. a
+        # trivial turn that skipped classification), which keeps the legacy
+        # behaviour rather than defaulting blindly.
+        is_code_task = True
+        _cached = None
+        if project_id:
+            try:
+                _cached = self._f._project_state_manager.get_pstate(
+                    project_id
+                ).get("turn_classification")
+            except Exception:
+                _cached = None
+        if _cached is not None:
+            is_code_task = bool(_cached.get("is_code_session", True))
+        else:
+            _fallback_signals = {
+                "refactor", "refactoriza", "implement", "implementa",
+                "escribe", "write", "genera", "generate", "crea", "create",
+                "código", "code", "clase", "class", "función", "function",
+                "método", "method", "módulo", "module", "reescribe", "rewrite",
+            }
+            is_code_task = any(
+                sig in _scan_query.lower() for sig in _fallback_signals
+            )
 
         part_budget = min(
             self._f.valves.multi_phase_effective_max_tokens,
@@ -18281,6 +18344,183 @@ class CommandRouter:
         "how does",
     )
 
+    async def classify_turn(
+        self, user_content: str, project_id: str, is_continuation: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Single LLM classification of the current turn across every intent /
+        structure dimension the inlet needs, cached once per turn.
+
+        The heuristic -> CrossEncoder -> LLM cascade this replaces asked the
+        same pragmatic question ("what does the user want?") from 5-6 separate
+        classifiers in one inlet, each over the same query, each with its own
+        fragile keyword table. A CrossEncoder ranks semantic similarity; it
+        cannot read illocutionary force (is this a request?), logical
+        structure (does it negate?), or command chaining. Those are exactly
+        the dimensions below, so they move to the one tool that can read them
+        — the LLM — and share a single coherent interpretation of the turn
+        instead of six that can disagree.
+
+        Runs at most once per turn: the result is memoized in pstate under a
+        content hash, so every consumer (is_code_only_message, classify_intent,
+        classify_use_case, classify_session, detect_cot_configuration) reads
+        the same dict without a second call.
+
+        Returns a dict with keys:
+          is_code_only    bool  — a bare paste with no question/request
+          has_request     bool  — carries question or request intent
+          is_code_session bool  — the turn is about working on code
+          intent          str   — explain | modify | debug | refactor
+          use_case        str   — A(rchitecture) | B(planning) | C(programming)
+                                   | D(refactoring) | E(scaffolding)
+          cot_level       int   — 1 (direct) | 2 (reasoned) | 3 (scientific)
+          negates_reasoning bool — explicitly asks to SKIP reasoning
+          multiclause     bool  — several chained imperatives (pipeline shape)
+
+        Fail-safe: on any error returns a neutral default that keeps the
+        legacy behaviour (has_request True so nothing is misread as code-only,
+        cot_level 1, etc.), so a classifier outage degrades gracefully.
+        """
+        # ------------------------------------------------------------------
+        # Region: per-turn cache lookup
+        # ------------------------------------------------------------------
+        pstate = self._f._project_state_manager.get_pstate(project_id)
+        cleaned = self._extract_text_for_classification(user_content or "")
+        cache_key = hashlib.md5(
+            (cleaned + f"|cont={is_continuation}").encode()
+        ).hexdigest()[:16]
+        cached = pstate.get("turn_classification")
+        if cached and cached.get("_key") == cache_key:
+            return cached
+
+        # ------------------------------------------------------------------
+        # Region: neutral fail-safe default (also the legacy-safe fallback)
+        # ------------------------------------------------------------------
+        default: Dict[str, Any] = {
+            "is_code_only": False,
+            "has_request": True,
+            "is_code_session": True,
+            "intent": "explain",
+            "use_case": "C",
+            "cot_level": 1,
+            "negates_reasoning": False,
+            "multiclause": False,
+            "_key": cache_key,
+            "_source": "default",
+        }
+
+        # A trivial message is never worth a classification call.
+        if not cleaned or len(cleaned.strip()) < 3:
+            default["_source"] = "trivial"
+            pstate["turn_classification"] = default
+            return default
+
+        # ------------------------------------------------------------------
+        # Region: symbol vocabulary so the LLM knows names are not commands
+        # (e.g. 'build_block_b' is a symbol, not 'build something')
+        # ------------------------------------------------------------------
+        try:
+            known = self._f._symbol_index.get_all_names(project_id)
+            sample = ", ".join(sorted(known)[:40]) if known else "(none yet)"
+        except Exception:
+            sample = "(unavailable)"
+
+        # ------------------------------------------------------------------
+        # Region: single classification call
+        # ------------------------------------------------------------------
+        system = (
+            "You classify a developer's chat turn for a code-assistant "
+            "pipeline. Read the user's message and answer ONLY with a JSON "
+            "object — no prose, no fences. Judge intent and structure, not "
+            "surface keywords. Known code symbols in this project (names, not "
+            f"commands): {sample}.\n\n"
+            "Fields:\n"
+            "- is_code_only: true only if the message is a bare code paste "
+            "with NO question or request.\n"
+            "- has_request: true if it asks a question or requests an action "
+            "(including indirect ones like 'me podrías decir…').\n"
+            "- is_code_session: true if the turn is about working on / "
+            "understanding code.\n"
+            "- intent: one of explain, modify, debug, refactor.\n"
+            "- use_case: one of A (architecture), B (planning), C "
+            "(programming), D (refactoring), E (scaffolding).\n"
+            "- cot_level: 1 if a direct answer suffices, 2 if it needs "
+            "step-by-step reasoning, 3 if it needs rigorous hypothesis "
+            "testing.\n"
+            "- negates_reasoning: true if the user explicitly asks to SKIP or "
+            "AVOID detailed reasoning (e.g. 'sin entrar en detalle', "
+            "'don't overthink').\n"
+            "- multiclause: true if it chains several distinct commands "
+            "(e.g. 'analiza X, luego mejora Y, y optimiza Z').\n"
+        )
+        prompt = f"User message:\n{cleaned[:2000]}\n\nClassify it."
+
+        try:
+            raw = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=system,
+                max_tokens=200,
+                temperature=0.0,
+                label="classify_turn",
+                response_format={"type": "json_object"},
+                enable_thinking=False,
+            )
+        except Exception as exc:
+            self._f._log_debug(
+                f"classify_turn: LLM call failed ({type(exc).__name__}: "
+                f"{exc}) — using neutral default"
+            )
+            pstate["turn_classification"] = default
+            return default
+
+        # ------------------------------------------------------------------
+        # Region: parse + coerce (any malformed field falls back to default)
+        # ------------------------------------------------------------------
+        result = dict(default)
+        result["_source"] = "llm"
+        try:
+            cleaned_raw = (raw or "").replace("```json", "").replace("```", "").strip()
+            data = json.loads(cleaned_raw)
+            if isinstance(data, dict):
+                if isinstance(data.get("is_code_only"), bool):
+                    result["is_code_only"] = data["is_code_only"]
+                if isinstance(data.get("has_request"), bool):
+                    result["has_request"] = data["has_request"]
+                if isinstance(data.get("is_code_session"), bool):
+                    result["is_code_session"] = data["is_code_session"]
+                if str(data.get("intent", "")).lower() in (
+                    "explain", "modify", "debug", "refactor"
+                ):
+                    result["intent"] = str(data["intent"]).lower()
+                if str(data.get("use_case", "")).upper() in ("A", "B", "C", "D", "E"):
+                    result["use_case"] = str(data["use_case"]).upper()
+                try:
+                    lvl = int(data.get("cot_level", 1))
+                    if lvl in (1, 2, 3):
+                        result["cot_level"] = lvl
+                except (TypeError, ValueError):
+                    pass
+                if isinstance(data.get("negates_reasoning"), bool):
+                    result["negates_reasoning"] = data["negates_reasoning"]
+                if isinstance(data.get("multiclause"), bool):
+                    result["multiclause"] = data["multiclause"]
+        except Exception as exc:
+            self._f._log_debug(
+                f"classify_turn: parse error ({exc}) — using neutral default"
+            )
+            result = dict(default)
+            result["_source"] = "parse_error"
+
+        pstate["turn_classification"] = result
+        self._f._log_debug(
+            f"classify_turn [{result['_source']}]: "
+            f"code_only={result['is_code_only']} req={result['has_request']} "
+            f"sess={result['is_code_session']} intent={result['intent']} "
+            f"uc={result['use_case']} L{result['cot_level']} "
+            f"neg={result['negates_reasoning']} multi={result['multiclause']}"
+        )
+        return result
+
     def _extract_text_for_classification(self, message: str) -> str:
         """
         Extract only non-code portions of the user message for intent classification.
@@ -18331,9 +18571,33 @@ class CommandRouter:
         Returns:
             dict: Probabilities for explain, modify, debug, refactor.
         """
-        classifier_input = self._extract_text_for_classification(user_query)
+        # ── Unified turn classifier shortcut ──────────────────────────────
+        # The intent dimension comes from the single per-turn classification
+        # shared across the inlet. Downstream consumers read this vector by
+        # threshold (intent_vector.get("debug", 0) > 0.3), so a one-hot
+        # distribution — 1.0 for the chosen intent, 0.0 for the rest — clears
+        # the active threshold and leaves the others below, preserving every
+        # existing comparison. The CrossEncoder cascade below stays only as
+        # the fallback when the unified classifier is unavailable.
+        _cls = await self._classify_turn_cached_for(user_query, project_id)
+        if _cls is not None:
+            _intent = _cls.get("intent", "explain")
+            vector = {
+                "explain": 0.0,
+                "modify": 0.0,
+                "debug": 0.0,
+                "refactor": 0.0,
+            }
+            if _intent in vector:
+                vector[_intent] = 1.0
+            else:
+                vector["explain"] = 1.0
+            self._f._log_debug(
+                f"classify_intent [unified]: {_intent} (one-hot)"
+            )
+            return vector
 
-        # ── Mask indexed symbol names before intent scoring ──
+        classifier_input = self._extract_text_for_classification(user_query)
         # Same contamination as classify_use_case: a verb embedded in an
         # identifier ("build" in build_block_b) reads as intent to the
         # CrossEncoder and skews the explain/modify balance for a question
@@ -19886,78 +20150,43 @@ class CommandRouter:
         kept += data[cursor:]
         return kept.decode("utf-8", errors="ignore").strip()
 
-    @classmethod
-    def _line_carries_request(cls, raw_line: str) -> bool:
-        """Return True when a single line carries genuine user request intent.
-
-        Detects intent independently of the structural / prose line split, so a
-        question is never lost because a heuristic regex tagged its line as
-        code. Robust in three moves:
-
-          1. Code noise (strings, comments, docstrings) is blanked first, so a
-             '?' inside a regex literal or a comment cannot fire.
-          2. Leading formatting — list markers ("1.", "-", "*"), bold ("**"),
-             blockquote (">"), and a short "Label:" prefix — is stripped, so
-             "1. ¿qué hace X?" and "Pregunta: dime Y" reduce to their core.
-          3. The exposed remainder is checked for a '?'/'¿' or a request lead.
-
-        Request leads (dime, explica, qué, fix, improve, ...) require a trailing
-        space and so never collide with identifiers (improve_thing,
-        classify_use_case); '?'/'¿' is only trusted after noise blanking. The
-        asymmetry is deliberate: leads are near-zero-collision and trusted
-        broadly, punctuation is leaky and must be guarded.
-        """
-        # ── Step 1: blank code noise; bail on pure-code / blank lines ─────────
-        cleaned = cls._strip_code_noise(raw_line).strip()
-        if not cleaned:
-            return False
-
-        # ── Step 2: strip leading formatting so the prose lead is exposed ─────
-        cleaned = re.sub(r"^(?:\d+[.)]\s*|[-*+>]\s+|\*\*)+", "", cleaned)
-        cleaned = re.sub(r"^[^\W\d][\w áéíóúñ]{0,18}:\s+", "", cleaned)
-
-        # ── Step 3: interrogative or request lead on the exposed prose ────────
-        return cls._looks_interrogative(cleaned)
-
     async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """Decide whether a message is a bare code paste with no question.
 
-        A code-only verdict requires positive code evidence AND the absence of
-        any request or question intent. Intent is detected independently of the
-        structural/prose split (via _line_carries_request), so a numbered or
-        labelled question ("1. ¿qué hace X?", "Pregunta: dime Y") that the line
-        regexes tag as structural is still recognised, and a '?' inside a regex
-        literal or a '# fix ...' comment is never mistaken for one.
+        Migrated from the heuristic->CrossEncoder->LLM cascade to LLM-only for
+        the semantic judgement. Only structural CERTAINTIES are decided
+        locally (facts, not intent); the pragmatic question — is this a
+        request or a bare paste? — goes to the LLM, an open space no keyword
+        list can close. The old cascade vetoed on an imperative-lead
+        dictionary (_has_request_lead) that missed real verbs ('busca',
+        'itera') and misclassified questions as code, then leaned on a
+        CrossEncoder that scores lexical similarity rather than
+        illocutionary force.
 
-        Cascade:
-        1. Prose / structural split: comments, docstrings and string/regex
-           literals are blanked. Feeds the structural ratio and the CrossEncoder
-           query below. Computed once and reused.
-        2. Intent veto: a head request lead or ANY line carrying request intent
-           (scanned at the paste edges) vetoes the code-only verdict outright —
-           the user wants an answer.
-        3. Fenced short-circuit (tree-sitter): a fenced paste with negligible
-           surrounding prose and no intent is code-only.
-        4. Structural poles + CrossEncoder for the genuinely ambiguous band.
-           Substantial user prose defers the structural short-circuits to the
-           CrossEncoder/LLM, so a markerless declarative ("esto no me cuadra")
-           is judged semantically instead of being swallowed as code.
-        5. Structural verdict for the remainder.
+        Cascade (cheap, deterministic → semantic):
+        1. Length / reference guards: sub-threshold messages and re-attached
+           already-indexed pastes (spliced to a one-line reference) are
+           resolved without a model call.
+        2. Fenced short-circuit (tree-sitter): a fenced paste with negligible
+           surrounding prose is structurally code with nowhere for a question
+           to live — the one code-only verdict decidable without semantics.
+        3. LLM verdict: everything else. A message carrying request/question
+           intent is by definition not code-only, so one call decides both
+           dimensions.
 
-        Restores the KV slot after any auxiliary LLM call.
+        Restores the KV slot after the LLM call.
         """
-        # ── Step 0: guard clauses & line inventory ────────────────────────────
+        # ── Step 0: length guard ──────────────────────────────────────────────
         if not content or len(content.strip()) < 20:
             return False
 
-        # A re-attached, already-indexed paste is spliced down to a one-line
-        # reference (_indexed_reference_line) that still reads as technical
-        # prose ('… symbols already indexed in the SymbolGraph …'). Dropping
-        # those reference lines before classification means the verdict rests
-        # on the ACTUAL user text, not on the residual reference — a
-        # mechanism that does not depend on the imperative-lead dictionary
-        # staying exhaustive (the fragile path that let 'busca'/'itera'
-        # through as code-only).
+        # ── Step 1: already-indexed reference guard (0016) ────────────────────
+        # A re-attached paste is spliced to a one-line reference that still
+        # reads as technical prose ('… symbols already indexed in the
+        # SymbolGraph …'). Drop those lines first; if what remains is short
+        # prose (a bare question), it is not code-only — resolved without a
+        # model call. This keeps the common "question + re-attached paste"
+        # turn off the LLM path entirely.
         _ref_markers = ("symbols already", "indexed in the symbolgraph")
         _kept = [
             ln
@@ -19966,70 +20195,16 @@ class CommandRouter:
         ]
         _deref = "\n".join(_kept).strip()
         if _deref and _deref != content.strip():
-            # If what remains after removing references is short prose (a bare
-            # question like 'busca mejoras en build_block_b'), it is not
-            # code-only regardless of what the classifier would say.
             if len(_deref) < 200 and "```" not in _deref:
                 return False
             content = _deref
 
         stripped = content.strip()
-        estimated_tokens = self._f._tokens.estimate_code_tokens(content)
-        raw_lines = stripped.splitlines()
-        non_blank_idx = [i for i, l in enumerate(raw_lines) if l.strip()]
-        code_line_count = len(non_blank_idx)
-        if code_line_count == 0:
-            return False
+        query = stripped[:500]
 
-        # ── Step 1: prose / structural split (single pass, reused below) ──────
-        # _strip_code_noise blanks comments, docstrings and string/regex
-        # literals, so only real natural-language lines reach prose_candidates.
-        # This split feeds the structural ratio (Steps 4-5) and the CrossEncoder
-        # query; the intent check in Step 2 is deliberately NOT tied to it.
-        structural_lines = 0
-        prose_candidates: List[str] = []
-        for i in non_blank_idx:
-            raw_line = raw_lines[i]
-            if self._STRUCTURAL_LINE_START.match(
-                raw_line
-            ) or self._CONTINUATION_OR_LITERAL.match(raw_line):
-                structural_lines += 1
-                continue
-            cleaned_line = self._strip_code_noise(raw_line).strip()
-            if not cleaned_line:
-                structural_lines += 1
-                continue
-            prose_candidates.append(cleaned_line)
-
-        structural_ratio = (
-            structural_lines / code_line_count if code_line_count else 0.0
-        )
-        prose_text = " ".join(prose_candidates).strip()
-
-        # ── Step 2: intent veto (decoupled from the structural split) ─────────
-        # _line_carries_request does its own noise-blanking and strips leading
-        # formatting (list markers, "Label:", bullets) before checking for a
-        # lead or '?'/'¿', so a question the line regexes mis-tagged as
-        # structural is still caught. A question lives at the head or the tail
-        # of a paste, never buried in line 18000, so a large body is scanned
-        # only at its edges — bounding cost regardless of size while covering
-        # every realistic case. Small messages are scanned whole.
-        intent_edge_scan = 12
-        if code_line_count <= 2 * intent_edge_scan:
-            _scan_idx = non_blank_idx
-        else:
-            _scan_idx = (
-                non_blank_idx[:intent_edge_scan] + non_blank_idx[-intent_edge_scan:]
-            )
-
-        if self._has_request_lead(stripped) or any(
-            self._line_carries_request(raw_lines[i]) for i in _scan_idx
-        ):
-            return False
-
-        # ── Step 3: fenced code short-circuit (tree-sitter) ───────────────────
-        # No intent survived Step 2, so a fenced paste with negligible
-        # surrounding prose is code-only.
+        # ── Step 2: fenced short-circuit (structural certainty) ───────────────
+        # A fenced paste with negligible surrounding prose is code-only — the
+        # only such verdict decidable without semantics.
         if HAS_TREE_SITTER:
             try:
                 from tree_sitter_language_pack import process, ProcessConfig
@@ -20051,106 +20226,80 @@ class CommandRouter:
             except Exception:
                 pass
 
-        # ── Step 4: structural poles + CrossEncoder for the ambiguous band ────
-        # A coherent prose line (>= code_only_prose_min_words words) is the user
-        # talking, not code noise (comments/strings were already blanked out of
-        # prose_candidates). Its presence defers the structural short-circuits to
-        # the semantic layer below, which can recognise a markerless declarative
-        # that carries no lead and no '?'/'¿'. The CrossEncoder backstops false
-        # positives, so this signal is deliberately sensitive.
-        min_words = self._f.valves.code_only_prose_min_words
-        has_user_prose = any(len(p.split()) >= min_words for p in prose_candidates)
+        # ── Step 3: unified turn classifier (code vs. request) ────────────────
+        # The pragmatic verdict comes from the single per-turn classification
+        # shared by every inlet consumer, not a dedicated call: a message
+        # carrying request/question intent is by definition not code-only.
+        # is_code_only and has_request are complementary here — the classifier
+        # returns both, and either being "not a bare paste" settles it.
+        cls = await self._classify_turn_cached_for(query, project_id)
+        if cls is not None:
+            return bool(cls.get("is_code_only")) and not bool(
+                cls.get("has_request")
+            )
+        # Fallback only if the unified classifier is somehow unavailable.
+        return await self._is_code_only_with_llm(query, None, project_id)
 
-        if not has_user_prose:
-            # A huge, overwhelmingly-structural paste with no user prose is code
-            # with no question (intent was ruled out above), so short-circuit
-            # without the CrossEncoder — it only sees a prose/content head and
-            # adds nothing on a body this structural.
-            if code_line_count > 500 and structural_ratio > 0.6:
-                return True
-            # Real code lines and no surviving prose → pure paste.
-            if structural_lines > 0 and not prose_candidates:
-                return True
-
-        # CrossEncoder for the genuine remainder: enough code to matter, OR user
-        # prose present (a possible markerless question). It decides
-        # snippet-vs-question semantically; the LLM arbitrates an inconclusive
-        # margin. query = prose_text so the classifier sees the natural language,
-        # not the code head.
-        if (
-            estimated_tokens >= self._f.valves.lean_user_code_min_tokens // 2
-            or has_user_prose
-        ):
-            query = prose_text[:500] if prose_text else content[:500]
-            pairs = [
-                (
-                    query,
-                    "This is a code snippet or technical content without a question.",
-                ),
-                (query, "This is a natural language question or explanation."),
-            ]
-            scores = await self._predict_cross_encoder(pairs)
-            if scores is not None and len(scores) >= 2:
-                scores_reinforced = list(scores)
-
-                # Short, intent-free messages lean code-only. Intent was already
-                # excluded in Step 2, so no interrogative re-check is needed here.
-                if len(content.split()) < 30:
-                    scores_reinforced[0] += 0.2
-
-                ce_threshold = self._f.valves.code_only_ce_threshold
-                llm_threshold = self._f.valves.code_only_llm_threshold
-                if llm_threshold > ce_threshold:
-                    llm_threshold = ce_threshold
-
-                diff = scores_reinforced[0] - scores_reinforced[1]
-                if diff >= ce_threshold:
-                    return scores_reinforced[0] > scores_reinforced[1]
-                elif diff < llm_threshold:
-                    return await self._is_code_only_with_llm(
-                        query, scores_reinforced, project_id
-                    )
-
-        # ── Step 5: structural verdict (no intent, CrossEncoder inconclusive) ─
-        # With user prose present but nothing resolving it as code, lean toward
-        # answering: a coherent typed sentence that survived every check is far
-        # more likely a message than an unlabelled paste.
-        if structural_lines == 0:
-            return False
-        if not has_user_prose and structural_ratio > 0.70:
-            return True
-        if has_user_prose or len(prose_text) >= 30:
-            return False
-        return True
+    async def _classify_turn_cached_for(
+        self, query: str, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Thin accessor: run/read the unified turn classifier, swallowing any
+        failure so callers can fall back to their own path."""
+        try:
+            return await self.classify_turn(query, project_id)
+        except Exception as exc:
+            self._f._log_debug(
+                f"_classify_turn_cached_for: unavailable ({exc})"
+            )
+            return None
 
     async def _is_code_only_with_llm(
-        self, query: str, ce_scores: list, project_id: str
+        self, query: str, ce_scores: Optional[list], project_id: str
     ) -> bool:
         """
-        LLM fallback for code-only detection when the CrossEncoder diff is below
-        the confidence threshold.
+        LLM verdict for the code-only decision (now the primary path, not a
+        fallback).
 
-        Uses response_format={"type":"json_object"} and enable_thinking=False to
-        get a clean structured answer with no reasoning preamble. The server-side
-        GBNF grammar guarantees the response is valid JSON, so no text stripping
-        is needed.
+        Decides both dimensions the old cascade split across a keyword veto
+        and a CrossEncoder: whether the message is a bare code paste AND
+        whether it carries request/question intent. Intent wins — a message
+        that asks for anything is not code-only, however code-like its body.
+        This is the pragmatic judgement (illocutionary force) that keyword
+        lists and similarity rankers cannot make reliably.
+
+        Uses response_format={"type":"json_object"} and enable_thinking=False
+        for a clean structured answer. ce_scores is accepted for signature
+        compatibility but no longer supplied (the CrossEncoder was removed
+        from this decision); when present it is surfaced as a weak hint.
 
         Args:
-            query: The message text to classify (truncated to 500 chars).
-            ce_scores: [code_score, text_score] from the CrossEncoder.
+            query: The message text to classify (already truncated).
+            ce_scores: Deprecated; None on the migrated path.
             project_id: Current project identifier, used for slot restoration.
 
         Returns:
-            bool: True if the message is code-only, False otherwise.
+            bool: True if the message is code-only (no request intent).
         """
+        _hint = ""
+        if ce_scores is not None and len(ce_scores) >= 2:
+            _hint = (
+                f"Weak prior — code_only: {ce_scores[0]:.2f}, "
+                f"not_code_only: {ce_scores[1]:.2f}\\n\\n"
+            )
         prompt = (
-            f"CrossEncoder scores — code_only: {ce_scores[0]:.2f}, "
-            f"not_code_only: {ce_scores[1]:.2f}\n\n"
-            f"Message:\n{query}\n\n"
-            f"Examples:\n"
-            f'  "def foo(): pass"                    → {{"is_code_only": true}}\n'
-            f'  "def foo(): pass  # what does this?" → {{"is_code_only": false}}\n'
-            f'  "how to fix this bug?"               → {{"is_code_only": false}}\n\n'
+            f"{_hint}"
+            f"Message:\\n{query}\\n\\n"
+            f"A message is code-only ONLY when it is a bare code paste or "
+            f"technical content with NO question, request, or instruction. "
+            f"Any ask — explicit ('¿qué hace X?', 'busca mejoras', 'itera "
+            f"sobre esto', 'explain this') or a trailing question mark — "
+            f"means it is NOT code-only, no matter how code-like the body.\\n\\n"
+            f"Examples:\\n"
+            f'  "def foo(): pass"                    → {{"is_code_only": true}}\\n'
+            f'  "def foo(): pass  # what does this?" → {{"is_code_only": false}}\\n'
+            f'  "busca mejoras en build_block_b"     → {{"is_code_only": false}}\\n'
+            f'  "itera agentic sobre tu respuesta"   → {{"is_code_only": false}}\\n'
+            f'  "how to fix this bug?"               → {{"is_code_only": false}}\\n\\n'
             f"Classify the message. Output only the JSON object."
         )
 
@@ -31105,6 +31254,22 @@ class InletOrchestrator:
             self._cache_session_result(cache_key, True)
             return True
 
+        # ── Unified turn classifier shortcut ──────────────────────────────
+        # No active blocks yet — the is_code_session dimension comes from the
+        # single per-turn classification shared across the inlet. The
+        # CrossEncoder cascade below stays only as the unavailable-fallback.
+        if last_user:
+            _cls = await self._f._commands._classify_turn_cached_for(
+                last_user.get("content", ""), project_id
+            )
+            if _cls is not None:
+                _sess = bool(_cls.get("is_code_session"))
+                self._f._log_debug(
+                    f"classify_session [unified]: {_sess}"
+                )
+                self._cache_session_result(cache_key, _sess)
+                return _sess
+
         # ── CrossEncoder primary ──
         if last_user and len(last_user.get("content", "")) >= 20:
             user_text = last_user.get("content", "")[:500]
@@ -33737,9 +33902,9 @@ class MessageAssembler:
         # planner / per-step / synthesis prompts downstream — the exact
         # 'consumer without a diet' failure. 2000 chars is ample for a
         # question; the code itself reaches the pipeline through Block A/B.
-        _agentic_question = ((user_question or "").strip() or user_content.strip())[
-            :2000
-        ]
+        _agentic_question = (
+            (user_question or "").strip() or user_content.strip()
+        )[:2000]
         if self._f.valves.enable_agentic_pipeline and _always_mode in (
             "always",
             "shadow",
@@ -34815,6 +34980,7 @@ class MessageAssembler:
                 user_query=user_question,
                 cot_degraded_to_l1=self._last_cot_degraded,
                 is_continuation=is_continuation,
+                project_id=project_id,
             )
             dynamic_injections.append(("critical", _mp_instructions))
             self._f._log_debug(
