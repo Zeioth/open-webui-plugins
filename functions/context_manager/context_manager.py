@@ -37686,15 +37686,15 @@ class ProjectStateManager:
     # 3 — KVCache persistence
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def slot_save(
-        self, project_id: str, force: bool = False, wait_slot_free: bool = False
-    ) -> bool:
+    async def slot_save(self, project_id: str, force: bool = False) -> bool:
         """
         Save the KV slot after a turn.
 
-        force=True ignores the static-hash guard (used after monotonic
-        compaction, when the history prefix changed but Block A did not).
-        The token-threshold guard (P5) is always respected.
+        force=True ignores the static-hash guard (used by callers whose
+        reusable prefix grew while Block A's structural hash did not: a
+        history-frontier advance via WindowManager._on_frontier_advance, and
+        the ingestion warmup in _warmup_tier_prefill). The token-threshold
+        guard (P5) is always respected.
 
         Uses the structural hash (signatures only) for the filename so
         docstring population does not cause slot file proliferation.
@@ -37713,35 +37713,28 @@ class ProjectStateManager:
 
         Slot-contention semantics
         ─────────────────────────
-        Under --parallel 1 the server processes one request at a time. If this
-        save POSTs while a prefill/generation is still in flight (e.g. the ~43k-
-        token Block A prefill right after a large ingestion), it queues behind
-        that work and burns the whole slot_operation_timeout for nothing.
+        Under --parallel 1 the server processes one request at a time, and this
+        save is always awaited — there is no detached background variant. A
+        detached save would race the caller's later work and could be truncated
+        mid-write, producing a corrupt .bin that hangs the next restore. Two
+        call contexts follow from that, and neither ever blocks waiting for the
+        slot to drain (an unbounded wait could hang the whole request):
 
-        wait_slot_free controls how that is handled, and the default is the SAFE
-        one:
+        • On the critical path (inlet: _warmup_tier_prefill, reason_per_focus,
+          and _on_frontier_advance via WindowManager._persist) the slot may
+          still be busy with an in-flight prefill/generation. The POST fires
+          immediately and slot_operation_timeout bounds it, absorbing the
+          contention; a save that loses the race is simply skipped this turn.
 
-        • wait_slot_free=False (default): do NOT block waiting for the slot.
-          The save POSTs immediately; the HTTP call is bounded by
-          slot_operation_timeout, which absorbs the contention. Correct for
-          callers ON THE CRITICAL PATH (inlet: WindowManager._persist and the
-          build_block_a saves) where an unbounded wait could hang the whole
-          request behind an in-flight generation.
-
-        • wait_slot_free=True: first wait (unbounded) for the inference slot to
-          drain via the shared LLM semaphore, then POST into an idle server so
-          the save completes cleanly in milliseconds. Only safe for a DETACHED
-          caller that nothing awaits — currently just Filter.outlet, which fires
-          this as a background task. The wait is best-effort: the semaphore is
-          released before the POST, so another task could momentarily re-take
-          the slot; slot_operation_timeout remains the backstop either way.
+        • In Filter.outlet the save runs AFTER wait_for_llm_tasks() has drained
+          every auxiliary call of the turn, so the slot is idle and holds the
+          clean main-chat KV. It completes in milliseconds and captures that
+          clean state before the background tasks (raptor / docstrings) are
+          relaunched and dirty it.
 
         Args:
             project_id: The project identifier.
             force: Whether to force save even if the hash hasn't changed.
-            wait_slot_free: Whether to wait for the inference slot to drain
-                before POSTing. Only pass True from a detached (non-awaited)
-                caller; see semantics above.
 
         Returns:
             bool: True if the slot was saved successfully.
@@ -37796,19 +37789,7 @@ class ProjectStateManager:
                     f"{self._f.valves.slot_resave_min_growth})"
                 )
 
-        # --- 5. Optionally wait for the inference slot to drain before POSTing.
-        # Only detached callers (Filter.outlet) request this; on-critical-path
-        # callers pass wait_slot_free=False and rely on slot_operation_timeout
-        # to bound the POST instead of risking an unbounded wait.
-        if wait_slot_free:
-            try:
-                await self._f._llm_orchestrator.wait_for_slot()
-            except Exception as _wait_err:
-                self._f._log_debug(
-                    f"Slot save: slot-wait error (non-fatal): {_wait_err}"
-                )
-
-        # --- 6. Build filename and call llama.cpp API ---
+        # --- 5. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -37834,7 +37815,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # --- 7. Execute, bounded only if slot_operation_timeout > 0 ---
+        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -43321,8 +43302,8 @@ class Filter:
         # slot_restore recovers it instead of a version polluted by raptor /
         # docstrings. Synchronous by design: a detached save races the background
         # tasks and can be truncated mid-write, producing the corrupt .bin that
-        # hangs the next restore. The slot is idle here, so no wait_slot_free is
-        # needed.
+        # hangs the next restore. The slot is idle here, so the save completes
+        # cleanly with no need to wait for it to drain.
         if self.valves.enable_slot_persistence:
             try:
                 await self._project_state_manager.slot_save(project_id)
