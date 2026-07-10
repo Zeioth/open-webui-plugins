@@ -636,6 +636,17 @@ def _build_request(
                 ],
                 "temperature": temperature,
             }
+        if backend == "llamacpp":
+            # Explicitly request slot prompt caching. Modern llama.cpp
+            # defaults cache_prompt to true, but the whole KV strategy of
+            # the context_manager plugin (slot save/restore, the pre_aligned
+            # launchpad, --cache-reuse chunk reuse) depends on it, so the
+            # request must not be at the mercy of a build's default. A
+            # production run measured ZERO prefix reuse on the aligned
+            # auxiliary calls (planner: 125.9s cold vs 123.1s with an
+            # 80,693-token snapshot restored and a 61,294-token common
+            # head) — this makes the client side of that contract explicit.
+            payload["cache_prompt"] = True
         if forward_max_tokens is not None:
             payload["max_tokens"] = forward_max_tokens
         if seed is not None:
