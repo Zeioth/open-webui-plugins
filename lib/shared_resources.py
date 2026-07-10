@@ -15,7 +15,6 @@ requirements: aiohttp, chromadb, tiktoken, sentence-transformers, llmlingua>=0.2
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import random
@@ -1574,45 +1573,6 @@ def set_active_expert(expert_id: str) -> None:
 # ---------------------------------------------------------------------------
 # 5.2 Helper to safely unload all models from a llama.cpp server
 # ---------------------------------------------------------------------------
-async def unload_all_models(base_url: str) -> None:
-    """
-    Unload all currently loaded models from a llama.cpp server.
-
-    This is used when switching auxiliary models to free VRAM before
-    loading a different model. The function queries the server for loaded
-    models and unloads them one by one.
-
-    Args:
-        base_url (str): The base URL of the llama.cpp server.
-    """
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3].rstrip("/")
-    async with aiohttp.ClientSession() as sess:
-        try:
-            async with sess.get(f"{base_url}/v1/models", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return
-                data = await resp.json()
-        except Exception:
-            return
-        models = []
-        for m in data.get("data", []):
-            if m.get("status", {}).get("value") == "loaded":
-                models.append(m["id"])
-        for model_id in models:
-            try:
-                async with sess.post(
-                    f"{base_url}/models/unload",
-                    json={"model": model_id},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        logging.getLogger(__name__).debug(f"Unloaded model {model_id}")
-            except Exception:
-                pass
-        await asyncio.sleep(0.5)
-
 # ---------------------------------------------------------------------------
 # 5.3 Helpers to parse a "backend/model" formatted model identifier
 # ---------------------------------------------------------------------------
