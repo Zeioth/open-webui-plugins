@@ -11569,7 +11569,9 @@ class LLMOrchestrator:
         # recommendation (reasoning calls default True; structured/JSON
         # contracts pass False).
         _think_mode = (
-            str(getattr(self._f.valves, "llm_thinking_mode", "auto")).strip().lower()
+            str(getattr(self._f.valves, "llm_thinking_mode", "auto"))
+            .strip()
+            .lower()
         )
         if _think_mode in ("off", "false", "0", "no"):
             enable_thinking = False
@@ -33352,10 +33354,19 @@ class MessageAssembler:
         #
         # A silent non-fire is a defect, so every blocking condition names
         # itself in the log.
+        #
+        # Reference-line diet: when OpenWebUI re-attaches the ingested file
+        # on later turns, merge_pasted_files replaces it with the synthetic
+        # stub ("**name:** _(unchanged — N symbols already indexed…)_"),
+        # which rides inside the user message and — without this strip —
+        # inside the pipeline question, polluting the planner, every step
+        # prompt, the synthesis, and the workspace header verbatim (observed
+        # in production dumps). Same _REFERENCE_LINE_RE diet the classifier
+        # and seed-extraction consumers already apply.
         # ------------------------------------------------------------------
-        _agentic_question = ((user_question or "").strip() or user_content.strip())[
-            :2000
-        ]
+        _agentic_question = self._f._commands._REFERENCE_LINE_RE.sub(
+            "", (user_question or "").strip() or user_content.strip()
+        ).strip()[:2000]
         if self._f.valves.enable_agentic_pipeline:
             _block_reason = ""
             if is_continuation:
