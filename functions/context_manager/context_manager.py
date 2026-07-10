@@ -1973,8 +1973,21 @@ class ActivationGraph:
         )
         if seed_total == 0:
             return
+        # Each seed restarts with its own full score, NOT score/seed_total.
+        # Normalising by the seed total made every per-seed restart mass
+        # shrink as 1/N while min_score stayed absolute: with the default
+        # floor of 0.05 and alpha=0.85 the per-seed stationary mass
+        # (1-alpha)/N fell below the pump floor from N=3 seeds on, and the
+        # storage filter below dropped every propagated node — PPR silently
+        # degraded to "seeds only" exactly when a query produced several
+        # seeds (measured: N=1 and N=2 propagate; N>=3 stores zero
+        # non-seed nodes). Un-normalised, masses stay on the single-seed
+        # scale for any N, which is the scale every absolute threshold in
+        # this file (0.05 / 0.03 / 0.01 harvests) was calibrated against;
+        # relative seed weights are preserved, and no consumer relies on
+        # the scores summing to 1 (_normalize_ppr_scores rescales by max).
         personalization: Dict[str, float] = {
-            nid: s.score / seed_total
+            nid: s.score
             for nid, s in self._activations.items()
             if s.source == "seed"
         }
@@ -4946,7 +4959,6 @@ class ContextBuilder:
             parts.append(critical_guidelines)
 
         # 5.2 Symbol index (depth depends on call_graph_context_mode)
-        symbol_section_rendered = False
         if is_code_session and self._f.valves.enable_code_awareness:
             state = self._f._conversation_state_manager.get(project_id)
             if state and state.active_blocks:
@@ -4998,7 +5010,6 @@ class ContextBuilder:
                 )
                 if symbol_section:
                     parts.append(symbol_section)
-                    symbol_section_rendered = True
 
         # 5.3 Skeleton tier
         skeleton_rendered_this_turn = False
@@ -5032,7 +5043,6 @@ class ContextBuilder:
 
         # --- 7. Record whether skeleton was actually rendered this turn ---
         psm.set_skeleton_rendered_this_turn(project_id, skeleton_rendered_this_turn)
-        pstate_raw["skeleton_render_mode"] = mode
 
         # --- 8. Detect and log prefix changes (KV cache miss) ---
         new_prefix_hash = effective_hash
@@ -5311,8 +5321,15 @@ class ContextBuilder:
         pstate["block_a_last_turn_structure_hash"] = current_hash
 
         # ── Step 2: feature disabled → force inactive, pin nothing ──
+        # A manual /freeze outranks the valve, as the command documents: an
+        # explicit user instruction must survive block_a_freeze_turns == 0.
+        # Before this guard, this branch cleared the manual window on the
+        # very next inlet, making /freeze a one-turn no-op with the feature
+        # valve disabled.
         freeze_turns = self._f.valves.block_a_freeze_turns
-        if freeze_turns <= 0:
+        manual = pstate.get("block_a_freeze_manual", False)
+        manual_limit = pstate.get("block_a_freeze_manual_limit", 0)
+        if freeze_turns <= 0 and not manual:
             if pstate.get("block_a_freeze_active"):
                 self._f._log_debug(
                     "Block A freeze: disabled by valve — clearing active window"
@@ -5356,12 +5373,23 @@ class ContextBuilder:
         drift_ratio = (len(dirty) / total_symbols) if total_symbols else 0.0
         max_drift = self._f.valves.block_a_freeze_max_drift
 
-        break_on_count = edits_used >= freeze_turns
-        break_on_drift = max_drift > 0.0 and drift_ratio > max_drift
+        # A manual window breaks on the terms the command promised and
+        # nothing else: '/freeze N' breaks when its own budget is spent
+        # ('until /unfreeze or the budget is spent'); '/freeze 0' is
+        # indefinite ('until /unfreeze') and exempt from both the count and
+        # the automatic drift release. Automatic windows keep the valve
+        # budget and the drift safety unchanged.
+        if manual:
+            break_on_count = manual_limit > 0 and edits_used >= manual_limit
+            break_on_drift = False
+        else:
+            break_on_count = edits_used >= freeze_turns
+            break_on_drift = max_drift > 0.0 and drift_ratio > max_drift
 
         if break_on_count or break_on_drift:
+            _limit_shown = manual_limit if manual else freeze_turns
             _why = (
-                f"edits_used={edits_used} >= {freeze_turns}"
+                f"edits_used={edits_used} >= {_limit_shown}"
                 if break_on_count
                 else f"drift {drift_ratio:.0%} > {max_drift:.0%}"
             )
@@ -5373,6 +5401,17 @@ class ContextBuilder:
             psm.set_block_a_cached(project_id, None)
             pstate["skeleton_tier_cache_key"] = None
             pstate["skeleton_tier_cached"] = None
+            if manual:
+                # The manual budget is spent: the explicit instruction has run
+                # its course, so hand control back to the automatic policy.
+                pstate["block_a_freeze_manual"] = False
+                pstate["block_a_freeze_manual_limit"] = 0
+                if freeze_turns <= 0:
+                    # Valve disabled: no automatic window to fall back to.
+                    pstate["block_a_freeze_active"] = False
+                    pstate["block_a_frozen_structure_hash"] = None
+                    pstate["block_a_freeze_edits_used"] = 0
+                    return
             self._start_block_a_freeze_window(
                 project_id, current_hash, current_turn, reason=_why
             )
@@ -5382,9 +5421,14 @@ class ContextBuilder:
         psm.set_structure_hash_for_cache(
             project_id, pstate["block_a_frozen_structure_hash"]
         )
+        _budget_shown = (
+            f"{edits_used}/{manual_limit} manual"
+            if manual and manual_limit > 0
+            else ("indefinite manual" if manual else f"{edits_used}/{freeze_turns}")
+        )
         self._f._log_debug(
             f"Block A freeze: holding frozen map "
-            f"({edits_used}/{freeze_turns} counted edits used, "
+            f"({_budget_shown} counted edits used, "
             f"accumulated drift {drift_ratio:.0%})"
         )
 
@@ -5662,7 +5706,13 @@ class ContextBuilder:
         self._f._conversation_state_manager.set(project_id, state)
 
         # ── Log KV-cache stability signal ─────────────────────────────────────────
-        previous_tier_hash = psm.get_pstate(project_id).get("last_tier_hash")
+        # The callers store this build's hash under pstate["hub_tier_hash"]
+        # AFTER we return, so at this point the key still holds the previous
+        # build's value — exactly the baseline this comparison needs. (This
+        # read used the never-written key "last_tier_hash" before, which made
+        # previous_tier_hash always None: the HIT/MISS branches below were
+        # unreachable and every build logged "first tier built".)
+        previous_tier_hash = psm.get_pstate(project_id).get("hub_tier_hash")
         if previous_tier_hash and previous_tier_hash != tier_hash:
             self._f._log_debug(
                 f"⚠️ TIER CACHE MISS: tier_hash changed "
@@ -8297,7 +8347,7 @@ class ControlFlowExtractor:
             )
             return None
         if len(block_content.encode()) > ControlFlowExtractor.MAX_PARSE_SIZE_BYTES:
-            logger.debug(f"[CFG] SKIP: block_content exceeds MAX_PARSE_SIZE_BYTES")
+            logger.debug("[CFG] SKIP: block_content exceeds MAX_PARSE_SIZE_BYTES")
             return None
 
         lines = block_content.split("\n")
@@ -8371,7 +8421,9 @@ class ControlFlowExtractor:
         for node in ast.walk(func_node):
             if node is func_node:
                 continue
-            if isinstance(node, (ast.If, ast.Try, ast.For, ast.While, ast.AsyncFor)):
+            if isinstance(
+                node, (ast.If, ast.Try, ast.For, ast.While, ast.AsyncFor, ast.Match)
+            ):
                 logger.debug(
                     f"[CFG] _has_control_flow: found control-flow node "
                     f"'{type(node).__name__}' in function"
@@ -8436,6 +8488,16 @@ class ControlFlowExtractor:
                 control_count += 1
                 logger.debug("[CFG] _compress_stmt_list: found Loop statement")
                 out.append(ControlFlowExtractor._compress_loop(stmt, role_queue))
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                _flush_run()
+                control_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found With statement")
+                out.append(ControlFlowExtractor._compress_with(stmt, role_queue))
+            elif isinstance(stmt, ast.Match):
+                _flush_run()
+                control_count += 1
+                logger.debug("[CFG] _compress_stmt_list: found Match statement")
+                out.append(ControlFlowExtractor._compress_match(stmt, role_queue))
             elif isinstance(stmt, (ast.Return, ast.Raise)):
                 _flush_run()
                 terminal_count += 1
@@ -8609,6 +8671,60 @@ class ControlFlowExtractor:
         )
         return new_node
 
+    @staticmethod
+    def _compress_with(node, role_queue: List[Optional[str]]):
+        """
+        Compress a `with` / `async with` block.
+
+        A with statement is a transparent control container, not a branch:
+        the context-manager items are kept verbatim and the body is
+        compressed recursively so any branching inside it survives. Before
+        this existed, with-blocks fell into the straight-line default and
+        their entire body collapsed to a single `...` — in a codebase where
+        the critical logic of most methods lives inside `async with lock:`,
+        the CFG tier was blind to exactly the guarded sections.
+
+        `with` lines are not matched by _CONTROL_LINE_RE, so no role is
+        queued for the header — pushing one would desynchronise the role
+        injection pairing for every control line that follows.
+        """
+        logger.debug(
+            f"[CFG] _compress_with: compressing {type(node).__name__} node "
+            f"(items={len(node.items)})"
+        )
+        new_body = ControlFlowExtractor._compress_stmt_list(node.body, role_queue)
+        cls = type(node)
+        new_node = cls(items=node.items, body=new_body)
+        ast.copy_location(new_node, node)
+        return new_node
+
+    @staticmethod
+    def _compress_match(node: "ast.Match", role_queue: List[Optional[str]]):
+        """
+        Compress a `match` statement: the subject and every case pattern and
+        guard are kept verbatim, and each case body is compressed
+        recursively. Like `with`, `match`/`case` lines are not matched by
+        _CONTROL_LINE_RE, so no roles are queued for them.
+        """
+        logger.debug(
+            f"[CFG] _compress_match: compressing Match node "
+            f"(cases={len(node.cases)})"
+        )
+        new_cases = []
+        for case in node.cases:
+            new_cases.append(
+                ast.match_case(
+                    pattern=case.pattern,
+                    guard=case.guard,
+                    body=ControlFlowExtractor._compress_stmt_list(
+                        case.body, role_queue
+                    ),
+                )
+            )
+        new_node = ast.Match(subject=node.subject, cases=new_cases)
+        ast.copy_location(new_node, node)
+        return new_node
+
     # ═══════════════════════════════════════════════════════════════════
     # 4. Call & straight-run placeholders
     # ═══════════════════════════════════════════════════════════════════
@@ -8734,7 +8850,7 @@ class ControlFlowExtractor:
 
         if body_has_return and ControlFlowExtractor._CACHE_HIT_RE.search(test_src):
             logger.debug(
-                f"[CFG] _classify_if_role: MATCH fast path (test mentions cache/memo)"
+                "[CFG] _classify_if_role: MATCH fast path (test mentions cache/memo)"
             )
             return "fast path"
         else:
@@ -9721,10 +9837,18 @@ class LongTermMemory:
             name="conversation_memory",
             metadata={"hnsw:space": "cosine"},
         )
-        self._f._log_debug(
-            f"LTM collection ready – vector size = "
-            f"{self._f.memory_collection.metadata.get('dimension', '?')}"
-        )
+        # Collections are created with only {"hnsw:space": "cosine"}; no code
+        # ever writes a "dimension" metadata key, so reading it here printed
+        # "vector size = ?" on every startup since the line was written. Log
+        # the live embedder dimension instead — the number that actually
+        # matters when debugging an embedder swap.
+        _dim = "?"
+        try:
+            if self._f.embedder is not None:
+                _dim = self._f.embedder.get_sentence_embedding_dimension()
+        except Exception:
+            pass
+        self._f._log_debug(f"LTM collection ready – vector size = {_dim}")
 
         # ------------------------------------------------------------------
         # Region: Response cache collection (with automatic recovery)
@@ -9911,7 +10035,6 @@ class LongTermMemory:
             q_emb = await anyio.to_thread.run_sync(
                 lambda: self._f.embedder.encode(query[:8000]).tolist()
             )
-            now = time.time()
 
             # ------------------------------------------------------------------
             # Region: Build time‑filtered ChromaDB query
@@ -9947,7 +10070,6 @@ class LongTermMemory:
             # Region: Evaluate candidates
             # ------------------------------------------------------------------
             best_candidate = None
-            best_sim = 0.0
             for i, doc in enumerate(results["documents"][0]):
                 dist = results["distances"][0][i]
                 sim = 1.0 - (dist / 2.0)
@@ -9960,7 +10082,11 @@ class LongTermMemory:
                         break
 
                     ce_score = ce_scores[0]
-                    ce_prob = 1.0 / (1.0 + math.exp(-ce_score))
+                    # predict() output is already sigmoid-activated to [0,1];
+                    # a second sigmoid here compressed the range to
+                    # [0.5, 0.731], leaving the >=0.85 strong-accept and the
+                    # (0.5 - p) > threshold reject branches below unreachable.
+                    ce_prob = float(ce_score)
 
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.duplicate_ce_threshold
                     LLM_FALLBACK_THRESHOLD = self._f.valves.duplicate_llm_threshold
@@ -11997,7 +12123,7 @@ class AgenticEvidenceLedger:
     since fabricated identifiers die mechanically, without an LLM judge.
     """
 
-    _TAIL_RE = re.compile(r"```json\s*(.*?)```\s*\Z", re.S)
+    _FENCE_RE = re.compile(r"```[a-zA-Z ]*\s*(.*?)```", re.S)
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -12033,25 +12159,58 @@ class AgenticEvidenceLedger:
             "ask": "",
         }
 
-        # Region: locate and strip the fenced JSON tail
-        m = self._TAIL_RE.search(step.output)
-        if not m:
-            return control
-        step.output = step.output[: m.start()].rstrip()
-
-        # Region: parse-or-nothing (the fence is stripped either way, so a
-        # malformed tail degrades to prose-only instead of leaking JSON
-        # fragments into the digest)
-        try:
-            data = json.loads(m.group(1).strip())
-            raw_claims = data.get("claims", [])
-            assert isinstance(raw_claims, list)
-        except Exception:
+        # Region: locate the JSON tail (tolerant ladder, parse-or-nothing)
+        # The previous extractor demanded the byte-exact contract shape — a
+        # literal lowercase json-tagged fence, end-anchored with nothing but
+        # whitespace after it. Measured against a corpus of realistic model
+        # output, only that exact shape and its CRLF variant survived (2/11):
+        # a plain untagged fence, a bare JSON tail, any courtesy text after
+        # the closing fence, an upper-case or space-separated tag, or an
+        # echoed example block earlier in the output each silently yielded
+        # zero claims — starving the whole evidence machinery of exactly the
+        # signal it exists to collect. Acceptance below requires a parseable
+        # dict that carries a "claims" key, so the tolerance cannot misfire
+        # on ordinary fenced code in the prose; anything unparseable still
+        # degrades to prose-only, keeping the parse-or-nothing philosophy.
+        data = None
+        tail_start = None
+        # (a) fenced blocks with any (or no) language tag — accept the LAST
+        #     one whose content parses to a dict with a "claims" key.
+        for fm in self._FENCE_RE.finditer(step.output):
+            try:
+                cand = json.loads(fm.group(1).strip())
+            except Exception:
+                continue
+            if isinstance(cand, dict) and "claims" in cand:
+                data, tail_start = cand, fm.start()
+        # (b) bare JSON tail — try a bounded set of '{' positions from the
+        #     end (models often emit the object unfenced when told to
+        #     "output only JSON").
+        if data is None:
+            pos = len(step.output)
+            for _ in range(8):
+                pos = step.output.rfind("{", 0, pos)
+                if pos < 0:
+                    break
+                frag = step.output[pos:].strip().strip("`").strip()
+                try:
+                    cand = json.loads(frag)
+                except Exception:
+                    continue
+                if isinstance(cand, dict) and "claims" in cand:
+                    data, tail_start = cand, pos
+                    break
+        if data is None:
             self._f._log_debug(
-                f"🤖 Ledger: step {step.id} claims tail unparseable — "
+                f"🤖 Ledger: step {step.id} has no parseable claims tail — "
                 "prose kept, no claims recorded"
             )
             return control
+        step.output = step.output[:tail_start].rstrip()
+
+        raw_claims = data.get("claims", [])
+        if not isinstance(raw_claims, list):
+            raw_claims = []
 
         # Region: control signals (early-exit / re-plan markers)
         try:
@@ -16207,9 +16366,6 @@ class ReasoningEngine:
             self._f._cross_encoder is not None
             and self._f.valves.enable_cot_llm_detection
         ):
-            stripped = self._f._commands._extract_text_for_classification(user_content)
-            query_short = stripped[:500] if stripped else user_content[:500]
-
             session_type = "code" if is_code_session else "general"
             intent_hint = ""
             if (
@@ -17343,7 +17499,7 @@ class ReasoningEngine:
         # ── REGION 6: Format and return the reasoning ──
         prefix = (
             "## 🏗️ Architecture Reasoning (skeleton-based CoT)\n"
-            f"*Reasoning on contracts — use `/expand <name>` for implementations.*"
+            "*Reasoning on contracts — use `/expand <name>` for implementations.*"
         )
         return f"{prefix}\n\n{response}"
 
@@ -18065,7 +18221,14 @@ class CommandRouter:
     async def _predict_cross_encoder(self, pairs: list) -> Optional[list]:
         """
         Run the CrossEncoder on (text_a, text_b) pairs.
-        Returns raw scores (logits) or None if the model is not loaded.
+
+        Returns scores in [0,1] or None if the model is not loaded.
+        sentence_transformers applies its default nn.Sigmoid() activation on
+        top of the logits for num_labels=1 models inside predict(), so call
+        sites must treat the output as a bounded relevance score and must NOT
+        apply a second sigmoid. The first successful prediction logs the
+        observed score range so a mis-loaded model (Identity activation,
+        multi-label head) is visible in one line.
 
         Each pair is truncated to the model's maximum length (512) using the
         CrossEncoder's own tokenizer BEFORE prediction. This is done centrally
@@ -18085,7 +18248,25 @@ class CommandRouter:
             return ce.predict(self._truncate_pairs_for_cross_encoder(ce, pairs))
 
         async with self._f._cross_encoder_lock:
-            return await anyio.to_thread.run_sync(_predict_safely)
+            preds = await anyio.to_thread.run_sync(_predict_safely)
+
+        if preds is not None and not getattr(self, "_ce_range_logged", False):
+            self._ce_range_logged = True
+            try:
+                _vals = [float(v) for v in list(preds)[:8]]
+                if _vals:
+                    self._f._log_debug(
+                        f"CrossEncoder first-call score sample: "
+                        f"min={min(_vals):.4f} max={max(_vals):.4f} "
+                        f"n={len(_vals)} (expected within [0,1] via the "
+                        f"default sigmoid activation for num_labels=1)"
+                    )
+            except Exception as e:
+                self._f._log_debug(
+                    f"CrossEncoder score sample not scalar (shape/type "
+                    f"unexpected): {e}"
+                )
+        return preds
 
     @staticmethod
     def _truncate_pairs_for_cross_encoder(
@@ -20478,10 +20659,27 @@ class CodeBlockManager:
         """
         lines = block.strip().split("\n")
         # ── Step 1: drop everything up to and including the opening fence ──
+        opener_found = False
         for i, line in enumerate(lines):
             if line.lstrip().startswith("```"):
+                if i == len(lines) - 1 and i > 0:
+                    # The only fence-looking line is the LAST one with content
+                    # before it: that is a dangling CLOSER, not an opener.
+                    # Treating it as the opener discarded everything before it
+                    # as "header" and collapsed the whole block to ''
+                    # (measured on 'code line' + trailing fence). The
+                    # documented contract — a block with no opening fence is
+                    # returned unchanged — applies. Unreachable from the
+                    # current sole caller (get_code_spans spans always include
+                    # their opener), but a content-destroying edge has no
+                    # place in a general utility. A lone fence as the FIRST
+                    # line (i == 0) remains an opener with an empty body.
+                    break
                 lines = lines[i + 1 :]
+                opener_found = True
                 break
+        if not opener_found:
+            return "\n".join(lines)
         # ── Step 2: drop the closing fence line if present ──
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
@@ -21437,6 +21635,11 @@ class CodeBlockManager:
         result_lines = lines[:]
         hunks = []
 
+        # Normalize line endings before parsing: a CRLF diff otherwise
+        # carries \r into every context/old line and fails the exact-match
+        # check against \n content.
+        diff_text = diff_text.replace("\r\n", "\n").replace("\r", "\n")
+
         # ── 1. Parse diff hunks ─────────────────────────────────────────────
         for match in re.finditer(
             r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
@@ -21444,10 +21647,19 @@ class CodeBlockManager:
             old_start = int(match.group(1))
             old_count_str = match.group(2)
             old_count = int(old_count_str) if old_count_str else 1
-            new_start = int(match.group(3))
             new_count_str = match.group(4)
             new_count = int(new_count_str) if new_count_str else 1
-            hunk_body = match.group(5).strip("\n")
+            hunk_body = match.group(5)
+            # git-style hunk headers carry the enclosing declaration on the
+            # header line itself ("@@ -a,b +c,d @@ def foo():"). group(5)
+            # starts right after the second @@, so that tail — one leading
+            # space plus the declaration — parsed as a bogus context line and
+            # made every git-produced hunk fail the exact-match check
+            # ("hunk mismatch at line 1"). The hunk body proper starts after
+            # the header line's own newline; whatever precedes it is header
+            # remainder and is discarded.
+            hunk_body = hunk_body.split("\n", 1)[1] if "\n" in hunk_body else ""
+            hunk_body = hunk_body.strip("\n")
 
             old_lines, new_lines = [], []
             for line in hunk_body.split("\n"):
@@ -22451,7 +22663,7 @@ Output only the symbol name.
                 else:
                     # No usable string found – return neutral value
                     self._f._log_debug(
-                        f"[DIAG] _compute_node_specificity: dict has no 'name'/'symbol'/'id' key → returning 1.0"
+                        "[DIAG] _compute_node_specificity: dict has no 'name'/'symbol'/'id' key → returning 1.0"
                     )
                     return 1.0
             else:
@@ -22461,7 +22673,7 @@ Output only the symbol name.
         # Double‑check: if it still isn't a string, return 1.0
         if not isinstance(symbol_name, str):
             self._f._log_debug(
-                f"[DIAG] _compute_node_specificity: final type is not str, returning 1.0"
+                "[DIAG] _compute_node_specificity: final type is not str, returning 1.0"
             )
             return 1.0
 
@@ -23834,7 +24046,6 @@ Output only the symbol name.
         self, symbol_names: Iterable[str], project_id: str
     ) -> str:
         """Hash of the symbols' content blocks (changes when code changes)."""
-        state = self._f._conversation_state_manager.get(project_id)
         hashes = []
         for name in sorted(symbol_names):
             for bh in sorted(self._f._symbol_index.find_blocks(name, project_id)):
@@ -23951,7 +24162,6 @@ Output only the symbol name.
         """
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
-        pstate["cached_lightweight_context"] = ""
         pstate["cached_code_state_hash"] = None
 
     # ======================================================================
@@ -24627,7 +24837,7 @@ class MetacognitiveReasoningEngine:
             "(e.g. 'X calls Y', 'Z exists', 'A inherits from B').\n"
             "Only include claims checkable against the symbol graph.\n"
             "Do NOT repeat claims already explicit in the hypothesis.\n\n"
-            f'Output only the JSON object: {{"predictions": ["claim1", "claim2"]}}'
+            'Output only the JSON object: {"predictions": ["claim1", "claim2"]}'
         )
 
         response = await self._f._llm_orchestrator.call_llm(
@@ -25922,10 +26132,6 @@ class MetacognitiveReasoningEngine:
         if not self._f.valves.enable_peer_review:
             return None
 
-        _fallback_approve = PeerReviewResult(
-            verdict="APPROVE", critiques=[], reviewer_model="", is_external=False
-        )
-
         _same_model = (
             not self._f.valves.peer_review_model
             or self._f.valves.peer_review_model == self._f.valves.cot_model_level3
@@ -26639,9 +26845,11 @@ Code context (recent symbols referenced):
                 pairs = [(current_query[:500], content[:500])]
                 scores = await self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None and len(scores) > 0:
-                    semantic_score = 1.0 / (1.0 + math.exp(-scores[0]))
-                    CE_CONFIDENCE_THRESHOLD = self._f.valves.code_history_ce_threshold
-                    LLM_FALLBACK_THRESHOLD = self._f.valves.code_history_llm_threshold
+                    # predict() output is already sigmoid-activated to [0,1];
+                    # re-applying sigmoid floored the score at 0.5, so the
+                    # < 0.3 compress vote below could never fire and this
+                    # stage could only ever preserve or abstain.
+                    semantic_score = float(scores[0])
                     if semantic_score < 0.3:
                         should_compress = True
                     elif semantic_score > 0.7:
@@ -27018,7 +27226,7 @@ Code context (recent symbols referenced):
         dep_symbols = dep_symbols[:6]
 
         if force_no_expand:
-            title = f"[🗜️ CÓDIGO COMPRIMIDO — sin índice]"
+            title = "[🗜️ CÓDIGO COMPRIMIDO — sin índice]"
             lines = [title]
             if classes:
                 lines.append(f"Clases:    {', '.join(classes)}")
@@ -28897,7 +29105,6 @@ class EnrichmentTasks:
         self,
         qids: List[str],
         project_id: str,
-        pstate: dict,
     ) -> List[str]:
         """
         Sort symbols by docstring generation priority.
@@ -28905,27 +29112,31 @@ class EnrichmentTasks:
         Priority order:
         1. Symbols in skeleton tier (visible in Block A every turn)
         2. Symbols currently in Block B at LOD-2/3 (visible this turn)
-        3. Hub symbols (high PPR — frequently referenced)
+        3. Hub symbols (high call-graph centrality — frequently referenced)
         4. Everything else (leaf symbols — rarely in context)
         """
         psm = self._f._project_state_manager
         skeleton_qids: Set[str] = set(psm.get_skeleton_tier_qids(project_id))
         block_b_qids: Set[str] = set(psm.get_block_b_qids_this_turn(project_id))
 
-        # Get cached PPR scores if available
-        ppr_scores: Dict[str, float] = (
-            self._f._activation._ppr_cache.get(
-                pstate.get("code_state_hash", ""),
-                frozenset(pstate.get("hub_tier_qids_persisted", [])),
-            )
-            or {}
-        )
+        # Hub-ness signal for the third criterion. The previous
+        # implementation peeked at the per-turn PPR cache with
+        # pstate["code_state_hash"] — a key that is never written (the
+        # maintained one is "cached_code_state_hash") — and with a plain-qid
+        # seed set, while the producer keys entries by
+        # structure_hash-or-code_state_hash plus (qid, weight) tuples when
+        # personalization weights are present. That lookup could not hit by
+        # construction, so the hub criterion was permanently zero. Node
+        # centrality is the maintained hub-ness measure (PageRank over the
+        # full call graph, the same signal the hub tier itself ranks by), so
+        # read it directly.
+        centrality: Dict[str, float] = psm.get_node_centrality(project_id) or {}
 
         def priority_key(qid: str) -> tuple:
             in_skeleton = 0 if qid in skeleton_qids else 1  # 0 = highest priority
             in_block_b = 0 if qid in block_b_qids else 1
-            ppr = -ppr_scores.get(qid, 0.0)  # negate for desc sort
-            return (in_skeleton, in_block_b, ppr, qid)
+            hub = -centrality.get(qid, 0.0)  # negate for desc sort
+            return (in_skeleton, in_block_b, hub, qid)
 
         return sorted(qids, key=priority_key)
 
@@ -29013,7 +29224,7 @@ class EnrichmentTasks:
 
         # Region: sort by visibility priority — skeleton-tier and LOD-2 first
         prioritized_qids = self._prioritize_docstring_targets(
-            pending_qids, project_id, pstate
+            pending_qids, project_id
         )
 
         self._f._log_debug(
@@ -30670,8 +30881,6 @@ class InletOrchestrator:
             else:
                 user_question = user_query
 
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            pstate["last_processed_message_idx"] = last_idx
         else:
             user_question = user_query
 
@@ -30999,7 +31208,6 @@ class InletOrchestrator:
         ) = await self._f._ctx_builder.classify_use_case(
             user_query, intent_vector, project_id
         )
-        confidence = max(intent_vector.values()) if intent_vector else 0.5
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
         if is_continuation:
@@ -31920,7 +32128,12 @@ class SystemPromptBuilder:
                                 [(norm[:500], w[:500])]
                             )
                             if scores is not None and len(scores) > 0:
-                                prob = 1.0 / (1.0 + math.exp(-scores[0]))
+                                # predict() output is already sigmoid-activated
+                                # to [0,1]; the extra sigmoid floored prob at
+                                # 0.5, which made the >= 0.5 duplicate verdict
+                                # below unconditional whenever the model fired
+                                # and silently suppressed LTM injection.
+                                prob = float(scores[0])
                                 common_words = set(norm.split()) & set(w.split())
                                 if common_words:
                                     prob = min(
@@ -33595,13 +33808,11 @@ class MessageAssembler:
             if isinstance(cot_config, dict):
                 detected_level = cot_config.get("level", 0)
                 _use_scientific = cot_config.get("use_scientific", False)
-                _decompose_hint = cot_config.get("decompose", False)
                 _cot_source = cot_config.get("source", "?")
                 _cot_rationale = cot_config.get("rationale", "")
             else:
                 detected_level = int(cot_config) if cot_config else 0
                 _use_scientific = False
-                _decompose_hint = False
                 _cot_source = "compat"
                 _cot_rationale = ""
 
@@ -34570,10 +34781,10 @@ class MessageAssembler:
             )
             self._f._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
             self._f._log_debug(
-                f"  → If hash matches previous:   KV cache HIT in llama.cpp"
+                "  → If hash matches previous:   KV cache HIT in llama.cpp"
             )
             self._f._log_debug(
-                f"  → If hash changed:            KV cache MISS, full prefill"
+                "  → If hash changed:            KV cache MISS, full prefill"
             )
             if self._f.valves.enable_multi_phase_response:
                 self._f._log_debug("  Multi-phase:                  (see earlier log)")
@@ -35482,10 +35693,17 @@ class TaskRegistry:
             filter_ref: The parent Filter instance.
         """
         self._f = filter_ref
-        self._bg_tasks: List[BackgroundTask] = self._build_tasks()
+        self._bg_tasks: List["BackgroundTask"] = self._build_tasks()
         self._validate_and_order()
 
-    def _build_tasks(self) -> List[BackgroundTask]:
+    # BackgroundTask is defined ~1800 lines further down the module, so these
+    # signature annotations must be string forward references. Unquoted, a
+    # def's annotations are evaluated eagerly when the class body executes at
+    # import time on Python <= 3.13 and raise NameError, killing the whole
+    # plugin load (reproduced on 3.12). PEP 649 defers evaluation on >= 3.14,
+    # which is the only reason current production never noticed. Quoted, the
+    # annotations behave identically on every interpreter.
+    def _build_tasks(self) -> List["BackgroundTask"]:
         """
         Build the list of background task definitions.
 
@@ -35661,7 +35879,7 @@ class TaskRegistry:
     # Region: Public API for Filter
     # ------------------------------------------------------------------
 
-    def get_background_tasks(self) -> List[BackgroundTask]:
+    def get_background_tasks(self) -> List["BackgroundTask"]:
         """
         Return the list of background tasks in execution order (priority order).
 
@@ -35670,7 +35888,7 @@ class TaskRegistry:
         """
         return self._bg_tasks
 
-    def get_task_definition(self, name: str) -> Optional[BackgroundTask]:
+    def get_task_definition(self, name: str) -> Optional["BackgroundTask"]:
         """
         Return the task definition for a given name, or None if not found.
 
@@ -36160,21 +36378,14 @@ class ProjectStateManager:
         return {
             # -- Call-graph mode ------------------------------------------
             "resolved_call_graph_mode": None,
-            "current_call_graph_mode": None,
             # -- Ingestion -----------------------------------------
-            "ingested_lang": None,
             "merged_file_blocks": None,
             # -- Block A / skeleton cache ---------------------------------
             "block_a_cache_key": None,
             "block_a_cached": None,
-            "skeleton_cache_key": None,
-            "skeleton_cached": None,
             "skeleton_tier_cache_key": None,
             "skeleton_tier_cached": None,
-            "skeleton_invalidated": False,
-            "block_a_invalidated": False,
             "skeleton_rendered_this_turn": False,
-            "skeleton_render_mode": None,
             "skeleton_tier_qids": [],
             "agentic_tdd_pending": None,
             "agentic_tdd_last_verdict": None,
@@ -36185,7 +36396,6 @@ class ProjectStateManager:
             # -- Centrality and lightweight context -----------------------
             "node_centrality": {},
             "node_centrality_structure_hash": None,
-            "cached_lightweight_context": "",
             "cached_code_state_hash": None,
             "structure_hash_for_cache": None,
             "last_static_prefix_hash": None,
@@ -36212,7 +36422,6 @@ class ProjectStateManager:
             "last_user_query": "",
             "last_assistant_response": "",
             "last_response_timestamp": 0.0,
-            "last_outlet_response_hash": "",
             # -- Continuation tracking ------------------------------------
             "is_continuation": False,
             "continuation_turns": 0,
@@ -36223,8 +36432,6 @@ class ProjectStateManager:
             # -- Use case tracking ----------------------------------------
             "last_use_case": None,
             # -- Misc -----------------------------------------------------
-            "last_processed_message_idx": -1,
-            "summarize_inactive_in_progress": False,
             "force_compressed_keys": [],
             "block_a_rebuild_reason": None,
             # -- Block A freeze (KV prefix stability across edits) --------
@@ -36592,10 +36799,7 @@ class ProjectStateManager:
         if not self._f.valves.enable_slot_persistence:
             return False
 
-        # --- 1. Resolve per-project state ---
-        pstate = self.get_pstate(project_id)
-
-        # --- 2. Token threshold guard (skip oversized KV writes) ---
+        # --- 1. Token threshold guard (skip oversized KV writes) ---
         _max_ctx = self._f.valves.slot_save_max_context_tokens
         _ctx_tok = self.get_last_total_context_tokens(project_id)
         if _max_ctx > 0 and _ctx_tok > _max_ctx:
@@ -36605,7 +36809,7 @@ class ProjectStateManager:
             )
             return False
 
-        # --- 3. Get the structural hash from pstate (set by build_block_a) ---
+        # --- 2. Get the structural hash from pstate (set by build_block_a) ---
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             cached = self.get_block_a_cached(project_id)
@@ -36614,7 +36818,7 @@ class ProjectStateManager:
             else:
                 return False
 
-        # --- 4. Skip if already saved, not forced, and not materially larger ---
+        # --- 3. Skip if already saved, not forced, and not materially larger ---
         # Size-aware: a previous SMALL save (hub-tier warmup) must not veto the
         # full main-chat save for the same structural hash. Re-save only when
         # the current context sufficiently outgrows what the .bin captured;
@@ -36639,7 +36843,7 @@ class ProjectStateManager:
                     f"{self._f.valves.slot_resave_min_growth})"
                 )
 
-        # --- 5. Optionally wait for the inference slot to drain before POSTing.
+        # --- 4. Optionally wait for the inference slot to drain before POSTing.
         # Only detached callers (Filter.outlet) request this; on-critical-path
         # callers pass wait_slot_free=False and rely on slot_operation_timeout
         # to bound the POST instead of risking an unbounded wait.
@@ -36651,7 +36855,7 @@ class ProjectStateManager:
                     f"Slot save: slot-wait error (non-fatal): {_wait_err}"
                 )
 
-        # --- 6. Build filename and call llama.cpp API ---
+        # --- 5. Build filename and call llama.cpp API ---
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -36677,7 +36881,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # --- 7. Execute, bounded only if slot_operation_timeout > 0 ---
+        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -36843,16 +37047,13 @@ class ProjectStateManager:
         if not self._f.valves.enable_slot_persistence:
             return False
 
-        # ── Step 1: resolve per-project state ─────────────────────────────────────
-        pstate = self.get_pstate(project_id)
-
-        # ── Step 2: skip if already attempted this session ────────────────────────
+        # ── Step 1: skip if already attempted this session ────────────────────────
         if self.get_slot_restore_attempted(project_id):
             return self.get_slot_restored(project_id)
 
         self.set_slot_restore_attempted(project_id, True)
 
-        # ── Step 3: resolve the structural hash ───────────────────────────────────
+        # ── Step 2: resolve the structural hash ───────────────────────────────────
         static_hash = self.get_structure_hash_for_cache(project_id)
         if not static_hash:
             cached = self.get_block_a_cached(project_id)
@@ -36872,7 +37073,7 @@ class ProjectStateManager:
                 )
                 return False
 
-        # ── Step 4: build filename and call llama.cpp API ─────────────────────────
+        # ── Step 3: build filename and call llama.cpp API ─────────────────────────
         filename = self._slot_filename(project_id, static_hash)
         base = self._f.valves.LLM_BASE_URL.rstrip("/")
         if base.endswith("/v1"):
@@ -36898,7 +37099,7 @@ class ProjectStateManager:
                 body_text = await resp.text()
                 return False, None, (resp.status, body_text)
 
-        # ── Step 5: execute, bounded only if slot_operation_timeout > 0 ───────────
+        # ── Step 4: execute, bounded only if slot_operation_timeout > 0 ───────────
         _timeout = self._f.valves.slot_operation_timeout
 
         try:
@@ -39126,18 +39327,6 @@ class Filter:
         )
 
         # ── 7.4 Memory (LTM & code history) ──────────────────────────────────
-        code_history_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for code history compression.",
-        )
-        code_history_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for code history compression.",
-        )
 
         # ── 7.5 Intent & use case ─────────────────────────────────────────────
         intent_ce_threshold: float = Field(
@@ -40465,7 +40654,6 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
 
         # ── 13.1 Commands & expansion ─────────────────────────────────────────
-        enable_forget_command: bool = Field(default=True)
         outlet_expand_intercept_enabled: bool = Field(default=True)
         outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
         outlet_expand_intercept_depth: int = Field(default=5, ge=0)
@@ -41562,9 +41750,6 @@ class Filter:
                         raw_symbols = [
                             s for mfb in _merged for s in mfb.get("symbols", [])
                         ]
-                        pstate_local["ingested_lang"] = _merged[0].get(
-                            "language", "python"
-                        )
                     else:
                         # Inline path: strip fences, parse the clean source, and
                         # publish it on the same channel as a single block.
@@ -41587,7 +41772,6 @@ class Filter:
                         _lang = (
                             _guessed_lang if _guessed_lang != "unknown" else "python"
                         )
-                        pstate_local["ingested_lang"] = _lang
 
                         raw_symbols = []
                         if HAS_TREE_SITTER:
