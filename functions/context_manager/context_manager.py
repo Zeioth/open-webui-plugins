@@ -4751,7 +4751,7 @@ class ContextBuilder:
         )
 
         try:
-            await self._f._llm_orchestrator.call_llm(
+            _ack = await self._f._llm_orchestrator.call_llm(
                 prompt="Acknowledge silently.",
                 system_prompt=prefix_text,
                 model_override=self._f.valves.llm_model,
@@ -4762,6 +4762,18 @@ class ContextBuilder:
             )
         except Exception as e:
             self._f._log_debug(f"_warmup_tier_prefill: warmup call failed: {e}")
+            return
+
+        if _ack is None:
+            # call_llm returned without hitting the server (gated, deduped
+            # away, or refused). The slot never received the prefill, so a
+            # force-save here would capture whatever junk the slot holds and
+            # poison the launchpad for the next turn — exactly the 297-token
+            # snapshot observed in production. No prefill, no save.
+            self._f._log_debug(
+                "_warmup_tier_prefill: warmup call returned no response — "
+                "slot not prefilled, skipping launchpad save"
+            )
             return
 
         try:
@@ -11545,6 +11557,7 @@ class LLMOrchestrator:
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
             "lazy_docstring_batch",
+            "tier_prefill_warmup",
         ):
             return None
 
