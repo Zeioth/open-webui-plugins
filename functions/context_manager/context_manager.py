@@ -11569,9 +11569,7 @@ class LLMOrchestrator:
         # recommendation (reasoning calls default True; structured/JSON
         # contracts pass False).
         _think_mode = (
-            str(getattr(self._f.valves, "llm_thinking_mode", "auto"))
-            .strip()
-            .lower()
+            str(getattr(self._f.valves, "llm_thinking_mode", "auto")).strip().lower()
         )
         if _think_mode in ("off", "false", "0", "no"):
             enable_thinking = False
