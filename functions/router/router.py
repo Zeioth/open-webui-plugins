@@ -349,7 +349,7 @@ class Filter:
                     "max_tokens": max_tokens,
                 }
 
-        session = await get_http_session(timeout=timeout)
+        session = await get_http_session(timeout_seconds=timeout)
         try:
             async with session.post(
                 url,
