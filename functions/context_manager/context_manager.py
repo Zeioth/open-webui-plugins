@@ -10574,9 +10574,12 @@ class LongTermMemory:
         if len(metas) < len(docs):
             metas = list(metas) + [{}] * (len(docs) - len(metas))
 
-        # ── Step 3: rerank with the CrossEncoder (raw [0,1] scores) ────────
-        # _predict_cross_encoder already applies the model's sigmoid; no
-        # second normalization here. Fallback score is 1 - cosine distance.
+        # ── Step 3: rerank with the CrossEncoder ───────────────────────────
+        # Scores are expected in [0,1], but a reranker loaded with Identity
+        # activation returns raw logits (observed live: best score -8.06).
+        # Squash out-of-range values through a sigmoid so ordering,
+        # thresholding and display stay consistent regardless of how the
+        # model was loaded. Fallback score is 1 - cosine distance.
         ce_scores = await self._f._commands._predict_cross_encoder(
             [(query, doc) for doc in docs]
         )
@@ -10584,6 +10587,9 @@ class LongTermMemory:
         for idx, doc in enumerate(docs):
             if ce_scores is not None and idx < len(ce_scores):
                 score = float(ce_scores[idx])
+                if score < 0.0 or score > 1.0:
+                    _clamped = max(-60.0, min(60.0, score))
+                    score = 1.0 / (1.0 + math.exp(-_clamped))
             elif isinstance(dists[idx], (int, float)):
                 score = max(0.0, min(1.0, 1.0 - float(dists[idx])))
             else:
@@ -10592,6 +10598,13 @@ class LongTermMemory:
                 (score, ids[idx] if idx < len(ids) else "", doc, metas[idx] or {})
             )
         scored.sort(key=lambda t: t[0], reverse=True)
+        # Relevance floor: with a near-empty memory the top-k of whatever
+        # exists is junk; below the floor the broker must produce the
+        # explicit no-results fallback instead of feeding noise to the step.
+        _min_score = float(getattr(self._f.valves, "napmem_min_score", 0.3))
+        scored = [t for t in scored if t[0] >= _min_score]
+        if not scored:
+            return []
         scored = scored[:top_k]
 
         # ── Step 4: resolve associated diffs from napmem_diffs ─────────────
@@ -14792,12 +14805,14 @@ class AgenticSynthesisComposer:
         header = (
             f"## 🤖 Agentic workspace ({len(plan.steps)} steps — " f"{len(done)} done"
         )
+        _all_citations_invalid = False
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
             header += f"; {total} claims, {ok} with valid citations"
             refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
             if refuted:
                 header += f", {refuted} REFUTED"
+            _all_citations_invalid = total > 0 and ok == 0
         header += ")"
 
         lines = [
@@ -14807,6 +14822,22 @@ class AgenticSynthesisComposer:
             f"your answer; verify claims against the code context above._",
             "",
         ]
+        # Degenerate workspace guard: when NO claim could be tied to indexed
+        # symbols, the investigated names likely do not exist in this
+        # codebase (observed live: a ghost symbol produced 3/3 invalid
+        # claims and the main model fell back to parroting the ingestion
+        # ack). Say so explicitly so the answer is honest instead of hollow.
+        if _all_citations_invalid:
+            lines.insert(
+                1,
+                "⚠ NONE of the claims below could be tied to symbols present "
+                "in the indexed codebase — the investigated names may not "
+                "exist in this project. Treat their content as UNVERIFIED. "
+                "If the user's question names a symbol that is not in the "
+                "index, state that explicitly and answer with what IS "
+                "indexed; do not fabricate an analysis of unknown code, and "
+                "do not reply with a bare ingestion confirmation.",
+            )
         for s in plan.steps:
             if s.status != "done":
                 continue
@@ -16075,6 +16106,11 @@ class AgenticOrchestrator:
                 )
                 plan.steps.insert(idx + 1, new_step)
                 inserted += 1
+                # Re-stamp display positions: the inserted step would
+                # otherwise render as "step 0/N" and every later step's
+                # position shifted by one (observed live in fase 4).
+                for _pos, _s in enumerate(plan.steps, start=1):
+                    _s.display_no = _pos
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported gaps — inserted "
                     f"step {new_step.id} ({new_step.goal[:60]})"
@@ -16246,13 +16282,16 @@ class AgenticOrchestrator:
             )
             for wstep in _wave:
                 plan.steps.append(wstep)
+                # Appended at the tail, so its display position is the
+                # current length; earlier steps keep their numbers.
+                wstep.display_no = len(plan.steps)
                 _rem_now = budget - (time.monotonic() - started)
                 if _rem_now <= 0:
                     wstep.status = "skipped"
                     wstep.skip_reason = "budget"
                     continue
                 await self._f._emit_status(
-                    f"🤖 Agentic wave step {wstep.id} ({wstep.kind}): "
+                    f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
                     f"{wstep.goal[:60]}"
                 )
                 workspace = self._render_workspace(plan.steps)
@@ -27660,9 +27699,11 @@ Code context (recent symbols referenced):
             f"already fully indexed.)_\n\n"
             f"_[{symbol_count} symbols indexed in the SymbolGraph; ask for any "
             f"implementation by name.]_\n\n"
-            f"_(If this message contains no question, reply with a single "
+            f"_(If THIS message contains no question, reply with a single "
             f"short line confirming the code is indexed and wait for the "
-            f"next message.)_"
+            f"next message. This instruction applies ONLY to this ingestion "
+            f"message: every later user message must be answered normally "
+            f"and fully, never with that confirmation line.)_"
         )
 
     def ensure_compressed_user_messages(
@@ -40936,6 +40977,16 @@ class Filter:
             description=(
                 "Maximum memories returned per MEMORY tool search "
                 "(summaries with their associated diffs)."
+            ),
+        )
+        napmem_min_score: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Relevance floor for MEMORY results (normalized [0,1]). Hits "
+                "below it are dropped; if none survive, the tool returns the "
+                "explicit no-results fallback instead of noise."
             ),
         )
         napmem_tool_enable: bool = Field(
