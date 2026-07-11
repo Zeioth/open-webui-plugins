@@ -15772,11 +15772,42 @@ class AgenticOrchestrator:
                 )
 
             # -- early exit: hard evidence steps are never skipped ---------
+            # Evidence gate: skipping the rest of the plan on a step's own
+            # say-so requires that its claims survived citation validation —
+            # at least one claim whose cited qids all resolved against the
+            # SymbolIndex, and no claim with a structurally invalid citation
+            # or a refuted call relation (the same invalidity predicate the
+            # difficulty gate uses). A fabricated identifier anywhere in the
+            # step is exactly the confabulation signal this ledger exists to
+            # catch — measured live: a step-1 early exit citing a
+            # non-existent symbol skipped the two steps that would have
+            # corrected it. A resolution with no claims at all keeps running
+            # too: an exit that skips verification must be backed.
+            _exit_ok = False
             if (
                 control["resolved"]
                 and control["confidence"]
                 >= self._f.valves.agentic_early_exit_confidence
             ):
+                _step_claims = self._ledger.claims_for(step.id)
+                _bad = [
+                    c
+                    for c in _step_claims
+                    if self._ledger._structural_invalid_qids(c)
+                    or c.invalid_relations
+                ]
+                _good = [
+                    c for c in _step_claims if c.valid_qids and c not in _bad
+                ]
+                _exit_ok = bool(_good) and not _bad
+                if not _exit_ok:
+                    self._f._log_debug(
+                        f"🤖 Agentic: early-exit vetoed at step {step.id} — "
+                        f"claims={len(_step_claims)} valid={len(_good)} "
+                        f"invalid={len(_bad)} (confidence "
+                        f"{control['confidence']:.2f})"
+                    )
+            if _exit_ok:
                 skipped_ids = []
                 for later in plan.steps[idx + 1 :]:
                     if later.status == "pending" and later.kind != "verify":
@@ -20389,25 +20420,53 @@ class CommandRouter:
 
         # ── Step 2: fenced short-circuit (structural certainty) ───────────────
         # A fenced paste with negligible surrounding prose is code-only — the
-        # only such verdict decidable without semantics.
-        if HAS_TREE_SITTER:
-            try:
-                from tree_sitter_language_pack import process, ProcessConfig
+        # only such verdict decidable without semantics. Deterministic
+        # line-based fence pairing: fences are line-anchored by definition,
+        # so no parser is needed. The previous implementation asked
+        # tree_sitter_language_pack.process() for markdown fence blocks, and
+        # was dead on both legs: it assigned .language on a frozen
+        # ProcessConfig dataclass — FrozenInstanceError on every call,
+        # swallowed by the except — and, constructed correctly, process()
+        # returns no blocks for fenced markdown in the installed API anyway.
+        # Since the LLM-only migration every large paste therefore fell to
+        # the classifier's 500-char window, whose view of a file that opens
+        # with a module docstring is pure prose: silent ingestion never
+        # fired for attachment pastes.
+        _fence_count = 0
+        _outside_lines: List[str] = []
+        for _ln in content.splitlines():
+            if _ln.lstrip().startswith("```"):
+                _fence_count += 1
+                continue
+            if _fence_count % 2 == 0:
+                _outside_lines.append(_ln)
+        if _fence_count >= 1:
+            text_outside = "\n".join(_outside_lines).strip()
+            if not text_outside or (
+                len(text_outside) < 80
+                and not self._looks_interrogative(text_outside)
+            ):
+                return True
 
-                config = ProcessConfig()
-                config.language = "markdown"
-                blocks = process(content, config)
-                fence_spans = [
-                    (b.start_byte, b.end_byte)
-                    for b in (getattr(blocks, "blocks", None) or [])
-                ]
-                if fence_spans:
-                    text_outside = self._text_outside_spans(content, fence_spans)
-                    if not text_outside or (
-                        len(text_outside) < 80
-                        and not self._looks_interrogative(text_outside)
-                    ):
-                        return True
+        # ── Step 2.5: large unfenced Python paste (structural certainty) ──────
+        # 'Paste the raw file' from the chat box arrives with no fences and,
+        # for a typical module, opens with a docstring — the classifier's
+        # 500-char window sees pure prose and can never call it code-only.
+        # Syntactically valid Python of real size is a bare paste by
+        # structure (the ast.parse fast path, lost in the LLM-only
+        # migration); a question can then only live inside a comment, a
+        # documented and accepted edge. Parsed in a worker thread (~1.2 s
+        # for a 1.8 MB file) — negligible against misrouting a 42k-line
+        # turn through the full pipeline and a generation.
+        if (
+            _fence_count == 0
+            and len(stripped) > 2000
+            and len(content.encode("utf-8", "ignore"))
+            <= SignatureExtractor.MAX_PARSE_SIZE_BYTES
+        ):
+            try:
+                await anyio.to_thread.run_sync(ast.parse, content)
+                return True
             except Exception:
                 pass
 
