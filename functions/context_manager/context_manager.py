@@ -14,6 +14,7 @@ import time
 import re
 import anyio
 import hashlib
+import difflib
 import sqlite3
 import ast
 import json
@@ -1987,9 +1988,7 @@ class ActivationGraph:
         # relative seed weights are preserved, and no consumer relies on
         # the scores summing to 1 (_normalize_ppr_scores rescales by max).
         personalization: Dict[str, float] = {
-            nid: s.score
-            for nid, s in self._activations.items()
-            if s.source == "seed"
+            nid: s.score for nid, s in self._activations.items() if s.source == "seed"
         }
         out_weight_total: Dict[str, float] = {}
         for src, edges in edges_out.items():
@@ -9056,6 +9055,23 @@ class StateStore:
             )
         """)
 
+        # --- NapMem diffs (raw code changes for long-term memory retrieval) ---
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS napmem_diffs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL,
+                block_hash  TEXT NOT NULL,
+                file_path   TEXT NOT NULL DEFAULT '',
+                turn_number INTEGER NOT NULL DEFAULT 0,
+                diff_text   TEXT NOT NULL,
+                created_at  REAL NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_napmem_diffs_pt
+                ON napmem_diffs (project_id, turn_number)
+        """)
+
         # --- Code path views (cached subgraph projections) ---
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS code_path_views (
@@ -10490,6 +10506,125 @@ class LongTermMemory:
     # 4. Main retrieval methods
     # ═══════════════════════════════════════════════════════════════════════════
 
+    async def napmem_search(
+        self, query: str, project_id: str, top_k: int
+    ) -> List[dict]:
+        """
+        NapMem retrieval: conversation summaries plus their associated diffs.
+
+        Zero-LLM pipeline (embedder + ChromaDB + CrossEncoder only), so it is
+        safe to call from agentic tool rounds without touching the KV slot.
+        Query expansion is deliberately absent: iterative refinement is done
+        by the calling model across tool rounds, not by auxiliary LLM calls.
+
+        Args:
+            query: Natural-language memory query (LLM-authored).
+            project_id: Current project identifier.
+            top_k: Maximum number of results to return.
+
+        Returns:
+            List of dicts shaped {"id", "summary", "diffs", "score"}, where
+            diffs is a list of {"file", "change"} dicts (empty when the hit
+            has no associated diffs) and score is the CrossEncoder relevance
+            in [0,1] (cosine-similarity fallback when the CE is not loaded).
+            Empty list when nothing is retrievable.
+        """
+        # ── Step 1: availability and input guards ──────────────────────────
+        query = (query or "").strip()
+        if not query:
+            return []
+        if not (HAS_SENTENCE and HAS_CHROMA and self._f.memory_collection is not None):
+            return []
+        if self._retrieval_disabled_reason:
+            self._f._log_debug(
+                f"napmem_search blocked — {self._retrieval_disabled_reason}"
+            )
+            return []
+
+        # ── Step 2: embed the query and fetch candidate summaries ──────────
+        try:
+            q_emb = await anyio.to_thread.run_sync(
+                lambda: self._f.embedder.encode(query[:1000]).tolist()
+            )
+            res = await anyio.to_thread.run_sync(
+                lambda: self._f.memory_collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=max(top_k * 2, top_k),
+                    where={
+                        "$and": [
+                            {"project_id": {"$eq": project_id}},
+                            {"is_session_summary": {"$eq": True}},
+                        ]
+                    },
+                    include=["documents", "metadatas", "distances"],
+                )
+            )
+        except Exception as e:
+            self._f._log_debug(f"napmem_search: ChromaDB query failed: {e}")
+            return []
+
+        ids = (res.get("ids") or [[]])[0]
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
+        if not docs:
+            return []
+        if len(dists) < len(docs):
+            dists = list(dists) + [None] * (len(docs) - len(dists))
+        if len(metas) < len(docs):
+            metas = list(metas) + [{}] * (len(docs) - len(metas))
+
+        # ── Step 3: rerank with the CrossEncoder (raw [0,1] scores) ────────
+        # _predict_cross_encoder already applies the model's sigmoid; no
+        # second normalization here. Fallback score is 1 - cosine distance.
+        ce_scores = await self._f._commands._predict_cross_encoder(
+            [(query, doc) for doc in docs]
+        )
+        scored = []
+        for idx, doc in enumerate(docs):
+            if ce_scores is not None and idx < len(ce_scores):
+                score = float(ce_scores[idx])
+            elif isinstance(dists[idx], (int, float)):
+                score = max(0.0, min(1.0, 1.0 - float(dists[idx])))
+            else:
+                score = 0.0
+            scored.append(
+                (score, ids[idx] if idx < len(ids) else "", doc, metas[idx] or {})
+            )
+        scored.sort(key=lambda t: t[0], reverse=True)
+        scored = scored[:top_k]
+
+        # ── Step 4: resolve associated diffs from napmem_diffs ─────────────
+        results: List[dict] = []
+        for score, doc_id, doc, meta in scored:
+            diffs: List[dict] = []
+            raw_ids = str(meta.get("napmem_diff_ids", "") or "")
+            diff_ids = [int(t) for t in raw_ids.split(",") if t.strip().isdigit()]
+            if diff_ids:
+                try:
+                    placeholders = ",".join("?" for _ in diff_ids)
+                    _sql = (
+                        f"SELECT file_path, diff_text FROM napmem_diffs "
+                        f"WHERE id IN ({placeholders}) ORDER BY id"
+                    )
+                    # Bind per-iteration values as defaults: the lambda is
+                    # awaited within this iteration today, but default-arg
+                    # capture keeps it correct if the loop is ever gathered.
+                    rows = await self._f._state_store._db_read(
+                        lambda s=_sql, p=tuple(diff_ids): self._f._db_conn.execute(
+                            s, p
+                        ).fetchall()
+                    )
+                    diffs = [
+                        {"file": r[0] or "?", "change": r[1]} for r in (rows or [])
+                    ]
+                except Exception as e:
+                    self._f._log_debug(f"napmem_search: diff fetch failed: {e}")
+            results.append(
+                {"id": doc_id, "summary": doc, "diffs": diffs, "score": score}
+            )
+        return results
+
     async def retrieve_memories_unified(
         self,
         query: str,
@@ -11695,9 +11830,7 @@ class LLMOrchestrator:
         # recommendation (reasoning calls default True; structured/JSON
         # contracts pass False).
         _think_mode = (
-            str(getattr(self._f.valves, "llm_thinking_mode", "auto"))
-            .strip()
-            .lower()
+            str(getattr(self._f.valves, "llm_thinking_mode", "auto")).strip().lower()
         )
         if _think_mode in ("off", "false", "0", "no"):
             enable_thinking = False
@@ -12535,7 +12668,8 @@ class AgenticStepCache:
 
 class AgenticToolBroker:
     """
-    Deterministic, zero-LLM tools a step may request mid-execution.
+    Deterministic tools with zero LLM-slot cost a step may request
+    mid-execution.
 
     Generalizes the /expand resolution the architecture CoT already does:
     a step emits `TOOL: NAME(arg)` lines, the broker resolves them from the
@@ -12543,20 +12677,133 @@ class AgenticToolBroker:
     appended to the step conversation. Every tool is local and free — the
     only cost of a tool round is the incremental prefill of the appended
     text, since the step prompt grows append-only under the aligned prefix.
+    MEMORY additionally touches the embedder, ChromaDB and the CrossEncoder
+    (all local models off the llama.cpp slot), never call_llm.
     """
 
     _MAX_BODY_CHARS = 6000
     _MAX_EDGES = 20
     _MAX_GREP_LINES = 20
     _MAX_GREP_SCAN_CHARS = 2_000_000
+    _MAX_MEMORY_RESULT_CHARS = 12_000
+    _MAX_MEMORY_QUERY_CHARS = 300
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+
+    async def resolve_async(self, name: str, arg: str, project_id: str) -> str:
+        """
+        Async-capable dispatcher: routes MEMORY to its awaitable resolver
+        and delegates every other tool to the synchronous resolve().
+
+        Args:
+            name: Tool name (EXPAND | CALLERS | CALLEES | DOC | GREP | MEMORY).
+            arg: Raw argument as written by the model.
+            project_id: Current project identifier.
+
+        Returns:
+            Result text, or a bracketed diagnostic on failure.
+        """
+        if name.upper().strip() == "MEMORY":
+            try:
+                return await self._memory(arg.strip().strip("\"'"), project_id)
+            except Exception as e:
+                return f"[MEMORY({arg}) failed: {e}]"
+        return self.resolve(name, arg, project_id)
+
+    async def _memory(self, query: str, project_id: str) -> str:
+        """
+        Long-term memory search (NapMem): conversation summaries plus the
+        code diffs associated with them, retrieved via napmem_search.
+
+        Args:
+            query: Natural-language memory query authored by the model.
+            project_id: Current project identifier.
+
+        Returns:
+            Formatted memory results, or a bracketed note (disabled tool,
+            empty/over-long query, or the explicit no-results fallback the
+            model is instructed to acknowledge).
+        """
+        # ── Step 1: guards ──────────────────────────────────────────────────
+        if not getattr(self._f.valves, "napmem_tool_enable", False):
+            return "[MEMORY: tool disabled by configuration]"
+        if not query:
+            return "[MEMORY: empty query]"
+        if len(query) > self._MAX_MEMORY_QUERY_CHARS:
+            return (
+                f"[MEMORY: query longer than {self._MAX_MEMORY_QUERY_CHARS} "
+                "chars — refine it]"
+            )
+
+        # ── Step 2: retrieval ───────────────────────────────────────────────
+        top_k = int(getattr(self._f.valves, "napmem_top_k", 3))
+        hits = await self._f._ltm.napmem_search(query, project_id, top_k)
+        if not hits:
+            self._f._log_debug(
+                f"🧠 NapMem MEMORY fired: '{query[:80]}' → 0 hits (fallback)"
+            )
+            return (
+                f"[MEMORY: no relevant memories found for '{query}' — "
+                "refine the query or proceed with the current context]"
+            )
+        self._f._log_debug(
+            f"🧠 NapMem MEMORY fired: '{query[:80]}' → {len(hits)} hit(s), "
+            f"best score {hits[0].get('score', 0.0):.2f}, "
+            f"{sum(len(h.get('diffs') or []) for h in hits)} diff(s)"
+        )
+
+        # ── Step 3: render ──────────────────────────────────────────────────
+        return self._format_memory_hits(query, hits)
+
+    def _format_memory_hits(self, query: str, hits: List[dict]) -> str:
+        """
+        Render napmem_search hits as structured text for the step prompt.
+
+        Per-diff truncation follows napmem_diff_truncate_chars (0 = no
+        per-diff truncation); the aggregate result is always capped at
+        _MAX_MEMORY_RESULT_CHARS so a round's appended delta stays bounded.
+
+        Args:
+            query: The original memory query (echoed in the header).
+            hits: Result dicts from napmem_search.
+
+        Returns:
+            The formatted results block.
+        """
+        trunc = int(getattr(self._f.valves, "napmem_diff_truncate_chars", 0))
+        lines = [f'### Long-term memory results for: "{query}"']
+        for n, hit in enumerate(hits, 1):
+            summary = str(hit.get("summary", "")).strip()
+            score = float(hit.get("score", 0.0))
+            lines.append(f"{n}. [score: {score:.2f}] {summary}")
+            diffs = hit.get("diffs") or []
+            if not diffs:
+                lines.append("   (no associated diffs)")
+            for d in diffs:
+                change = str(d.get("change", ""))
+                if trunc > 0 and len(change) > trunc:
+                    change = change[:trunc] + "\n... [diff truncated by valve]"
+                lines.append(f"   Diff ({d.get('file', '?')}):")
+                lines.append("   ```")
+                lines.extend(f"   {ln}" for ln in change.splitlines())
+                lines.append("   ```")
+        text = "\n".join(lines)
+        if len(text) > self._MAX_MEMORY_RESULT_CHARS:
+            text = (
+                text[: self._MAX_MEMORY_RESULT_CHARS]
+                + "\n... [memory results truncated by broker]"
+            )
+        return text
 
     def resolve(self, name: str, arg: str, project_id: str) -> str:
         """
         Resolve one tool request to a text result. Never raises: failures
         come back as bracketed notes so the step can keep reasoning.
+
+        MEMORY is NOT handled here — it needs awaits and is routed by
+        resolve_async before this method is reached; a direct call with
+        MEMORY falls through to the unknown-tool note by design.
 
         Args:
             name: Tool name (EXPAND | CALLERS | CALLEES | DOC | GREP).
@@ -14052,8 +14299,16 @@ class AgenticPlanner:
         "other steps).\n"
         "- symbols lists exact qualified names from the context that the "
         "step should focus on (may be empty).\n\n"
+        "{memory_hint}"
         "{seed_hint}"
         "Question:\n{question}"
+    )
+
+    _MEMORY_HINT = (
+        "Note: steps can consult long-term memory (past decisions, resolved "
+        "bugs, previous code changes with their diffs) via a MEMORY tool. "
+        "When the question may depend on prior work, phrase the relevant "
+        "step goal to include checking memory for it.\n\n"
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -14101,8 +14356,16 @@ class AgenticPlanner:
         # relevant symbols and whether this is debug/refactor/explain sharpen
         # the step breakdown. Best-effort: any failure yields an empty hint.
         seed_hint = await self._build_seed_hint(question, project_id)
+        # NapMem: tell the planner the MEMORY tool exists so investigate
+        # goals can be phrased to include past-work lookups (V4 lever).
+        memory_hint = (
+            self._MEMORY_HINT
+            if getattr(self._f.valves, "napmem_tool_enable", False)
+            else ""
+        )
         prompt = (
             self._CONTRACT.replace("{max_steps}", str(max_steps))
+            .replace("{memory_hint}", memory_hint)
             .replace("{seed_hint}", seed_hint)
             .replace("{question}", question)
         )
@@ -14280,7 +14543,11 @@ class AgenticStepExecutor:
         ),
     }
 
-    _CLAIMS_CONTRACT = (
+    # The step contract is assembled from these parts in build_prompt so the
+    # MEMORY tool can join the menu conditionally. With napmem_tool_enable
+    # off, MENU + TAIL + JSON concatenate byte-identically to the historical
+    # single-constant contract.
+    _TOOLS_MENU = (
         "\n\nAt any point BEFORE finishing you may request local tools by "
         "emitting lines exactly like:\n"
         "TOOL: EXPAND(SymbolName)   — full body of a symbol\n"
@@ -14288,7 +14555,25 @@ class AgenticStepExecutor:
         "TOOL: CALLEES(Qualified.Name) — what it calls\n"
         "TOOL: DOC(SymbolName)      — its docstring\n"
         "TOOL: GREP(pattern)        — matching lines in the code\n"
-        "Results will be appended and you will continue the step."
+    )
+
+    _MEMORY_MENU_LINE = (
+        "TOOL: MEMORY(natural language query) — long-term memory: past "
+        "decisions, resolved bugs, previous code changes (summaries with "
+        "their diffs)\n"
+    )
+
+    _TOOLS_TAIL = "Results will be appended and you will continue the step."
+
+    _MEMORY_GUIDANCE = (
+        "\nUse MEMORY proactively when the goal may depend on past "
+        "decisions, resolved bugs or previous code changes; refine the "
+        "query and retry if the first results are not useful; if nothing "
+        "useful is found, acknowledge that and proceed with the current "
+        "context."
+    )
+
+    _JSON_CONTRACT = (
         "\n\nWhen you finish, end with a fenced JSON block exactly like:\n"
         "```json\n"
         '{"claims": [{"claim": "<one factual statement>", '
@@ -14333,13 +14618,24 @@ class AgenticStepExecutor:
             instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
                 step.symbols
             )
-        instruction += self._CLAIMS_CONTRACT
+        # Region: assemble the step contract (MEMORY joins the tool menu so
+        # the model sees it as a peer option, and its usage guidance lands
+        # BEFORE the JSON finishing contract, which must stay the last thing
+        # read).
+        instruction += self._TOOLS_MENU
+        _memory_on = getattr(self._f.valves, "napmem_tool_enable", False)
+        if _memory_on:
+            instruction += self._MEMORY_MENU_LINE
+        instruction += self._TOOLS_TAIL
+        if _memory_on:
+            instruction += self._MEMORY_GUIDANCE
+        instruction += self._JSON_CONTRACT
         if workspace:
             return f"{workspace}## Step instruction\n{instruction}"
         return f"## Step instruction\n{instruction}"
 
     _TOOL_RE = re.compile(
-        r"^TOOL:\s*(EXPAND|CALLERS|CALLEES|DOC|GREP)\((.+?)\)\s*$", re.M
+        r"^TOOL:\s*(EXPAND|CALLERS|CALLEES|DOC|GREP|MEMORY)\((.+?)\)\s*$", re.M
     )
 
     async def run(
@@ -14418,8 +14714,11 @@ class AgenticStepExecutor:
                 break
 
             # -- resolve up to 4 unique requests and append the delta ------
+            # Sequential on purpose: MEMORY is the only real awaitable and
+            # DB writes are queue-serialized; gather would only interleave
+            # log lines without saving wall-clock time.
             seen = list(dict.fromkeys(requests))[:4]
-            results = [broker.resolve(n, a, project_id) for n, a in seen]
+            results = [await broker.resolve_async(n, a, project_id) for n, a in seen]
             self._f._log_debug(
                 f"🤖 Agentic step {step.id}: tool round {round_no + 1} — "
                 + ", ".join(f"{n}({a[:30]})" for n, a in seen)
@@ -15793,12 +16092,9 @@ class AgenticOrchestrator:
                 _bad = [
                     c
                     for c in _step_claims
-                    if self._ledger._structural_invalid_qids(c)
-                    or c.invalid_relations
+                    if self._ledger._structural_invalid_qids(c) or c.invalid_relations
                 ]
-                _good = [
-                    c for c in _step_claims if c.valid_qids and c not in _bad
-                ]
+                _good = [c for c in _step_claims if c.valid_qids and c not in _bad]
                 _exit_ok = bool(_good) and not _bad
                 if not _exit_ok:
                     self._f._log_debug(
@@ -20443,8 +20739,7 @@ class CommandRouter:
         if _fence_count >= 1:
             text_outside = "\n".join(_outside_lines).strip()
             if not text_outside or (
-                len(text_outside) < 80
-                and not self._looks_interrogative(text_outside)
+                len(text_outside) < 80 and not self._looks_interrogative(text_outside)
             ):
                 return True
 
@@ -27937,6 +28232,8 @@ class EnrichmentTasks:
         block_hash: str,
         prev_content: str,
         new_content: str,
+        project_id: str = "",
+        file_path: str = "",
     ) -> None:
         """
         Generate and persist a one-sentence change summary immediately.
@@ -27945,7 +28242,89 @@ class EnrichmentTasks:
         so no max_tokens ceiling is needed — the model terminates naturally.
         enable_thinking=False avoids reasoning overhead on a deterministic
         single-sentence task.
+
+        When project_id is provided, the raw unified diff of the change is
+        also persisted to the napmem_diffs table (Step 0), tagged with the
+        global turn number so turn summaries can later attach it as NapMem
+        associated-diff context.
+
+        Args:
+            block_hash: Hash of the block's NEW content.
+            prev_content: Block content before the change.
+            new_content: Block content after the change.
+            project_id: Current project identifier ('' skips diff persistence).
+            file_path: File path of the block, used as diff header.
         """
+        # ── Step 0: Persist the raw unified diff for NapMem ────────────────
+        # Runs before the LLM call so the diff survives silent ingestion
+        # (call_llm returns None for this label there) and summary failures.
+        # The source cap guards against quadratic difflib cost on huge
+        # blocks (whole-file pastes): an oversized change is recorded as a
+        # synthetic one-line stub instead of a computed diff.
+        if project_id and prev_content != new_content:
+            try:
+                src_cap = int(
+                    getattr(self._f.valves, "napmem_diff_source_max_chars", 400_000)
+                )
+                turn_number = int(
+                    self._f._project_state_manager.get_pstate(project_id).get(
+                        "napmem_turn_number", 0
+                    )
+                )
+                if src_cap > 0 and (len(prev_content) + len(new_content)) > src_cap:
+                    diff_text = (
+                        f"[diff omitted: block too large — "
+                        f"{len(prev_content)} -> {len(new_content)} chars, "
+                        f"file {file_path or '?'}]"
+                    )
+                else:
+                    diff_text = "".join(
+                        difflib.unified_diff(
+                            prev_content.splitlines(keepends=True),
+                            new_content.splitlines(keepends=True),
+                            fromfile=file_path or "a",
+                            tofile=file_path or "b",
+                            n=2,
+                        )
+                    )
+                if diff_text:
+                    _created = time.time()
+                    _keep = int(getattr(self._f.valves, "napmem_max_stored_diffs", 500))
+                    _is_cont = self._f._project_state_manager.get_is_continuation(
+                        project_id
+                    )
+
+                    def _write_diff():
+                        self._f._db_conn.execute(
+                            "INSERT INTO napmem_diffs "
+                            "(project_id, block_hash, file_path, turn_number, "
+                            "diff_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                project_id,
+                                block_hash,
+                                file_path or "",
+                                turn_number,
+                                diff_text,
+                                _created,
+                            ),
+                        )
+                        self._f._db_conn.execute(
+                            "DELETE FROM napmem_diffs WHERE id NOT IN "
+                            "(SELECT id FROM napmem_diffs "
+                            "ORDER BY created_at DESC, id DESC LIMIT ?)",
+                            (_keep,),
+                        )
+                        self._f._db_conn.commit()
+
+                    await self._f._state_store._db_enqueue(_write_diff)
+                    self._f._log_debug(
+                        f"🧠 NapMem diff persisted: turn={turn_number}, "
+                        f"file={file_path or '?'}, {len(diff_text)} chars, "
+                        f"continuation={_is_cont}"
+                    )
+            except Exception as e:
+                self._f._log_debug(f"NapMem diff persist failed: {e}")
+
         model = self._f.valves.llm_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
@@ -29282,9 +29661,7 @@ class EnrichmentTasks:
         )
 
         # Region: sort by visibility priority — skeleton-tier and LOD-2 first
-        prioritized_qids = self._prioritize_docstring_targets(
-            pending_qids, project_id
-        )
+        prioritized_qids = self._prioritize_docstring_targets(pending_qids, project_id)
 
         self._f._log_debug(
             f"bg_docstring: prioritized {len(prioritized_qids)} symbols, "
@@ -30185,7 +30562,11 @@ class ActiveCodeUpdater:
 
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
-                    existing.hash, prev_content, new_block.content
+                    existing.hash,
+                    prev_content,
+                    new_block.content,
+                    project_id=project_id,
+                    file_path=existing.file_path or "",
                 )
             return
 
@@ -30224,7 +30605,11 @@ class ActiveCodeUpdater:
 
             if prev_content != new_block.content:
                 await self._f._enrichment.generate_change_summary(
-                    existing.hash, prev_content, new_block.content
+                    existing.hash,
+                    prev_content,
+                    new_block.content,
+                    project_id=project_id,
+                    file_path=existing.file_path or "",
                 )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -30591,7 +30976,11 @@ class ActiveCodeUpdater:
                     state.has_any_calls = True
                 if prev_content != block_info["code"]:
                     await self._f._enrichment.generate_change_summary(
-                        best_base.hash, prev_content, block_info["code"]
+                        best_base.hash,
+                        prev_content,
+                        block_info["code"],
+                        project_id=project_id,
+                        file_path=best_base.file_path or "",
                     )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -32083,6 +32472,41 @@ class SystemPromptBuilder:
             and HAS_CHROMA
         ):
             return None
+
+        # NapMem static-injection gate. 'off' always skips the injection;
+        # 'auto' skips it only when the MEMORY tool will actually be
+        # reachable this turn, i.e. when the agentic pipeline entry gate
+        # (see _detect_and_generate_cot) is going to fire — same blocking
+        # conditions, same reference-line diet on the question. Turns the
+        # pipeline skips (continuations, busy slot, architecture queries,
+        # non-code, empty question) keep the static injection, so no turn
+        # is ever memory-blind. A wrong guess in the other direction only
+        # yields a harmless hybrid turn.
+        _static_mode = (
+            str(getattr(self._f.valves, "napmem_static_ltm", "auto")).strip().lower()
+        )
+        if _static_mode == "off":
+            self._f._log_debug("LTM static injection skipped (napmem_static_ltm=off)")
+            return None
+        if _static_mode == "auto":
+            _q_gate = self._f._commands._REFERENCE_LINE_RE.sub(
+                "",
+                (user_question or "").strip() or (user_query or "").strip(),
+            ).strip()[:2000]
+            _pipeline_reachable = (
+                getattr(self._f.valves, "napmem_tool_enable", False)
+                and getattr(self._f.valves, "enable_agentic_pipeline", False)
+                and not is_continuation
+                and slot_free
+                and bool(_q_gate)
+                and not self._f._reasoning.is_architecture_query(_q_gate)
+            )
+            if _pipeline_reachable:
+                self._f._log_debug(
+                    "LTM static injection skipped (napmem_static_ltm=auto — "
+                    "MEMORY tool reachable via the agentic pipeline this turn)"
+                )
+                return None
 
         _ltm_query = user_question if user_question else user_query
 
@@ -34393,6 +34817,28 @@ class MessageAssembler:
             msg_id = (
                 f"{project_id}_turnsummary_{turn_start}_{turn_end}_{int(time.time())}"
             )
+
+            # ------------------------------------------------------------------
+            # Region: NapMem — attach diff ids covered by this turn range
+            # ------------------------------------------------------------------
+            # Diffs are tagged with the global turn number at capture time
+            # (see generate_change_summary Step 0); the covers_turns range of
+            # this summary selects them exactly. Chroma metadata only accepts
+            # scalars, so the ids are materialized as a comma-joined string.
+            napmem_diff_ids = ""
+            try:
+                rows = await self._f._state_store._db_read(
+                    lambda: self._f._db_conn.execute(
+                        "SELECT id FROM napmem_diffs "
+                        "WHERE project_id = ? AND turn_number BETWEEN ? AND ? "
+                        "ORDER BY id",
+                        (project_id, turn_start, turn_end),
+                    ).fetchall()
+                )
+                napmem_diff_ids = ",".join(str(r[0]) for r in (rows or []))
+            except Exception as e:
+                self._f._log_debug(f"NapMem diff-id attach failed: {e}")
+
             await anyio.to_thread.run_sync(
                 lambda: self._f.memory_collection.upsert(
                     ids=[msg_id],
@@ -34409,6 +34855,7 @@ class MessageAssembler:
                             "covers_turn_end": turn_end,
                             "content_type": ContentType.GENERAL.value,
                             "has_code": False,
+                            "napmem_diff_ids": napmem_diff_ids,
                         }
                     ],
                 )
@@ -39728,7 +40175,7 @@ class Filter:
             ),
         )
         agentic_ledger_persist: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "#11: persist the agentic evidence ledger between turns. At "
                 "the end of a pipeline run the claims are snapshotted into "
@@ -40330,6 +40777,65 @@ class Filter:
             ge=0.0,
             le=1.0,
             description="0.0 = semantic only, 1.0 = graph only.",
+        )
+
+        # ── 9.x NapMem (agentic long-term memory tool) ───────────────────────
+        napmem_max_stored_diffs: int = Field(
+            default=500,
+            ge=50,
+            description=(
+                "Global retention cap for rows in the napmem_diffs table. "
+                "Oldest rows beyond the cap are deleted on insert."
+            ),
+        )
+        napmem_diff_source_max_chars: int = Field(
+            default=400_000,
+            ge=0,
+            description=(
+                "Cap on len(prev)+len(new) above which the unified diff is "
+                "not computed (quadratic difflib cost on whole-file pastes); "
+                "a synthetic one-line stub is stored instead. 0 disables the "
+                "cap (not recommended)."
+            ),
+        )
+        napmem_top_k: int = Field(
+            default=3,
+            ge=1,
+            le=5,
+            description=(
+                "Maximum memories returned per MEMORY tool search "
+                "(summaries with their associated diffs)."
+            ),
+        )
+        napmem_tool_enable: bool = Field(
+            default=True,
+            description=(
+                "Expose the MEMORY tool (NapMem long-term memory search) to "
+                "agentic steps. Off removes the tool from the step contract "
+                "and the broker rejects MEMORY requests."
+            ),
+        )
+        napmem_diff_truncate_chars: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Per-diff truncation when rendering MEMORY results. 0 = no "
+                "per-diff truncation (default). The aggregate tool result is "
+                "always capped by the broker regardless of this value."
+            ),
+        )
+        napmem_static_ltm: str = Field(
+            default="auto",
+            description=(
+                "'on' = inject retrieved LTM memories into the system prompt "
+                "every turn (legacy behavior). 'auto' (default) = skip the "
+                "static injection only on turns where the agentic pipeline "
+                "fires and the MEMORY tool is therefore reachable; turns the "
+                "pipeline skips (continuations, busy slot, architecture "
+                "queries) keep the injection so no turn is memory-blind. "
+                "'off' = never inject; memory is on-demand only. LTM storage "
+                "is unaffected in every mode."
+            ),
         )
 
         # ═════════════════════════════════════════════════════════════════════════
@@ -41548,6 +42054,19 @@ class Filter:
             state.reset_wm_metrics()
             psm = self._project_state_manager
             pstate = psm.get_pstate(project_id)
+
+            # ------------------------------------------------------------------
+            # Region: record the global turn number for NapMem diff tagging
+            # ------------------------------------------------------------------
+            # Same 1-based user-turn basis as WindowManager._index_turns: the
+            # client resends the full history each turn, so the count is a
+            # stable global turn number. Diffs persisted this inlet are tagged
+            # with it; turn summaries later attach diffs by covers_turns range.
+            pstate["napmem_turn_number"] = sum(
+                1
+                for m in (body.get("messages") or [])
+                if isinstance(m, dict) and m.get("role") == "user"
+            )
 
             # ------------------------------------------------------------------
             # Region: clear per-turn slot-restore guards
