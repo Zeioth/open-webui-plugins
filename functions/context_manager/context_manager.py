@@ -32590,12 +32590,19 @@ class SystemPromptBuilder:
                 "",
                 (user_question or "").strip() or (user_query or "").strip(),
             ).strip()[:2000]
+            _turn_cls_gate = (
+                self._f._project_state_manager.get_pstate(project_id).get(
+                    "turn_classification"
+                )
+                or {}
+            )
             _pipeline_reachable = (
                 getattr(self._f.valves, "napmem_tool_enable", False)
                 and getattr(self._f.valves, "enable_agentic_pipeline", False)
                 and not is_continuation
                 and slot_free
                 and bool(_q_gate)
+                and bool(_turn_cls_gate.get("is_code_session", True))
                 and not self._f._reasoning.is_architecture_query(_q_gate)
             )
             if _pipeline_reachable:
@@ -34160,6 +34167,20 @@ class MessageAssembler:
         _agentic_question = self._f._commands._REFERENCE_LINE_RE.sub(
             "", (user_question or "").strip() or user_content.strip()
         ).strip()[:2000]
+        # Per-TURN code verdict from the unified classifier. is_code_session
+        # is sticky by design (classify_session returns True for the whole
+        # session once active blocks exist — correct for LTM and code-aware
+        # features), but the gate needs the turn dimension: a greeting in the
+        # middle of a code session must not spend minutes in the pipeline.
+        # Fail-open True: when the classifier did not run (trivial/default),
+        # the gate behaves exactly as before.
+        _turn_cls = (
+            self._f._project_state_manager.get_pstate(project_id).get(
+                "turn_classification"
+            )
+            or {}
+        )
+        _turn_is_code = bool(_turn_cls.get("is_code_session", True))
         if self._f.valves.enable_agentic_pipeline:
             _block_reason = ""
             if is_continuation:
@@ -34168,6 +34189,8 @@ class MessageAssembler:
                 _block_reason = "slot busy"
             elif not is_code_session:
                 _block_reason = "non-code turn (fast path)"
+            elif not _turn_is_code:
+                _block_reason = "non-code turn (unified turn classifier)"
             elif not _agentic_question:
                 _block_reason = "empty question"
             elif self._f._reasoning.is_architecture_query(_agentic_question):
