@@ -31190,6 +31190,103 @@ class InletOrchestrator:
             f"indexed in the SymbolGraph; ask for any implementation by name)_"
         )
 
+    _PASTE_DIET_SPAN_FLOOR = 2000
+
+    async def apply_current_turn_paste_diet(
+        self, messages: list, project_id: str
+    ) -> list:
+        """
+        Replace oversized, already-indexed code spans in the CURRENT user
+        message with one-line SymbolGraph references, keeping prose intact.
+
+        The silent-ingestion path already stubs code-only pastes, but a paste
+        accompanied by prose flows through the normal reasoning path and the
+        raw blob reaches llama.cpp verbatim — the only layer where a context
+        overflow can actually happen. Running this after
+        inlet_prepare_code_session (symbols are indexed by then) bounds the
+        outgoing turn regardless of paste size, which is what allows running
+        the server at a native-window --ctx-size instead of a YaRN-stretched
+        one.
+
+        Only spans whose content hash is registered in the project's active
+        blocks are replaced — an unindexed span is never destroyed. Spans
+        shorter than _PASTE_DIET_SPAN_FLOOR chars are kept for readability.
+        The replacement reuses _indexed_reference_line, so the spliced text
+        is automatically covered by the _REFERENCE_LINE_RE diet the
+        classifiers and the agentic gate already apply.
+
+        Args:
+            messages: The turn's message list (last user message may be
+                mutated in place).
+            project_id: Current project identifier.
+
+        Returns:
+            The same message list, possibly with a slimmed last user message.
+        """
+        # ── Step 1: valve gate and cheap size pre-check ─────────────────────
+        budget = int(getattr(self._f.valves, "paste_diet_max_chars", 100_000))
+        if budget <= 0 or not messages:
+            return messages
+        target = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if target is None:
+            return messages
+        content = self._f._coerce_message_content(target.get("content"))
+        if len(content) <= budget:
+            return messages
+
+        # ── Step 2: extract spans and measure the code payload ──────────────
+        try:
+            extracted, spans = await self._f._code_blocks.extract_code_blocks(
+                content, project_id
+            )
+        except Exception as e:
+            self._f._log_debug(f"Paste diet: span extraction failed: {e}")
+            return messages
+        if not spans or len(extracted) != len(spans):
+            return messages
+        total_span_chars = sum(e - s for s, e in spans)
+        if total_span_chars <= budget:
+            return messages
+
+        # ── Step 3: replace indexed oversized spans, back to front ──────────
+        state = self._f._conversation_state_manager.get(project_id)
+        blocks_by_hash = {b.hash: b for b in state.active_blocks}
+        replaced = 0
+        saved_chars = 0
+        new_content = content
+        for (span_start, span_end), blk in sorted(
+            zip(spans, extracted), key=lambda t: t[0][0], reverse=True
+        ):
+            span_len = span_end - span_start
+            if span_len < self._PASTE_DIET_SPAN_FLOOR:
+                continue
+            code = blk.get("code", "") or ""
+            known = blocks_by_hash.get(
+                hashlib.md5(code.encode()).hexdigest()[:16]
+            )
+            if known is None:
+                continue
+            name = blk.get("file_path") or known.file_path or "pasted code"
+            sym_count = len(getattr(known, "symbols", []) or []) or "?"
+            stub = self._indexed_reference_line(name, sym_count)
+            new_content = (
+                new_content[:span_start] + stub + new_content[span_end:]
+            )
+            replaced += 1
+            saved_chars += span_len - len(stub)
+
+        # ── Step 4: commit and log ──────────────────────────────────────────
+        if replaced:
+            target["content"] = new_content
+            self._f._log_debug(
+                f"🥗 Paste diet: {replaced} indexed span(s) replaced, "
+                f"{saved_chars} chars saved (payload {total_span_chars} > "
+                f"budget {budget})"
+            )
+        return messages
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Preprocessing (project switch, cache load, slot restore)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -40842,6 +40939,19 @@ class Filter:
         # 10. CONTEXT COMPRESSION
         # ═════════════════════════════════════════════════════════════════════════
 
+        # ── 10.0 Current-turn paste diet ─────────────────────────────────────
+        paste_diet_max_chars: int = Field(
+            default=100_000,
+            ge=0,
+            description=(
+                "When the current user message's fenced-code payload exceeds "
+                "this many characters, spans whose blocks are already indexed "
+                "are replaced with one-line SymbolGraph references (prose is "
+                "kept). Bounds the outgoing turn so the server can run at a "
+                "native-window --ctx-size without YaRN. 0 disables the diet."
+            ),
+        )
+
         # ── 10.1 History compression (LLMLingua) ─────────────────────────────
         enable_history_llmlingua: bool = Field(
             default=True,
@@ -42564,6 +42674,13 @@ class Filter:
                 )
             )
             _inlet_timing("Step 5/6: Prepare code session", step_start)
+
+            # 🥗 Current-turn paste diet: bound the outgoing turn even when a
+            # large paste arrives WITH prose (silent ingestion only covers
+            # code-only turns). Runs after Step 5 so the blocks are indexed.
+            messages = await self._inlet_orch.apply_current_turn_paste_diet(
+                messages, project_id
+            )
 
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
