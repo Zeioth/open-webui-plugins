@@ -39328,7 +39328,7 @@ class Filter:
 
         # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
-            default=393216,
+            default=131072,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
         llama_cpp_keep_tokens: int = Field(
@@ -40203,7 +40203,7 @@ class Filter:
             ),
         )
         agentic_step_max_tokens: int = Field(
-            default=700,
+            default=2500,
             ge=100,
             description="Generation cap per agentic step.",
         )
@@ -40216,7 +40216,7 @@ class Filter:
             ),
         )
         agentic_max_seconds: int = Field(
-            default=180,
+            default=480,
             ge=10,
             description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
         )
