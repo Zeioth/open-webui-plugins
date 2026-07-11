@@ -12215,6 +12215,7 @@ class AgenticStep:
     symbols: List[str] = field(default_factory=list)
     cached: bool = False
     skip_reason: str = ""
+    display_no: int = 0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
 
 
 @dataclass
@@ -15318,7 +15319,7 @@ class AgenticOrchestrator:
             )
             return 0
         per_claim = max(4.0, deadline / len(claims))
-        _prefix = status_prefix or f"🤖 Agentic step {step.id}"
+        _prefix = status_prefix or f"🤖 Agentic step {step.display_no}"
         await self._f._emit_status(
             f"{_prefix} · metacog: static falsification of "
             f"{len(claims)} claim(s), ≤{deadline:.0f}s"
@@ -15813,6 +15814,15 @@ class AgenticOrchestrator:
                 ),
             )
 
+        # Region: stamp 1-based display_no from the final execution order.
+        # The verify auto-insert above places its step by POSITION but gives
+        # it a max()+1 id, so id order no longer matches list order; user
+        # labels must follow the list, not the id, or the last two steps
+        # read swapped (e.g. "3" then "2"). id stays the stable cache/ledger
+        # key; display_no is presentation only.
+        for _pos, _s in enumerate(plan.steps, start=1):
+            _s.display_no = _pos
+
         # Region: sequential execution — cache, tools, control signals
         self._ledger.reset()
         structure_hash = ""
@@ -15862,13 +15872,13 @@ class AgenticOrchestrator:
                             "no explicit !test — static verify used instead)"
                         )
                         self._f._log_debug(
-                            f"🤖 Agentic step {step.id} (verify_dynamic): "
+                            f"🤖 Agentic step {step.display_no} (verify_dynamic): "
                             "skipped — gated on need (#10)"
                         )
                         idx += 1
                         continue
                 await self._f._emit_status(
-                    f"🤖 Agentic step {step.id}/{len(plan.steps)} "
+                    f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                     f"(verify_dynamic): executing test harnesses"
                 )
                 await self._dyn.run_dynamic_step(
@@ -15877,7 +15887,7 @@ class AgenticOrchestrator:
                 if step.status == "done":
                     step.digest = self._digest(step.output)
                 self._f._log_debug(
-                    f"🤖 Agentic step {step.id} (verify_dynamic): "
+                    f"🤖 Agentic step {step.display_no} (verify_dynamic): "
                     f"{step.status} in {step.seconds:.1f}s"
                 )
                 idx += 1
@@ -15888,7 +15898,7 @@ class AgenticOrchestrator:
             # the dynamic verifier, keyed by qid and body_hash).
             if step.kind == "verify_regression":
                 await self._f._emit_status(
-                    f"🤖 Agentic step {step.id}/{len(plan.steps)} "
+                    f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                     f"(verify_regression): re-checking callers"
                 )
                 await self._dyn.run_regression_step(
@@ -15897,7 +15907,7 @@ class AgenticOrchestrator:
                 if step.status == "done":
                     step.digest = self._digest(step.output)
                 self._f._log_debug(
-                    f"🤖 Agentic step {step.id} (verify_regression): "
+                    f"🤖 Agentic step {step.display_no} (verify_regression): "
                     f"{step.status} in {step.seconds:.1f}s"
                 )
                 idx += 1
@@ -15908,7 +15918,7 @@ class AgenticOrchestrator:
             # goal-keyed cache entry would collide across different runs)
             if step.kind == "verify":
                 await self._f._emit_status(
-                    f"🤖 Agentic step {step.id}/{len(plan.steps)} "
+                    f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                     f"(verify): checking workspace claims"
                 )
                 await self._verifier.run_verify_step(
@@ -15917,7 +15927,7 @@ class AgenticOrchestrator:
                 if step.status == "done":
                     step.digest = self._digest(step.output)
                 self._f._log_debug(
-                    f"🤖 Agentic step {step.id} (verify): {step.status} "
+                    f"🤖 Agentic step {step.display_no} (verify): {step.status} "
                     f"in {step.seconds:.1f}s"
                 )
                 idx += 1
@@ -15933,13 +15943,13 @@ class AgenticOrchestrator:
                     step.cached = True
                     self._ledger.restore(step, hit["claims_json"])
                     self._f._log_debug(
-                        f"🤖 Agentic step {step.id} ({step.kind}): cache hit"
+                        f"🤖 Agentic step {step.display_no} ({step.kind}): cache hit"
                     )
                     idx += 1
                     continue
 
             await self._f._emit_status(
-                f"🤖 Agentic step {step.id}/{len(plan.steps)} "
+                f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                 f"({step.kind}): {step.goal[:60]}"
             )
             workspace = self._render_workspace(plan.steps)
@@ -15971,7 +15981,7 @@ class AgenticOrchestrator:
                     _rem_compete,
                     project_id,
                     status_prefix=(
-                        f"🤖 Agentic step {step.id}/{len(plan.steps)} " f"(hypothesize)"
+                        f"🤖 Agentic step {step.display_no}/{len(plan.steps)} " f"(hypothesize)"
                     ),
                 )
                 if _slot_dirtied and self._f.valves.enable_slot_persistence:
@@ -16003,7 +16013,7 @@ class AgenticOrchestrator:
                                 _rem_now,
                                 project_id,
                                 status_prefix=(
-                                    f"🤖 Agentic step {step.id}/"
+                                    f"🤖 Agentic step {step.display_no}/"
                                     f"{len(plan.steps)} ({step.kind})"
                                 ),
                             )
@@ -16017,7 +16027,7 @@ class AgenticOrchestrator:
                                 _rem_dyn,
                                 project_id,
                                 status_prefix=(
-                                    f"🤖 Agentic step {step.id}/"
+                                    f"🤖 Agentic step {step.display_no}/"
                                     f"{len(plan.steps)} ({step.kind})"
                                 ),
                             )
@@ -16048,7 +16058,7 @@ class AgenticOrchestrator:
                         self._ledger.serialize_for(step.id),
                     )
             self._f._log_debug(
-                f"🤖 Agentic step {step.id} ({step.kind}): {step.status} "
+                f"🤖 Agentic step {step.display_no} ({step.kind}): {step.status} "
                 f"in {step.seconds:.1f}s"
             )
 
@@ -16316,7 +16326,8 @@ class AgenticOrchestrator:
                 "replans": _replans_used,
                 "steps": [
                     {
-                        "id": s.id,
+                        "id": s.display_no,
+                        "sid": s.id,
                         "kind": s.kind,
                         "status": s.status,
                         "s": round(s.seconds, 1),
