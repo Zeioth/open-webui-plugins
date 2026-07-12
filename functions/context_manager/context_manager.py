@@ -15138,8 +15138,10 @@ class AgenticSynthesisComposer:
             f"## 🤖 Agentic workspace ({len(plan.steps)} steps — " f"{len(done)} done"
         )
         _all_citations_invalid = False
+        _claims_total, _claims_bad = 0, 0
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
+            _claims_total, _claims_bad = total, bad
             header += f"; {total} claims, {ok} with valid citations"
             refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
             if refuted:
@@ -15231,6 +15233,41 @@ class AgenticSynthesisComposer:
             for s in problems:
                 detail = s.output if s.status == "failed" else "budget exhausted"
                 lines.append(f"- Step {s.id} ({s.kind}) {s.status}: {detail}")
+        # ── Pre-mortem: red-team the answer the model is about to write ─────
+        # Intensity gated by the objective fraction of invalid citations
+        # (graph signal, not self-reported confidence). The fully-degenerate
+        # case (ok == 0) already has its own warning above, so skip it here.
+        if (
+            getattr(self._f.valves, "agentic_premortem", False)
+            and not _all_citations_invalid
+            and _claims_total > 0
+        ):
+            _ratio = (
+                _claims_bad / _claims_total if _claims_total > 0 else 0.0
+            )
+            _suspect = _ratio >= float(
+                getattr(self._f.valves, "premortem_suspect_ratio", 0.34)
+            )
+            lines.append("")
+            lines.append("### 🔴 Pre-mortem")
+            if _suspect:
+                lines.append(
+                    "Before you answer, red-team your own conclusion: a "
+                    "large share of the evidence above cites unverified "
+                    "symbols. Name the SINGLE most fragile point your answer "
+                    "rests on, and the one condition (the validity clause) "
+                    "that must hold for it to be correct. If that condition "
+                    "is NOT backed by the verified evidence above, say so "
+                    "plainly in your answer — flag the assumption rather than "
+                    "presenting it as certain."
+                )
+            else:
+                lines.append(
+                    "Before you answer, state in one line the key assumption "
+                    "your conclusion depends on, so the user can judge it. If "
+                    "it is not supported by the evidence above, flag it "
+                    "rather than asserting it."
+                )
         return "\n".join(lines).rstrip()
 
 
@@ -16784,9 +16821,21 @@ class AgenticOrchestrator:
                 )
 
         # Region: inject synthesis workspace for the main call
-        dynamic_injections.append(
-            ("high", self._composer.render(plan, question, self._ledger))
-        )
+        _workspace = self._composer.render(plan, question, self._ledger)
+        if self._f.valves.agentic_premortem and self._ledger.claims:
+            _t, _o, _b = self._ledger.counts()
+            if not (_t > 0 and _o == 0):
+                _r = _b / _t if _t > 0 else 0.0
+                _mode = (
+                    "emphatic"
+                    if _r >= float(self._f.valves.premortem_suspect_ratio)
+                    else "light"
+                )
+                self._f._log_debug(
+                    f"🔴 Pre-mortem: {_mode} ({_b}/{_t} claims cite "
+                    f"unverified symbols)"
+                )
+        dynamic_injections.append(("high", _workspace))
         dynamic_injections.append(
             (
                 "low",
@@ -41585,6 +41634,34 @@ class Filter:
                 "Average coverage_score below which a no-survivor competition "
                 "is reported as abstention (insufficient evidence) rather than "
                 "refutation."
+            ),
+        )
+        agentic_premortem: bool = Field(
+            default=True,
+            description=(
+                "Pre-mortem: instruct the synthesis (main) call to red-team "
+                "its OWN answer before giving it — name the single most "
+                "fragile point and the validity clause that must hold; if "
+                "that clause is not backed by the workspace evidence, say so "
+                "in the answer instead of sounding falsely confident. "
+                "Intensity is gated by the fraction of invalid citations in "
+                "the ledger (objective graph signal, not self-reported "
+                "confidence): light when evidence is solid, emphatic when "
+                "the solution leans on unverified identifiers. No extra LLM "
+                "call — it rides the synthesis prompt already sent."
+            ),
+        )
+        premortem_suspect_ratio: float = Field(
+            default=0.34,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Fraction of ledger claims with invalid citations at or above "
+                "which the pre-mortem switches from light to emphatic. Below "
+                "it the solution is treated as evidence-solid (light "
+                "pre-mortem); the fully-degenerate case (zero valid claims) "
+                "is already covered by the degenerate-workspace warning and "
+                "skips the pre-mortem to avoid duplication."
             ),
         )
         stagnation_window: int = Field(
