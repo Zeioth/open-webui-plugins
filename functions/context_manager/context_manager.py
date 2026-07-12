@@ -16257,7 +16257,6 @@ class AgenticOrchestrator:
             await self._f._project_state_manager.slot_restore_for_continuity(
                 project_id, authoritative=True, purpose="pre_aligned"
             )
-        await self._f._emit_status("🤖 Agentic: planning…")
         # Region: pre-planner — discover the WHAT before the planner decides
         # the HOW. Agentic (may consult MEMORY autonomously), same aligned
         # prefix so it pays the hybrid prefill and the planner call becomes
@@ -16294,6 +16293,7 @@ class AgenticOrchestrator:
                 )
                 return
 
+        await self._f._emit_status("🤖 Agentic: planning…")
         plan = await self._planner.plan(
             question, aligned_prefix, slot_free, project_id,
             preplan_brief=preplan_brief,
