@@ -12563,13 +12563,44 @@ class AgenticEvidenceLedger:
                     continue
                 if not self._qid_exists(callee, project_id):
                     continue
-                caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
-                verified = any(
-                    e.dst == callee and e.type in ("calls", "reads", "writes")
-                    for e in caller_edges
+                # Edge lookup mismatch (root cause of every call relation on a
+                # class method being marked "no edge" live): the regex
+                # captures bare names (\w+ cannot span the dot in
+                # 'ContextBuilder.build_block_b'), but edges are indexed by
+                # the QUALIFIED src id. get_edges_out('build_block_b') then
+                # misses the edge stored under 'ContextBuilder.build_block_b'.
+                # Resolve the caller's bare name to every qid that carries it
+                # and check edges out of each; edge dst is stored bare, so the
+                # callee side already matches.
+                caller_qids = self._f._symbol_index.get_qualified_names_for(
+                    caller, project_id
                 )
+                callee_bare = callee.split(".")[-1]
+                verified = False
+                _edge_count = 0
+                for cq in caller_qids:
+                    c_edges = self._f._symbol_index.get_edges_out(cq, project_id)
+                    _edge_count += len(c_edges)
+                    if any(
+                        e.dst.split(".")[-1] == callee_bare
+                        and e.type in ("calls", "reads", "writes")
+                        for e in c_edges
+                    ):
+                        verified = True
+                        break
                 if not verified:
                     invalid.append(f"{caller}_calls_{callee}")
+                    self._f._log_debug(
+                        f"🔗 DIAG relation: '{caller} calls {callee}' "
+                        f"UNVERIFIED — resolved caller to "
+                        f"{sorted(caller_qids)}, scanned {_edge_count} out-edge(s), "
+                        f"no dst matched '{callee_bare}'"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"🔗 DIAG relation: '{caller} calls {callee}' "
+                        f"verified via caller qids {sorted(caller_qids)}"
+                    )
         except Exception:
             return invalid
         return invalid
