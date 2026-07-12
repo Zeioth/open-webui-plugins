@@ -14268,6 +14268,274 @@ if __name__ == "__main__":
         self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
 
 
+class AgenticPreplanner:
+    """
+    Agentic pre-planning stage: discover the correct WHAT before the planner
+    decides the HOW.
+
+    The planner (and the metacognitive engine behind hypothesize steps) is
+    excellent at "how" and "why" once the problem is framed — but it commits
+    to the FIRST framing it reads. This stage diverges over 2-3 mechanically
+    distinct framings of the request, may consult long-term memory
+    autonomously (TOOL: MEMORY — the validated V4 lever: the model decides
+    when to search and can refine its query across rounds), and picks the
+    most defensible framing on the available evidence. Its brief orients the
+    planner; it never overrides an explicit question.
+
+    Design guarantees:
+      - Fail-open everywhere: any failure (call, parse, tools) yields an
+        empty brief and the pipeline runs exactly as without the stage.
+      - Same aligned prefix as the planner, called FIRST — so this stage
+        pays the hybrid-model prefill and the planner call becomes
+        delta-cheap; net turn cost is generation only.
+      - Inherits the P15 ask: when NO framing is defensible without the
+        user, it can request clarification through the same Fase 7 surface.
+      - Fully instrumented (status emissions + logs + AGENTIC-RUN field).
+    """
+
+    _CONTRACT = (
+        "You are the PRE-planner of a code-analysis pipeline. Your job is "
+        "NOT to plan — a separate planner will decide HOW. Your job is to "
+        "discover the correct WHAT.\n\n"
+        "Do, in order:\n"
+        "1. Propose 2-3 MECHANICALLY DISTINCT framings of the user's "
+        "request (different problem being solved, not rephrasings).\n"
+        "2. If past work could be relevant, emit one or two lines exactly "
+        "like: TOOL: MEMORY(natural language query) — and STOP. You will "
+        "receive the results and be called again; you may refine the query "
+        "once more.\n"
+        "3. Choose the most probable framing based on the EVIDENCE "
+        "available (the code context above, memory results, the literal "
+        "request). Do not choose on style.\n"
+        "4. Only if NO framing is defensible without the user, set ask to "
+        "one concrete question and leave chosen empty.\n\n"
+        "When you are ready to answer (no more TOOL lines), reply ONLY "
+        "with a JSON object, no prose, no fences:\n"
+        "{\"framings\": [\"...\", \"...\"], \"chosen\": \"<the framing "
+        "you pick, verbatim>\", \"rationale\": \"<one sentence, "
+        "evidence-based>\", \"memory_findings\": \"<one short line on "
+        "what memory contributed, or empty>\", \"ask\": \"\"}\n\n"
+        "{tool_results}"
+        "Request:\n{question}"
+    )
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """
+        Bind the pre-planner to the filter and its own tool broker.
+
+        Args:
+            filter_ref: The owning Filter instance.
+        """
+        self._f = filter_ref
+        self._broker = AgenticToolBroker(filter_ref)
+        # Telemetry of the last run, read by the AGENTIC-RUN record.
+        self.last_stats: Dict[str, Any] = {}
+
+    @staticmethod
+    def _extract_tool_lines(response: str) -> List[str]:
+        """
+        Extract MEMORY tool queries from a pre-planner response.
+
+        Args:
+            response: Raw LLM output.
+
+        Returns:
+            Up to two query strings, in order of appearance.
+        """
+        queries: List[str] = []
+        for line in (response or "").splitlines():
+            m = re.match(r"\s*TOOL:\s*MEMORY\((.*)\)\s*$", line.strip())
+            if m:
+                q = m.group(1).strip().strip("\"'")
+                if q:
+                    queries.append(q)
+            if len(queries) >= 2:
+                break
+        return queries
+
+    @staticmethod
+    def _parse(response: str) -> Optional[Dict[str, Any]]:
+        """
+        Best-effort parse of the pre-planner JSON.
+
+        Args:
+            response: Raw LLM output (possibly fenced).
+
+        Returns:
+            The parsed dict, or None on any failure.
+        """
+        if not response:
+            return None
+        try:
+            cleaned = (
+                response.replace("```json", "").replace("```", "").strip()
+            )
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            data = json.loads(cleaned[start : end + 1])
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _render_brief(data: Dict[str, Any]) -> str:
+        """
+        Render the planner-facing brief from parsed pre-planner output.
+
+        The brief carries ALL framings considered (so the planner sees the
+        discarded alternatives), the chosen one with its rationale, and any
+        memory conclusion — explicitly framed as orientation, not orders.
+
+        Args:
+            data: Parsed pre-planner JSON.
+
+        Returns:
+            A capped markdown block ending in a blank line, or "".
+        """
+        framings = [
+            str(f).strip()[:220]
+            for f in (data.get("framings") or [])
+            if str(f).strip()
+        ][:3]
+        chosen = str(data.get("chosen", "") or "").strip()[:220]
+        rationale = str(data.get("rationale", "") or "").strip()[:300]
+        memory = str(data.get("memory_findings", "") or "").strip()[:300]
+        if not chosen or not framings:
+            return ""
+        lines = [
+            "Pre-planning brief (the WHAT, explored before you decide the "
+            "HOW):",
+            "Framings considered:",
+        ]
+        lines += [f"{i}. {f}" for i, f in enumerate(framings, 1)]
+        lines.append(f"Chosen: {chosen}")
+        if rationale:
+            lines.append(f"Rationale: {rationale}")
+        if memory:
+            lines.append(f"Memory findings: {memory}")
+        lines.append(
+            "Treat this as orientation, not orders: if the user's question "
+            "clearly says otherwise, deviate."
+        )
+        return "\n".join(lines)[:1400] + "\n\n"
+
+    async def preplan(
+        self,
+        question: str,
+        aligned_prefix: str,
+        project_id: str,
+        slot_free: bool,
+    ) -> Tuple[str, str]:
+        """
+        Run the pre-planning stage: diverge, optionally consult memory,
+        converge on a framing.
+
+        Args:
+            question: The pipeline question (capped by the caller's gate).
+            aligned_prefix: Same KV-aligned prefix the planner uses.
+            project_id: Current project identifier.
+            slot_free: When False the stage is skipped entirely.
+
+        Returns:
+            (brief, ask): the planner brief (or "") and a clarification
+            question (or ""). Both empty on any failure — fail-open.
+        """
+        self.last_stats = {"used": False}
+        if not slot_free:
+            return "", ""
+        question = (question or "")[:2000]
+        await self._f._emit_status("🧭 Pre-planner: exploring framings…")
+        max_rounds = int(
+            getattr(self._f.valves, "agentic_preplanner_max_tool_rounds", 2)
+        )
+        tool_results = ""
+        memory_rounds = 0
+        response = ""
+        # ── Region: agentic loop — call, honor TOOL rounds, re-call ────────
+        for attempt in range(max_rounds + 1):
+            prompt = self._CONTRACT.replace(
+                "{tool_results}", tool_results
+            ).replace("{question}", question)
+            try:
+                response = await self._f._llm_orchestrator.call_llm(
+                    prompt=prompt,
+                    system_prompt=aligned_prefix,
+                    model_override=self._f.valves.cot_model_level2,
+                    max_tokens=self._f.valves.agentic_preplanner_max_tokens,
+                    temperature=0.6,
+                    label="agentic_preplanner",
+                    enable_thinking=False,
+                )
+            except Exception as e:
+                self._f._log_debug(f"🧭 Preplanner: call failed ({e})")
+                return "", ""
+            if not response:
+                self._f._log_debug("🧭 Preplanner: empty response — no brief")
+                return "", ""
+            queries = self._extract_tool_lines(response)
+            if not queries or attempt >= max_rounds:
+                break
+            memory_rounds += 1
+            await self._f._emit_status(
+                f"🧭 Pre-planner: consulting memory (round {memory_rounds})…"
+            )
+            rendered: List[str] = []
+            for q in queries:
+                try:
+                    res = await self._broker.resolve_async(
+                        "MEMORY", q, project_id
+                    )
+                except Exception as e:
+                    res = f"[MEMORY({q}) failed: {e}]"
+                self._f._log_debug(
+                    f"🧭 Preplanner: MEMORY('{q[:60]}') → "
+                    f"{len(res)} chars"
+                )
+                rendered.append(f"MEMORY({q}) →\n{res}")
+            tool_results = (
+                "Results of your memory queries:\n"
+                + "\n\n".join(rendered)[:8000]
+                + "\n\n"
+            )
+        # ── Region: parse-or-fail-open ──────────────────────────────────────
+        data = self._parse(response)
+        if data is None:
+            self._f._log_debug("🧭 Preplanner: unparseable output — no brief")
+            return "", ""
+        ask = str(data.get("ask", "") or "").strip()[:400]
+        brief = self._render_brief(data)
+        n_framings = len(data.get("framings") or [])
+        chosen = str(data.get("chosen", "") or "").strip()
+        self.last_stats = {
+            "used": True,
+            "framings": n_framings,
+            "memory_rounds": memory_rounds,
+            "asked": bool(ask and not chosen),
+        }
+        if ask and not chosen:
+            self._f._log_debug(
+                f"🧭 Preplanner: no framing defensible — asking "
+                f"('{ask[:80]}')"
+            )
+            return "", ask
+        if brief:
+            await self._f._emit_status(
+                f"🧭 Pre-planner: framing chosen — {chosen[:60]}"
+            )
+            self._f._log_debug(
+                f"🧭 Preplanner: framings={n_framings}, "
+                f"memory_rounds={memory_rounds}, chose='{chosen[:80]}'"
+            )
+            self._f._log_debug(f"🧭 Preplanner brief:\n{brief.strip()}")
+        else:
+            self._f._log_debug(
+                "🧭 Preplanner: parsed but no usable framing — no brief"
+            )
+        return brief, ""
+
+
 class AgenticPlanner:
     """
     Produces an AgenticPlan for a question via a single prefix-aligned,
@@ -14327,6 +14595,7 @@ class AgenticPlanner:
         "step should focus on (may be empty).\n\n"
         "{memory_hint}"
         "{seed_hint}"
+        "{preplan_brief}"
         "Question:\n{question}"
     )
 
@@ -14347,6 +14616,7 @@ class AgenticPlanner:
         aligned_prefix: str,
         slot_free: bool,
         project_id: str = "",
+        preplan_brief: str = "",
     ) -> AgenticPlan:
         """
         Build a plan for the question.
@@ -14394,6 +14664,7 @@ class AgenticPlanner:
             self._CONTRACT.replace("{max_steps}", str(max_steps))
             .replace("{memory_hint}", memory_hint)
             .replace("{seed_hint}", seed_hint)
+            .replace("{preplan_brief}", preplan_brief or "")
             .replace("{question}", question)
         )
         try:
@@ -14981,6 +15252,7 @@ class AgenticOrchestrator:
         self._executor = AgenticStepExecutor(filter_ref)
         self._composer = AgenticSynthesisComposer(filter_ref)
         self._planner = AgenticPlanner(filter_ref)
+        self._preplanner = AgenticPreplanner(filter_ref)
         self._ledger = AgenticEvidenceLedger(filter_ref)
         self._cache = AgenticStepCache(filter_ref)
         self._broker = AgenticToolBroker(filter_ref)
@@ -15949,7 +16221,46 @@ class AgenticOrchestrator:
                 project_id, authoritative=True, purpose="pre_aligned"
             )
         await self._f._emit_status("🤖 Agentic: planning…")
-        plan = await self._planner.plan(question, aligned_prefix, slot_free, project_id)
+        # Region: pre-planner — discover the WHAT before the planner decides
+        # the HOW. Agentic (may consult MEMORY autonomously), same aligned
+        # prefix so it pays the hybrid prefill and the planner call becomes
+        # delta-cheap. Fail-open: empty brief = today's behavior, verbatim.
+        preplan_brief, _pre_ask = "", ""
+        if self._f.valves.agentic_preplanner:
+            try:
+                preplan_brief, _pre_ask = await self._preplanner.preplan(
+                    question, aligned_prefix, project_id, slot_free
+                )
+            except Exception as e:
+                self._f._log_debug(
+                    f"🧭 Preplanner failed ({e}) — empty brief, planner "
+                    f"proceeds as usual"
+                )
+                preplan_brief, _pre_ask = "", ""
+            # P15 inheritance: the pre-planner is better positioned than the
+            # planner to detect genuine ambiguity (it just explored the
+            # framings); same valve, same length gate, same Fase 7 surface.
+            if (
+                self._f.valves.agentic_enable_ask_user
+                and _pre_ask
+                and len(_pre_ask) >= 8
+            ):
+                await self._f._emit_status(
+                    "🧭 Pre-planner: clarification needed"
+                )
+                self._append_clarification_injections(
+                    dynamic_injections, _pre_ask
+                )
+                self._f._log_debug(
+                    "🧭 Preplanner requested clarification — pipeline not "
+                    "started"
+                )
+                return
+
+        plan = await self._planner.plan(
+            question, aligned_prefix, slot_free, project_id,
+            preplan_brief=preplan_brief,
+        )
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
             f"source={plan.source}, trigger={trigger})"
@@ -16494,6 +16805,7 @@ class AgenticOrchestrator:
                 "trigger": trigger,
                 "wall_s": round(time.monotonic() - started, 1),
                 "replans": _replans_used,
+                "preplan": getattr(self._preplanner, "last_stats", {}),
                 "steps": [
                     {
                         "id": s.display_no,
@@ -25680,6 +25992,19 @@ class MetacognitiveReasoningEngine:
         """
         # ── Step 1: build the contrast list ─────────────────────────────────
         listed = "\n".join(f"- {t}" for t, _ in existing[:6]) or "- (none yet)"
+        # Popperian null hypothesis: one of the divergent slots may assert
+        # that the observed behavior has NO code cause. Costs nothing here
+        # (rides the pool); the competition falsifies it like any other.
+        null_clause = ""
+        if getattr(self._f.valves, "hypothesis_include_null", False):
+            null_clause = (
+                f"\nImportant: if it is plausible, make ONE of the {n} "
+                f"hypotheses the NULL hypothesis — that the observed behavior "
+                f"has no code cause at all (non-determinism, coincidence, an "
+                f"environmental/config artifact, or a misread of the symptom "
+                f"itself) — and give the observable that would confirm it "
+                f"(e.g. the effect not reproducing under identical inputs).\n"
+            )
         prompt = (
             f"Question under investigation:\n{question[:600]}\n\n"
             f"Candidate explanations already on the table:\n{listed}\n\n"
@@ -25687,7 +26012,8 @@ class MetacognitiveReasoningEngine:
             f"different from every candidate above (different module, timing/"
             f"ordering, state lifecycle, configuration, or the observation "
             f"itself being misleading). For each, also name the single "
-            f"observable that would discriminate it from the others.\n\n"
+            f"observable that would discriminate it from the others."
+            f"{null_clause}\n\n"
             f"Hypothesis: <one concise sentence>\n"
             f"Confidence: <0.0-1.0>"
         )
@@ -26229,8 +26555,44 @@ class MetacognitiveReasoningEngine:
                 project_id=project_id,
                 abductive_used=abductive_used,
             )
+            # Honest abstention: separate "actively refuted" (high coverage —
+            # the evidence contradicts every hypothesis) from "cannot decide"
+            # (low coverage — the indexed code does not carry enough evidence
+            # to rule anything in or out). Popper's falsified-vs-not-testable,
+            # surfaced instead of a flat failure. Verdict itself unchanged.
+            _abstain = (
+                getattr(self._f.valves, "enable_abstention", False)
+                and _avg_cov
+                < float(getattr(self._f.valves, "abstention_coverage_floor", 0.35))
+            )
+            if _abstain:
+                await self._f._emit_status(
+                    "🤔 Insufficient evidence — abstaining"
+                )
+                self._f._log_debug(
+                    f"compete_hypotheses: abstaining (avg coverage "
+                    f"{_avg_cov:.2f} < floor) — evidence insufficient, not "
+                    f"refutation"
+                )
+                _msg = (
+                    "The indexed code does not carry enough evidence to "
+                    "confirm or rule out any hypothesis here (low coverage). "
+                    "This is insufficient evidence, not a refutation — the "
+                    "relevant code may be outside the index, or the behavior "
+                    "may depend on runtime state not visible statically. "
+                    "State this honestly rather than guessing a cause."
+                )
+            else:
+                self._f._log_debug(
+                    f"compete_hypotheses: no hypothesis survived — all "
+                    f"falsified (avg coverage {_avg_cov:.2f})"
+                )
+                _msg = (
+                    "Unable to validate any hypothesis against the codebase "
+                    "structure."
+                )
             return (
-                "Unable to validate any hypothesis against the codebase structure.",
+                _msg,
                 0.0,
                 StaticEvidence(
                     symbols_found={},
@@ -40928,6 +41290,39 @@ class Filter:
                 "stray token cannot hijack the turn."
             ),
         )
+        agentic_preplanner: bool = Field(
+            default=True,
+            description=(
+                "Pre-planner: an agentic stage BEFORE the planner that "
+                "discovers the correct WHAT while the planner decides the "
+                "HOW. It diverges over 2-3 mechanically distinct framings of "
+                "the request, may consult long-term memory autonomously "
+                "(TOOL: MEMORY), and picks the most defensible framing on "
+                "the available evidence. Its brief orients the planner but "
+                "never overrides an explicit question. Fail-open: any "
+                "failure yields an empty brief and the planner runs exactly "
+                "as without it."
+            ),
+        )
+        agentic_preplanner_max_tokens: int = Field(
+            default=900,
+            ge=200,
+            le=2000,
+            description=(
+                "Token budget per pre-planner call (framings + choice + "
+                "optional memory conclusions)."
+            ),
+        )
+        agentic_preplanner_max_tool_rounds: int = Field(
+            default=2,
+            ge=0,
+            le=3,
+            description=(
+                "Maximum MEMORY tool rounds the pre-planner may take before "
+                "committing to a framing (0 disables memory access). Each "
+                "round is zero-LLM retrieval plus one short aligned re-call."
+            ),
+        )
         scientific_hypotheses_count: int = Field(
             default=3,  # ← sweet spot: N=2 loses 12% quality, N=4+ diminishing returns
             ge=2,
@@ -41154,6 +41549,42 @@ class Filter:
                 "dead hypotheses shared and negates it, then re-enters the "
                 "same falsification machinery. At most once per competition; "
                 "worst case equals the old behavior plus one LLM call."
+            ),
+        )
+        hypothesis_include_null: bool = Field(
+            default=True,
+            description=(
+                "Popperian null hypothesis: when the divergent pool is built "
+                "(Capa 1), instruct the model to include — if plausible — the "
+                "hypothesis that the observed behavior has NO code cause "
+                "(non-determinism, coincidence, or a misread symptom), with "
+                "its discriminating observable. The competition falsifies it "
+                "like any other; if it survives, that is a strong signal the "
+                "pipeline should stop and say 'this is probably not a bug'. "
+                "Needs hypothesis_divergent_n > 0 (rides the same pool, no "
+                "extra call)."
+            ),
+        )
+        enable_abstention: bool = Field(
+            default=True,
+            description=(
+                "Honest abstention: when no hypothesis survives, distinguish "
+                "'all falsified' (high average coverage — the evidence "
+                "actively refutes them) from 'insufficient evidence' (low "
+                "coverage — the indexed code cannot decide). Below "
+                "abstention_coverage_floor the pipeline abstains explicitly "
+                "instead of reporting a flat failure. Reshapes only the "
+                "no-survivor message; changes no verdict."
+            ),
+        )
+        abstention_coverage_floor: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Average coverage_score below which a no-survivor competition "
+                "is reported as abstention (insufficient evidence) rather than "
+                "refutation."
             ),
         )
         stagnation_window: int = Field(
