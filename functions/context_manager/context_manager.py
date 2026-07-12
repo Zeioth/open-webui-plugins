@@ -12875,8 +12875,23 @@ class AgenticToolBroker:
         body = CodeBlockManager.extract_symbol_body(block, qid)
         if not body:
             return f"[EXPAND: body of '{qid}' not extractable]"
-        if len(body) > self._MAX_BODY_CHARS:
-            body = body[: self._MAX_BODY_CHARS] + "\n# ... [truncated by broker]"
+        _cap = int(
+            getattr(self._f.valves, "agentic_expand_max_chars", self._MAX_BODY_CHARS)
+        )
+        if len(body) > _cap:
+            # Actionable truncation: a silent mid-body cut leaves the model
+            # blind to the trailing calls/returns (observed live: a truncated
+            # build_block_b produced a hallucinated answer). Tell it exactly
+            # how to get the rest instead of stopping.
+            _shown = body[:_cap]
+            _total = len(body)
+            body = (
+                _shown
+                + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
+                f"chars. To see the rest, GREP a distinctive token from the "
+                f"missing region, or state that the tail of {qid} was not "
+                f"inspected — do NOT guess its remaining calls.]"
+            )
         return f"### Body of {qid}\n```\n{body}\n```"
 
     def _edges(self, sym: str, project_id: str, incoming: bool) -> str:
@@ -14799,6 +14814,16 @@ class AgenticPlanner:
         if not response:
             return None
         cleaned = response.replace("```json", "").replace("```", "").strip()
+        # The planner is a reasoning model and often wraps its JSON in prose
+        # ("Here is the plan: {...}. This investigates..."). Strict
+        # json.loads on the whole string then fails and the pipeline falls
+        # to fallback_fixed — which never schedules hypothesize (observed
+        # live across every code turn). Extract the outermost {...} object,
+        # mirroring _extract_ask, before parsing.
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            cleaned = cleaned[start : end + 1]
         try:
             data = json.loads(cleaned)
             raw = data.get("steps", [])
@@ -15171,6 +15196,33 @@ class AgenticSynthesisComposer:
                 "index, state that explicitly and answer with what IS "
                 "indexed; do not fabricate an analysis of unknown code, and "
                 "do not reply with a bare ingestion confirmation.",
+            )
+        # Empty-ledger abstention: the pipeline ran investigative steps but
+        # produced NO verifiable claim at all (observed live: an EXPAND
+        # returned a truncated body, the investigate step gave up, the
+        # ledger stayed empty, and the synthesis hallucinated the method's
+        # calls to fill the void). Distinct from the degenerate case above:
+        # there claims existed but cited ghosts; here there is no evidence
+        # whatsoever. Only fires when investigative work was actually
+        # attempted (done steps beyond a lone terminal analyze) so a
+        # trivially-simple turn is unaffected. Pipeline-level sibling of the
+        # P18 abstention.
+        _investigative_done = [
+            s
+            for s in done
+            if s.kind in ("investigate", "hypothesize", "verify_dynamic")
+        ]
+        if _claims_total == 0 and _investigative_done and not _all_citations_invalid:
+            lines.insert(
+                1,
+                "⚠ The pipeline investigated but recovered NO verifiable "
+                "evidence (zero validated claims) — a tool result was likely "
+                "truncated or a lookup failed. Do NOT reconstruct the "
+                "implementation from memory: if you cannot ground an answer "
+                "in the code context above, say plainly that the relevant "
+                "code could not be retrieved and ask the user to point to it "
+                "or request the specific symbol, rather than guessing its "
+                "contents.",
             )
         for s in plan.steps:
             if s.status != "done":
@@ -41662,6 +41714,21 @@ class Filter:
                 "pre-mortem); the fully-degenerate case (zero valid claims) "
                 "is already covered by the degenerate-workspace warning and "
                 "skips the pre-mortem to avoid duplication."
+            ),
+        )
+        agentic_expand_max_chars: int = Field(
+            default=16000,
+            ge=2000,
+            le=64000,
+            description=(
+                "Character cap for a symbol body returned by the EXPAND tool "
+                "in the agentic pipeline. The previous 6000 truncated large "
+                "hub methods mid-body (observed live: an investigate step "
+                "received a truncated build_block_b, could not see its "
+                "trailing calls, and the pipeline synthesized a hallucinated "
+                "answer). When a body still exceeds the cap the truncation "
+                "notice now tells the model to request the specific line "
+                "range instead of leaving it blind."
             ),
         )
         stagnation_window: int = Field(
