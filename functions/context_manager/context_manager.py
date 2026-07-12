@@ -14331,10 +14331,11 @@ class AgenticPlanner:
     )
 
     _MEMORY_HINT = (
-        "Note: steps can consult long-term memory (past decisions, resolved "
-        "bugs, previous code changes with their diffs) via a MEMORY tool. "
-        "When the question may depend on prior work, phrase the relevant "
-        "step goal to include checking memory for it.\n\n"
+        "Note: any investigate step can consult long-term memory (past "
+        "decisions, resolved bugs, previous code changes with their diffs) "
+        "via a MEMORY tool — the executor decides when to use it, so you "
+        "need not add a dedicated step for it. Only when the question "
+        "clearly hinges on prior work, say so in the relevant goal.\n\n"
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
