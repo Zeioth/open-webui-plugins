@@ -267,6 +267,7 @@ class CompetitionRecord:
     call_relation_failures: int
     symbol_failures: int
     low_coverage_count: int
+    abductive_used: bool = False
 
 
 class UseCase(str, Enum):
@@ -14298,7 +14299,11 @@ class AgenticPlanner:
         "Rules:\n"
         "- 2 to {max_steps} steps.\n"
         "- kind must be one of: investigate (gather facts), hypothesize "
-        "(enumerate competing root causes; only for debugging questions), "
+        "(enumerate competing root causes and falsify them against the "
+        "code graph — use it when the root cause is genuinely uncertain, "
+        "for bugs, intermittent failures or contradictory evidence; it "
+        "also explores divergent hypotheses beyond the obvious ones; do "
+        "NOT use it for factual lookups), "
         "verify (check earlier factual claims against the code graph; "
         "schedule right before the final analyze when steps will assert "
         "structural facts), verify_dynamic (generate and execute a real "
@@ -15187,6 +15192,38 @@ class AgenticOrchestrator:
             f"🤖 Agentic: step {step.id} competes {n_found} rival "
             f"hypotheses (debug_intent={_intent_debug})"
         )
+        # Capa 1 — planner-gated divergent pool: this path is reached ONLY on
+        # a planner-chosen hypothesize step, so widening the rival set here is
+        # exactly the "planner decides when it needs this" behavior. The
+        # competition's objective scoring stays the selector.
+        _div_n = int(getattr(self._f.valves, "hypothesis_divergent_n", 0))
+        if _div_n > 0:
+            try:
+                _div = await self._f._meta_reasoning._generate_presearch_divergent(
+                    step.goal or "",
+                    hyps,
+                    _div_n,
+                    float(
+                        getattr(
+                            self._f.valves,
+                            "hypothesis_divergent_temperature",
+                            0.9,
+                        )
+                    ),
+                    project_id,
+                    label=f"agentic_hypothesize_step_{step.id}",
+                )
+                if _div:
+                    _before = len(hyps)
+                    hyps = self._f._meta_reasoning._dedupe_hypotheses(hyps + _div)
+                    self._f._log_debug(
+                        f"🤖 Agentic: divergent pool +{len(hyps) - _before} "
+                        f"(requested {_div_n}, {len(_div)} parsed) → "
+                        f"{len(hyps)} rivals"
+                    )
+                    n_found = len(hyps)
+            except Exception as e:
+                self._f._log_debug(f"🤖 Agentic: divergent pool failed ({e})")
         try:
             best, score, _evidence, peer = (
                 await self._f._meta_reasoning.compete_hypotheses(
@@ -25480,6 +25517,180 @@ class MetacognitiveReasoningEngine:
 
         return "\n".join(constraints) if constraints else ""
 
+    @staticmethod
+    def _dedupe_hypotheses(
+        hyps: List[Tuple[str, float]], cap: int = 0
+    ) -> List[Tuple[str, float]]:
+        """
+        Drop near-duplicate hypothesis texts, keeping first occurrence.
+
+        Uses difflib token-free ratio (deterministic, zero model calls) with
+        a 0.8 similarity threshold — a CE-based semantic dedupe was rejected
+        as one extra model pass for marginal gain on <10 short sentences.
+
+        Args:
+            hyps: (text, confidence) tuples in priority order.
+            cap: Optional maximum kept (0 = no cap).
+
+        Returns:
+            Deduplicated list, order preserved.
+        """
+        # ── Step 1: sequential near-duplicate filter ────────────────────────
+        kept: List[Tuple[str, float]] = []
+        for text, conf in hyps:
+            t = (text or "").strip()
+            if not t:
+                continue
+            dup = any(
+                difflib.SequenceMatcher(
+                    None, t.lower(), k.lower()
+                ).quick_ratio() > 0.8
+                for k, _ in kept
+            )
+            if not dup:
+                kept.append((t, conf))
+        # ── Step 2: optional cap ────────────────────────────────────────────
+        if cap > 0:
+            kept = kept[:cap]
+        return kept
+
+    async def _generate_presearch_divergent(
+        self,
+        question: str,
+        existing: List[Tuple[str, float]],
+        n: int,
+        temperature: float,
+        project_id: str,
+        label: str = "",
+    ) -> List[Tuple[str, float]]:
+        """
+        Planner-gated divergent pool (Capa 1): widen the rival set BEFORE a
+        hypothesize-step competition with mechanically different root causes.
+
+        Fires only on planner-chosen hypothesize steps (see
+        _maybe_compete_hypothesize), never on ordinary queries. Diversity
+        lives in this exploratory pool; the competition's objective scoring
+        stays cold and does the selecting — the empirically supported split
+        (diverse pool + external evidence-based selector).
+
+        Args:
+            question: The step goal / user question driving the competition.
+            existing: Rival hypotheses already gathered from the step claims.
+            n: How many divergent additions to request.
+            temperature: Sampling temperature for the divergent call.
+            project_id: Current project identifier.
+            label: Log label prefix.
+
+        Returns:
+            (text, confidence) tuples parsed from the response; [] on failure.
+        """
+        # ── Step 1: build the contrast list ─────────────────────────────────
+        listed = "\n".join(f"- {t}" for t, _ in existing[:6]) or "- (none yet)"
+        prompt = (
+            f"Question under investigation:\n{question[:600]}\n\n"
+            f"Candidate explanations already on the table:\n{listed}\n\n"
+            f"Propose {n} ADDITIONAL hypotheses whose root-cause MECHANISM is "
+            f"different from every candidate above (different module, timing/"
+            f"ordering, state lifecycle, configuration, or the observation "
+            f"itself being misleading). For each, also name the single "
+            f"observable that would discriminate it from the others.\n\n"
+            f"Hypothesis: <one concise sentence>\n"
+            f"Confidence: <0.0-1.0>"
+        )
+        # ── Step 2: high-temperature call + slot continuity ────────────────
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a divergent thinking engine for software debugging. "
+                "Propose mechanically distinct hypotheses grounded in how "
+                "real codebases fail. No extra commentary."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=temperature,
+            label=f"{label}_presearch_div" if label else "sci_presearch_div",
+        )
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(
+                project_id
+            )
+        if not response:
+            return []
+        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(
+            response
+        )
+
+    async def _generate_abductive_hypotheses(
+        self,
+        falsified: List["ScoredHypothesis"],
+        max_hypotheses: int,
+        project_id: str,
+        label: str = "",
+    ) -> List[Tuple[str, float]]:
+        """
+        Epistemic-bankruptcy escape (Capa 3): every hypothesis died, so the
+        true cause lies OUTSIDE the assumption space they shared.
+
+        One call, two moves: name the assumption all dead hypotheses share,
+        then negate it and propose mechanisms that only make sense in that
+        inverted world. Grounded in each hypothesis's falsification_reason —
+        abduction anchored in why things failed, not free-floating
+        creativity. COMPETITION LEVEL — fires at most once per competition
+        (enforced by the caller).
+
+        Args:
+            falsified: Scored hypotheses from the iteration where all died.
+            max_hypotheses: How many escape hypotheses to request.
+            project_id: Current project identifier.
+            label: Log label prefix.
+
+        Returns:
+            (text, confidence) tuples parsed from the response; [] on failure.
+        """
+        # ── Step 1: obituary of the dead hypothesis space ───────────────────
+        obituary = "\n".join(
+            f"- '{s.text}' — falsified: {s.falsification_reason or 'unknown'}"
+            for s in falsified
+            if s.falsified
+        ) or "- (no detail available)"
+        prompt = (
+            f"ALL of these hypotheses were falsified against the real code "
+            f"graph:\n{obituary}\n\n"
+            f"Step 1 — State, in ONE sentence, the ASSUMPTION they all share "
+            f"(the belief that made them all wrong together).\n"
+            f"Step 2 — Assume that assumption is FALSE. Propose "
+            f"{max_hypotheses} hypotheses that only make sense in that "
+            f"inverted world: a different mechanism each (timing/ordering, "
+            f"state lifecycle, a different module entirely, or the "
+            f"observation itself being misleading). For each, name the "
+            f"single observable that would discriminate it.\n\n"
+            f"Assumption: <one sentence>\n"
+            f"Hypothesis: <one concise sentence>\n"
+            f"Confidence: <0.0-1.0>"
+        )
+        # ── Step 2: high-temperature call + slot continuity ────────────────
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are an abductive reasoning engine. The entire hypothesis "
+                "space just collapsed; your job is to step outside it. Ground "
+                "every proposal in the falsification evidence provided."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=600,
+            temperature=0.9,
+            label=f"{label}_abductive" if label else "sci_abductive",
+        )
+        if self._f.valves.enable_slot_persistence and project_id:
+            await self._f._project_state_manager.slot_restore_for_continuity(
+                project_id
+            )
+        if not response:
+            return []
+        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(
+            response
+        )
+
     async def _generate_divergent_hypotheses(
         self,
         best: "ScoredHypothesis",
@@ -25675,6 +25886,7 @@ class MetacognitiveReasoningEngine:
         runner_up: Optional["ScoredHypothesis"] = None
         obj_score_history: List[float] = []  # obj_score ONLY — no llm_conf
         stagnated_this_run = False
+        abductive_used = False
         valid_scored: List["ScoredHypothesis"] = []
         all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
         iteration = 0
@@ -25821,6 +26033,31 @@ class MetacognitiveReasoningEngine:
             valid_scored.sort(key=lambda x: x.score, reverse=True)
 
             if not valid_scored:
+                # COMPETITION LEVEL — epistemic bankruptcy: every hypothesis
+                # died this iteration. Before surrendering, try one abductive
+                # escape that negates the assumption they all shared. Fires at
+                # most once, only with iterations left; on success the escaped
+                # hypotheses re-enter the same falsification machinery below.
+                if (
+                    self._f.valves.enable_abductive_escape
+                    and not abductive_used
+                    and iteration < max_iters
+                ):
+                    abductive_used = True
+                    await self._f._emit_status(
+                        "🕵️ All hypotheses falsified — abductive escape…"
+                    )
+                    self._f._log_debug(
+                        f"compete_hypotheses iter {iteration}: all falsified "
+                        f"→ abductive escape"
+                    )
+                    escaped = await self._generate_abductive_hypotheses(
+                        current_scored, max_hypotheses, project_id, label
+                    )
+                    if escaped:
+                        hypotheses = escaped
+                        obj_score_history = []  # inverted world, new baseline
+                        continue
                 self._f._log_debug(
                     f"compete_hypotheses iter {iteration}: all hypotheses falsified"
                 )
@@ -25896,6 +26133,7 @@ class MetacognitiveReasoningEngine:
                 score_trajectory=obj_score_history,
                 stagnated=stagnated_this_run,
                 project_id=project_id,
+                abductive_used=abductive_used,
             )
             return (
                 "Unable to validate any hypothesis against the codebase structure.",
@@ -26040,6 +26278,7 @@ class MetacognitiveReasoningEngine:
             score_trajectory=obj_score_history,
             stagnated=stagnated_this_run,
             project_id=project_id,
+            abductive_used=abductive_used,
         )
 
         self._f._log_debug(
@@ -26265,6 +26504,7 @@ class MetacognitiveReasoningEngine:
         score_trajectory: List[float],
         stagnated: bool,
         project_id: str,
+        abductive_used: bool = False,
     ) -> None:
         """
         Post-competition metacognitive analysis.
@@ -26317,6 +26557,7 @@ class MetacognitiveReasoningEngine:
             call_relation_failures=call_failures,
             symbol_failures=symbol_failures,
             low_coverage_count=low_cov_count,
+            abductive_used=abductive_used,
         )
 
         if project_id not in self._performance_history:
@@ -40785,6 +41026,40 @@ class Filter:
                 "divergent thinking (high temperature, contrarian prompt). "
                 "Harmless with scientific_max_iterations=2 (cannot fire). "
                 "Set scientific_max_iterations=4 to enable effectively."
+            ),
+        )
+        hypothesis_divergent_n: int = Field(
+            default=2,
+            ge=0,
+            le=5,
+            description=(
+                "Planner-gated divergent pool (Capa 1): extra high-temperature "
+                "hypotheses generated BEFORE a hypothesize-step competition, "
+                "each with a mechanically different root cause and its "
+                "discriminating observable. 0 disables (byte-equivalent to "
+                "previous behavior). Only fires on planner-chosen hypothesize "
+                "steps, never on ordinary queries."
+            ),
+        )
+        hypothesis_divergent_temperature: float = Field(
+            default=0.9,
+            ge=0.0,
+            le=1.5,
+            description=(
+                "Sampling temperature for the divergent hypothesis pool. High "
+                "on purpose: diversity lives in the exploratory pool only; "
+                "scoring and synthesis stay cold."
+            ),
+        )
+        enable_abductive_escape: bool = Field(
+            default=True,
+            description=(
+                "Capa 3: when EVERY hypothesis in a competition is falsified "
+                "(epistemic bankruptcy — previously an immediate surrender), "
+                "run one abductive generation that names the assumption all "
+                "dead hypotheses shared and negates it, then re-enters the "
+                "same falsification machinery. At most once per competition; "
+                "worst case equals the old behavior plus one LLM call."
             ),
         )
         stagnation_window: int = Field(
