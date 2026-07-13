@@ -13184,7 +13184,9 @@ class AgenticStaticVerifier:
         Run one check. Returns (verdict, detail) with verdict in
         confirmed | refuted | unsupported | unverifiable.
         """
-        kind, src_n, dst_n = check["kind"], check["src"], check["dst"]
+        kind = check["kind"]
+        src_n = check["src"]
+        dst_n = check.get("dst", "")
         try:
             if kind == "exists":
                 if self._qid_for(src_n, project_id):
