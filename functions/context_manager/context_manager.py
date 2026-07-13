@@ -12399,6 +12399,12 @@ class AgenticEvidenceLedger:
         # Region: control signals (early-exit / re-plan markers)
         try:
             control["resolved"] = bool(data.get("resolved", False))
+            # Track whether the step actually REPORTED a confidence, separate
+            # from its value. A step only emits confidence when it claims to
+            # fully resolve the question; an intermediate step omits it. The
+            # default 0.0 must not be read as "low confidence" — that is
+            # absence of signal, not a low signal (see _should_reinforce_step).
+            control["confidence_reported"] = "confidence" in data
             control["confidence"] = max(
                 0.0, min(1.0, float(data.get("confidence", 0.0)))
             )
@@ -15586,8 +15592,19 @@ class AgenticOrchestrator:
         )
         if n_invalid:
             return True, f"invalid_qids:{n_invalid}"
+        # Escalate on confidence only when the step actually REPORTED one and
+        # it is genuinely low. An intermediate step that never claimed to
+        # resolve omits confidence entirely; its 0.0 default is absence of
+        # signal, not low confidence, and must not trip reinforcement — doing
+        # so would escalate nearly every intermediate step. The primary
+        # signal (fabricated identifiers, above) still catches steps that
+        # assert bad structure regardless of whether they report confidence.
         floor = self._f.valves.agentic_metacog_confidence_floor
-        if not control.get("resolved") and control.get("confidence", 0.0) < floor:
+        if (
+            control.get("confidence_reported")
+            and not control.get("resolved")
+            and control.get("confidence", 0.0) < floor
+        ):
             return True, f"low_confidence:{control.get('confidence', 0.0):.2f}"
         return False, ""
 
