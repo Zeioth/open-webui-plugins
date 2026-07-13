@@ -1607,6 +1607,24 @@ class ConversationStateManager:
             )
             raw_active = {}
 
+        # Per-value validation: the block-rebuild loops below assume every
+        # value is a dict (v.get("content"), CodeBlock(**v)). A single value
+        # that deserialized as a str — from a malformed prior save — otherwise
+        # raises 'str' object has no attribute 'get'/'hash' and takes down the
+        # whole inlet before the pipeline can start. Drop non-dict values here,
+        # once, so both loops see only well-formed entries.
+        if raw_active:
+            _bad_keys = [k for k, v in raw_active.items() if not isinstance(v, dict)]
+            if _bad_keys:
+                self._f._log_debug(
+                    f"⚠️  CORRUPT STATE: {len(_bad_keys)} active_block value(s) "
+                    f"are not dicts for '{project_id}' "
+                    f"(e.g. {type(raw_active[_bad_keys[0]]).__name__}); "
+                    f"dropping them to keep the turn alive."
+                )
+                for k in _bad_keys:
+                    raw_active.pop(k, None)
+
         hash_to_block_key: Dict[str, str] = {}
         for k, v in raw_active.items():
             content_field = v.get("content", "")
@@ -12317,6 +12335,66 @@ class AgenticEvidenceLedger:
         """Clear claims at the start of each pipeline run."""
         self.claims = []
 
+    def _gap_is_non_indexable(self, gap: str) -> bool:
+        """Return True when a reported gap asks for data the SymbolIndex
+        structurally does not hold, so the NEEDS mechanism should not insert
+        an investigate step to chase it.
+
+        The index stores symbols, signatures, call/data-flow relations, and
+        docstrings — never a symbol's absolute position in the on-disk file
+        nor disk-level metadata. Observed live (phase 4, P18): asked "what
+        line is class Filter on?", a step reported the gap "need the exact
+        line number of Filter", the pipeline dutifully inserted a step to
+        find it, that step could not (line_start is block-relative and never
+        surfaced to the model), and the model filled the void by inventing
+        "around line 1-5". Chasing an unanswerable gap manufactures exactly
+        the vacuum a model hallucinates into.
+
+        The match is intentionally about file-absolute POSITION and disk
+        METADATA — line/column numbers, byte offsets, commit authorship or
+        timestamps — not about code structure, which the index does hold and
+        which legitimately warrants a follow-up step.
+
+        Args:
+            gap: One reported gap string from a step's ``needs`` list.
+
+        Returns:
+            True if the gap requests non-indexable positional/disk data.
+        """
+        g = gap.lower()
+        # Position-in-file phrasing (English + Spanish). Bare "line" is too
+        # broad (control flow, "in line with"), so a line reference only
+        # counts when a positional qualifier — number, exact, which, position,
+        # starts/defined at — sits near the line/línea token. Regex rather
+        # than fixed phrases so wording variants ("exact line number", "número
+        # exacto de línea", "line Filter is defined at") all match.
+        _positional_re = (
+            r"l[ií]nea?\s+(?:number|no\b|exact|exacta?)",
+            r"(?:number|exact|exacto|exacta)\s+\w*\s*l[ií]nea?",
+            r"(?:qu[ée]|which|what)\s+l[ií]ne",
+            r"l[ií]ne\w*\s+(?:number|at which|\w+\s+is\s+defined|is\s+defined)",
+            r"en\s+qu[ée]\s+l[ií]nea",
+            r"(?:column|columna)\s+(?:number|número)",
+            r"(?:byte|character|file|char)\s+offset",
+            r"(?:absolute\s+position|position\s+in\s+the\s+file)",
+            r"posici[óo]n\s+en\s+el\s+(?:archivo|fichero)",
+        )
+        _disk_meta = (
+            r"commit\s+(?:author|date|timestamp)",
+            r"last\s+modified",
+            r"modification\s+date",
+            r"file\s+size",
+            r"when\s+was.*written",
+            r"who\s+wrote",
+            r"autor\s+del\s+commit",
+            r"fecha\s+de.*commit",
+        )
+        if any(re.search(p, g) for p in _positional_re):
+            return True
+        if any(re.search(p, g) for p in _disk_meta):
+            return True
+        return False
+
     def extract_and_validate(
         self, step: AgenticStep, project_id: str
     ) -> Dict[str, Any]:
@@ -12408,9 +12486,12 @@ class AgenticEvidenceLedger:
             control["confidence"] = max(
                 0.0, min(1.0, float(data.get("confidence", 0.0)))
             )
-            control["needs"] = [
+            _raw_needs = [
                 str(n).strip() for n in data.get("needs", []) if str(n).strip()
             ][:4]
+            control["needs"] = [
+                n for n in _raw_needs if not self._gap_is_non_indexable(n)
+            ]
             control["ask"] = str(data.get("ask", "")).strip()[:400]
         except Exception:
             pass
@@ -14387,8 +14468,22 @@ class AgenticPreplanner:
         "NOT to plan — a separate planner will decide HOW. Your job is to "
         "discover the correct WHAT.\n\n"
         "Do, in order:\n"
-        "1. Propose 2-3 MECHANICALLY DISTINCT framings of the user's "
-        "request (different problem being solved, not rephrasings).\n"
+        "0. FIRST decide whether the request is answerable at all from what "
+        "you have. It is NOT — and you must set ask (step 4) and stop — when "
+        "the request names an action but no object that you can identify "
+        "from the USER's own words this turn: e.g. 'fix the bug' / 'arregla "
+        "el bug' with no bug named, no symbol pointed to, and no error or "
+        "traceback that the user pasted. Judge this on what the USER wrote, "
+        "not on the surrounding context: invalid citations, a prior step's "
+        "notes, or leftover analysis in the context are NOT a bug to fix — "
+        "do not treat pipeline artifacts as the user's target. If a "
+        "reasonable, specific interpretation exists (the user named a "
+        "symbol, described a misbehavior, pasted an error, or the intent is "
+        "otherwise concrete), it IS answerable — continue to step 1. When in "
+        "genuine doubt between 'answerable' and 'must ask', prefer to ask "
+        "one sharp question: a wrong-target investigation wastes far more "
+        "than a quick clarification.\n"
+        "{step1}"
         "2. If past work could be relevant, emit one or two lines exactly "
         "like: TOOL: MEMORY(natural language query) — and STOP. You will "
         "receive the results and be called again; you may refine the query "
@@ -14396,8 +14491,22 @@ class AgenticPreplanner:
         "3. Choose the most probable framing based on the EVIDENCE "
         "available (the code context above, memory results, the literal "
         "request). Do not choose on style.\n"
-        "4. Only if NO framing is defensible without the user, set ask to "
-        "one concrete question and leave chosen empty.\n\n"
+        "3b. If the request presupposes an artifact that is NOT in the "
+        "evidence available to you — a prior version, an external file, "
+        "another project, a paper, a 'v9.0', a document the user believes "
+        "you have — do NOT frame the task as though that artifact were "
+        "present. You cannot compare against, or reason about, code you "
+        "cannot see, and the downstream steps cannot retrieve it if memory "
+        "already returned nothing. Frame the task around what IS available "
+        "(e.g. 'describe the CURRENT implementation of X and state that the "
+        "referenced <artifact> is not in context') so the answer reports "
+        "the present code and names the missing term as unavailable, rather "
+        "than inventing its contents. If the request is ENTIRELY about the "
+        "absent artifact so that nothing defensible remains, fall through "
+        "to the ask in step 4 instead.\n"
+        "4. If step 0 found the request unanswerable without the user, OR no "
+        "framing is defensible without them, set ask to one concrete "
+        "question and leave chosen empty.\n\n"
         "When you are ready to answer (no more TOOL lines), reply ONLY "
         "with a JSON object, no prose, no fences:\n"
         "{\"framings\": [\"...\", \"...\"], \"chosen\": \"<the framing "
@@ -14406,6 +14515,34 @@ class AgenticPreplanner:
         "what memory contributed, or empty>\", \"ask\": \"\"}\n\n"
         "{tool_results}"
         "Request:\n{question}"
+    )
+
+    # Step 1 has two variants selected by valve agentic_preplanner_collapse.
+    # CLASSIC always diverges over 2-3 framings — the maximally de-anchoring
+    # behavior, worth its cost on any request that might hide an alternative
+    # reading. COLLAPSIBLE still runs the anti-anchoring EXERCISE (always asks
+    # "is there another interpretation?") but does not force fabrication: an
+    # unambiguous request legitimately yields ONE framing, chosen directly,
+    # which is faster and avoids the invented distinctions that forced 2-3
+    # produce on a clear question. The valve lets the collapse be switched off
+    # if divergence turns out to be suppressed on grey-area questions that
+    # benefited from it — divergence is among the most valuable pipe steps, so
+    # the classic behavior stays one toggle away.
+    _STEP1_CLASSIC = (
+        "1. If answerable, propose 2-3 MECHANICALLY DISTINCT framings of the "
+        "user's request (different problem being solved, not rephrasings).\n"
+    )
+    _STEP1_COLLAPSIBLE = (
+        "1. If answerable, identify the MECHANICALLY DISTINCT framings of the "
+        "user's request that genuinely exist (a different problem being "
+        "solved, not a rephrasing). For an UNAMBIGUOUS request this is a "
+        "SINGLE framing — emit just that one and choosing it directly is "
+        "correct; do NOT pad to two or three by inventing distinctions that "
+        "are really the same problem reworded. Only when the request "
+        "genuinely admits different problems, enumerate 2-3 and choose among "
+        "them on the evidence. When you are unsure whether a second reading "
+        "is real, include it: the cost of one extra framing is small, a "
+        "missed alternative sends the plan down the wrong path.\n"
     )
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -14543,10 +14680,17 @@ class AgenticPreplanner:
         memory_rounds = 0
         response = ""
         # ── Region: agentic loop — call, honor TOOL rounds, re-call ────────
+        _step1 = (
+            self._STEP1_COLLAPSIBLE
+            if getattr(self._f.valves, "agentic_preplanner_collapse", True)
+            else self._STEP1_CLASSIC
+        )
         for attempt in range(max_rounds + 1):
-            prompt = self._CONTRACT.replace(
-                "{tool_results}", tool_results
-            ).replace("{question}", question)
+            prompt = (
+                self._CONTRACT.replace("{step1}", _step1)
+                .replace("{tool_results}", tool_results)
+                .replace("{question}", question)
+            )
             try:
                 response = await self._f._llm_orchestrator.call_llm(
                     prompt=prompt,
@@ -15265,17 +15409,6 @@ class AgenticSynthesisComposer:
         # codebase (observed live: a ghost symbol produced 3/3 invalid
         # claims and the main model fell back to parroting the ingestion
         # ack). Say so explicitly so the answer is honest instead of hollow.
-        if _all_citations_invalid:
-            lines.insert(
-                1,
-                "⚠ NONE of the claims below could be tied to symbols present "
-                "in the indexed codebase — the investigated names may not "
-                "exist in this project. Treat their content as UNVERIFIED. "
-                "If the user's question names a symbol that is not in the "
-                "index, state that explicitly and answer with what IS "
-                "indexed; do not fabricate an analysis of unknown code, and "
-                "do not reply with a bare ingestion confirmation.",
-            )
         # Empty-ledger abstention: the pipeline ran investigative steps but
         # produced NO verifiable claim at all (observed live: an EXPAND
         # returned a truncated body, the investigate step gave up, the
@@ -15332,6 +15465,61 @@ class AgenticSynthesisComposer:
                 "or request the specific symbol, rather than guessing its "
                 "contents.",
             )
+        # Degenerate workspace guard: when NO claim could be tied to indexed
+        # symbols, the investigated names likely do not exist in this
+        # codebase (observed live P17: a ghost symbol _consume_stream produced
+        # 2/2 invalid claims and the main model, handed those very claims as
+        # workspace material, fabricated an implementation from them despite a
+        # "do not fabricate" warning). The earlier design inserted a warning
+        # but STILL listed the invalid claims and their digests below it —
+        # handing the model the fabricable material and asking it not to use
+        # it. That is self-defeating: a plausible-looking analysis of a ghost
+        # is exactly what a terse instruction cannot override.
+        #
+        # Instead, when every citation is invalid, the workspace carries ONLY
+        # the abstention — no step digests, no claim text — so there is no
+        # ghost analysis for the model to copy. The model still has Block A
+        # (the real indexed code) to answer from; it simply is not shown the
+        # fabricated material. The code decides WHAT the model sees (bounds);
+        # the model writes within it (proposes). This is a structural remedy,
+        # not another textual plea.
+        if _all_citations_invalid:
+            _ghost_syms = sorted(
+                {
+                    q
+                    for c in ledger.claims
+                    for q in (c.invalid_qids or [])
+                }
+            )
+            _ghost_hint = (
+                f" The investigated name(s) not found in the index: "
+                f"{', '.join(_ghost_syms)}."
+                if _ghost_syms
+                else ""
+            )
+            lines = [
+                header,
+                "",
+                "⚠ The agentic pipeline investigated the question but could "
+                "NOT tie a single claim to a symbol present in the indexed "
+                "codebase." + _ghost_hint,
+                "",
+                "This usually means the symbol the question is about is not "
+                "part of this project's indexed code (for example, it lives "
+                "in an external module that was never pasted or ingested). "
+                "The pipeline's findings are therefore omitted here: they "
+                "described code that could not be verified to exist, and "
+                "presenting them would invite a fabricated analysis.",
+                "",
+                "Answer honestly from the code that IS indexed (shown in the "
+                "context above). If the named symbol is genuinely not "
+                "available, say so plainly and tell the user what you would "
+                "need — the file or the specific symbol — rather than "
+                "reconstructing its contents from memory. Do NOT invent an "
+                "implementation, its fields, or its control flow.",
+            ]
+            return "\n".join(lines).rstrip()
+
         for s in plan.steps:
             if s.status != "done":
                 continue
@@ -39334,6 +39522,23 @@ class Filter:
                 "never overrides an explicit question. Fail-open: any "
                 "failure yields an empty brief and the planner runs exactly "
                 "as without it."
+            ),
+        )
+        agentic_preplanner_collapse: bool = Field(
+            default=True,
+            description=(
+                "Pre-planner divergence mode. When True (collapse ON), the "
+                "pre-planner still runs the anti-anchoring exercise on every "
+                "turn but is not forced to fabricate alternatives: an "
+                "unambiguous request yields a SINGLE framing (faster, avoids "
+                "invented distinctions), while a genuinely ambiguous one "
+                "still gets 2-3. When False, it always diverges over 2-3 "
+                "framings — the maximally de-anchoring behavior, at the cost "
+                "of forced framings on clear questions. Turn OFF if you find "
+                "the collapse suppressing divergence on grey-area questions "
+                "that benefited from it: divergence is among the most "
+                "valuable pipe steps, so the always-diverge behavior is one "
+                "toggle away. No effect when agentic_preplanner is False."
             ),
         )
         agentic_preplanner_max_tokens: int = Field(
