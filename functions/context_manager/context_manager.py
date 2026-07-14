@@ -16613,19 +16613,35 @@ class AgenticOrchestrator:
         # per run for deterministic behaviour, then optionally restore a
         # persisted snapshot so a multi-turn line of reasoning can resume.
         # The snapshot lives in pstate (per-project); restore only when the
-        # valve is on and this turn continues the same project.
+        # valve is on and this turn continues the same project. The
+        # continuation check is load-bearing: observed live (phase 7), the
+        # valve-only gate restored the previous turn's claims into UNRELATED
+        # fresh questions — build_block_a claims surfacing as a 'Nota
+        # crítica' inside an answer about slot_restore — because three
+        # different bugs in a row each inherited the prior bug's ledger.
+        # is_continuation is classified in the inlet before the pipeline
+        # runs, so pstate already holds this turn's verdict here.
         self._ledger.claims = []
         if self._f.valves.agentic_ledger_persist:
             try:
                 _snap = self._f._project_state_manager.get_pstate(project_id).get(
                     "agentic_ledger_snapshot"
                 )
-                if _snap:
+                _is_cont = self._f._project_state_manager.get_is_continuation(
+                    project_id
+                )
+                if _snap and _is_cont:
                     for _d in _snap:
                         self._ledger.claims.append(LedgerClaim(**_d))
                     self._f._log_debug(
                         f"🤖 Agentic: restored {len(_snap)} ledger claim(s) "
                         "from the previous turn"
+                    )
+                elif _snap:
+                    self._f._log_debug(
+                        f"🤖 Agentic: ledger snapshot present ({len(_snap)} "
+                        "claim(s)) but this turn is not a continuation — "
+                        "starting a fresh ledger"
                     )
             except Exception:
                 self._ledger.claims = []
@@ -39212,10 +39228,16 @@ class Filter:
             description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
         )
         agentic_max_steps: int = Field(
-            default=4,
+            default=5,
             ge=2,
             le=8,
-            description="Maximum steps the planner may emit.",
+            description=(
+                "Maximum steps the planner may emit. 5 leaves headroom: a "
+                "hypothesize plan (investigate + hypothesize + verify + "
+                "analyze) fills 4 exactly, so at 4 there was no room for a "
+                "NEEDS-inserted follow-up step on precisely the turns that "
+                "investigate the hardest questions."
+            ),
         )
         agentic_planner_max_tokens: int = Field(
             default=768,
@@ -39301,13 +39323,15 @@ class Filter:
             description=(
                 "#11: persist the agentic evidence ledger between turns. At "
                 "the end of a pipeline run the claims are snapshotted into "
-                "pstate (per-project); a continuing turn restores them so a "
-                "multi-turn line of reasoning can resume instead of starting "
-                "the ledger empty. Off by default — it adds cross-turn state, "
-                "and a stale snapshot could bias a fresh question; enable when "
-                "you want long debugging threads to accumulate evidence. A "
-                "project switch gets a clean pstate and never inherits another "
-                "project's snapshot."
+                "pstate (per-project); a turn classified as a CONTINUATION "
+                "restores them so a multi-turn line of reasoning can resume "
+                "instead of starting the ledger empty. A fresh question "
+                "never restores — the snapshot stays put and a 'not a "
+                "continuation' log is emitted instead — so a stale snapshot "
+                "cannot bias an unrelated turn (observed live before the "
+                "gate: three different bugs in a row each inherited the "
+                "prior bug's claims). On by default. A project switch gets a "
+                "clean pstate and never inherits another project's snapshot."
             ),
         )
         agentic_ledger_snapshot_max: int = Field(
@@ -39335,7 +39359,7 @@ class Filter:
             ),
         )
         agentic_hypothesize_compete: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "0030: run the full hypothesis COMPETITION "
                 "(compete_hypotheses) on a hypothesize step PROACTIVELY, when "
@@ -39347,10 +39371,15 @@ class Filter:
                 "hypotheses; the surviving verdict (with its scope and peer "
                 "review) annotates the step output before synthesis. 'off' = "
                 "never (hypothesize runs as a plain generative step). "
-                "'shadow' (default) = log '[COMPETE-SHADOW] would compete' "
-                "with the hypothesis count WITHOUT running it, to calibrate "
-                "first. 'on' = run it, bounded by the remaining budget; it "
-                "dirties the KV slot, so the launchpad re-fires afterwards."
+                "'shadow' = log '[COMPETE-SHADOW] would compete' with the "
+                "hypothesis count WITHOUT running it, to calibrate first "
+                "(the shadow phase confirmed the trigger live: 3 rivals, "
+                "debug intent, would-compete logged correctly). 'on' "
+                "(default) = run it, bounded by the remaining budget; it "
+                "dirties the KV slot, so the launchpad re-fires afterwards. "
+                "Expect hypothesize turns to be noticeably slower when on — "
+                "the competition adds several LLM calls (experiment design "
+                "and predictions per rival, challenge, possible tiebreaker)."
             ),
         )
         agentic_metacog_confidence_floor: float = Field(
