@@ -39196,9 +39196,20 @@ class Filter:
             description="Maximum steps the planner may emit.",
         )
         agentic_planner_max_tokens: int = Field(
-            default=400,
+            default=768,
             ge=100,
-            description="Generation cap for the planner's JSON plan.",
+            description=(
+                "Generation cap for the planner's JSON plan. 768 leaves "
+                "comfortable room for a multi-step plan with descriptive "
+                "goals and a rationale; a tighter cap truncates the JSON "
+                "mid-object, which fails to parse and falls back to the "
+                "fixed plan — silently dropping richer step kinds like "
+                "design_tests (observed live at 400: a design-tests plan "
+                "generated 402 tokens, hit finish_reason=length, and "
+                "reverted to investigate/verify/analyze with no tests "
+                "armed). Raise further only if plans with many steps are "
+                "still being cut off."
+            ),
         )
         agentic_step_cache: bool = Field(
             default=True,
