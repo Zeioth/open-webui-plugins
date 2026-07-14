@@ -6631,6 +6631,18 @@ class ContextBuilder:
 
         Used when the signature is already present in Block A (skeleton tier).
 
+        Two containment rules, both from a live incident (a pasted-file class
+        symbol injected its entire ~1400-line body into Block B — 77% of that
+        turn's dynamic-context bloat — while one of its members was ALSO
+        rendered standalone, duplicating the method inside the class):
+        - Class-kind symbols never render a full body here. The class outline
+          already lives in the skeleton tier (this path only runs for
+          skeleton-tier qids), every member is individually activatable, and
+          a full class body duplicates each activated member inside it.
+        - Function bodies are capped by max_code_block_tokens — the main
+          LOD-3 loop already had this guard; this path did not, which is
+          exactly why the oversized body slipped through here.
+
         The qid in the comment header is backtick-delimited and separated from
         the suffix by a parenthesis: the previous "# {qid} — body" form let the
         model fuse the identifier with the suffix and cite hallucinated names
@@ -6638,6 +6650,16 @@ class ContextBuilder:
         "build_body" while the real body sat in context). A delimited token
         cannot be extended into a plausible identifier.
         """
+        # ── Step 1: class containment — the outline is in the skeleton tier ──
+        meta = self._f._symbol_index.get_symbol_meta(qid, project_id)
+        if (meta or {}).get("kind") == "class":
+            self._f._log_debug(
+                f"Block B: not rendering full class body for `{qid}` — its "
+                "outline is in the skeleton tier and members activate "
+                "individually"
+            )
+            return ""
+        # ── Step 2: resolve the body from an active block ──
         state = self._f._conversation_state_manager.get(project_id)
         block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
         for bh in block_hashes:
@@ -6645,6 +6667,16 @@ class ContextBuilder:
             if block and not block.obsolete:
                 body = CodeBlockManager.extract_symbol_body(block, qid)
                 if body:
+                    # ── Step 3: cap oversized bodies (parity with LOD-3) ──
+                    _cap = self._f.valves.max_code_block_tokens
+                    if (
+                        _cap > 0
+                        and self._f._tokens.estimate_code_tokens(body) > _cap
+                    ):
+                        body = (
+                            self._f._tokens.truncate_text_to_tokens(body, _cap)
+                            + "\n# ... [truncated — use /expand for full body]"
+                        )
                     return f"# `{qid}` (body)\n{body}\n"
         return ""
 
@@ -15629,17 +15661,25 @@ class AgenticSynthesisComposer:
                     "large share of the evidence above cites unverified "
                     "symbols. Name the SINGLE most fragile point your answer "
                     "rests on, and the one condition (the validity clause) "
-                    "that must hold for it to be correct. If that condition "
-                    "is NOT backed by the verified evidence above, say so "
-                    "plainly in your answer — flag the assumption rather than "
-                    "presenting it as certain."
+                    "that must hold for it to be correct. First try to settle "
+                    "that condition yourself from the code context above — it "
+                    "is in front of you; read the relevant symbols and "
+                    "decide. Only if it genuinely cannot be settled from the "
+                    "available code, state it as an explicit assumption in "
+                    "your answer. Still deliver the answer: flag the "
+                    "assumption, do NOT withhold the response or ask the user "
+                    "to confirm something you could verify yourself."
                 )
             else:
                 lines.append(
                     "Before you answer, state in one line the key assumption "
-                    "your conclusion depends on, so the user can judge it. If "
-                    "it is not supported by the evidence above, flag it "
-                    "rather than asserting it."
+                    "your conclusion depends on. First try to confirm it "
+                    "yourself from the code context above rather than "
+                    "asserting it blindly. Deliver your answer either way: if "
+                    "the code confirms it, proceed; if it genuinely cannot be "
+                    "settled from the available code, flag it as an "
+                    "assumption in the answer. Do NOT ask the user to confirm "
+                    "facts that are present in the code you already have."
                 )
         lines.append("")
         lines.append("</agentic_findings>")
@@ -15649,7 +15689,16 @@ class AgenticSynthesisComposer:
             "your answer in those findings, verify their claims against the "
             "code context above, and write the answer in your own prose. "
             "NEVER reproduce the block, its 'Step N' scaffolding, its "
-            "verification markers (✓/✗), or this instruction in your reply."
+            "verification markers (✓/✗), or this instruction in your reply. "
+            "Your task is to ANSWER the user's question now. Do not ask the "
+            "user to confirm or verify facts that you can determine yourself "
+            "from the code context above — a discrepancy the findings noted "
+            "between two symbols is something you resolve by reading those "
+            "symbols, not a question for the user. Only ask when the "
+            "information you need is genuinely NOT obtainable from the code "
+            "or the conversation (e.g. runtime behavior, the user's "
+            "intent or environment); in every other case, answer, flagging "
+            "any assumption you had to make."
         )
         return "\n".join(lines).rstrip()
 
@@ -40018,8 +40067,10 @@ class Filter:
                 "docstring.\n"
                 "Every function body is divided into comment regions by its "
                 "logical steps or blocks (e.g. '# ── Step N: … ──').\n"
-                "Python code follows PEP 8; any other language follows that "
-                "language's most widespread style convention."
+                "Python code follows PEP 8, including its line-length "
+                "limits: maximum 79 columns for code and 72 for comments "
+                "and docstrings; any other language follows that language's "
+                "most widespread style convention."
             ),
             description=(
                 "Standing code-style rules injected into every reply's "
