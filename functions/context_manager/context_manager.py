@@ -5860,9 +5860,21 @@ class ContextBuilder:
 
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    @staticmethod
-    def _build_instruction_tail(use_case: str = "C") -> str:
-        """M2: instruction tail adapted to the active use case."""
+    def _build_instruction_tail(self, use_case: str = "C") -> str:
+        """M2: instruction tail adapted to the active use case.
+
+        The tail also RESTATES the declared code preferences (comment
+        language and style contract). They already sit at the top of Block A
+        for KV stability, but that is ~60k tokens of class index and call
+        graph away from where generation starts, and the model was observed
+        writing Spanish comments while the profile line asked for English.
+        This is a position problem, not a wording one: the tail is the last
+        thing read before the answer, so the standing rules are repeated
+        here where they are actually attended to. The cost is a few dozen
+        tokens on a block that is per-query anyway (nothing in Block A's
+        cached prefix moves), and the restatement is byte-identical each
+        turn, so it adds no churn of its own.
+        """
         tails = {
             "A": "_[Architecture mode: focus on contracts, interfaces, and invariants. "
             "Reasoning guidelines from system above apply.]_",
@@ -5875,7 +5887,29 @@ class ContextBuilder:
             "_[Reasoning mode: code review checklist + critical reasoning "
             "guidelines from system above apply to this response]_"
         )
-        return tails.get(use_case, default)
+        out = [tails.get(use_case, default)]
+        # ── Restate the declared preferences at the point of generation ──
+        _rules: List[str] = []
+        _clang = str(
+            getattr(self._f.valves, "code_comment_language", "") or ""
+        ).strip()
+        if _clang:
+            _rules.append(
+                f"write every code comment and docstring in {_clang} "
+                "(the conversation language does not apply to code)"
+            )
+        _style = str(getattr(self._f.valves, "code_style_contract", "") or "")
+        for _raw in _style.splitlines():
+            _rule = _raw.strip().lstrip("- ").strip()
+            if _rule:
+                _rules.append(_rule[0].lower() + _rule[1:] if _rule else _rule)
+        if _rules:
+            out.append(
+                "_[When you write code in this reply: "
+                + "; ".join(_rules).rstrip(".")
+                + ".]_"
+            )
+        return "\n".join(out)
 
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
         """True only if the skeleton tier was actually rendered into Block A THIS turn."""
@@ -12495,9 +12529,10 @@ class AgenticEvidenceLedger:
                     data, tail_start = cand, pos
                     break
         if data is None:
+            _tail = (step.output or "")[-180:].replace("\n", "⏎")
             self._f._log_debug(
                 f"🤖 Ledger: step {step.id} has no parseable claims tail — "
-                "prose kept, no claims recorded"
+                f"prose kept, no claims recorded; output ends: {_tail!r}"
             )
             return control
         step.output = step.output[:tail_start].rstrip()
@@ -15077,8 +15112,18 @@ class AgenticPlanner:
 
         Unknown kinds coerce to investigate; the list is capped at
         max_steps; a missing terminal analyze step is appended.
+
+        Every rejection path logs its reason. Returning None sends the turn
+        to the fixed investigate/verify/analyze plan, which can never
+        schedule hypothesize — so a silent None is indistinguishable from a
+        planner that simply chose not to compete, and that ambiguity has
+        already cost two diagnoses (observed live: a 496-token, untruncated
+        response rejected with no trace of why).
         """
         if not response:
+            self._f._log_debug(
+                "🤖 Planner: empty response → fixed plan"
+            )
             return None
         cleaned = response.replace("```json", "").replace("```", "").strip()
         # The planner is a reasoning model and often wraps its JSON in prose
@@ -15093,28 +15138,55 @@ class AgenticPlanner:
             cleaned = cleaned[start : end + 1]
         try:
             data = json.loads(cleaned)
-            raw = data.get("steps", [])
-            assert isinstance(raw, list) and raw
-        except Exception:
+        except Exception as e:
+            self._f._log_debug(
+                f"🤖 Planner: JSON parse failed ({e}) → fixed plan; "
+                f"raw head: {response[:200]!r}"
+            )
+            return None
+        raw = data.get("steps", []) if isinstance(data, dict) else []
+        if not isinstance(raw, list) or not raw:
+            self._f._log_debug(
+                "🤖 Planner: JSON parsed but carries no usable 'steps' list "
+                f"(keys={list(data)[:6] if isinstance(data, dict) else type(data).__name__}) "
+                f"→ fixed plan; raw head: {response[:200]!r}"
+            )
             return None
 
         steps: List[AgenticStep] = []
+        _dropped = 0
         for rs in raw[:max_steps]:
             try:
                 goal = str(rs.get("goal", "")).strip()
                 kind = str(rs.get("kind", "investigate")).strip().lower()
                 symbols = [str(s).strip() for s in rs.get("symbols", [])][:8]
             except Exception:
+                _dropped += 1
                 continue
             if not goal:
+                _dropped += 1
                 continue
             if kind not in self._VALID_KINDS:
+                self._f._log_debug(
+                    f"🤖 Planner: unknown kind '{kind}' coerced to "
+                    "investigate"
+                )
                 kind = "investigate"
             steps.append(
                 AgenticStep(id=len(steps) + 1, goal=goal, kind=kind, symbols=symbols)
             )
         if not steps:
+            self._f._log_debug(
+                f"🤖 Planner: all {len(raw)} step(s) unusable "
+                f"({_dropped} dropped: missing goal or malformed) → fixed "
+                f"plan; raw head: {response[:200]!r}"
+            )
             return None
+        if _dropped:
+            self._f._log_debug(
+                f"🤖 Planner: dropped {_dropped} malformed step(s), kept "
+                f"{len(steps)}"
+            )
         if steps[-1].kind != "analyze":
             if len(steps) >= max_steps:
                 steps[-1].kind = "analyze"
@@ -16061,7 +16133,9 @@ class AgenticOrchestrator:
                 )
                 if _div:
                     _before = len(hyps)
-                    hyps = self._f._meta_reasoning._dedupe_hypotheses(hyps + _div)
+                    hyps = self._f._meta_reasoning._dedupe_hypotheses(
+                        hyps + _div, protect=_before
+                    )
                     self._f._log_debug(
                         f"🤖 Agentic: divergent pool +{len(hyps) - _before} "
                         f"(requested {_div_n}, {len(_div)} parsed) → "
@@ -24830,32 +24904,47 @@ class MetacognitiveReasoningEngine:
 
     @staticmethod
     def _dedupe_hypotheses(
-        hyps: List[Tuple[str, float]], cap: int = 0
+        hyps: List[Tuple[str, float]], cap: int = 0, protect: int = 0
     ) -> List[Tuple[str, float]]:
         """
         Drop near-duplicate hypothesis texts, keeping first occurrence.
 
-        Uses difflib token-free ratio (deterministic, zero model calls) with
-        a 0.8 similarity threshold — a CE-based semantic dedupe was rejected
-        as one extra model pass for marginal gain on <10 short sentences.
+        Uses difflib's real ratio() (deterministic, zero model calls) with a
+        0.8 similarity threshold — a CE-based semantic dedupe was rejected as
+        one extra model pass for marginal gain on <10 short sentences.
+
+        ratio(), not quick_ratio(): the latter is a cheap UPPER BOUND that
+        compares character multisets and ignores order, so two hypotheses
+        about the same code — inevitably sharing vocabulary ("cache", "slot",
+        "restore", and every Spanish stopword) — clear 0.8 while describing
+        completely different mechanisms. Thresholding an upper bound
+        over-detects duplicates by construction; observed live, a divergent
+        pool of 3 originals + 2 new collapsed to 2, destroying rivals the
+        planner had legitimately enumerated.
 
         Args:
             hyps: (text, confidence) tuples in priority order.
             cap: Optional maximum kept (0 = no cap).
+            protect: The first N entries are kept unconditionally. A merge
+                that exists to WIDEN a rival set must never drop what it
+                started with; only the additions are filtered against it.
 
         Returns:
             Deduplicated list, order preserved.
         """
         # ── Step 1: sequential near-duplicate filter ────────────────────────
         kept: List[Tuple[str, float]] = []
-        for text, conf in hyps:
+        for _i, (text, conf) in enumerate(hyps):
             t = (text or "").strip()
             if not t:
+                continue
+            if _i < protect:
+                kept.append((t, conf))
                 continue
             dup = any(
                 difflib.SequenceMatcher(
                     None, t.lower(), k.lower()
-                ).quick_ratio() > 0.8
+                ).ratio() > 0.8
                 for k, _ in kept
             )
             if not dup:
@@ -40570,7 +40659,27 @@ class Filter:
         # ═════════════════════════════════════════════════════════════════════════
 
         # ── 12.1 KV cache (slots) ─────────────────────────────────────────────
-        enable_slot_persistence: bool = Field(default=True)
+        enable_slot_persistence: bool = Field(
+            default=False,
+            description=(
+                "Save/restore the llama.cpp KV slot to sidecar .bin files "
+                "across turns. OFF by default: current llama.cpp keeps a "
+                "native prompt cache with per-prompt context checkpoints "
+                "(observed reusing a 79929-token prefix across four tasks "
+                "with auxiliary traffic in between — the exact problem this "
+                "mechanism was built to solve, handled server-side). With "
+                "SWA / hybrid-memory models, partial prefix reuse is "
+                "architecturally impossible: a restored checkpoint whose "
+                "position does not exactly match the incoming prompt makes "
+                "the server 'force full prompt re-processing due to lack of "
+                "cache data' (its own words, llama.cpp PR #13194), erase "
+                "the checkpoint pool (pos_next = 0), and re-prefill ~80k "
+                "tokens — observed as 76+ second stalls at 3% GPU. Enable "
+                "ONLY on llama.cpp builds without native context "
+                "checkpoints, where the sidecar is the sole survivor of "
+                "auxiliary-call slot churn."
+            ),
+        )
         slot_save_path: str = Field(default="/kvcache")
         warmup_prefill_wait_timeout: float = Field(
             default=30.0,
