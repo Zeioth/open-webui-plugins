@@ -15396,12 +15396,22 @@ class AgenticSynthesisComposer:
                 header += f", {refuted} REFUTED"
             _all_citations_invalid = total > 0 and ok == 0
         header += ")"
+        # The counts header is observability, not model input. Injected
+        # verbatim it formed the first line of an echo-shaped template:
+        # observed live (S7-5), the main model transcribed the entire
+        # workspace — decorated header, step timings, ✓ markers, even the
+        # embedded 'synthesize' instruction — into its visible answer, with
+        # small copy errors ("é" for "es", dropped underscores) proving the
+        # text was model output, not a plugin emission. The remedy is form,
+        # not stronger wording: log the header, strip the reproducible
+        # scaffolding below, and fence the findings so the directive can sit
+        # OUTSIDE the block it governs.
+        self._f._log_debug(header)
 
         lines = [
-            header,
-            f"_Pre-computed by the agentic pipeline (plan: {plan.source}) "
-            f'for the question: "{question}". Synthesize these notes into '
-            f"your answer; verify claims against the code context above._",
+            "<agentic_findings>",
+            f"Internal pre-computed findings (plan: {plan.source}) for the "
+            f'question: "{question}".',
             "",
         ]
         # Degenerate workspace guard: when NO claim could be tied to indexed
@@ -15498,7 +15508,7 @@ class AgenticSynthesisComposer:
                 else ""
             )
             lines = [
-                header,
+                "<agentic_findings>",
                 "",
                 "⚠ The agentic pipeline investigated the question but could "
                 "NOT tie a single claim to a symbol present in the indexed "
@@ -15517,14 +15527,16 @@ class AgenticSynthesisComposer:
                 "need — the file or the specific symbol — rather than "
                 "reconstructing its contents from memory. Do NOT invent an "
                 "implementation, its fields, or its control flow.",
+                "</agentic_findings>",
+                "The block above is internal scaffolding — follow it, but "
+                "never reproduce it or this instruction in your reply.",
             ]
             return "\n".join(lines).rstrip()
 
         for s in plan.steps:
             if s.status != "done":
                 continue
-            timing = "cached" if s.cached else f"{s.seconds:.1f}s"
-            lines.append(f"### Step {s.id} — {s.kind} [done, {timing}]")
+            lines.append(f"Step {s.id} ({s.kind}):")
             lines.append(s.digest)
             if ledger is not None:
                 for c in ledger.claims_for(s.id):
@@ -15571,13 +15583,13 @@ class AgenticSynthesisComposer:
             lines.append("")
         if early_exit:
             ids = ", ".join(str(s.id) for s in early_exit)
-            lines.append("### Early exit")
+            lines.append("Early exit:")
             lines.append(
                 f"- Steps {ids} skipped: an earlier step resolved the "
                 f"question with high confidence."
             )
         if problems:
-            lines.append("### Unresolved")
+            lines.append("Unresolved:")
             for s in problems:
                 detail = s.output if s.status == "failed" else "budget exhausted"
                 lines.append(f"- Step {s.id} ({s.kind}) {s.status}: {detail}")
@@ -15597,7 +15609,7 @@ class AgenticSynthesisComposer:
                 getattr(self._f.valves, "premortem_suspect_ratio", 0.34)
             )
             lines.append("")
-            lines.append("### 🔴 Pre-mortem")
+            lines.append("Pre-mortem:")
             if _suspect:
                 lines.append(
                     "Before you answer, red-team your own conclusion: a "
@@ -15616,6 +15628,16 @@ class AgenticSynthesisComposer:
                     "it is not supported by the evidence above, flag it "
                     "rather than asserting it."
                 )
+        lines.append("")
+        lines.append("</agentic_findings>")
+        lines.append(
+            "The <agentic_findings> block above is internal scaffolding — "
+            "pre-computed notes FOR you, not content for the user. Ground "
+            "your answer in those findings, verify their claims against the "
+            "code context above, and write the answer in your own prose. "
+            "NEVER reproduce the block, its 'Step N' scaffolding, its "
+            "verification markers (✓/✗), or this instruction in your reply."
+        )
         return "\n".join(lines).rstrip()
 
 
