@@ -34323,20 +34323,36 @@ class UserProfileManager:
     # ── Cache hash (authoritative only; freeze pins it) ────────────────────
     def cache_hash(self, project_id: str) -> str:
         """
-        Stable short hash of the AUTHORITATIVE profile only, for the Block A
-        cache key. Provisional values are excluded so an inferred guess never
-        churns the cache without changing the rendered prompt. Authoritative
-        changes are rare (promotion/declaration), so this rarely changes.
+        Stable short hash of everything the profile renders into Block A:
+        the AUTHORITATIVE tier plus the declared-preference valves (default
+        response language, code-comment language, style contract), since all
+        of them shape the rendered block. Provisional values stay excluded
+        so an inferred guess never churns the cache without changing the
+        prompt. Both sources change rarely (promotion, or the user editing a
+        valve), and either change must invalidate the Block A cache exactly
+        once — hence both are hashed.
         """
         prof = self.get_authoritative(project_id)
-        if not prof:
+        raw_parts: List[str] = []
+        if prof:
+            items = sorted(
+                (k, str(v.get("value", "")))
+                for k, v in prof.items()
+                if v.get("value")
+            )
+            raw_parts.extend(f"{k}={val}" for k, val in items)
+        # ── Declared valves: part of the rendered block, part of the key ──
+        for _vname in (
+            "default_response_language",
+            "code_comment_language",
+            "code_style_contract",
+        ):
+            _vval = str(getattr(self._f.valves, _vname, "") or "")
+            if _vval.strip():
+                raw_parts.append(f"valve:{_vname}={_vval}")
+        if not raw_parts:
             return "noprof"
-        items = sorted(
-            (k, str(v.get("value", ""))) for k, v in prof.items() if v.get("value")
-        )
-        if not items:
-            return "noprof"
-        raw = "|".join(f"{k}={val}" for k, val in items)
+        raw = "|".join(raw_parts)
         return hashlib.md5(raw.encode()).hexdigest()[:8]
 
     # ── Corroboration + promotion (inference → provisional → authoritative) ─
@@ -34574,12 +34590,39 @@ class UserProfileManager:
         if not getattr(self._f.valves, "enable_user_profile", False):
             return ""
         prof = self.get_authoritative(project_id)
-        lang = (prof.get("language") or {}).get("value")
+        # Declared default seeds the language line from turn 1; a promoted
+        # authoritative value (the user consistently writing in another
+        # language) wins over the seed. Detection refines, declaration
+        # bootstraps — the rendered line is byte-identical across turns
+        # either way, so Block A stays KV-stable.
+        lang = (prof.get("language") or {}).get("value") or str(
+            getattr(self._f.valves, "default_response_language", "") or ""
+        ).strip()
         lines: List[str] = []
         if lang:
             lines.append(
                 f"- Respond in {lang} unless the user writes in another language."
             )
+        # Declared (never inferred) code preferences: comment language and
+        # the standing style contract. Stable policies the user already
+        # knows are configuration, not detection targets — their observable
+        # signal is scarce and ambiguous (inherited code says nothing about
+        # the user's own preference), a wrong inference would silently
+        # degrade every later turn, and static valve text keeps Block A
+        # byte-stable where a dynamically learned value would churn the KV.
+        _comment_lang = str(
+            getattr(self._f.valves, "code_comment_language", "") or ""
+        ).strip()
+        if _comment_lang:
+            lines.append(
+                f"- Write code comments and docstrings in {_comment_lang}, "
+                f"regardless of the conversation language."
+            )
+        _style = str(getattr(self._f.valves, "code_style_contract", "") or "")
+        for _raw in _style.splitlines():
+            _rule = _raw.strip()
+            if _rule:
+                lines.append(_rule if _rule.startswith("- ") else f"- {_rule}")
         if not lines:
             return ""
         return "## User profile (honor across every reply)\n" + "\n".join(lines)
@@ -39927,6 +39970,55 @@ class Filter:
                 "answer). When a body still exceeds the cap the truncation "
                 "notice now tells the model to request the specific line "
                 "range instead of leaving it blind."
+            ),
+        )
+        default_response_language: str = Field(
+            default="Spanish",
+            description=(
+                "Seed for the profile's response language: injected from "
+                "turn 1 as the '- Respond in …' line whenever the profile "
+                "has not yet promoted an authoritative language, so early "
+                "turns do not drift to English while corroboration "
+                "converges. Once the profile promotes a language (the user "
+                "consistently writes in another one), the promoted value "
+                "wins over this seed. Empty disables the seed (previous "
+                "behaviour: no language line until promotion). Rendered via "
+                "the user-profile block; requires enable_user_profile."
+            ),
+        )
+        code_comment_language: str = Field(
+            default="English",
+            description=(
+                "Language for code comments and docstrings in generated "
+                "code, independent of the conversation language. Declared, "
+                "never inferred: the observable signal (comments in pasted "
+                "code) is scarce and ambiguous — inherited code says nothing "
+                "about the user's own preference — so a standing policy "
+                "belongs in configuration, not in detection. Empty disables "
+                "the line. Rendered via the user-profile block; requires "
+                "enable_user_profile."
+            ),
+        )
+        code_style_contract: str = Field(
+            default=(
+                "Every function and class must have a concise, descriptive "
+                "docstring.\n"
+                "Every function body is divided into comment regions by its "
+                "logical steps or blocks (e.g. '# ── Step N: … ──').\n"
+                "Python code follows PEP 8; any other language follows that "
+                "language's most widespread style convention."
+            ),
+            description=(
+                "Standing code-style rules injected into every reply's "
+                "profile block, one '- ' line per non-empty line of this "
+                "text. Declared, never inferred: these are stable policies "
+                "the user already knows, where a wrong inference would "
+                "silently degrade every later turn while a valve cannot be "
+                "wrong — and as static text they keep Block A byte-stable "
+                "(KV-cache friendly), unlike a dynamically learned value. "
+                "Edit freely; a change invalidates the Block A cache once "
+                "via the profile hash. Empty disables. Requires "
+                "enable_user_profile."
             ),
         )
         enable_user_profile: bool = Field(
